@@ -2,6 +2,11 @@
 
 这是一个反无人机的项目。当前阶段使用 C++，编写一个运行在香橙派算力板上的控制系统。
 
+## 硬件平台
+
+- **算力板**：香橙派，芯片 RK3588
+- **目标识别**：YOLOv26
+
 ## 功能
 
 算力板上的主要功能是进行目标识别和控制无人机。系统接收地面站发送的目标无人机位置信息，预测目标轨迹后，指引 PX4 无人机在机载模式下飞向目标。
@@ -16,7 +21,7 @@
 
 ## 目标识别
 
-使用 YOLO 进行目标识别，识别后的画面通过图传发回地面站。
+使用 YOLOv26 进行目标识别，识别后的画面通过图传发回地面站。
 
 ## 系统架构设计
 
@@ -41,6 +46,10 @@
 | 激光测距雷达线程 | 通过串口持续读取距离数据 | 单向读取 |
 | 状态机与控制线程 | 消费各线程产出的数据，进行目标轨迹预测和状态机决策，生成 MAVLink 控制指令投递给 PX4 线程发送 | 核心逻辑 |
 
+### MAVLink 库
+
+MAVLink 库放于 `third_party/mavlink/`，CMakeLists.txt 自动检测并使用。
+
 ### 消息流
 
 ```
@@ -63,7 +72,7 @@
 系统包含状态机，用于管理整体系统状态。状态机为自主实现，状态流转如下：
 
 1. **上电自检**：检查 PX4、地面站、摄像头、图传、激光测距雷达是否正常。
-2. **加载模型**：加载 YOLO 模型。
+2. **加载模型**：加载 YOLOv26 模型。
 3. **解锁**：飞控解锁。
 4. **起飞爬升**：原地起飞，达到目标高度。
 5. **地面站引导**：进入机载模式，依赖地面站通过电台下发的目标位置来引导飞行，激光测距雷达用于避障。
@@ -87,7 +96,7 @@ drone_test/
 │   │   └── radio_link.h          # 电台数传
 │   ├── perception/               # 感知模块
 │   │   ├── camera.h              # 摄像头采集（网口）
-│   │   └── yolo_detector.h       # YOLO 目标识别
+│   │   └── yolo_detector.h       # YOLOv26 目标识别
 │   ├── control/                  # 控制模块
 │   │   ├── trajectory_predictor.h  # 目标轨迹预测
 │   │   └── px4_controller.h        # PX4 无人机控制
@@ -99,6 +108,8 @@ drone_test/
 │       ├── message_queue.h       # 线程安全消息队列
 │       ├── memory_pool.h         # 内存池（图像零拷贝传递）
 │       └── types.h               # 公共数据类型
+│   └── config/                   # 配置模块
+│       └── config.h              # 配置文件解析与参数管理
 ├── src/
 │   ├── communication/
 │   │   ├── serial_port.cpp
@@ -118,14 +129,20 @@ drone_test/
 │   │   ├── message_queue.cpp
 │   │   ├── memory_pool.cpp
 │   │   └── types.cpp
+│   ├── config/
+│   │   └── config.cpp
 │   └── main.cpp                  # 入口，启动所有线程
+├── config/                       # 配置文件
+├── tests/                        # 单元测试（Google Test）
 └── third_party/
-    └── mavlink/                  # MAVLink 库
+    ├── mavlink/                  # MAVLink 库（CMake 自动检测）
+    └── spdlog/                   # spdlog 日志库
 ```
 
 ## 构建
 
 - 操作系统：Ubuntu
+- 芯片：RK3588（ARM64）
 - C++ 标准：C++17
 - 使用 CMakeLists.txt 进行构建
-- 日志：使用 spdlog
+- 日志：spdlog
