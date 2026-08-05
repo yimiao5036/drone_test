@@ -11,8 +11,17 @@ target_include_directories(drone_common INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_common INTERFACE cxx_std_17)
 
-add_executable(drone_control main.cpp)
-target_link_libraries(drone_control PRIVATE drone_common)
+# ---- 第三方库：spdlog（异步日志） ----
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/spdlog)
+
+add_executable(drone_control
+    main.cpp
+    src/common/logger.cpp)
+target_link_libraries(drone_control PRIVATE drone_common spdlog::spdlog)
 
 if(MSVC)
     target_compile_options(drone_control PRIVATE /W4 /permissive-)
