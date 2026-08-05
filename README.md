@@ -65,28 +65,31 @@
 - [通信与数据定义](docs/通信与数据定义.md)
 - [感知与避障设计](docs/感知与避障设计.md)
 - [电源与失效保护设计](docs/电源与失效保护设计.md)
+- [RK3588 RTSP + YOLO 视频链路修复与优化方案](videoPart/rtsp_yolo_stream/OPTIMIZATION_PLAN.md)
+- [项目文件结构与命名规划](docs/项目文件结构.md)
+- [Topic 发布订阅使用文档](include/common/topic.md)
 
-## 计划目录
+## 当前正式工程目录
 
 ```text
 drone_test/
 ├── CMakeLists.txt
+├── main.cpp
 ├── README.md
 ├── docs/
 ├── include/
 │   ├── communication/
+│   ├── video/
 │   ├── perception/
 │   ├── control/
 │   ├── state_machine/
-│   ├── video_transmission/
 │   ├── common/
 │   └── config/
 ├── src/
-├── config/
 ├── tests/
-└── third_party/
-    ├── mavlink/
-    └── spdlog/
+├── config/
+├── third_party/
+└── videoPart/              # 现有视频/RKNN验证原型，后续按模块迁移
 ```
 
 ## 构建环境
@@ -97,4 +100,4 @@ drone_test/
 - spdlog
 - Google Test
 
-当前尚未创建源码和构建文件。进入编码阶段前，需要先关闭各设计文档中的待定项，并在 PX4 SITL、台架和受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建。`videoPart`中的代码仍作为硬件验证原型保留；后续按 `video`、`perception` 等模块逐步迁移，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
