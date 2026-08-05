@@ -1,0 +1,17 @@
+# Build output
+out/
+build/
+
+# IDE
+.vs/
+.idea/
+*.user
+
+# Compiled files
+*.o
+*.so
+*.a
+yolo26_rknn
+
+# Result images
+result.jpg
