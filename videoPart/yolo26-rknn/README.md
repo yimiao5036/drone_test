@@ -127,12 +127,12 @@ y2 = (box[3] + i + 0.5f) * stride;
 
 在 RK3588 上 YOLO26n INT8 模型的典型性能：
 
-| 指标 | 典型值 |
+| 指标 | 典型值    |
 |------|--------|
-| 推理时间 | ~65 ms |
-| FPS | ~15 |
-| 模型大小 | ~7 MB |
-| mAP50-95 | 0.479 |
+| 推理时间 | ~25 ms |
+| FPS | ~35    |
+| 模型大小 | ~7 MB  |
+| mAP50-95 | 0.479  |
 
 ## 代码说明
 
@@ -162,7 +162,7 @@ y2 = (box[3] + i + 0.5f) * stride;
 3. **RGA 库**: 需要系统安装 `librga`
 4. **图像格式**: 输入图像需转换为 RGB 格式
 
-## 参考
+## 参考4
 
 - [rknn-cpp-yolo](../rknn-cpp-yolo/) - 原始 YOLO11 参考项目
 - [Ultralytics YOLO26 RKNN 导出文档](https://docs.ultralytics.com/zh/integrations/rockchip-rknn/)
