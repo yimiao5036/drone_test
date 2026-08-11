@@ -27,9 +27,12 @@ namespace drone::common {
 /// 业务线程只做入队，不阻塞在磁盘 I/O 上，适合高频日志场景。
 ///
 /// @param log_dir 日志输出目录，不存在时自动创建，默认 "logs/"
+/// @param level 日志等级（info / debug / warn / error 等），由 main 从
+///              JSON 配置文件读取后传入，默认 debug（兜底值）
 /// @return 全局异步 logger；重复调用返回同一个实例（幂等）
 std::shared_ptr<spdlog::logger> InitializeAsyncLogger(
-    const std::string& log_dir = "logs/");
+    const std::string& log_dir = "logs/",
+    spdlog::level::level_enum level = spdlog::level::debug);
 
 }  // namespace drone::common
 

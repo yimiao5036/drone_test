@@ -90,6 +90,9 @@ drone_test/
 - 线程安全的数据结构放在 `common/message_queue.h` 和 `common/memory_pool.h`
 - 所有串口通信使用 `communication/serial_port.h` 统一封装
 - MAVLink 消息处理统一使用 `communication/mavlink_handler.h`
+- **头文件保护统一使用 `#pragma once`**；已有头文件（如 `topic.h`、
+  `logger.h`、`video_frame.h`）沿用原 include guard，不再改动，新头文件
+  一律使用 `#pragma once`
 
 ### 命名规范
 - 类名：大驼峰，如 `SerialPort`、`YoloDetector`
@@ -105,6 +108,17 @@ drone_test/
 - 运行时错误：使用 `std::optional` 或错误码，避免异常影响实时性
 - 线程内错误：通过日志记录，关键错误通过消息队列通知控制线程统一决策
 - 资源申请：一律使用 RAII，杜绝裸指针管理资源
+
+### 日志规范
+- **只打关键路径日志**：模块生命周期（创建/销毁）、错误、状态变化；
+  高频热路径（每帧/每条消息调用的代码）不打日志
+- **异常日志必须节流**：第 1 次与每满 100 次才打印（`ShouldLogThrottled`
+  模式），防止高频异常刷屏；节流消息中带累计计数便于监控趋势
+- **等级分层**：INFO = 生命周期与状态变化；WARN = 异常降级（丢帧、队列满）；
+  ERROR = 逻辑缺陷与参数错误
+- 同一异常只在最合适的一层记录一次，调用链上不重复打印
+- 日志消息携带关键上下文（计数、容量、对象标识），便于事后定位
+- 日志纪律是硬约束：宁可少打，不可刷屏
 
 ### 线程安全约定
 - 每个线程的数据默认是线程独占的，不共享

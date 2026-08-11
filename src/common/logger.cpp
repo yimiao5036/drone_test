@@ -118,7 +118,7 @@ std::filesystem::path BuildLogFilePath(const std::string& log_dir) {
 }  // namespace
 
 std::shared_ptr<spdlog::logger> InitializeAsyncLogger(
-    const std::string& log_dir) {
+    const std::string& log_dir, spdlog::level::level_enum level) {
     // 幂等：已经初始化过则直接返回既有实例
     if (const auto existing = spdlog::get(kLoggerName)) {
         return existing;
@@ -133,7 +133,8 @@ std::shared_ptr<spdlog::logger> InitializeAsyncLogger(
     auto logger = spdlog::create_async<spdlog::sinks::basic_file_sink_mt>(
         kLoggerName, file_path.string(), false);
     logger->set_pattern(kLogPattern);
-    logger->set_level(spdlog::level::debug);  // 级别后续由配置文件控制
+    // 日志等级由调用方（main 从 JSON 配置文件读取）决定
+    logger->set_level(level);
 
     // 设为全局默认 logger，业务代码直接用 SPDLOG_* 宏
     spdlog::set_default_logger(logger);
@@ -141,7 +142,8 @@ std::shared_ptr<spdlog::logger> InitializeAsyncLogger(
     // 定期冲刷，防止崩溃时日志丢失过多
     spdlog::flush_every(std::chrono::seconds(kFlushIntervalSeconds));
 
-    SPDLOG_INFO("异步文件日志已初始化: {}", file_path.string());
+    SPDLOG_INFO("异步文件日志已初始化: {} (等级={})", file_path.string(),
+                spdlog::level::to_string_view(level));
     return logger;
 }
 
