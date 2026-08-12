@@ -114,4 +114,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。`videoPart`中的代码仍作为硬件验证原型保留；后续按 `video`、`perception` 等模块逐步迁移替换 Stub，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。已按实施顺序迁入真实实现：`video` 模块的 RTSP 接收（CameraReceiver）与解码（VideoDecoder，rkmpp 硬解/软解回退）、`perception` 模块的 YOLO 检测（YoloDetector + 后处理纯函数 + RKNN 后端条件编译，详见 `docs/开发进度.md`）。`videoPart` 中的代码仍作为硬件验证原型保留；RKNN 推理链路留待香橙派实机验证，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。

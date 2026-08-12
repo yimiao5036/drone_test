@@ -45,16 +45,43 @@ target_compile_features(drone_video_transmission PUBLIC cxx_std_17)
 target_link_libraries(drone_video_transmission PRIVATE spdlog::spdlog)
 
 # ---- perception 模块（YOLO、光流、激光雷达、融合、目标估计接口） ----
-add_library(drone_perception STATIC
+# RKNN 推理后端（香橙派专用）：DRONE_HAVE_RKNN=ON 时编译 rknn_detection_backend.cpp
+option(DRONE_HAVE_RKNN "启用 RKNN 推理后端（需香橙派 RKNN runtime 与 RGA）" OFF)
+set(DRONE_RKNN_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn/include" CACHE PATH "RKNN API 头文件目录（含 rknn_api.h）")
+set(DRONE_RGA_DIR "/usr/include/rga" CACHE PATH "RGA 头文件目录（含 rga.h / im2d.hpp）")
+
+set(PERCEPTION_SOURCES
     src/perception/yolo_detector.cpp
+    src/perception/yolo_detector_stub.cpp
+    src/perception/yolo_postprocess.cpp
     src/perception/optical_flow_estimator.cpp
     src/perception/laser_range_finder.cpp
     src/perception/perception_fusion.cpp
     src/perception/target_estimator.cpp)
+if(DRONE_HAVE_RKNN)
+    find_library(DRONE_RKNN_LIBRARY NAMES rknnrt)
+    if(NOT DRONE_RKNN_LIBRARY)
+        message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librknnrt.so（香橙派需安装 RKNN runtime）")
+    endif()
+    find_library(DRONE_RGA_LIBRARY NAMES rga)
+    if(NOT DRONE_RGA_LIBRARY)
+        message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librga.so（香橙派需安装 librga）")
+    endif()
+    list(APPEND PERCEPTION_SOURCES src/perception/rknn_detection_backend.cpp)
+endif()
+
+add_library(drone_perception STATIC ${PERCEPTION_SOURCES})
 target_include_directories(drone_perception PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_perception PUBLIC cxx_std_17)
 target_link_libraries(drone_perception PRIVATE spdlog::spdlog)
+if(DRONE_HAVE_RKNN)
+    target_compile_definitions(drone_perception PRIVATE DRONE_HAVE_RKNN=1)
+    target_include_directories(drone_perception PRIVATE
+        ${DRONE_RKNN_API_DIR} ${DRONE_RGA_DIR})
+    target_link_libraries(drone_perception PRIVATE
+        ${DRONE_RKNN_LIBRARY} ${DRONE_RGA_LIBRARY})
+endif()
 
 # ---- communication 模块（串口封装、PX4/地面站链路接口） ----
 add_library(drone_communication STATIC
@@ -172,6 +199,32 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
+        add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)
+        target_link_libraries(yolo_postprocess_test PRIVATE
+            drone_common drone_perception GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(yolo_postprocess_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(yolo_postprocess_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(yolo_postprocess_test)
+
+        # YOLO 检测器测试：注入 Mock 后端验证线程/发布/统计（不依赖硬件）
+        add_executable(yolo_detector_test tests/perception/yolo_detector_test.cpp)
+        target_link_libraries(yolo_detector_test PRIVATE
+            drone_common drone_video drone_perception GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(yolo_detector_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(yolo_detector_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(yolo_detector_test)
     else()
         message(STATUS "GoogleTest not found; topic tests will not be built")
     endif()
