@@ -19,14 +19,70 @@ set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/spdlog)
 
-# ---- video 模块（视频帧句柄与内存池） ----
+# ---- video 模块（帧句柄、内存池、摄像头接收、解码接口） ----
 add_library(drone_video STATIC
-    src/video/video_frame_pool.cpp)
+    src/video/video_frame_pool.cpp
+    src/video/camera_receiver.cpp
+    src/video/video_decoder.cpp)
 target_include_directories(drone_video PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video PUBLIC cxx_std_17)
-# 关键路径日志使用 spdlog（视频池内部打印，不向使用者暴露）
+# 关键路径日志使用 spdlog（视频池与骨架占位内部打印，不向使用者暴露）
 target_link_libraries(drone_video PRIVATE spdlog::spdlog)
+
+# ---- video_transmission 模块（图传发送接口） ----
+add_library(drone_video_transmission STATIC
+    src/video_transmission/video_sender.cpp)
+target_include_directories(drone_video_transmission PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_video_transmission PUBLIC cxx_std_17)
+target_link_libraries(drone_video_transmission PRIVATE spdlog::spdlog)
+
+# ---- perception 模块（YOLO、光流、激光雷达、融合、目标估计接口） ----
+add_library(drone_perception STATIC
+    src/perception/yolo_detector.cpp
+    src/perception/optical_flow_estimator.cpp
+    src/perception/laser_range_finder.cpp
+    src/perception/perception_fusion.cpp
+    src/perception/target_estimator.cpp)
+target_include_directories(drone_perception PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_perception PUBLIC cxx_std_17)
+target_link_libraries(drone_perception PRIVATE spdlog::spdlog)
+
+# ---- communication 模块（串口封装、PX4/地面站链路接口） ----
+add_library(drone_communication STATIC
+    src/communication/serial_port.cpp
+    src/communication/px4_link.cpp
+    src/communication/ground_station_link.cpp)
+target_include_directories(drone_communication PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_communication PUBLIC cxx_std_17)
+target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
+
+# ---- state_machine 模块（任务状态机接口） ----
+add_library(drone_state_machine STATIC
+    src/state_machine/mission_state_machine.cpp)
+target_include_directories(drone_state_machine PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_state_machine PUBLIC cxx_std_17)
+target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog)
+
+# ---- control 模块（飞行控制接口；库名加 _core 避免与可执行 drone_control 冲突） ----
+add_library(drone_control_core STATIC
+    src/control/flight_controller.cpp)
+target_include_directories(drone_control_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_control_core PUBLIC cxx_std_17)
+target_link_libraries(drone_control_core PRIVATE spdlog::spdlog)
+
+# ---- health 模块（健康管理接口） ----
+add_library(drone_health STATIC
+    src/health/health_manager.cpp)
+target_include_directories(drone_health PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_health PUBLIC cxx_std_17)
+target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 
 add_executable(drone_control
     main.cpp
@@ -75,6 +131,28 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(video_frame_pool_test)
+
+        # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
+        add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)
+        target_link_libraries(stub_smoke_test PRIVATE
+            drone_common
+            drone_video
+            drone_video_transmission
+            drone_perception
+            drone_communication
+            drone_state_machine
+            drone_control_core
+            drone_health
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(stub_smoke_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(stub_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(stub_smoke_test)
     else()
         message(STATUS "GoogleTest not found; topic tests will not be built")
     endif()
