@@ -1,0 +1,6 @@
+{
+    "log": {
+        "dir": "logs/",
+        "level": "info"
+    }
+}

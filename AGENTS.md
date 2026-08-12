@@ -11,6 +11,22 @@
 - **主要功能**：接收地面站目标位置 → YOLOv26 目标识别 → 轨迹预测 → 控制 PX4 无人机跟踪/反制
 - **通信协议**：MAVLink（与 PX4 飞控和地面站通信）
 
+## 开发与构建环境（强制规则）
+
+- **运行目标**：代码最终在香橙派（RK3588，ARM64，Ubuntu）上编译、部署和运行。
+- **开发机唯一构建环境**：Windows 主机上的 WSL2 中的 **Ubuntu 24.04**（工具链与依赖已配置好）。
+  所有本地编译验证、单元测试和提交前检查一律在 Ubuntu 24.04 中进行。
+- WSL2 中的 Ubuntu 20.04 **不用于**本项目构建，避免环境不一致导致问题。
+- 在 WSL2 Ubuntu 24.04 中的标准构建流程：
+
+  ```bash
+  cmake -S . -B build
+  cmake --build build -j$(nproc)
+  ./build/drone_control        # 生成 logs/0001_xxx.log 日志
+  ```
+
+- 提交代码前必须保证在 WSL2 Ubuntu 24.04 中编译通过；香橙派上执行最终部署验证。
+
 ## 架构设计
 
 采用**线程 + 消息队列**的解耦架构（借鉴 PX4/ROS2 设计思想）：
@@ -38,21 +54,38 @@
 drone_test/
 ├── CMakeLists.txt
 ├── README.md
+├── docs/                    # 全部设计文档（含 开发思路.md、状态机设计.md）
 ├── include/
-│   ├── communication/       # serial_port.h, mavlink_handler.h, radio_link.h
-│   ├── perception/          # camera.h, yolo_detector.h
-│   ├── control/             # trajectory_predictor.h, px4_controller.h
-│   ├── state_machine/       # state_machine.h
+│   ├── communication/       # serial_port.h, px4_link.h, ground_station_link.h
+│   ├── perception/          # yolo_detector.h, optical_flow_estimator.h, laser_range_finder.h,
+│   │                        #   perception_fusion.h, target_estimator.h
+│   ├── control/             # flight_controller.h
+│   ├── state_machine/       # mission_state_machine.h
+│   ├── video/               # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h
 │   ├── video_transmission/  # video_sender.h
-│   └── common/              # message_queue.h, memory_pool.h, types.h
+│   ├── health/              # health_manager.h
+│   ├── common/              # logger.h, topic.h, types.h
 │   └── config/              # config.h（配置文件解析与参数管理）
 ├── src/                     # 对应的 .cpp 实现文件 + main.cpp
-├── tests/                   # 单元测试，与 src/ 结构对应
+├── tests/                   # 单元测试（含 tests/skeleton/ 骨架冒烟测试），与 src/ 结构对应
 ├── config/                  # 配置文件（JSON/YAML）
 └── third_party/
     ├── mavlink/             # MAVLink 库
-    └── spdlog/              # spdlog 日志库
+    ├── spdlog/              # spdlog 日志库
+    └── nlohmann/            # JSON 库
 ```
+
+## 语言、命名与信息核实规则
+
+- **统一中文**：项目沟通、代码注释、提交说明及文档正文统一使用中文；
+  代码标识符（类名、函数名、变量名）、命令行、第三方库名等保留原文，
+  如 `Topic`、`cmake`、`spdlog`。
+- **文件命名**：`README.md`、`AGENTS.md`、`CMakeLists.txt` 等工具约定或
+  配置文件保留规定名称；其他文档使用中文文件名，如 `设计文档.md`、
+  `连接协议.md`。
+- **不得猜测未确认的信息**：先检查源码、配置和 git 历史；仓库没有依据时，
+  查阅官方文档或可靠来源并记录链接。无法联网、来源冲突或涉及产品取舍时，
+  先询问维护者确认后再执行。
 
 ## 开发规范
 
@@ -62,6 +95,9 @@ drone_test/
 - 线程安全的数据结构放在 `common/message_queue.h` 和 `common/memory_pool.h`
 - 所有串口通信使用 `communication/serial_port.h` 统一封装
 - MAVLink 消息处理统一使用 `communication/mavlink_handler.h`
+- **头文件保护统一使用 `#pragma once`**；已有头文件（如 `topic.h`、
+  `logger.h`、`video_frame.h`）沿用原 include guard，不再改动，新头文件
+  一律使用 `#pragma once`
 
 ### 命名规范
 - 类名：大驼峰，如 `SerialPort`、`YoloDetector`
@@ -77,6 +113,17 @@ drone_test/
 - 运行时错误：使用 `std::optional` 或错误码，避免异常影响实时性
 - 线程内错误：通过日志记录，关键错误通过消息队列通知控制线程统一决策
 - 资源申请：一律使用 RAII，杜绝裸指针管理资源
+
+### 日志规范
+- **只打关键路径日志**：模块生命周期（创建/销毁）、错误、状态变化；
+  高频热路径（每帧/每条消息调用的代码）不打日志
+- **异常日志必须节流**：第 1 次与每满 100 次才打印（`ShouldLogThrottled`
+  模式），防止高频异常刷屏；节流消息中带累计计数便于监控趋势
+- **等级分层**：INFO = 生命周期与状态变化；WARN = 异常降级（丢帧、队列满）；
+  ERROR = 逻辑缺陷与参数错误
+- 同一异常只在最合适的一层记录一次，调用链上不重复打印
+- 日志消息携带关键上下文（计数、容量、对象标识），便于事后定位
+- 日志纪律是硬约束：宁可少打，不可刷屏
 
 ### 线程安全约定
 - 每个线程的数据默认是线程独占的，不共享
