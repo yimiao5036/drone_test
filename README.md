@@ -72,6 +72,15 @@
 - [开发进度](docs/开发进度.md)
 - [Topic 发布订阅使用文档](include/common/topic.md)
 
+### 模块实现文档（与代码同目录，随实现更新）
+
+- [异步文件日志](include/common/logger.md)
+- [视频帧句柄](include/video/video_frame.md)
+- [视频帧内存池](include/video/video_frame_pool.md)
+- [RTSP 接收](include/video/camera_receiver.md)
+- [视频解码](include/video/video_decoder.md)
+- [串口封装](include/communication/serial_port.md)
+
 ## 当前正式工程目录
 
 ```text
