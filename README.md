@@ -69,6 +69,7 @@
 - [电源与失效保护设计](docs/电源与失效保护设计.md)
 - [RK3588 RTSP + YOLO 视频链路修复与优化方案](videoPart/rtsp_yolo_stream/OPTIMIZATION_PLAN.md)
 - [项目文件结构与命名规划](docs/项目文件结构.md)
+- [部署与打包](docs/部署与打包.md)
 - [开发进度](docs/开发进度.md)
 - [Topic 发布订阅使用文档](include/common/topic.md)
 
