@@ -2,5 +2,10 @@
     "log": {
         "dir": "logs/",
         "level": "info"
+    },
+    "yolo": {
+        "model_path": "models/yolo26n_int8.rknn",
+        "conf_threshold": 0.25,
+        "nms_threshold": 0.45
     }
 }
