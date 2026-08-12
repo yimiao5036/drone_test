@@ -61,8 +61,10 @@
 
 - [需求分析](docs/需求分析.md)
 - [系统架构设计](docs/系统架构设计.md)
-- [状态机设计](状态机设计.md)
+- [状态机设计](docs/状态机设计.md)
+- [开发思路](docs/开发思路.md)
 - [通信与数据定义](docs/通信与数据定义.md)
+- [数据接口文档](docs/数据接口文档.md)
 - [感知与避障设计](docs/感知与避障设计.md)
 - [电源与失效保护设计](docs/电源与失效保护设计.md)
 - [RK3588 RTSP + YOLO 视频链路修复与优化方案](videoPart/rtsp_yolo_stream/OPTIMIZATION_PLAN.md)
@@ -77,20 +79,23 @@ drone_test/
 ├── CMakeLists.txt
 ├── main.cpp
 ├── README.md
-├── docs/
+├── docs/                     # 全部设计文档
 ├── include/
-│   ├── communication/
-│   ├── video/
-│   ├── perception/
-│   ├── control/
-│   ├── state_machine/
-│   ├── common/
+│   ├── common/               # logger.h, topic.h, types.h（公共消息类型与 Topic 名称常量）
+│   ├── video/                # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h
+│   ├── video_transmission/   # video_sender.h
+│   ├── perception/           # yolo_detector.h, optical_flow_estimator.h, laser_range_finder.h,
+│   │                         #   perception_fusion.h, target_estimator.h
+│   ├── communication/        # serial_port.h, px4_link.h, ground_station_link.h
+│   ├── control/              # flight_controller.h
+│   ├── state_machine/        # mission_state_machine.h
+│   ├── health/               # health_manager.h
 │   └── config/
-├── src/
-├── tests/
+├── src/                      # 各模块 Stub 实现（业务逻辑阶段替换）
+├── tests/                    # 单元测试 + tests/skeleton/ 骨架冒烟测试
 ├── config/
 ├── third_party/
-└── videoPart/              # 现有视频/RKNN验证原型，后续按模块迁移
+└── videoPart/                # 现有视频/RKNN验证原型，后续按模块迁移
 ```
 
 ## 构建环境
@@ -100,4 +105,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建。`videoPart`中的代码仍作为硬件验证原型保留；后续按 `video`、`perception` 等模块逐步迁移，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。`videoPart`中的代码仍作为硬件验证原型保留；后续按 `video`、`perception` 等模块逐步迁移替换 Stub，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。

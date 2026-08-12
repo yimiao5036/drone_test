@@ -54,20 +54,25 @@
 drone_test/
 ├── CMakeLists.txt
 ├── README.md
+├── docs/                    # 全部设计文档（含 开发思路.md、状态机设计.md）
 ├── include/
-│   ├── communication/       # serial_port.h, mavlink_handler.h, radio_link.h
-│   ├── perception/          # camera.h, yolo_detector.h
-│   ├── control/             # trajectory_predictor.h, px4_controller.h
-│   ├── state_machine/       # state_machine.h
+│   ├── communication/       # serial_port.h, px4_link.h, ground_station_link.h
+│   ├── perception/          # yolo_detector.h, optical_flow_estimator.h, laser_range_finder.h,
+│   │                        #   perception_fusion.h, target_estimator.h
+│   ├── control/             # flight_controller.h
+│   ├── state_machine/       # mission_state_machine.h
+│   ├── video/               # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h
 │   ├── video_transmission/  # video_sender.h
-│   └── common/              # message_queue.h, memory_pool.h, types.h
+│   ├── health/              # health_manager.h
+│   ├── common/              # logger.h, topic.h, types.h
 │   └── config/              # config.h（配置文件解析与参数管理）
 ├── src/                     # 对应的 .cpp 实现文件 + main.cpp
-├── tests/                   # 单元测试，与 src/ 结构对应
+├── tests/                   # 单元测试（含 tests/skeleton/ 骨架冒烟测试），与 src/ 结构对应
 ├── config/                  # 配置文件（JSON/YAML）
 └── third_party/
     ├── mavlink/             # MAVLink 库
-    └── spdlog/              # spdlog 日志库
+    ├── spdlog/              # spdlog 日志库
+    └── nlohmann/            # JSON 库
 ```
 
 ## 语言、命名与信息核实规则
