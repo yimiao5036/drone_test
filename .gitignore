@@ -1,5 +1,6 @@
 /build/
 /cmake-build-*/
-
+/.idea/
 *.log
 *.tmp
+/logs/

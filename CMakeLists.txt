@@ -19,16 +19,22 @@ set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/spdlog)
 
-# ---- video 模块（帧句柄、内存池、摄像头接收、解码接口） ----
+# FFmpeg（RTSP 拉流与 H.264/H.265 解码；香橙派需安装 ffmpeg-rockchip 开发包）
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+
+# ---- video 模块（帧句柄、内存池、摄像头接收、解码） ----
 add_library(drone_video STATIC
     src/video/video_frame_pool.cpp
     src/video/camera_receiver.cpp
-    src/video/video_decoder.cpp)
+    src/video/camera_receiver_stub.cpp
+    src/video/video_decoder.cpp
+    src/video/video_decoder_stub.cpp)
 target_include_directories(drone_video PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video PUBLIC cxx_std_17)
-# 关键路径日志使用 spdlog（视频池与骨架占位内部打印，不向使用者暴露）
-target_link_libraries(drone_video PRIVATE spdlog::spdlog)
+# 关键路径日志使用 spdlog；FFmpeg 依赖仅实现内部使用（PIMPL 不泄漏到头文件）
+target_link_libraries(drone_video PRIVATE spdlog::spdlog PkgConfig::FFMPEG)
 
 # ---- video_transmission 模块（图传发送接口） ----
 add_library(drone_video_transmission STATIC
@@ -131,6 +137,19 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(video_frame_pool_test)
+
+        # 解码器软解测试：用 libx264 编码测试码流，验证 VideoDecoder 输出 NV12 帧
+        add_executable(video_decoder_test tests/video/video_decoder_test.cpp)
+        target_link_libraries(video_decoder_test PRIVATE
+            drone_common drone_video GTest::gtest_main PkgConfig::FFMPEG)
+        if(MSVC)
+            target_compile_options(video_decoder_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(video_decoder_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(video_decoder_test)
 
         # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
         add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)

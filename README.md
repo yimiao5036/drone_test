@@ -102,7 +102,7 @@ drone_test/
 
 - 运行目标：Ubuntu / ARM64 / RK3588（香橙派）
 - 开发/构建环境：Windows + WSL2 中的 **Ubuntu 24.04**（工具链已配置好，本项目唯一构建环境；WSL2 内的 Ubuntu 20.04 不用于本项目）
-- C++17、CMake、spdlog、Google Test
+- C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
 正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。`videoPart`中的代码仍作为硬件验证原型保留；后续按 `video`、`perception` 等模块逐步迁移替换 Stub，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
