@@ -127,7 +127,15 @@ target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
-target_link_libraries(drone_control PRIVATE drone_common drone_video spdlog::spdlog)
+# 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
+# drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
+target_link_libraries(drone_control PRIVATE
+    drone_common
+    drone_video
+    drone_perception
+    drone_video_transmission
+    spdlog::spdlog
+    PkgConfig::FFMPEG)
 
 if(MSVC)
     target_compile_options(drone_control PRIVATE /W4 /permissive-)
