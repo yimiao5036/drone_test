@@ -23,26 +23,33 @@ add_subdirectory(third_party/spdlog)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 
-# ---- video 模块（帧句柄、内存池、摄像头接收、解码） ----
+# ---- video 模块（帧句柄、内存池、摄像头接收、解码、叠加） ----
 add_library(drone_video STATIC
     src/video/video_frame_pool.cpp
     src/video/camera_receiver.cpp
     src/video/camera_receiver_stub.cpp
     src/video/video_decoder.cpp
-    src/video/video_decoder_stub.cpp)
+    src/video/video_decoder_stub.cpp
+    src/video/frame_compositor.cpp)
 target_include_directories(drone_video PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video PUBLIC cxx_std_17)
 # 关键路径日志使用 spdlog；FFmpeg 依赖仅实现内部使用（PIMPL 不泄漏到头文件）
 target_link_libraries(drone_video PRIVATE spdlog::spdlog PkgConfig::FFMPEG)
 
-# ---- video_transmission 模块（图传发送接口） ----
+# ---- video_transmission 模块（图传发送接口 + 编码后端） ----
 add_library(drone_video_transmission STATIC
-    src/video_transmission/video_sender.cpp)
+    src/video_transmission/video_sender.cpp
+    src/video_transmission/video_encoder.cpp)
 target_include_directories(drone_video_transmission PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video_transmission PUBLIC cxx_std_17)
+# 编码后端内部使用 FFmpeg（PIMPL 不泄漏到头文件），故链接到 drone_perception 同级
+# 此处链接 FFMPEG 到 transmission（编码器内部用），头文件不依赖 FFmpeg。
 target_link_libraries(drone_video_transmission PRIVATE spdlog::spdlog)
+# 编码后端内部使用 FFmpeg（PIMPL 不泄漏到头文件）。静态库符号需在最终链接传播，
+# 故 FFMPEG 设为 PUBLIC，使下游可执行文件（测试/主程序）能解析编码器符号。
+target_link_libraries(drone_video_transmission PUBLIC PkgConfig::FFMPEG)
 
 # ---- perception 模块（YOLO、光流、激光雷达、融合、目标估计接口） ----
 # RKNN 推理后端（香橙派专用）：DRONE_HAVE_RKNN=ON 时编译 rknn_detection_backend.cpp
@@ -225,6 +232,46 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(yolo_detector_test)
+
+        # 叠加器测试：验证 NV12 帧 + 检测 → 标注帧（不依赖硬件）
+        add_executable(frame_compositor_test tests/video/frame_compositor_test.cpp)
+        target_link_libraries(frame_compositor_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(frame_compositor_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(frame_compositor_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(frame_compositor_test)
+
+        # 图传发送器测试：注入 Mock 编码后端验证线程/计数（不依赖真实 RTSP）
+        add_executable(video_sender_test tests/video_transmission/video_sender_test.cpp)
+        target_link_libraries(video_sender_test PRIVATE
+            drone_common drone_video drone_video_transmission GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(video_sender_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(video_sender_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(video_sender_test)
+
+        # 编码后端开发机集成验证：软件编码 NV12→本地 MPEG-TS 文件
+        add_executable(video_encoder_integration_test
+            tests/video_transmission/video_encoder_integration_test.cpp)
+        target_link_libraries(video_encoder_integration_test PRIVATE
+            drone_common drone_video drone_video_transmission GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(video_encoder_integration_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(video_encoder_integration_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(video_encoder_integration_test)
     else()
         message(STATUS "GoogleTest not found; topic tests will not be built")
     endif()
