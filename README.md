@@ -80,6 +80,8 @@
 - [视频帧内存池](include/video/video_frame_pool.md)
 - [RTSP 接收](include/video/camera_receiver.md)
 - [视频解码](include/video/video_decoder.md)
+- [视频叠加](include/video/frame_compositor.md)
+- [图传发送与编码后端](include/video_transmission/video_sender.md)
 - [串口封装](include/communication/serial_port.md)
 
 ## 当前正式工程目录
@@ -92,18 +94,21 @@ drone_test/
 ├── docs/                     # 全部设计文档
 ├── include/
 │   ├── common/               # logger.h, topic.h, types.h（公共消息类型与 Topic 名称常量）
-│   ├── video/                # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h
-│   ├── video_transmission/   # video_sender.h
-│   ├── perception/           # yolo_detector.h, optical_flow_estimator.h, laser_range_finder.h,
+│   ├── video/                # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h,
+│   │                         #   frame_compositor.h（叠加）
+│   ├── video_transmission/   # video_sender.h, video_encoder.h（编码+图传协议可替换边界）
+│   ├── perception/           # yolo_detector.h, detection_backend.h, yolo_postprocess.h,
+│   │                         #   optical_flow_estimator.h, laser_range_finder.h,
 │   │                         #   perception_fusion.h, target_estimator.h
 │   ├── communication/        # serial_port.h, px4_link.h, ground_station_link.h
 │   ├── control/              # flight_controller.h
 │   ├── state_machine/        # mission_state_machine.h
 │   ├── health/               # health_manager.h
 │   └── config/
-├── src/                      # 各模块 Stub 实现（业务逻辑阶段替换）
+├── src/                      # 各模块实现（含真实实现与 Stub）
 ├── tests/                    # 单元测试 + tests/skeleton/ 骨架冒烟测试
 ├── config/
+├── models/                   # yolo26n_int8.rknn
 ├── third_party/
 └── videoPart/                # 现有视频/RKNN验证原型，后续按模块迁移
 ```
@@ -115,4 +120,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。已按实施顺序迁入真实实现：`video` 模块的 RTSP 接收（CameraReceiver）与解码（VideoDecoder，rkmpp 硬解/软解回退）、`perception` 模块的 YOLO 检测（YoloDetector + 后处理纯函数 + RKNN 后端条件编译，详见 `docs/开发进度.md`）。`videoPart` 中的代码仍作为硬件验证原型保留；RKNN 推理链路留待香橙派实机验证，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。已按实施顺序迁入真实实现：`video` 模块的 RTSP 接收（CameraReceiver）与解码（VideoDecoder，rkmpp 硬解/软解回退）、`perception` 模块的 YOLO 检测（YoloDetector + 后处理纯函数 + RKNN 后端条件编译）、`video` 的叠加（FrameCompositor）与 `video_transmission` 的图传发送（VideoSender + 可替换编码后端 IVideoEncoderBackend，rkmpp 硬编/软编回退 + RTSP 推流）。`main.cpp` 已提供视频链路装配版（RTSP→解码→YOLO→叠加→编码推流，含 /proc/self/exe 路径解析与逆序停机），便于提前上香橙派实机测试。历次构建开发机测试 73/73 通过、0 警告（详见 `docs/开发进度.md`）。`videoPart` 中的代码仍作为硬件验证原型保留；RKNN/RGA/rkmpp 硬编硬解链路与 RTSP 真实推流留待香橙派实机验证，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
