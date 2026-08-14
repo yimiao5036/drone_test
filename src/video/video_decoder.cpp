@@ -89,7 +89,6 @@ struct VideoDecoder::Impl {
     AVBufferRef* hw_device = nullptr;  // DRM 硬件设备（硬解路径）
     bool is_hardware = false;
     bool decoder_creation_failed = false;  // 创建失败后不再重试（避免刷屏）
-    bool decoder_initialized = false;      // 已取得参数集（extradata 或关键帧），可处理非关键帧
     SwsContext* sws_ctx = nullptr;
     int sws_src_format = -1;  // 当前 sws 上下文对应的源格式（缓存）
     AVFrame* decoded_frame = nullptr;
@@ -195,7 +194,6 @@ struct VideoDecoder::Impl {
             std::memcpy(codec_ctx->extradata, parameter_sets.data(),
                         parameter_sets.size());
             codec_ctx->extradata_size = static_cast<int>(parameter_sets.size());
-            decoder_initialized = true;  // 流级参数集就绪，可直接处理任意帧
         }
 
         if (is_hardware) {
@@ -233,7 +231,6 @@ struct VideoDecoder::Impl {
 
     /// 释放解码器相关资源（幂等）。
     void CleanupCodec() {
-        decoder_initialized = false;
         if (sws_ctx != nullptr) {
             sws_freeContext(sws_ctx);
             sws_ctx = nullptr;
@@ -290,11 +287,14 @@ struct VideoDecoder::Impl {
                 }
                 continue;
             }
-            // 参数集未就绪（无 extradata 且未收到关键帧）时跳过非关键帧：
-            // 队列丢帧可能挤掉含 SPS/PPS 的 I 帧，避免用残缺参数集无效解码，
-            // 等下一个关键帧恢复（真实 RTSP 每 GOP 周期有关键帧）
-            if (!frame.is_key_frame && !decoder_initialized) {
-                continue;
+            // 不再按“未初始化跳过非关键帧”：本款摄像头 RTSP 的 SPS/PPS 是 IDR
+            // 之前独立到达的非关键帧小包，旧逻辑会丢弃它们，使 rkmpp 永远收不到
+            // 参数集，随后解析 IDR 报 invalid pps 并段错误。
+            // 修正（对齐原型 videoPart/rtsp_yolo_stream）：解码器未创建时，由
+            // below 的 DecodeOne 用首个数据帧（任意类型）创建并与该帧一并送包，
+            // 之后全量送包，由 rkmpp 自行完成 SPS/PPS 参数同步与关键帧等待。
+            if (decoder_creation_failed) {
+                continue;  // 创建已失败，跳过，避免无效空转
             }
             DecodeOne(frame, packet);
         }
@@ -313,12 +313,6 @@ struct VideoDecoder::Impl {
         if (codec_ctx == nullptr) {
             return;  // 解码器创建失败，无法继续
         }
-        // 收到关键帧（码流内嵌 SPS/PPS）视为参数集就绪；
-        // 若解码器创建时已带 extradata（参数集消息），此标志已为 true
-        if (encoded.is_key_frame) {
-            decoder_initialized = true;
-        }
-
         // 分配解码/转存帧（解码器确定后尺寸已知，创建一次）
         if (decoded_frame == nullptr) {
             decoded_frame = av_frame_alloc();

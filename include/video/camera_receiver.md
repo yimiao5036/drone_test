@@ -70,6 +70,7 @@ class CameraReceiver final : public ICameraReceiver {
 | 现象 | 排查方向 |
 |------|----------|
 | 一直 `打开 RTSP 失败` | 地址/端口、`rtsp_transport` 是否与源匹配、`open_timeout` 是否过短、防火墙 |
+| `Server returned 404 Not Found` | RTSP 应用路径不对。**网络已通（能收到服务器 404 响应）**，是 URL 尾缀错误。需用摄像头实际提供的应用路径，本项目摄像头实测为 `/main.264`（见 `rtsp_yolo_stream.log` 成功记录）；`/main`、`/live` 均不可用。改 `config/config.json` 的 `video.input_rtsp` |
 | 频繁断流重连 | 网络抖动；`fflags=nobuffer` 会放大丢包，必要时调小 `reconnect_delay` 或加大缓冲 |
 | 摄像头不支持 RTSP | 替换实现类（保持 `ICameraReceiver` 接口），参考通信与数据定义 §11 厂商协议 |
 | 改重连策略 | `reconnect_delay`；如需退避（指数/上限）在 `ReceiveLoop` 中扩展 |

@@ -10,7 +10,7 @@
 `FrameHandle` 发布（零拷贝共享、最后引用归还内存池）：
 
 - 解码器优先 rkmpp 硬解（香橙派 DRM 路径），不可用时回退 FFmpeg 软解（开发机验证路径）。
-- 参数集就绪前跳过非关键帧（等关键帧同步），队列丢帧不破坏链路。
+- 解码器未创建前不丢弃任何包：首个数据帧（任意类型，含 IDR 前独立到达的 SPS/PPS 小包）创建解码器并送包，之后全量送包，由解码器自行完成参数集同步与关键帧等待（对齐原型 `videoPart/rtsp_yolo_stream`）。
 - 池满丢帧不阻塞（WARN 节流）。
 
 不做什么：不负责拉流（上游 `CameraReceiver`）；不负责色彩转换到 RGB（后续 YOLO 用 RGA 转）。
@@ -44,8 +44,11 @@ class VideoDecoder final : public IVideoDecoder {
 - **软解路径**：YUV420P → swscale 转 NV12；`sws_ctx` 按源格式缓存，格式变化时重建。
 - **参数集**：`EncodedFrame.parameter_sets` 写入 `codec_ctx->extradata`（RTSP 流级参数集）；
   无参数集时解码器从关键帧内嵌 SPS/PPS 解析。
-- **关键帧同步**：`decoder_initialized` 标志——extradata 就绪或收到关键帧后置位；
-  之前跳过非关键帧（避免用残缺参数集无效解码，等下一个关键帧恢复）。
+- **参数集与送包策略（关键）**：不再按“未初始化跳过非关键帧”。本款摄像头 RTSP 的
+  SPS/PPS 是 IDR 之前**独立到达的非关键帧小包**；旧逻辑丢弃它们导致 rkmpp 永远收不到
+  参数集，随后解析 IDR 报 `invalid pps` 并段错误。修正：解码器未创建时用首个数据帧
+  （任意类型）创建并一并送包，此后全量送包，由 rkmpp 自行完成参数同步与关键帧等待。
+  若容器头 `extradata` 非空，`CameraReceiver` 仍会先发参数集消息初始化解码器。
 - **内存池**：配置给分辨率则 `Start()` 预建池；否则首帧确定尺寸懒建池。
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
 - **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
@@ -75,7 +78,7 @@ cmake --build build && cd build && ctest -R VideoDecoder
 
 | 现象 | 排查方向 |
 |------|----------|
-| `non-existing PPS 0 referenced` | 参数集丢失：确认 `CameraReceiver` 发布了参数集消息、或码流关键帧内嵌 SPS/PPS；检查队列容量是否挤掉关键帧 |
+| `non-existing PPS 0 referenced` / `h265d: pps invalid` / 空参数集 | 参数集丢失。本款摄像头 SPS/PPS 为 IDR 前独立小包，旧逻辑按“跳过非关键帧”丢弃；已修正为全量送包。若再遇到先确认 `CameraReceiver` 的 extradata/参数集消息是否下发，再看队列容量是否挤包 |
 | 解码 0 帧但无错误 | 输入队列容量(8) < 突发帧数挤掉关键帧后无后续关键帧（GOP 过长）；调整队列容量或等关键帧机制确认 |
 | `DroppedFrameCount` 增长 | 池容量 < 输出订阅队列 + 在途；调大 `pool_capacity` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |
