@@ -36,8 +36,10 @@ class CameraReceiver final : public ICameraReceiver {
 ## 3. 关键实现点
 
 - **FFmpeg avformat**：`avformat_open_input` + `avformat_find_stream_info`，选项：
-  `rtsp_transport`（tcp/udp）、`fflags=nobuffer`、`probesize/analyzeduration` 限制探测时间、
-  `stimeout` 超时（微秒）。
+  `rtsp_transport`（tcp/udp）、`fflags=nobuffer+discardcorrupt`、`reorder_queue_size=0`
+  （禁用 RTP 重排，防 SPS/PPS 与 IDR 顺序打乱）、`max_delay=0`、`buffer_size=102400`、
+  `probesize/analyzeduration` 限制探测时间、`stimeout` 超时（微秒）。
+  以上选项与实测可稳定拉本摄像头 H265 流的原型 `videoPart/rtsp_yolo_stream` 一致。
 - **中断回调**：`format_ctx->interrupt_callback` 的 `opaque` 指向实现对象，回调检查停止标志；
   `Stop()` 置位后阻塞中的 `av_read_frame` 尽快返回（`AVERROR_EXIT`），保证确定性停机。
 - **断线重连**：`av_read_frame` 失败 → 关闭连接 → 等待 `reconnect_delay` → 重新 `OpenStream`。
