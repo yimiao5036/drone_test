@@ -35,14 +35,27 @@ struct MessageHeader {
     uint8_t frame_id = 0;          ///< 坐标系标识（空间数据），编码见文件头注释
 };
 
-/// H.265 码流块（摄像头采集 → 视频解码器）。
+/// 视频编码类型（码流块语义）。
+enum class VideoCodec : uint8_t {
+    kUnknown = 0,  ///< 未知编码
+    kH264,         ///< H.264 / AVC
+    kH265,         ///< H.265 / HEVC
+};
+
+/// H.265/H.264 码流块（摄像头采集 → 视频解码器）。
 /// 骨架期使用字节容器；大数据零拷贝优化在实现期按性能实测决定。
 struct EncodedFrame {
     MessageHeader header;
+    VideoCodec codec = VideoCodec::kUnknown;  ///< 编码类型
     uint32_t stream_sequence = 0;  ///< 码流序号（解码侧用于乱序/丢包检测）
     uint64_t capture_time_ms = 0;  ///< 摄像头时间；不可用时为 0（不得伪造）
     bool is_key_frame = false;     ///< 是否关键帧（I 帧）
-    std::vector<uint8_t> data;     ///< 码流字节（含帧边界，分包处理见实现协议）
+    /// 流级参数集（H.264 SPS/PPS 或 H.265 VPS/SPS/PPS，annexb 或 avcC/hvcC
+    /// 原始字节）。RTSP/容器流的参数集在流级（SDP/容器头）而非逐帧码流中，
+    /// 由 CameraReceiver 在连接建立后单独发布一条仅含参数集的消息（data 为空）；
+    /// 裸码流无独立参数集时留空，解码器从关键帧内嵌参数集解析。
+    std::vector<uint8_t> parameter_sets;
+    std::vector<uint8_t> data;     ///< 码流字节（一个可送入解码器的访问单元，含帧边界）
 };
 
 /// 检测结果（YOLO → 感知融合 / 目标估计）。

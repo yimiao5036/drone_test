@@ -19,36 +19,76 @@ set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/spdlog)
 
-# ---- video 模块（帧句柄、内存池、摄像头接收、解码接口） ----
+# FFmpeg（RTSP 拉流与 H.264/H.265 解码；香橙派需安装 ffmpeg-rockchip 开发包）
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+
+# ---- video 模块（帧句柄、内存池、摄像头接收、解码、叠加） ----
 add_library(drone_video STATIC
     src/video/video_frame_pool.cpp
     src/video/camera_receiver.cpp
-    src/video/video_decoder.cpp)
+    src/video/camera_receiver_stub.cpp
+    src/video/video_decoder.cpp
+    src/video/video_decoder_stub.cpp
+    src/video/frame_compositor.cpp)
 target_include_directories(drone_video PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video PUBLIC cxx_std_17)
-# 关键路径日志使用 spdlog（视频池与骨架占位内部打印，不向使用者暴露）
-target_link_libraries(drone_video PRIVATE spdlog::spdlog)
+# 关键路径日志使用 spdlog；FFmpeg 依赖仅实现内部使用（PIMPL 不泄漏到头文件）
+target_link_libraries(drone_video PRIVATE spdlog::spdlog PkgConfig::FFMPEG)
 
-# ---- video_transmission 模块（图传发送接口） ----
+# ---- video_transmission 模块（图传发送接口 + 编码后端） ----
 add_library(drone_video_transmission STATIC
-    src/video_transmission/video_sender.cpp)
+    src/video_transmission/video_sender.cpp
+    src/video_transmission/video_encoder.cpp)
 target_include_directories(drone_video_transmission PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video_transmission PUBLIC cxx_std_17)
+# 编码后端内部使用 FFmpeg（PIMPL 不泄漏到头文件），故链接到 drone_perception 同级
+# 此处链接 FFMPEG 到 transmission（编码器内部用），头文件不依赖 FFmpeg。
 target_link_libraries(drone_video_transmission PRIVATE spdlog::spdlog)
+# 编码后端内部使用 FFmpeg（PIMPL 不泄漏到头文件）。静态库符号需在最终链接传播，
+# 故 FFMPEG 设为 PUBLIC，使下游可执行文件（测试/主程序）能解析编码器符号。
+target_link_libraries(drone_video_transmission PUBLIC PkgConfig::FFMPEG)
 
 # ---- perception 模块（YOLO、光流、激光雷达、融合、目标估计接口） ----
-add_library(drone_perception STATIC
+# RKNN 推理后端（香橙派专用）：DRONE_HAVE_RKNN=ON 时编译 rknn_detection_backend.cpp
+option(DRONE_HAVE_RKNN "启用 RKNN 推理后端（需香橙派 RKNN runtime 与 RGA）" OFF)
+set(DRONE_RKNN_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn/include" CACHE PATH "RKNN API 头文件目录（含 rknn_api.h）")
+set(DRONE_RGA_DIR "/usr/include/rga" CACHE PATH "RGA 头文件目录（含 rga.h / im2d.hpp）")
+
+set(PERCEPTION_SOURCES
     src/perception/yolo_detector.cpp
+    src/perception/yolo_detector_stub.cpp
+    src/perception/yolo_postprocess.cpp
     src/perception/optical_flow_estimator.cpp
     src/perception/laser_range_finder.cpp
     src/perception/perception_fusion.cpp
     src/perception/target_estimator.cpp)
+if(DRONE_HAVE_RKNN)
+    find_library(DRONE_RKNN_LIBRARY NAMES rknnrt)
+    if(NOT DRONE_RKNN_LIBRARY)
+        message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librknnrt.so（香橙派需安装 RKNN runtime）")
+    endif()
+    find_library(DRONE_RGA_LIBRARY NAMES rga)
+    if(NOT DRONE_RGA_LIBRARY)
+        message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librga.so（香橙派需安装 librga）")
+    endif()
+    list(APPEND PERCEPTION_SOURCES src/perception/rknn_detection_backend.cpp)
+endif()
+
+add_library(drone_perception STATIC ${PERCEPTION_SOURCES})
 target_include_directories(drone_perception PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_perception PUBLIC cxx_std_17)
 target_link_libraries(drone_perception PRIVATE spdlog::spdlog)
+if(DRONE_HAVE_RKNN)
+    target_compile_definitions(drone_perception PRIVATE DRONE_HAVE_RKNN=1)
+    target_include_directories(drone_perception PRIVATE
+        ${DRONE_RKNN_API_DIR} ${DRONE_RGA_DIR})
+    target_link_libraries(drone_perception PRIVATE
+        ${DRONE_RKNN_LIBRARY} ${DRONE_RGA_LIBRARY})
+endif()
 
 # ---- communication 模块（串口封装、PX4/地面站链路接口） ----
 add_library(drone_communication STATIC
@@ -87,7 +127,15 @@ target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
-target_link_libraries(drone_control PRIVATE drone_common drone_video spdlog::spdlog)
+# 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
+# drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
+target_link_libraries(drone_control PRIVATE
+    drone_common
+    drone_video
+    drone_perception
+    drone_video_transmission
+    spdlog::spdlog
+    PkgConfig::FFMPEG)
 
 if(MSVC)
     target_compile_options(drone_control PRIVATE /W4 /permissive-)
@@ -132,6 +180,19 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(video_frame_pool_test)
 
+        # 解码器软解测试：用 libx264 编码测试码流，验证 VideoDecoder 输出 NV12 帧
+        add_executable(video_decoder_test tests/video/video_decoder_test.cpp)
+        target_link_libraries(video_decoder_test PRIVATE
+            drone_common drone_video GTest::gtest_main PkgConfig::FFMPEG)
+        if(MSVC)
+            target_compile_options(video_decoder_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(video_decoder_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(video_decoder_test)
+
         # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
         add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)
         target_link_libraries(stub_smoke_test PRIVATE
@@ -153,6 +214,72 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
+        add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)
+        target_link_libraries(yolo_postprocess_test PRIVATE
+            drone_common drone_perception GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(yolo_postprocess_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(yolo_postprocess_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(yolo_postprocess_test)
+
+        # YOLO 检测器测试：注入 Mock 后端验证线程/发布/统计（不依赖硬件）
+        add_executable(yolo_detector_test tests/perception/yolo_detector_test.cpp)
+        target_link_libraries(yolo_detector_test PRIVATE
+            drone_common drone_video drone_perception GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(yolo_detector_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(yolo_detector_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(yolo_detector_test)
+
+        # 叠加器测试：验证 NV12 帧 + 检测 → 标注帧（不依赖硬件）
+        add_executable(frame_compositor_test tests/video/frame_compositor_test.cpp)
+        target_link_libraries(frame_compositor_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(frame_compositor_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(frame_compositor_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(frame_compositor_test)
+
+        # 图传发送器测试：注入 Mock 编码后端验证线程/计数（不依赖真实 RTSP）
+        add_executable(video_sender_test tests/video_transmission/video_sender_test.cpp)
+        target_link_libraries(video_sender_test PRIVATE
+            drone_common drone_video drone_video_transmission GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(video_sender_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(video_sender_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(video_sender_test)
+
+        # 编码后端开发机集成验证：软件编码 NV12→本地 MPEG-TS 文件
+        add_executable(video_encoder_integration_test
+            tests/video_transmission/video_encoder_integration_test.cpp)
+        target_link_libraries(video_encoder_integration_test PRIVATE
+            drone_common drone_video drone_video_transmission GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(video_encoder_integration_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(video_encoder_integration_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(video_encoder_integration_test)
     else()
         message(STATUS "GoogleTest not found; topic tests will not be built")
     endif()
