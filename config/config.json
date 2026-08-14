@@ -10,7 +10,7 @@
     },
     "video": {
         "input_rtsp": "rtsp://192.168.144.25:8554/live",
-        "output_rtsp": "rtsp://192.168.144.202:8554/drone_out",
+        "output_rtsp": "rtsp://192.168.144.26:8554/drone_out",
         "width": 1920,
         "height": 1080,
         "fps": 25,
