@@ -45,10 +45,13 @@ class VideoDecoder final : public IVideoDecoder {
 - **参数集**：`EncodedFrame.parameter_sets` 写入 `codec_ctx->extradata`（RTSP 流级参数集）；
   无参数集时解码器从关键帧内嵌 SPS/PPS 解析。
 - **参数集与送包策略（关键）**：不再按“未初始化跳过非关键帧”。本款摄像头 RTSP 的
-  SPS/PPS 是 IDR 之前**独立到达的非关键帧小包**；旧逻辑丢弃它们导致 rkmpp 永远收不到
-  参数集，随后解析 IDR 报 `invalid pps` 并段错误。修正：解码器未创建时用首个数据帧
-  （任意类型）创建并一并送包，此后全量送包，由 rkmpp 自行完成参数同步与关键帧等待。
-  若容器头 `extradata` 非空，`CameraReceiver` 仍会先发参数集消息初始化解码器。
+  SPS/PPS 是 IDR 之前独立到达的非关键帧小包；旧逻辑丢弃它们导致 rkmpp 收不到参数。
+  修正：解码器未创建时用首个数据帧（任意类型）创建并一并送包，此后全量送包。
+- **HEVC extradata 陷阱（关键，验证为本相机崩溃根因）**：容器头 `extradata` 对 HEVC 是
+  `HEVCDecoderConfigurationRecord`（MP4 格式），**不能整块塞给 rkmpp 硬解**（rkmpp
+  按 Annex-B 解析，直接段错误 `invalid pps`）。修复：硬解一律不塞容器 extradata，交给
+  rkmpp 从码流内嵌 SPS/PPS 自行解析（对齐实测成功的原型）；只有软解才写 extradata。
+  本相机实测：H.265/HEVC Main、1280x720、25fps、LIVE555 RTSP（ffprobe 确认）。
 - **内存池**：配置给分辨率则 `Start()` 预建池；否则首帧确定尺寸懒建池。
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
 - **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
@@ -78,7 +81,7 @@ cmake --build build && cd build && ctest -R VideoDecoder
 
 | 现象 | 排查方向 |
 |------|----------|
-| `non-existing PPS 0 referenced` / `h265d: pps invalid` / 空参数集 | 参数集丢失。本款摄像头 SPS/PPS 为 IDR 前独立小包，旧逻辑按“跳过非关键帧”丢弃；已修正为全量送包。若再遇到先确认 `CameraReceiver` 的 extradata/参数集消息是否下发，再看队列容量是否挤包 |
+| `non-existing PPS 0` / `h265d: pps invalid` / 段错误 | ① 若是 HEVC：容器 extradata 是 MP4 record，勿塞给 rkmpp（已修复为硬解不塞 extradata）。② 若 SPS/PPS 为 IDR 前独立小包：勿按“未初始化跳过非关键帧”（已修复为全量送包）。③ 确认 `CameraReceiver` 能读到参数、队列够大 |
 | 解码 0 帧但无错误 | 输入队列容量(8) < 突发帧数挤掉关键帧后无后续关键帧（GOP 过长）；调整队列容量或等关键帧机制确认 |
 | `DroppedFrameCount` 增长 | 池容量 < 输出订阅队列 + 在途；调大 `pool_capacity` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |

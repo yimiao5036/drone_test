@@ -182,8 +182,16 @@ struct VideoDecoder::Impl {
         }
         codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
-        // 流级参数集（SPS/PPS 等）：RTSP/容器流在流头而非逐帧码流中
-        if (!parameter_sets.empty()) {
+        // 流级参数集（SPS/PPS 等）：RTSP/容器流在流头而非逐帧码流中。
+        // 重要（对齐已验证成功的原型 videoPart/rtsp_yolo_stream）：
+        // - HEVC（本相机）的容器 extradata 是 HEVCDecoderConfigurationRecord
+        //   （MP4 格式），而非 Annex-B NALU 序列。整块塞给 rkmpp 硬解当作参数
+        //   集是错误的，会导致 rkmpp 一打开就对码流报 `invalid pps id 0` 并段错误。
+        // - 正确做法：硬解交给 rkmpp 从码流内嵌的 SPS/PPS 自行解析（LIVE555 的
+        //   RTP 流内嵌参数，原型实测可行），不塞容器 extradata。
+        // - 软解（libx264/hevc 等）接受 mp4 config 格式 extradata，保留塞入以
+        //   支持“容器头带参数”的流（H264 容器 extradata 是 Annex-B，也可用）。
+        if (!is_hardware && !parameter_sets.empty()) {
             codec_ctx->extradata = static_cast<uint8_t*>(
                 av_mallocz(parameter_sets.size() + AV_INPUT_BUFFER_PADDING_SIZE));
             if (codec_ctx->extradata == nullptr) {
