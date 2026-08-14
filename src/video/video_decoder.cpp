@@ -378,9 +378,10 @@ struct VideoDecoder::Impl {
 
     /// 将解码帧转为 NV12 写入内存池并发布。
     void PublishFrame(AVFrame* source) {
-        // 硬解帧：从 DRM 显存转存到系统内存（输出 NV12）
+        // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
         AVFrame* frame = source;
-        if (source->format == AV_PIX_FMT_DRM_PRIME) {
+        if (source->format == AV_PIX_FMT_DRM_PRIME ||
+            source->hw_frames_ctx != nullptr) {
             av_frame_unref(sw_frame);
             if (av_hwframe_transfer_data(sw_frame, source, 0) < 0) {
                 ++error_count;
@@ -423,37 +424,70 @@ struct VideoDecoder::Impl {
 
         const VideoFrameInfo& info = handle.Info();
         std::byte* dst = handle.Data();
+        const int dst_stride = static_cast<int>(info.hor_stride);
 
-        // 目标 NV12（Y 平面 + UV 半平面），swscale 按行写入
-        const int y_bytes =
-            static_cast<int>(info.hor_stride) * static_cast<int>(info.height);
-        uint8_t* dst_planes[2] = {reinterpret_cast<uint8_t*>(dst),
-                                  reinterpret_cast<uint8_t*>(dst) + y_bytes};
-        int dst_linesize[2] = {static_cast<int>(info.hor_stride),
-                               static_cast<int>(info.hor_stride)};
-
-        // 源格式变化时重建转换上下文（软解 YUV420P→NV12；硬解 NV12→NV12）
-        if (sws_ctx == nullptr || sws_src_format != frame->format) {
-            if (sws_ctx != nullptr) {
-                sws_freeContext(sws_ctx);
-            }
-            sws_ctx = sws_getContext(width, height,
-                                     static_cast<AVPixelFormat>(frame->format),
-                                     width, height, AV_PIX_FMT_NV12,
-                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-            sws_src_format = frame->format;
-            if (sws_ctx == nullptr) {
+        // 目标 NV12（Y 平面 + UV 半平面）。
+        // 硬解（rkmpp）输出为 NV12，直接按源 linesize 逐行 memcpy，不经过
+        // sws_scale（sws_scale 在部分源码 linesize/UV 指针组合下会踩内存段错误，
+        // 且 NV12→NV12 同形时是纯拷贝，无缩放）。
+        // 仅软解（YUV420P）需要 sws_scale 转 NV12。
+        if (frame->format == AV_PIX_FMT_NV12) {
+            if (frame->data[0] == nullptr || frame->data[1] == nullptr) {
                 ++error_count;
                 if (ShouldLogThrottled(error_count)) {
-                    SPDLOG_ERROR("视频解码器创建 sws 转换上下文失败(源格式={})，累计 {}",
-                                 frame->format, error_count.load());
+                    SPDLOG_ERROR("视频解码器 NV12 帧数据指针为空，累计 {}",
+                                 error_count.load());
                 }
                 return;
             }
-        }
+            const int src_stride_v = frame->linesize[0];
+            const uint8_t* src_y = frame->data[0];
+            uint8_t* dst_y = reinterpret_cast<uint8_t*>(dst);
+            for (int row = 0; row < height; ++row) {
+                std::memcpy(dst_y + static_cast<size_t>(row) * dst_stride,
+                            src_y + static_cast<size_t>(row) * src_stride_v,
+                            static_cast<size_t>(width));
+            }
+            // UV 半平面：高度 h/2 行，每行 2 字节/像素
+            const int src_stride_uv = frame->linesize[1];
+            const uint8_t* src_uv = frame->data[1];
+            uint8_t* dst_uv =
+                reinterpret_cast<uint8_t*>(dst) +
+                static_cast<size_t>(dst_stride) * height;
+            for (int row = 0; row < height / 2; ++row) {
+                std::memcpy(dst_uv + static_cast<size_t>(row) * dst_stride,
+                            src_uv + static_cast<size_t>(row) * src_stride_uv,
+                            static_cast<size_t>(width));
+            }
+        } else {
+            // 软解 YUV420P → NV12 经 sws_scale。
+            uint8_t* dst_planes[2] = {reinterpret_cast<uint8_t*>(dst),
+                                      reinterpret_cast<uint8_t*>(dst) +
+                                          static_cast<size_t>(dst_stride) * height};
+            int dst_linesize[2] = {dst_stride, dst_stride};
 
-        sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
-                  dst_planes, dst_linesize);
+            if (sws_ctx == nullptr || sws_src_format != frame->format) {
+                if (sws_ctx != nullptr) {
+                    sws_freeContext(sws_ctx);
+                }
+                sws_ctx = sws_getContext(width, height,
+                                         static_cast<AVPixelFormat>(frame->format),
+                                         width, height, AV_PIX_FMT_NV12,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+                sws_src_format = frame->format;
+                if (sws_ctx == nullptr) {
+                    ++error_count;
+                    if (ShouldLogThrottled(error_count)) {
+                        SPDLOG_ERROR("视频解码器创建 sws 转换上下文失败(源格式={})，累计 {}",
+                                     frame->format, error_count.load());
+                    }
+                    return;
+                }
+            }
+
+            sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
+                      dst_planes, dst_linesize);
+        }
 
         (void)frame_output.Emplace(std::move(handle));
         ++decoded_count;

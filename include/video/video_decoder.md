@@ -47,11 +47,17 @@ class VideoDecoder final : public IVideoDecoder {
 - **参数集与送包策略（关键）**：不再按“未初始化跳过非关键帧”。本款摄像头 RTSP 的
   SPS/PPS 是 IDR 之前独立到达的非关键帧小包；旧逻辑丢弃它们导致 rkmpp 收不到参数。
   修正：解码器未创建时用首个数据帧（任意类型）创建并一并送包，此后全量送包。
-- **HEVC extradata 陷阱（关键，验证为本相机崩溃根因）**：容器头 `extradata` 对 HEVC 是
-  `HEVCDecoderConfigurationRecord`（MP4 格式），**不能整块塞给 rkmpp 硬解**（rkmpp
-  按 Annex-B 解析，直接段错误 `invalid pps`）。修复：硬解一律不塞容器 extradata，交给
-  rkmpp 从码流内嵌 SPS/PPS 自行解析（对齐实测成功的原型）；只有软解才写 extradata。
-  本相机实测：H.265/HEVC Main、1280x720、25fps、LIVE555 RTSP（ffprobe 确认）。
+- **HEVC extradata 陷阱**：容器头 `extradata` 对 HEVC 是 `HEVCDecoderConfigurationRecord`
+  （MP4 格式），不能整块塞给 rkmpp 硬解；硬解交给 rkmpp 从码流内嵌 SPS/PPS 自行解析
+  （对齐实测成功的原型）；软解才写 extradata。
+- **输出转存（关键，本机段错误根因）**：rkmpp 硬解输出为 **NV12**（实测 ffmpeg:
+  `wrapped_avframe nv12`）。旧实现用 `sws_scale` 做 NV12→NV12 纯拷贝时，在部分
+  linesize/UV 指针组合下踩内存 → `SIGSEGV`（gdb 回栈定位在 `PublishFrame → sws_scale`、
+  解码线程）。修复：**NV12 帧不走 sws**，直接按 `frame->linesize` 源 stride 逐行 `memcpy`
+  Y/UV 平面到内存池；仅软解 YUV420P 才用 `sws_scale` 转 NV12。硬解识别条件兼看
+  `hw_frames_ctx`。
+- **本相机实测**：H.265/HEVC Main、1280x720、25fps、LIVE555 RTSP；`ffprobe` 确认；
+  rkmpp 硬解经实验确认可正常出帧。
 - **内存池**：配置给分辨率则 `Start()` 预建池；否则首帧确定尺寸懒建池。
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
 - **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
@@ -81,7 +87,7 @@ cmake --build build && cd build && ctest -R VideoDecoder
 
 | 现象 | 排查方向 |
 |------|----------|
-| `non-existing PPS 0` / `h265d: pps invalid` / 段错误 | ① 若是 HEVC：容器 extradata 是 MP4 record，勿塞给 rkmpp（已修复为硬解不塞 extradata）。② 若 SPS/PPS 为 IDR 前独立小包：勿按“未初始化跳过非关键帧”（已修复为全量送包）。③ 确认 `CameraReceiver` 能读到参数、队列够大 |
+| `non-existing PPS 0` / `h265d: pps invalid`（段错误） | ① 若 SPS/PPS 为 IDR 前独立小包：勿按“未初始化跳过非关键帧”（已修复为全量送包）。② HEVC 容器 extradata 勿塞给 rkmpp（已修复）。③ 若已能出帧仍段错误：为输出转存内存问题；纯 NV12 拷贝不再走 sws（已修复），确认源 linesize 与池 stride 匹配 |
 | 解码 0 帧但无错误 | 输入队列容量(8) < 突发帧数挤掉关键帧后无后续关键帧（GOP 过长）；调整队列容量或等关键帧机制确认 |
 | `DroppedFrameCount` 增长 | 池容量 < 输出订阅队列 + 在途；调大 `pool_capacity` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |
