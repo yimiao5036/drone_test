@@ -13,22 +13,12 @@
 #include <nlohmann/json.hpp>
 
 #include "common/logger.h"
-#include "common/topic.h"
-#include "common/types.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
 #include "video/video_decoder.h"
-#include "video/video_frame.h"
 #include "perception/yolo_detector.h"
 #include "video_transmission/video_sender.h"
 #include "perception/detection_backend.h"  // IDetectionBackend 完整类型（YoloDetector 析构）
-
-// 全局视频链路主题（跨模块共享，线程间解耦通信）。
-// 名称对应 common::topics::kCameraStream / kDecodedFrame / kDetection / kAnnotatedFrame。
-drone::common::Topic<drone::common::EncodedFrame> g_camera_stream_topic;   // ICameraReceiver → IVideoDecoder
-drone::common::Topic<drone::video::FrameHandle> g_decoded_frame_topic;      // IVideoDecoder → YOLO/叠加
-drone::common::Topic<drone::common::DetectionResult> g_detection_topic;     // IYoloDetector → 叠加
-drone::common::Topic<drone::video::FrameHandle> g_annotated_topic;          // 叠加 → 图传
 
 namespace {
 
@@ -191,12 +181,12 @@ int main() {
     auto sender = std::make_unique<drone::video_transmission::VideoSender>(
         std::move(sender_cfg));
 
-    // 5. 接线（Topic 依赖注入）
+    // 5. 接线（直接订阅各部件真实输出 Topic，避免装配到无生产者的孤立 Topic）
     decoder->SetInput(camera->StreamOutput());
-    detector->SetInput(g_decoded_frame_topic);
-    compositor->SetDecodedInput(g_decoded_frame_topic);
-    compositor->SetDetectionInput(g_detection_topic);
-    sender->SetInput(g_annotated_topic);
+    detector->SetInput(decoder->FrameOutput());
+    compositor->SetDecodedInput(decoder->FrameOutput());
+    compositor->SetDetectionInput(detector->DetectionOutput());
+    sender->SetInput(compositor->AnnotatedOutput());
 
     // 6. 注册 Ctrl+C / SIGTERM 停机
     std::signal(SIGINT, OnSignal);
