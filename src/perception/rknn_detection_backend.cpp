@@ -158,6 +158,7 @@ struct RknnDetectionBackend::Impl {
     rknn_input_output_num io_num_{};
     int model_width_ = 0;    ///< 模型输入宽（像素）
     int model_height_ = 0;   ///< 模型输入高（像素）
+    int model_channel_ = 0;  ///< 模型输入通道数
     int num_classes_ = 0;    ///< 类别数（score 张量通道数）
     int outputs_per_branch_ = 0;  ///< 每分支输出数（2 或 3，含 score_sum）
 

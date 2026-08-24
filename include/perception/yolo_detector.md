@@ -98,7 +98,9 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   停机后停止消费、停止后重启。
 - **香橙派实机**：`cmake -S . -B build -DDRONE_HAVE_RKNN=ON
   -DDRONE_RKNN_API_DIR=<rknn头目录> -DDRONE_RGA_DIR=/usr/include/rga`，需安装
-  librknnrt（RKNN runtime）与 librga；验证 RGA 预处理色彩/裁剪、3 核推理耗时
+  librknnrt（RKNN runtime）与 librga；验证 RGA 预处理色彩/裁剪、3 核推理耗时。
+  2026-08-24 实机首次启用条件编译时修复 `RknnDetectionBackend::Impl` 缺失
+  `model_channel_` 成员导致的编译错误；该成员用于记录 NCHW/NHWC 输入通道数并输出模型信息
   （原型实测约 53ms/帧）、检测框与实拍目标对齐、断流重连分辨率变化。
 
 ## 排查/修改要点
