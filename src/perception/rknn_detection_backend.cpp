@@ -229,6 +229,20 @@ struct RknnDetectionBackend::Impl {
             }
         }
 
+        // 打印全部输出张量形状（一次性，用于核对模型导出格式：
+        // 非 end2end 应为 6 个 [1,4,H,W]/[1,C,H,W]；end2end 通常为 [1,N,6/7]）。
+        for (uint32_t i = 0; i < io_num_.n_output; ++i) {
+            std::string dims_str;
+            for (uint32_t d = 0; d < output_attrs_[i].n_dims; ++d) {
+                if (d > 0) {
+                    dims_str += "x";
+                }
+                dims_str += std::to_string(output_attrs_[i].dims[d]);
+            }
+            SPDLOG_INFO("RKNN 输出[{}]: 形状={} 布局={}", i, dims_str,
+                        static_cast<int>(output_attrs_[i].fmt));
+        }
+
         // 解析模型输入尺寸（NCHW 或 NHWC）
         if (input_attrs_[0].fmt == RKNN_TENSOR_NCHW) {
             model_channel_ = static_cast<int>(input_attrs_[0].dims[1]);

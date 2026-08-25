@@ -113,6 +113,11 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   香橙派检查 CMake 是否 `DRONE_HAVE_RKNN=ON`、模型路径是否存在。
 - **启动失败"后端加载失败"**：模型文件不可读、RKNN 驱动未加载（`dmesg` 查 rknpu）、
   SRAM 初始化失败（尝试去掉 `RKNN_FLAG_ENABLE_SRAM`）。
+- **模型输出结构不匹配**：日志 `输出=N 类别数=C` 与模型实际导出一致性需核对。仓库
+  `models/yolo26n_int8.rknn` 实测 `n_output=1`、`dims[1]=4`，与原型文档描述的
+  "6 输出（3 分支×box+score）非 end2end"不一致；`QueryModelInfo` 已增加输出张量
+  形状日志（`RKNN 输出[i]: 形状=...`），实机重新编译运行后依据真实维度决定后处理
+  适配 end2end 单输出还是合并输出。
 - **检测结果坐标错位**：先核对 letterbox 参数（`x_pad/y_pad/scale`）与后处理逆变换
   一致性；再核对裁剪偏移叠加；用单目标单色场景在香橙派打点验证。
 - **推理耗时异常**：确认 3 核上下文与 `RKNN_NPU_CORE_ALL`；检查是否误用
