@@ -52,8 +52,16 @@ target_link_libraries(drone_video_transmission PRIVATE spdlog::spdlog)
 target_link_libraries(drone_video_transmission PUBLIC PkgConfig::FFMPEG)
 
 # ---- perception 模块（YOLO、光流、激光雷达、融合、目标估计接口） ----
-# RKNN 推理后端（香橙派专用）：DRONE_HAVE_RKNN=ON 时编译 rknn_detection_backend.cpp
-option(DRONE_HAVE_RKNN "启用 RKNN 推理后端（需香橙派 RKNN runtime 与 RGA）" OFF)
+# RKNN 推理后端（香橙派专用）：ARM64 原生构建默认开启，x86_64 开发机构建默认关闭。
+# 已有 build/CMakeCache.txt 会保留旧值；需重新选择时使用
+# cmake -S . -B build -U DRONE_HAVE_RKNN，或显式传入 -DDRONE_HAVE_RKNN=ON/OFF。
+set(DRONE_HAVE_RKNN_DEFAULT OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(DRONE_HAVE_RKNN_DEFAULT ON)
+endif()
+option(DRONE_HAVE_RKNN "启用 RKNN 推理后端（需香橙派 RKNN runtime 与 RGA）"
+       ${DRONE_HAVE_RKNN_DEFAULT})
+message(STATUS "RKNN 推理后端: ${DRONE_HAVE_RKNN}（目标架构=${CMAKE_SYSTEM_PROCESSOR}）")
 set(DRONE_RKNN_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn/include" CACHE PATH "RKNN API 头文件目录（含 rknn_api.h）")
 set(DRONE_RGA_DIR "/usr/include/rga" CACHE PATH "RGA 头文件目录（含 rga.h / im2d.hpp）")
 
@@ -127,6 +135,14 @@ target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
+
+# 编译后复制模型到可执行文件旁，匹配 main.cpp 按 /proc/self/exe 解析 models/ 的约定。
+add_custom_command(TARGET drone_control POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/models"
+            "${CMAKE_BINARY_DIR}/models"
+    COMMENT "复制 models/ 到构建目录"
+    VERBATIM)
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE

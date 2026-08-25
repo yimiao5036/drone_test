@@ -96,9 +96,13 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   同类别 NMS 抑制、异类保留、letterbox 逆变换坐标；`yolo_detector_test` 验证
   Start/Stop 幂等、无后端失败、检测字段完整、帧序号关联、后端故障恢复、无效帧跳过、
   停机后停止消费、停止后重启。
-- **香橙派实机**：`cmake -S . -B build -DDRONE_HAVE_RKNN=ON
-  -DDRONE_RKNN_API_DIR=<rknn头目录> -DDRONE_RGA_DIR=/usr/include/rga`，需安装
-  librknnrt（RKNN runtime）与 librga；验证 RGA 预处理色彩/裁剪、3 核推理耗时。
+- **香橙派实机**：CMake 在目标架构为 `aarch64/arm64` 时默认开启 `DRONE_HAVE_RKNN`；
+  x86_64 开发机默认关闭。已有 `build/CMakeCache.txt` 会保留旧值，香橙派首次切换可执行
+  `cmake -S . -B build -U DRONE_HAVE_RKNN` 让架构默认值重新生效，或显式执行
+  `cmake -S . -B build -DDRONE_HAVE_RKNN=ON
+  -DDRONE_RKNN_API_DIR=<rknn头目录> -DDRONE_RGA_DIR=/usr/include/rga`。需安装
+  librknnrt（RKNN runtime）与 librga；构建 `drone_control` 后 CMake 自动把仓库 `models/`
+  复制到 `build/models/`，再验证 RGA 预处理色彩/裁剪、3 核推理耗时。
   2026-08-24 实机首次启用条件编译时修复 `RknnDetectionBackend::Impl` 缺失
   `model_channel_` 成员导致的编译错误；该成员用于记录 NCHW/NHWC 输入通道数并输出模型信息
   （原型实测约 53ms/帧）、检测框与实拍目标对齐、断流重连分辨率变化。

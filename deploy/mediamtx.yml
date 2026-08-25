@@ -15,13 +15,15 @@ logDestinations: [stdout]
 # RTSP 服务端口
 rtsp: true
 rtspAddress: :8554
-rtspTransports: [udp, tcp]
+# HM30/QGC 实测 UDP RTP 会花屏或无画面，固定使用 RTSP interleaved TCP
+rtspTransports: [tcp]
 
-# 关闭不需要的服务（HLS/WebRTC/SRT 等按需开启）
+# 关闭不需要的服务（HLS/WebRTC/SRT/MoQ 等按需开启）
 rtmp: false
 hls: false
 webrtc: false
 srt: false
+moq: false
 
 paths:
   # 香橙派程序推流的目标路径（对应 config.json 的 video.output_rtsp 尾部 /drone_out）
