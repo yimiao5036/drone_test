@@ -4,9 +4,12 @@
         "level": "info"
     },
     "yolo": {
-        "model_path": "models/yolo26n_int8.rknn",
+        "model_path": "models/yolo26n-int8.rknn",
         "conf_threshold": 0.25,
-        "nms_threshold": 0.45
+        "nms_threshold": 0.45,
+        "class_names": [
+            "BALLOON"
+        ]
     },
     "video": {
         "input_rtsp": "rtsp://192.168.144.25:8554/main.264",

@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/types.h>  // ssize_t
 #include <unistd.h>     // readlink
@@ -137,11 +138,34 @@ int main() {
     }
     const float conf_threshold = yolo_cfg.value("conf_threshold", 0.25f);
     const float nms_threshold = yolo_cfg.value("nms_threshold", 0.45f);
+    std::vector<std::string> class_names{"UAV", "OBS"};
+    const auto class_names_it = yolo_cfg.find("class_names");
+    if (class_names_it != yolo_cfg.end()) {
+        if (class_names_it->is_array()) {
+            std::vector<std::string> configured_names;
+            configured_names.reserve(class_names_it->size());
+            bool valid = true;
+            for (const auto& item : *class_names_it) {
+                if (!item.is_string()) {
+                    valid = false;
+                    break;
+                }
+                configured_names.push_back(item.get<std::string>());
+            }
+            if (valid && !configured_names.empty()) {
+                class_names = std::move(configured_names);
+            } else {
+                SPDLOG_WARN("YOLO class_names 必须是非空字符串数组，使用默认类别名称");
+            }
+        } else {
+            SPDLOG_WARN("YOLO class_names 不是数组，使用默认类别名称");
+        }
+    }
 
     SPDLOG_INFO("视频链路配置: 输入={} 输出={} 帧率={} 码率={}", input_url, output_url,
                 fps, bitrate);
-    SPDLOG_INFO("YOLO 配置: 模型={} conf={} nms={}", model_path, conf_threshold,
-                nms_threshold);
+    SPDLOG_INFO("YOLO 配置: 模型={} conf={} nms={} 类别名称数={}", model_path,
+                conf_threshold, nms_threshold, class_names.size());
 
     // 4. 装配视频链路（依赖注入绑定输入、输出主题）
     //    摄像头拉流 → 解码 → YOLO 识别 → 叠加 → 编码推流
@@ -167,6 +191,7 @@ int main() {
     drone::video::CompositorConfig compose_cfg;
     compose_cfg.pool_capacity = 8;
     compose_cfg.draw_text = true;
+    compose_cfg.class_names = class_names;
     auto compositor = std::make_unique<drone::video::FrameCompositor>(compose_cfg);
 
     drone::video_transmission::VideoSenderConfig sender_cfg;

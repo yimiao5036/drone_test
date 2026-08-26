@@ -210,6 +210,96 @@ int Nms(int valid_count, const std::vector<float>& boxes_xywh,
     return 0;
 }
 
+int PostProcessNormalizedXywh(const NormalizedXywhTensor& tensor,
+                              int model_width, int model_height,
+                              float conf_threshold, float nms_threshold,
+                              int class_id, const LetterBox& letterbox,
+                              std::vector<YoloDetection>* out) {
+    if (tensor.data == nullptr || tensor.channels != 5 ||
+        tensor.candidate_count <= 0 || tensor.scale <= 0.f ||
+        model_width <= 0 || model_height <= 0 || letterbox.scale <= 0.f) {
+        return 0;
+    }
+
+    std::vector<float> boxes_xywh;
+    std::vector<float> scores;
+    std::vector<int> class_ids;
+    boxes_xywh.reserve(kMaxPostProcessResults * 4);
+    scores.reserve(kMaxPostProcessResults);
+    class_ids.reserve(kMaxPostProcessResults);
+
+    const int candidates = tensor.candidate_count;
+    for (int i = 0; i < candidates; ++i) {
+        const float score = DequantToF32(tensor.data[4 * candidates + i],
+                                         tensor.zp, tensor.scale);
+        if (score < conf_threshold) {
+            continue;
+        }
+
+        const float center_x = DequantToF32(tensor.data[i], tensor.zp,
+                                            tensor.scale) * model_width;
+        const float center_y = DequantToF32(tensor.data[candidates + i], tensor.zp,
+                                            tensor.scale) * model_height;
+        const float width = DequantToF32(tensor.data[2 * candidates + i], tensor.zp,
+                                         tensor.scale) * model_width;
+        const float height = DequantToF32(tensor.data[3 * candidates + i], tensor.zp,
+                                          tensor.scale) * model_height;
+        if (width <= 0.f || height <= 0.f) {
+            continue;
+        }
+
+        boxes_xywh.push_back(center_x - width * 0.5f);
+        boxes_xywh.push_back(center_y - height * 0.5f);
+        boxes_xywh.push_back(width);
+        boxes_xywh.push_back(height);
+        scores.push_back(score);
+        class_ids.push_back(class_id);
+    }
+
+    const int valid_count = static_cast<int>(scores.size());
+    if (valid_count == 0) {
+        return 0;
+    }
+
+    std::vector<int> order;
+    SortDescending(scores, order);
+    Nms(valid_count, boxes_xywh, class_ids, order, class_id, nms_threshold);
+
+    int result_count = 0;
+    for (int i = 0; i < valid_count && result_count < kMaxPostProcessResults; ++i) {
+        const int candidate = order[static_cast<std::size_t>(i)];
+        if (candidate < 0) {
+            continue;
+        }
+
+        const float model_x1 = boxes_xywh[static_cast<std::size_t>(candidate) * 4] -
+                               static_cast<float>(letterbox.x_pad);
+        const float model_y1 = boxes_xywh[static_cast<std::size_t>(candidate) * 4 + 1] -
+                               static_cast<float>(letterbox.y_pad);
+        const float model_x2 = model_x1 +
+                               boxes_xywh[static_cast<std::size_t>(candidate) * 4 + 2];
+        const float model_y2 = model_y1 +
+                               boxes_xywh[static_cast<std::size_t>(candidate) * 4 + 3];
+
+        if (out != nullptr) {
+            YoloDetection detection;
+            detection.x1 = ClampToInt(model_x1, 0, model_width) / letterbox.scale;
+            detection.y1 = ClampToInt(model_y1, 0, model_height) / letterbox.scale;
+            detection.x2 = ClampToInt(model_x2, 0, model_width) / letterbox.scale;
+            detection.y2 = ClampToInt(model_y2, 0, model_height) / letterbox.scale;
+            detection.confidence = scores[static_cast<std::size_t>(i)];
+            detection.class_id = class_id;
+            if (detection.x2 > detection.x1 && detection.y2 > detection.y1) {
+                out->push_back(detection);
+                ++result_count;
+            }
+        } else {
+            ++result_count;
+        }
+    }
+    return result_count;
+}
+
 int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
                 float conf_threshold, float nms_threshold, int num_classes,
                 const LetterBox& letterbox, std::vector<YoloDetection>* out) {

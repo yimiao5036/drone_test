@@ -9,12 +9,11 @@
  *
  * 推理链路（对应原型 videoPart/yolo26-rknn）：
  *
- *   NV12 解码帧 ──► RGA 预处理（居中裁剪 16 对齐正方形 +
- *                  NV12→RGB letterbox 写入模型输入内存，一次完成）
+ *   NV12 解码帧 ──► RGA 预处理（完整画面等比缩放 + RGB letterbox）
  *              ──► RKNN NPU 推理（3 核上下文，单帧由运行时调度）
  *              ──► 输出张量 NC1HWC2→NCHW 转换（预分配缓冲）
- *              ──► yolo_postprocess 解码 + NMS + letterbox 逆变换
- *              ──► 叠加裁剪偏移 → 原图坐标 BackendDetection
+ *              ──► `[1,5,N]` 归一化 xywh 解码 + NMS + letterbox 逆变换
+ *              ──► 原图坐标 BackendDetection
  *
  * 依赖（香橙派系统）：
  * - librknnrt.so（RKNN runtime），头文件见 third_party/rknn/include

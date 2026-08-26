@@ -149,6 +149,47 @@ TEST_F(FrameCompositorTest, DetectionAppliedAndIdempotentPublish) {
     EXPECT_TRUE(WaitFor([this] { return compositor_->AnnotatedCount() == 2; }));
 }
 
+TEST_F(FrameCompositorTest, UsesConfiguredClassNameAndNormalizesLowercase) {
+    CompositorConfig config;
+    config.pool_capacity = 2;
+    config.class_names = {"balloon"};
+    FrameCompositor configured_compositor(config);
+    common::Topic<video::FrameHandle> decoded;
+    common::Topic<common::DetectionResult> detections;
+    configured_compositor.SetDecodedInput(decoded);
+    configured_compositor.SetDetectionInput(detections);
+    auto output = configured_compositor.AnnotatedOutput().Subscribe(2);
+
+    ASSERT_TRUE(configured_compositor.Start());
+    common::DetectionResult detection;
+    detection.class_id = 0;
+    detection.confidence = 0.9f;
+    detection.bbox_x = 4.f;
+    detection.bbox_y = 30.f;
+    detection.bbox_w = 20.f;
+    detection.bbox_h = 20.f;
+    (void)detections.Emplace(detection);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    auto frame = source_pool_->Acquire();
+    ASSERT_TRUE(frame.Valid());
+    std::memset(frame.Data(), 128, source_pool_->SlotSize());
+    (void)decoded.Emplace(std::move(frame));
+
+    ASSERT_TRUE(WaitFor([&configured_compositor] {
+        return configured_compositor.AnnotatedCount() == 1;
+    }));
+    auto message = output.WaitTakeFor(std::chrono::milliseconds(1000));
+    ASSERT_TRUE(message.has_value());
+
+    // "BALLOON" 第三个字符 L 从 x=16 开始，文字顶行为 y=23；该像素不在检测框上。
+    // 若 JSON 配置名未生效、未转大写或 L 字模缺失，此处仍会保持输入亮度 128。
+    const auto& annotated = **message;
+    const std::size_t l_top_left = 23u * annotated.Info().hor_stride + 16u;
+    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[l_top_left]), 230u);
+    configured_compositor.Stop();
+}
+
 TEST_F(FrameCompositorTest, InvalidFrameCountsErrorNoPublish) {
     ASSERT_TRUE(compositor_->Start());
     PublishEmptyFrame();

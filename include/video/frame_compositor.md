@@ -24,7 +24,8 @@ kDetection(DetectionResult) ──────┘
 ## 接口与数据流
 
 - `CompositorConfig`：`pool_capacity`（输出池容量）、`stride_alignment`、`box_line_thickness`、
-  `draw_text`（是否画类型+置信度）、`text_scale`。
+  `draw_text`（是否画类型+置信度）、`text_scale`、`class_names`（数组下标即 `class_id`）。
+  根 `main.cpp` 从 `yolo.class_names` 读取后注入，配置缺失时默认 `UAV/OBS`。
 - `SetDecodedInput(Topic<FrameHandle>&)`：绑定解码帧（队列容量 4，丢最旧）。
 - `SetDetectionInput(Topic<DetectionResult>&)`：绑定检测结果（队列容量 32，缓存供对齐）。
 - `AnnotatedOutput()` → `Topic<FrameHandle>&`。
@@ -44,10 +45,11 @@ kDetection(DetectionResult) ──────┘
 
 ### NV12 叠加（零外部依赖，不引 OpenCV/FreeType）
 - **检测框**：`DrawBox` 沿边框描亮绿像素（每个像素改 Y=230 + 对应 UV 采样 → 显色）。
-- **文字**：内置 5×7 点阵 ASCII 字模（数字 0-9、大写 `UAV/OBS/OBJ` 等、`. - %`），
-  `DrawText` 按 scale 放大逐点画；标签格式 `类型标记 置信度%`（如 `UAV 85%`）。
-  类型标记映射 `ClassToken`：0→`UAV`（无人机）、1→`OBS`（障碍物）、其他→`OBJ`。
-  中文"无人机"需大字体集，未内置——用 ASCII 简写替代，实机如需中文可扩展字模。
+- **文字**：内置 5×7 点阵 ASCII 字模（A-Z、数字 0-9、空格、`. - %`），
+  `DrawText` 按 scale 放大逐点画；标签格式 `配置名称 置信度%`（如 `BALLOON 85%`）。
+  `ClassToken` 按 `class_id` 查询 `CompositorConfig::class_names`，越界或名称为空回退 `OBJ`；
+  小写自动转大写，不支持字符替换为空格，名称最多显示 16 个字符。
+  中文需要大字体集，当前未内置；实机如需中文可扩展字模或接入 FreeType。
 
 ### 输出池懒建
 首帧确定分辨率后按 `pool_capacity` + `stride_alignment` 创建。池满 `Acquire` 返回空句柄
@@ -79,10 +81,10 @@ cmake --build build -j$(nproc) && cd build && ./frame_compositor_test
 
 - **标注帧未发布**：确认解码帧主题有数据、检测主题已绑（`pending_` 空则只画框不画文字，
   且逐帧仍有输出）；确认输出池未被 0 容量覆盖（构造抛异常）。
-- **画框但无文字**：`ClassToken` 字符不在内置点阵（走 `default:0x00`）或 `draw_text=false`，
-  或 `text_scale` 过大导致字符越出画布被 clip。
-- **改标签文本/颜色**：改 `ClassToken` 与 `PlotPixel` 的 Y/U/V 常量；新增字符在
-  `GlyphByte` 加 case。
+- **画框但无文字**：检查 `config/config.json` 的 `yolo.class_names` 是否为非空字符串数组、
+  `class_id` 是否越界、`draw_text` 是否为 true，或 `text_scale` 是否过大导致文字越界。
+- **改标签文本/颜色**：标签只需修改 JSON 的 `yolo.class_names`；颜色修改 `PlotPixel` 的
+  Y/U/V 常量；新增非 ASCII 字符需扩展 `GlyphByte` 或接入字体库。
 - **想用真字体/中文**：替换 `DrawText` 为 FreeType/二值字库（受"不引入 OpenCV/控制依赖"
   约束，需权衡后问维护者）。
 - **线程模型**：单消费线程串行；若要并行化叠加（多目标/多流）需重新设计，勿直接加锁

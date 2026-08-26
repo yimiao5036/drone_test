@@ -5,12 +5,12 @@
  * 属于 drone/perception 模块，是 YoloDetector 的组成部分。
  *
  * 职责边界：
- * - 本模块只做"推理输出的数值后处理"：把 NPU 输出的多分支 INT8 量化张量
- *   解码为检测候选，按类别执行 NMS，再经 letterbox 逆变换还原到裁剪图坐标。
+ * - 本模块只做"推理输出的数值后处理"：支持旧版多分支 INT8 张量，以及
+ *   单输出 `[1,5,N]` 归一化 xywh 张量；完成阈值过滤、NMS 与 letterbox 逆变换。
  * - 不涉及推理本身（RKNN）、图像预处理（RGA）、内存池（视频帧），
  *   因此不依赖任何硬件库，可在开发机独立编译与单元测试。
- * - 输出坐标系为"裁剪图坐标"（居中裁剪正方形子图，见 RknnDetectionBackend），
- *   原图偏移由调用方（后端）叠加。
+ * - 输出坐标系为 letterbox 之前的源图像坐标；当前 RKNN 后端对完整解码帧
+ *   预处理，因此输出可直接作为原图坐标使用。
  *
  * 与原型 videoPart/yolo26-rknn/src/common.cpp 的对应关系：
  * - process_i8               → DecodeBranch（单分支量化解码 + 阈值过滤）
@@ -34,14 +34,14 @@ namespace drone::perception {
 /// 单分支后处理输出上限（对应原型 OBJ_NUMB_MAX_SIZE）。
 inline constexpr int kMaxPostProcessResults = 128;
 
-/// 后处理输出的单个检测（裁剪图坐标系，像素）。
+/// 后处理输出的单个检测（letterbox 之前的源图像坐标系，像素）。
 struct YoloDetection {
     int class_id = 0;
     float confidence = 0.f;
-    float x1 = 0.f;  ///< 裁剪图坐标左上角 x
-    float y1 = 0.f;  ///< 裁剪图坐标左上角 y
-    float x2 = 0.f;  ///< 裁剪图坐标右下角 x
-    float y2 = 0.f;  ///< 裁剪图坐标右下角 y
+    float x1 = 0.f;  ///< 源图像坐标左上角 x
+    float y1 = 0.f;  ///< 源图像坐标左上角 y
+    float x2 = 0.f;  ///< 源图像坐标右下角 x
+    float y2 = 0.f;  ///< 源图像坐标右下角 y
 };
 
 /// letterbox 填充信息：预处理时记录，后处理逆变换使用。
@@ -66,6 +66,16 @@ struct BranchOutput {
     QuantTensor box;        ///< [1, 4×dfl_len, H, W]
     QuantTensor score;      ///< [1, num_classes, H, W]
     QuantTensor score_sum;  ///< [1, 1, H, W]；data == nullptr 表示无此张量
+};
+
+/// 单输出检测张量：INT8、通道优先布局 `[1,5,N]`。
+/// 5 个通道依次为归一化 x_center/y_center/width/height/confidence。
+struct NormalizedXywhTensor {
+    const std::int8_t* data = nullptr;
+    std::int32_t zp = 0;
+    float scale = 1.f;
+    int channels = 0;
+    int candidate_count = 0;
 };
 
 /// 解码单分支：遍历网格、量化阈值过滤，输出候选（模型坐标系 xywh，未去 pad）。
@@ -100,10 +110,18 @@ int Nms(int valid_count, const std::vector<float>& boxes_xywh,
 /// @param nms_threshold NMS IoU 阈值
 /// @param num_classes 类别数
 /// @param letterbox 预处理填充信息（x_pad/y_pad/scale）
-/// @param out 输出检测列表（裁剪图坐标系）；为空指针时仅返回数量
+/// @param out 输出检测列表（letterbox 前源图坐标系）；为空指针时仅返回数量
 /// @return 输出检测数量（<= kMaxPostProcessResults）
 int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
                 float conf_threshold, float nms_threshold, int num_classes,
                 const LetterBox& letterbox, std::vector<YoloDetection>* out);
+
+/// 单输出 `[1,5,N]` 后处理：反量化 → 归一化 xywh 解码 → 单类别 NMS →
+/// letterbox 逆变换。模型不输出类别，结果统一使用 class_id。
+int PostProcessNormalizedXywh(const NormalizedXywhTensor& tensor,
+                              int model_width, int model_height,
+                              float conf_threshold, float nms_threshold,
+                              int class_id, const LetterBox& letterbox,
+                              std::vector<YoloDetection>* out);
 
 }  // namespace drone::perception

@@ -109,9 +109,28 @@ std::uint8_t GlyphByte(char ch, int row) {
         case 'A': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
         case 'V': { const std::uint8_t g[7]={0x11,0x11,0x11,0x11,0x0A,0x0A,0x04}; return g[row]; }
         case 'B': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}; return g[row]; }
-        case 'O': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
-        case 'S': { const std::uint8_t g[7]={0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; return g[row]; }
+        case 'C': { const std::uint8_t g[7]={0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}; return g[row]; }
+        case 'D': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}; return g[row]; }
+        case 'E': { const std::uint8_t g[7]={0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}; return g[row]; }
         case 'F': { const std::uint8_t g[7]={0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}; return g[row]; }
+        case 'G': { const std::uint8_t g[7]={0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}; return g[row]; }
+        case 'H': { const std::uint8_t g[7]={0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
+        case 'I': { const std::uint8_t g[7]={0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}; return g[row]; }
+        case 'J': { const std::uint8_t g[7]={0x07,0x02,0x02,0x02,0x12,0x12,0x0C}; return g[row]; }
+        case 'K': { const std::uint8_t g[7]={0x11,0x12,0x14,0x18,0x14,0x12,0x11}; return g[row]; }
+        case 'L': { const std::uint8_t g[7]={0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; return g[row]; }
+        case 'M': { const std::uint8_t g[7]={0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; return g[row]; }
+        case 'N': { const std::uint8_t g[7]={0x11,0x19,0x15,0x13,0x11,0x11,0x11}; return g[row]; }
+        case 'O': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
+        case 'P': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; return g[row]; }
+        case 'Q': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}; return g[row]; }
+        case 'R': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; return g[row]; }
+        case 'S': { const std::uint8_t g[7]={0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; return g[row]; }
+        case 'T': { const std::uint8_t g[7]={0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; return g[row]; }
+        case 'W': { const std::uint8_t g[7]={0x11,0x11,0x11,0x15,0x15,0x15,0x0A}; return g[row]; }
+        case 'X': { const std::uint8_t g[7]={0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; return g[row]; }
+        case 'Y': { const std::uint8_t g[7]={0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; return g[row]; }
+        case 'Z': { const std::uint8_t g[7]={0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}; return g[row]; }
         default: return 0x00;
     }
 }
@@ -184,13 +203,36 @@ void DrawBox(Nv12Surface& s, float bx, float by, float bw, float bh, int thick) 
     }
 }
 
-/// 类别 ID → 简短类型标记（ASCII，供点阵渲染）。
-const char* ClassToken(std::uint32_t class_id) {
-    switch (class_id) {
-        case 0:  return "UAV";   // 无人机
-        case 1:  return "OBS";   // 障碍物
-        default: return "OBJ";   // 其他
+/// 将 JSON 类别名称规范成点阵可显示的 ASCII，并限制长度避免标签越界过长。
+std::string NormalizeClassLabel(const std::string& label) {
+    constexpr std::size_t kMaxLabelLength = 16;
+    std::string normalized;
+    bool has_visible_character = false;
+    normalized.reserve(std::min(label.size(), kMaxLabelLength));
+    for (char ch : label) {
+        if (normalized.size() >= kMaxLabelLength) {
+            break;
+        }
+        if (ch >= 'a' && ch <= 'z') {
+            ch = static_cast<char>(ch - 'a' + 'A');
+        }
+        const bool supported = (ch >= 'A' && ch <= 'Z') ||
+                               (ch >= '0' && ch <= '9') || ch == ' ' ||
+                               ch == '.' || ch == '-' || ch == '%';
+        const char output = supported ? ch : ' ';
+        normalized.push_back(output);
+        has_visible_character = has_visible_character || output != ' ';
     }
+    return has_visible_character ? normalized : "OBJ";
+}
+
+/// 类别 ID → JSON 配置名称；越界或空名称回退 OBJ。
+std::string ClassToken(const std::vector<std::string>& class_names,
+                       std::uint32_t class_id) {
+    if (class_id >= class_names.size() || class_names[class_id].empty()) {
+        return "OBJ";
+    }
+    return NormalizeClassLabel(class_names[class_id]);
 }
 
 }  // namespace
@@ -326,7 +368,7 @@ struct FrameCompositor::Impl {
                     config.box_line_thickness);
             if (config.draw_text) {
                 const int conf_pct = static_cast<int>(d.confidence * 100 + 0.5f);
-                std::string text = std::string(ClassToken(d.class_id)) + " " +
+                std::string text = ClassToken(config.class_names, d.class_id) + " " +
                                    std::to_string(conf_pct) + "%";
                 // 文字画在框左上角外侧（避免遮目标本身）
                 int ty = static_cast<int>(d.bbox_y) - 7 * config.text_scale;

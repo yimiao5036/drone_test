@@ -6,6 +6,7 @@
  * - DecodeBranch：无 DFL 量化解码、阈值过滤、score_sum 快速过滤
  * - SortDescending + Nms：同类重叠抑制、异类保留
  * - PostProcess：多分支全链路 + letterbox 逆变换坐标还原
+ * - PostProcessNormalizedXywh：`[1,5,N]` 阈值过滤、NMS、原图坐标还原
  */
 #include <algorithm>
 #include <cmath>
@@ -252,6 +253,69 @@ TEST(YoloPostProcessTest, PostProcessFullChain) {
     EXPECT_NEAR(detections[0].y2, 104.f, 1e-3f);
     EXPECT_NEAR(detections[0].confidence, 0.5f, 1e-3f);
     EXPECT_EQ(detections[0].class_id, 0);
+}
+
+TEST(YoloPostProcessTest, NormalizedXywhSingleOutputRestoresLetterbox) {
+    // `[1,5,2]` 通道优先：候选0有效，候选1低于阈值。
+    // 原图 1280x720 → 640x640：scale=0.5，顶部 padding=140。
+    constexpr float kScale = 0.01f;
+    std::vector<std::int8_t> data(10, 0);
+    const int n = 2;
+    data[0 * n + 0] = Quantize(0.50f, 0, kScale);  // center x
+    data[1 * n + 0] = Quantize(0.50f, 0, kScale);  // center y
+    data[2 * n + 0] = Quantize(0.50f, 0, kScale);  // width
+    data[3 * n + 0] = Quantize(0.25f, 0, kScale);  // height
+    data[4 * n + 0] = Quantize(0.90f, 0, kScale);  // confidence
+    data[4 * n + 1] = Quantize(0.10f, 0, kScale);  // 被阈值过滤
+
+    NormalizedXywhTensor tensor{data.data(), 0, kScale, 5, n};
+    LetterBox letterbox;
+    letterbox.scale = 0.5f;
+    letterbox.y_pad = 140;
+
+    std::vector<YoloDetection> detections;
+    const int count = PostProcessNormalizedXywh(
+        tensor, 640, 640, 0.25f, 0.45f, 0, letterbox, &detections);
+
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(detections.size(), 1u);
+    EXPECT_NEAR(detections[0].x1, 320.f, 1e-3f);
+    EXPECT_NEAR(detections[0].y1, 200.f, 1e-3f);
+    EXPECT_NEAR(detections[0].x2, 960.f, 1e-3f);
+    EXPECT_NEAR(detections[0].y2, 520.f, 1e-3f);
+    EXPECT_NEAR(detections[0].confidence, 0.90f, 1e-3f);
+    EXPECT_EQ(detections[0].class_id, 0);
+}
+
+TEST(YoloPostProcessTest, NormalizedXywhSingleOutputAppliesNms) {
+    constexpr float kScale = 0.01f;
+    constexpr int kCandidates = 2;
+    std::vector<std::int8_t> data(5 * kCandidates, 0);
+    for (int i = 0; i < kCandidates; ++i) {
+        data[0 * kCandidates + i] = Quantize(0.50f + i * 0.01f, 0, kScale);
+        data[1 * kCandidates + i] = Quantize(0.50f + i * 0.01f, 0, kScale);
+        data[2 * kCandidates + i] = Quantize(0.40f, 0, kScale);
+        data[3 * kCandidates + i] = Quantize(0.40f, 0, kScale);
+    }
+    data[4 * kCandidates + 0] = Quantize(0.90f, 0, kScale);
+    data[4 * kCandidates + 1] = Quantize(0.80f, 0, kScale);
+
+    NormalizedXywhTensor tensor{data.data(), 0, kScale, 5, kCandidates};
+    std::vector<YoloDetection> detections;
+    const int count = PostProcessNormalizedXywh(
+        tensor, 640, 640, 0.25f, 0.45f, 0, LetterBox{}, &detections);
+
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(detections.size(), 1u);
+    EXPECT_NEAR(detections[0].confidence, 0.90f, 1e-3f);
+}
+
+TEST(YoloPostProcessTest, NormalizedXywhRejectsInvalidTensor) {
+    std::vector<YoloDetection> detections;
+    EXPECT_EQ(PostProcessNormalizedXywh({}, 640, 640, 0.25f, 0.45f, 0,
+                                        LetterBox{}, &detections),
+              0);
+    EXPECT_TRUE(detections.empty());
 }
 
 TEST(YoloPostProcessTest, PostProcessEmptyBranch) {
