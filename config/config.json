@@ -4,15 +4,19 @@
         "level": "info"
     },
     "yolo": {
-        "model_path": "models/yolo26n_int8.rknn",
-        "conf_threshold": 0.25,
-        "nms_threshold": 0.45
+        "model_path": "models/yolo26n-int8.rknn",
+        "conf_threshold": 0.60,
+        "nms_threshold": 0.45,
+        "max_detection_frame_lag": 10,
+        "class_names": [
+            "BALLOON"
+        ]
     },
     "video": {
-        "input_rtsp": "rtsp://192.168.144.25:8554/live",
-        "output_rtsp": "rtsp://192.168.144.26:8554/drone_out",
-        "width": 1920,
-        "height": 1080,
+        "input_rtsp": "rtsp://192.168.144.25:8554/main.264",
+        "output_rtsp": "rtsp://127.0.0.1:8554/drone_out",
+        "width": 1280,
+        "height": 720,
         "fps": 25,
         "bitrate": 6000000
     }

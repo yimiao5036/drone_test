@@ -97,9 +97,16 @@ struct CameraReceiver::Impl {
 
         AVDictionary* options = nullptr;
         av_dict_set(&options, "rtsp_transport", config.rtsp_transport.c_str(), 0);
-        av_dict_set(&options, "fflags", "nobuffer", 0);
+        // 以下选项与已验证成功拉流的原型 videoPart/rtsp_yolo_stream/rtsp_decoder.cpp
+        // 保持一致：nobuffer+discardcorrupt（低延迟+丢坏包）、禁用 RTP 重排（防 SPS/PPS
+        // 与 IDR 顺序打乱导致 rkmpp 收不到参数集）、无额外延迟、小 TCP 缓冲、临时
+        // stimeout。这些是实测可稳定解析本摄像头 H265 流的组合。
+        av_dict_set(&options, "fflags", "nobuffer+discardcorrupt", 0);
+        av_dict_set(&options, "reorder_queue_size", "0", 0);
+        av_dict_set(&options, "max_delay", "0", 0);
         av_dict_set(&options, "probesize", "50000", 0);
         av_dict_set(&options, "analyzeduration", "100000", 0);
+        av_dict_set(&options, "buffer_size", "102400", 0);
         const std::string timeout_us =
             std::to_string(config.open_timeout.count() * 1000);
         av_dict_set(&options, "stimeout", timeout_us.c_str(), 0);

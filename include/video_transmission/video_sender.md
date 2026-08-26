@@ -95,11 +95,18 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
   ```
 - **RTSP 推流 + rkmpp 硬编码**：需真实图传目标/香橙派（`ffmpeg-rockchip`），在
   香橙派实机用 `ffprobe -rtsp_transport tcp ...` 或地面站播放器验收。
+  **当前采用 mediamtx 中转架构**：`config.output_rtsp` 指向本机 mediamtx
+  （`rtsp://127.0.0.1:8554/drone_out`），香橙派程序推给本机 mediamtx，mediamtx 再对外
+  发布供任意图传设备拉取（见 `deploy/mediamtx.yml`、`deploy/install_mediamtx.sh`）。
+  换图传设备时不动香橙派代码/配置。
 
 ## 排查 / 修改要点
 
 - **推流地址不可达**：`Start` 返回 false，`avformat_write_header` 报
-  "图传 RTSP 写头失败"。确认地址、端口、`transport=tcp`（不支持时回 udp）。
+  "图传 RTSP 写头失败"。
+  - 若指向本机 mediamtx：确认 mediamtx 服务已启动（`systemctl status mediamtx`）、
+    8554 端口在监听、配置含 `drone_out` 且 `source: publisher`。
+  - 若目标是远端图传设备：确认地址端口与传输协议（`transport=tcp` 不支持时回 udp）。
 - **软编不产包 / stride 报错**：确认未在软编路径误送 NV12；`pic_out_` YUV420P 转换是否生效。
 - **文件测试段错误（avio_write）**：多半是文件输出未 `avio_open`，`pb` 空。
 - **PTS 警告**：用独立帧计数器，勿用发送计数。

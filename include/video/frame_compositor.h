@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "common/topic.h"
 #include "common/types.h"
@@ -37,6 +39,11 @@ struct CompositorConfig {
     int box_line_thickness = 2;        ///< 检测框线宽（像素）
     bool draw_text = true;             ///< 是否绘制类型 + 置信度文字
     int text_scale = 1;                ///< 文字放大倍数（每字符像素 = 5*scale x 7*scale）
+    /// 类别名称表：数组下标即 class_id；越界或空名称显示 OBJ。
+    /// 内置点阵支持 ASCII 字母/数字/空格/.-%，小写会自动转大写。
+    std::vector<std::string> class_names{"UAV", "OBS"};
+    /// 当前解码帧比最近检测帧领先超过该数量时清除旧框；25fps 下默认约 400ms。
+    std::uint64_t max_detection_frame_lag = 10;
 };
 
 /// 视频帧叠加器。

@@ -89,7 +89,6 @@ struct VideoDecoder::Impl {
     AVBufferRef* hw_device = nullptr;  // DRM 硬件设备（硬解路径）
     bool is_hardware = false;
     bool decoder_creation_failed = false;  // 创建失败后不再重试（避免刷屏）
-    bool decoder_initialized = false;      // 已取得参数集（extradata 或关键帧），可处理非关键帧
     SwsContext* sws_ctx = nullptr;
     int sws_src_format = -1;  // 当前 sws 上下文对应的源格式（缓存）
     AVFrame* decoded_frame = nullptr;
@@ -183,8 +182,16 @@ struct VideoDecoder::Impl {
         }
         codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
-        // 流级参数集（SPS/PPS 等）：RTSP/容器流在流头而非逐帧码流中
-        if (!parameter_sets.empty()) {
+        // 流级参数集（SPS/PPS 等）：RTSP/容器流在流头而非逐帧码流中。
+        // 重要（对齐已验证成功的原型 videoPart/rtsp_yolo_stream）：
+        // - HEVC（本相机）的容器 extradata 是 HEVCDecoderConfigurationRecord
+        //   （MP4 格式），而非 Annex-B NALU 序列。整块塞给 rkmpp 硬解当作参数
+        //   集是错误的，会导致 rkmpp 一打开就对码流报 `invalid pps id 0` 并段错误。
+        // - 正确做法：硬解交给 rkmpp 从码流内嵌的 SPS/PPS 自行解析（LIVE555 的
+        //   RTP 流内嵌参数，原型实测可行），不塞容器 extradata。
+        // - 软解（libx264/hevc 等）接受 mp4 config 格式 extradata，保留塞入以
+        //   支持“容器头带参数”的流（H264 容器 extradata 是 Annex-B，也可用）。
+        if (!is_hardware && !parameter_sets.empty()) {
             codec_ctx->extradata = static_cast<uint8_t*>(
                 av_mallocz(parameter_sets.size() + AV_INPUT_BUFFER_PADDING_SIZE));
             if (codec_ctx->extradata == nullptr) {
@@ -195,7 +202,6 @@ struct VideoDecoder::Impl {
             std::memcpy(codec_ctx->extradata, parameter_sets.data(),
                         parameter_sets.size());
             codec_ctx->extradata_size = static_cast<int>(parameter_sets.size());
-            decoder_initialized = true;  // 流级参数集就绪，可直接处理任意帧
         }
 
         if (is_hardware) {
@@ -233,7 +239,6 @@ struct VideoDecoder::Impl {
 
     /// 释放解码器相关资源（幂等）。
     void CleanupCodec() {
-        decoder_initialized = false;
         if (sws_ctx != nullptr) {
             sws_freeContext(sws_ctx);
             sws_ctx = nullptr;
@@ -290,11 +295,14 @@ struct VideoDecoder::Impl {
                 }
                 continue;
             }
-            // 参数集未就绪（无 extradata 且未收到关键帧）时跳过非关键帧：
-            // 队列丢帧可能挤掉含 SPS/PPS 的 I 帧，避免用残缺参数集无效解码，
-            // 等下一个关键帧恢复（真实 RTSP 每 GOP 周期有关键帧）
-            if (!frame.is_key_frame && !decoder_initialized) {
-                continue;
+            // 不再按“未初始化跳过非关键帧”：本款摄像头 RTSP 的 SPS/PPS 是 IDR
+            // 之前独立到达的非关键帧小包，旧逻辑会丢弃它们，使 rkmpp 永远收不到
+            // 参数集，随后解析 IDR 报 invalid pps 并段错误。
+            // 修正（对齐原型 videoPart/rtsp_yolo_stream）：解码器未创建时，由
+            // below 的 DecodeOne 用首个数据帧（任意类型）创建并与该帧一并送包，
+            // 之后全量送包，由 rkmpp 自行完成 SPS/PPS 参数同步与关键帧等待。
+            if (decoder_creation_failed) {
+                continue;  // 创建已失败，跳过，避免无效空转
             }
             DecodeOne(frame, packet);
         }
@@ -313,12 +321,6 @@ struct VideoDecoder::Impl {
         if (codec_ctx == nullptr) {
             return;  // 解码器创建失败，无法继续
         }
-        // 收到关键帧（码流内嵌 SPS/PPS）视为参数集就绪；
-        // 若解码器创建时已带 extradata（参数集消息），此标志已为 true
-        if (encoded.is_key_frame) {
-            decoder_initialized = true;
-        }
-
         // 分配解码/转存帧（解码器确定后尺寸已知，创建一次）
         if (decoded_frame == nullptr) {
             decoded_frame = av_frame_alloc();
@@ -376,9 +378,10 @@ struct VideoDecoder::Impl {
 
     /// 将解码帧转为 NV12 写入内存池并发布。
     void PublishFrame(AVFrame* source) {
-        // 硬解帧：从 DRM 显存转存到系统内存（输出 NV12）
+        // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
         AVFrame* frame = source;
-        if (source->format == AV_PIX_FMT_DRM_PRIME) {
+        if (source->format == AV_PIX_FMT_DRM_PRIME ||
+            source->hw_frames_ctx != nullptr) {
             av_frame_unref(sw_frame);
             if (av_hwframe_transfer_data(sw_frame, source, 0) < 0) {
                 ++error_count;
@@ -421,37 +424,70 @@ struct VideoDecoder::Impl {
 
         const VideoFrameInfo& info = handle.Info();
         std::byte* dst = handle.Data();
+        const int dst_stride = static_cast<int>(info.hor_stride);
 
-        // 目标 NV12（Y 平面 + UV 半平面），swscale 按行写入
-        const int y_bytes =
-            static_cast<int>(info.hor_stride) * static_cast<int>(info.height);
-        uint8_t* dst_planes[2] = {reinterpret_cast<uint8_t*>(dst),
-                                  reinterpret_cast<uint8_t*>(dst) + y_bytes};
-        int dst_linesize[2] = {static_cast<int>(info.hor_stride),
-                               static_cast<int>(info.hor_stride)};
-
-        // 源格式变化时重建转换上下文（软解 YUV420P→NV12；硬解 NV12→NV12）
-        if (sws_ctx == nullptr || sws_src_format != frame->format) {
-            if (sws_ctx != nullptr) {
-                sws_freeContext(sws_ctx);
-            }
-            sws_ctx = sws_getContext(width, height,
-                                     static_cast<AVPixelFormat>(frame->format),
-                                     width, height, AV_PIX_FMT_NV12,
-                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-            sws_src_format = frame->format;
-            if (sws_ctx == nullptr) {
+        // 目标 NV12（Y 平面 + UV 半平面）。
+        // 硬解（rkmpp）输出为 NV12，直接按源 linesize 逐行 memcpy，不经过
+        // sws_scale（sws_scale 在部分源码 linesize/UV 指针组合下会踩内存段错误，
+        // 且 NV12→NV12 同形时是纯拷贝，无缩放）。
+        // 仅软解（YUV420P）需要 sws_scale 转 NV12。
+        if (frame->format == AV_PIX_FMT_NV12) {
+            if (frame->data[0] == nullptr || frame->data[1] == nullptr) {
                 ++error_count;
                 if (ShouldLogThrottled(error_count)) {
-                    SPDLOG_ERROR("视频解码器创建 sws 转换上下文失败(源格式={})，累计 {}",
-                                 frame->format, error_count.load());
+                    SPDLOG_ERROR("视频解码器 NV12 帧数据指针为空，累计 {}",
+                                 error_count.load());
                 }
                 return;
             }
-        }
+            const int src_stride_v = frame->linesize[0];
+            const uint8_t* src_y = frame->data[0];
+            uint8_t* dst_y = reinterpret_cast<uint8_t*>(dst);
+            for (int row = 0; row < height; ++row) {
+                std::memcpy(dst_y + static_cast<size_t>(row) * dst_stride,
+                            src_y + static_cast<size_t>(row) * src_stride_v,
+                            static_cast<size_t>(width));
+            }
+            // UV 半平面：高度 h/2 行，每行 2 字节/像素
+            const int src_stride_uv = frame->linesize[1];
+            const uint8_t* src_uv = frame->data[1];
+            uint8_t* dst_uv =
+                reinterpret_cast<uint8_t*>(dst) +
+                static_cast<size_t>(dst_stride) * height;
+            for (int row = 0; row < height / 2; ++row) {
+                std::memcpy(dst_uv + static_cast<size_t>(row) * dst_stride,
+                            src_uv + static_cast<size_t>(row) * src_stride_uv,
+                            static_cast<size_t>(width));
+            }
+        } else {
+            // 软解 YUV420P → NV12 经 sws_scale。
+            uint8_t* dst_planes[2] = {reinterpret_cast<uint8_t*>(dst),
+                                      reinterpret_cast<uint8_t*>(dst) +
+                                          static_cast<size_t>(dst_stride) * height};
+            int dst_linesize[2] = {dst_stride, dst_stride};
 
-        sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
-                  dst_planes, dst_linesize);
+            if (sws_ctx == nullptr || sws_src_format != frame->format) {
+                if (sws_ctx != nullptr) {
+                    sws_freeContext(sws_ctx);
+                }
+                sws_ctx = sws_getContext(width, height,
+                                         static_cast<AVPixelFormat>(frame->format),
+                                         width, height, AV_PIX_FMT_NV12,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+                sws_src_format = frame->format;
+                if (sws_ctx == nullptr) {
+                    ++error_count;
+                    if (ShouldLogThrottled(error_count)) {
+                        SPDLOG_ERROR("视频解码器创建 sws 转换上下文失败(源格式={})，累计 {}",
+                                     frame->format, error_count.load());
+                    }
+                    return;
+                }
+            }
+
+            sws_scale(sws_ctx, frame->data, frame->linesize, 0, height,
+                      dst_planes, dst_linesize);
+        }
 
         (void)frame_output.Emplace(std::move(handle));
         ++decoded_count;

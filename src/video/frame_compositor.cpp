@@ -70,16 +70,16 @@ struct Nv12Surface {
     }
 };
 
-/// 绘制一个像素（含色）：Y 亮度 + 对应采样 U/V 置为彩色。
-/// box 以亮黄绿高对比色：Y=230，U/V 选为明显区别于无色的绿色调。
+/// 绘制一个像素（含色）：Y 亮度 + 对应采样 U/V 置为红色。
+/// NV12 红色近似值采用 Y=82、U=90、V=240，框和文字统一为红色。
 inline void PlotPixel(Nv12Surface& s, uint32_t x, uint32_t y) {
     if (x >= s.hor_stride || y >= s.height) {
         return;
     }
-    // 亮绿色边框：Y 高亮，U/V 取绿色域（NV12 YUV：绿色 ≈ U=149,V=43 区段）
-    *s.Y(x, y) = static_cast<std::byte>(230);
-    *s.U(x, y) = static_cast<std::byte>(150);
-    *s.V(x, y) = static_cast<std::byte>(44);
+    // 高饱和红色（limited-range YUV 近似值）。
+    *s.Y(x, y) = static_cast<std::byte>(82);
+    *s.U(x, y) = static_cast<std::byte>(90);
+    *s.V(x, y) = static_cast<std::byte>(240);
 }
 
 // ---------------------------------------------------------------------------
@@ -109,9 +109,28 @@ std::uint8_t GlyphByte(char ch, int row) {
         case 'A': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
         case 'V': { const std::uint8_t g[7]={0x11,0x11,0x11,0x11,0x0A,0x0A,0x04}; return g[row]; }
         case 'B': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}; return g[row]; }
-        case 'O': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
-        case 'S': { const std::uint8_t g[7]={0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; return g[row]; }
+        case 'C': { const std::uint8_t g[7]={0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}; return g[row]; }
+        case 'D': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}; return g[row]; }
+        case 'E': { const std::uint8_t g[7]={0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}; return g[row]; }
         case 'F': { const std::uint8_t g[7]={0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}; return g[row]; }
+        case 'G': { const std::uint8_t g[7]={0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}; return g[row]; }
+        case 'H': { const std::uint8_t g[7]={0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
+        case 'I': { const std::uint8_t g[7]={0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}; return g[row]; }
+        case 'J': { const std::uint8_t g[7]={0x07,0x02,0x02,0x02,0x12,0x12,0x0C}; return g[row]; }
+        case 'K': { const std::uint8_t g[7]={0x11,0x12,0x14,0x18,0x14,0x12,0x11}; return g[row]; }
+        case 'L': { const std::uint8_t g[7]={0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; return g[row]; }
+        case 'M': { const std::uint8_t g[7]={0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; return g[row]; }
+        case 'N': { const std::uint8_t g[7]={0x11,0x19,0x15,0x13,0x11,0x11,0x11}; return g[row]; }
+        case 'O': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
+        case 'P': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; return g[row]; }
+        case 'Q': { const std::uint8_t g[7]={0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}; return g[row]; }
+        case 'R': { const std::uint8_t g[7]={0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; return g[row]; }
+        case 'S': { const std::uint8_t g[7]={0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; return g[row]; }
+        case 'T': { const std::uint8_t g[7]={0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; return g[row]; }
+        case 'W': { const std::uint8_t g[7]={0x11,0x11,0x11,0x15,0x15,0x15,0x0A}; return g[row]; }
+        case 'X': { const std::uint8_t g[7]={0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; return g[row]; }
+        case 'Y': { const std::uint8_t g[7]={0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; return g[row]; }
+        case 'Z': { const std::uint8_t g[7]={0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}; return g[row]; }
         default: return 0x00;
     }
 }
@@ -184,13 +203,36 @@ void DrawBox(Nv12Surface& s, float bx, float by, float bw, float bh, int thick) 
     }
 }
 
-/// 类别 ID → 简短类型标记（ASCII，供点阵渲染）。
-const char* ClassToken(std::uint32_t class_id) {
-    switch (class_id) {
-        case 0:  return "UAV";   // 无人机
-        case 1:  return "OBS";   // 障碍物
-        default: return "OBJ";   // 其他
+/// 将 JSON 类别名称规范成点阵可显示的 ASCII，并限制长度避免标签越界过长。
+std::string NormalizeClassLabel(const std::string& label) {
+    constexpr std::size_t kMaxLabelLength = 16;
+    std::string normalized;
+    bool has_visible_character = false;
+    normalized.reserve(std::min(label.size(), kMaxLabelLength));
+    for (char ch : label) {
+        if (normalized.size() >= kMaxLabelLength) {
+            break;
+        }
+        if (ch >= 'a' && ch <= 'z') {
+            ch = static_cast<char>(ch - 'a' + 'A');
+        }
+        const bool supported = (ch >= 'A' && ch <= 'Z') ||
+                               (ch >= '0' && ch <= '9') || ch == ' ' ||
+                               ch == '.' || ch == '-' || ch == '%';
+        const char output = supported ? ch : ' ';
+        normalized.push_back(output);
+        has_visible_character = has_visible_character || output != ' ';
     }
+    return has_visible_character ? normalized : "OBJ";
+}
+
+/// 类别 ID → JSON 配置名称；越界或空名称回退 OBJ。
+std::string ClassToken(const std::vector<std::string>& class_names,
+                       std::uint32_t class_id) {
+    if (class_id >= class_names.size() || class_names[class_id].empty()) {
+        return "OBJ";
+    }
+    return NormalizeClassLabel(class_names[class_id]);
 }
 
 }  // namespace
@@ -217,8 +259,10 @@ struct FrameCompositor::Impl {
 
     // 检测结果跨线程暂存：检测订阅在消费线程读取，无需锁（单独线程）。
     // 但 SetDetectionInput 与等待循环同线程，这里存放"取帧时尚未处理的最新结果"。
+    // 只保留最新检测帧的一组目标；同一 frame_sequence 的多目标一起保留。
     std::vector<common::DetectionResult> pending_detections;
-    std::uint64_t last_applied_sequence = 0;
+    std::uint64_t latest_detection_frame_sequence = 0;
+    bool has_detection_frame_sequence = false;
 
     std::shared_ptr<VideoFramePool> pool;  // 输出标注帧池（懒建）
     std::atomic<uint64_t> annotated_count{0};
@@ -238,14 +282,39 @@ struct FrameCompositor::Impl {
                     pool->SlotSize());
     }
 
-    /// 取帧时把订阅队列里新到的检测结果拉出来暂存（异步对齐）。
+    /// 拉取检测结果，只保留最新 frame_sequence 的整组目标。
+    /// 旧实现持续 push_back 且从不清空，导致历史位置的框被每帧重复绘制。
     void DrainDetections() {
         for (;;) {
             auto msg = detection_sub.TryTake();
             if (!msg) {
                 break;
             }
-            pending_detections.push_back(**msg);
+            const auto& detection = **msg;
+            if (!has_detection_frame_sequence ||
+                detection.frame_sequence > latest_detection_frame_sequence) {
+                pending_detections.clear();
+                latest_detection_frame_sequence = detection.frame_sequence;
+                has_detection_frame_sequence = true;
+            }
+            if (detection.frame_sequence == latest_detection_frame_sequence) {
+                pending_detections.push_back(detection);
+            }
+            // 晚到的旧帧检测直接丢弃，避免框倒退到历史位置。
+        }
+    }
+
+    /// 连续无检测时按帧序号清除旧框，避免目标消失后最后一个框永久停留。
+    void ExpireStaleDetections(std::uint64_t current_frame_sequence) {
+        if (pending_detections.empty() || !has_detection_frame_sequence ||
+            current_frame_sequence <= latest_detection_frame_sequence) {
+            return;
+        }
+        if (current_frame_sequence - latest_detection_frame_sequence >
+            config.max_detection_frame_lag) {
+            pending_detections.clear();
+            latest_detection_frame_sequence = 0;
+            has_detection_frame_sequence = false;
         }
     }
 
@@ -267,6 +336,10 @@ struct FrameCompositor::Impl {
                 }
                 continue;
             }
+            // 检测 Topic 不会唤醒 decoded_sub 的等待；取到帧后再拉一次，确保等待
+            // 期间到达的新检测在本帧立即生效，而不是延迟到下一帧。
+            DrainDetections();
+            ExpireStaleDetections(in_handle.Info().sequence);
             Compose(in_handle, pending_detections);
         }
     }
@@ -326,7 +399,7 @@ struct FrameCompositor::Impl {
                     config.box_line_thickness);
             if (config.draw_text) {
                 const int conf_pct = static_cast<int>(d.confidence * 100 + 0.5f);
-                std::string text = std::string(ClassToken(d.class_id)) + " " +
+                std::string text = ClassToken(config.class_names, d.class_id) + " " +
                                    std::to_string(conf_pct) + "%";
                 // 文字画在框左上角外侧（避免遮目标本身）
                 int ty = static_cast<int>(d.bbox_y) - 7 * config.text_scale;

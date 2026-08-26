@@ -4,12 +4,11 @@
  *
  * 整合原型 videoPart/yolo26-rknn 的 rknn_model.cpp / rga_utils.cpp /
  * yolo26_detector.cpp 三部分：
- * - RGA 预处理：NV12 解码帧 → 居中裁剪 16 对齐正方形 → NV12→RGB
- *   letterbox 写入模型输入内存（RGA 缩放 + 色彩转换一次完成）
+ * - RGA 预处理：完整 NV12 解码帧 → 等比例缩放 → RGB letterbox 写入模型输入内存
  * - RKNN：3 核上下文（rknn_dup_context + RKNN_NPU_CORE_ALL），
  *   输入输出零拷贝内存（rknn_create_mem / rknn_set_io_mem）
- * - 后处理：NC1HWC2→NCHW 转换（预分配缓冲）→ yolo_postprocess
- *   解码 + NMS + letterbox 逆变换 → 叠加裁剪偏移还原原图坐标
+ * - 后处理：NC1HWC2→NCHW 转换（预分配缓冲）→ `[1,5,N]` 归一化
+ *   xywh 解码 + NMS + letterbox 逆变换，直接得到原图坐标
  *
  * 与正式工程的解耦点：
  * - 输入不再使用 cv::Mat（原型依赖 OpenCV），直接读 NV12 FrameHandle；
@@ -20,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -59,24 +59,6 @@ bool ReadModelFile(const std::string& path, std::vector<uint8_t>* data) {
     file.seekg(0, std::ios::beg);
     file.read(reinterpret_cast<char*>(data->data()), size);
     return file.good() || file.eof();
-}
-
-/// 居中裁剪为正方形且边长 16 对齐的区域。
-struct CropRect {
-    int x = 0;
-    int y = 0;
-    int side = 0;
-};
-
-CropRect ComputeCenterCrop(int width, int height) {
-    CropRect crop;
-    if (width <= 0 || height <= 0) {
-        return crop;
-    }
-    crop.side = (std::min(width, height) / 16) * 16;
-    crop.x = (width - crop.side) / 2;
-    crop.y = (height - crop.side) / 2;
-    return crop;
 }
 
 /// 数值夹取。
@@ -158,19 +140,26 @@ struct RknnDetectionBackend::Impl {
     rknn_input_output_num io_num_{};
     int model_width_ = 0;    ///< 模型输入宽（像素）
     int model_height_ = 0;   ///< 模型输入高（像素）
-    int num_classes_ = 0;    ///< 类别数（score 张量通道数）
+    int model_channel_ = 0;  ///< 模型输入通道数
+    enum class OutputMode {
+        kMultiBranch,
+        kNormalizedXywh,
+    };
+    OutputMode output_mode_ = OutputMode::kMultiBranch;
+    int num_classes_ = 0;    ///< 多分支模型类别数；单输出模型固定为 1
     int outputs_per_branch_ = 0;  ///< 每分支输出数（2 或 3，含 score_sum）
+    int single_output_candidates_ = 0;  ///< `[1,5,N]` 的 N
 
     // 输入输出内存（零拷贝）
     std::vector<std::vector<rknn_tensor_mem*>> input_mems_;
     std::vector<std::vector<rknn_tensor_mem*>> output_mems_;
     std::vector<std::vector<int8_t>> output_buffers_;  ///< 后处理输出缓冲（预分配）
 
-    // 裁剪缓冲（懒分配复用，避免每帧 malloc/free）
-    std::vector<uint8_t> crop_buffer_;
-    int crop_buffer_side_ = 0;
+    // letterbox 缩放临时 RGB 缓冲（懒分配复用，避免每帧 malloc/free）
+    std::vector<uint8_t> resized_rgb_buffer_;
+    std::string last_preprocess_error_;  ///< 最近一次 RGA 错误，仅检测线程访问
 
-    /// 查询模型信息并解析输入尺寸/类别数/分支结构。
+    /// 查询模型信息并识别单输出 `[1,5,N]` 或旧版多分支结构。
     bool QueryModelInfo() {
         rknn_sdk_version sdk_version{};
         int ret = rknn_query(ctxs_[0], RKNN_QUERY_SDK_VERSION, &sdk_version,
@@ -228,6 +217,20 @@ struct RknnDetectionBackend::Impl {
             }
         }
 
+        // 打印全部输出张量形状（一次性，用于核对模型导出格式：
+        // 非 end2end 应为 6 个 [1,4,H,W]/[1,C,H,W]；end2end 通常为 [1,N,6/7]）。
+        for (uint32_t i = 0; i < io_num_.n_output; ++i) {
+            std::string dims_str;
+            for (uint32_t d = 0; d < output_attrs_[i].n_dims; ++d) {
+                if (d > 0) {
+                    dims_str += "x";
+                }
+                dims_str += std::to_string(output_attrs_[i].dims[d]);
+            }
+            SPDLOG_INFO("RKNN 输出[{}]: 形状={} 布局={}", i, dims_str,
+                        static_cast<int>(output_attrs_[i].fmt));
+        }
+
         // 解析模型输入尺寸（NCHW 或 NHWC）
         if (input_attrs_[0].fmt == RKNN_TENSOR_NCHW) {
             model_channel_ = static_cast<int>(input_attrs_[0].dims[1]);
@@ -239,18 +242,37 @@ struct RknnDetectionBackend::Impl {
             model_channel_ = static_cast<int>(input_attrs_[0].dims[3]);
         }
 
-        // 类别数取第一个 score 输出张量的通道数
+        // 新模型：单输出 `[1,5,N]`，通道依次为归一化 xywh + confidence。
+        if (io_num_.n_output == 1 && output_attrs_[0].n_dims == 3 &&
+            output_attrs_[0].dims[1] == 5) {
+            output_mode_ = OutputMode::kNormalizedXywh;
+            num_classes_ = 1;
+            single_output_candidates_ = static_cast<int>(output_attrs_[0].dims[2]);
+            if (output_attrs_[0].type != RKNN_TENSOR_INT8) {
+                SPDLOG_ERROR("RKNN 单输出张量类型不支持: type={}，当前仅支持 INT8 零拷贝输出",
+                             static_cast<int>(output_attrs_[0].type));
+                return false;
+            }
+            SPDLOG_INFO("RKNN 模型: 输入={}x{}x{}，单输出=[1,5,{}]，坐标=归一化xywh",
+                        model_width_, model_height_, model_channel_,
+                        single_output_candidates_);
+            return model_width_ > 0 && model_height_ > 0 &&
+                   single_output_candidates_ > 0;
+        }
+
+        // 兼容旧模型：3 分支 × (box + score [+ score_sum])。
+        output_mode_ = OutputMode::kMultiBranch;
         if (io_num_.n_output >= 2) {
             num_classes_ = static_cast<int>(output_attrs_[1].dims[1]);
         }
-        // 分支结构：YOLO26 非 end2end 输出 = 3 分支 × (box + score [+ score_sum])
         outputs_per_branch_ = io_num_.n_output / 3;
         const int dfl_len = static_cast<int>(output_attrs_[0].dims[1]) / 4;
 
         SPDLOG_INFO("RKNN 模型: 输入={}x{}x{} 输出={} 类别数={} 每分支输出={} dfl_len={}",
                     model_width_, model_height_, model_channel_, io_num_.n_output,
                     num_classes_, outputs_per_branch_, dfl_len);
-        return model_width_ > 0 && model_height_ > 0 && num_classes_ > 0;
+        return model_width_ > 0 && model_height_ > 0 && num_classes_ > 0 &&
+               (outputs_per_branch_ == 2 || outputs_per_branch_ == 3);
     }
 
     /// 分配输入输出内存并绑定。
@@ -338,14 +360,19 @@ struct RknnDetectionBackend::Impl {
     int Nv12LetterboxToRgb(const uint8_t* src, int src_w, int src_h, int src_wstride,
                            int target_size, uint8_t* dst_rgb, LetterBox* letterbox,
                            uint8_t fill_color = 114) {
+        last_preprocess_error_.clear();
         if (src == nullptr || dst_rgb == nullptr || target_size <= 0 ||
             letterbox == nullptr) {
+            last_preprocess_error_ = "输入指针或尺寸非法";
             return -1;
         }
         const int wstride = src_wstride > 0 ? src_wstride : src_w;
+        // im2d.hpp 六参数重载顺序是 width/height/format/wstride/hstride。
+        // 旧代码把 format 放在最后，导致 RGA 将 height 当成 wstride，报
+        // "wstride=720 < width=1280"。
         rga_buffer_t src_buf = wrapbuffer_virtualaddr(
-            const_cast<uint8_t*>(src), src_w, src_h, wstride, src_h,
-            RK_FORMAT_YCbCr_420_SP);
+            const_cast<uint8_t*>(src), src_w, src_h, RK_FORMAT_YCbCr_420_SP,
+            wstride, src_h);
 
         // 源已是目标尺寸：RGA 完成 NV12→RGB 色彩转换
         if (src_w == target_size && src_h == target_size) {
@@ -354,7 +381,7 @@ struct RknnDetectionBackend::Impl {
             const IM_STATUS status =
                 imcvtcolor(src_buf, dst_buf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
             if (status != IM_STATUS_SUCCESS) {
-                SPDLOG_ERROR("RGA 色彩转换失败: {}", imStrError(status));
+                last_preprocess_error_ = imStrError(status);
                 return -1;
             }
             letterbox->scale = 1.f;
@@ -363,45 +390,43 @@ struct RknnDetectionBackend::Impl {
             return 0;
         }
 
-        // 计算等比缩放尺寸
+        // 与通过验证的 Python 参考实现一致：round 后等比缩放，再居中填充 114。
         const float scale = std::min(static_cast<float>(target_size) / src_w,
                                      static_cast<float>(target_size) / src_h);
-        const int new_width = static_cast<int>(src_w * scale);
-        const int new_height = static_cast<int>(src_h * scale);
-
-        // 缩放后恰好等于目标尺寸：RGA 缩放 + 色彩转换一次完成
-        if (new_width == target_size && new_height == target_size) {
-            rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
-                dst_rgb, target_size, target_size, RK_FORMAT_RGB_888);
-            const IM_STATUS status = imresize(src_buf, dst_buf, scale, scale,
-                                              INTER_LINEAR);
-            if (status != IM_STATUS_SUCCESS) {
-                SPDLOG_ERROR("RGA 缩放失败: {}", imStrError(status));
-                return -1;
-            }
-            letterbox->scale = scale;
-            letterbox->x_pad = 0;
-            letterbox->y_pad = 0;
-            return 0;
-        }
-
-        // 居中填充背景色，缩放写入偏移位置
+        const int new_width = static_cast<int>(std::lround(src_w * scale));
+        const int new_height = static_cast<int>(std::lround(src_h * scale));
         const int pad_left = (target_size - new_width) / 2;
         const int pad_top = (target_size - new_height) / 2;
-        std::memset(dst_rgb, fill_color,
-                    static_cast<std::size_t>(target_size) * target_size * 3);
-        rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
-            dst_rgb + (pad_top * target_size + pad_left) * 3,
-            new_width, new_height, RK_FORMAT_RGB_888);
-        const IM_STATUS status = imresize(src_buf, dst_buf, scale, scale,
+
+        // RGA 输出先写入连续的缩放 RGB 缓冲，再逐行放入带目标 stride 的
+        // letterbox 画布；不能把画布内部地址包装成紧凑 new_width stride，
+        // 否则第二行起会写错位置。
+        resized_rgb_buffer_.resize(static_cast<std::size_t>(new_width) *
+                                   new_height * 3);
+        rga_buffer_t resized_buf = wrapbuffer_virtualaddr(
+            resized_rgb_buffer_.data(), new_width, new_height, RK_FORMAT_RGB_888);
+        const IM_STATUS status = imresize(src_buf, resized_buf, scale, scale,
                                           INTER_LINEAR);
         if (status != IM_STATUS_SUCCESS) {
-            SPDLOG_ERROR("RGA letterbox 缩放失败: {}", imStrError(status));
+            last_preprocess_error_ = imStrError(status);
             return -1;
+        }
+
+        std::memset(dst_rgb, fill_color,
+                    static_cast<std::size_t>(target_size) * target_size * 3);
+        const std::size_t src_row_bytes = static_cast<std::size_t>(new_width) * 3;
+        const std::size_t dst_row_bytes = static_cast<std::size_t>(target_size) * 3;
+        for (int row = 0; row < new_height; ++row) {
+            std::memcpy(dst_rgb + (static_cast<std::size_t>(pad_top + row) *
+                                  dst_row_bytes + static_cast<std::size_t>(pad_left) * 3),
+                        resized_rgb_buffer_.data() + static_cast<std::size_t>(row) *
+                                                         src_row_bytes,
+                        src_row_bytes);
         }
         letterbox->scale = scale;
         letterbox->x_pad = pad_left;
         letterbox->y_pad = pad_top;
+        last_preprocess_error_.clear();
         return 0;
     }
 
@@ -424,45 +449,29 @@ struct RknnDetectionBackend::Impl {
         const int height = static_cast<int>(info.height);
         const int hor_stride = static_cast<int>(info.hor_stride);
 
-        // 居中裁剪正方形（16 对齐），与后处理输出坐标约定一致
-        const CropRect crop = ComputeCenterCrop(width, height);
-        if (crop.side <= 0) {
+        if (model_width_ != model_height_) {
+            const uint64_t errors = error_count.fetch_add(1) + 1;
+            if (ShouldLogThrottled(errors)) {
+                SPDLOG_ERROR("RKNN 后端暂只支持正方形模型输入，实际={}x{}，累计 {}",
+                             model_width_, model_height_, errors);
+            }
             return out;
         }
 
-        // 裁剪缓冲复用（懒分配）
-        if (crop_buffer_side_ != crop.side) {
-            crop_buffer_.resize(static_cast<std::size_t>(crop.side) * crop.side * 3 / 2);
-            crop_buffer_side_ = crop.side;
-        }
-
-        // RGA 裁剪（NV12 → NV12）
-        {
-            rga_buffer_t src_buf = wrapbuffer_virtualaddr(
-                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(frame.Data())),
-                width, height, hor_stride, height, RK_FORMAT_YCbCr_420_SP);
-            rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
-                crop_buffer_.data(), crop.side, crop.side, RK_FORMAT_YCbCr_420_SP);
-            const im_rect rect = {crop.x, crop.y, crop.side, crop.side};
-            const IM_STATUS status = imcrop(src_buf, dst_buf, rect);
-            if (status != IM_STATUS_SUCCESS) {
-                const uint64_t errors = error_count.fetch_add(1) + 1;
-                if (ShouldLogThrottled(errors)) {
-                    SPDLOG_ERROR("RGA 裁剪失败: {}，累计 {}", imStrError(status), errors);
-                }
-                return out;
-            }
-        }
-
-        // letterbox 写入模型输入内存（NV12 → RGB888，含色彩转换）
+        // 对完整原图做 letterbox，与已通过验证的 Python 参考代码一致；不再先
+        // 居中裁成正方形，避免丢失 16:9 画面左右区域。
         LetterBox letterbox;
         const int ret = Nv12LetterboxToRgb(
-            crop_buffer_.data(), crop.side, crop.side, crop.side, model_width_,
-            static_cast<uint8_t*>(input_mems_[0][0]->virt_addr), &letterbox);
+            reinterpret_cast<const uint8_t*>(frame.Data()), width, height, hor_stride,
+            model_width_, static_cast<uint8_t*>(input_mems_[0][0]->virt_addr),
+            &letterbox);
         if (ret != 0) {
             const uint64_t errors = error_count.fetch_add(1) + 1;
             if (ShouldLogThrottled(errors)) {
-                SPDLOG_ERROR("RKNN 预处理失败，累计 {}", errors);
+                SPDLOG_ERROR("RKNN 预处理失败: {}，累计 {}",
+                             last_preprocess_error_.empty() ? "未知 RGA 错误"
+                                                            : last_preprocess_error_,
+                             errors);
             }
             return out;
         }
@@ -482,57 +491,66 @@ struct RknnDetectionBackend::Impl {
             const int8_t* src = static_cast<int8_t*>(output_mems_[0][i]->virt_addr);
             int8_t* dst = output_buffers_[i].data();
             if (output_native_attrs_[i].fmt == RKNN_TENSOR_NC1HWC2) {
+                const int logical_h = output_attrs_[i].n_dims == 3
+                                          ? 1
+                                          : static_cast<int>(output_attrs_[i].dims[2]);
+                const int logical_w = output_attrs_[i].n_dims == 3
+                                          ? static_cast<int>(output_attrs_[i].dims[2])
+                                          : static_cast<int>(output_attrs_[i].dims[3]);
                 ConvertNc1hwc2ToNchw(
                     src, dst, output_native_attrs_[i],
-                    static_cast<int>(output_attrs_[i].dims[1]),
-                    static_cast<int>(output_attrs_[i].dims[2]),
-                    static_cast<int>(output_attrs_[i].dims[3]));
+                    static_cast<int>(output_attrs_[i].dims[1]), logical_h, logical_w);
             } else {
                 std::memcpy(dst, src, output_native_attrs_[i].n_elems);
             }
         }
 
-        // 组织分支输出并后处理
-        std::vector<BranchOutput> branches;
-        branches.reserve(3);
-        for (int i = 0; i < 3; ++i) {
-            const int box_idx = i * outputs_per_branch_;
-            const int score_idx = box_idx + 1;
-            if (score_idx >= static_cast<int>(io_num_.n_output)) {
-                break;
+        std::vector<YoloDetection> detections;
+        if (output_mode_ == OutputMode::kNormalizedXywh) {
+            NormalizedXywhTensor tensor;
+            tensor.data = output_buffers_[0].data();
+            tensor.zp = output_attrs_[0].zp;
+            tensor.scale = output_attrs_[0].scale;
+            tensor.channels = 5;
+            tensor.candidate_count = single_output_candidates_;
+            (void)PostProcessNormalizedXywh(
+                tensor, model_width_, model_height_, conf_threshold, nms_threshold,
+                0, letterbox, &detections);
+        } else {
+            std::vector<BranchOutput> branches;
+            branches.reserve(3);
+            for (int i = 0; i < 3; ++i) {
+                const int box_idx = i * outputs_per_branch_;
+                const int score_idx = box_idx + 1;
+                if (score_idx >= static_cast<int>(io_num_.n_output)) {
+                    break;
+                }
+                BranchOutput branch;
+                branch.box = MakeTensor(output_buffers_[box_idx].data(),
+                                        output_attrs_[box_idx]);
+                branch.score = MakeTensor(output_buffers_[score_idx].data(),
+                                          output_attrs_[score_idx]);
+                if (outputs_per_branch_ == 3 &&
+                    box_idx + 2 < static_cast<int>(io_num_.n_output)) {
+                    branch.score_sum = MakeTensor(output_buffers_[box_idx + 2].data(),
+                                                  output_attrs_[box_idx + 2]);
+                }
+                branches.push_back(std::move(branch));
             }
-            BranchOutput branch;
-            branch.box = MakeTensor(output_buffers_[box_idx].data(), output_attrs_[box_idx]);
-            branch.score =
-                MakeTensor(output_buffers_[score_idx].data(), output_attrs_[score_idx]);
-            if (outputs_per_branch_ == 3 &&
-                box_idx + 2 < static_cast<int>(io_num_.n_output)) {
-                branch.score_sum = MakeTensor(output_buffers_[box_idx + 2].data(),
-                                              output_attrs_[box_idx + 2]);
-            }
-            branches.push_back(std::move(branch));
+            (void)PostProcess(branches, model_width_, conf_threshold, nms_threshold,
+                              num_classes_, letterbox, &detections);
         }
 
-        std::vector<YoloDetection> detections;
-        const int count = PostProcess(branches, model_width_, conf_threshold,
-                                      nms_threshold, num_classes_, letterbox,
-                                      &detections);
-        (void)count;
-
-        // 叠加裁剪偏移还原原图坐标，过滤退化框
+        // 后处理已撤销完整原图的 letterbox，直接限制到原图范围并过滤退化框。
         out.reserve(detections.size());
         for (const auto& d : detections) {
             BackendDetection bd;
             bd.class_id = d.class_id;
             bd.confidence = d.confidence;
-            bd.x1 = ClampF(d.x1 + static_cast<float>(crop.x), 0.f,
-                           static_cast<float>(width));
-            bd.y1 = ClampF(d.y1 + static_cast<float>(crop.y), 0.f,
-                           static_cast<float>(height));
-            bd.x2 = ClampF(d.x2 + static_cast<float>(crop.x), 0.f,
-                           static_cast<float>(width));
-            bd.y2 = ClampF(d.y2 + static_cast<float>(crop.y), 0.f,
-                           static_cast<float>(height));
+            bd.x1 = ClampF(d.x1, 0.f, static_cast<float>(width));
+            bd.y1 = ClampF(d.y1, 0.f, static_cast<float>(height));
+            bd.x2 = ClampF(d.x2, 0.f, static_cast<float>(width));
+            bd.y2 = ClampF(d.y2, 0.f, static_cast<float>(height));
             if (bd.x2 > bd.x1 && bd.y2 > bd.y1) {
                 out.push_back(bd);
             }
@@ -592,9 +610,11 @@ bool RknnDetectionBackend::Load() {
     }
 
     impl_->loaded = true;
-    SPDLOG_INFO("RKNN 后端加载成功: 模型={} 输入={}x{} 类别数={}",
+    SPDLOG_INFO("RKNN 后端加载成功: 模型={} 输入={}x{} 输出模式={}",
                 impl_->model_path, impl_->model_width_, impl_->model_height_,
-                impl_->num_classes_);
+                impl_->output_mode_ == Impl::OutputMode::kNormalizedXywh
+                    ? "单输出归一化xywh"
+                    : "多分支");
     return true;
 }
 

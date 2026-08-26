@@ -36,8 +36,10 @@ class CameraReceiver final : public ICameraReceiver {
 ## 3. 关键实现点
 
 - **FFmpeg avformat**：`avformat_open_input` + `avformat_find_stream_info`，选项：
-  `rtsp_transport`（tcp/udp）、`fflags=nobuffer`、`probesize/analyzeduration` 限制探测时间、
-  `stimeout` 超时（微秒）。
+  `rtsp_transport`（tcp/udp）、`fflags=nobuffer+discardcorrupt`、`reorder_queue_size=0`
+  （禁用 RTP 重排，防 SPS/PPS 与 IDR 顺序打乱）、`max_delay=0`、`buffer_size=102400`、
+  `probesize/analyzeduration` 限制探测时间、`stimeout` 超时（微秒）。
+  以上选项与实测可稳定拉本摄像头 H265 流的原型 `videoPart/rtsp_yolo_stream` 一致。
 - **中断回调**：`format_ctx->interrupt_callback` 的 `opaque` 指向实现对象，回调检查停止标志；
   `Stop()` 置位后阻塞中的 `av_read_frame` 尽快返回（`AVERROR_EXIT`），保证确定性停机。
 - **断线重连**：`av_read_frame` 失败 → 关闭连接 → 等待 `reconnect_delay` → 重新 `OpenStream`。
@@ -70,6 +72,7 @@ class CameraReceiver final : public ICameraReceiver {
 | 现象 | 排查方向 |
 |------|----------|
 | 一直 `打开 RTSP 失败` | 地址/端口、`rtsp_transport` 是否与源匹配、`open_timeout` 是否过短、防火墙 |
+| `Server returned 404 Not Found` | RTSP 应用路径不对。**网络已通（能收到服务器 404 响应）**，是 URL 尾缀错误。需用摄像头实际提供的应用路径，本项目摄像头实测为 `/main.264`（见 `rtsp_yolo_stream.log` 成功记录）；`/main`、`/live` 均不可用。改 `config/config.json` 的 `video.input_rtsp` |
 | 频繁断流重连 | 网络抖动；`fflags=nobuffer` 会放大丢包，必要时调小 `reconnect_delay` 或加大缓冲 |
 | 摄像头不支持 RTSP | 替换实现类（保持 `ICameraReceiver` 接口），参考通信与数据定义 §11 厂商协议 |
 | 改重连策略 | `reconnect_delay`；如需退避（指数/上限）在 `ReceiveLoop` 中扩展 |

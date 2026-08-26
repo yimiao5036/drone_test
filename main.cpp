@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/types.h>  // ssize_t
 #include <unistd.h>     // readlink
@@ -13,22 +14,12 @@
 #include <nlohmann/json.hpp>
 
 #include "common/logger.h"
-#include "common/topic.h"
-#include "common/types.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
 #include "video/video_decoder.h"
-#include "video/video_frame.h"
 #include "perception/yolo_detector.h"
 #include "video_transmission/video_sender.h"
 #include "perception/detection_backend.h"  // IDetectionBackend 完整类型（YoloDetector 析构）
-
-// 全局视频链路主题（跨模块共享，线程间解耦通信）。
-// 名称对应 common::topics::kCameraStream / kDecodedFrame / kDetection / kAnnotatedFrame。
-drone::common::Topic<drone::common::EncodedFrame> g_camera_stream_topic;   // ICameraReceiver → IVideoDecoder
-drone::common::Topic<drone::video::FrameHandle> g_decoded_frame_topic;      // IVideoDecoder → YOLO/叠加
-drone::common::Topic<drone::common::DetectionResult> g_detection_topic;     // IYoloDetector → 叠加
-drone::common::Topic<drone::video::FrameHandle> g_annotated_topic;          // 叠加 → 图传
 
 namespace {
 
@@ -147,11 +138,37 @@ int main() {
     }
     const float conf_threshold = yolo_cfg.value("conf_threshold", 0.25f);
     const float nms_threshold = yolo_cfg.value("nms_threshold", 0.45f);
+    const std::uint64_t max_detection_frame_lag =
+        yolo_cfg.value("max_detection_frame_lag", 10ULL);
+    std::vector<std::string> class_names{"UAV", "OBS"};
+    const auto class_names_it = yolo_cfg.find("class_names");
+    if (class_names_it != yolo_cfg.end()) {
+        if (class_names_it->is_array()) {
+            std::vector<std::string> configured_names;
+            configured_names.reserve(class_names_it->size());
+            bool valid = true;
+            for (const auto& item : *class_names_it) {
+                if (!item.is_string()) {
+                    valid = false;
+                    break;
+                }
+                configured_names.push_back(item.get<std::string>());
+            }
+            if (valid && !configured_names.empty()) {
+                class_names = std::move(configured_names);
+            } else {
+                SPDLOG_WARN("YOLO class_names 必须是非空字符串数组，使用默认类别名称");
+            }
+        } else {
+            SPDLOG_WARN("YOLO class_names 不是数组，使用默认类别名称");
+        }
+    }
 
     SPDLOG_INFO("视频链路配置: 输入={} 输出={} 帧率={} 码率={}", input_url, output_url,
                 fps, bitrate);
-    SPDLOG_INFO("YOLO 配置: 模型={} conf={} nms={}", model_path, conf_threshold,
-                nms_threshold);
+    SPDLOG_INFO("YOLO 配置: 模型={} conf={} nms={} 类别名称数={} 旧框保留={}帧",
+                model_path, conf_threshold, nms_threshold, class_names.size(),
+                max_detection_frame_lag);
 
     // 4. 装配视频链路（依赖注入绑定输入、输出主题）
     //    摄像头拉流 → 解码 → YOLO 识别 → 叠加 → 编码推流
@@ -177,6 +194,8 @@ int main() {
     drone::video::CompositorConfig compose_cfg;
     compose_cfg.pool_capacity = 8;
     compose_cfg.draw_text = true;
+    compose_cfg.class_names = class_names;
+    compose_cfg.max_detection_frame_lag = max_detection_frame_lag;
     auto compositor = std::make_unique<drone::video::FrameCompositor>(compose_cfg);
 
     drone::video_transmission::VideoSenderConfig sender_cfg;
@@ -191,12 +210,12 @@ int main() {
     auto sender = std::make_unique<drone::video_transmission::VideoSender>(
         std::move(sender_cfg));
 
-    // 5. 接线（Topic 依赖注入）
+    // 5. 接线（直接订阅各部件真实输出 Topic，避免装配到无生产者的孤立 Topic）
     decoder->SetInput(camera->StreamOutput());
-    detector->SetInput(g_decoded_frame_topic);
-    compositor->SetDecodedInput(g_decoded_frame_topic);
-    compositor->SetDetectionInput(g_detection_topic);
-    sender->SetInput(g_annotated_topic);
+    detector->SetInput(decoder->FrameOutput());
+    compositor->SetDecodedInput(decoder->FrameOutput());
+    compositor->SetDetectionInput(detector->DetectionOutput());
+    sender->SetInput(compositor->AnnotatedOutput());
 
     // 6. 注册 Ctrl+C / SIGTERM 停机
     std::signal(SIGINT, OnSignal);
