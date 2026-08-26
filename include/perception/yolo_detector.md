@@ -119,9 +119,10 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   一致性；再核对裁剪偏移叠加；用单目标单色场景在香橙派打点验证。
 - **推理耗时异常**：确认 3 核上下文与 `RKNN_NPU_CORE_ALL`；检查是否误用
   `RKNN_FLAG_COLLECT_PERF_MASK`（原型已去除）。
-- **RGA 接口差异**：`wrapbuffer_virtualaddr` 带 stride 重载、`im2d.hpp` 常量
-  （`INTER_LINEAR`、`IM_STATUS_SUCCESS`）以香橙派实际安装的 librga 版本为准，
-  实机联调时核对；`/usr/include/rga` 缺失时 `apt install librga-dev`。
+- **RGA 接口差异**：香橙派当前 `im2d.hpp` 的 `wrapbuffer_virtualaddr` 六参数顺序为
+  `地址, width, height, format, wstride, hstride`。若误写成把 format 放在最后，会出现
+  `wstride=720, width=1280` 的 Invalid parameters。预处理内部 RGA 错误由外层按第 1 次和
+  每 100 次节流，避免逐帧刷屏。`/usr/include/rga` 缺失时安装对应 librga 开发包。
 - **修改关联**：`DetectionResult` 字段与 `docs/数据接口文档.md` §2 冻结，改动需同步
   文档并重跑 `yolo_detector_test`；后处理数值逻辑改动需同步原型
   `videoPart/yolo26-rknn`（避免两套实现漂移）；`IDetectionBackend` 新增后端时

@@ -157,6 +157,7 @@ struct RknnDetectionBackend::Impl {
 
     // letterbox 缩放临时 RGB 缓冲（懒分配复用，避免每帧 malloc/free）
     std::vector<uint8_t> resized_rgb_buffer_;
+    std::string last_preprocess_error_;  ///< 最近一次 RGA 错误，仅检测线程访问
 
     /// 查询模型信息并识别单输出 `[1,5,N]` 或旧版多分支结构。
     bool QueryModelInfo() {
@@ -359,14 +360,19 @@ struct RknnDetectionBackend::Impl {
     int Nv12LetterboxToRgb(const uint8_t* src, int src_w, int src_h, int src_wstride,
                            int target_size, uint8_t* dst_rgb, LetterBox* letterbox,
                            uint8_t fill_color = 114) {
+        last_preprocess_error_.clear();
         if (src == nullptr || dst_rgb == nullptr || target_size <= 0 ||
             letterbox == nullptr) {
+            last_preprocess_error_ = "输入指针或尺寸非法";
             return -1;
         }
         const int wstride = src_wstride > 0 ? src_wstride : src_w;
+        // im2d.hpp 六参数重载顺序是 width/height/format/wstride/hstride。
+        // 旧代码把 format 放在最后，导致 RGA 将 height 当成 wstride，报
+        // "wstride=720 < width=1280"。
         rga_buffer_t src_buf = wrapbuffer_virtualaddr(
-            const_cast<uint8_t*>(src), src_w, src_h, wstride, src_h,
-            RK_FORMAT_YCbCr_420_SP);
+            const_cast<uint8_t*>(src), src_w, src_h, RK_FORMAT_YCbCr_420_SP,
+            wstride, src_h);
 
         // 源已是目标尺寸：RGA 完成 NV12→RGB 色彩转换
         if (src_w == target_size && src_h == target_size) {
@@ -375,7 +381,7 @@ struct RknnDetectionBackend::Impl {
             const IM_STATUS status =
                 imcvtcolor(src_buf, dst_buf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
             if (status != IM_STATUS_SUCCESS) {
-                SPDLOG_ERROR("RGA 色彩转换失败: {}", imStrError(status));
+                last_preprocess_error_ = imStrError(status);
                 return -1;
             }
             letterbox->scale = 1.f;
@@ -402,7 +408,7 @@ struct RknnDetectionBackend::Impl {
         const IM_STATUS status = imresize(src_buf, resized_buf, scale, scale,
                                           INTER_LINEAR);
         if (status != IM_STATUS_SUCCESS) {
-            SPDLOG_ERROR("RGA letterbox 缩放失败: {}", imStrError(status));
+            last_preprocess_error_ = imStrError(status);
             return -1;
         }
 
@@ -420,6 +426,7 @@ struct RknnDetectionBackend::Impl {
         letterbox->scale = scale;
         letterbox->x_pad = pad_left;
         letterbox->y_pad = pad_top;
+        last_preprocess_error_.clear();
         return 0;
     }
 
@@ -461,7 +468,10 @@ struct RknnDetectionBackend::Impl {
         if (ret != 0) {
             const uint64_t errors = error_count.fetch_add(1) + 1;
             if (ShouldLogThrottled(errors)) {
-                SPDLOG_ERROR("RKNN 预处理失败，累计 {}", errors);
+                SPDLOG_ERROR("RKNN 预处理失败: {}，累计 {}",
+                             last_preprocess_error_.empty() ? "未知 RGA 错误"
+                                                            : last_preprocess_error_,
+                             errors);
             }
             return out;
         }
