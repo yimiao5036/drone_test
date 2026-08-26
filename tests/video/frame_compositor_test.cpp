@@ -191,7 +191,7 @@ TEST_F(FrameCompositorTest, UsesConfiguredClassNameAndNormalizesLowercase) {
     // 若 JSON 配置名未生效、未转大写或 L 字模缺失，此处仍会保持输入亮度 128。
     const auto& annotated = **message;
     const std::size_t l_top_left = 23u * annotated.Info().hor_stride + 16u;
-    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[l_top_left]), 230u);
+    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[l_top_left]), 82u);
     configured_compositor.Stop();
 }
 
@@ -238,7 +238,7 @@ TEST_F(FrameCompositorTest, NewDetectionFrameReplacesHistoricalBoxes) {
     const std::size_t old_position = 30u * annotated.Info().hor_stride + 4u;
     const std::size_t new_position = 30u * annotated.Info().hor_stride + 40u;
     EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[old_position]), 128u);
-    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[new_position]), 230u);
+    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[new_position]), 82u);
     configured_compositor.Stop();
 }
 

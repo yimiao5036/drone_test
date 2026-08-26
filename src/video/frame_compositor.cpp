@@ -70,16 +70,16 @@ struct Nv12Surface {
     }
 };
 
-/// 绘制一个像素（含色）：Y 亮度 + 对应采样 U/V 置为彩色。
-/// box 以亮黄绿高对比色：Y=230，U/V 选为明显区别于无色的绿色调。
+/// 绘制一个像素（含色）：Y 亮度 + 对应采样 U/V 置为红色。
+/// NV12 红色近似值采用 Y=82、U=90、V=240，框和文字统一为红色。
 inline void PlotPixel(Nv12Surface& s, uint32_t x, uint32_t y) {
     if (x >= s.hor_stride || y >= s.height) {
         return;
     }
-    // 亮绿色边框：Y 高亮，U/V 取绿色域（NV12 YUV：绿色 ≈ U=149,V=43 区段）
-    *s.Y(x, y) = static_cast<std::byte>(230);
-    *s.U(x, y) = static_cast<std::byte>(150);
-    *s.V(x, y) = static_cast<std::byte>(44);
+    // 高饱和红色（limited-range YUV 近似值）。
+    *s.Y(x, y) = static_cast<std::byte>(82);
+    *s.U(x, y) = static_cast<std::byte>(90);
+    *s.V(x, y) = static_cast<std::byte>(240);
 }
 
 // ---------------------------------------------------------------------------

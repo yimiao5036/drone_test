@@ -52,7 +52,8 @@ kDetection(DetectionResult) ──────┘
 从机制上杜绝竞态。代价是按帧一次 `memcpy`（3MB@1080p），相对编码耗时可忽略。
 
 ### NV12 叠加（零外部依赖，不引 OpenCV/FreeType）
-- **检测框**：`DrawBox` 沿边框描亮绿像素（每个像素改 Y=230 + 对应 UV 采样 → 显色）。
+- **检测框与文字颜色**：`DrawBox`/`DrawText` 统一调用 `PlotPixel` 绘制红色像素，
+  NV12 近似值为 Y=82、U=90、V=240。
 - **文字**：内置 5×7 点阵 ASCII 字模（A-Z、数字 0-9、空格、`. - %`），
   `DrawText` 按 scale 放大逐点画；标签格式 `配置名称 置信度%`（如 `BALLOON 85%`）。
   `ClassToken` 按 `class_id` 查询 `CompositorConfig::class_names`，越界或名称为空回退 `OBJ`；
