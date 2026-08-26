@@ -42,6 +42,8 @@ struct CompositorConfig {
     /// 类别名称表：数组下标即 class_id；越界或空名称显示 OBJ。
     /// 内置点阵支持 ASCII 字母/数字/空格/.-%，小写会自动转大写。
     std::vector<std::string> class_names{"UAV", "OBS"};
+    /// 当前解码帧比最近检测帧领先超过该数量时清除旧框；25fps 下默认约 400ms。
+    std::uint64_t max_detection_frame_lag = 10;
 };
 
 /// 视频帧叠加器。

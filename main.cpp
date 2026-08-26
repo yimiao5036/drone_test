@@ -138,6 +138,8 @@ int main() {
     }
     const float conf_threshold = yolo_cfg.value("conf_threshold", 0.25f);
     const float nms_threshold = yolo_cfg.value("nms_threshold", 0.45f);
+    const std::uint64_t max_detection_frame_lag =
+        yolo_cfg.value("max_detection_frame_lag", 10ULL);
     std::vector<std::string> class_names{"UAV", "OBS"};
     const auto class_names_it = yolo_cfg.find("class_names");
     if (class_names_it != yolo_cfg.end()) {
@@ -164,8 +166,9 @@ int main() {
 
     SPDLOG_INFO("视频链路配置: 输入={} 输出={} 帧率={} 码率={}", input_url, output_url,
                 fps, bitrate);
-    SPDLOG_INFO("YOLO 配置: 模型={} conf={} nms={} 类别名称数={}", model_path,
-                conf_threshold, nms_threshold, class_names.size());
+    SPDLOG_INFO("YOLO 配置: 模型={} conf={} nms={} 类别名称数={} 旧框保留={}帧",
+                model_path, conf_threshold, nms_threshold, class_names.size(),
+                max_detection_frame_lag);
 
     // 4. 装配视频链路（依赖注入绑定输入、输出主题）
     //    摄像头拉流 → 解码 → YOLO 识别 → 叠加 → 编码推流
@@ -192,6 +195,7 @@ int main() {
     compose_cfg.pool_capacity = 8;
     compose_cfg.draw_text = true;
     compose_cfg.class_names = class_names;
+    compose_cfg.max_detection_frame_lag = max_detection_frame_lag;
     auto compositor = std::make_unique<drone::video::FrameCompositor>(compose_cfg);
 
     drone::video_transmission::VideoSenderConfig sender_cfg;

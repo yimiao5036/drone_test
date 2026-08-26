@@ -259,8 +259,10 @@ struct FrameCompositor::Impl {
 
     // 检测结果跨线程暂存：检测订阅在消费线程读取，无需锁（单独线程）。
     // 但 SetDetectionInput 与等待循环同线程，这里存放"取帧时尚未处理的最新结果"。
+    // 只保留最新检测帧的一组目标；同一 frame_sequence 的多目标一起保留。
     std::vector<common::DetectionResult> pending_detections;
-    std::uint64_t last_applied_sequence = 0;
+    std::uint64_t latest_detection_frame_sequence = 0;
+    bool has_detection_frame_sequence = false;
 
     std::shared_ptr<VideoFramePool> pool;  // 输出标注帧池（懒建）
     std::atomic<uint64_t> annotated_count{0};
@@ -280,14 +282,39 @@ struct FrameCompositor::Impl {
                     pool->SlotSize());
     }
 
-    /// 取帧时把订阅队列里新到的检测结果拉出来暂存（异步对齐）。
+    /// 拉取检测结果，只保留最新 frame_sequence 的整组目标。
+    /// 旧实现持续 push_back 且从不清空，导致历史位置的框被每帧重复绘制。
     void DrainDetections() {
         for (;;) {
             auto msg = detection_sub.TryTake();
             if (!msg) {
                 break;
             }
-            pending_detections.push_back(**msg);
+            const auto& detection = **msg;
+            if (!has_detection_frame_sequence ||
+                detection.frame_sequence > latest_detection_frame_sequence) {
+                pending_detections.clear();
+                latest_detection_frame_sequence = detection.frame_sequence;
+                has_detection_frame_sequence = true;
+            }
+            if (detection.frame_sequence == latest_detection_frame_sequence) {
+                pending_detections.push_back(detection);
+            }
+            // 晚到的旧帧检测直接丢弃，避免框倒退到历史位置。
+        }
+    }
+
+    /// 连续无检测时按帧序号清除旧框，避免目标消失后最后一个框永久停留。
+    void ExpireStaleDetections(std::uint64_t current_frame_sequence) {
+        if (pending_detections.empty() || !has_detection_frame_sequence ||
+            current_frame_sequence <= latest_detection_frame_sequence) {
+            return;
+        }
+        if (current_frame_sequence - latest_detection_frame_sequence >
+            config.max_detection_frame_lag) {
+            pending_detections.clear();
+            latest_detection_frame_sequence = 0;
+            has_detection_frame_sequence = false;
         }
     }
 
@@ -309,6 +336,10 @@ struct FrameCompositor::Impl {
                 }
                 continue;
             }
+            // 检测 Topic 不会唤醒 decoded_sub 的等待；取到帧后再拉一次，确保等待
+            // 期间到达的新检测在本帧立即生效，而不是延迟到下一帧。
+            DrainDetections();
+            ExpireStaleDetections(in_handle.Info().sequence);
             Compose(in_handle, pending_detections);
         }
     }

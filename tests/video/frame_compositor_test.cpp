@@ -68,12 +68,16 @@ protected:
         compositor_.reset();
     }
 
-    /// 发布一帧有效的纯色 NV12 帧。
-    void PublishDecodedFrame() {
+    /// 向指定主题发布一帧有效的纯色 NV12 帧。
+    void PublishFrameTo(common::Topic<video::FrameHandle>& topic) {
         auto handle = source_pool_->Acquire();
         ASSERT_TRUE(handle.Valid());
         std::memset(handle.Data(), 128, source_pool_->SlotSize());
-        (void)decoded_topic_.Emplace(std::move(handle));
+        (void)topic.Emplace(std::move(handle));
+    }
+
+    void PublishDecodedFrame() {
+        PublishFrameTo(decoded_topic_);
     }
 
     /// 发布一个空句柄（无效帧场景）。
@@ -83,8 +87,9 @@ protected:
 
     /// 构造并发布一条检测结果。
     void PublishDetection(uint32_t class_id, float conf, float x, float y,
-                          float w, float h) {
+                          float w, float h, std::uint64_t frame_sequence = 0) {
         common::DetectionResult d;
+        d.frame_sequence = frame_sequence;
         d.class_id = class_id;
         d.confidence = conf;
         d.bbox_x = x;
@@ -187,6 +192,105 @@ TEST_F(FrameCompositorTest, UsesConfiguredClassNameAndNormalizesLowercase) {
     const auto& annotated = **message;
     const std::size_t l_top_left = 23u * annotated.Info().hor_stride + 16u;
     EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[l_top_left]), 230u);
+    configured_compositor.Stop();
+}
+
+TEST_F(FrameCompositorTest, NewDetectionFrameReplacesHistoricalBoxes) {
+    CompositorConfig config;
+    config.pool_capacity = 2;
+    config.draw_text = false;
+    FrameCompositor configured_compositor(config);
+    common::Topic<video::FrameHandle> decoded;
+    common::Topic<common::DetectionResult> detections;
+    configured_compositor.SetDecodedInput(decoded);
+    configured_compositor.SetDetectionInput(detections);
+    auto output = configured_compositor.AnnotatedOutput().Subscribe(2);
+    ASSERT_TRUE(configured_compositor.Start());
+
+    common::DetectionResult old_detection;
+    old_detection.frame_sequence = 10;
+    old_detection.class_id = 0;
+    old_detection.confidence = 0.9f;
+    old_detection.bbox_x = 4.f;
+    old_detection.bbox_y = 30.f;
+    old_detection.bbox_w = 10.f;
+    old_detection.bbox_h = 10.f;
+    (void)detections.Emplace(old_detection);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    PublishFrameTo(decoded);
+    ASSERT_TRUE(WaitFor([&configured_compositor] {
+        return configured_compositor.AnnotatedCount() == 1;
+    }));
+    EXPECT_TRUE(output.WaitTakeFor(std::chrono::milliseconds(1000)).has_value());
+
+    common::DetectionResult new_detection = old_detection;
+    new_detection.frame_sequence = 11;
+    new_detection.bbox_x = 40.f;
+    (void)detections.Emplace(new_detection);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    PublishFrameTo(decoded);
+    ASSERT_TRUE(WaitFor([&configured_compositor] {
+        return configured_compositor.AnnotatedCount() == 2;
+    }));
+    auto message = output.WaitTakeFor(std::chrono::milliseconds(1000));
+    ASSERT_TRUE(message.has_value());
+    const auto& annotated = **message;
+    const std::size_t old_position = 30u * annotated.Info().hor_stride + 4u;
+    const std::size_t new_position = 30u * annotated.Info().hor_stride + 40u;
+    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[old_position]), 128u);
+    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[new_position]), 230u);
+    configured_compositor.Stop();
+}
+
+TEST_F(FrameCompositorTest, ClearsDetectionAfterConfiguredFrameLag) {
+    CompositorConfig config;
+    config.pool_capacity = 2;
+    config.draw_text = false;
+    config.max_detection_frame_lag = 1;
+    FrameCompositor configured_compositor(config);
+    common::Topic<video::FrameHandle> decoded;
+    common::Topic<common::DetectionResult> detections;
+    configured_compositor.SetDecodedInput(decoded);
+    configured_compositor.SetDetectionInput(detections);
+    auto output = configured_compositor.AnnotatedOutput().Subscribe(2);
+    ASSERT_TRUE(configured_compositor.Start());
+
+    auto first_frame = source_pool_->Acquire();
+    ASSERT_TRUE(first_frame.Valid());
+    const std::uint64_t detection_sequence = first_frame.Info().sequence;
+    std::memset(first_frame.Data(), 128, source_pool_->SlotSize());
+
+    common::DetectionResult detection;
+    detection.frame_sequence = detection_sequence;
+    detection.class_id = 0;
+    detection.confidence = 0.9f;
+    detection.bbox_x = 4.f;
+    detection.bbox_y = 30.f;
+    detection.bbox_w = 10.f;
+    detection.bbox_h = 10.f;
+    (void)detections.Emplace(detection);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    (void)decoded.Emplace(std::move(first_frame));
+    ASSERT_TRUE(WaitFor([&configured_compositor] {
+        return configured_compositor.AnnotatedCount() == 1;
+    }));
+    EXPECT_TRUE(output.WaitTakeFor(std::chrono::milliseconds(1000)).has_value());
+
+    PublishFrameTo(decoded);  // 领先 1 帧，仍允许短暂沿用检测框
+    ASSERT_TRUE(WaitFor([&configured_compositor] {
+        return configured_compositor.AnnotatedCount() == 2;
+    }));
+    EXPECT_TRUE(output.WaitTakeFor(std::chrono::milliseconds(1000)).has_value());
+
+    PublishFrameTo(decoded);  // 领先 2 帧，超过配置，必须清除旧框
+    ASSERT_TRUE(WaitFor([&configured_compositor] {
+        return configured_compositor.AnnotatedCount() == 3;
+    }));
+    auto message = output.WaitTakeFor(std::chrono::milliseconds(1000));
+    ASSERT_TRUE(message.has_value());
+    const auto& annotated = **message;
+    const std::size_t old_position = 30u * annotated.Info().hor_stride + 4u;
+    EXPECT_EQ(std::to_integer<unsigned char>(annotated.Data()[old_position]), 128u);
     configured_compositor.Stop();
 }
 
