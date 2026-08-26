@@ -1,6 +1,6 @@
 # drone_test
 
-运行在香橙派 RK3588 算力板上的反无人机控制系统。项目当前处于需求与架构设计阶段，计划使用 C++17 和 CMake 实现。
+运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前已完成视频与 YOLO 实机链路，正在进入 PX4、地面站通信和状态控制阶段。
 
 ## 系统目标
 
@@ -25,8 +25,8 @@
 | 飞控 | Pixhawk 2.4.8，PX4 1.11.3 |
 | 算力板与飞控 | 串口 MAVLink |
 | 地面站 | 自研，通过电台与算力板使用 MAVLink 通信 |
-| 摄像头 | 机头正前方固定安装，RJ45/TCP，H.265，1080p，25 FPS |
-| 视觉算法 | YOLOv26；输出类别、置信度和目标像素位置；光流由算力板根据图像计算 |
+| 摄像头 | 机头正前方固定安装，RJ45/TCP，H.265，实机流 1280×720、25 FPS |
+| 视觉算法 | YOLOv26 RKNN；正式模型输出 `[1,5,8400]` 归一化框与置信度，类别名称由 JSON 配置 |
 | 测距雷达 | 机头正前方单点激光雷达，更新频率可配置 |
 | 导航信息 | PX4 融合 GPS、IMU、磁力计和气压计；算力板自身没有 GPS |
 | Home 点 | 使用 PX4 上报的 Home 点 |
@@ -108,7 +108,7 @@ drone_test/
 ├── src/                      # 各模块实现（含真实实现与 Stub）
 ├── tests/                    # 单元测试 + tests/skeleton/ 骨架冒烟测试
 ├── config/
-├── models/                   # yolo26n_int8.rknn
+├── models/                   # yolo26n-int8.rknn
 ├── third_party/
 └── videoPart/                # 现有视频/RKNN验证原型，后续按模块迁移
 ```
@@ -120,4 +120,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。已按实施顺序迁入真实实现：`video` 模块的 RTSP 接收（CameraReceiver）与解码（VideoDecoder，rkmpp 硬解/软解回退）、`perception` 模块的 YOLO 检测（YoloDetector + 后处理纯函数 + RKNN 后端条件编译）、`video` 的叠加（FrameCompositor）与 `video_transmission` 的图传发送（VideoSender + 可替换编码后端 IVideoEncoderBackend，rkmpp 硬编/软编回退 + RTSP 推流）。`main.cpp` 已提供视频链路装配版（RTSP→解码→YOLO→叠加→编码推流，含 /proc/self/exe 路径解析与逆序停机），便于提前上香橙派实机测试。历次构建开发机测试 73/73 通过、0 警告（详见 `docs/开发进度.md`）。`videoPart` 中的代码仍作为硬件验证原型保留；RKNN/RGA/rkmpp 硬编硬解链路与 RTSP 真实推流留待香橙派实机验证，并在 RK3588、PX4 SITL、台架和受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留，开发机全工程 **79/79 测试通过**。`videoPart` 保留为硬件验证原型；下一阶段开发 PX4 串口、地面站电台、状态主题和全量控制装配，之后在 PX4 SITL、台架及受控飞行环境中分级验证。

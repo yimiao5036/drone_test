@@ -88,7 +88,7 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   cmake -S . -B build && cmake --build build -j$(nproc)
   ./build/yolo_postprocess_test   # 后处理纯函数：多分支 + `[1,5,N]`/NMS/letterbox
   ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理，9 用例
-  ctest                           # 全部 60 用例应通过
+  ctest --test-dir build          # 当前全工程 79/79 用例应通过
   ```
   期望结果：`yolo_postprocess_test` 验证多分支量化解码，以及 `[1,5,N]` 的阈值过滤、
   单类别 NMS、1280×720→640×640 letterbox 坐标还原；`yolo_detector_test` 验证
