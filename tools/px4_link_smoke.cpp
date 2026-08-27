@@ -46,12 +46,13 @@ std::string ExecDir() {
 struct Options {
     std::string config_path;
     std::chrono::seconds duration{30};
+    bool sitl_zero_velocity = false;
 };
 
 void PrintUsage(const char* program) {
     std::cout << "用法: " << program
-              << " [--config <config.json>] [--duration <秒>]\n"
-              << "该程序只测试 PX4 串口和遥测，不发送解锁、模式或控制指令。\n";
+              << " [--config <config.json>] [--duration <秒>] [--sitl-zero-velocity]\n"
+              << "默认只测试链路和遥测；--sitl-zero-velocity 仅允许 UDP/SITL，发送零速度但不切模式。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -67,6 +68,10 @@ Options ParseOptions(int argc, char** argv) {
                 throw std::invalid_argument("--config 缺少路径");
             }
             options.config_path = argv[index];
+            continue;
+        }
+        if (argument == "--sitl-zero-velocity") {
+            options.sitl_zero_velocity = true;
             continue;
         }
         if (argument == "--duration") {
@@ -141,8 +146,10 @@ Px4LinkConfig LoadPx4Config(const json& root) {
     const json& identity = root.at("mavlink");
     const json& px4 = root.at("px4");
     const json& serial = px4.at("serial");
+    const json& udp = px4.at("udp");
 
     Px4LinkConfig config;
+    config.transport = px4.at("transport").get<std::string>();
     config.firmware_version = px4.at("firmware_version").get<std::string>();
     config.onboard_system_id = ReadUint8(identity, "onboard_system_id");
     config.onboard_component_id = ReadUint8(identity, "onboard_component_id");
@@ -158,6 +165,9 @@ Px4LinkConfig LoadPx4Config(const json& root) {
     config.reconnect_interval = ReadPositiveMilliseconds(px4, "reconnect_interval_ms");
     config.command_ack_timeout =
         ReadPositiveMilliseconds(px4, "command_ack_timeout_ms");
+    config.setpoint_send_interval =
+        ReadPositiveMilliseconds(px4, "setpoint_send_interval_ms");
+    config.setpoint_timeout = ReadPositiveMilliseconds(px4, "setpoint_timeout_ms");
 
     const int64_t queue_capacity = px4.at("setpoint_queue_capacity").get<int64_t>();
     if (queue_capacity <= 0) {
@@ -199,6 +209,13 @@ Px4LinkConfig LoadPx4Config(const json& root) {
     config.serial.parity = parity.front();
     config.serial.read_timeout = ReadPositiveMilliseconds(serial, "read_timeout_ms");
     config.serial.write_timeout = ReadPositiveMilliseconds(serial, "write_timeout_ms");
+
+    config.udp.bind_address = udp.at("bind_address").get<std::string>();
+    config.udp.bind_port = static_cast<uint16_t>(udp.at("bind_port").get<int>());
+    config.udp.remote_address = udp.at("remote_address").get<std::string>();
+    config.udp.remote_port = static_cast<uint16_t>(udp.at("remote_port").get<int>());
+    config.udp.read_timeout = ReadPositiveMilliseconds(udp, "read_timeout_ms");
+    config.udp.write_timeout = ReadPositiveMilliseconds(udp, "write_timeout_ms");
     config.Validate();
     return config;
 }
@@ -283,6 +300,9 @@ int main(int argc, char** argv) {
         const std::string config_path = ResolveConfigPath(options.config_path);
         const json root = LoadJson(config_path);
         const Px4LinkConfig config = LoadPx4Config(root);
+        if (options.sitl_zero_velocity && config.transport != "udp") {
+            throw std::invalid_argument("--sitl-zero-velocity 只允许 transport=udp，禁止在真实串口运行");
+        }
 
         const json log_config = root.value("log", json::object());
         const auto log_level = spdlog::level::from_str(
@@ -292,8 +312,9 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 
-        std::cout << "PX4 只读串口冒烟测试\n"
+        std::cout << "PX4 链路冒烟测试\n"
                   << "  config: " << config_path << '\n'
+                  << "  transport: " << config.transport << '\n'
                   << "  device: " << config.serial.device << '\n'
                   << "  baud: " << config.serial.baud_rate << '\n'
                   << "  onboard: " << static_cast<int>(config.onboard_system_id) << '/'
@@ -302,10 +323,18 @@ int main(int argc, char** argv) {
                   << static_cast<int>(config.target_component_id) << '\n'
                   << "  firmware: " << config.firmware_version << '\n'
                   << "  duration: " << options.duration.count() << " 秒\n"
-                  << "  安全边界: 仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令\n"
+                  << "  安全边界: "
+                  << (options.sitl_zero_velocity
+                          ? "SITL UDP 零速度流，不切模式、不解锁"
+                          : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")
+                  << '\n'
                   << std::endl;
 
         drone::communication::Px4Link link(config);
+        drone::common::Topic<drone::common::Px4Setpoint> setpoint_topic;
+        if (options.sitl_zero_velocity) {
+            link.SetInput(setpoint_topic);
+        }
         auto subscription = link.StateOutput().Subscribe(32);
         if (!link.Start()) {
             std::cerr << "[FAIL] PX4 串口启动失败，请检查设备、权限和波特率" << std::endl;
@@ -322,6 +351,7 @@ int main(int argc, char** argv) {
 
         const auto started = std::chrono::steady_clock::now();
         auto next_summary = started;
+        auto next_setpoint_publish = started;
         while (!g_stop.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() - started < options.duration) {
             if (auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100))) {
@@ -344,19 +374,45 @@ int main(int argc, char** argv) {
             }
 
             const auto now = std::chrono::steady_clock::now();
+            if (options.sitl_zero_velocity && link.IsConnected() &&
+                now >= next_setpoint_publish) {
+                drone::common::Px4Setpoint setpoint;
+                setpoint.header.receive_time_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()).count());
+                setpoint.header.valid_for_ms = 300;
+                setpoint.header.frame_id = 3;
+                setpoint.type = drone::common::SetpointType::kVelocity;
+                setpoint.x = 0.f;
+                setpoint.y = 0.f;
+                setpoint.z = 0.f;
+                setpoint.valid = true;
+                (void)setpoint_topic.Emplace(setpoint);
+                next_setpoint_publish = now + std::chrono::milliseconds(100);
+            }
             if (have_snapshot && now >= next_summary) {
                 PrintSummary(latest, std::chrono::duration_cast<std::chrono::seconds>(now - started));
                 next_summary = now + std::chrono::seconds(1);
             }
         }
 
+        if (options.sitl_zero_velocity) {
+            drone::common::Px4Setpoint stop_setpoint;
+            stop_setpoint.valid = false;
+            (void)setpoint_topic.Emplace(stop_setpoint);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         const bool connected_at_end = link.IsConnected();
         link.Stop();
 
-        std::cout << "\n========== PX4 串口验收报告 ==========" << std::endl;
-        PrintCheck("串口已成功打开并运行", true, true);
+        std::cout << "\n========== PX4 链路验收报告 ==========" << std::endl;
+        PrintCheck("通信传输已成功打开并运行", true, true);
         PrintCheck("PX4 HEARTBEAT", observed.heartbeat, true);
         PrintCheck("测试结束时心跳仍连接", connected_at_end, true);
+        if (options.sitl_zero_velocity) {
+            PrintCheck("SITL 零速度设定值已发送", link.SetpointSendCount() > 0, true);
+            std::cout << "设定值发送数: " << link.SetpointSendCount() << std::endl;
+        }
         PrintCheck("遥测请求 COMMAND_ACK", link.AckMatchCount() > 0, false);
         PrintCheck("遥测请求无 ACK 超时", link.AckTimeoutCount() == 0, false);
         PrintMessageCheck("AUTOPILOT_VERSION",
@@ -400,9 +456,12 @@ int main(int argc, char** argv) {
                   << "说明: WARN 通常表示 PX4 未配置该消息流，后续可主动请求消息频率。\n"
                   << std::endl;
 
-        const bool passed = observed.heartbeat && connected_at_end && link.ErrorCount() == 0;
-        std::cout << (passed ? "结果: 基础 PX4 串口链路通过"
-                            : "结果: 基础 PX4 串口链路未通过")
+        const bool setpoint_passed =
+            !options.sitl_zero_velocity || link.SetpointSendCount() > 0;
+        const bool passed = observed.heartbeat && connected_at_end &&
+                            link.ErrorCount() == 0 && setpoint_passed;
+        std::cout << (passed ? "结果: 基础 PX4 链路通过"
+                            : "结果: 基础 PX4 链路未通过")
                   << std::endl;
         return passed ? 0 : 3;
     } catch (const std::exception& error) {

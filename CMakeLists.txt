@@ -101,6 +101,7 @@ endif()
 # ---- communication 模块（串口封装、PX4/地面站链路接口） ----
 add_library(drone_communication STATIC
     src/communication/serial_port.cpp
+    src/communication/communication_transport.cpp
     src/communication/mavlink_handler.cpp
     src/communication/px4_link.cpp
     src/communication/ground_station_link.cpp)
@@ -268,6 +269,20 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(serial_port_test)
+
+        # 通信传输测试：UDP 双向数据报、动态学习对端和配置校验（供 PX4 SITL）
+        add_executable(communication_transport_test
+            tests/communication/communication_transport_test.cpp)
+        target_link_libraries(communication_transport_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(communication_transport_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(communication_transport_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(communication_transport_test)
 
         # MAVLink 字节流测试：验证 v1/v2、半包、粘包、坏 CRC 恢复和实例隔离
         add_executable(mavlink_handler_test tests/communication/mavlink_handler_test.cpp)

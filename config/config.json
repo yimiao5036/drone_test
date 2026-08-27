@@ -8,6 +8,7 @@
         "onboard_component_id": 191
     },
     "px4": {
+        "transport": "serial",
         "firmware_version": "1.17.0",
         "target_system_id": 1,
         "target_component_id": 1,
@@ -17,6 +18,8 @@
         "telemetry_timeout_ms": 2000,
         "state_publish_interval_ms": 100,
         "command_ack_timeout_ms": 1000,
+        "setpoint_send_interval_ms": 50,
+        "setpoint_timeout_ms": 500,
         "setpoint_queue_capacity": 4,
         "command_queue_capacity": 16,
         "one_shot_message_requests": [148, 242],
@@ -36,6 +39,14 @@
             "data_bits": 8,
             "stop_bits": 1,
             "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "udp": {
+            "bind_address": "127.0.0.1",
+            "bind_port": 14540,
+            "remote_address": "127.0.0.1",
+            "remote_port": 14580,
             "read_timeout_ms": 20,
             "write_timeout_ms": 100
         },

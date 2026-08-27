@@ -85,7 +85,9 @@
 - [串口封装](include/communication/serial_port.md)
 - [MAVLink 字节流处理器](include/communication/mavlink_handler.md)
 - [PX4 通信链路](include/communication/px4_link.md)
-- [PX4 只读串口冒烟测试](tools/px4_link_smoke.md)
+- [PX4 链路冒烟测试](tools/px4_link_smoke.md)
+- [PX4 1.17.0 SITL 分级测试](tools/PX4_SITL分级测试.md)
+- [通信传输抽象](include/communication/communication_transport.md)
 
 ## 当前正式工程目录
 
@@ -103,7 +105,8 @@ drone_test/
 │   ├── perception/           # yolo_detector.h, detection_backend.h, yolo_postprocess.h,
 │   │                         #   optical_flow_estimator.h, laser_range_finder.h,
 │   │                         #   perception_fusion.h, target_estimator.h
-│   ├── communication/        # serial_port.h, mavlink_handler.h, px4_link.h, ground_station_link.h
+│   ├── communication/        # serial_port.h, communication_transport.h, mavlink_handler.h,
+│   │                         # px4_link.h, ground_station_link.h
 │   ├── control/              # flight_controller.h
 │   ├── state_machine/        # mission_state_machine.h
 │   ├── health/               # health_manager.h
@@ -124,4 +127,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留。PX4 通信阶段已完成可配置串口基础层、通用 `MavlinkHandler` 和 `Px4Link` 遥测实现：独占串口线程、心跳/版本、连接超时、落地、全局/局部位置、姿态、GPS、电池、Home、RC 解析及数据新鲜度失效；串口配置已改为 `/dev/ttyS1`。开发机使用 Linux PTY 完成自动化验证；可靠命令队列、`COMMAND_LONG/COMMAND_ACK`、版本/Home 单次请求和遥测频率请求已完成，全工程 **105/105 测试通过**。独立 `px4_link_smoke` 仅发送心跳与安全遥测请求，不发送飞行控制。`videoPart` 保留为硬件验证原型；下一步在香橙派 `/dev/ttyS1` 进行第二轮 30 秒冒烟测试，验证实际 ACK 与请求后的消息流，再实现设定值并进行 PX4 1.17.0 SITL、台架及受控飞行验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留。PX4 通信阶段已完成可配置串口基础层、通用 `MavlinkHandler` 和 `Px4Link` 遥测实现：独占串口线程、心跳/版本、连接超时、落地、全局/局部位置、姿态、GPS、电池、Home、RC 解析及数据新鲜度失效；串口配置已改为 `/dev/ttyS1`。开发机使用 Linux PTY 完成自动化验证；可靠命令/ACK、安全遥测请求和本地 NED `Px4Setpoint` 位置/速度发送已完成，含 type mask、yaw/yaw rate、有效期和过期停发，全工程 **109/109 测试通过**。香橙派 `/dev/ttyS1` 接收/命令链路已实机通过，`px4_link_smoke` 仍不发送飞行控制。`videoPart` 保留为硬件验证原型；下一步先在 PX4 1.17.0 SITL 验证 Offboard 设定值，再进行拆桨台架测试。
