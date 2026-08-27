@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -16,6 +17,7 @@
 #include <spdlog/spdlog.h>
 
 #include "common/logger.h"
+#include "communication/mavlink_handler.h"
 #include "communication/px4_link.h"
 
 namespace {
@@ -154,12 +156,37 @@ Px4LinkConfig LoadPx4Config(const json& root) {
     config.state_publish_interval =
         ReadPositiveMilliseconds(px4, "state_publish_interval_ms");
     config.reconnect_interval = ReadPositiveMilliseconds(px4, "reconnect_interval_ms");
+    config.command_ack_timeout =
+        ReadPositiveMilliseconds(px4, "command_ack_timeout_ms");
 
     const int64_t queue_capacity = px4.at("setpoint_queue_capacity").get<int64_t>();
     if (queue_capacity <= 0) {
         throw std::invalid_argument("setpoint_queue_capacity 必须为正数");
     }
     config.setpoint_queue_capacity = static_cast<std::size_t>(queue_capacity);
+    const int64_t command_capacity = px4.at("command_queue_capacity").get<int64_t>();
+    if (command_capacity <= 0) {
+        throw std::invalid_argument("command_queue_capacity 必须为正数");
+    }
+    config.command_queue_capacity = static_cast<std::size_t>(command_capacity);
+
+    for (const auto& item : px4.at("one_shot_message_requests")) {
+        const int64_t message_id = item.get<int64_t>();
+        if (message_id < 0 || message_id > 0xFFFFFF) {
+            throw std::invalid_argument("one_shot_message_requests 包含非法消息 ID");
+        }
+        config.one_shot_message_requests.push_back(static_cast<uint32_t>(message_id));
+    }
+    for (const auto& item : px4.at("message_interval_requests")) {
+        const int64_t message_id = item.at("message_id").get<int64_t>();
+        const int64_t interval_us = item.at("interval_us").get<int64_t>();
+        if (message_id < 0 || message_id > 0xFFFFFF ||
+            interval_us <= 0 || interval_us > std::numeric_limits<int32_t>::max()) {
+            throw std::invalid_argument("message_interval_requests 包含非法 ID 或周期");
+        }
+        config.message_interval_requests.push_back(
+            {static_cast<uint32_t>(message_id), static_cast<int32_t>(interval_us)});
+    }
 
     config.serial.device = serial.at("device").get<std::string>();
     config.serial.baud_rate = serial.at("baud_rate").get<int>();
@@ -189,6 +216,7 @@ struct ObservedState {
     bool local_position = false;
     bool attitude = false;
     bool gps = false;
+    bool gps_3d_fix = false;
     bool battery = false;
     bool home = false;
     bool rc = false;
@@ -203,6 +231,7 @@ void UpdateObserved(const drone::common::FlightStateSnapshot& state,
     observed->local_position = observed->local_position || state.local_position_valid;
     observed->attitude = observed->attitude || state.attitude_valid;
     observed->gps = observed->gps || state.gps_state_valid;
+    observed->gps_3d_fix = observed->gps_3d_fix || state.gps_fix;
     observed->battery = observed->battery || state.battery_valid;
     observed->home = observed->home || state.home_valid;
     observed->rc = observed->rc || state.rc_state_valid;
@@ -235,6 +264,17 @@ void PrintCheck(const char* name, bool passed, bool required) {
     std::cout << '[' << level << "] " << name << std::endl;
 }
 
+void PrintMessageCheck(const char* name, uint64_t count, bool valid_seen) {
+    if (count == 0) {
+        std::cout << "[WARN] " << name << " 未收到" << std::endl;
+    } else if (!valid_seen) {
+        std::cout << "[WARN] " << name << " 收到 " << count
+                  << " 条，但未形成有效状态" << std::endl;
+    } else {
+        std::cout << "[PASS] " << name << " 收到 " << count << " 条" << std::endl;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -262,7 +302,7 @@ int main(int argc, char** argv) {
                   << static_cast<int>(config.target_component_id) << '\n'
                   << "  firmware: " << config.firmware_version << '\n'
                   << "  duration: " << options.duration.count() << " 秒\n"
-                  << "  安全边界: 仅发送机载电脑 HEARTBEAT，不发送控制命令\n"
+                  << "  安全边界: 仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令\n"
                   << std::endl;
 
         drone::communication::Px4Link link(config);
@@ -317,16 +357,45 @@ int main(int argc, char** argv) {
         PrintCheck("串口已成功打开并运行", true, true);
         PrintCheck("PX4 HEARTBEAT", observed.heartbeat, true);
         PrintCheck("测试结束时心跳仍连接", connected_at_end, true);
-        PrintCheck("AUTOPILOT_VERSION", observed.version, false);
-        PrintCheck("EXTENDED_SYS_STATE", observed.landed, false);
-        PrintCheck("GLOBAL_POSITION_INT", observed.global_position, false);
-        PrintCheck("LOCAL_POSITION_NED", observed.local_position, false);
-        PrintCheck("ATTITUDE", observed.attitude, false);
-        PrintCheck("GPS_RAW_INT", observed.gps, false);
-        PrintCheck("SYS_STATUS/BATTERY_STATUS", observed.battery, false);
-        PrintCheck("HOME_POSITION", observed.home, false);
-        PrintCheck("RC_CHANNELS", observed.rc, false);
+        PrintCheck("遥测请求 COMMAND_ACK", link.AckMatchCount() > 0, false);
+        PrintCheck("遥测请求无 ACK 超时", link.AckTimeoutCount() == 0, false);
+        PrintMessageCheck("AUTOPILOT_VERSION",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_AUTOPILOT_VERSION),
+                          observed.version);
+        PrintMessageCheck("EXTENDED_SYS_STATE",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_EXTENDED_SYS_STATE),
+                          observed.landed);
+        PrintMessageCheck("GLOBAL_POSITION_INT",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_GLOBAL_POSITION_INT),
+                          observed.global_position);
+        PrintMessageCheck("LOCAL_POSITION_NED",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_LOCAL_POSITION_NED),
+                          observed.local_position);
+        PrintMessageCheck("ATTITUDE",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_ATTITUDE),
+                          observed.attitude);
+        PrintMessageCheck("GPS_RAW_INT",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_GPS_RAW_INT),
+                          observed.gps);
+        if (observed.gps && !observed.gps_3d_fix) {
+            std::cout << "[WARN] GPS_RAW_INT 已收到，但测试期间没有 3D fix" << std::endl;
+        }
+        const uint64_t battery_message_count =
+            link.MessageReceiveCount(MAVLINK_MSG_ID_SYS_STATUS) +
+            link.MessageReceiveCount(MAVLINK_MSG_ID_BATTERY_STATUS);
+        PrintMessageCheck("SYS_STATUS/BATTERY_STATUS", battery_message_count,
+                          observed.battery);
+        PrintMessageCheck("HOME_POSITION",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_HOME_POSITION),
+                          observed.home);
+        PrintMessageCheck("RC_CHANNELS",
+                          link.MessageReceiveCount(MAVLINK_MSG_ID_RC_CHANNELS),
+                          observed.rc);
         std::cout << "接收目标消息数: " << link.ReceiveCount() << '\n'
+                  << "ACK 匹配数: " << link.AckMatchCount() << '\n'
+                  << "ACK 超时数: " << link.AckTimeoutCount() << '\n'
+                  << "最近 ACK: command=" << latest.last_ack_command
+                  << " result=" << static_cast<int>(latest.last_ack_result) << '\n'
                   << "链路错误数: " << link.ErrorCount() << '\n'
                   << "说明: WARN 通常表示 PX4 未配置该消息流，后续可主动请求消息频率。\n"
                   << std::endl;

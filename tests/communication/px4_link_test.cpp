@@ -129,6 +129,16 @@ Px4LinkConfig MakeConfig(const std::string& device) {
     return config;
 }
 
+std::vector<uint8_t> EncodeCommandAck(MavlinkHandler& encoder, uint16_t command,
+                                      uint8_t result) {
+    return encoder.Encode(
+        [=](mavlink_status_t* status, mavlink_message_t* message) {
+            return mavlink_msg_command_ack_pack_status(
+                1, MAV_COMP_ID_AUTOPILOT1, status, message, command, result,
+                100, 0, 1, MAV_COMP_ID_ONBOARD_COMPUTER);
+        });
+}
+
 std::vector<uint8_t> EncodePx4Heartbeat(MavlinkHandler& encoder, uint8_t system_id,
                                         uint8_t component_id, bool armed,
                                         uint8_t main_mode, uint8_t sub_mode) {
@@ -177,6 +187,14 @@ TEST(Px4LinkTest, ConfigRejectsInvalidIdentityAndVersion) {
 
     config.onboard_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;
     config.mavlink_version = 3;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.mavlink_version = 2;
+    config.command_queue_capacity = 0;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.command_queue_capacity = 16;
+    config.message_interval_requests = {{MAVLINK_MSG_ID_ATTITUDE, 0}};
     EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
@@ -437,6 +455,9 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
     EXPECT_EQ(snapshot.autopilot_capabilities,
               static_cast<uint64_t>(MAV_PROTOCOL_CAPABILITY_MAVLINK2));
     EXPECT_EQ(snapshot.header.frame_id, 3);
+    EXPECT_EQ(link.MessageReceiveCount(MAVLINK_MSG_ID_ATTITUDE), 1u);
+    EXPECT_EQ(link.MessageReceiveCount(MAVLINK_MSG_ID_BATTERY_STATUS), 1u);
+    EXPECT_EQ(link.MessageReceiveCount(0xFFFFFFu), 0u);
 
     link.Stop();
 }
@@ -495,12 +516,118 @@ TEST(Px4LinkTest, CanRestartAfterStop) {
     link.Stop();
 }
 
-TEST(Px4LinkTest, CommandSendingRemainsExplicitlyUnavailableInTelemetryStage) {
+TEST(Px4LinkTest, RejectsCommandWhenLinkIsNotConnected) {
     PseudoTerminal terminal;
     Px4Link link(MakeConfig(terminal.SlaveName()));
     EXPECT_FALSE(link.SendCommand(MAV_CMD_COMPONENT_ARM_DISARM,
                                   1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f));
-    EXPECT_EQ(link.ErrorCount(), 1u);
+    EXPECT_EQ(link.ErrorCount(), 0u);
+}
+
+TEST(Px4LinkTest, SendsCommandLongAndMatchesFinalAck) {
+    PseudoTerminal terminal;
+    Px4Link link(MakeConfig(terminal.SlaveName()));
+    auto subscription = link.StateOutput().Subscribe(32);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_COMPONENT_ARM_DISARM,
+                                 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f));
+    mavlink_message_t command_message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, &command_message));
+    mavlink_command_long_t command{};
+    mavlink_msg_command_long_decode(&command_message, &command);
+    EXPECT_EQ(command.command, MAV_CMD_COMPONENT_ARM_DISARM);
+    EXPECT_EQ(command.target_system, 1);
+    EXPECT_EQ(command.target_component, MAV_COMP_ID_AUTOPILOT1);
+    EXPECT_FLOAT_EQ(command.param1, 1.f);
+    EXPECT_FLOAT_EQ(command.param7, 7.f);
+
+    ASSERT_TRUE(terminal.Write(EncodeCommandAck(
+        px4_encoder, MAV_CMD_COMPONENT_ARM_DISARM, MAV_RESULT_ACCEPTED)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.AckMatchCount() == 1; }, 500ms));
+
+    bool found_ack_snapshot = false;
+    const auto deadline = std::chrono::steady_clock::now() + 500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message &&
+            (*message)->last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+            EXPECT_EQ((*message)->last_ack_result, MAV_RESULT_ACCEPTED);
+            EXPECT_GT((*message)->last_ack_time_ms, 0u);
+            found_ack_snapshot = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_ack_snapshot);
+    EXPECT_EQ(link.AckTimeoutCount(), 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, CountsCommandAckTimeoutAndContinuesQueue) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.command_ack_timeout = 50ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_REQUEST_MESSAGE,
+                                 static_cast<float>(MAVLINK_MSG_ID_HOME_POSITION),
+                                 0.f, 0.f, 0.f, 0.f, 0.f, 0.f));
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
+    EXPECT_TRUE(WaitUntil([&link] { return link.AckTimeoutCount() == 1; }, 500ms));
+    link.Stop();
+}
+
+TEST(Px4LinkTest, QueuesSafeTelemetryRequestsAfterFirstHeartbeat) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.one_shot_message_requests = {MAVLINK_MSG_ID_AUTOPILOT_VERSION};
+    config.message_interval_requests = {
+        {MAVLINK_MSG_ID_ATTITUDE, 100000},
+    };
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+
+    mavlink_message_t first_message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, &first_message));
+    mavlink_command_long_t first{};
+    mavlink_msg_command_long_decode(&first_message, &first);
+    EXPECT_EQ(first.command, MAV_CMD_REQUEST_MESSAGE);
+    EXPECT_FLOAT_EQ(first.param1,
+                    static_cast<float>(MAVLINK_MSG_ID_AUTOPILOT_VERSION));
+    ASSERT_TRUE(terminal.Write(EncodeCommandAck(
+        px4_encoder, MAV_CMD_REQUEST_MESSAGE, MAV_RESULT_ACCEPTED)));
+
+    mavlink_message_t second_message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, &second_message));
+    mavlink_command_long_t second{};
+    mavlink_msg_command_long_decode(&second_message, &second);
+    EXPECT_EQ(second.command, MAV_CMD_SET_MESSAGE_INTERVAL);
+    EXPECT_FLOAT_EQ(second.param1, static_cast<float>(MAVLINK_MSG_ID_ATTITUDE));
+    EXPECT_FLOAT_EQ(second.param2, 100000.f);
+    ASSERT_TRUE(terminal.Write(EncodeCommandAck(
+        px4_encoder, MAV_CMD_SET_MESSAGE_INTERVAL, MAV_RESULT_ACCEPTED)));
+
+    EXPECT_TRUE(WaitUntil([&link] { return link.AckMatchCount() == 2; }, 500ms));
+    EXPECT_EQ(link.AckTimeoutCount(), 0u);
+    link.Stop();
 }
 
 }  // namespace

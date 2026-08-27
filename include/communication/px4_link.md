@@ -19,8 +19,8 @@
 - 周期及状态变化时发布 `Topic<FlightStateSnapshot>`；
 - Start/Stop 幂等，停止后可以重新启动。
 
-当前不做：`Px4Setpoint` 编码发送、`COMMAND_LONG/COMMAND_ACK` 队列和关联、串口运行时
-自动重连。这些是后续阶段任务，接口和配置已预留。
+当前不做：`Px4Setpoint` 编码发送和串口运行时自动重连。可靠 `COMMAND_LONG` 队列、
+`COMMAND_ACK` 关联、超时统计和安全遥测请求已经实现。
 
 `Px4LinkStub` 继续保留，仅供骨架冒烟测试，不参与真实硬件通信。
 
@@ -40,7 +40,11 @@ struct Px4LinkConfig {
     std::chrono::milliseconds telemetry_timeout;
     std::chrono::milliseconds state_publish_interval;
     std::chrono::milliseconds reconnect_interval;
+    std::chrono::milliseconds command_ack_timeout;
     std::size_t setpoint_queue_capacity;
+    std::size_t command_queue_capacity;
+    std::vector<uint32_t> one_shot_message_requests;
+    std::vector<MavlinkMessageIntervalRequest> message_interval_requests;
 };
 
 class Px4Link : public IPx4Link {
@@ -71,11 +75,13 @@ PX4 串口
 当前发送数据流：
 
 ```text
-Px4Link 周期调度
-  → 机载电脑 HEARTBEAT pack_status
+机载电脑 HEARTBEAT / SendCommand / 自动遥测请求
+  → 有界命令队列（命令）
+  → 单条在途 COMMAND_LONG
   → MavlinkHandler::Encode
   → SerialPort::Write
   → PX4
+  → COMMAND_ACK 匹配/超时
 ```
 
 `SetInput()` 必须在 `Start()` 前调用。当前仅建立容量可配置、丢旧留新的设定值订阅；实际
@@ -89,11 +95,12 @@ Px4Link 周期调度
 
 1. 带超时读取串口；
 2. 增量解析收到的 MAVLink 帧；
-3. 检查 PX4 心跳超时；
-4. 到期发送机载电脑心跳；
-5. 到期发布飞行状态快照。
+3. 检查 PX4 心跳和命令 ACK 超时；
+4. 发送下一条排队命令；
+5. 到期发送机载电脑心跳；
+6. 到期发布飞行状态快照。
 
-其他线程不得访问 `SerialPort::Write()`。后续设定值和命令也只能进入 Topic/有界队列，由本线程发送。
+其他线程不得访问 `SerialPort::Write()`。设定值和命令只能进入 Topic/有界队列，由本线程发送。
 
 ### 3.2 身份过滤
 
@@ -151,7 +158,26 @@ bits 24..31 → flight_sub_mode（sub mode）
 - `health`：连接时 1，断开时 3；
 - `source_time_ms=0`：HEARTBEAT 不提供可靠源时间，不伪造。
 
-### 3.5 停机与重启
+### 3.5 可靠命令与安全遥测请求
+
+`SendCommand()` 只负责把命令放入有界队列，返回 true 表示成功入队，不表示 PX4 已接受。
+链路线程同一时刻只发送一条 `COMMAND_LONG` 并等待同 command ID 的 `COMMAND_ACK`：
+
+- 最终 ACK 增加 `AckMatchCount()`，更新快照最近 ACK 后发送下一条；
+- `MAV_RESULT_IN_PROGRESS` 保持在途并刷新超时时间；
+- 超过 `command_ack_timeout` 增加 `AckTimeoutCount()`，丢弃该在途命令并继续队列；
+- 队列满、未运行或未连接时拒绝外部命令；
+- 心跳断开和 Stop 清空排队/在途命令，禁止重连后恢复旧命令。
+
+首次建立心跳后按 JSON 自动排队：
+
+- `MAV_CMD_REQUEST_MESSAGE`：请求 `AUTOPILOT_VERSION` 和 `HOME_POSITION`；
+- `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
+  `EXTENDED_SYS_STATE` 的配置频率。
+
+这些内部命令只改变本 MAVLink 链路的消息输出，不执行解锁、模式切换或飞行控制。
+
+### 3.6 停机与重启
 
 `Stop()` 先清除运行标志，等待串口 `poll()` 在 `read_timeout` 内返回并退出线程，然后关闭串口。
 若停止前已连接，会发布最终 `connected=false` 快照。再次 `Start()` 时重置 MAVLink 半包、发送序号、
@@ -161,8 +187,8 @@ bits 24..31 → flight_sub_mode（sub mode）
 
 | 等级 | 场景 |
 |---|---|
-| INFO | 创建/销毁、启动/停止、首次 PX4 心跳、固件版本上报、正常停止时连接置断 |
-| WARN | PX4 心跳超时、上报固件与配置不一致、当前阶段调用未实现的 `SendCommand`（节流） |
+| INFO | 创建/销毁、启动/停止、首次心跳、遥测请求入队、命令 ACK、固件版本、正常停止 |
+| WARN | 心跳超时、固件不一致、命令队列满、ACK 超时（异常均按约定节流） |
 | ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
 
 不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
@@ -184,7 +210,10 @@ bits 24..31 → flight_sub_mode（sub mode）
 - 遥测超时后有效标志清零但心跳连接保持；
 - 忽略非目标 system ID；
 - Stop 后重新 Start；
-- 命令发送在当前阶段明确返回未实现。
+- 未连接拒绝命令；
+- `COMMAND_LONG` 参数编码、最终 ACK 匹配和快照更新；
+- ACK 超时计数后继续队列；
+- 首次心跳后按顺序发送单次消息请求和消息频率请求。
 
 运行：
 
@@ -196,8 +225,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 真实硬件使用独立 `px4_link_smoke` 验证，详见 `tools/px4_link_smoke.md`。该程序只发送机载电脑
-HEARTBEAT，不发送任何控制命令，可在正式 main 全量装配前验证 `/dev/ttyS1`、波特率、目标 ID
-和 PX4 实际消息流。
+HEARTBEAT、`REQUEST_MESSAGE` 和 `SET_MESSAGE_INTERVAL`，不发送解锁、模式或飞行控制命令，
+可在正式 main 全量装配前验证 `/dev/ttyS1`、ACK 和 PX4 实际消息流。
 
 ## 6. 排查/修改要点
 
@@ -211,5 +240,5 @@ HEARTBEAT，不发送任何控制命令，可在正式 main 全量装配前验�
 | 重启后旧控制恢复 | 属于缺陷；Start 必须清空状态和后续的设定值/命令缓存 |
 | 收到其他 MAVLink 设备消息 | 当前按目标 ID 过滤；未来多组件遥测需明确白名单后扩展 |
 
-下一阶段扩展遥测时必须同步更新 `FlightStateSnapshot` 有效性语义、本文档、
-`docs/通信与数据定义.md` 和对应录制字节流/PTY 测试。
+下一阶段实现 `Px4Setpoint` 时必须同步更新坐标系、type_mask、有效期语义、本文档、
+`docs/通信与数据定义.md` 和对应 PTY/SITL 测试。

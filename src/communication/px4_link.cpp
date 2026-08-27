@@ -4,9 +4,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -48,11 +50,21 @@ void Px4LinkConfig::Validate() const {
     if (serial.read_timeout.count() <= 0 ||
         heartbeat_send_interval.count() <= 0 || heartbeat_timeout.count() <= 0 ||
         telemetry_timeout.count() <= 0 || state_publish_interval.count() <= 0 ||
-        reconnect_interval.count() <= 0) {
-        throw std::invalid_argument("PX4 链路读取超时、遥测超时、周期与超时必须为正数");
+        reconnect_interval.count() <= 0 || command_ack_timeout.count() <= 0) {
+        throw std::invalid_argument("PX4 链路读取、遥测、命令 ACK、周期与超时必须为正数");
     }
-    if (setpoint_queue_capacity == 0) {
-        throw std::invalid_argument("PX4 设定值队列容量必须大于 0");
+    if (setpoint_queue_capacity == 0 || command_queue_capacity == 0) {
+        throw std::invalid_argument("PX4 设定值和命令队列容量必须大于 0");
+    }
+    for (uint32_t message_id : one_shot_message_requests) {
+        if (message_id > 0xFFFFFFU) {
+            throw std::invalid_argument("MAVLink 单次请求消息 ID 超出 24 位范围");
+        }
+    }
+    for (const auto& request : message_interval_requests) {
+        if (request.message_id > 0xFFFFFFU || request.interval_us <= 0) {
+            throw std::invalid_argument("MAVLink 消息频率请求 ID 必须为 24 位且周期必须为正数");
+        }
     }
 }
 
@@ -90,6 +102,9 @@ public:
             state_sequence_ = 0;
             last_heartbeat_time_ms_ = 0;
             ResetTelemetryTimes();
+            ClearCommands();
+            next_command_sequence_.store(1, std::memory_order_relaxed);
+            telemetry_requests_queued_ = false;
             firmware_version_logged_ = false;
             connected_.store(false, std::memory_order_release);
 
@@ -105,6 +120,7 @@ public:
             running_.store(false, std::memory_order_release);
             connected_.store(false, std::memory_order_release);
             setpoint_subscription_.Reset();
+            ClearCommands();
             serial_.Close();
             const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (ShouldLogThrottled(count)) {
@@ -128,6 +144,7 @@ public:
             worker_.join();
         }
         setpoint_subscription_.Reset();
+        ClearCommands();
         serial_.Close();
         connected_.store(false, std::memory_order_release);
         SPDLOG_INFO("PX4 通信停止: device={}", config_.serial.device);
@@ -157,12 +174,18 @@ public:
         return state_output_;
     }
 
-    bool SendCommand() {
-        const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (ShouldLogThrottled(count)) {
-            SPDLOG_WARN("PX4 SendCommand 尚未接入命令队列，累计调用 {}", count);
+    bool SendCommand(uint16_t command, float param1, float param2, float param3,
+                     float param4, float param5, float param6, float param7) {
+        if (!running_.load(std::memory_order_acquire) ||
+            !connected_.load(std::memory_order_acquire)) {
+            return false;
         }
-        return false;
+        CommandRequest request;
+        request.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+        request.command = command;
+        request.params = {param1, param2, param3, param4, param5, param6, param7};
+        request.internal = false;
+        return EnqueueCommand(std::move(request));
     }
 
     uint64_t SetpointSendCount() const {
@@ -185,8 +208,73 @@ public:
         return error_count_.load(std::memory_order_relaxed);
     }
 
+    uint64_t MessageReceiveCount(uint32_t message_id) const {
+        if (message_id >= message_receive_counts_.size()) {
+            return 0;
+        }
+        return message_receive_counts_[message_id].load(std::memory_order_relaxed);
+    }
+
 private:
     using SetpointSubscription = common::Topic<common::Px4Setpoint>::Subscription;
+
+    struct CommandRequest {
+        uint64_t sequence = 0;
+        uint16_t command = 0;
+        std::array<float, 7> params{};
+        bool internal = false;
+    };
+
+    struct InFlightCommand {
+        CommandRequest request;
+        uint64_t sent_time_ms = 0;
+    };
+
+    bool EnqueueCommand(CommandRequest request) {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        if (command_queue_.size() >= config_.command_queue_capacity) {
+            const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("PX4 命令队列已满: capacity={} command={}，累计错误 {}",
+                            config_.command_queue_capacity, request.command, count);
+            }
+            return false;
+        }
+        command_queue_.push_back(std::move(request));
+        return true;
+    }
+
+    void ClearCommands() {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        command_queue_.clear();
+        in_flight_command_.reset();
+    }
+
+    void QueueTelemetryRequests() {
+        for (uint32_t message_id : config_.one_shot_message_requests) {
+            CommandRequest request;
+            request.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+            request.command = MAV_CMD_REQUEST_MESSAGE;
+            request.params[0] = static_cast<float>(message_id);
+            request.internal = true;
+            (void)EnqueueCommand(std::move(request));
+        }
+        for (const auto& interval : config_.message_interval_requests) {
+            CommandRequest request;
+            request.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+            request.command = MAV_CMD_SET_MESSAGE_INTERVAL;
+            request.params[0] = static_cast<float>(interval.message_id);
+            request.params[1] = static_cast<float>(interval.interval_us);
+            request.internal = true;
+            (void)EnqueueCommand(std::move(request));
+        }
+        if (!config_.one_shot_message_requests.empty() ||
+            !config_.message_interval_requests.empty()) {
+            SPDLOG_INFO("PX4 遥测请求已入队: one_shot={} intervals={}",
+                        config_.one_shot_message_requests.size(),
+                        config_.message_interval_requests.size());
+        }
+    }
 
     void WorkerLoop() {
         auto next_heartbeat = std::chrono::steady_clock::now();
@@ -208,6 +296,8 @@ private:
             const auto now = std::chrono::steady_clock::now();
             const uint64_t now_ms = MonotonicMs();
             CheckHeartbeatTimeout(now_ms);
+            CheckCommandTimeout(now_ms);
+            SendNextCommand(now_ms);
 
             if (now >= next_heartbeat) {
                 SendHeartbeat();
@@ -234,6 +324,9 @@ private:
         }
 
         receive_count_.fetch_add(1, std::memory_order_relaxed);
+        if (message.msgid < message_receive_counts_.size()) {
+            message_receive_counts_[message.msgid].fetch_add(1, std::memory_order_relaxed);
+        }
         const uint64_t now_ms = MonotonicMs();
         switch (message.msgid) {
             case MAVLINK_MSG_ID_HEARTBEAT:
@@ -269,6 +362,9 @@ private:
             case MAVLINK_MSG_ID_AUTOPILOT_VERSION:
                 HandleAutopilotVersion(message);
                 break;
+            case MAVLINK_MSG_ID_COMMAND_ACK:
+                HandleCommandAck(message, now_ms);
+                break;
             default:
                 break;
         }
@@ -295,6 +391,10 @@ private:
             SPDLOG_INFO("PX4 心跳已连接: source={}/{} mode={}/{} armed={}",
                         message.sysid, message.compid, state_.flight_mode,
                         state_.flight_sub_mode, state_.armed);
+            if (!telemetry_requests_queued_) {
+                telemetry_requests_queued_ = true;
+                QueueTelemetryRequests();
+            }
         }
         PublishState(now_ms);
     }
@@ -460,6 +560,85 @@ private:
         }
     }
 
+    void HandleCommandAck(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_command_ack_t ack{};
+        mavlink_msg_command_ack_decode(&message, &ack);
+        state_.last_ack_command = ack.command;
+        state_.last_ack_result = ack.result;
+        state_.last_ack_time_ms = now_ms;
+
+        if (!in_flight_command_ ||
+            in_flight_command_->request.command != ack.command) {
+            return;
+        }
+
+        ack_match_count_.fetch_add(1, std::memory_order_relaxed);
+        const bool in_progress = ack.result == MAV_RESULT_IN_PROGRESS;
+        SPDLOG_INFO("PX4 命令 ACK: sequence={} command={} result={} internal={} progress={}",
+                    in_flight_command_->request.sequence, ack.command, ack.result,
+                    in_flight_command_->request.internal, ack.progress);
+        if (in_progress) {
+            in_flight_command_->sent_time_ms = now_ms;
+        } else {
+            in_flight_command_.reset();
+        }
+        PublishState(now_ms);
+    }
+
+    void CheckCommandTimeout(uint64_t now_ms) {
+        if (!in_flight_command_ || now_ms < in_flight_command_->sent_time_ms) {
+            return;
+        }
+        const uint64_t timeout_ms =
+            static_cast<uint64_t>(config_.command_ack_timeout.count());
+        if (now_ms - in_flight_command_->sent_time_ms <= timeout_ms) {
+            return;
+        }
+
+        const auto timed_out = in_flight_command_->request;
+        in_flight_command_.reset();
+        const uint64_t count =
+            ack_timeout_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("PX4 命令 ACK 超时: sequence={} command={} internal={} timeout_ms={}，累计 {}",
+                        timed_out.sequence, timed_out.command, timed_out.internal,
+                        config_.command_ack_timeout.count(), count);
+        }
+    }
+
+    void SendNextCommand(uint64_t now_ms) {
+        if (in_flight_command_ || !connected_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        CommandRequest request;
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            if (command_queue_.empty()) {
+                return;
+            }
+            request = std::move(command_queue_.front());
+            command_queue_.pop_front();
+        }
+
+        const auto frame = mavlink_.Encode(
+            [this, &request](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_command_long_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, config_.target_system_id,
+                    config_.target_component_id, request.command, 0,
+                    request.params[0], request.params[1], request.params[2],
+                    request.params[3], request.params[4], request.params[5],
+                    request.params[6]);
+            });
+        if (frame.empty() || !serial_.Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        in_flight_command_ = InFlightCommand{std::move(request), now_ms};
+    }
+
     bool IsTelemetryFresh(uint64_t timestamp_ms, uint64_t now_ms) const {
         if (timestamp_ms == 0 || now_ms < timestamp_ms) {
             return false;
@@ -526,6 +705,8 @@ private:
 
         connected_.store(false, std::memory_order_release);
         state_.connected = false;
+        telemetry_requests_queued_ = false;
+        ClearCommands();
         InvalidateVolatileState();
         SPDLOG_WARN("PX4 心跳超时: source={}/{} timeout_ms={}",
                     config_.target_system_id, config_.target_component_id,
@@ -587,12 +768,19 @@ private:
     uint64_t last_rc_time_ms_ = 0;
     bool rc_link_present_ = false;
     bool firmware_version_logged_ = false;
+    bool telemetry_requests_queued_ = false;
+
+    std::mutex command_mutex_;
+    std::deque<CommandRequest> command_queue_;
+    std::optional<InFlightCommand> in_flight_command_;
+    std::atomic<uint64_t> next_command_sequence_{1};
 
     std::atomic<uint64_t> setpoint_send_count_{0};
     std::atomic<uint64_t> receive_count_{0};
     std::atomic<uint64_t> ack_match_count_{0};
     std::atomic<uint64_t> ack_timeout_count_{0};
     std::atomic<uint64_t> error_count_{0};
+    std::array<std::atomic<uint64_t>, 256> message_receive_counts_{};
 };
 
 Px4Link::Px4Link(Px4LinkConfig config)
@@ -610,14 +798,20 @@ void Px4Link::SetInput(common::Topic<common::Px4Setpoint>& setpoint) {
 common::Topic<common::FlightStateSnapshot>& Px4Link::StateOutput() {
     return impl_->StateOutput();
 }
-bool Px4Link::SendCommand(uint16_t, float, float, float, float, float, float, float) {
-    return impl_->SendCommand();
+bool Px4Link::SendCommand(uint16_t command, float param1, float param2,
+                          float param3, float param4, float param5,
+                          float param6, float param7) {
+    return impl_->SendCommand(command, param1, param2, param3, param4,
+                              param5, param6, param7);
 }
 uint64_t Px4Link::SetpointSendCount() const { return impl_->SetpointSendCount(); }
 uint64_t Px4Link::ReceiveCount() const { return impl_->ReceiveCount(); }
 uint64_t Px4Link::AckMatchCount() const { return impl_->AckMatchCount(); }
 uint64_t Px4Link::AckTimeoutCount() const { return impl_->AckTimeoutCount(); }
 uint64_t Px4Link::ErrorCount() const { return impl_->ErrorCount(); }
+uint64_t Px4Link::MessageReceiveCount(uint32_t message_id) const {
+    return impl_->MessageReceiveCount(message_id);
+}
 
 Px4LinkStub::Px4LinkStub() {
     SPDLOG_INFO("PX4 通信部件骨架创建");

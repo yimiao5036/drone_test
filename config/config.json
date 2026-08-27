@@ -16,7 +16,20 @@
         "heartbeat_timeout_ms": 3000,
         "telemetry_timeout_ms": 2000,
         "state_publish_interval_ms": 100,
+        "command_ack_timeout_ms": 1000,
         "setpoint_queue_capacity": 4,
+        "command_queue_capacity": 16,
+        "one_shot_message_requests": [148, 242],
+        "message_interval_requests": [
+            {"message_id": 1, "interval_us": 1000000},
+            {"message_id": 24, "interval_us": 200000},
+            {"message_id": 30, "interval_us": 100000},
+            {"message_id": 32, "interval_us": 100000},
+            {"message_id": 33, "interval_us": 200000},
+            {"message_id": 65, "interval_us": 200000},
+            {"message_id": 147, "interval_us": 1000000},
+            {"message_id": 245, "interval_us": 500000}
+        ],
         "serial": {
             "device": "/dev/ttyS1",
             "baud_rate": 115200,

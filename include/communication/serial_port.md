@@ -97,7 +97,11 @@ class SerialPort {
     "heartbeat_timeout_ms": 3000,
     "telemetry_timeout_ms": 2000,
     "state_publish_interval_ms": 100,
+    "command_ack_timeout_ms": 1000,
     "setpoint_queue_capacity": 4,
+    "command_queue_capacity": 16,
+    "one_shot_message_requests": [148, 242],
+    "message_interval_requests": ["见 config/config.json"],
     "serial": {
         "device": "/dev/ttyS1",
         "baud_rate": 115200,
@@ -112,5 +116,5 @@ class SerialPort {
 ```
 
 `onboard_component_id=191` 对应 MAVLink 标准 `MAV_COMP_ID_ONBOARD_COMPUTER`。PX4 串口已
-确认为 `/dev/ttyS1`；波特率仍可通过 JSON 修改。配置读取与注入由后续
-`Px4Link` 实现接入，`SerialPort` 本身不依赖 JSON。
+确认为 `/dev/ttyS1`；波特率仍可通过 JSON 修改。`px4_link_smoke` 已严格读取并注入该配置，
+根 `main.cpp` 的全量配置装配仍待后续；`SerialPort` 本身不依赖 JSON。

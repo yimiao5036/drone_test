@@ -8,7 +8,7 @@
  *
  * 当前实现阶段：
  * - Px4Link 已实现独占串口线程、MAVLink 1/2 心跳、连接超时、版本与飞行遥测快照；
- * - 设定值发送、命令队列、ACK 关联和串口自动重连后续接入；
+ * - 可靠命令队列、ACK 和安全遥测请求已实现；设定值与串口自动重连后续接入；
  * - Px4LinkStub 继续保留用于骨架冒烟测试。
  *
  * 数据流：
@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/topic.h"
 #include "common/types.h"
@@ -75,6 +76,12 @@ public:
     virtual uint64_t ErrorCount() const = 0;
 };
 
+/// MAV_CMD_SET_MESSAGE_INTERVAL 请求项。
+struct MavlinkMessageIntervalRequest {
+    uint32_t message_id = 0;
+    int32_t interval_us = 0;
+};
+
 /// PX4 MAVLink 链路配置。设备名、身份和周期均由 JSON 注入，禁止在实现中写死。
 struct Px4LinkConfig {
     SerialPortConfig serial;
@@ -89,7 +96,11 @@ struct Px4LinkConfig {
     std::chrono::milliseconds telemetry_timeout{2000};
     std::chrono::milliseconds state_publish_interval{100};
     std::chrono::milliseconds reconnect_interval{1000};
+    std::chrono::milliseconds command_ack_timeout{1000};
     std::size_t setpoint_queue_capacity = 4;
+    std::size_t command_queue_capacity = 16;
+    std::vector<uint32_t> one_shot_message_requests;
+    std::vector<MavlinkMessageIntervalRequest> message_interval_requests;
 
     void Validate() const;
 };
@@ -120,6 +131,9 @@ public:
     uint64_t AckMatchCount() const override;
     uint64_t AckTimeoutCount() const override;
     uint64_t ErrorCount() const override;
+
+    /// 指定 MAVLink message ID 的累计接收数（用于硬件 smoke 诊断）。
+    uint64_t MessageReceiveCount(uint32_t message_id) const;
 
 private:
     class Impl;

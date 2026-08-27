@@ -17,8 +17,9 @@
 - 到期或 Ctrl+C 后停止并输出 PASS/WARN/FAIL 验收报告；
 - 根据基础链路结果返回进程退出码。
 
-安全边界：程序不绑定 `Px4Setpoint`，不调用 `SendCommand`，不会发送解锁、模式切换、起飞、
-降落或 Offboard 控制指令。当前唯一主动发送消息是机载电脑 HEARTBEAT。
+安全边界：程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、降落或 Offboard 控制。
+主动发送内容仅包括机载电脑 HEARTBEAT、`MAV_CMD_REQUEST_MESSAGE` 和
+`MAV_CMD_SET_MESSAGE_INTERVAL`，用于请求遥测及其频率。
 
 ## 2. 构建与运行
 
@@ -57,6 +58,13 @@ echo "退出码=$?"
     "target_system_id": 1,
     "target_component_id": 1,
     "mavlink_version": 2,
+    "command_ack_timeout_ms": 1000,
+    "command_queue_capacity": 16,
+    "one_shot_message_requests": [148, 242],
+    "message_interval_requests": [
+        {"message_id": 30, "interval_us": 100000},
+        {"message_id": 32, "interval_us": 100000}
+    ],
     "serial": {
         "device": "/dev/ttyS1",
         "baud_rate": 115200,
@@ -121,7 +129,8 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 ```text
 [PASS] PX4 HEARTBEAT
 [PASS] 测试结束时心跳仍连接
-[WARN] AUTOPILOT_VERSION
+[PASS] 遥测请求 COMMAND_ACK
+[PASS] AUTOPILOT_VERSION 收到 1 条
 [PASS] ATTITUDE
 ...
 结果: 基础 PX4 串口链路通过
@@ -159,3 +168,25 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | 退出码 3 且错误计数增加 | 查看 `logs/` 中串口 poll/read/write 节流错误 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
+
+## 8. 首次香橙派实测结果（2026-08-27）
+
+```text
+设备：/dev/ttyS1，115200，MAVLink 2
+目标：system/component = 1/1
+时长：30 秒
+接收目标消息：763
+ACK：首次版本尚未实现请求
+链路错误：0
+退出码：0
+结果：基础 PX4 串口链路通过
+```
+
+- HEARTBEAT 全程稳定，实测模式 `4/3` 对应 PX4 1.17.0 `AUTO/LOITER`，飞控未解锁；
+- 已收到 `EXTENDED_SYS_STATE`、`LOCAL_POSITION_NED`、`ATTITUDE`、`GPS_RAW_INT`；
+- GPS 消息存在但没有 3D fix，因此 `GLOBAL_POSITION_INT`、Home 不可用符合当前台架条件；
+- `AUTOPILOT_VERSION`、电池、Home、RC 未收到或未形成有效状态，需要主动请求或检查硬件；
+- landed/local 偶尔显示未知，是消息间隔超过 `telemetry_timeout_ms=2000`，心跳并未断开。
+
+下一轮 smoke 已具备 `MAV_CMD_REQUEST_MESSAGE`、`MAV_CMD_SET_MESSAGE_INTERVAL`、ACK
+匹配/超时和每类 message ID 计数，可区分“消息未配置”“消息已收到但字段无效”和“解析缺陷”。
