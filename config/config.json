@@ -19,7 +19,7 @@
         "setpoint_queue_capacity": 4,
         "serial": {
             "device": "/dev/ttyS1",
-            "baud_rate": 57600,
+            "baud_rate": 115200,
             "data_bits": 8,
             "stop_bits": 1,
             "parity": "N",
