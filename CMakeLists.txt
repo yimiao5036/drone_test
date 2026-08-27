@@ -164,6 +164,26 @@ else()
     target_compile_options(drone_control PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# PX4 只读硬件冒烟测试：独立于视频主程序，仅装配配置、串口、MAVLink、Px4Link 和状态订阅。
+add_executable(px4_link_smoke
+    tools/px4_link_smoke.cpp
+    src/common/logger.cpp)
+target_link_libraries(px4_link_smoke PRIVATE
+    drone_common
+    drone_communication
+    spdlog::spdlog)
+if(MSVC)
+    target_compile_options(px4_link_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(px4_link_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_custom_command(TARGET px4_link_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/config"
+            "${CMAKE_BINARY_DIR}/config"
+    COMMENT "复制 config/ 到 PX4 冒烟测试构建目录"
+    VERBATIM)
+
 include(CTest)
 if(BUILD_TESTING)
     find_package(GTest QUIET)
@@ -261,6 +281,19 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(mavlink_handler_test)
+
+        # PX4 链路基础测试：PTY 串口、本机/PX4 心跳、连接超时、快照发布与重启
+        add_executable(px4_link_test tests/communication/px4_link_test.cpp)
+        target_link_libraries(px4_link_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(px4_link_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(px4_link_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(px4_link_test)
 
         # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
         add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)

@@ -89,8 +89,17 @@ class SerialPort {
     "onboard_component_id": 191
 },
 "px4": {
+    "firmware_version": "1.17.0",
+    "target_system_id": 1,
+    "target_component_id": 1,
+    "mavlink_version": 2,
+    "heartbeat_send_interval_ms": 1000,
+    "heartbeat_timeout_ms": 3000,
+    "telemetry_timeout_ms": 2000,
+    "state_publish_interval_ms": 100,
+    "setpoint_queue_capacity": 4,
     "serial": {
-        "device": "/dev/ttyS0",
+        "device": "/dev/ttyS1",
         "baud_rate": 115200,
         "data_bits": 8,
         "stop_bits": 1,
@@ -102,6 +111,6 @@ class SerialPort {
 }
 ```
 
-`onboard_component_id=191` 对应 MAVLink 标准 `MAV_COMP_ID_ONBOARD_COMPUTER`。当前设备名和
-波特率是可修改占位值；待确认香橙派实际 UART 后只改 JSON。配置读取与注入由后续
+`onboard_component_id=191` 对应 MAVLink 标准 `MAV_COMP_ID_ONBOARD_COMPUTER`。PX4 串口已
+确认为 `/dev/ttyS1`；波特率仍可通过 JSON 修改。配置读取与注入由后续
 `Px4Link` 实现接入，`SerialPort` 本身不依赖 JSON。

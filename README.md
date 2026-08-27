@@ -22,8 +22,8 @@
 | 项目 | 当前方案 |
 |------|----------|
 | 算力板 | Orange Pi，RK3588，Ubuntu |
-| 飞控 | Pixhawk 2.4.8，PX4 1.11.3 |
-| 算力板与飞控 | 串口 MAVLink |
+| 飞控 | Pixhawk 2.4.8，PX4 1.17.0 |
+| 算力板与飞控 | `/dev/ttyS1` 串口 MAVLink |
 | 地面站 | 自研，通过电台与算力板使用 MAVLink 通信 |
 | 摄像头 | 机头正前方固定安装，RJ45/TCP，H.265，实机流 1280×720、25 FPS |
 | 视觉算法 | YOLOv26 RKNN；正式模型输出 `[1,5,8400]` 归一化框与置信度，类别名称由 JSON 配置 |
@@ -84,6 +84,8 @@
 - [图传发送与编码后端](include/video_transmission/video_sender.md)
 - [串口封装](include/communication/serial_port.md)
 - [MAVLink 字节流处理器](include/communication/mavlink_handler.md)
+- [PX4 通信链路](include/communication/px4_link.md)
+- [PX4 只读串口冒烟测试](tools/px4_link_smoke.md)
 
 ## 当前正式工程目录
 
@@ -109,6 +111,7 @@ drone_test/
 ├── src/                      # 各模块实现（含真实实现与 Stub）
 ├── tests/                    # 单元测试 + tests/skeleton/ 骨架冒烟测试
 ├── config/
+├── tools/                    # px4_link_smoke.cpp（PX4 只读硬件冒烟测试）
 ├── models/                   # yolo26n-int8.rknn
 ├── third_party/
 └── videoPart/                # 现有视频/RKNN验证原型，后续按模块迁移
@@ -121,4 +124,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留。PX4 通信阶段已完成可配置串口基础层强化（非阻塞 fd + `poll()` 精确超时）、Linux PTY 自动化测试和通用 `MavlinkHandler`（MAVLink 1/2、半包/粘包、CRC 错误恢复、每链路独立序号），开发机全工程 **93/93 测试通过**。`videoPart` 保留为硬件验证原型；下一步实现 `Px4Link` 独占通信线程、心跳与遥测快照，之后继续地面站链路和状态控制装配，并在 PX4 SITL、台架及受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留。PX4 通信阶段已完成可配置串口基础层、通用 `MavlinkHandler` 和 `Px4Link` 遥测实现：独占串口线程、心跳/版本、连接超时、落地、全局/局部位置、姿态、GPS、电池、Home、RC 解析及数据新鲜度失效；串口配置已改为 `/dev/ttyS1`。开发机使用 Linux PTY 完成自动化验证，全工程 **102/102 测试通过**；独立只读 `px4_link_smoke` 已完成装配。`videoPart` 保留为硬件验证原型；下一步先在香橙派 `/dev/ttyS1` 运行 30 秒串口冒烟测试，再实现设定值、可靠命令队列与 ACK，并进行 PX4 1.17.0 SITL、台架及受控飞行验证。
