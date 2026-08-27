@@ -190,3 +190,52 @@ ACK：首次版本尚未实现请求
 
 下一轮 smoke 已具备 `MAV_CMD_REQUEST_MESSAGE`、`MAV_CMD_SET_MESSAGE_INTERVAL`、ACK
 匹配/超时和每类 message ID 计数，可区分“消息未配置”“消息已收到但字段无效”和“解析缺陷”。
+
+## 9. 第二次香橙派实测结果（2026-08-27）
+
+```text
+时长：30 秒
+ACK 匹配：10
+ACK 超时：0
+sequence 1：REQUEST_MESSAGE(AUTOPILOT_VERSION)，result=0 ACCEPTED
+sequence 2：REQUEST_MESSAGE(HOME_POSITION)，result=2 DENIED（当前无 GPS/Home）
+sequence 3~10：SET_MESSAGE_INTERVAL，全部 result=0 ACCEPTED
+AUTOPILOT_VERSION：1 条，版本 1.17.0，capabilities=59647
+EXTENDED_SYS_STATE：17 条
+LOCAL_POSITION_NED：85 条
+ATTITUDE：86 条
+GPS_RAW_INT：42 条，无 3D fix
+SYS_STATUS/BATTERY_STATUS：18 条，但电池字段无效
+GLOBAL_POSITION_INT / HOME_POSITION / RC_CHANNELS：未收到
+链路错误：0
+退出码：0
+```
+
+结论：PX4 1.17.0 接受版本请求和全部 8 条频率请求；Home 请求被明确拒绝，符合当前没有
+GPS 3D fix、尚未建立 Home 的状态。可靠命令/ACK 链路实机通过；
+落地和局部位置不再因 2 秒超时反复失效。无 GPS 3D fix 时全局位置/Home 缺失符合预期。
+实机测试时未插动力电池、未开启遥控器，因此电池消息字段无效和 RC 未收到属于预期状态；
+后续接入硬件后再验证。PX4 `mavlink status` 确认对应 instance #0 为 PX4 内部
+`/dev/ttyS0 @115200`（对端香橙派 `/dev/ttyS1`），mode=Normal、tx rate max=1200 B/s、
+rate multiplier=0.283，解释了实际消息频率约为请求值的三分之一。
+
+## 10. 第三次香橙派实测结果：提高 MAVLink 带宽（2026-08-27）
+
+将 PX4 参数 `MAV_0_RATE` 从 1200 调整为 0，使 PX4 按 115200 波特率自动使用约
+`baudrate/20 = 5760 B/s` 上限。30 秒结果：
+
+```text
+EXTENDED_SYS_STATE：59 条（约 2 Hz）
+LOCAL_POSITION_NED：294 条（约 10 Hz）
+ATTITUDE：304 条（约 10 Hz）
+GPS_RAW_INT：150 条（5 Hz）
+SYS_STATUS/BATTERY_STATUS：60 条（两类各约 1 Hz）
+总接收目标消息：1674
+ACK 匹配：10
+ACK 超时：0
+链路错误：0
+```
+
+请求频率已全部达到预期，且 30 秒内状态有效性稳定。无全局位置/Home、无有效电池和无 RC
+分别与无 GPS 3D fix、未插动力电池、未开启遥控器一致。当前 115200 串口带宽满足基础遥测，
+PX4 接收与安全命令阶段验收完成。
