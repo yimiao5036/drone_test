@@ -6,9 +6,10 @@
 
 ## 1. 功能职责
 
-`Px4Link` 是 Pixhawk/PX4 MAVLink 物理链路的唯一拥有者。当前第一阶段已实现：
+`Px4Link` 是 Pixhawk/PX4 MAVLink 链路的唯一拥有者，可通过 `ICommunicationTransport`
+选择真实串口或 PX4 SITL UDP。当前已实现：
 
-- 根据 `Px4LinkConfig` 打开 PX4 串口；
+- 根据 `Px4LinkConfig.transport` 打开 PX4 串口或 UDP；
 - 启动一条独占通信线程，只有该线程执行串口读写；
 - 通过 `MavlinkHandler` 增量解析 MAVLink 1/2；
 - 周期发送机载电脑 `HEARTBEAT`；
@@ -19,8 +20,8 @@
 - 周期及状态变化时发布 `Topic<FlightStateSnapshot>`；
 - Start/Stop 幂等，停止后可以重新启动。
 
-当前不做：`Px4Setpoint` 编码发送和串口运行时自动重连。可靠 `COMMAND_LONG` 队列、
-`COMMAND_ACK` 关联、超时统计和安全遥测请求已经实现。
+当前不做：姿态设定值、全局坐标设定值和串口运行时自动重连。`Px4Setpoint` 的本地 NED
+位置/速度发送、可靠 `COMMAND_LONG` 队列、ACK 和安全遥测请求已经实现。
 
 `Px4LinkStub` 继续保留，仅供骨架冒烟测试，不参与真实硬件通信。
 
@@ -28,7 +29,9 @@
 
 ```cpp
 struct Px4LinkConfig {
+    std::string transport;  // serial / udp
     SerialPortConfig serial;
+    UdpTransportConfig udp;
     std::string firmware_version;  // 当前为 1.17.0
     uint8_t onboard_system_id;
     uint8_t onboard_component_id;
@@ -41,6 +44,8 @@ struct Px4LinkConfig {
     std::chrono::milliseconds state_publish_interval;
     std::chrono::milliseconds reconnect_interval;
     std::chrono::milliseconds command_ack_timeout;
+    std::chrono::milliseconds setpoint_send_interval;
+    std::chrono::milliseconds setpoint_timeout;
     std::size_t setpoint_queue_capacity;
     std::size_t command_queue_capacity;
     std::vector<uint32_t> one_shot_message_requests;
@@ -84,8 +89,8 @@ PX4 串口
   → COMMAND_ACK 匹配/超时
 ```
 
-`SetInput()` 必须在 `Start()` 前调用。当前仅建立容量可配置、丢旧留新的设定值订阅；实际
-`SET_POSITION_TARGET_LOCAL_NED` 发送将在下一阶段实现。
+`SetInput()` 必须在 `Start()` 前调用。订阅采用容量可配置、丢旧留新策略；通信线程缓存最新
+有效设定值，并按 `setpoint_send_interval` 重复发送 `SET_POSITION_TARGET_LOCAL_NED`。
 
 ## 3. 关键实现点
 
@@ -158,7 +163,26 @@ bits 24..31 → flight_sub_mode（sub mode）
 - `health`：连接时 1，断开时 3；
 - `source_time_ms=0`：HEARTBEAT 不提供可靠源时间，不伪造。
 
-### 3.5 可靠命令与安全遥测请求
+### 3.5 本地 NED 设定值
+
+当前支持：
+
+- `SetpointType::kPosition`：x/y/z 为 NED 位置（米）；
+- `SetpointType::kVelocity`：x/y/z 为 NED 速度（m/s）；
+- 可选 yaw 或 yaw rate，度/度每秒在发送前转换为弧度/弧度每秒；
+- 坐标系必须为 `header.frame_id=3`（本地 NED）；
+- 根据类型构造严格的 `POSITION_TARGET_TYPEMASK`，忽略未使用的位置/速度/加速度/yaw 字段。
+
+安全规则：
+
+- `valid=false` 清除缓存并停止发送，不会用空 mask 维持 Offboard；
+- 刹停/悬停必须由控制器生成有效零速度或位置保持设定值；
+- `kNone/kAttitude`、非 NED、NaN/Inf、同时启用 yaw 和 yaw rate 均拒绝；
+- 有效期取 `min(header.valid_for_ms, setpoint_timeout)`；头部未给有效期时使用配置上限；
+- 设定值收到时已过期、时间戳在未来或缓存过期时停止发送；
+- 只在 PX4 心跳连接期间发送，断开/Stop/Start 都清除旧设定值。
+
+### 3.6 可靠命令与安全遥测请求
 
 `SendCommand()` 只负责把命令放入有界队列，返回 true 表示成功入队，不表示 PX4 已接受。
 链路线程同一时刻只发送一条 `COMMAND_LONG` 并等待同 command ID 的 `COMMAND_ACK`：
@@ -177,7 +201,7 @@ bits 24..31 → flight_sub_mode（sub mode）
 
 这些内部命令只改变本 MAVLink 链路的消息输出，不执行解锁、模式切换或飞行控制。
 
-### 3.6 停机与重启
+### 3.7 停机与重启
 
 `Stop()` 先清除运行标志，等待串口 `poll()` 在 `read_timeout` 内返回并退出线程，然后关闭串口。
 若停止前已连接，会发布最终 `connected=false` 快照。再次 `Start()` 时重置 MAVLink 半包、发送序号、
@@ -188,7 +212,7 @@ bits 24..31 → flight_sub_mode（sub mode）
 | 等级 | 场景 |
 |---|---|
 | INFO | 创建/销毁、启动/停止、首次心跳、遥测请求入队、命令 ACK、固件版本、正常停止 |
-| WARN | 心跳超时、固件不一致、命令队列满、ACK 超时（异常均按约定节流） |
+| WARN | 心跳超时、固件不一致、命令队列满、ACK 超时、非法/过期设定值（均节流） |
 | ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
 
 不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
@@ -213,7 +237,11 @@ bits 24..31 → flight_sub_mode（sub mode）
 - 未连接拒绝命令；
 - `COMMAND_LONG` 参数编码、最终 ACK 匹配和快照更新；
 - ACK 超时计数后继续队列；
-- 首次心跳后按顺序发送单次消息请求和消息频率请求。
+- 首次心跳后按顺序发送单次消息请求和消息频率请求；
+- 本地 NED 位置设定值、type mask 和 yaw 角转换；
+- 本地 NED 速度设定值、type mask 和 yaw rate 转换；
+- 过期设定值停止重发；
+- 非 NED、姿态、NaN/Inf 和 yaw 选择冲突拒绝。
 
 运行：
 
@@ -224,7 +252,8 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-真实硬件使用独立 `px4_link_smoke` 验证，详见 `tools/px4_link_smoke.md`。该程序只发送机载电脑
+真实硬件和 SITL 均使用独立 `px4_link_smoke` 验证，详见 `tools/px4_link_smoke.md` 和
+`tools/PX4_SITL分级测试.md`。硬件模式只发送机载电脑
 HEARTBEAT、`REQUEST_MESSAGE` 和 `SET_MESSAGE_INTERVAL`，不发送解锁、模式或飞行控制命令，
 可在正式 main 全量装配前验证 `/dev/ttyS1`、ACK 和 PX4 实际消息流。
 
@@ -240,5 +269,5 @@ HEARTBEAT、`REQUEST_MESSAGE` 和 `SET_MESSAGE_INTERVAL`，不发送解锁、模
 | 重启后旧控制恢复 | 属于缺陷；Start 必须清空状态和后续的设定值/命令缓存 |
 | 收到其他 MAVLink 设备消息 | 当前按目标 ID 过滤；未来多组件遥测需明确白名单后扩展 |
 
-下一阶段实现 `Px4Setpoint` 时必须同步更新坐标系、type_mask、有效期语义、本文档、
-`docs/通信与数据定义.md` 和对应 PTY/SITL 测试。
+下一阶段必须先在 PX4 1.17.0 SITL 验证 Offboard 前置设定值流、位置/速度效果和设定值中断
+保护，再允许拆桨台架测试。姿态/机体系/全局设定值需要独立接口评审后才能扩展。

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -34,7 +35,13 @@ uint64_t MonotonicMs() {
 }  // namespace
 
 void Px4LinkConfig::Validate() const {
-    serial.Validate();
+    if (transport == "serial") {
+        serial.Validate();
+    } else if (transport == "udp") {
+        udp.Validate();
+    } else {
+        throw std::invalid_argument("PX4 transport 必须是 serial 或 udp");
+    }
     if (firmware_version.empty()) {
         throw std::invalid_argument("PX4 固件版本标识不能为空");
     }
@@ -50,8 +57,9 @@ void Px4LinkConfig::Validate() const {
     if (serial.read_timeout.count() <= 0 ||
         heartbeat_send_interval.count() <= 0 || heartbeat_timeout.count() <= 0 ||
         telemetry_timeout.count() <= 0 || state_publish_interval.count() <= 0 ||
-        reconnect_interval.count() <= 0 || command_ack_timeout.count() <= 0) {
-        throw std::invalid_argument("PX4 链路读取、遥测、命令 ACK、周期与超时必须为正数");
+        reconnect_interval.count() <= 0 || command_ack_timeout.count() <= 0 ||
+        setpoint_send_interval.count() <= 0 || setpoint_timeout.count() <= 0) {
+        throw std::invalid_argument("PX4 链路读取、遥测、命令 ACK、设定值周期与超时必须为正数");
     }
     if (setpoint_queue_capacity == 0 || command_queue_capacity == 0) {
         throw std::invalid_argument("PX4 设定值和命令队列容量必须大于 0");
@@ -72,20 +80,22 @@ class Px4Link::Impl final {
 public:
     explicit Impl(Px4LinkConfig config)
         : config_(std::move(config)),
-          serial_(config_.serial),
+          transport_(config_.transport == "serial"
+                         ? CreateSerialTransport(config_.serial)
+                         : CreateUdpTransport(config_.udp)),
           mavlink_(config_.mavlink_version == 1 ? MavlinkVersion::kV1
                                                 : MavlinkVersion::kV2) {
         config_.Validate();
-        SPDLOG_INFO("PX4 通信部件创建: firmware={} device={} baud={} onboard={}/{} target={}/{} mavlink={}",
-                    config_.firmware_version, config_.serial.device,
-                    config_.serial.baud_rate, config_.onboard_system_id,
-                    config_.onboard_component_id, config_.target_system_id,
-                    config_.target_component_id, config_.mavlink_version);
+        SPDLOG_INFO("PX4 通信部件创建: firmware={} transport={} onboard={}/{} target={}/{} mavlink={}",
+                    config_.firmware_version, transport_->Description(),
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    config_.target_system_id, config_.target_component_id,
+                    config_.mavlink_version);
     }
 
     ~Impl() {
         Stop();
-        SPDLOG_INFO("PX4 通信部件销毁: device={}", config_.serial.device);
+        SPDLOG_INFO("PX4 通信部件销毁: transport={}", transport_->Description());
     }
 
     bool Start() {
@@ -95,14 +105,15 @@ public:
         }
 
         try {
-            serial_.Open();
-            serial_.Flush();
+            transport_->Open();
+            transport_->Flush();
             mavlink_.Reset();
             state_ = common::FlightStateSnapshot{};
             state_sequence_ = 0;
             last_heartbeat_time_ms_ = 0;
             ResetTelemetryTimes();
             ClearCommands();
+            cached_setpoint_.reset();
             next_command_sequence_.store(1, std::memory_order_relaxed);
             telemetry_requests_queued_ = false;
             firmware_version_logged_ = false;
@@ -121,16 +132,16 @@ public:
             connected_.store(false, std::memory_order_release);
             setpoint_subscription_.Reset();
             ClearCommands();
-            serial_.Close();
+            transport_->Close();
             const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (ShouldLogThrottled(count)) {
-                SPDLOG_ERROR("PX4 通信启动失败: device={} error={}，累计 {}",
-                             config_.serial.device, error.what(), count);
+                SPDLOG_ERROR("PX4 通信启动失败: transport={} error={}，累计 {}",
+                             transport_->Description(), error.what(), count);
             }
             return false;
         }
 
-        SPDLOG_INFO("PX4 通信启动: device={}", config_.serial.device);
+        SPDLOG_INFO("PX4 通信启动: transport={}", transport_->Description());
         return true;
     }
 
@@ -145,9 +156,10 @@ public:
         }
         setpoint_subscription_.Reset();
         ClearCommands();
-        serial_.Close();
+        cached_setpoint_.reset();
+        transport_->Close();
         connected_.store(false, std::memory_order_release);
-        SPDLOG_INFO("PX4 通信停止: device={}", config_.serial.device);
+        SPDLOG_INFO("PX4 通信停止: transport={}", transport_->Description());
     }
 
     bool IsRunning() const {
@@ -230,6 +242,11 @@ private:
         uint64_t sent_time_ms = 0;
     };
 
+    struct CachedSetpoint {
+        common::Px4Setpoint value;
+        uint64_t accepted_time_ms = 0;
+    };
+
     bool EnqueueCommand(CommandRequest request) {
         std::lock_guard<std::mutex> lock(command_mutex_);
         if (command_queue_.size() >= config_.command_queue_capacity) {
@@ -279,10 +296,11 @@ private:
     void WorkerLoop() {
         auto next_heartbeat = std::chrono::steady_clock::now();
         auto next_state_publish = next_heartbeat;
+        auto next_setpoint_send = next_heartbeat;
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
-            const std::ptrdiff_t count = serial_.Read(read_buffer.data(), read_buffer.size());
+            const std::ptrdiff_t count = transport_->Read(read_buffer.data(), read_buffer.size());
             if (count > 0) {
                 mavlink_.Feed(
                     read_buffer.data(), static_cast<std::size_t>(count),
@@ -290,15 +308,23 @@ private:
             } else if (count < 0) {
                 error_count_.fetch_add(1, std::memory_order_relaxed);
                 // 串口持续异常时避免通信线程无等待自旋；自动关闭/重连在下一阶段接入。
-                std::this_thread::sleep_for(config_.serial.read_timeout);
+                const auto retry_delay = config_.transport == "serial"
+                                             ? config_.serial.read_timeout
+                                             : config_.udp.read_timeout;
+                std::this_thread::sleep_for(retry_delay);
             }
 
             const auto now = std::chrono::steady_clock::now();
             const uint64_t now_ms = MonotonicMs();
+            DrainSetpointInput(now_ms);
             CheckHeartbeatTimeout(now_ms);
             CheckCommandTimeout(now_ms);
             SendNextCommand(now_ms);
 
+            if (now >= next_setpoint_send) {
+                SendSetpointIfDue(now_ms);
+                next_setpoint_send = now + config_.setpoint_send_interval;
+            }
             if (now >= next_heartbeat) {
                 SendHeartbeat();
                 next_heartbeat = now + config_.heartbeat_send_interval;
@@ -314,7 +340,133 @@ private:
         }
         state_.connected = false;
         InvalidateVolatileState();
+        cached_setpoint_.reset();
         PublishState(MonotonicMs());
+    }
+
+    bool IsSetpointStructurallyValid(const common::Px4Setpoint& setpoint) const {
+        if (!setpoint.valid || setpoint.header.frame_id != 3 ||
+            (setpoint.type != common::SetpointType::kPosition &&
+             setpoint.type != common::SetpointType::kVelocity) ||
+            !std::isfinite(setpoint.x) || !std::isfinite(setpoint.y) ||
+            !std::isfinite(setpoint.z) ||
+            (setpoint.use_yaw && !std::isfinite(setpoint.yaw_deg)) ||
+            (setpoint.use_yaw_rate && !std::isfinite(setpoint.yaw_rate_dps)) ||
+            (setpoint.use_yaw && setpoint.use_yaw_rate)) {
+            return false;
+        }
+        return true;
+    }
+
+    uint64_t SetpointMaxAgeMs(const common::Px4Setpoint& setpoint) const {
+        const uint64_t configured =
+            static_cast<uint64_t>(config_.setpoint_timeout.count());
+        if (setpoint.header.valid_for_ms == 0) {
+            return configured;
+        }
+        return std::min(configured, setpoint.header.valid_for_ms);
+    }
+
+    bool IsSetpointFresh(const CachedSetpoint& cached, uint64_t now_ms) const {
+        const uint64_t timestamp = cached.value.header.receive_time_ms != 0
+                                       ? cached.value.header.receive_time_ms
+                                       : cached.accepted_time_ms;
+        return now_ms >= timestamp &&
+               now_ms - timestamp <= SetpointMaxAgeMs(cached.value);
+    }
+
+    void RejectSetpoint(const char* reason) {
+        const uint64_t count =
+            setpoint_reject_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("PX4 设定值拒绝: reason={}，累计 {}", reason, count);
+        }
+    }
+
+    void DrainSetpointInput(uint64_t now_ms) {
+        while (auto message = setpoint_subscription_.TryTake()) {
+            const common::Px4Setpoint& setpoint = **message;
+            if (!setpoint.valid) {
+                cached_setpoint_.reset();
+                continue;
+            }
+            if (!IsSetpointStructurallyValid(setpoint)) {
+                RejectSetpoint("类型、坐标系、数值或 yaw 选择非法");
+                cached_setpoint_.reset();
+                continue;
+            }
+
+            CachedSetpoint candidate{setpoint, now_ms};
+            if (!IsSetpointFresh(candidate, now_ms)) {
+                RejectSetpoint("收到时已过期或时间戳在未来");
+                cached_setpoint_.reset();
+                continue;
+            }
+            cached_setpoint_ = std::move(candidate);
+        }
+    }
+
+    uint16_t BuildSetpointTypeMask(const common::Px4Setpoint& setpoint) const {
+        uint16_t mask = POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                        POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                        POSITION_TARGET_TYPEMASK_AZ_IGNORE;
+        if (setpoint.type == common::SetpointType::kPosition) {
+            mask |= POSITION_TARGET_TYPEMASK_VX_IGNORE |
+                    POSITION_TARGET_TYPEMASK_VY_IGNORE |
+                    POSITION_TARGET_TYPEMASK_VZ_IGNORE;
+        } else {
+            mask |= POSITION_TARGET_TYPEMASK_X_IGNORE |
+                    POSITION_TARGET_TYPEMASK_Y_IGNORE |
+                    POSITION_TARGET_TYPEMASK_Z_IGNORE;
+        }
+        if (!setpoint.use_yaw) {
+            mask |= POSITION_TARGET_TYPEMASK_YAW_IGNORE;
+        }
+        if (!setpoint.use_yaw_rate) {
+            mask |= POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE;
+        }
+        return mask;
+    }
+
+    void SendSetpointIfDue(uint64_t now_ms) {
+        if (!connected_.load(std::memory_order_acquire) || !cached_setpoint_) {
+            return;
+        }
+        if (!IsSetpointFresh(*cached_setpoint_, now_ms)) {
+            RejectSetpoint("缓存设定值已过期，停止发送");
+            cached_setpoint_.reset();
+            return;
+        }
+
+        const common::Px4Setpoint& setpoint = cached_setpoint_->value;
+        const bool position = setpoint.type == common::SetpointType::kPosition;
+        constexpr float kDegreesToRadians = 0.01745329251994329577f;
+        const float yaw = setpoint.use_yaw ? setpoint.yaw_deg * kDegreesToRadians : 0.f;
+        const float yaw_rate = setpoint.use_yaw_rate
+                                   ? setpoint.yaw_rate_dps * kDegreesToRadians
+                                   : 0.f;
+        const uint16_t type_mask = BuildSetpointTypeMask(setpoint);
+        const auto frame = mavlink_.Encode(
+            [this, &setpoint, position, now_ms, type_mask, yaw, yaw_rate](
+                mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_set_position_target_local_ned_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, static_cast<uint32_t>(now_ms),
+                    config_.target_system_id, config_.target_component_id,
+                    MAV_FRAME_LOCAL_NED, type_mask,
+                    position ? setpoint.x : 0.f,
+                    position ? setpoint.y : 0.f,
+                    position ? setpoint.z : 0.f,
+                    position ? 0.f : setpoint.x,
+                    position ? 0.f : setpoint.y,
+                    position ? 0.f : setpoint.z,
+                    0.f, 0.f, 0.f, yaw, yaw_rate);
+            });
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        setpoint_send_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
     void HandleMessage(const mavlink_message_t& message) {
@@ -631,7 +783,7 @@ private:
                     request.params[3], request.params[4], request.params[5],
                     request.params[6]);
             });
-        if (frame.empty() || !serial_.Write(frame.data(), frame.size())) {
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
             error_count_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -722,7 +874,7 @@ private:
                     status, message, MAV_TYPE_ONBOARD_CONTROLLER,
                     MAV_AUTOPILOT_INVALID, 0, 0, MAV_STATE_ACTIVE);
             });
-        if (frame.empty() || !serial_.Write(frame.data(), frame.size())) {
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
             error_count_.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -745,7 +897,7 @@ private:
     }
 
     Px4LinkConfig config_;
-    SerialPort serial_;
+    std::unique_ptr<ICommunicationTransport> transport_;
     MavlinkHandler mavlink_;
 
     mutable std::mutex lifecycle_mutex_;
@@ -774,12 +926,14 @@ private:
     std::deque<CommandRequest> command_queue_;
     std::optional<InFlightCommand> in_flight_command_;
     std::atomic<uint64_t> next_command_sequence_{1};
+    std::optional<CachedSetpoint> cached_setpoint_;
 
     std::atomic<uint64_t> setpoint_send_count_{0};
     std::atomic<uint64_t> receive_count_{0};
     std::atomic<uint64_t> ack_match_count_{0};
     std::atomic<uint64_t> ack_timeout_count_{0};
     std::atomic<uint64_t> error_count_{0};
+    std::atomic<uint64_t> setpoint_reject_count_{0};
     std::array<std::atomic<uint64_t>, 256> message_receive_counts_{};
 };
 

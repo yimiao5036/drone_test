@@ -27,7 +27,7 @@
 
 #include "common/topic.h"
 #include "common/types.h"
-#include "communication/serial_port.h"
+#include "communication/communication_transport.h"
 
 namespace drone::communication {
 
@@ -84,7 +84,9 @@ struct MavlinkMessageIntervalRequest {
 
 /// PX4 MAVLink 链路配置。设备名、身份和周期均由 JSON 注入，禁止在实现中写死。
 struct Px4LinkConfig {
+    std::string transport = "serial";  ///< serial 或 udp
     SerialPortConfig serial;
+    UdpTransportConfig udp;
     std::string firmware_version = "1.17.0";  ///< 当前适配目标，用于日志与版本核验
     uint8_t onboard_system_id = 1;
     uint8_t onboard_component_id = 191;  ///< MAV_COMP_ID_ONBOARD_COMPUTER
@@ -97,6 +99,8 @@ struct Px4LinkConfig {
     std::chrono::milliseconds state_publish_interval{100};
     std::chrono::milliseconds reconnect_interval{1000};
     std::chrono::milliseconds command_ack_timeout{1000};
+    std::chrono::milliseconds setpoint_send_interval{50};
+    std::chrono::milliseconds setpoint_timeout{500};
     std::size_t setpoint_queue_capacity = 4;
     std::size_t command_queue_capacity = 16;
     std::vector<uint32_t> one_shot_message_requests;

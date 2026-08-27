@@ -240,9 +240,11 @@ struct Px4Setpoint {
     float x = 0.f;         ///< 位置或速度分量
     float y = 0.f;
     float z = 0.f;
-    float yaw_deg = 0.f;   ///< 目标航向
-    float yaw_rate_dps = 0.f;  ///< 目标航向角速度
-    bool valid = false;    ///< 无效设定值（如刹停完成）也需发送，避免过期指令
+    float yaw_deg = 0.f;       ///< 目标航向；仅 use_yaw=true 时使用
+    float yaw_rate_dps = 0.f;  ///< 目标航向角速度；仅 use_yaw_rate=true 时使用
+    bool use_yaw = false;      ///< 是否启用航向角控制
+    bool use_yaw_rate = false; ///< 是否启用航向角速度控制；不得与 use_yaw 同时为 true
+    bool valid = false;        ///< false 时停止发送；刹停/悬停必须生成有效零速度或位置保持值
 };
 
 /// 健康状态（健康管理 → 状态机/地面站回传）。

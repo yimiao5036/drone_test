@@ -125,6 +125,9 @@ Px4LinkConfig MakeConfig(const std::string& device) {
     config.heartbeat_timeout = 100ms;
     config.state_publish_interval = 20ms;
     config.reconnect_interval = 100ms;
+    config.command_ack_timeout = 100ms;
+    config.setpoint_send_interval = 10ms;
+    config.setpoint_timeout = 100ms;
     config.setpoint_queue_capacity = 4;
     return config;
 }
@@ -586,6 +589,155 @@ TEST(Px4LinkTest, CountsCommandAckTimeoutAndContinuesQueue) {
     ASSERT_TRUE(terminal.WaitForMessage(
         MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
     EXPECT_TRUE(WaitUntil([&link] { return link.AckTimeoutCount() == 1; }, 500ms));
+    link.Stop();
+}
+
+TEST(Px4LinkTest, SendsLocalNedPositionSetpointWithYaw) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 3;
+    setpoint.header.valid_for_ms = 200;
+    setpoint.type = common::SetpointType::kPosition;
+    setpoint.x = 1.5f;
+    setpoint.y = -2.5f;
+    setpoint.z = -3.f;
+    setpoint.yaw_deg = 90.f;
+    setpoint.use_yaw = true;
+    setpoint.valid = true;
+    (void)topic.Emplace(setpoint);
+
+    mavlink_message_t message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED, 500ms, &message));
+    mavlink_set_position_target_local_ned_t target{};
+    mavlink_msg_set_position_target_local_ned_decode(&message, &target);
+    EXPECT_EQ(target.coordinate_frame, MAV_FRAME_LOCAL_NED);
+    EXPECT_FLOAT_EQ(target.x, setpoint.x);
+    EXPECT_FLOAT_EQ(target.y, setpoint.y);
+    EXPECT_FLOAT_EQ(target.z, setpoint.z);
+    EXPECT_FLOAT_EQ(target.vx, 0.f);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_VX_IGNORE, 0);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_X_IGNORE, 0);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_YAW_IGNORE, 0);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE, 0);
+    EXPECT_NEAR(target.yaw, 1.57079632679f, 1e-5f);
+    EXPECT_GT(link.SetpointSendCount(), 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, SendsLocalNedVelocitySetpointWithYawRate) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 3;
+    setpoint.header.valid_for_ms = 200;
+    setpoint.type = common::SetpointType::kVelocity;
+    setpoint.x = 4.f;
+    setpoint.y = 5.f;
+    setpoint.z = -1.f;
+    setpoint.yaw_rate_dps = 30.f;
+    setpoint.use_yaw_rate = true;
+    setpoint.valid = true;
+    (void)topic.Emplace(setpoint);
+
+    mavlink_message_t message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED, 500ms, &message));
+    mavlink_set_position_target_local_ned_t target{};
+    mavlink_msg_set_position_target_local_ned_decode(&message, &target);
+    EXPECT_FLOAT_EQ(target.vx, setpoint.x);
+    EXPECT_FLOAT_EQ(target.vy, setpoint.y);
+    EXPECT_FLOAT_EQ(target.vz, setpoint.z);
+    EXPECT_FLOAT_EQ(target.x, 0.f);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_X_IGNORE, 0);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_VX_IGNORE, 0);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_YAW_IGNORE, 0);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE, 0);
+    EXPECT_NEAR(target.yaw_rate, 0.52359877559f, 1e-5f);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, StopsSendingExpiredSetpoint) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    config.setpoint_send_interval = 10ms;
+    config.setpoint_timeout = 50ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 3;
+    setpoint.type = common::SetpointType::kVelocity;
+    setpoint.valid = true;
+    (void)topic.Emplace(setpoint);
+    ASSERT_TRUE(WaitUntil([&link] { return link.SetpointSendCount() > 0; }, 500ms));
+
+    std::this_thread::sleep_for(120ms);
+    const uint64_t after_expiry = link.SetpointSendCount();
+    std::this_thread::sleep_for(80ms);
+    EXPECT_EQ(link.SetpointSendCount(), after_expiry);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, RejectsUnsupportedOrAmbiguousSetpoint) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 2;  // 当前只允许 LOCAL_NED=3
+    setpoint.type = common::SetpointType::kVelocity;
+    setpoint.valid = true;
+    (void)topic.Emplace(setpoint);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(link.SetpointSendCount(), 0u);
+
+    setpoint.header.frame_id = 3;
+    setpoint.use_yaw = true;
+    setpoint.use_yaw_rate = true;
+    (void)topic.Emplace(setpoint);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(link.SetpointSendCount(), 0u);
     link.Stop();
 }
 

@@ -98,6 +98,8 @@ class SerialPort {
     "telemetry_timeout_ms": 2000,
     "state_publish_interval_ms": 100,
     "command_ack_timeout_ms": 1000,
+    "setpoint_send_interval_ms": 50,
+    "setpoint_timeout_ms": 500,
     "setpoint_queue_capacity": 4,
     "command_queue_capacity": 16,
     "one_shot_message_requests": [148, 242],
