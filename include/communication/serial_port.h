@@ -30,7 +30,8 @@ struct SerialPortConfig {
     uint8_t data_bits = 8;                   ///< 数据位（5/6/7/8）
     uint8_t stop_bits = 1;                   ///< 停止位（1/2）
     char parity = 'N';                       ///< 校验位：N=无 E=偶 O=奇
-    std::chrono::milliseconds read_timeout{100};  ///< 单次读取超时
+    std::chrono::milliseconds read_timeout{100};   ///< 单次读取超时
+    std::chrono::milliseconds write_timeout{100};  ///< 单帧写入超时
 
     /// 参数合法性校验；非法时抛出 std::invalid_argument。
     void Validate() const;
@@ -61,8 +62,8 @@ public:
     /// @return 实际读取字节数；0 表示超时无数据；-1 表示错误（记入 ErrorCount）。
     [[nodiscard]] std::ptrdiff_t Read(uint8_t* buffer, std::size_t size);
 
-    /// 写入全部字节。
-    /// @return 是否全部写入成功；失败时记入 ErrorCount。
+    /// 在 write_timeout 内写入全部字节。
+    /// @return 是否全部写入成功；超时或失败时记入 ErrorCount。
     bool Write(const uint8_t* data, std::size_t size);
 
     /// 丢弃收发缓冲区中的残留数据（用于重同步）。

@@ -3,6 +3,22 @@
         "dir": "logs/",
         "level": "info"
     },
+    "mavlink": {
+        "onboard_system_id": 1,
+        "onboard_component_id": 191
+    },
+    "px4": {
+        "serial": {
+            "device": "/dev/ttyS0",
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "stop_bits": 1,
+            "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "reconnect_interval_ms": 1000
+    },
     "yolo": {
         "model_path": "models/yolo26n-int8.rknn",
         "conf_threshold": 0.60,

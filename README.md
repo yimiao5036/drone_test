@@ -83,6 +83,7 @@
 - [视频叠加](include/video/frame_compositor.md)
 - [图传发送与编码后端](include/video_transmission/video_sender.md)
 - [串口封装](include/communication/serial_port.md)
+- [MAVLink 字节流处理器](include/communication/mavlink_handler.md)
 
 ## 当前正式工程目录
 
@@ -100,7 +101,7 @@ drone_test/
 │   ├── perception/           # yolo_detector.h, detection_backend.h, yolo_postprocess.h,
 │   │                         #   optical_flow_estimator.h, laser_range_finder.h,
 │   │                         #   perception_fusion.h, target_estimator.h
-│   ├── communication/        # serial_port.h, px4_link.h, ground_station_link.h
+│   ├── communication/        # serial_port.h, mavlink_handler.h, px4_link.h, ground_station_link.h
 │   ├── control/              # flight_controller.h
 │   ├── state_machine/        # mission_state_machine.h
 │   ├── health/               # health_manager.h
@@ -120,4 +121,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留，开发机全工程 **79/79 测试通过**。`videoPart` 保留为硬件验证原型；下一阶段开发 PX4 串口、地面站电台、状态主题和全量控制装配，之后在 PX4 SITL、台架及受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留。PX4 通信阶段已完成可配置串口基础层强化（非阻塞 fd + `poll()` 精确超时）、Linux PTY 自动化测试和通用 `MavlinkHandler`（MAVLink 1/2、半包/粘包、CRC 错误恢复、每链路独立序号），开发机全工程 **93/93 测试通过**。`videoPart` 保留为硬件验证原型；下一步实现 `Px4Link` 独占通信线程、心跳与遥测快照，之后继续地面站链路和状态控制装配，并在 PX4 SITL、台架及受控飞行环境中分级验证。

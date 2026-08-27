@@ -101,10 +101,15 @@ endif()
 # ---- communication 模块（串口封装、PX4/地面站链路接口） ----
 add_library(drone_communication STATIC
     src/communication/serial_port.cpp
+    src/communication/mavlink_handler.cpp
     src/communication/px4_link.cpp
     src/communication/ground_station_link.cpp)
 target_include_directories(drone_communication PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+# MAVLink 为生成的第三方 C 头文件，按 SYSTEM 传播以屏蔽其 packed/匿名结构体警告；
+# 项目自身代码仍保持 -Wall -Wextra -Wpedantic。
+target_include_directories(drone_communication SYSTEM PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/c_library_v2-master>)
 target_compile_features(drone_communication PUBLIC cxx_std_17)
 target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
@@ -230,6 +235,32 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
+        add_executable(serial_port_test tests/communication/serial_port_test.cpp)
+        target_link_libraries(serial_port_test PRIVATE
+            drone_communication spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(serial_port_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(serial_port_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(serial_port_test)
+
+        # MAVLink 字节流测试：验证 v1/v2、半包、粘包、坏 CRC 恢复和实例隔离
+        add_executable(mavlink_handler_test tests/communication/mavlink_handler_test.cpp)
+        target_link_libraries(mavlink_handler_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mavlink_handler_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mavlink_handler_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mavlink_handler_test)
 
         # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
         add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)
