@@ -446,6 +446,32 @@ PX4 已退出 Offboard
 Offboard 丢失反应时间: ... ms，保护模式: main/sub
 ```
 
+### 11.1 第 3D 阶段实测结果（2026-08-28）
+
+```text
+停止 setpoint 后额外发送：0 条
+退出 Offboard 反应时间：1270 ms
+观测保护模式：4/5
+最大相对高度：0.968808 m
+最大水平漂移：0.0514454 m
+设定值：224，接收：5155，ACK：14，超时：0，链路错误：0
+```
+
+PX4 成功退出 6/0 并稳定 1 秒，随后程序统一切 AUTO.LAND 4/6、landed、主动 DISARM，全部
+验收 PASS。实测参数：
+
+```text
+COM_OF_LOSS_T = 1.0000
+COM_OBL_RC_ACT = 0
+```
+
+1270ms 比配置的1秒多约270ms，包含 commander切换、HEARTBEAT上报和应用采样延迟，符合预期。
+PX4 1.17.0 源码确认：`COM_OBL_RC_ACT=0`定义为Position mode，custom 4/5定义为AUTO/RTL。
+`fromOffboardLossActParam()`先请求FallbackPosCtrl/POSCTL；`checkModeFallback()`在POSCTL不可用时
+依次降级到ALTCTL、STAB，对`manual_control_signal_lost`执行人工控制丢失回退，最后若目标模式
+仍不可运行则强制AUTO_RTL。本次没有人工控制输入，因此4/5 AUTO/RTL是PX4的确定性安全降级，
+不是`COM_OBL_RC_ACT`未生效。
+
 任何阶段未通过都不得进入真实 Pixhawk 控制测试。
 
 ## 8. 常见问题
