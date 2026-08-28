@@ -50,6 +50,7 @@ echo "退出码=$?"
 | `--sitl-arm-zero-velocity` | 仅 UDP，ARM 后零速度保持 5 秒，再主动 DISARM |
 | `--sitl-takeoff-land` | 仅 UDP，相对起飞 1m、稳定悬停 3 秒、AUTO.LAND、确认 landed 后主动 DISARM |
 | `--sitl-horizontal-motion` | 仅 UDP，起飞 1m 后北向 0.5m/s×2 秒、零速度制动、返回起点、降落上锁；最短 30 秒 |
+| `--sitl-offboard-loss` | 仅 UDP，起飞 1m 后停止 setpoint、验证 PX4 退出 Offboard，再 AUTO.LAND 回收；最短 25 秒 |
 | `--help` | 显示帮助 |
 
 ## 3. 当前配置
@@ -179,6 +180,8 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | AUTO.LAND 后未 landed | 检查 mode 4/6、land detector 和位置估计；未 landed 时程序不会空中 DISARM |
 | 水平运动阶段安全回收 | 北向位移超过 1.50m、东西偏差超过 0.30m，或相对高度离开 0.65~1.30m |
 | 水平运动位移验收失败 | 制动完成时北向位移必须在 0.70~1.30m；速度命令结束瞬间位移仅用于观察加速响应 |
+| 停止 setpoint 后仍为 6/0 | 检查 `COM_OF_LOSS_T` 和实际 setpoint 发送计数；本工具最长等待 10 秒 |
+| Offboard loss 保护模式与预期不同 | 对照运行前记录的 `COM_OBL_RC_ACT` 和 RC 是否存在，不在工具内猜测或改参数 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

@@ -393,8 +393,60 @@ Offboard、位置、姿态或限制异常均优先 AUTO.LAND，未 landed 禁止
 最大东西向偏差: ...
 ```
 
-第 3C 通过后再测试 Offboard setpoint 丢失保护。任何阶段未通过都不得进入真实 Pixhawk
-控制测试。
+### 10.1 第 3C 阶段实测结果（2026-08-28）
+
+```text
+速度命令结束北向位移：0.582914 m
+制动完成北向位移：1.02714 m
+最大北向位移：1.02865 m
+最大东西向偏差：0.0695659 m
+最大相对高度：1.00696 m
+设定值：391，接收：6701，ACK：14，超时：0，链路错误：0
+```
+
+全部验收 PASS。仿真视觉上运动短促，是由于 2 秒速度脉冲以及位置→阶跃速度→零速度→返回
+位置的连续切换；实际位移约 1.03m。该阶段用于验证控制链路和边界，不代表最终任务轨迹的
+平滑策略；生产控制需增加加速度/jerk 限制或速度斜坡。
+
+## 11. 第 3D 阶段：SITL Offboard setpoint 丢失保护
+
+运行前在 PX4 shell 记录实际参数，不得猜测：
+
+```text
+param show COM_OF_LOSS_T
+param show COM_OBL_RC_ACT
+```
+
+本工具从发布 `valid=false` 起最多等待 10 秒退出 Offboard；测量值还包含机载端最多约 0.5 秒
+setpoint 缓存清除时间。若实际 `COM_OF_LOSS_T` 接近或超过 9 秒，先不要运行，需调整测试等待
+上限而不是修改飞控安全参数。
+
+```bash
+./build/px4_link_smoke \
+  --config config/px4_sitl.json \
+  --duration 35 \
+  --sitl-offboard-loss
+```
+
+固定流程：起飞至 1m 并稳定 3 秒，发布 `valid=false` 且停止刷新 setpoint；保持 MAVLink
+HEARTBEAT 和遥测链路，确认 PX4 在 10 秒内从 6/0 退出并稳定 1 秒，记录反应时间和保护模式。
+随后程序统一请求 AUTO.LAND 4/6，确认 landed 后主动 DISARM。这样只切断控制设定值，不切断
+整个机载电脑 UDP 链路，可单独验证 Offboard loss。
+
+硬门禁：仅 UDP、与其他阶段互斥、最短 25 秒；停止请求后只容许通信线程竞态额外发送不超过
+2 条缓存 setpoint；连接/位置/姿态/高度/漂移异常仍触发 AUTO.LAND；未 landed 禁止 DISARM。
+
+验收新增：
+
+```text
+已主动停止 Offboard setpoint
+PX4 已退出 Offboard
+退出 Offboard 后模式稳定 1 秒
+停止后设定值发送已停止
+Offboard 丢失反应时间: ... ms，保护模式: main/sub
+```
+
+任何阶段未通过都不得进入真实 Pixhawk 控制测试。
 
 ## 8. 常见问题
 
