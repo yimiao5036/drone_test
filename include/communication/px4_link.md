@@ -269,5 +269,9 @@ HEARTBEAT、`REQUEST_MESSAGE` 和 `SET_MESSAGE_INTERVAL`，不发送解锁、模
 | 重启后旧控制恢复 | 属于缺陷；Start 必须清空状态和后续的设定值/命令缓存 |
 | 收到其他 MAVLink 设备消息 | 当前按目标 ID 过滤；未来多组件遥测需明确白名单后扩展 |
 
-下一阶段必须先在 PX4 1.17.0 SITL 验证 Offboard 前置设定值流、位置/速度效果和设定值中断
-保护，再允许拆桨台架测试。姿态/机体系/全局设定值需要独立接口评审后才能扩展。
+PX4 1.17.0 SITL 第 3A~3D 已完成：Offboard 前置流、ARM/DISARM、零速度、相对起飞、
+位置悬停、水平速度/制动/返回、AUTO.LAND，以及停止 setpoint 后退出 Offboard 的保护闭环。
+实测 `COM_OF_LOSS_T=1s`，应用侧 1270ms 观测到 6/0→4/5 AUTO/RTL；源码确认
+`COM_OBL_RC_ACT=0`先请求 Position，无人工控制信号时经模式可运行性回退到 RTL。下一阶段为
+真实 Pixhawk 拆桨台架，仍从只读、disarmed setpoint、disarmed Offboard、拆桨 ARM/主动
+DISARM逐级执行。姿态/机体系/全局设定值需要独立接口评审后才能扩展。

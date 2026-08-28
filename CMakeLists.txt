@@ -138,24 +138,52 @@ target_include_directories(drone_health PUBLIC
 target_compile_features(drone_health PUBLIC cxx_std_17)
 target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 
+# ---- config 模块（正式主程序强类型配置） ----
+add_library(drone_config STATIC
+    src/config/config.cpp)
+target_include_directories(drone_config PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_config PUBLIC cxx_std_17)
+target_link_libraries(drone_config PUBLIC
+    drone_common
+    drone_communication
+    drone_video
+    drone_perception
+    drone_video_transmission)
+
+# ---- application 模块（正式主程序组件所有权、Topic 接线与生命周期） ----
+add_library(drone_application STATIC
+    src/application/drone_application.cpp)
+target_include_directories(drone_application PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_application PUBLIC cxx_std_17)
+target_link_libraries(drone_application PUBLIC
+    drone_config
+    drone_communication
+    drone_video
+    drone_perception
+    drone_video_transmission
+    spdlog::spdlog)
+
 add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
 
-# 编译后复制模型到可执行文件旁，匹配 main.cpp 按 /proc/self/exe 解析 models/ 的约定。
+# 编译后复制模型和配置到可执行文件旁，匹配 /proc/self/exe 路径解析约定。
 add_custom_command(TARGET drone_control POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/models"
             "${CMAKE_BINARY_DIR}/models"
-    COMMENT "复制 models/ 到构建目录"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/config"
+            "${CMAKE_BINARY_DIR}/config"
+    COMMENT "复制 models/ 和 config/ 到构建目录"
     VERBATIM)
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE
     drone_common
-    drone_video
-    drone_perception
-    drone_video_transmission
+    drone_application
     spdlog::spdlog
     PkgConfig::FFMPEG)
 
@@ -165,7 +193,7 @@ else()
     target_compile_options(drone_control PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-# PX4 只读硬件冒烟测试：独立于视频主程序，仅装配配置、串口、MAVLink、Px4Link 和状态订阅。
+# PX4 串口冒烟与强制UDP的SITL分级测试：独立于正式主程序。
 add_executable(px4_link_smoke
     tools/px4_link_smoke.cpp
     src/common/logger.cpp)
@@ -309,6 +337,20 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(px4_link_test)
+
+        # 正式主程序配置测试：生产配置解析和控制/地面站安全门禁
+        add_executable(config_test tests/config/config_test.cpp)
+        target_link_libraries(config_test PRIVATE drone_config GTest::gtest_main)
+        target_compile_definitions(config_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MSVC)
+            target_compile_options(config_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(config_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(config_test)
 
         # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
         add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)

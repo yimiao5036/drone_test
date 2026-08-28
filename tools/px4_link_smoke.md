@@ -1,4 +1,4 @@
-# PX4 只读串口冒烟测试（px4_link_smoke）
+# PX4 串口冒烟与 SITL 分级控制测试（px4_link_smoke）
 
 > 对应实现：`tools/px4_link_smoke.cpp`
 > 使用模块：`SerialPort`、`MavlinkHandler`、`Px4Link`、`FlightStateSnapshot`

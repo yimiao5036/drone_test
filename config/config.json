@@ -3,6 +3,12 @@
         "dir": "logs/",
         "level": "info"
     },
+    "runtime": {
+        "enable_video": true,
+        "enable_px4": true,
+        "enable_ground_station": false,
+        "enable_control": false
+    },
     "mavlink": {
         "onboard_system_id": 1,
         "onboard_component_id": 191
