@@ -5,7 +5,7 @@
 
 ## 1. 功能职责
 
-该程序用于在香橙派上尽早验证真实 Pixhawk/PX4 串口，不依赖视频、YOLO、图传、状态机和控制器。
+该程序用于分级验证真实 Pixhawk/PX4 串口基础链路和 PX4 SITL UDP 控制链路，不依赖视频、YOLO、图传、状态机和控制器。
 
 测试内容：
 
@@ -17,9 +17,10 @@
 - 到期或 Ctrl+C 后停止并输出 PASS/WARN/FAIL 验收报告；
 - 根据基础链路结果返回进程退出码。
 
-安全边界：程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、降落或 Offboard 控制。
-主动发送内容仅包括机载电脑 HEARTBEAT、`MAV_CMD_REQUEST_MESSAGE` 和
-`MAV_CMD_SET_MESSAGE_INTERVAL`，用于请求遥测及其频率。
+安全边界：不带 SITL 阶段参数时，程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、
+降落或 Offboard 控制；主动内容仅为 HEARTBEAT 和遥测请求。所有控制阶段参数强制要求
+`transport=udp` 且互斥，串口配置会在启动前拒绝。`--sitl-takeoff-land` 固定相对起飞 1m，
+不可通过命令行扩大，确认 landed 前禁止 DISARM。
 
 ## 2. 构建与运行
 
@@ -43,7 +44,11 @@ echo "退出码=$?"
 | 参数 | 说明 |
 |---|---|
 | `--config <路径>` | 显式指定 JSON；缺省按“可执行文件旁 config → 当前目录 config”查找 |
-| `--duration <秒>` | 测试时长，范围 1~3600，默认 30 秒 |
+| `--duration <秒>` | 测试时长，范围 1~3600，默认 30 秒；解锁零速度最短 10 秒，起飞降落最短 20 秒 |
+| `--sitl-zero-velocity` | 仅 UDP，零 NED 速度，不切模式、不解锁 |
+| `--sitl-offboard-disarmed` | 仅 UDP，零速度后进入 Offboard，全程不解锁 |
+| `--sitl-arm-zero-velocity` | 仅 UDP，ARM 后零速度保持 5 秒，再主动 DISARM |
+| `--sitl-takeoff-land` | 仅 UDP，相对起飞 1m、稳定悬停 3 秒、AUTO.LAND、确认 landed 后主动 DISARM |
 | `--help` | 显示帮助 |
 
 ## 3. 当前配置
@@ -153,7 +158,8 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 - 控制台：每秒状态摘要、状态变化、最终验收报告；
 - 文件日志：沿用 `config.log` 配置和工程异步日志；
 - 不逐条打印高频姿态/位置消息；
-- `Px4Link` 仅记录生命周期、连接变化、版本首次上报和节流错误。
+- `Px4Link` 仅记录生命周期、连接变化、版本首次上报和节流错误；命令拒绝/失败使用 WARN；
+- SITL 飞行阶段仅打印状态变化、阶段切换、安全回收和最终验收，不逐设定值打印。
 
 ## 7. 排查要点
 
@@ -165,7 +171,11 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | 只有 HEARTBEAT，其他全 WARN | PX4 MAVLink stream 配置或尚未主动请求消息 |
 | 版本 WARN | PX4 未主动发送 AUTOPILOT_VERSION；后续命令阶段主动请求 |
 | 收到消息但数值无效 | GPS/估计器/电池/RC 本身未就绪，检查 valid 标志而非默认零值 |
-| 退出码 3 且错误计数增加 | 查看 `logs/` 中串口 poll/read/write 节流错误 |
+| 退出码 3 且错误计数增加 | 查看 `logs/` 中串口/UDP read/write 节流错误 |
+| 起飞阶段拒绝启动 | 必须使用 `config/px4_sitl.json` 且 duration≥20 |
+| ARM ACK denied | 检查 PX4 preflight 和 QGC/GCS 连接，禁止 force arm |
+| 高度/漂移安全回收 | 查看最大相对高度、水平漂移和 local position；程序会优先请求 AUTO.LAND |
+| AUTO.LAND 后未 landed | 检查 mode 4/6、land detector 和位置估计；未 landed 时程序不会空中 DISARM |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

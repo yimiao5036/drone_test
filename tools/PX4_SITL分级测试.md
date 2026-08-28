@@ -252,7 +252,88 @@ PX4 已确认 disarmed
 
 如果 ARM 被拒绝，检查 `command=400` ACK 和 PX4 preflight 日志，不得使用 force arm 绕过检查。
 
-第 3B 阶段才允许在 SITL 使用最大 0.5m/s、2 秒的小幅水平速度。任何阶段未通过都不得进入
+### 8.1 第 3A 阶段实测结果（2026-08-28）
+
+```text
+Offboard/ARM/DISARM ACK：全部 received + accepted
+真实 armed：确认
+零速度 armed 保持：5 秒
+主动 DISARM 前自动上锁：未发生
+真实 disarmed：确认
+设定值：146 条
+最大三维位移：0.025746 m
+总接收：2297
+ACK：13，超时 0
+链路错误：0
+```
+
+PX4 shell：
+
+```text
+Armed by external command
+Disarmed by external command
+```
+
+第 3A 完整通过。测试结束后 `Connection to mission computer lost` 是测试程序正常停止链路后的
+预期告警。
+
+## 9. 第 3B 阶段：SITL 相对起飞 1m、悬停和降落
+
+第 3A 通过后执行：
+
+```bash
+./build/px4_link_smoke \
+  --config config/px4_sitl.json \
+  --duration 30 \
+  --sitl-takeoff-land
+```
+
+固定流程和边界：
+
+1. 零 NED 速度预发送至少 2 秒；
+2. 本轮 Offboard ACK accepted 后 ARM，并以 heartbeat 确认 armed；
+3. 第一次 armed 且 local position 有效时锁定起点，不使用固定原点；
+4. 位置目标固定为 `[start_x, start_y, start_z-1m]`，即 NED 向上 1m；
+5. 高度误差不超过 0.15m、水平漂移不超过 0.30m、垂速不超过 0.30m/s 时开始计时；
+6. 连续稳定悬停 3 秒后停止 Offboard setpoint，并请求 PX4 `AUTO.LAND`（4/6）；
+7. AUTO.LAND ACK accepted 且 `landed=true` 后主动 DISARM，确认 `armed=false`；
+8. 超时或安全限制触发时也优先请求 AUTO.LAND，禁止空中直接 DISARM。
+
+硬安全门禁：
+
+- 仅允许 UDP；串口配置启动前拒绝；
+- 与其他 SITL 阶段参数互斥；
+- 最短时长 20 秒，建议 30 秒；
+- 起飞高度不可通过命令行扩大，固定 1m；
+- 最大允许相对高度 1.30m；
+- 最大允许水平漂移 0.50m；
+- armed 飞行期间连接、Offboard、本地位置或姿态失效会触发安全回收；
+- 未确认 landed 时不会发送 DISARM；
+- 不使用 force arm，不发送水平运动目标。
+
+验收报告必须全部 PASS：
+
+```text
+相对起飞目标已建立
+达到相对 1m 高度
+目标高度稳定悬停 3 秒
+AUTO.LAND 请求已入队/ACK accepted
+PX4 已确认 landed
+飞行未触发高度/漂移安全回收
+主动 DISARM 前未被自动上锁
+DISARM ACK accepted
+PX4 已确认 disarmed
+```
+
+PX4 shell 预期：
+
+```text
+Armed by external command
+... AUTO LAND ...
+Disarmed by external command
+```
+
+第 3B 通过后，第 3C 才允许最大 0.5m/s、2 秒的小幅水平速度。任何阶段未通过都不得进入
 真实 Pixhawk 控制测试。
 
 ## 8. 常见问题
