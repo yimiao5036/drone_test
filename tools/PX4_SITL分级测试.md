@@ -69,6 +69,19 @@ cmake --build build --target px4_link_smoke -j$(nproc)
 - ACK 无超时；
 - 退出码 0。
 
+### 4.1 第 0 阶段实测结果（2026-08-27）
+
+```text
+时长：10 秒
+总接收：2665
+ACK：10，超时 0
+链路错误：0
+版本/落地/全局位置/局部位置/姿态/GPS/电池/Home：PASS
+RC：未收到（SITL 未注入 RC）
+```
+
+UDP 14540/14580、PX4 1.17.0 版本和完整仿真遥测均验证成功，第 0 阶段通过。
+
 ## 5. 第 1 阶段：零速度流，不切模式
 
 确认第 0 阶段通过后执行：
@@ -97,6 +110,20 @@ cmake --build build --target px4_link_smoke -j$(nproc)
 结果: 基础 PX4 链路通过
 ```
 
+### 5.1 第 1 阶段应用侧实测结果（2026-08-27）
+
+```text
+时长：10 秒
+SET_POSITION_TARGET_LOCAL_NED 发送：172 条
+模式：4/3 AUTO/LOITER，全程未变化
+armed：false
+接收目标消息：2600
+ACK：10，超时 0
+链路错误：0
+```
+
+应用侧已通过；还需完成下面的 PX4 内部 topic 确认，才算第 1 阶段完整通过。
+
 ## 6. PX4 侧确认
 
 测试运行期间在 PX4 shell 中检查：
@@ -123,7 +150,32 @@ PX4 shell `listener`/`uorb top` 实际输出为准并记录，不凭记忆修改
 - 停止后设定值不再增长；
 - 无链路错误。
 
-通过后再实现第 2 阶段：持续预发送设定值至少 1 秒后请求 Offboard，但仍保持 disarmed；
+第 1 阶段 PX4 侧已确认新鲜 `offboard_control_mode`：`velocity=true`，其余控制层级均 false。
+`trajectory_setpoint` 被当前 AUTO/LOITER 发布器覆盖，读取到的是任务轨迹；这不影响 MAVLink
+输入类型确认，数值将在进入 Offboard 后由该模式消费时验证。
+
+## 7. 第 2 阶段：切换 Offboard，但保持 disarmed
+
+第 1 阶段通过后执行：
+
+```bash
+./build/px4_link_smoke \
+  --config config/px4_sitl.json \
+  --duration 15 \
+  --sitl-offboard-disarmed
+```
+
+程序先持续发送零 NED 速度至少 2 秒，再通过 `MAV_CMD_DO_SET_MODE` 请求 PX4 main mode 6
+（OFFBOARD）。安全门禁：仅 UDP 可用，程序不发送 ARM 命令，并持续检查 `armed=false`。
+
+验收：
+
+- 模式从 `4/3` 变为 `6/0`；
+- 最终报告 `PX4 已进入 Offboard=PASS`；
+- 全程 `armed=否`；
+- `trajectory_setpoint.velocity=[0,0,0]`；
+- ACK 无超时、链路无错误。
+
 第 3 阶段才在 SITL 解锁并验证位置/速度效果与 Offboard 丢失保护。任何阶段未通过都不得进入
 真实 Pixhawk 控制测试。
 
@@ -133,6 +185,7 @@ PX4 shell `listener`/`uorb top` 实际输出为准并记录，不凭记忆修改
 |---|---|
 | UDP bind 14540 失败 | QGC/MAVSDK/旧进程占用，执行 `ss -lunp | grep 14540` |
 | 一直 connected=否 | 检查 SITL `mavlink status` 的远端端口 |
-| 有心跳但发送数为 0 | 是否遗漏 `--sitl-zero-velocity`，或配置误用 serial |
+| 有心跳但发送数为 0 | 是否遗漏 SITL 阶段参数，或配置误用 serial |
+| Offboard 请求被拒绝 | 设定值预发送不足、local position 无效、模式命令 ACK 非 accepted |
 | PX4 没有 target | remote_port 错误、type mask/消息未到，抓取 `mavlink status` |
 | 程序拒绝启动 | 安全保护检测到 `--sitl-zero-velocity` 配合了非 UDP 配置 |
