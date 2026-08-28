@@ -276,6 +276,11 @@ void UpdateObserved(const drone::common::FlightStateSnapshot& state,
     observed->rc = observed->rc || state.rc_state_valid;
 }
 
+uint64_t MonotonicMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 const char* YesNo(bool value) {
     return value ? "是" : "否";
 }
@@ -383,12 +388,21 @@ int main(int argc, char** argv) {
         auto next_summary = started;
         auto next_setpoint_publish = started;
         bool offboard_command_queued = false;
+        bool offboard_ack_received = false;
+        bool offboard_ack_accepted = false;
         bool offboard_mode_reached = false;
+        uint64_t offboard_request_time_ms = 0;
         bool remained_disarmed = true;
         bool arm_command_queued = false;
+        bool arm_ack_received = false;
+        bool arm_ack_accepted = false;
         bool armed_reached = false;
+        uint64_t arm_request_time_ms = 0;
         bool disarm_command_queued = false;
+        bool disarm_ack_received = false;
+        bool disarm_ack_accepted = false;
         bool disarmed_confirmed = false;
+        uint64_t disarm_request_time_ms = 0;
         bool arm_start_position_valid = false;
         float arm_start_x = 0.f;
         float arm_start_y = 0.f;
@@ -442,13 +456,31 @@ int main(int argc, char** argv) {
                     static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
                     static_cast<float>(kPx4MainModeOffboard), 0.f,
                     0.f, 0.f, 0.f, 0.f);
+                if (offboard_command_queued) {
+                    offboard_request_time_ms = MonotonicMs();
+                }
                 std::cout << "[SITL] Offboard(disarmed) 模式请求"
                           << (offboard_command_queued ? "已入队" : "入队失败")
                           << std::endl;
             }
             if (have_snapshot) {
+                if (offboard_command_queued &&
+                    latest.last_ack_time_ms >= offboard_request_time_ms &&
+                    latest.last_ack_command == MAV_CMD_DO_SET_MODE) {
+                    offboard_ack_received = true;
+                    offboard_ack_accepted =
+                        latest.last_ack_result == MAV_RESULT_ACCEPTED;
+                }
+                if (arm_command_queued &&
+                    latest.last_ack_time_ms >= arm_request_time_ms &&
+                    latest.last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+                    arm_ack_received = true;
+                    arm_ack_accepted =
+                        latest.last_ack_result == MAV_RESULT_ACCEPTED;
+                }
                 offboard_mode_reached = offboard_mode_reached ||
-                                        latest.flight_mode == 6;
+                                        (offboard_command_queued &&
+                                         latest.flight_mode == 6);
                 if (options.sitl_offboard_disarmed) {
                     remained_disarmed = remained_disarmed && !latest.armed;
                 }
@@ -469,13 +501,17 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (options.sitl_arm_zero_velocity && offboard_mode_reached &&
-                !arm_command_queued && latest.connected && !latest.armed &&
+            if (options.sitl_arm_zero_velocity && offboard_ack_accepted &&
+                offboard_mode_reached && !arm_command_queued &&
+                latest.connected && !latest.armed &&
                 latest.landed_state_valid && latest.landed &&
                 latest.local_position_valid && latest.attitude_valid) {
                 arm_command_queued = link.SendCommand(
                     MAV_CMD_COMPONENT_ARM_DISARM, 1.f, 0.f, 0.f, 0.f,
                     0.f, 0.f, 0.f);
+                if (arm_command_queued) {
+                    arm_request_time_ms = MonotonicMs();
+                }
                 std::cout << "[SITL] ARM 请求"
                           << (arm_command_queued ? "已入队" : "入队失败")
                           << std::endl;
@@ -487,9 +523,15 @@ int main(int argc, char** argv) {
         }
 
         if (options.sitl_arm_zero_velocity && armed_reached) {
+            while (subscription.TryTake()) {
+                // 清除排队的旧快照，避免用解锁前 armed=false 误判上锁完成。
+            }
             disarm_command_queued = link.SendCommand(
                 MAV_CMD_COMPONENT_ARM_DISARM, 0.f, 0.f, 0.f, 0.f,
                 0.f, 0.f, 0.f);
+            if (disarm_command_queued) {
+                disarm_request_time_ms = MonotonicMs();
+            }
             std::cout << "[SITL] DISARM 请求"
                       << (disarm_command_queued ? "已入队" : "入队失败")
                       << std::endl;
@@ -509,7 +551,13 @@ int main(int argc, char** argv) {
                 if (auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100))) {
                     latest = **message;
                     UpdateObserved(latest, &observed);
-                    if (!latest.armed) {
+                    if (latest.last_ack_time_ms >= disarm_request_time_ms &&
+                        latest.last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+                        disarm_ack_received = true;
+                        disarm_ack_accepted =
+                            latest.last_ack_result == MAV_RESULT_ACCEPTED;
+                    }
+                    if (disarm_ack_accepted && !latest.armed) {
                         disarmed_confirmed = true;
                         break;
                     }
@@ -536,6 +584,8 @@ int main(int argc, char** argv) {
         }
         if (sitl_offboard_test) {
             PrintCheck("Offboard 模式请求已入队", offboard_command_queued, true);
+            PrintCheck("Offboard 模式 ACK 已收到", offboard_ack_received, true);
+            PrintCheck("Offboard 模式 ACK accepted", offboard_ack_accepted, true);
             PrintCheck("PX4 已进入 Offboard", offboard_mode_reached, true);
         }
         if (options.sitl_offboard_disarmed) {
@@ -543,8 +593,12 @@ int main(int argc, char** argv) {
         }
         if (options.sitl_arm_zero_velocity) {
             PrintCheck("ARM 请求已入队", arm_command_queued, true);
+            PrintCheck("ARM ACK 已收到", arm_ack_received, true);
+            PrintCheck("ARM ACK accepted", arm_ack_accepted, true);
             PrintCheck("PX4 已确认 armed", armed_reached, true);
             PrintCheck("DISARM 请求已入队", disarm_command_queued, true);
+            PrintCheck("DISARM ACK 已收到", disarm_ack_received, true);
+            PrintCheck("DISARM ACK accepted", disarm_ack_accepted, true);
             PrintCheck("PX4 已确认 disarmed", disarmed_confirmed, true);
             std::cout << "解锁期间最大位移: " << max_displacement_m << " m" << std::endl;
         }
@@ -594,12 +648,15 @@ int main(int argc, char** argv) {
         const bool setpoint_passed =
             !sitl_setpoint_test || link.SetpointSendCount() > 0;
         const bool offboard_passed = !sitl_offboard_test ||
-                                     (offboard_command_queued && offboard_mode_reached);
+                                     (offboard_command_queued && offboard_ack_received &&
+                                      offboard_ack_accepted && offboard_mode_reached);
         const bool disarmed_stage_passed = !options.sitl_offboard_disarmed ||
                                            remained_disarmed;
         const bool arm_stage_passed = !options.sitl_arm_zero_velocity ||
-                                      (arm_command_queued && armed_reached &&
-                                       disarm_command_queued && disarmed_confirmed);
+                                      (arm_command_queued && arm_ack_received &&
+                                       arm_ack_accepted && armed_reached &&
+                                       disarm_command_queued && disarm_ack_received &&
+                                       disarm_ack_accepted && disarmed_confirmed);
         const bool passed = observed.heartbeat && connected_at_end &&
                             link.ErrorCount() == 0 && setpoint_passed && offboard_passed &&
                             disarmed_stage_passed && arm_stage_passed;

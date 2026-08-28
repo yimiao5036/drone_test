@@ -726,9 +726,15 @@ private:
 
         ack_match_count_.fetch_add(1, std::memory_order_relaxed);
         const bool in_progress = ack.result == MAV_RESULT_IN_PROGRESS;
-        SPDLOG_INFO("PX4 命令 ACK: sequence={} command={} result={} internal={} progress={}",
-                    in_flight_command_->request.sequence, ack.command, ack.result,
-                    in_flight_command_->request.internal, ack.progress);
+        if (ack.result == MAV_RESULT_ACCEPTED || in_progress) {
+            SPDLOG_INFO("PX4 命令 ACK: sequence={} command={} result={} internal={} progress={}",
+                        in_flight_command_->request.sequence, ack.command, ack.result,
+                        in_flight_command_->request.internal, ack.progress);
+        } else {
+            SPDLOG_WARN("PX4 命令被拒绝/失败: sequence={} command={} result={} internal={} progress={}",
+                        in_flight_command_->request.sequence, ack.command, ack.result,
+                        in_flight_command_->request.internal, ack.progress);
+        }
         if (in_progress) {
             in_flight_command_->sent_time_ms = now_ms;
         } else {

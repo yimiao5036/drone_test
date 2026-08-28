@@ -239,7 +239,11 @@ DISARM 请求已入队
 PX4 已确认 disarmed
 ```
 
-如果 ARM 被拒绝，检查最近 `command=400` ACK 和 PX4 preflight 日志，不得使用 force arm 绕过检查。
+如果 SITL 从上次测试遗留在 OFFBOARD，本轮仍必须重新发送 mode 命令并获得本轮
+`command=176 result=ACCEPTED` 后才 ARM，禁止仅凭初始 mode=6 跳过顺序。ARM/DISARM 报告会分别
+显示 ACK received、ACK accepted 和真实 armed 状态。
+
+如果 ARM 被拒绝，检查 `command=400` ACK 和 PX4 preflight 日志，不得使用 force arm 绕过检查。
 
 第 3B 阶段才允许在 SITL 使用最大 0.5m/s、2 秒的小幅水平速度。任何阶段未通过都不得进入
 真实 Pixhawk 控制测试。
