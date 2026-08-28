@@ -178,7 +178,7 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | 高度/漂移安全回收 | 查看最大相对高度、水平漂移和 local position；程序会优先请求 AUTO.LAND |
 | AUTO.LAND 后未 landed | 检查 mode 4/6、land detector 和位置估计；未 landed 时程序不会空中 DISARM |
 | 水平运动阶段安全回收 | 北向位移超过 1.50m、东西偏差超过 0.30m，或相对高度离开 0.65~1.30m |
-| 水平运动位移验收失败 | 2 秒运动结束时北向位移必须在 0.70~1.30m，检查速度 setpoint 和 LOCAL_POSITION_NED |
+| 水平运动位移验收失败 | 制动完成时北向位移必须在 0.70~1.30m；速度命令结束瞬间位移仅用于观察加速响应 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

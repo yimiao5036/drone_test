@@ -465,7 +465,8 @@ int main(int argc, char** argv) {
         bool returned_to_start = false;
         float max_north_displacement_m = 0.f;
         float max_east_deviation_m = 0.f;
-        float motion_end_north_displacement_m = 0.f;
+        float motion_command_end_north_displacement_m = 0.f;
+        float brake_end_north_displacement_m = 0.f;
         while (!g_stop.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() - started < options.duration) {
             if (auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100))) {
@@ -726,7 +727,7 @@ int main(int argc, char** argv) {
                 horizontal_motion_complete = true;
                 horizontal_braking = true;
                 if (latest.local_position_valid) {
-                    motion_end_north_displacement_m =
+                    motion_command_end_north_displacement_m =
                         latest.local_x_m - arm_start_x;
                 }
                 std::cout << "[SITL] 水平运动 2 秒完成，切换零速度制动"
@@ -734,6 +735,10 @@ int main(int argc, char** argv) {
             }
             if (options.sitl_horizontal_motion && horizontal_brake_complete &&
                 !returning_to_start) {
+                if (latest.local_position_valid) {
+                    brake_end_north_displacement_m =
+                        latest.local_x_m - arm_start_x;
+                }
                 returning_to_start = true;
                 std::cout << "[SITL] 制动完成，切换位置目标返回起飞点上方"
                           << std::endl;
@@ -904,8 +909,10 @@ int main(int argc, char** argv) {
                                horizontal_brake_complete, true);
                     PrintCheck("已返回起飞点上方",
                                returned_to_start, true);
-                    std::cout << "运动结束北向位移: "
-                              << motion_end_north_displacement_m
+                    std::cout << "速度命令结束北向位移: "
+                              << motion_command_end_north_displacement_m
+                              << " m，制动完成北向位移: "
+                              << brake_end_north_displacement_m
                               << " m，最大北向位移: "
                               << max_north_displacement_m
                               << " m，最大东西向偏差: "
@@ -998,8 +1005,8 @@ int main(int argc, char** argv) {
              horizontal_motion_complete && horizontal_brake_complete &&
              returned_to_start && land_command_queued && land_ack_received &&
              land_ack_accepted && landed_after_flight &&
-             !flight_safety_violation && motion_end_north_displacement_m >= 0.70f &&
-             motion_end_north_displacement_m <= 1.30f &&
+             !flight_safety_violation && brake_end_north_displacement_m >= 0.70f &&
+             brake_end_north_displacement_m <= 1.30f &&
              max_north_displacement_m <= 1.50f &&
              max_east_deviation_m <= 0.30f && max_takeoff_height_m <= 1.30f);
         const bool passed = observed.heartbeat && connected_at_end &&
