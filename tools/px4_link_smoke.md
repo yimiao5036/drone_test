@@ -49,6 +49,7 @@ echo "退出码=$?"
 | `--sitl-offboard-disarmed` | 仅 UDP，零速度后进入 Offboard，全程不解锁 |
 | `--sitl-arm-zero-velocity` | 仅 UDP，ARM 后零速度保持 5 秒，再主动 DISARM |
 | `--sitl-takeoff-land` | 仅 UDP，相对起飞 1m、稳定悬停 3 秒、AUTO.LAND、确认 landed 后主动 DISARM |
+| `--sitl-horizontal-motion` | 仅 UDP，起飞 1m 后北向 0.5m/s×2 秒、零速度制动、返回起点、降落上锁；最短 30 秒 |
 | `--help` | 显示帮助 |
 
 ## 3. 当前配置
@@ -176,6 +177,8 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | ARM ACK denied | 检查 PX4 preflight 和 QGC/GCS 连接，禁止 force arm |
 | 高度/漂移安全回收 | 查看最大相对高度、水平漂移和 local position；程序会优先请求 AUTO.LAND |
 | AUTO.LAND 后未 landed | 检查 mode 4/6、land detector 和位置估计；未 landed 时程序不会空中 DISARM |
+| 水平运动阶段安全回收 | 北向位移超过 1.50m、东西偏差超过 0.30m，或相对高度离开 0.65~1.30m |
+| 水平运动位移验收失败 | 2 秒运动结束时北向位移必须在 0.70~1.30m，检查速度 setpoint 和 LOCAL_POSITION_NED |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

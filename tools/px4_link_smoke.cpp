@@ -52,14 +52,16 @@ struct Options {
     bool sitl_offboard_disarmed = false;
     bool sitl_arm_zero_velocity = false;
     bool sitl_takeoff_land = false;
+    bool sitl_horizontal_motion = false;
 };
 
 void PrintUsage(const char* program) {
     std::cout << "用法: " << program
               << " [--config <config.json>] [--duration <秒>]\n"
               << "       [--sitl-zero-velocity | --sitl-offboard-disarmed | --sitl-arm-zero-velocity\n"
-              << "        | --sitl-takeoff-land]\n"
-              << "SITL 参数仅允许 UDP；takeoff-land 固定相对起飞 1m、悬停 3 秒后降落上锁。\n";
+              << "        | --sitl-takeoff-land | --sitl-horizontal-motion]\n"
+              << "SITL 参数仅允许 UDP；horizontal-motion 在 1m 高度北向 0.5m/s 运动 2 秒，\n"
+              << "随后制动、返回起点、降落上锁。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -93,6 +95,10 @@ Options ParseOptions(int argc, char** argv) {
             options.sitl_takeoff_land = true;
             continue;
         }
+        if (argument == "--sitl-horizontal-motion") {
+            options.sitl_horizontal_motion = true;
+            continue;
+        }
         if (argument == "--duration") {
             if (++index >= argc) {
                 throw std::invalid_argument("--duration 缺少秒数");
@@ -109,7 +115,8 @@ Options ParseOptions(int argc, char** argv) {
     const int sitl_stage_count = static_cast<int>(options.sitl_zero_velocity) +
                                  static_cast<int>(options.sitl_offboard_disarmed) +
                                  static_cast<int>(options.sitl_arm_zero_velocity) +
-                                 static_cast<int>(options.sitl_takeoff_land);
+                                 static_cast<int>(options.sitl_takeoff_land) +
+                                 static_cast<int>(options.sitl_horizontal_motion);
     if (sitl_stage_count > 1) {
         throw std::invalid_argument("多个 SITL 阶段参数不能同时使用");
     }
@@ -118,6 +125,9 @@ Options ParseOptions(int argc, char** argv) {
     }
     if (options.sitl_takeoff_land && options.duration < std::chrono::seconds(20)) {
         throw std::invalid_argument("受限起飞降落测试时长不能少于 20 秒");
+    }
+    if (options.sitl_horizontal_motion && options.duration < std::chrono::seconds(30)) {
+        throw std::invalid_argument("受限水平运动测试时长不能少于 30 秒");
     }
     return options;
 }
@@ -337,8 +347,10 @@ int main(int argc, char** argv) {
         const std::string config_path = ResolveConfigPath(options.config_path);
         const json root = LoadJson(config_path);
         const Px4LinkConfig config = LoadPx4Config(root);
+        const bool sitl_flight_test =
+            options.sitl_takeoff_land || options.sitl_horizontal_motion;
         const bool sitl_arm_test =
-            options.sitl_arm_zero_velocity || options.sitl_takeoff_land;
+            options.sitl_arm_zero_velocity || sitl_flight_test;
         const bool sitl_offboard_test =
             options.sitl_offboard_disarmed || sitl_arm_test;
         const bool sitl_setpoint_test =
@@ -367,15 +379,17 @@ int main(int argc, char** argv) {
                   << "  firmware: " << config.firmware_version << '\n'
                   << "  duration: " << options.duration.count() << " 秒\n"
                   << "  安全边界: "
-                  << (options.sitl_takeoff_land
-                          ? "SITL UDP 相对起飞 1m、悬停 3 秒、自动降落并主动上锁"
-                          : (options.sitl_arm_zero_velocity
+                  << (options.sitl_horizontal_motion
+                          ? "SITL UDP 起飞 1m、北向 0.5m/s 运动 2 秒、制动返回并降落"
+                          : (options.sitl_takeoff_land
+                                 ? "SITL UDP 相对起飞 1m、悬停 3 秒、自动降落并主动上锁"
+                                 : (options.sitl_arm_zero_velocity
                                  ? "SITL UDP 进入 Offboard 后解锁，始终零速度，结束前主动上锁"
                                  : (options.sitl_offboard_disarmed
                                  ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
                                  : (options.sitl_zero_velocity
                                         ? "SITL UDP 零速度流，不切模式、不解锁"
-                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令"))))
+                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")))))
                   << '\n'
                   << std::endl;
 
@@ -440,6 +454,18 @@ int main(int argc, char** argv) {
         bool land_ack_accepted = false;
         uint64_t land_request_time_ms = 0;
         bool landed_after_flight = false;
+        bool horizontal_motion_started = false;
+        uint64_t horizontal_motion_started_ms = 0;
+        bool horizontal_motion_complete = false;
+        bool horizontal_braking = false;
+        uint64_t brake_stable_since_ms = 0;
+        bool horizontal_brake_complete = false;
+        bool returning_to_start = false;
+        uint64_t return_stable_since_ms = 0;
+        bool returned_to_start = false;
+        float max_north_displacement_m = 0.f;
+        float max_east_deviation_m = 0.f;
+        float motion_end_north_displacement_m = 0.f;
         while (!g_stop.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() - started < options.duration) {
             if (auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100))) {
@@ -468,7 +494,19 @@ int main(int argc, char** argv) {
                 setpoint.header.receive_time_ms = MonotonicMs();
                 setpoint.header.valid_for_ms = 300;
                 setpoint.header.frame_id = 3;
-                if (options.sitl_takeoff_land && takeoff_target_ready) {
+                if (options.sitl_horizontal_motion && horizontal_motion_started &&
+                    !horizontal_motion_complete) {
+                    setpoint.type = drone::common::SetpointType::kVelocity;
+                    setpoint.x = 0.5f;
+                    setpoint.y = 0.f;
+                    setpoint.z = 0.f;
+                } else if (options.sitl_horizontal_motion && horizontal_braking &&
+                           !horizontal_brake_complete) {
+                    setpoint.type = drone::common::SetpointType::kVelocity;
+                    setpoint.x = 0.f;
+                    setpoint.y = 0.f;
+                    setpoint.z = 0.f;
+                } else if (sitl_flight_test && takeoff_target_ready) {
                     setpoint.type = drone::common::SetpointType::kPosition;
                     setpoint.x = takeoff_target_x;
                     setpoint.y = takeoff_target_y;
@@ -538,7 +576,7 @@ int main(int argc, char** argv) {
                         arm_start_x = latest.local_x_m;
                         arm_start_y = latest.local_y_m;
                         arm_start_z = latest.local_z_m;
-                        if (options.sitl_takeoff_land) {
+                        if (sitl_flight_test) {
                             takeoff_target_ready = true;
                             takeoff_target_x = arm_start_x;
                             takeoff_target_y = arm_start_y;
@@ -556,7 +594,7 @@ int main(int argc, char** argv) {
                             max_displacement_m, std::sqrt(dx * dx + dy * dy + dz * dz));
                     }
                 }
-                if (options.sitl_takeoff_land && armed_reached && latest.armed &&
+                if (sitl_flight_test && armed_reached && latest.armed &&
                     !land_command_queued &&
                     (!latest.connected || latest.flight_mode != 6 ||
                      !latest.local_position_valid || !latest.attitude_valid)) {
@@ -566,7 +604,7 @@ int main(int argc, char** argv) {
                                   << std::endl;
                     }
                 }
-                if (options.sitl_takeoff_land && arm_start_position_valid &&
+                if (sitl_flight_test && arm_start_position_valid &&
                     latest.local_position_valid && latest.armed) {
                     const float ascent_m = arm_start_z - latest.local_z_m;
                     const float dx = latest.local_x_m - arm_start_x;
@@ -575,24 +613,72 @@ int main(int argc, char** argv) {
                     max_takeoff_height_m = std::max(max_takeoff_height_m, ascent_m);
                     max_horizontal_drift_m =
                         std::max(max_horizontal_drift_m, horizontal_drift_m);
-                    if (!flight_safety_violation &&
-                        (ascent_m > 1.30f || horizontal_drift_m > 0.50f)) {
+                    max_north_displacement_m =
+                        std::max(max_north_displacement_m, latest.local_x_m - arm_start_x);
+                    max_east_deviation_m =
+                        std::max(max_east_deviation_m,
+                                 std::fabs(latest.local_y_m - arm_start_y));
+                    const bool height_out_of_range =
+                        ascent_m > 1.30f ||
+                        (horizontal_motion_started && ascent_m < 0.65f);
+                    const bool horizontal_out_of_range =
+                        options.sitl_horizontal_motion
+                            ? (latest.local_x_m - arm_start_x > 1.50f ||
+                               std::fabs(latest.local_y_m - arm_start_y) > 0.30f)
+                            : horizontal_drift_m > 0.50f;
+                    if (!land_command_queued && !flight_safety_violation &&
+                        (height_out_of_range || horizontal_out_of_range)) {
                         flight_safety_violation = true;
-                        std::cout << "[SITL][安全回收] 高度或水平漂移超过硬限制"
+                        std::cout << "[SITL][安全回收] 高度或水平位移超过硬限制"
                                   << std::endl;
                     }
                     const bool inside_hover_window =
                         std::fabs(latest.local_z_m - takeoff_target_z) <= 0.15f &&
                         horizontal_drift_m <= 0.30f && std::fabs(latest.vz_mps) <= 0.30f;
-                    if (inside_hover_window) {
+                    if (!horizontal_motion_started && inside_hover_window) {
                         takeoff_height_reached = true;
                         if (hover_stable_since_ms == 0) {
                             hover_stable_since_ms = MonotonicMs();
                         }
                         hover_complete =
                             MonotonicMs() - hover_stable_since_ms >= 3000;
-                    } else {
+                    } else if (!horizontal_motion_started) {
                         hover_stable_since_ms = 0;
+                    }
+                    if (horizontal_braking && !horizontal_brake_complete) {
+                        const float horizontal_speed_mps =
+                            std::sqrt(latest.vx_mps * latest.vx_mps +
+                                      latest.vy_mps * latest.vy_mps);
+                        if (horizontal_speed_mps <= 0.20f &&
+                            std::fabs(latest.vz_mps) <= 0.20f) {
+                            if (brake_stable_since_ms == 0) {
+                                brake_stable_since_ms = MonotonicMs();
+                            }
+                            horizontal_brake_complete =
+                                MonotonicMs() - brake_stable_since_ms >= 1000;
+                        } else {
+                            brake_stable_since_ms = 0;
+                        }
+                    }
+                    if (returning_to_start && horizontal_brake_complete) {
+                        const float horizontal_error_m = horizontal_drift_m;
+                        const float horizontal_speed_mps =
+                            std::sqrt(latest.vx_mps * latest.vx_mps +
+                                      latest.vy_mps * latest.vy_mps);
+                        const bool return_window =
+                            horizontal_error_m <= 0.20f &&
+                            std::fabs(latest.local_z_m - takeoff_target_z) <= 0.15f &&
+                            horizontal_speed_mps <= 0.20f &&
+                            std::fabs(latest.vz_mps) <= 0.20f;
+                        if (return_window) {
+                            if (return_stable_since_ms == 0) {
+                                return_stable_since_ms = MonotonicMs();
+                            }
+                            returned_to_start =
+                                MonotonicMs() - return_stable_since_ms >= 2000;
+                        } else {
+                            return_stable_since_ms = 0;
+                        }
                     }
                 }
                 if (sitl_arm_test && armed_reached && !latest.armed &&
@@ -627,8 +713,36 @@ int main(int argc, char** argv) {
                           << std::endl;
                 break;
             }
-            if (options.sitl_takeoff_land &&
-                (hover_complete || flight_safety_violation) &&
+            if (options.sitl_horizontal_motion && hover_complete &&
+                !horizontal_motion_started && !flight_safety_violation) {
+                horizontal_motion_started = true;
+                horizontal_motion_started_ms = MonotonicMs();
+                std::cout << "[SITL] 北向 0.5m/s 受限运动开始，固定持续 2 秒"
+                          << std::endl;
+            }
+            if (options.sitl_horizontal_motion && horizontal_motion_started &&
+                !horizontal_motion_complete &&
+                MonotonicMs() - horizontal_motion_started_ms >= 2000) {
+                horizontal_motion_complete = true;
+                horizontal_braking = true;
+                if (latest.local_position_valid) {
+                    motion_end_north_displacement_m =
+                        latest.local_x_m - arm_start_x;
+                }
+                std::cout << "[SITL] 水平运动 2 秒完成，切换零速度制动"
+                          << std::endl;
+            }
+            if (options.sitl_horizontal_motion && horizontal_brake_complete &&
+                !returning_to_start) {
+                returning_to_start = true;
+                std::cout << "[SITL] 制动完成，切换位置目标返回起飞点上方"
+                          << std::endl;
+            }
+            const bool flight_mission_complete =
+                options.sitl_takeoff_land ? hover_complete :
+                (options.sitl_horizontal_motion && returned_to_start);
+            if (sitl_flight_test &&
+                (flight_mission_complete || flight_safety_violation) &&
                 !land_command_queued && latest.connected && latest.armed) {
                 drone::common::Px4Setpoint stop_setpoint;
                 stop_setpoint.valid = false;
@@ -648,7 +762,7 @@ int main(int argc, char** argv) {
                           << (land_command_queued ? "已入队" : "入队失败")
                           << std::endl;
             }
-            if (options.sitl_takeoff_land && land_ack_accepted &&
+            if (sitl_flight_test && land_ack_accepted &&
                 latest.landed_state_valid && latest.landed) {
                 landed_after_flight = true;
                 std::cout << "[SITL] PX4 已确认降落，准备主动 DISARM" << std::endl;
@@ -656,7 +770,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (options.sitl_takeoff_land && armed_reached && latest.armed &&
+        if (sitl_flight_test && armed_reached && latest.armed &&
             !landed_after_flight) {
             if (!land_command_queued) {
                 drone::common::Px4Setpoint stop_setpoint;
@@ -698,7 +812,7 @@ int main(int argc, char** argv) {
         }
 
         if (sitl_arm_test && armed_reached &&
-            (!options.sitl_takeoff_land || landed_after_flight)) {
+            (!sitl_flight_test || landed_after_flight)) {
             while (subscription.TryTake()) {
                 // 清除排队的旧快照，避免用解锁前 armed=false 误判上锁完成。
             }
@@ -754,8 +868,8 @@ int main(int argc, char** argv) {
         PrintCheck("PX4 HEARTBEAT", observed.heartbeat, true);
         PrintCheck("测试结束时心跳仍连接", connected_at_end, true);
         if (sitl_setpoint_test) {
-            PrintCheck(options.sitl_takeoff_land
-                           ? "SITL 起飞/悬停设定值已发送"
+            PrintCheck(sitl_flight_test
+                           ? "SITL 飞行设定值已发送"
                            : "SITL 零速度设定值已发送",
                        link.SetpointSendCount() > 0, true);
             std::cout << "设定值发送数: " << link.SetpointSendCount() << std::endl;
@@ -777,10 +891,26 @@ int main(int argc, char** argv) {
             if (options.sitl_arm_zero_velocity) {
                 PrintCheck("armed 零速度保持 5 秒", arm_hold_complete, true);
             }
-            if (options.sitl_takeoff_land) {
+            if (sitl_flight_test) {
                 PrintCheck("相对起飞目标已建立", takeoff_target_ready, true);
                 PrintCheck("达到相对 1m 高度", takeoff_height_reached, true);
                 PrintCheck("目标高度稳定悬停 3 秒", hover_complete, true);
+                if (options.sitl_horizontal_motion) {
+                    PrintCheck("北向 0.5m/s 运动已开始",
+                               horizontal_motion_started, true);
+                    PrintCheck("北向运动持续 2 秒",
+                               horizontal_motion_complete, true);
+                    PrintCheck("零速度制动完成",
+                               horizontal_brake_complete, true);
+                    PrintCheck("已返回起飞点上方",
+                               returned_to_start, true);
+                    std::cout << "运动结束北向位移: "
+                              << motion_end_north_displacement_m
+                              << " m，最大北向位移: "
+                              << max_north_displacement_m
+                              << " m，最大东西向偏差: "
+                              << max_east_deviation_m << " m" << std::endl;
+                }
                 PrintCheck("AUTO.LAND 请求已入队", land_command_queued, true);
                 PrintCheck("AUTO.LAND ACK 已收到", land_ack_received, true);
                 PrintCheck("AUTO.LAND ACK accepted", land_ack_accepted, true);
@@ -862,10 +992,20 @@ int main(int argc, char** argv) {
              land_ack_accepted && landed_after_flight &&
              !flight_safety_violation && max_takeoff_height_m <= 1.30f &&
              max_horizontal_drift_m <= 0.50f);
+        const bool horizontal_stage_passed = !options.sitl_horizontal_motion ||
+            (common_arm_passed && takeoff_target_ready && takeoff_height_reached &&
+             hover_complete && horizontal_motion_started &&
+             horizontal_motion_complete && horizontal_brake_complete &&
+             returned_to_start && land_command_queued && land_ack_received &&
+             land_ack_accepted && landed_after_flight &&
+             !flight_safety_violation && motion_end_north_displacement_m >= 0.70f &&
+             motion_end_north_displacement_m <= 1.30f &&
+             max_north_displacement_m <= 1.50f &&
+             max_east_deviation_m <= 0.30f && max_takeoff_height_m <= 1.30f);
         const bool passed = observed.heartbeat && connected_at_end &&
                             link.ErrorCount() == 0 && setpoint_passed && offboard_passed &&
                             disarmed_stage_passed && arm_stage_passed &&
-                            takeoff_stage_passed;
+                            takeoff_stage_passed && horizontal_stage_passed;
         std::cout << (passed ? "结果: 基础 PX4 链路通过"
                             : "结果: 基础 PX4 链路未通过")
                   << std::endl;
