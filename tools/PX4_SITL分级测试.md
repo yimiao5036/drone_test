@@ -333,8 +333,29 @@ Armed by external command
 Disarmed by external command
 ```
 
-第 3B 通过后，第 3C 才允许最大 0.5m/s、2 秒的小幅水平速度。任何阶段未通过都不得进入
-真实 Pixhawk 控制测试。
+### 9.1 第 3B 阶段实测结果（2026-08-28）
+
+```text
+最大相对高度：0.975826 m
+最大水平漂移：0.0639602 m
+解锁期间最大三维位移：0.976025 m
+设定值：231 条
+总接收：4897
+ACK：14，超时 0
+链路错误：0
+```
+
+全部阶段验收 PASS，真实模式切换为 AUTO.LAND 4/6。PX4 shell：
+
+```text
+Armed by external command
+Takeoff detected
+Landing detected
+Disarmed by external command
+```
+
+第 3B 完整通过。第 3C 才允许在 1m 高度使用北向最大 0.5m/s、2 秒的小幅水平速度，随后
+必须零速度制动、返回起点、降落和主动上锁。任何阶段未通过都不得进入真实 Pixhawk 控制测试。
 
 ## 8. 常见问题
 
