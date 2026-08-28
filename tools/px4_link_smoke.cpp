@@ -398,6 +398,9 @@ int main(int argc, char** argv) {
         bool arm_ack_accepted = false;
         bool armed_reached = false;
         uint64_t arm_request_time_ms = 0;
+        uint64_t armed_since_ms = 0;
+        bool unexpected_disarm_before_command = false;
+        bool arm_hold_complete = false;
         bool disarm_command_queued = false;
         bool disarm_ack_received = false;
         bool disarm_ack_accepted = false;
@@ -485,6 +488,9 @@ int main(int argc, char** argv) {
                     remained_disarmed = remained_disarmed && !latest.armed;
                 }
                 if (options.sitl_arm_zero_velocity && latest.armed) {
+                    if (!armed_reached) {
+                        armed_since_ms = MonotonicMs();
+                    }
                     armed_reached = true;
                     if (!arm_start_position_valid && latest.local_position_valid) {
                         arm_start_position_valid = true;
@@ -499,6 +505,10 @@ int main(int argc, char** argv) {
                         max_displacement_m = std::max(
                             max_displacement_m, std::sqrt(dx * dx + dy * dy + dz * dz));
                     }
+                }
+                if (options.sitl_arm_zero_velocity && armed_reached &&
+                    !latest.armed && !disarm_command_queued) {
+                    unexpected_disarm_before_command = true;
                 }
             }
             if (options.sitl_arm_zero_velocity && offboard_ack_accepted &&
@@ -519,6 +529,14 @@ int main(int argc, char** argv) {
             if (have_snapshot && now >= next_summary) {
                 PrintSummary(latest, std::chrono::duration_cast<std::chrono::seconds>(now - started));
                 next_summary = now + std::chrono::seconds(1);
+            }
+            if (options.sitl_arm_zero_velocity && armed_reached &&
+                latest.armed && armed_since_ms != 0 &&
+                MonotonicMs() - armed_since_ms >= 5000) {
+                arm_hold_complete = true;
+                std::cout << "[SITL] armed 零速度保持 5 秒完成，准备主动 DISARM"
+                          << std::endl;
+                break;
             }
         }
 
@@ -596,6 +614,9 @@ int main(int argc, char** argv) {
             PrintCheck("ARM ACK 已收到", arm_ack_received, true);
             PrintCheck("ARM ACK accepted", arm_ack_accepted, true);
             PrintCheck("PX4 已确认 armed", armed_reached, true);
+            PrintCheck("armed 零速度保持 5 秒", arm_hold_complete, true);
+            PrintCheck("主动 DISARM 前未被自动上锁",
+                       !unexpected_disarm_before_command, true);
             PrintCheck("DISARM 请求已入队", disarm_command_queued, true);
             PrintCheck("DISARM ACK 已收到", disarm_ack_received, true);
             PrintCheck("DISARM ACK accepted", disarm_ack_accepted, true);
@@ -655,6 +676,8 @@ int main(int argc, char** argv) {
         const bool arm_stage_passed = !options.sitl_arm_zero_velocity ||
                                       (arm_command_queued && arm_ack_received &&
                                        arm_ack_accepted && armed_reached &&
+                                       arm_hold_complete &&
+                                       !unexpected_disarm_before_command &&
                                        disarm_command_queued && disarm_ack_received &&
                                        disarm_ack_accepted && disarmed_confirmed);
         const bool passed = observed.heartbeat && connected_at_end &&

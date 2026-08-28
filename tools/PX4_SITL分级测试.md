@@ -221,9 +221,10 @@ ACK：11，超时 0
 3. 仅在 connected、landed、local position、attitude 均有效时发送 ARM；
 4. 以 heartbeat `armed=true` 确认解锁，不以 ACK 代替状态；
 5. 全程持续零速度，不发送位置/非零速度/起飞；
-6. 记录解锁期间三维最大位移；
-7. 测试结束前发送 DISARM，继续零速度并等待 `armed=false`；
-8. 确认上锁后停止设定值和链路。
+6. 记录解锁期间三维最大位移，并保持 armed 5 秒；
+7. 5 秒到期立即发送 DISARM，必须早于 PX4 `COM_DISARM_PRFLT` 自动上锁；
+8. 继续零速度，等待 DISARM ACK accepted 和真实 `armed=false`；
+9. 确认上锁后停止设定值和链路。
 
 安全门禁：该参数只允许 `transport=udp`，最短时长 10 秒，不能与其他 SITL 阶段参数共用。
 串口配置会在启动前被拒绝。
@@ -235,6 +236,8 @@ Offboard 模式请求已入队
 PX4 已进入 Offboard
 ARM 请求已入队
 PX4 已确认 armed
+armed 零速度保持 5 秒
+主动 DISARM 前未被自动上锁
 DISARM 请求已入队
 PX4 已确认 disarmed
 ```
@@ -242,6 +245,10 @@ PX4 已确认 disarmed
 如果 SITL 从上次测试遗留在 OFFBOARD，本轮仍必须重新发送 mode 命令并获得本轮
 `command=176 result=ACCEPTED` 后才 ARM，禁止仅凭初始 mode=6 跳过顺序。ARM/DISARM 报告会分别
 显示 ACK received、ACK accepted 和真实 armed 状态。
+
+首次成功解锁实测中，PX4 在约 10 秒后执行 `Disarmed by auto preflight disarming`，这是
+未起飞时的预解锁自动上锁保护。程序已改为 armed 5 秒后主动 DISARM，避免把自动上锁误判为
+本程序的 DISARM 效果。
 
 如果 ARM 被拒绝，检查 `command=400` ACK 和 PX4 preflight 日志，不得使用 force arm 绕过检查。
 
