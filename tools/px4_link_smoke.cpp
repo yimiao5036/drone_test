@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -48,13 +50,14 @@ struct Options {
     std::chrono::seconds duration{30};
     bool sitl_zero_velocity = false;
     bool sitl_offboard_disarmed = false;
+    bool sitl_arm_zero_velocity = false;
 };
 
 void PrintUsage(const char* program) {
     std::cout << "用法: " << program
               << " [--config <config.json>] [--duration <秒>]\n"
-              << "       [--sitl-zero-velocity | --sitl-offboard-disarmed]\n"
-              << "SITL 参数仅允许 UDP；offboard-disarmed 持续零速度后切 Offboard，但绝不解锁。\n";
+              << "       [--sitl-zero-velocity | --sitl-offboard-disarmed | --sitl-arm-zero-velocity]\n"
+              << "SITL 参数仅允许 UDP；arm-zero-velocity 会解锁但不发送运动目标，结束前主动上锁。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -80,6 +83,10 @@ Options ParseOptions(int argc, char** argv) {
             options.sitl_offboard_disarmed = true;
             continue;
         }
+        if (argument == "--sitl-arm-zero-velocity") {
+            options.sitl_arm_zero_velocity = true;
+            continue;
+        }
         if (argument == "--duration") {
             if (++index >= argc) {
                 throw std::invalid_argument("--duration 缺少秒数");
@@ -93,8 +100,14 @@ Options ParseOptions(int argc, char** argv) {
         }
         throw std::invalid_argument("未知参数: " + argument);
     }
-    if (options.sitl_zero_velocity && options.sitl_offboard_disarmed) {
-        throw std::invalid_argument("两个 SITL 阶段参数不能同时使用");
+    const int sitl_stage_count = static_cast<int>(options.sitl_zero_velocity) +
+                                 static_cast<int>(options.sitl_offboard_disarmed) +
+                                 static_cast<int>(options.sitl_arm_zero_velocity);
+    if (sitl_stage_count > 1) {
+        throw std::invalid_argument("多个 SITL 阶段参数不能同时使用");
+    }
+    if (options.sitl_arm_zero_velocity && options.duration < std::chrono::seconds(10)) {
+        throw std::invalid_argument("解锁零速度测试时长不能少于 10 秒");
     }
     return options;
 }
@@ -309,8 +322,10 @@ int main(int argc, char** argv) {
         const std::string config_path = ResolveConfigPath(options.config_path);
         const json root = LoadJson(config_path);
         const Px4LinkConfig config = LoadPx4Config(root);
+        const bool sitl_offboard_test =
+            options.sitl_offboard_disarmed || options.sitl_arm_zero_velocity;
         const bool sitl_setpoint_test =
-            options.sitl_zero_velocity || options.sitl_offboard_disarmed;
+            options.sitl_zero_velocity || sitl_offboard_test;
         if (sitl_setpoint_test && config.transport != "udp") {
             throw std::invalid_argument("SITL 设定值参数只允许 transport=udp，禁止在真实串口运行");
         }
@@ -335,11 +350,13 @@ int main(int argc, char** argv) {
                   << "  firmware: " << config.firmware_version << '\n'
                   << "  duration: " << options.duration.count() << " 秒\n"
                   << "  安全边界: "
-                  << (options.sitl_offboard_disarmed
-                          ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
-                          : (options.sitl_zero_velocity
-                                 ? "SITL UDP 零速度流，不切模式、不解锁"
-                                 : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令"))
+                  << (options.sitl_arm_zero_velocity
+                          ? "SITL UDP 进入 Offboard 后解锁，始终零速度，结束前主动上锁"
+                          : (options.sitl_offboard_disarmed
+                                 ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
+                                 : (options.sitl_zero_velocity
+                                        ? "SITL UDP 零速度流，不切模式、不解锁"
+                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")))
                   << '\n'
                   << std::endl;
 
@@ -368,6 +385,15 @@ int main(int argc, char** argv) {
         bool offboard_command_queued = false;
         bool offboard_mode_reached = false;
         bool remained_disarmed = true;
+        bool arm_command_queued = false;
+        bool armed_reached = false;
+        bool disarm_command_queued = false;
+        bool disarmed_confirmed = false;
+        bool arm_start_position_valid = false;
+        float arm_start_x = 0.f;
+        float arm_start_y = 0.f;
+        float arm_start_z = 0.f;
+        float max_displacement_m = 0.f;
         while (!g_stop.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() - started < options.duration) {
             if (auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100))) {
@@ -406,7 +432,7 @@ int main(int argc, char** argv) {
                 (void)setpoint_topic.Emplace(setpoint);
                 next_setpoint_publish = now + std::chrono::milliseconds(100);
             }
-            if (options.sitl_offboard_disarmed && link.IsConnected() &&
+            if (sitl_offboard_test && link.IsConnected() &&
                 !offboard_command_queued &&
                 now - started >= std::chrono::seconds(2) &&
                 link.SetpointSendCount() >= 20) {
@@ -423,11 +449,71 @@ int main(int argc, char** argv) {
             if (have_snapshot) {
                 offboard_mode_reached = offboard_mode_reached ||
                                         latest.flight_mode == 6;
-                remained_disarmed = remained_disarmed && !latest.armed;
+                if (options.sitl_offboard_disarmed) {
+                    remained_disarmed = remained_disarmed && !latest.armed;
+                }
+                if (options.sitl_arm_zero_velocity && latest.armed) {
+                    armed_reached = true;
+                    if (!arm_start_position_valid && latest.local_position_valid) {
+                        arm_start_position_valid = true;
+                        arm_start_x = latest.local_x_m;
+                        arm_start_y = latest.local_y_m;
+                        arm_start_z = latest.local_z_m;
+                    }
+                    if (arm_start_position_valid && latest.local_position_valid) {
+                        const float dx = latest.local_x_m - arm_start_x;
+                        const float dy = latest.local_y_m - arm_start_y;
+                        const float dz = latest.local_z_m - arm_start_z;
+                        max_displacement_m = std::max(
+                            max_displacement_m, std::sqrt(dx * dx + dy * dy + dz * dz));
+                    }
+                }
+            }
+            if (options.sitl_arm_zero_velocity && offboard_mode_reached &&
+                !arm_command_queued && latest.connected && !latest.armed &&
+                latest.landed_state_valid && latest.landed &&
+                latest.local_position_valid && latest.attitude_valid) {
+                arm_command_queued = link.SendCommand(
+                    MAV_CMD_COMPONENT_ARM_DISARM, 1.f, 0.f, 0.f, 0.f,
+                    0.f, 0.f, 0.f);
+                std::cout << "[SITL] ARM 请求"
+                          << (arm_command_queued ? "已入队" : "入队失败")
+                          << std::endl;
             }
             if (have_snapshot && now >= next_summary) {
                 PrintSummary(latest, std::chrono::duration_cast<std::chrono::seconds>(now - started));
                 next_summary = now + std::chrono::seconds(1);
+            }
+        }
+
+        if (options.sitl_arm_zero_velocity && armed_reached) {
+            disarm_command_queued = link.SendCommand(
+                MAV_CMD_COMPONENT_ARM_DISARM, 0.f, 0.f, 0.f, 0.f,
+                0.f, 0.f, 0.f);
+            std::cout << "[SITL] DISARM 请求"
+                      << (disarm_command_queued ? "已入队" : "入队失败")
+                      << std::endl;
+            const auto disarm_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < disarm_deadline) {
+                const auto now = std::chrono::steady_clock::now();
+                drone::common::Px4Setpoint hold;
+                hold.header.receive_time_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()).count());
+                hold.header.valid_for_ms = 300;
+                hold.header.frame_id = 3;
+                hold.type = drone::common::SetpointType::kVelocity;
+                hold.valid = true;
+                (void)setpoint_topic.Emplace(hold);
+                if (auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100))) {
+                    latest = **message;
+                    UpdateObserved(latest, &observed);
+                    if (!latest.armed) {
+                        disarmed_confirmed = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -448,10 +534,19 @@ int main(int argc, char** argv) {
             PrintCheck("SITL 零速度设定值已发送", link.SetpointSendCount() > 0, true);
             std::cout << "设定值发送数: " << link.SetpointSendCount() << std::endl;
         }
-        if (options.sitl_offboard_disarmed) {
+        if (sitl_offboard_test) {
             PrintCheck("Offboard 模式请求已入队", offboard_command_queued, true);
             PrintCheck("PX4 已进入 Offboard", offboard_mode_reached, true);
+        }
+        if (options.sitl_offboard_disarmed) {
             PrintCheck("测试全程保持 disarmed", remained_disarmed, true);
+        }
+        if (options.sitl_arm_zero_velocity) {
+            PrintCheck("ARM 请求已入队", arm_command_queued, true);
+            PrintCheck("PX4 已确认 armed", armed_reached, true);
+            PrintCheck("DISARM 请求已入队", disarm_command_queued, true);
+            PrintCheck("PX4 已确认 disarmed", disarmed_confirmed, true);
+            std::cout << "解锁期间最大位移: " << max_displacement_m << " m" << std::endl;
         }
         PrintCheck("遥测请求 COMMAND_ACK", link.AckMatchCount() > 0, false);
         PrintCheck("遥测请求无 ACK 超时", link.AckTimeoutCount() == 0, false);
@@ -498,11 +593,16 @@ int main(int argc, char** argv) {
 
         const bool setpoint_passed =
             !sitl_setpoint_test || link.SetpointSendCount() > 0;
-        const bool offboard_passed = !options.sitl_offboard_disarmed ||
-                                     (offboard_command_queued && offboard_mode_reached &&
-                                      remained_disarmed);
+        const bool offboard_passed = !sitl_offboard_test ||
+                                     (offboard_command_queued && offboard_mode_reached);
+        const bool disarmed_stage_passed = !options.sitl_offboard_disarmed ||
+                                           remained_disarmed;
+        const bool arm_stage_passed = !options.sitl_arm_zero_velocity ||
+                                      (arm_command_queued && armed_reached &&
+                                       disarm_command_queued && disarmed_confirmed);
         const bool passed = observed.heartbeat && connected_at_end &&
-                            link.ErrorCount() == 0 && setpoint_passed && offboard_passed;
+                            link.ErrorCount() == 0 && setpoint_passed && offboard_passed &&
+                            disarmed_stage_passed && arm_stage_passed;
         std::cout << (passed ? "结果: 基础 PX4 链路通过"
                             : "结果: 基础 PX4 链路未通过")
                   << std::endl;

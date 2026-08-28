@@ -176,7 +176,72 @@ PX4 shell `listener`/`uorb top` 实际输出为准并记录，不凭记忆修改
 - `trajectory_setpoint.velocity=[0,0,0]`；
 - ACK 无超时、链路无错误。
 
-第 3 阶段才在 SITL 解锁并验证位置/速度效果与 Offboard 丢失保护。任何阶段未通过都不得进入
+### 7.1 第 2 阶段实测结果（2026-08-27）
+
+PX4 内部确认：
+
+```text
+offboard_control_mode: velocity=true，其余控制层级=false
+trajectory_setpoint:
+  position=[nan,nan,nan]
+  velocity=[0,0,0]
+  acceleration=[nan,nan,nan]
+  yaw/yawspeed=nan
+```
+
+50 秒应用结果：
+
+```text
+模式：4/3 → 6/0 OFFBOARD
+MAV_CMD_DO_SET_MODE ACK：command=176 result=0
+设定值：876 条
+armed：全程 false
+总接收：12871
+ACK：11，超时 0
+链路错误：0
+```
+
+第 2 阶段完整通过。
+
+## 8. 第 3A 阶段：SITL 解锁，始终零速度
+
+第 2 阶段通过后执行：
+
+```bash
+./build/px4_link_smoke \
+  --config config/px4_sitl.json \
+  --duration 20 \
+  --sitl-arm-zero-velocity
+```
+
+程序顺序：
+
+1. 零 NED 速度预发送至少 2 秒；
+2. 请求并确认 OFFBOARD 6/0；
+3. 仅在 connected、landed、local position、attitude 均有效时发送 ARM；
+4. 以 heartbeat `armed=true` 确认解锁，不以 ACK 代替状态；
+5. 全程持续零速度，不发送位置/非零速度/起飞；
+6. 记录解锁期间三维最大位移；
+7. 测试结束前发送 DISARM，继续零速度并等待 `armed=false`；
+8. 确认上锁后停止设定值和链路。
+
+安全门禁：该参数只允许 `transport=udp`，最短时长 10 秒，不能与其他 SITL 阶段参数共用。
+串口配置会在启动前被拒绝。
+
+验收报告必须全部 PASS：
+
+```text
+Offboard 模式请求已入队
+PX4 已进入 Offboard
+ARM 请求已入队
+PX4 已确认 armed
+DISARM 请求已入队
+PX4 已确认 disarmed
+```
+
+如果 ARM 被拒绝，检查最近 `command=400` ACK 和 PX4 preflight 日志，不得使用 force arm 绕过检查。
+
+第 3B 阶段才允许在 SITL 使用最大 0.5m/s、2 秒的小幅水平速度。任何阶段未通过都不得进入
 真实 Pixhawk 控制测试。
 
 ## 8. 常见问题
