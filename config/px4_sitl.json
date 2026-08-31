@@ -3,18 +3,12 @@
         "dir": "logs/",
         "level": "info"
     },
-    "runtime": {
-        "enable_video": true,
-        "enable_px4": true,
-        "enable_ground_station": false,
-        "enable_control": false
-    },
     "mavlink": {
         "onboard_system_id": 1,
         "onboard_component_id": 191
     },
     "px4": {
-        "transport": "serial",
+        "transport": "udp",
         "firmware_version": "1.17.0",
         "target_system_id": 1,
         "target_component_id": 1,
@@ -57,22 +51,5 @@
             "write_timeout_ms": 100
         },
         "reconnect_interval_ms": 1000
-    },
-    "yolo": {
-        "model_path": "models/yolo26n-int8.rknn",
-        "conf_threshold": 0.60,
-        "nms_threshold": 0.45,
-        "max_detection_frame_lag": 10,
-        "class_names": [
-            "BALLOON"
-        ]
-    },
-    "video": {
-        "input_rtsp": "rtsp://192.168.144.25:8554/main.264",
-        "output_rtsp": "rtsp://127.0.0.1:8554/drone_out",
-        "width": 1280,
-        "height": 720,
-        "fps": 25,
-        "bitrate": 6000000
     }
 }

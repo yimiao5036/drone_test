@@ -1,6 +1,6 @@
 # drone_test
 
-运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前已完成视频与 YOLO 实机链路，正在进入 PX4、地面站通信和状态控制阶段。
+运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前视频与 YOLO 实机链路已闭环，PX4 串口基础链路及 PX4 1.17.0 SITL 第3A~3D控制/失联保护验证已完成，正在进入真实 Pixhawk 拆桨台架、地面站通信和状态控制阶段。
 
 ## 系统目标
 
@@ -22,8 +22,8 @@
 | 项目 | 当前方案 |
 |------|----------|
 | 算力板 | Orange Pi，RK3588，Ubuntu |
-| 飞控 | Pixhawk 2.4.8，PX4 1.11.3 |
-| 算力板与飞控 | 串口 MAVLink |
+| 飞控 | Pixhawk 2.4.8，PX4 1.17.0 |
+| 算力板与飞控 | `/dev/ttyS1` 串口 MAVLink |
 | 地面站 | 自研，通过电台与算力板使用 MAVLink 通信 |
 | 摄像头 | 机头正前方固定安装，RJ45/TCP，H.265，实机流 1280×720、25 FPS |
 | 视觉算法 | YOLOv26 RKNN；正式模型输出 `[1,5,8400]` 归一化框与置信度，类别名称由 JSON 配置 |
@@ -83,6 +83,12 @@
 - [视频叠加](include/video/frame_compositor.md)
 - [图传发送与编码后端](include/video_transmission/video_sender.md)
 - [串口封装](include/communication/serial_port.md)
+- [MAVLink 字节流处理器](include/communication/mavlink_handler.md)
+- [PX4 通信链路](include/communication/px4_link.md)
+- [PX4 链路冒烟测试](tools/px4_link_smoke.md)
+- [PX4 1.17.0 SITL 分级测试](tools/PX4_SITL分级测试.md)
+- [主程序集成与数据链路实施计划](docs/主程序集成与数据链路实施计划.md)
+- [通信传输抽象](include/communication/communication_transport.md)
 
 ## 当前正式工程目录
 
@@ -100,7 +106,8 @@ drone_test/
 │   ├── perception/           # yolo_detector.h, detection_backend.h, yolo_postprocess.h,
 │   │                         #   optical_flow_estimator.h, laser_range_finder.h,
 │   │                         #   perception_fusion.h, target_estimator.h
-│   ├── communication/        # serial_port.h, px4_link.h, ground_station_link.h
+│   ├── communication/        # serial_port.h, communication_transport.h, mavlink_handler.h,
+│   │                         # px4_link.h, ground_station_link.h
 │   ├── control/              # flight_controller.h
 │   ├── state_machine/        # mission_state_machine.h
 │   ├── health/               # health_manager.h
@@ -108,6 +115,7 @@ drone_test/
 ├── src/                      # 各模块实现（含真实实现与 Stub）
 ├── tests/                    # 单元测试 + tests/skeleton/ 骨架冒烟测试
 ├── config/
+├── tools/                    # PX4 串口冒烟与强制 UDP 的 SITL 分级控制测试
 ├── models/                   # yolo26n-int8.rknn
 ├── third_party/
 └── videoPart/                # 现有视频/RKNN验证原型，后续按模块迁移
@@ -120,4 +128,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留，开发机全工程 **79/79 测试通过**。`videoPart` 保留为硬件验证原型；下一阶段开发 PX4 串口、地面站电台、状态主题和全量控制装配，之后在 PX4 SITL、台架及受控飞行环境中分级验证。
+正式工程骨架、根入口和发布订阅基础类已经创建；视频正式链路已在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态框叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。PX4 通信已完成串口/UDP 传输、MAVLink 1/2 解析、完整遥测快照、可靠命令/ACK、安全遥测请求和本地 NED 位置/速度设定值；香橙派 `/dev/ttyS1 @115200` 接收与命令链路实机通过。PX4 1.17.0 SITL 第 3A~3D 已完成 Offboard、ARM/DISARM、零速度、相对起飞 1m、悬停、水平速度/制动/返回、AUTO.LAND，以及 setpoint 丢失后 1270ms 退出 Offboard 并降级到 AUTO/RTL 的闭环验证。正式主程序现已新增统一强类型配置和 `DroneApplication` 装配层，视频链路已迁入应用层，真实 `Px4Link` 已按 `/dev/ttyS1` 配置装入正式程序；当前没有绑定 `Px4Setpoint` 或外部控制命令，只建立遥测数据面。全工程 **116/116 测试通过**。下一步在香橙派联合验证视频+PX4遥测，再实现地面站双向数传。

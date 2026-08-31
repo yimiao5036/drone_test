@@ -21,7 +21,8 @@ struct SerialPortConfig {
     uint8_t data_bits = 8;               // 5/6/7/8
     uint8_t stop_bits = 1;               // 1/2
     char parity = 'N';                   // N/E/O
-    std::chrono::milliseconds read_timeout{100};  // 单次读超时
+    std::chrono::milliseconds read_timeout{100};   // 单次读超时
+    std::chrono::milliseconds write_timeout{100};  // 单帧全量写超时
     void Validate() const;               // 非法参数抛 std::invalid_argument
 };
 
@@ -38,14 +39,19 @@ class SerialPort {
 };
 ```
 
-线程模型：单线程使用（每链路一线程独占），内部不加锁。
+线程模型：单线程使用（每链路一线程独占），内部不加锁。PX4、地面站等链路各自创建独立
+`SerialPort` 实例和通信线程，不共享 fd。
 
 ## 3. 关键实现点
 
-- **termios 配置**：`cfmakeraw` + 波特率映射 + 数据位/校验位/停止位。
-- **超时读**：`VMIN=0 + VTIME`（单位 0.1s），阻塞读最多等待 `read_timeout`；骨架期简化实现，
-  精度不足时后续可替换 poll/epoll。
-- **全量写**：`write` 可能部分写入，循环直到写完。
+- **termios 配置**：`cfmakeraw` + `CLOCAL | CREAD` + 波特率映射 + 数据位/校验位/停止位，
+  显式关闭软硬件流控。
+- **非阻塞 fd**：使用 `O_NONBLOCK | O_CLOEXEC` 打开，避免读写永久阻塞或 fd 泄漏到子进程。
+- **精确超时**：`VMIN=0`、`VTIME=0`，读写均使用 `poll()` 和单调时钟控制毫秒级超时；
+  `EINTR` 在剩余超时时间内继续等待。
+- **全量写**：`write` 可能部分写入，循环直到整帧完成；超过 `write_timeout` 返回失败，
+  禁止把半条协议帧当作发送成功。
+- **链路异常**：`POLLERR/POLLHUP/POLLNVAL` 作为运行时错误返回，由上层链路模块决定重连。
 - **移动语义**：可移动不可拷贝（fd 转移）。
 
 ## 4. 日志行为
@@ -59,7 +65,9 @@ class SerialPort {
 
 - **配置校验**：`tests/skeleton/stub_smoke_test.cpp` 的 `SerialPortConfigValidation`
   （非法波特率/校验位/数据位抛异常）。
-- **真实读写**：需串口设备，香橙派实机验证；开发机可借 `socat` 建伪终端（`socat -d -d pty,raw,echo=0 pty,raw,echo=0`）做读写回环验证。
+- **自动化伪终端测试**：`tests/communication/serial_port_test.cpp` 使用 Linux PTY 验证幂等启停、
+  双向收发、毫秒级读取超时、关闭后重启及写入超时参数校验，不依赖真实硬件。
+- **真实读写**：香橙派上仍需使用 Pixhawk/电台实机验证设备名、波特率、引脚电平和长期稳定性。
 
 ## 6. 排查/修改要点
 
@@ -70,3 +78,45 @@ class SerialPort {
 | 读到乱码 | 波特率不匹配、`parity`/`stop_bits` 错误 |
 | 写失败 | 设备断开；`Flush()` 在协议重同步时调用 |
 | 需要更高波特率 | `ToBaudConstant` 映射表扩展 |
+
+## 7. 当前配置占位
+
+`config/config.json` 已预留机载电脑 MAVLink 身份和 PX4 串口参数：
+
+```json
+"mavlink": {
+    "onboard_system_id": 1,
+    "onboard_component_id": 191
+},
+"px4": {
+    "firmware_version": "1.17.0",
+    "target_system_id": 1,
+    "target_component_id": 1,
+    "mavlink_version": 2,
+    "heartbeat_send_interval_ms": 1000,
+    "heartbeat_timeout_ms": 3000,
+    "telemetry_timeout_ms": 2000,
+    "state_publish_interval_ms": 100,
+    "command_ack_timeout_ms": 1000,
+    "setpoint_send_interval_ms": 50,
+    "setpoint_timeout_ms": 500,
+    "setpoint_queue_capacity": 4,
+    "command_queue_capacity": 16,
+    "one_shot_message_requests": [148, 242],
+    "message_interval_requests": ["见 config/config.json"],
+    "serial": {
+        "device": "/dev/ttyS1",
+        "baud_rate": 115200,
+        "data_bits": 8,
+        "stop_bits": 1,
+        "parity": "N",
+        "read_timeout_ms": 20,
+        "write_timeout_ms": 100
+    },
+    "reconnect_interval_ms": 1000
+}
+```
+
+`onboard_component_id=191` 对应 MAVLink 标准 `MAV_COMP_ID_ONBOARD_COMPUTER`。PX4 串口已
+确认为 `/dev/ttyS1`；波特率仍可通过 JSON 修改。`px4_link_smoke` 已严格读取并注入该配置，
+根 `main.cpp` 的全量配置装配仍待后续；`SerialPort` 本身不依赖 JSON。

@@ -101,10 +101,16 @@ endif()
 # ---- communication 模块（串口封装、PX4/地面站链路接口） ----
 add_library(drone_communication STATIC
     src/communication/serial_port.cpp
+    src/communication/communication_transport.cpp
+    src/communication/mavlink_handler.cpp
     src/communication/px4_link.cpp
     src/communication/ground_station_link.cpp)
 target_include_directories(drone_communication PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+# MAVLink 为生成的第三方 C 头文件，按 SYSTEM 传播以屏蔽其 packed/匿名结构体警告；
+# 项目自身代码仍保持 -Wall -Wextra -Wpedantic。
+target_include_directories(drone_communication SYSTEM PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/c_library_v2-master>)
 target_compile_features(drone_communication PUBLIC cxx_std_17)
 target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
@@ -132,24 +138,52 @@ target_include_directories(drone_health PUBLIC
 target_compile_features(drone_health PUBLIC cxx_std_17)
 target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 
+# ---- config 模块（正式主程序强类型配置） ----
+add_library(drone_config STATIC
+    src/config/config.cpp)
+target_include_directories(drone_config PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_config PUBLIC cxx_std_17)
+target_link_libraries(drone_config PUBLIC
+    drone_common
+    drone_communication
+    drone_video
+    drone_perception
+    drone_video_transmission)
+
+# ---- application 模块（正式主程序组件所有权、Topic 接线与生命周期） ----
+add_library(drone_application STATIC
+    src/application/drone_application.cpp)
+target_include_directories(drone_application PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_application PUBLIC cxx_std_17)
+target_link_libraries(drone_application PUBLIC
+    drone_config
+    drone_communication
+    drone_video
+    drone_perception
+    drone_video_transmission
+    spdlog::spdlog)
+
 add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
 
-# 编译后复制模型到可执行文件旁，匹配 main.cpp 按 /proc/self/exe 解析 models/ 的约定。
+# 编译后复制模型和配置到可执行文件旁，匹配 /proc/self/exe 路径解析约定。
 add_custom_command(TARGET drone_control POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/models"
             "${CMAKE_BINARY_DIR}/models"
-    COMMENT "复制 models/ 到构建目录"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/config"
+            "${CMAKE_BINARY_DIR}/config"
+    COMMENT "复制 models/ 和 config/ 到构建目录"
     VERBATIM)
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE
     drone_common
-    drone_video
-    drone_perception
-    drone_video_transmission
+    drone_application
     spdlog::spdlog
     PkgConfig::FFMPEG)
 
@@ -158,6 +192,26 @@ if(MSVC)
 else()
     target_compile_options(drone_control PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# PX4 串口冒烟与强制UDP的SITL分级测试：独立于正式主程序。
+add_executable(px4_link_smoke
+    tools/px4_link_smoke.cpp
+    src/common/logger.cpp)
+target_link_libraries(px4_link_smoke PRIVATE
+    drone_common
+    drone_communication
+    spdlog::spdlog)
+if(MSVC)
+    target_compile_options(px4_link_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(px4_link_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_custom_command(TARGET px4_link_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/config"
+            "${CMAKE_BINARY_DIR}/config"
+    COMMENT "复制 config/ 到 PX4 冒烟测试构建目录"
+    VERBATIM)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -230,6 +284,73 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
+        add_executable(serial_port_test tests/communication/serial_port_test.cpp)
+        target_link_libraries(serial_port_test PRIVATE
+            drone_communication spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(serial_port_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(serial_port_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(serial_port_test)
+
+        # 通信传输测试：UDP 双向数据报、动态学习对端和配置校验（供 PX4 SITL）
+        add_executable(communication_transport_test
+            tests/communication/communication_transport_test.cpp)
+        target_link_libraries(communication_transport_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(communication_transport_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(communication_transport_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(communication_transport_test)
+
+        # MAVLink 字节流测试：验证 v1/v2、半包、粘包、坏 CRC 恢复和实例隔离
+        add_executable(mavlink_handler_test tests/communication/mavlink_handler_test.cpp)
+        target_link_libraries(mavlink_handler_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mavlink_handler_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mavlink_handler_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mavlink_handler_test)
+
+        # PX4 链路基础测试：PTY 串口、本机/PX4 心跳、连接超时、快照发布与重启
+        add_executable(px4_link_test tests/communication/px4_link_test.cpp)
+        target_link_libraries(px4_link_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(px4_link_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(px4_link_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(px4_link_test)
+
+        # 正式主程序配置测试：生产配置解析和控制/地面站安全门禁
+        add_executable(config_test tests/config/config_test.cpp)
+        target_link_libraries(config_test PRIVATE drone_config GTest::gtest_main)
+        target_compile_definitions(config_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MSVC)
+            target_compile_options(config_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(config_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(config_test)
 
         # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
         add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)
