@@ -60,6 +60,60 @@ std::string ResolveAssetPath(const std::string& value,
     return executable_directory + '/' + value;
 }
 
+communication::GroundStationLinkConfig ParseGroundStationConfig(
+    const json& root) {
+    const json& identity = root.at("mavlink");
+    const json& ground = root.at("ground_station");
+    const json& serial = ground.at("serial");
+    const json& rates = ground.at("send_interval_ms");
+
+    communication::GroundStationLinkConfig config;
+    config.onboard_system_id = ReadUint8(identity, "onboard_system_id");
+    config.onboard_component_id = ReadUint8(identity, "onboard_component_id");
+    config.mavlink_version = ReadUint8(ground, "mavlink_version");
+    config.heartbeat_send_interval =
+        ReadPositiveMilliseconds(ground, "heartbeat_send_interval_ms");
+    config.heartbeat_timeout =
+        ReadPositiveMilliseconds(ground, "heartbeat_timeout_ms");
+    config.attitude_send_interval = ReadPositiveMilliseconds(rates, "attitude");
+    config.local_position_send_interval =
+        ReadPositiveMilliseconds(rates, "local_position");
+    config.global_position_send_interval =
+        ReadPositiveMilliseconds(rates, "global_position");
+    config.gps_send_interval = ReadPositiveMilliseconds(rates, "gps");
+    config.extended_state_send_interval =
+        ReadPositiveMilliseconds(rates, "extended_state");
+    config.system_status_send_interval =
+        ReadPositiveMilliseconds(rates, "system_status");
+    config.battery_send_interval = ReadPositiveMilliseconds(rates, "battery");
+    config.home_send_interval = ReadPositiveMilliseconds(rates, "home");
+
+    const int64_t queue_capacity =
+        ground.at("flight_state_queue_capacity").get<int64_t>();
+    if (queue_capacity <= 0) {
+        throw std::invalid_argument("ground_station飞行状态队列容量必须为正数");
+    }
+    config.flight_state_queue_capacity =
+        static_cast<std::size_t>(queue_capacity);
+
+    config.serial.device = serial.at("device").get<std::string>();
+    config.serial.baud_rate = serial.at("baud_rate").get<int>();
+    config.serial.data_bits = ReadUint8(serial, "data_bits");
+    config.serial.stop_bits = ReadUint8(serial, "stop_bits");
+    const std::string parity = serial.at("parity").get<std::string>();
+    if (parity.size() != 1) {
+        throw std::invalid_argument(
+            "ground_station.serial.parity必须是单个字符N/E/O");
+    }
+    config.serial.parity = parity.front();
+    config.serial.read_timeout =
+        ReadPositiveMilliseconds(serial, "read_timeout_ms");
+    config.serial.write_timeout =
+        ReadPositiveMilliseconds(serial, "write_timeout_ms");
+    config.Validate();
+    return config;
+}
+
 communication::Px4LinkConfig ParsePx4Config(const json& root) {
     const json& identity = root.at("mavlink");
     const json& px4 = root.at("px4");
@@ -188,11 +242,11 @@ AppConfig LoadAppConfig(const std::string& path,
     if (config.runtime.enable_control && !config.runtime.enable_px4) {
         throw std::invalid_argument("enable_control=true时必须启用PX4链路");
     }
+    if (config.runtime.enable_ground_station && !config.runtime.enable_px4) {
+        throw std::invalid_argument("当前地面站遥测链路启用时必须同时启用PX4链路");
+    }
     if (config.runtime.enable_control) {
         throw std::invalid_argument("正式控制装配尚未开放，enable_control必须为false");
-    }
-    if (config.runtime.enable_ground_station) {
-        throw std::invalid_argument("地面站真实链路尚未实现，enable_ground_station必须为false");
     }
 
     const json video = root.value("video", json::object());
@@ -254,6 +308,12 @@ AppConfig LoadAppConfig(const std::string& path,
         video.value("sender_input_queue", 2));
 
     config.px4 = ParsePx4Config(root);
+    if (root.find("ground_station") != root.end()) {
+        config.ground_station = ParseGroundStationConfig(root);
+    } else if (config.runtime.enable_ground_station) {
+        throw std::invalid_argument(
+            "enable_ground_station=true时必须提供ground_station配置节");
+    }
     return config;
 }
 

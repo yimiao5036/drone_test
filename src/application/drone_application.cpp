@@ -6,6 +6,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "perception/detection_backend.h"
 #include "perception/yolo_detector.h"
@@ -43,6 +44,10 @@ void DroneApplication::BuildComponents() {
     if (config_.runtime.enable_px4) {
         px4_link_ = std::make_unique<communication::Px4Link>(config_.px4);
     }
+    if (config_.runtime.enable_ground_station) {
+        ground_station_link_ = std::make_unique<communication::GroundStationLink>(
+            config_.ground_station);
+    }
 }
 
 void DroneApplication::BindTopics() {
@@ -54,7 +59,11 @@ void DroneApplication::BindTopics() {
         video_sender_->SetInput(compositor_->AnnotatedOutput());
     }
 
-    // 当前正式主程序只装配PX4遥测输出，不绑定Px4Setpoint输入，也不发送控制命令。
+    if (ground_station_link_ != nullptr && px4_link_ != nullptr) {
+        ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
+    }
+
+    // 当前正式主程序不绑定Px4Setpoint输入，也不发送控制命令。
     // 后续只有在状态机、控制器和真实拆桨台架门禁全部完成后才允许连接控制Topic。
 }
 
@@ -104,6 +113,16 @@ bool DroneApplication::Start() {
         }
     }
 
+    // 地面站是PX4状态消费者，必须先于PX4生产者启动。
+    if (ground_station_link_ != nullptr) {
+        if (!ground_station_link_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序地面站链路启动失败，地面站遥测下行不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
     if (px4_link_ != nullptr) {
         if (!px4_link_->Start()) {
             degraded = true;
@@ -128,9 +147,12 @@ void DroneApplication::Stop() {
     }
 
     SPDLOG_INFO("主程序开始停止");
-    // PX4当前只有状态输出，先停止物理生产者，确保未来地面站消费者可安全排空。
+    // 先停止PX4状态生产者，再停止地面站消费者。
     if (px4_link_ != nullptr) {
         px4_link_->Stop();
+    }
+    if (ground_station_link_ != nullptr) {
+        ground_station_link_->Stop();
     }
 
     if (camera_ != nullptr) {
