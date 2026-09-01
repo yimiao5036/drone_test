@@ -1,0 +1,48 @@
+{
+    "_comment": "视觉跟踪控制律配置。全部数值为占位示例（对应 docs/物理追踪思路.md 第 8 章待定项），键名后缀标注单位；标定完成前仅限回放验证，不得用于实飞。",
+
+    "control": {
+        "frequency_hz": 20.0,
+        "visual_stale_ms": 200,
+        "radar_stale_ms": 500,
+        "attitude_stale_ms": 300
+    },
+
+    "camera": {
+        "image_width": 1920,
+        "image_height": 1080,
+        "fov_h_deg": 60.0,
+        "fov_v_deg": 35.0
+    },
+
+    "heading": {
+        "mode": "rate",
+        "gain": 1.0,
+        "yaw_rate_limit_dps": 30.0,
+        "yaw_slew_limit_dps2": 60.0
+    },
+
+    "vertical": {
+        "vz_gain_mps_per_deg": 0.1,
+        "vz_limit_mps": 2.0
+    },
+
+    "distance": {
+        "d_exp_m": 10.0,
+        "kp": 0.5,
+        "ki": 0.05,
+        "kd": 0.1,
+        "integral_limit": 2.0,
+        "derivative_filter_coef": 0.2,
+        "approach_velocity_limit_mps": 3.0,
+        "retreat_velocity_limit_mps": 1.0,
+        "no_distance_action": "hold",
+        "no_distance_approach_limit_mps": 0.5
+    },
+
+    "accel_limit": {
+        "ax_mps2": 2.0,
+        "ay_mps2": 2.0,
+        "az_mps2": 1.5
+    }
+}
