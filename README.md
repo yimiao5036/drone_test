@@ -89,6 +89,7 @@
 - [PX4 链路冒烟测试](tools/px4_link_smoke.md)
 - [PX4 1.17.0 SITL 分级测试](tools/PX4_SITL分级测试.md)
 - [主程序集成与数据链路实施计划](docs/主程序集成与数据链路实施计划.md)
+- [多机身份与功能寻址设计](docs/多机身份与功能寻址设计.md)
 - [通信传输抽象](include/communication/communication_transport.md)
 
 ## 当前正式工程目录
@@ -129,4 +130,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式工程骨架、根入口和发布订阅基础类已经创建；视频正式链路已在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态框叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。PX4 通信已完成串口/UDP传输、MAVLink 1/2解析、完整遥测快照、可靠命令/ACK、安全遥测请求和本地NED位置/速度设定值；香橙派`/dev/ttyS1 @115200`接收与命令链路实机通过。PX4 1.17.0 SITL第3A~3D已完成Offboard、ARM/DISARM、零速度、相对起飞1m、悬停、水平速度/制动/返回、AUTO.LAND，以及setpoint丢失后退出Offboard并降级到AUTO/RTL的闭环验证。正式主程序通过`DroneApplication`装配视频、PX4和地面站链路；`GroundStationLink`订阅`FlightStateSnapshot`，通过JSON暂配的`/dev/ttyS6 @115200 8N1`发送MAVLink 2心跳、GPS、位置、姿态、电池、模式、landed和Home等标准状态。目标位置、任务/健康自定义协议仍为预留，当前没有绑定`Px4Setpoint`或发送外部控制命令。Ubuntu 24.04全工程 **124/124测试通过**。下一步在香橙派与Vue3地面站进行串口6实机联调。
+正式工程骨架、根入口和发布订阅基础类已经创建；视频正式链路已在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态框叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。PX4 通信已完成串口/UDP传输、MAVLink 1/2解析、完整遥测快照、可靠命令/ACK、安全遥测请求和本地NED位置/速度设定值；香橙派`/dev/ttyS1 @115200`接收与命令链路实机通过。PX4 1.17.0 SITL第3A~3D已完成Offboard、ARM/DISARM、零速度、相对起飞1m、悬停、水平速度/制动/返回、AUTO.LAND，以及setpoint丢失后退出Offboard并降级到AUTO/RTL的闭环验证。正式主程序通过`DroneApplication`装配视频、PX4和地面站链路；`GroundStationLink`订阅`FlightStateSnapshot`，通过JSON暂配的`/dev/ttyS6 @115200 8N1`发送MAVLink 2心跳、GPS、位置、姿态、电池、模式、landed和Home等标准状态。目标位置、任务/健康自定义协议仍为预留，当前没有绑定`Px4Setpoint`或发送外部控制命令。Ubuntu 24.04全工程 **124/124测试通过**。香橙派已完成HM30双向实机闭环：UART6使用`uart6-m1`引脚复用，`/dev/ttyS6 @115200 8N1`连接天空端，Windows通过地面端`192.168.144.12:19856`发送GCS心跳并持续收到`system=1/component=191`标准遥测。Vue3地面站配套通信逻辑已接入并成功显示下行飞行状态；下一步继续完善界面字段、链路诊断，并定义目标位置上行协议。

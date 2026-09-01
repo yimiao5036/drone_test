@@ -29,7 +29,7 @@ Px4Link::StateOutput()
   → 自研Vue3地面站
 ```
 
-发送身份复用`mavlink.onboard_system_id/onboard_component_id`，当前组件ID为191（`MAV_COMP_ID_ONBOARD_COMPUTER`）。输出心跳类型为`MAV_TYPE_ONBOARD_CONTROLLER`、自动驾驶类型为`MAV_AUTOPILOT_INVALID`。
+当前已运行实现仍复用`mavlink.onboard_system_id/onboard_component_id`，实机验证身份为`1/191`。多机阶段将按`docs/多机身份与功能寻址设计.md`拆分地面站链路身份：system ID表示同类型编号，component ID表示功能类别，捕网类使用25、火箭类使用26；PX4链路继续保持1/191→1/1。该设计尚未进入代码，修改前后必须保证两条链路配置互不覆盖。
 
 当前下行消息：
 
@@ -80,7 +80,8 @@ ctest --test-dir build --output-on-failure
 ## 排查与修改要点
 
 - 串口打不开：检查`ground_station.serial.device`是否为实际Linux节点、用户组权限和设备树串口使能；不需要修改代码。
-- 地面站无数据：先抓取`HEARTBEAT`，核对MAVLink 2、115200 8N1和地面站解析器是否接受system/component ID。
+- RK3588同一UART可有多组引脚复用。香橙派实测曾误启用`uart6-m2`而接线位于`uart6-m1`，表现为`/dev/ttyS6`可打开且`tx`计数增加，但排针无正确收发。必须保证设备树Overlay选择与实际TX/RX排针一致；当前实机使用`uart6-m1`。
+- 地面站无数据：先抓取`HEARTBEAT`，核对MAVLink 2、115200 8N1和地面站解析器是否接受完整system/component二元身份。HM30 UDP实机参数为地面端`192.168.144.12:19856`；当前单机实现由Windows发送`255/190` GCS心跳、飞机下行`1/191`并已完成Vue3显示验证。多机实现后应看到捕网N号=`N/25`、火箭N号=`N/26`。
 - 有心跳但无GPS/电池：检查PX4快照对应`*_valid`标志；本模块不会发送失效字段。
 - 模式显示：读取机载心跳中的`base_mode/custom_mode`，其中`custom_mode`保持PX4原始编码。
 - 修改发送频率只改JSON；不得在工作循环写死新周期。
