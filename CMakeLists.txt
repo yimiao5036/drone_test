@@ -338,7 +338,21 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(px4_link_test)
 
-        # 正式主程序配置测试：生产配置解析和控制/地面站安全门禁
+        # 地面站链路测试：PTY串口、MAVLink 2遥测编码、GCS心跳与重启
+        add_executable(ground_station_link_test
+            tests/communication/ground_station_link_test.cpp)
+        target_link_libraries(ground_station_link_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(ground_station_link_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(ground_station_link_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(ground_station_link_test)
+
+        # 正式主程序配置测试：生产配置解析和控制安全门禁
         add_executable(config_test tests/config/config_test.cpp)
         target_link_libraries(config_test PRIVATE drone_config GTest::gtest_main)
         target_compile_definitions(config_test PRIVATE

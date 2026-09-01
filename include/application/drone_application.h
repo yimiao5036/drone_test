@@ -5,6 +5,7 @@
 #include "config/config.h"
 
 namespace drone::communication {
+class GroundStationLink;
 class Px4Link;
 }
 namespace drone::perception {
@@ -49,6 +50,7 @@ private:
     std::unique_ptr<video::FrameCompositor> compositor_;
     std::unique_ptr<video_transmission::VideoSender> video_sender_;
     std::unique_ptr<communication::Px4Link> px4_link_;
+    std::unique_ptr<communication::GroundStationLink> ground_station_link_;
 };
 
 }  // namespace drone::application

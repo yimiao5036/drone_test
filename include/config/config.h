@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "perception/yolo_detector.h"
 #include "video/camera_receiver.h"
@@ -35,6 +36,7 @@ struct AppConfig {
     video::CompositorConfig compositor;
     video_transmission::VideoSenderConfig video_sender;
     communication::Px4LinkConfig px4;
+    communication::GroundStationLinkConfig ground_station;
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

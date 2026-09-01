@@ -6,7 +6,7 @@
     "runtime": {
         "enable_video": true,
         "enable_px4": true,
-        "enable_ground_station": false,
+        "enable_ground_station": true,
         "enable_control": false
     },
     "mavlink": {
@@ -57,6 +57,31 @@
             "write_timeout_ms": 100
         },
         "reconnect_interval_ms": 1000
+    },
+    "ground_station": {
+        "mavlink_version": 2,
+        "heartbeat_send_interval_ms": 1000,
+        "heartbeat_timeout_ms": 3000,
+        "flight_state_queue_capacity": 2,
+        "send_interval_ms": {
+            "attitude": 100,
+            "local_position": 200,
+            "global_position": 200,
+            "gps": 500,
+            "extended_state": 500,
+            "system_status": 1000,
+            "battery": 1000,
+            "home": 5000
+        },
+        "serial": {
+            "device": "/dev/ttyS6",
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "stop_bits": 1,
+            "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        }
     },
     "yolo": {
         "model_path": "models/yolo26n-int8.rknn",
