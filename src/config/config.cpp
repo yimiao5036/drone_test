@@ -60,6 +60,43 @@ std::string ResolveAssetPath(const std::string& value,
     return executable_directory + '/' + value;
 }
 
+std::string ToString(uint8_t value) {
+    return std::to_string(static_cast<unsigned int>(value));
+}
+
+void ReplaceAll(std::string& value, const std::string& from,
+                const std::string& to) {
+    std::size_t position = 0;
+    while ((position = value.find(from, position)) != std::string::npos) {
+        value.replace(position, from.size(), to);
+        position += to.size();
+    }
+}
+
+bool HasIdentityPlaceholder(const std::string& value) {
+    return value.find("{aircraft_system_id}") != std::string::npos ||
+           value.find("{aircraft_component_id}") != std::string::npos ||
+           value.find("{aircraft_number}") != std::string::npos;
+}
+
+std::string ResolveVideoOutputRtsp(
+    std::string value,
+    const communication::GroundStationLinkConfig* ground_station) {
+    if (!HasIdentityPlaceholder(value)) {
+        return value;
+    }
+    if (ground_station == nullptr) {
+        throw std::invalid_argument(
+            "video.output_rtsp使用身份占位符时必须提供ground_station配置节");
+    }
+    ReplaceAll(value, "{aircraft_system_id}",
+               ToString(ground_station->aircraft_system_id));
+    ReplaceAll(value, "{aircraft_component_id}",
+               ToString(ground_station->aircraft_component_id));
+    ReplaceAll(value, "{aircraft_number}", ToString(ground_station->aircraft_number));
+    return value;
+}
+
 communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& root) {
     const json& ground = root.at("ground_station");
@@ -252,6 +289,13 @@ AppConfig LoadAppConfig(const std::string& path,
         throw std::invalid_argument("正式控制装配尚未开放，enable_control必须为false");
     }
 
+    if (root.find("ground_station") != root.end()) {
+        config.ground_station = ParseGroundStationConfig(root);
+    } else if (config.runtime.enable_ground_station) {
+        throw std::invalid_argument(
+            "enable_ground_station=true时必须提供ground_station配置节");
+    }
+
     const json video = root.value("video", json::object());
     config.camera.rtsp_url = video.value(
         "input_rtsp", std::string("rtsp://192.168.1.100:8554/live"));
@@ -296,8 +340,13 @@ AppConfig LoadAppConfig(const std::string& path,
         }
     }
 
-    config.video_sender.encode.url = video.value(
-        "output_rtsp", std::string("rtsp://127.0.0.1:8554/drone_out"));
+    const std::string default_output_rtsp =
+        root.find("ground_station") != root.end()
+            ? "rtsp://127.0.0.1:8554/drone_{aircraft_component_id}_{aircraft_system_id}"
+            : "rtsp://127.0.0.1:8554/drone_out";
+    config.video_sender.encode.url = ResolveVideoOutputRtsp(
+        video.value("output_rtsp", default_output_rtsp),
+        root.find("ground_station") != root.end() ? &config.ground_station : nullptr);
     config.video_sender.encode.codec = video.value("output_codec", std::string("h264"));
     config.video_sender.encode.prefer_hardware =
         video.value("prefer_hardware_encode", true);
@@ -311,12 +360,6 @@ AppConfig LoadAppConfig(const std::string& path,
         video.value("sender_input_queue", 2));
 
     config.px4 = ParsePx4Config(root);
-    if (root.find("ground_station") != root.end()) {
-        config.ground_station = ParseGroundStationConfig(root);
-    } else if (config.runtime.enable_ground_station) {
-        throw std::invalid_argument(
-            "enable_ground_station=true时必须提供ground_station配置节");
-    }
     return config;
 }
 

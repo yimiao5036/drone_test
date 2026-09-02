@@ -95,8 +95,11 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
   ```
 - **RTSP 推流 + rkmpp 硬编码**：需真实图传目标/香橙派（`ffmpeg-rockchip`），在
   香橙派实机用 `ffprobe -rtsp_transport tcp ...` 或地面站播放器验收。
-  **当前采用 mediamtx 中转架构**：`config.output_rtsp` 指向本机 mediamtx
-  （`rtsp://127.0.0.1:8554/drone_out`），香橙派程序推给本机 mediamtx，mediamtx 再对外
+  **当前采用 mediamtx 中转架构**：`config.video.output_rtsp` 指向本机 mediamtx。
+  为避免多机图传路径冲突，正式配置使用身份占位符
+  `rtsp://127.0.0.1:8554/drone_{aircraft_component_id}_{aircraft_system_id}`，配置解析后
+  捕网-01会变为`rtsp://127.0.0.1:8554/drone_25_1`，火箭-01会变为
+  `rtsp://127.0.0.1:8554/drone_26_1`。香橙派程序推给本机 mediamtx，mediamtx 再对外
   发布供任意图传设备拉取（见 `deploy/mediamtx.yml`、`deploy/install_mediamtx.sh`）。
   换图传设备时不动香橙派代码/配置。
 
@@ -105,7 +108,8 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 - **推流地址不可达**：`Start` 返回 false，`avformat_write_header` 报
   "图传 RTSP 写头失败"。
   - 若指向本机 mediamtx：确认 mediamtx 服务已启动（`systemctl status mediamtx`）、
-    8554 端口在监听、配置含 `drone_out` 且 `source: publisher`。
+    8554 端口在监听、配置含对应身份路径或`all_others: source: publisher`。当前捕网-01
+    默认路径为`drone_25_1`。
   - 若目标是远端图传设备：确认地址端口与传输协议（`transport=tcp` 不支持时回 udp）。
 - **软编不产包 / stride 报错**：确认未在软编路径误送 NV12；`pic_out_` YUV420P 转换是否生效。
 - **文件测试段错误（avio_write）**：多半是文件输出未 `avio_open`，`pb` 空。

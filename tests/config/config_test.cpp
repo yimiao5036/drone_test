@@ -55,6 +55,8 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.ground_station.mavlink_version, 2);
     EXPECT_EQ(config.ground_station.attitude_send_interval.count(), 100);
     EXPECT_EQ(config.yolo.model_path, "/opt/drone/models/yolo26n-drone.rknn");
+    EXPECT_EQ(config.video_sender.encode.url,
+              "rtsp://127.0.0.1:8554/drone_25_1");
 }
 
 TEST(ConfigTest, RejectsControlBeforeFormalAssemblyIsEnabled) {
@@ -81,6 +83,7 @@ TEST(ConfigTest, AllowsMissingGroundStationSectionWhenDisabled) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_ground_station"] = false;
     value.erase("ground_station");
+    value["video"]["output_rtsp"] = "rtsp://127.0.0.1:8554/drone_out";
     const auto path = WriteTemporaryConfig(value, "drone_config_ground_disabled.json");
 
     EXPECT_NO_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"));
@@ -109,7 +112,19 @@ TEST(ConfigTest, AcceptsRocketGroundStationIdentity) {
     EXPECT_EQ(config.ground_station.aircraft_component_id, 26);
     EXPECT_EQ(config.ground_station.aircraft_type, "rocket");
     EXPECT_EQ(config.ground_station.callsign, "火箭-01");
+    EXPECT_EQ(config.video_sender.encode.url,
+              "rtsp://127.0.0.1:8554/drone_26_1");
     EXPECT_EQ(config.px4.onboard_component_id, 191);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, AllowsExplicitVideoOutputWithoutIdentityPlaceholder) {
+    json value = ReadSourceConfig();
+    value["video"]["output_rtsp"] = "rtsp://127.0.0.1:8554/debug";
+    const auto path = WriteTemporaryConfig(value, "drone_config_explicit_video.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.video_sender.encode.url, "rtsp://127.0.0.1:8554/debug");
     std::filesystem::remove(path);
 }
 

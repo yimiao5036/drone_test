@@ -99,7 +99,7 @@
     },
     "video": {
         "input_rtsp": "rtsp://192.168.144.25:8554/main.264",
-        "output_rtsp": "rtsp://127.0.0.1:8554/drone_out",
+        "output_rtsp": "rtsp://127.0.0.1:8554/drone_{aircraft_component_id}_{aircraft_system_id}",
         "width": 1280,
         "height": 720,
         "fps": 25,
