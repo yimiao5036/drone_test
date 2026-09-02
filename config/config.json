@@ -89,7 +89,7 @@
         }
     },
     "yolo": {
-        "model_path": "models/yolo26n-drone.rknn",
+        "model_path": "models/yolo26n-drone-best.rknn",
         "conf_threshold": 0.60,
         "nms_threshold": 0.45,
         "max_detection_frame_lag": 10,
