@@ -85,13 +85,13 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、GCS来源过滤与心跳超时、幂等停止和重启。硬件阶段在香橙派确认实际串口6设备节点后修改JSON并验证Vue3地面站解码。
+`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、GCS来源过滤与心跳超时、幂等停止和重启。硬件阶段已在香橙派/HM30/Web闭环确认：当前捕网-01下行来源为`system=1/component=25`，地面站来源为`255/190`，Web可显示飞机信息。
 
 ## 排查与修改要点
 
 - 串口打不开：检查`ground_station.serial.device`是否为实际Linux节点、用户组权限和设备树串口使能；不需要修改代码。
 - RK3588同一UART可有多组引脚复用。香橙派实测曾误启用`uart6-m2`而接线位于`uart6-m1`，表现为`/dev/ttyS6`可打开且`tx`计数增加，但排针无正确收发。必须保证设备树Overlay选择与实际TX/RX排针一致；当前实机使用`uart6-m1`。
-- 地面站无数据：先抓取`HEARTBEAT`，核对MAVLink 2、115200 8N1和地面站解析器是否接受完整system/component二元身份。HM30 UDP实机参数为地面端`192.168.144.12:19856`；Windows/Vue3必须发送`255/190` GCS心跳，飞机下行应看到捕网N号=`N/25`、火箭N号=`N/26`。当前生产配置捕网-01的期望来源为`1/25`；如果仍看到`1/191`，说明运行的不是本版本或配置未更新。
+- 地面站无数据：先抓取`HEARTBEAT`，核对MAVLink 2、115200 8N1和地面站解析器是否接受完整system/component二元身份。HM30 UDP实机参数为地面端`192.168.144.12:19856`；Windows/Vue3必须发送`255/190` GCS心跳，飞机下行应看到捕网N号=`N/25`、火箭N号=`N/26`。当前生产配置捕网-01已实测来源为`1/25`；如果仍看到`1/191`，说明运行的不是本版本或配置未更新。
 - 有心跳但无GPS/电池：检查PX4快照对应`*_valid`标志；本模块不会发送失效字段。
 - 模式显示：读取机载心跳中的`base_mode/custom_mode`，其中`custom_mode`保持PX4原始编码。
 - 修改发送频率只改JSON；不得在工作循环写死新周期。

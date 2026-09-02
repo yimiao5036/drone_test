@@ -101,6 +101,7 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
   捕网-01会变为`rtsp://127.0.0.1:8554/drone_25_1`，火箭-01会变为
   `rtsp://127.0.0.1:8554/drone_26_1`。香橙派程序推给本机 mediamtx，mediamtx 再对外
   发布供任意图传设备拉取（见 `deploy/mediamtx.yml`、`deploy/install_mediamtx.sh`）。
+  当前捕网-01已完成HM30/Web实机复验，Web端可通过`/drone_25_1`看到视频。
   换图传设备时不动香橙派代码/配置。
 
 ## 排查 / 修改要点
