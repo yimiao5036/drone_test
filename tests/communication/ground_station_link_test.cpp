@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -89,7 +90,11 @@ private:
     std::string slave_name_;
 };
 
-GroundStationLinkConfig MakeConfig(const std::string& device) {
+GroundStationLinkConfig MakeConfig(
+    const std::string& device, uint8_t aircraft_system_id = 1,
+    uint8_t aircraft_component_id = kNetCaptureAircraftComponentId,
+    std::string aircraft_type = "net_capture", uint8_t aircraft_number = 1,
+    std::string callsign = "捕网-01") {
     GroundStationLinkConfig config;
     config.serial.device = device;
     config.serial.baud_rate = 115200;
@@ -98,8 +103,13 @@ GroundStationLinkConfig MakeConfig(const std::string& device) {
     config.serial.parity = 'N';
     config.serial.read_timeout = 5ms;
     config.serial.write_timeout = 100ms;
-    config.onboard_system_id = 42;
-    config.onboard_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;
+    config.aircraft_system_id = aircraft_system_id;
+    config.aircraft_component_id = aircraft_component_id;
+    config.aircraft_type = std::move(aircraft_type);
+    config.aircraft_number = aircraft_number;
+    config.callsign = std::move(callsign);
+    config.ground_system_id = kGroundStationSystemId;
+    config.ground_component_id = kGroundStationComponentId;
     config.mavlink_version = 2;
     config.heartbeat_send_interval = 30ms;
     config.heartbeat_timeout = 80ms;
@@ -127,11 +137,14 @@ bool WaitUntil(const std::function<bool()>& predicate,
     return predicate();
 }
 
-std::vector<uint8_t> EncodeGcsHeartbeat() {
+std::vector<uint8_t> EncodeGcsHeartbeat(
+    uint8_t system_id = kGroundStationSystemId,
+    uint8_t component_id = kGroundStationComponentId) {
     MavlinkHandler encoder(MavlinkVersion::kV2);
-    return encoder.Encode([](mavlink_status_t* status, mavlink_message_t* message) {
+    return encoder.Encode([system_id, component_id](mavlink_status_t* status,
+                                                    mavlink_message_t* message) {
         return mavlink_msg_heartbeat_pack_status(
-            255, MAV_COMP_ID_MISSIONPLANNER, status, message, MAV_TYPE_GCS,
+            system_id, component_id, status, message, MAV_TYPE_GCS,
             MAV_AUTOPILOT_INVALID, 0, 0, MAV_STATE_ACTIVE);
     });
 }
@@ -146,6 +159,12 @@ TEST(GroundStationLinkTest, ConfigRejectsInvalidParameters) {
     config.mavlink_version = 2;
     config.flight_state_queue_capacity = 0;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.flight_state_queue_capacity = 2;
+    config.aircraft_component_id = 27;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.aircraft_component_id = kNetCaptureAircraftComponentId;
+    config.ground_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
 TEST(GroundStationLinkTest, RequiresFlightStateTopicBeforeStart) {
@@ -155,10 +174,12 @@ TEST(GroundStationLinkTest, RequiresFlightStateTopicBeforeStart) {
     EXPECT_GT(link.ErrorCount(), 0u);
 }
 
-TEST(GroundStationLinkTest, SendsMavlink2HeartbeatWithOnboardIdentity) {
+TEST(GroundStationLinkTest, SendsMavlink2HeartbeatWithAircraftIdentity) {
     PseudoTerminal terminal;
     common::Topic<common::FlightStateSnapshot> flight_state;
-    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    GroundStationLink link(MakeConfig(terminal.SlaveName(), 2,
+                                      kNetCaptureAircraftComponentId,
+                                      "net_capture", 2, "捕网-02"));
     link.SetFlightStateInput(flight_state);
     ASSERT_TRUE(link.Start());
 
@@ -168,12 +189,32 @@ TEST(GroundStationLinkTest, SendsMavlink2HeartbeatWithOnboardIdentity) {
             return candidate.msgid == MAVLINK_MSG_ID_HEARTBEAT;
         }, 300ms, &message));
     EXPECT_EQ(message.magic, MAVLINK_STX);
-    EXPECT_EQ(message.sysid, 42);
-    EXPECT_EQ(message.compid, MAV_COMP_ID_ONBOARD_COMPUTER);
+    EXPECT_EQ(message.sysid, 2);
+    EXPECT_EQ(message.compid, kNetCaptureAircraftComponentId);
     mavlink_heartbeat_t heartbeat{};
     mavlink_msg_heartbeat_decode(&message, &heartbeat);
     EXPECT_EQ(heartbeat.type, MAV_TYPE_ONBOARD_CONTROLLER);
     EXPECT_EQ(heartbeat.autopilot, MAV_AUTOPILOT_INVALID);
+
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, SendsRocketHeartbeatWithSameSystemIdAndDifferentComponent) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName(), 1,
+                                      kRocketAircraftComponentId,
+                                      "rocket", 1, "火箭-01"));
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    mavlink_message_t message{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& candidate) {
+            return candidate.msgid == MAVLINK_MSG_ID_HEARTBEAT;
+        }, 300ms, &message));
+    EXPECT_EQ(message.sysid, 1);
+    EXPECT_EQ(message.compid, kRocketAircraftComponentId);
 
     link.Stop();
 }
@@ -229,6 +270,8 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
         [](const mavlink_message_t& message) {
             return message.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT;
         }, 500ms, &global_message));
+    EXPECT_EQ(global_message.sysid, 1);
+    EXPECT_EQ(global_message.compid, kNetCaptureAircraftComponentId);
     mavlink_global_position_int_t global{};
     mavlink_msg_global_position_int_decode(&global_message, &global);
     EXPECT_EQ(global.lat, snapshot.latitude_1e7);
@@ -242,6 +285,8 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
         [](const mavlink_message_t& message) {
             return message.msgid == MAVLINK_MSG_ID_SYS_STATUS;
         }, 500ms, &battery_message));
+    EXPECT_EQ(battery_message.sysid, 1);
+    EXPECT_EQ(battery_message.compid, kNetCaptureAircraftComponentId);
     mavlink_sys_status_t system_status{};
     mavlink_msg_sys_status_decode(&battery_message, &system_status);
     EXPECT_EQ(system_status.voltage_battery, 15200);
@@ -252,12 +297,15 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
     link.Stop();
 }
 
-TEST(GroundStationLinkTest, TracksGcsHeartbeatAndTimeout) {
+TEST(GroundStationLinkTest, TracksOnlyConfiguredGcsHeartbeatAndTimeout) {
     PseudoTerminal terminal;
     common::Topic<common::FlightStateSnapshot> flight_state;
     GroundStationLink link(MakeConfig(terminal.SlaveName()));
     link.SetFlightStateInput(flight_state);
     ASSERT_TRUE(link.Start());
+
+    ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat(254, kGroundStationComponentId)));
+    EXPECT_FALSE(WaitUntil([&] { return link.IsConnected(); }, 120ms));
 
     ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat()));
     ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 200ms));

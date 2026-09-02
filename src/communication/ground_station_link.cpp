@@ -57,8 +57,32 @@ uint16_t HeadingCentidegrees(float yaw_rad) {
 
 void GroundStationLinkConfig::Validate() const {
     serial.Validate();
-    if (onboard_system_id == 0 || onboard_component_id == 0) {
-        throw std::invalid_argument("地面站链路机载电脑 system/component ID 不能为0");
+    if (aircraft_system_id == 0 || aircraft_system_id == 255) {
+        throw std::invalid_argument("地面站链路 aircraft_system_id 必须在1~254之间");
+    }
+    if (aircraft_number == 0 || aircraft_number == 255) {
+        throw std::invalid_argument("地面站链路 aircraft_number 必须在1~254之间");
+    }
+    if (aircraft_system_id != aircraft_number) {
+        throw std::invalid_argument("地面站链路 aircraft_system_id 必须等于 aircraft_number");
+    }
+    if (callsign.empty()) {
+        throw std::invalid_argument("地面站链路 callsign 不能为空");
+    }
+    if (aircraft_type == "net_capture") {
+        if (aircraft_component_id != kNetCaptureAircraftComponentId) {
+            throw std::invalid_argument("net_capture 必须使用 aircraft_component_id=25");
+        }
+    } else if (aircraft_type == "rocket") {
+        if (aircraft_component_id != kRocketAircraftComponentId) {
+            throw std::invalid_argument("rocket 必须使用 aircraft_component_id=26");
+        }
+    } else {
+        throw std::invalid_argument("未知地面站飞机类型，当前仅支持 net_capture 或 rocket");
+    }
+    if (ground_system_id != kGroundStationSystemId ||
+        ground_component_id != kGroundStationComponentId) {
+        throw std::invalid_argument("地面站来源身份当前必须固定为255/190");
     }
     if (mavlink_version != 1 && mavlink_version != 2) {
         throw std::invalid_argument("地面站链路 MAVLink 版本必须是1或2");
@@ -85,9 +109,11 @@ public:
           mavlink_(config_.mavlink_version == 1 ? MavlinkVersion::kV1
                                                 : MavlinkVersion::kV2) {
         config_.Validate();
-        SPDLOG_INFO("地面站通信部件创建: serial={}@{} onboard={}/{} mavlink={}",
+        SPDLOG_INFO("地面站通信部件创建: serial={}@{} aircraft={}/{} type={} callsign={} gcs={}/{} mavlink={}",
                     config_.serial.device, config_.serial.baud_rate,
-                    config_.onboard_system_id, config_.onboard_component_id,
+                    config_.aircraft_system_id, config_.aircraft_component_id,
+                    config_.aircraft_type, config_.callsign,
+                    config_.ground_system_id, config_.ground_component_id,
                     config_.mavlink_version);
     }
 
@@ -299,6 +325,10 @@ private:
         if (heartbeat.type != MAV_TYPE_GCS) {
             return;
         }
+        if (message.sysid != config_.ground_system_id ||
+            message.compid != config_.ground_component_id) {
+            return;
+        }
         last_gcs_heartbeat_ms_ = MonotonicMs();
         if (!connected_.exchange(true, std::memory_order_acq_rel)) {
             SPDLOG_INFO("地面站心跳建立: system={} component={}", message.sysid,
@@ -336,7 +366,7 @@ private:
         (void)EncodeAndWrite([this, &state](mavlink_status_t* status,
                                            mavlink_message_t* message) {
             return mavlink_msg_heartbeat_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID,
                 state.base_mode, state.custom_mode,
                 state.connected ? state.system_status : MAV_STATE_UNINIT);
@@ -350,7 +380,7 @@ private:
         return EncodeAndWrite([this, &state](mavlink_status_t* status,
                                              mavlink_message_t* message) {
             return mavlink_msg_attitude_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, static_cast<uint32_t>(MonotonicMs()), state.roll_rad,
                 state.pitch_rad, state.yaw_rad, 0.f, 0.f, 0.f);
         });
@@ -363,7 +393,7 @@ private:
         return EncodeAndWrite([this, &state](mavlink_status_t* status,
                                              mavlink_message_t* message) {
             return mavlink_msg_local_position_ned_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, static_cast<uint32_t>(MonotonicMs()), state.local_x_m,
                 state.local_y_m, state.local_z_m, state.vx_mps, state.vy_mps,
                 state.vz_mps);
@@ -392,7 +422,7 @@ private:
                                   mavlink_status_t* status,
                                   mavlink_message_t* message) {
             return mavlink_msg_global_position_int_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, static_cast<uint32_t>(MonotonicMs()), state.latitude_1e7,
                 state.longitude_1e7, state.altitude_mm, relative_altitude, vx, vy,
                 vz, heading);
@@ -410,7 +440,7 @@ private:
                                   mavlink_status_t* status,
                                   mavlink_message_t* message) {
             return mavlink_msg_gps_raw_int_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, 0, state.gps_fix_type, latitude, longitude, altitude,
                 UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT8_MAX, 0,
                 0, 0, 0, 0, 0);
@@ -426,7 +456,7 @@ private:
         return EncodeAndWrite([this, landed_state](mavlink_status_t* status,
                                                    mavlink_message_t* message) {
             return mavlink_msg_extended_sys_state_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, MAV_VTOL_STATE_UNDEFINED, landed_state);
         });
     }
@@ -448,7 +478,7 @@ private:
                                   mavlink_status_t* status,
                                   mavlink_message_t* message) {
             return mavlink_msg_sys_status_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, 0, 0, 0, 0, voltage, current, remaining, 0, 0, 0, 0, 0,
                 0, 0, 0, 0);
         });
@@ -476,7 +506,7 @@ private:
                                   mavlink_status_t* status,
                                   mavlink_message_t* message) {
             return mavlink_msg_battery_status_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, 0, MAV_BATTERY_FUNCTION_ALL, MAV_BATTERY_TYPE_UNKNOWN,
                 INT16_MAX, voltages.data(), current, -1, -1, remaining, 0,
                 MAV_BATTERY_CHARGE_STATE_UNDEFINED, voltages_ext.data(), 0, 0);
@@ -491,7 +521,7 @@ private:
         return EncodeAndWrite([this, &state, &quaternion](mavlink_status_t* status,
                                                           mavlink_message_t* message) {
             return mavlink_msg_home_position_pack_status(
-                config_.onboard_system_id, config_.onboard_component_id, status,
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, state.home_lat_1e7, state.home_lon_1e7,
                 state.home_altitude_mm, 0.f, 0.f, 0.f, quaternion.data(), 0.f, 0.f,
                 0.f, 0);

@@ -62,14 +62,18 @@ std::string ResolveAssetPath(const std::string& value,
 
 communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& root) {
-    const json& identity = root.at("mavlink");
     const json& ground = root.at("ground_station");
     const json& serial = ground.at("serial");
     const json& rates = ground.at("send_interval_ms");
 
     communication::GroundStationLinkConfig config;
-    config.onboard_system_id = ReadUint8(identity, "onboard_system_id");
-    config.onboard_component_id = ReadUint8(identity, "onboard_component_id");
+    config.aircraft_system_id = ReadUint8(ground, "aircraft_system_id");
+    config.aircraft_component_id = ReadUint8(ground, "aircraft_component_id");
+    config.aircraft_type = ground.at("aircraft_type").get<std::string>();
+    config.aircraft_number = ReadUint8(ground, "aircraft_number");
+    config.callsign = ground.at("callsign").get<std::string>();
+    config.ground_system_id = ReadUint8(ground, "ground_system_id");
+    config.ground_component_id = ReadUint8(ground, "ground_component_id");
     config.mavlink_version = ReadUint8(ground, "mavlink_version");
     config.heartbeat_send_interval =
         ReadPositiveMilliseconds(ground, "heartbeat_send_interval_ms");
@@ -115,7 +119,6 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
 }
 
 communication::Px4LinkConfig ParsePx4Config(const json& root) {
-    const json& identity = root.at("mavlink");
     const json& px4 = root.at("px4");
     const json& serial = px4.at("serial");
     const json& udp = px4.at("udp");
@@ -123,8 +126,8 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
     communication::Px4LinkConfig config;
     config.transport = px4.at("transport").get<std::string>();
     config.firmware_version = px4.at("firmware_version").get<std::string>();
-    config.onboard_system_id = ReadUint8(identity, "onboard_system_id");
-    config.onboard_component_id = ReadUint8(identity, "onboard_component_id");
+    config.onboard_system_id = ReadUint8(px4, "onboard_system_id");
+    config.onboard_component_id = ReadUint8(px4, "onboard_component_id");
     config.target_system_id = ReadUint8(px4, "target_system_id");
     config.target_component_id = ReadUint8(px4, "target_component_id");
     config.mavlink_version = ReadUint8(px4, "mavlink_version");

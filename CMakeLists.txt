@@ -169,16 +169,19 @@ add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
 
-# 编译后复制模型和配置到可执行文件旁，匹配 /proc/self/exe 路径解析约定。
-add_custom_command(TARGET drone_control POST_BUILD
+# 每次构建都同步模型和配置到可执行文件旁，匹配 /proc/self/exe 路径解析约定。
+# 不能只使用 drone_control 的 POST_BUILD：当只修改 JSON/模型而可执行文件无需重链时，
+# POST_BUILD 不会触发，容易继续读取 build/config 下的旧配置。
+add_custom_target(drone_runtime_assets
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/models"
             "${CMAKE_BINARY_DIR}/models"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/config"
             "${CMAKE_BINARY_DIR}/config"
-    COMMENT "复制 models/ 和 config/ 到构建目录"
+    COMMENT "同步 models/ 和 config/ 到构建目录"
     VERBATIM)
+add_dependencies(drone_control drone_runtime_assets)
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE

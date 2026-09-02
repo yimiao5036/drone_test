@@ -81,15 +81,13 @@ class SerialPort {
 
 ## 7. 当前配置占位
 
-`config/config.json` 已预留机载电脑 MAVLink 身份和 PX4 串口参数：
+`config/config.json` 已在 `px4` 配置节内声明机载电脑 MAVLink 身份和 PX4 串口参数：
 
 ```json
-"mavlink": {
-    "onboard_system_id": 1,
-    "onboard_component_id": 191
-},
 "px4": {
     "firmware_version": "1.17.0",
+    "onboard_system_id": 1,
+    "onboard_component_id": 191,
     "target_system_id": 1,
     "target_component_id": 1,
     "mavlink_version": 2,
@@ -118,5 +116,5 @@ class SerialPort {
 ```
 
 `onboard_component_id=191` 对应 MAVLink 标准 `MAV_COMP_ID_ONBOARD_COMPUTER`。PX4 串口已
-确认为 `/dev/ttyS1`；波特率仍可通过 JSON 修改。`px4_link_smoke` 已严格读取并注入该配置，
-根 `main.cpp` 的全量配置装配仍待后续；`SerialPort` 本身不依赖 JSON。
+确认为 `/dev/ttyS1`；波特率仍可通过 JSON 修改。`px4_link_smoke` 和正式 `drone_control`
+均严格读取并注入该配置；`SerialPort` 本身不依赖 JSON。

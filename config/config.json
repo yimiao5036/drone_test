@@ -9,12 +9,10 @@
         "enable_ground_station": true,
         "enable_control": false
     },
-    "mavlink": {
-        "onboard_system_id": 1,
-        "onboard_component_id": 191
-    },
     "px4": {
         "transport": "serial",
+        "onboard_system_id": 1,
+        "onboard_component_id": 191,
         "firmware_version": "1.17.0",
         "target_system_id": 1,
         "target_component_id": 1,
@@ -59,6 +57,13 @@
         "reconnect_interval_ms": 1000
     },
     "ground_station": {
+        "aircraft_system_id": 1,
+        "aircraft_component_id": 25,
+        "aircraft_type": "net_capture",
+        "aircraft_number": 1,
+        "callsign": "捕网-01",
+        "ground_system_id": 255,
+        "ground_component_id": 190,
         "mavlink_version": 2,
         "heartbeat_send_interval_ms": 1000,
         "heartbeat_timeout_ms": 3000,
@@ -89,7 +94,7 @@
         "nms_threshold": 0.45,
         "max_detection_frame_lag": 10,
         "class_names": [
-            "BALLOON"
+            "drone"
         ]
     },
     "video": {

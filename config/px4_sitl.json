@@ -3,12 +3,10 @@
         "dir": "logs/",
         "level": "info"
     },
-    "mavlink": {
-        "onboard_system_id": 1,
-        "onboard_component_id": 191
-    },
     "px4": {
         "transport": "udp",
+        "onboard_system_id": 1,
+        "onboard_component_id": 191,
         "firmware_version": "1.17.0",
         "target_system_id": 1,
         "target_component_id": 1,

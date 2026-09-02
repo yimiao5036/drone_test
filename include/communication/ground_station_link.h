@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include "common/topic.h"
 #include "common/types.h"
@@ -11,11 +12,21 @@
 
 namespace drone::communication {
 
+constexpr uint8_t kNetCaptureAircraftComponentId = 25;
+constexpr uint8_t kRocketAircraftComponentId = 26;
+constexpr uint8_t kGroundStationSystemId = 255;
+constexpr uint8_t kGroundStationComponentId = 190;
+
 /// 地面站数传链路配置。串口、身份和发送周期全部由 JSON 注入。
 struct GroundStationLinkConfig {
     SerialPortConfig serial;
-    uint8_t onboard_system_id = 1;
-    uint8_t onboard_component_id = 191;  ///< MAV_COMP_ID_ONBOARD_COMPUTER
+    uint8_t aircraft_system_id = 1;      ///< 地面站链路同类别飞机编号。
+    uint8_t aircraft_component_id = kNetCaptureAircraftComponentId;  ///< 飞机功能类别。
+    std::string aircraft_type = "net_capture";
+    uint8_t aircraft_number = 1;
+    std::string callsign = "捕网-01";
+    uint8_t ground_system_id = kGroundStationSystemId;
+    uint8_t ground_component_id = kGroundStationComponentId;
     uint8_t mavlink_version = 2;
     std::chrono::milliseconds heartbeat_send_interval{1000};
     std::chrono::milliseconds heartbeat_timeout{3000};
