@@ -53,8 +53,17 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.ground_station.serial.baud_rate, 115200);
     EXPECT_EQ(config.ground_station.serial.data_bits, 8);
     EXPECT_EQ(config.ground_station.mavlink_version, 2);
+    EXPECT_TRUE(config.ground_station.enable_time_sync);
+    EXPECT_EQ(config.ground_station.time_sync_acquire_interval.count(), 200);
+    EXPECT_EQ(config.ground_station.time_sync_steady_interval.count(), 1000);
+    EXPECT_EQ(config.ground_station.time_sync_minimum_samples, 5u);
+    EXPECT_EQ(config.ground_station.time_sync_window_capacity, 10u);
+    EXPECT_EQ(config.ground_station.time_sync_timeout.count(), 5000);
+    EXPECT_EQ(config.ground_station.time_sync_max_rtt.count(), 500);
+    EXPECT_EQ(config.ground_station.time_sync_max_offset_jump.count(), 100);
     EXPECT_EQ(config.ground_station.attitude_send_interval.count(), 100);
-    EXPECT_EQ(config.yolo.model_path, "/opt/drone/models/yolo26n-drone.rknn");
+    EXPECT_EQ(config.yolo.model_path,
+              "/opt/drone/models/yolo26n-drone-best.rknn");
     EXPECT_EQ(config.video_sender.encode.url,
               "rtsp://127.0.0.1:8554/drone_25_1");
 }
@@ -94,6 +103,28 @@ TEST(ConfigTest, RejectsInvalidGroundStationSendInterval) {
     json value = ReadSourceConfig();
     value["ground_station"]["send_interval_ms"]["gps"] = 0;
     const auto path = WriteTemporaryConfig(value, "drone_config_ground_rate_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidTimeSyncWindow) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["time_sync"]["minimum_samples"] = 11;
+    value["ground_station"]["time_sync"]["window_capacity"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_timesync_window.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsTimeSyncRttNotBelowTimeout) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["time_sync"]["max_rtt_ms"] = 5000;
+    value["ground_station"]["time_sync"]["sync_timeout_ms"] = 5000;
+    const auto path = WriteTemporaryConfig(value, "drone_config_timesync_timeout.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

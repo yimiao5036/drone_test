@@ -341,7 +341,7 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(px4_link_test)
 
-        # 地面站链路测试：PTY串口、MAVLink 2遥测编码、GCS心跳与重启
+        # 地面站链路测试：PTY串口、MAVLink 2遥测、GCS心跳、TIMESYNC与重启
         add_executable(ground_station_link_test
             tests/communication/ground_station_link_test.cpp)
         target_link_libraries(ground_station_link_test PRIVATE

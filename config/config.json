@@ -67,6 +67,16 @@
         "mavlink_version": 2,
         "heartbeat_send_interval_ms": 1000,
         "heartbeat_timeout_ms": 3000,
+        "time_sync": {
+            "enabled": true,
+            "acquire_interval_ms": 200,
+            "steady_interval_ms": 1000,
+            "minimum_samples": 5,
+            "window_capacity": 10,
+            "sync_timeout_ms": 5000,
+            "max_rtt_ms": 500,
+            "max_offset_jump_ms": 100
+        },
         "flight_state_queue_capacity": 2,
         "send_interval_ms": {
             "attitude": 100,

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -25,6 +26,30 @@ namespace {
 uint64_t MonotonicMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+int64_t MonotonicNs() {
+    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+uint64_t AbsoluteDifference(int64_t left, int64_t right) {
+    return left >= right ? static_cast<uint64_t>(left - right)
+                         : static_cast<uint64_t>(right - left);
+}
+
+const char* TimeSyncStateName(GroundStationTimeSyncState state) {
+    switch (state) {
+        case GroundStationTimeSyncState::kUnsynchronized:
+            return "UNSYNCHRONIZED";
+        case GroundStationTimeSyncState::kAcquiring:
+            return "ACQUIRING";
+        case GroundStationTimeSyncState::kSynchronized:
+            return "SYNCHRONIZED";
+        case GroundStationTimeSyncState::kDegraded:
+            return "DEGRADED";
+    }
+    return "UNKNOWN";
 }
 
 bool ShouldLogThrottled(uint64_t count) {
@@ -87,7 +112,15 @@ void GroundStationLinkConfig::Validate() const {
     if (mavlink_version != 1 && mavlink_version != 2) {
         throw std::invalid_argument("地面站链路 MAVLink 版本必须是1或2");
     }
+    if (enable_time_sync && mavlink_version != 2) {
+        throw std::invalid_argument(
+            "TIMESYNC多机目标字段需要地面站链路使用MAVLink 2");
+    }
     if (heartbeat_send_interval.count() <= 0 || heartbeat_timeout.count() <= 0 ||
+        time_sync_acquire_interval.count() <= 0 ||
+        time_sync_steady_interval.count() <= 0 ||
+        time_sync_timeout.count() <= 0 || time_sync_max_rtt.count() <= 0 ||
+        time_sync_max_offset_jump.count() <= 0 ||
         attitude_send_interval.count() <= 0 ||
         local_position_send_interval.count() <= 0 ||
         global_position_send_interval.count() <= 0 || gps_send_interval.count() <= 0 ||
@@ -99,6 +132,14 @@ void GroundStationLinkConfig::Validate() const {
     if (flight_state_queue_capacity == 0) {
         throw std::invalid_argument("地面站飞行状态订阅队列容量必须大于0");
     }
+    if (time_sync_minimum_samples == 0 || time_sync_window_capacity == 0 ||
+        time_sync_minimum_samples > time_sync_window_capacity) {
+        throw std::invalid_argument(
+            "TIMESYNC最小样本数必须大于0且不超过窗口容量");
+    }
+    if (time_sync_max_rtt >= time_sync_timeout) {
+        throw std::invalid_argument("TIMESYNC最大RTT必须小于同步超时");
+    }
 }
 
 class GroundStationLink::Impl final {
@@ -109,12 +150,12 @@ public:
           mavlink_(config_.mavlink_version == 1 ? MavlinkVersion::kV1
                                                 : MavlinkVersion::kV2) {
         config_.Validate();
-        SPDLOG_INFO("地面站通信部件创建: serial={}@{} aircraft={}/{} type={} callsign={} gcs={}/{} mavlink={}",
+        SPDLOG_INFO("地面站通信部件创建: serial={}@{} aircraft={}/{} type={} callsign={} gcs={}/{} mavlink={} timesync={}",
                     config_.serial.device, config_.serial.baud_rate,
                     config_.aircraft_system_id, config_.aircraft_component_id,
                     config_.aircraft_type, config_.callsign,
                     config_.ground_system_id, config_.ground_component_id,
-                    config_.mavlink_version);
+                    config_.mavlink_version, config_.enable_time_sync);
     }
 
     ~Impl() {
@@ -141,6 +182,7 @@ public:
                 common::Topic<common::FlightStateSnapshot>::OverflowPolicy::kDropOldest);
             latest_state_.reset();
             last_gcs_heartbeat_ms_ = 0;
+            ResetTimeSync(true);
             connected_.store(false, std::memory_order_release);
             running_.store(true, std::memory_order_release);
             worker_ = std::thread(&Impl::WorkerLoop, this);
@@ -169,11 +211,17 @@ public:
         latest_state_.reset();
         serial_.Close();
         connected_.store(false, std::memory_order_release);
+        ResetTimeSync(false);
         SPDLOG_INFO("地面站通信停止: serial={}", config_.serial.device);
     }
 
     bool IsRunning() const { return running_.load(std::memory_order_acquire); }
     bool IsConnected() const { return connected_.load(std::memory_order_acquire); }
+
+    GroundStationTimeSyncStatus GetTimeSyncStatus() const {
+        std::lock_guard<std::mutex> lock(time_sync_status_mutex_);
+        return time_sync_status_;
+    }
 
     common::Topic<common::GroundStationTarget>& TargetOutput() { return target_output_; }
 
@@ -218,6 +266,7 @@ private:
 
     struct Deadlines {
         std::chrono::steady_clock::time_point heartbeat;
+        std::chrono::steady_clock::time_point time_sync;
         std::chrono::steady_clock::time_point attitude;
         std::chrono::steady_clock::time_point local_position;
         std::chrono::steady_clock::time_point global_position;
@@ -230,7 +279,7 @@ private:
 
     void WorkerLoop() {
         const auto now = std::chrono::steady_clock::now();
-        Deadlines deadlines{now, now, now, now, now, now, now, now, now};
+        Deadlines deadlines{now, now, now, now, now, now, now, now, now, now};
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
@@ -246,11 +295,19 @@ private:
             }
 
             DrainFlightState();
-            CheckHeartbeatTimeout(MonotonicMs());
+            const uint64_t current_ms = MonotonicMs();
+            CheckHeartbeatTimeout(current_ms);
+            CheckTimeSyncTimeout(current_ms);
             const auto current = std::chrono::steady_clock::now();
             if (current >= deadlines.heartbeat) {
                 SendHeartbeat();
                 deadlines.heartbeat = current + config_.heartbeat_send_interval;
+            }
+            if (config_.enable_time_sync &&
+                connected_.load(std::memory_order_acquire) &&
+                current >= deadlines.time_sync) {
+                SendTimeSyncRequest();
+                deadlines.time_sync = current + TimeSyncSendInterval();
             }
             if (!latest_state_) {
                 continue;
@@ -317,15 +374,18 @@ private:
 
     void HandleMessage(const mavlink_message_t& message) {
         receive_count_.fetch_add(1, std::memory_order_relaxed);
-        if (message.msgid != MAVLINK_MSG_ID_HEARTBEAT) {
-            return;
+        if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+            HandleHeartbeat(message);
+        } else if (message.msgid == MAVLINK_MSG_ID_TIMESYNC) {
+            HandleTimeSync(message);
         }
+    }
+
+    void HandleHeartbeat(const mavlink_message_t& message) {
         mavlink_heartbeat_t heartbeat{};
         mavlink_msg_heartbeat_decode(&message, &heartbeat);
-        if (heartbeat.type != MAV_TYPE_GCS) {
-            return;
-        }
-        if (message.sysid != config_.ground_system_id ||
+        if (heartbeat.type != MAV_TYPE_GCS ||
+            message.sysid != config_.ground_system_id ||
             message.compid != config_.ground_component_id) {
             return;
         }
@@ -336,6 +396,36 @@ private:
         }
     }
 
+    void HandleTimeSync(const mavlink_message_t& message) {
+        if (!config_.enable_time_sync ||
+            message.sysid != config_.ground_system_id ||
+            message.compid != config_.ground_component_id) {
+            return;
+        }
+
+        mavlink_timesync_t time_sync{};
+        mavlink_msg_timesync_decode(&message, &time_sync);
+        if (time_sync.tc1 == 0) {
+            const bool broadcast = time_sync.target_system == 0 &&
+                                   time_sync.target_component == 0;
+            const bool addressed =
+                time_sync.target_system == config_.aircraft_system_id &&
+                time_sync.target_component == config_.aircraft_component_id;
+            if (broadcast || addressed) {
+                SendTimeSyncResponse(time_sync.ts1);
+            }
+            return;
+        }
+
+        if (time_sync.target_system != config_.aircraft_system_id ||
+            time_sync.target_component != config_.aircraft_component_id) {
+            ++time_sync_rejected_sample_count_;
+            PublishTimeSyncStatus(MonotonicNs());
+            return;
+        }
+        HandleTimeSyncResponse(time_sync);
+    }
+
     void CheckHeartbeatTimeout(uint64_t now_ms) {
         if (!connected_.load(std::memory_order_acquire) || last_gcs_heartbeat_ms_ == 0 ||
             now_ms < last_gcs_heartbeat_ms_) {
@@ -344,9 +434,263 @@ private:
         if (now_ms - last_gcs_heartbeat_ms_ >
             static_cast<uint64_t>(config_.heartbeat_timeout.count())) {
             connected_.store(false, std::memory_order_release);
+            ResetTimeSync(false);
             SPDLOG_WARN("地面站心跳超时: timeout_ms={}",
                         config_.heartbeat_timeout.count());
         }
+    }
+
+    std::chrono::milliseconds TimeSyncSendInterval() const {
+        return time_sync_state_ == GroundStationTimeSyncState::kSynchronized
+                   ? config_.time_sync_steady_interval
+                   : config_.time_sync_acquire_interval;
+    }
+
+    void PrunePendingTimeSyncRequests(int64_t now_ns) {
+        const int64_t max_rtt_ns =
+            static_cast<int64_t>(config_.time_sync_max_rtt.count()) * 1000000LL;
+        while (!pending_time_sync_requests_.empty()) {
+            const int64_t sent_ns = pending_time_sync_requests_.front();
+            if (now_ns >= sent_ns && now_ns - sent_ns > max_rtt_ns) {
+                pending_time_sync_requests_.pop_front();
+                ++time_sync_request_timeout_count_;
+            } else {
+                break;
+            }
+        }
+    }
+
+    void SendTimeSyncRequest() {
+        const int64_t request_time_ns = MonotonicNs();
+        PrunePendingTimeSyncRequests(request_time_ns);
+        const bool sent = EncodeAndWrite(
+            [this, request_time_ns](mavlink_status_t* status,
+                                    mavlink_message_t* message) {
+                return mavlink_msg_timesync_pack_status(
+                    config_.aircraft_system_id, config_.aircraft_component_id,
+                    status, message, 0, request_time_ns,
+                    config_.ground_system_id, config_.ground_component_id);
+            });
+        if (!sent) {
+            return;
+        }
+
+        pending_time_sync_requests_.push_back(request_time_ns);
+        const std::size_t pending_capacity =
+            std::max<std::size_t>(2, config_.time_sync_window_capacity * 2);
+        if (pending_time_sync_requests_.size() > pending_capacity) {
+            pending_time_sync_requests_.pop_front();
+            ++time_sync_request_timeout_count_;
+        }
+        ++time_sync_request_count_;
+        if (time_sync_state_ == GroundStationTimeSyncState::kUnsynchronized) {
+            time_sync_state_ = GroundStationTimeSyncState::kAcquiring;
+        }
+        PublishTimeSyncStatus(request_time_ns);
+    }
+
+    void SendTimeSyncResponse(int64_t requester_time_ns) {
+        const int64_t response_time_ns = MonotonicNs();
+        (void)EncodeAndWrite(
+            [this, requester_time_ns, response_time_ns](mavlink_status_t* status,
+                                                        mavlink_message_t* message) {
+                return mavlink_msg_timesync_pack_status(
+                    config_.aircraft_system_id, config_.aircraft_component_id,
+                    status, message, response_time_ns, requester_time_ns,
+                    config_.ground_system_id, config_.ground_component_id);
+            });
+    }
+
+    void HandleTimeSyncResponse(const mavlink_timesync_t& response) {
+        const int64_t receive_time_ns = MonotonicNs();
+        PrunePendingTimeSyncRequests(receive_time_ns);
+        const auto request = std::find(pending_time_sync_requests_.begin(),
+                                       pending_time_sync_requests_.end(),
+                                       response.ts1);
+        if (request == pending_time_sync_requests_.end()) {
+            ++time_sync_rejected_sample_count_;
+            PublishTimeSyncStatus(receive_time_ns);
+            return;
+        }
+
+        const int64_t request_time_ns = *request;
+        pending_time_sync_requests_.erase(request);
+        if (receive_time_ns <= request_time_ns) {
+            ++time_sync_rejected_sample_count_;
+            PublishTimeSyncStatus(receive_time_ns);
+            return;
+        }
+
+        const uint64_t round_trip_time_ns =
+            static_cast<uint64_t>(receive_time_ns - request_time_ns);
+        const uint64_t max_rtt_ns =
+            static_cast<uint64_t>(config_.time_sync_max_rtt.count()) * 1000000ULL;
+        if (round_trip_time_ns > max_rtt_ns) {
+            ++time_sync_rejected_sample_count_;
+            PublishTimeSyncStatus(receive_time_ns);
+            return;
+        }
+
+        const int64_t midpoint_ns =
+            request_time_ns + (receive_time_ns - request_time_ns) / 2;
+        const int64_t offset_ns = response.tc1 - midpoint_ns;
+        ++time_sync_response_count_;
+        ProcessTimeSyncSample({offset_ns, round_trip_time_ns, receive_time_ns});
+    }
+
+    struct TimeSyncSample {
+        int64_t offset_ns = 0;
+        uint64_t round_trip_time_ns = 0;
+        int64_t receive_time_ns = 0;
+    };
+
+    void ProcessTimeSyncSample(const TimeSyncSample& sample) {
+        const uint64_t max_jump_ns =
+            static_cast<uint64_t>(config_.time_sync_max_offset_jump.count()) *
+            1000000ULL;
+        if (time_sync_state_ == GroundStationTimeSyncState::kSynchronized &&
+            AbsoluteDifference(sample.offset_ns, time_sync_offset_ns_) > max_jump_ns) {
+            const auto previous_state = time_sync_state_;
+            ++time_sync_rejected_sample_count_;
+            time_sync_samples_.clear();
+            time_sync_state_ = GroundStationTimeSyncState::kDegraded;
+            SPDLOG_WARN("地面站时间同步偏移突变: state={}->{} max_jump_ms={}",
+                        TimeSyncStateName(previous_state),
+                        TimeSyncStateName(time_sync_state_),
+                        config_.time_sync_max_offset_jump.count());
+        }
+
+        time_sync_samples_.push_back(sample);
+        if (time_sync_samples_.size() > config_.time_sync_window_capacity) {
+            time_sync_samples_.erase(time_sync_samples_.begin());
+        }
+        last_time_sync_sample_ns_ = sample.receive_time_ns;
+        RecomputeTimeSyncEstimate(sample.receive_time_ns);
+    }
+
+    void RecomputeTimeSyncEstimate(int64_t now_ns) {
+        std::vector<TimeSyncSample> selected = time_sync_samples_;
+        std::sort(selected.begin(), selected.end(),
+                  [](const TimeSyncSample& left, const TimeSyncSample& right) {
+                      return left.round_trip_time_ns < right.round_trip_time_ns;
+                  });
+        if (selected.size() > config_.time_sync_minimum_samples) {
+            selected.resize(config_.time_sync_minimum_samples);
+        }
+        if (selected.empty()) {
+            PublishTimeSyncStatus(now_ns);
+            return;
+        }
+
+        std::vector<int64_t> offsets;
+        std::vector<uint64_t> round_trip_times;
+        offsets.reserve(selected.size());
+        round_trip_times.reserve(selected.size());
+        for (const auto& sample : selected) {
+            offsets.push_back(sample.offset_ns);
+            round_trip_times.push_back(sample.round_trip_time_ns);
+        }
+        std::sort(offsets.begin(), offsets.end());
+        std::sort(round_trip_times.begin(), round_trip_times.end());
+        const std::size_t middle = offsets.size() / 2;
+        const int64_t estimated_offset_ns =
+            offsets.size() % 2 == 0
+                ? offsets[middle - 1] +
+                      (offsets[middle] - offsets[middle - 1]) / 2
+                : offsets[middle];
+        const uint64_t estimated_rtt_ns =
+            round_trip_times.size() % 2 == 0
+                ? round_trip_times[middle - 1] +
+                      (round_trip_times[middle] - round_trip_times[middle - 1]) / 2
+                : round_trip_times[middle];
+        uint64_t jitter_ns = 0;
+        for (const int64_t offset : offsets) {
+            jitter_ns = std::max(jitter_ns,
+                                 AbsoluteDifference(offset, estimated_offset_ns));
+        }
+
+        time_sync_offset_ns_ = estimated_offset_ns;
+        time_sync_round_trip_time_ns_ = estimated_rtt_ns;
+        time_sync_jitter_ns_ = jitter_ns;
+        const uint64_t max_jitter_ns =
+            static_cast<uint64_t>(config_.time_sync_max_offset_jump.count()) *
+            1000000ULL;
+        if (time_sync_samples_.size() >= config_.time_sync_minimum_samples &&
+            jitter_ns <= max_jitter_ns) {
+            const auto previous_state = time_sync_state_;
+            time_sync_state_ = GroundStationTimeSyncState::kSynchronized;
+            if (previous_state != time_sync_state_) {
+                SPDLOG_INFO(
+                    "地面站时间同步建立: offset_ms={:.3f} rtt_ms={:.3f} jitter_ms={:.3f} samples={}",
+                    static_cast<double>(time_sync_offset_ns_) / 1000000.0,
+                    static_cast<double>(time_sync_round_trip_time_ns_) / 1000000.0,
+                    static_cast<double>(time_sync_jitter_ns_) / 1000000.0,
+                    time_sync_samples_.size());
+            }
+        }
+        PublishTimeSyncStatus(now_ns);
+    }
+
+    void CheckTimeSyncTimeout(uint64_t now_ms) {
+        const int64_t now_ns = static_cast<int64_t>(now_ms) * 1000000LL;
+        PrunePendingTimeSyncRequests(now_ns);
+        if (last_time_sync_sample_ns_ == 0 || now_ns < last_time_sync_sample_ns_) {
+            PublishTimeSyncStatus(now_ns);
+            return;
+        }
+        const uint64_t sample_age_ms =
+            static_cast<uint64_t>(now_ns - last_time_sync_sample_ns_) / 1000000ULL;
+        if (sample_age_ms <=
+            static_cast<uint64_t>(config_.time_sync_timeout.count())) {
+            PublishTimeSyncStatus(now_ns);
+            return;
+        }
+
+        const auto previous_state = time_sync_state_;
+        ResetTimeSync(false);
+        if (previous_state == GroundStationTimeSyncState::kSynchronized ||
+            previous_state == GroundStationTimeSyncState::kDegraded) {
+            SPDLOG_WARN("地面站时间同步超时: previous={} timeout_ms={}",
+                        TimeSyncStateName(previous_state),
+                        config_.time_sync_timeout.count());
+        }
+    }
+
+    void ResetTimeSync(bool reset_counters) {
+        time_sync_state_ = GroundStationTimeSyncState::kUnsynchronized;
+        time_sync_samples_.clear();
+        pending_time_sync_requests_.clear();
+        time_sync_offset_ns_ = 0;
+        time_sync_round_trip_time_ns_ = 0;
+        time_sync_jitter_ns_ = 0;
+        last_time_sync_sample_ns_ = 0;
+        if (reset_counters) {
+            time_sync_request_count_ = 0;
+            time_sync_response_count_ = 0;
+            time_sync_rejected_sample_count_ = 0;
+            time_sync_request_timeout_count_ = 0;
+        }
+        PublishTimeSyncStatus(MonotonicNs());
+    }
+
+    void PublishTimeSyncStatus(int64_t now_ns) {
+        GroundStationTimeSyncStatus status;
+        status.state = time_sync_state_;
+        status.offset_ns = time_sync_offset_ns_;
+        status.round_trip_time_ns = time_sync_round_trip_time_ns_;
+        status.jitter_ns = time_sync_jitter_ns_;
+        if (last_time_sync_sample_ns_ != 0 && now_ns >= last_time_sync_sample_ns_) {
+            status.sample_age_ms =
+                static_cast<uint64_t>(now_ns - last_time_sync_sample_ns_) /
+                1000000ULL;
+        }
+        status.valid_sample_count = time_sync_samples_.size();
+        status.request_count = time_sync_request_count_;
+        status.response_count = time_sync_response_count_;
+        status.rejected_sample_count = time_sync_rejected_sample_count_;
+        status.request_timeout_count = time_sync_request_timeout_count_;
+        std::lock_guard<std::mutex> lock(time_sync_status_mutex_);
+        time_sync_status_ = status;
     }
 
     template <typename Packer>
@@ -551,6 +895,22 @@ private:
     common::Topic<common::GroundStationTarget> target_output_;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
+
+    GroundStationTimeSyncState time_sync_state_ =
+        GroundStationTimeSyncState::kUnsynchronized;
+    std::vector<TimeSyncSample> time_sync_samples_;
+    std::deque<int64_t> pending_time_sync_requests_;
+    int64_t time_sync_offset_ns_ = 0;
+    uint64_t time_sync_round_trip_time_ns_ = 0;
+    uint64_t time_sync_jitter_ns_ = 0;
+    int64_t last_time_sync_sample_ns_ = 0;
+    uint64_t time_sync_request_count_ = 0;
+    uint64_t time_sync_response_count_ = 0;
+    uint64_t time_sync_rejected_sample_count_ = 0;
+    uint64_t time_sync_request_timeout_count_ = 0;
+    mutable std::mutex time_sync_status_mutex_;
+    GroundStationTimeSyncStatus time_sync_status_;
+
     std::atomic<uint64_t> send_count_{0};
     std::atomic<uint64_t> receive_count_{0};
     std::atomic<uint64_t> error_count_{0};
@@ -563,6 +923,9 @@ bool GroundStationLink::Start() { return impl_->Start(); }
 void GroundStationLink::Stop() { impl_->Stop(); }
 bool GroundStationLink::IsRunning() const { return impl_->IsRunning(); }
 bool GroundStationLink::IsConnected() const { return impl_->IsConnected(); }
+GroundStationTimeSyncStatus GroundStationLink::GetTimeSyncStatus() const {
+    return impl_->GetTimeSyncStatus();
+}
 common::Topic<common::GroundStationTarget>& GroundStationLink::TargetOutput() {
     return impl_->TargetOutput();
 }
@@ -601,6 +964,9 @@ void GroundStationLinkStub::Stop() {
 }
 bool GroundStationLinkStub::IsRunning() const { return running_; }
 bool GroundStationLinkStub::IsConnected() const { return false; }
+GroundStationTimeSyncStatus GroundStationLinkStub::GetTimeSyncStatus() const {
+    return {};
+}
 common::Topic<common::GroundStationTarget>& GroundStationLinkStub::TargetOutput() {
     return target_output_;
 }

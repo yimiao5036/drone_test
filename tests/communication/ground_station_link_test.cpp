@@ -113,6 +113,14 @@ GroundStationLinkConfig MakeConfig(
     config.mavlink_version = 2;
     config.heartbeat_send_interval = 30ms;
     config.heartbeat_timeout = 80ms;
+    config.enable_time_sync = true;
+    config.time_sync_acquire_interval = 10ms;
+    config.time_sync_steady_interval = 20ms;
+    config.time_sync_timeout = 80ms;
+    config.time_sync_max_rtt = 40ms;
+    config.time_sync_max_offset_jump = 20ms;
+    config.time_sync_minimum_samples = 3;
+    config.time_sync_window_capacity = 5;
     config.attitude_send_interval = 20ms;
     config.local_position_send_interval = 20ms;
     config.global_position_send_interval = 20ms;
@@ -149,6 +157,24 @@ std::vector<uint8_t> EncodeGcsHeartbeat(
     });
 }
 
+std::vector<uint8_t> EncodeTimeSyncResponse(
+    const mavlink_message_t& request, int64_t offset_ns,
+    uint8_t source_system = kGroundStationSystemId,
+    uint8_t source_component = kGroundStationComponentId,
+    uint8_t target_system = 1,
+    uint8_t target_component = kNetCaptureAircraftComponentId) {
+    mavlink_timesync_t request_payload{};
+    mavlink_msg_timesync_decode(&request, &request_payload);
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    return encoder.Encode([=](mavlink_status_t* status,
+                              mavlink_message_t* message) {
+        return mavlink_msg_timesync_pack_status(
+            source_system, source_component, status, message,
+            request_payload.ts1 + offset_ns, request_payload.ts1,
+            target_system, target_component);
+    });
+}
+
 TEST(GroundStationLinkTest, ConfigRejectsInvalidParameters) {
     GroundStationLinkConfig config;
     config.serial.device = "/dev/ttyS6";
@@ -156,6 +182,11 @@ TEST(GroundStationLinkTest, ConfigRejectsInvalidParameters) {
 
     config.mavlink_version = 3;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.mavlink_version = 1;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.enable_time_sync = false;
+    EXPECT_NO_THROW(config.Validate());
+    config.enable_time_sync = true;
     config.mavlink_version = 2;
     config.flight_state_queue_capacity = 0;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
@@ -164,6 +195,13 @@ TEST(GroundStationLinkTest, ConfigRejectsInvalidParameters) {
     EXPECT_THROW(config.Validate(), std::invalid_argument);
     config.aircraft_component_id = kNetCaptureAircraftComponentId;
     config.ground_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.ground_component_id = kGroundStationComponentId;
+    config.time_sync_minimum_samples = 6;
+    config.time_sync_window_capacity = 5;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.time_sync_minimum_samples = 3;
+    config.time_sync_max_rtt = config.time_sync_timeout;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
@@ -312,6 +350,164 @@ TEST(GroundStationLinkTest, TracksOnlyConfiguredGcsHeartbeatAndTimeout) {
     EXPECT_TRUE(WaitUntil([&] { return !link.IsConnected(); }, 300ms));
     EXPECT_GT(link.ReceiveCount(), 0u);
 
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, EstablishesTimeSyncAndExpiresWithoutResponses) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    GroundStationLink link(config);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat()));
+    ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 200ms));
+
+    constexpr int64_t kGroundClockOffsetNs = 40LL * 1000LL * 1000LL;
+    for (int index = 0; index < 3; ++index) {
+        mavlink_message_t request{};
+        ASSERT_TRUE(terminal.WaitFor(
+            [](const mavlink_message_t& message) {
+                return message.msgid == MAVLINK_MSG_ID_TIMESYNC;
+            }, 300ms, &request));
+        mavlink_timesync_t payload{};
+        mavlink_msg_timesync_decode(&request, &payload);
+        EXPECT_EQ(request.sysid, 1);
+        EXPECT_EQ(request.compid, kNetCaptureAircraftComponentId);
+        EXPECT_EQ(payload.tc1, 0);
+        EXPECT_EQ(payload.target_system, kGroundStationSystemId);
+        EXPECT_EQ(payload.target_component, kGroundStationComponentId);
+        ASSERT_TRUE(terminal.Write(
+            EncodeTimeSyncResponse(request, kGroundClockOffsetNs)));
+    }
+
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            return link.GetTimeSyncStatus().state ==
+                   GroundStationTimeSyncState::kSynchronized;
+        }, 300ms));
+    const auto synchronized = link.GetTimeSyncStatus();
+    EXPECT_EQ(synchronized.valid_sample_count, 3u);
+    EXPECT_EQ(synchronized.response_count, 3u);
+    EXPECT_GE(synchronized.request_count, 3u);
+    EXPECT_LT(synchronized.round_trip_time_ns, 40ULL * 1000ULL * 1000ULL);
+    EXPECT_NEAR(static_cast<double>(synchronized.offset_ns) / 1000000.0,
+                40.0, 10.0);
+
+    EXPECT_TRUE(WaitUntil(
+        [&] {
+            return link.GetTimeSyncStatus().state !=
+                   GroundStationTimeSyncState::kSynchronized;
+        }, 300ms));
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, OffsetJumpImmediatelyDegradesTimeSync) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    GroundStationLink link(config);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+    ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat()));
+    ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 200ms));
+
+    constexpr int64_t kInitialOffsetNs = 30LL * 1000LL * 1000LL;
+    for (int index = 0; index < 3; ++index) {
+        mavlink_message_t request{};
+        ASSERT_TRUE(terminal.WaitFor(
+            [](const mavlink_message_t& message) {
+                return message.msgid == MAVLINK_MSG_ID_TIMESYNC;
+            }, 300ms, &request));
+        ASSERT_TRUE(terminal.Write(
+            EncodeTimeSyncResponse(request, kInitialOffsetNs)));
+    }
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            return link.GetTimeSyncStatus().state ==
+                   GroundStationTimeSyncState::kSynchronized;
+        }, 300ms));
+
+    mavlink_message_t jump_request{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            return message.msgid == MAVLINK_MSG_ID_TIMESYNC;
+        }, 300ms, &jump_request));
+    constexpr int64_t kJumpedOffsetNs = 200LL * 1000LL * 1000LL;
+    ASSERT_TRUE(terminal.Write(
+        EncodeTimeSyncResponse(jump_request, kJumpedOffsetNs)));
+
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            return link.GetTimeSyncStatus().state ==
+                   GroundStationTimeSyncState::kDegraded;
+        }, 200ms));
+    const auto degraded = link.GetTimeSyncStatus();
+    EXPECT_EQ(degraded.valid_sample_count, 1u);
+    EXPECT_GT(degraded.rejected_sample_count, 0u);
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, IgnoresTimeSyncResponseWithWrongTarget) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+    ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat()));
+    ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 200ms));
+
+    mavlink_message_t request{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            return message.msgid == MAVLINK_MSG_ID_TIMESYNC;
+        }, 300ms, &request));
+    ASSERT_TRUE(terminal.Write(EncodeTimeSyncResponse(
+        request, 0, kGroundStationSystemId, kGroundStationComponentId,
+        2, kNetCaptureAircraftComponentId)));
+    std::this_thread::sleep_for(30ms);
+
+    const auto status = link.GetTimeSyncStatus();
+    EXPECT_EQ(status.response_count, 0u);
+    EXPECT_GT(status.rejected_sample_count, 0u);
+    EXPECT_NE(status.state, GroundStationTimeSyncState::kSynchronized);
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, RespondsToAddressedGroundStationTimeSyncRequest) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    constexpr int64_t kGroundRequestTimeNs = 123456789LL;
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    const auto request = encoder.Encode([](mavlink_status_t* status,
+                                           mavlink_message_t* message) {
+        return mavlink_msg_timesync_pack_status(
+            kGroundStationSystemId, kGroundStationComponentId, status, message,
+            0, kGroundRequestTimeNs, 1, kNetCaptureAircraftComponentId);
+    });
+    ASSERT_TRUE(terminal.Write(request));
+
+    mavlink_message_t response{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            if (message.msgid != MAVLINK_MSG_ID_TIMESYNC) {
+                return false;
+            }
+            mavlink_timesync_t payload{};
+            mavlink_msg_timesync_decode(&message, &payload);
+            return payload.tc1 != 0 && payload.ts1 == kGroundRequestTimeNs;
+        }, 300ms, &response));
+    mavlink_timesync_t payload{};
+    mavlink_msg_timesync_decode(&response, &payload);
+    EXPECT_EQ(payload.target_system, kGroundStationSystemId);
+    EXPECT_EQ(payload.target_component, kGroundStationComponentId);
     link.Stop();
 }
 

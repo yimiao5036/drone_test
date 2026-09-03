@@ -17,6 +17,29 @@ constexpr uint8_t kRocketAircraftComponentId = 26;
 constexpr uint8_t kGroundStationSystemId = 255;
 constexpr uint8_t kGroundStationComponentId = 190;
 
+/// 地面站与飞机单调时钟的同步状态。
+enum class GroundStationTimeSyncState : uint8_t {
+    kUnsynchronized = 0,
+    kAcquiring,
+    kSynchronized,
+    kDegraded,
+};
+
+/// TIMESYNC运行状态快照。offset语义为“地面站时钟 - 飞机时钟”。
+struct GroundStationTimeSyncStatus {
+    GroundStationTimeSyncState state =
+        GroundStationTimeSyncState::kUnsynchronized;
+    int64_t offset_ns = 0;
+    uint64_t round_trip_time_ns = 0;
+    uint64_t jitter_ns = 0;
+    uint64_t sample_age_ms = 0;
+    std::size_t valid_sample_count = 0;
+    uint64_t request_count = 0;
+    uint64_t response_count = 0;
+    uint64_t rejected_sample_count = 0;
+    uint64_t request_timeout_count = 0;
+};
+
 /// 地面站数传链路配置。串口、身份和发送周期全部由 JSON 注入。
 struct GroundStationLinkConfig {
     SerialPortConfig serial;
@@ -30,6 +53,14 @@ struct GroundStationLinkConfig {
     uint8_t mavlink_version = 2;
     std::chrono::milliseconds heartbeat_send_interval{1000};
     std::chrono::milliseconds heartbeat_timeout{3000};
+    bool enable_time_sync = true;
+    std::chrono::milliseconds time_sync_acquire_interval{200};
+    std::chrono::milliseconds time_sync_steady_interval{1000};
+    std::chrono::milliseconds time_sync_timeout{5000};
+    std::chrono::milliseconds time_sync_max_rtt{500};
+    std::chrono::milliseconds time_sync_max_offset_jump{100};
+    std::size_t time_sync_minimum_samples = 5;
+    std::size_t time_sync_window_capacity = 10;
     std::chrono::milliseconds attitude_send_interval{100};
     std::chrono::milliseconds local_position_send_interval{200};
     std::chrono::milliseconds global_position_send_interval{200};
@@ -53,6 +84,8 @@ public:
     virtual bool IsRunning() const = 0;
     /// 最近是否收到 MAV_TYPE_GCS 心跳。
     virtual bool IsConnected() const = 0;
+    /// 获取TIMESYNC状态快照；当前只观测时间，不接收目标位置。
+    virtual GroundStationTimeSyncStatus GetTimeSyncStatus() const = 0;
 
     /// 目标协议当前预留；协议确定前真实实现不会发布伪造目标。
     virtual common::Topic<common::GroundStationTarget>& TargetOutput() = 0;
@@ -84,6 +117,7 @@ public:
     void Stop() override;
     bool IsRunning() const override;
     bool IsConnected() const override;
+    GroundStationTimeSyncStatus GetTimeSyncStatus() const override;
 
     common::Topic<common::GroundStationTarget>& TargetOutput() override;
     void SetFlightStateInput(
@@ -114,6 +148,7 @@ public:
     void Stop() override;
     bool IsRunning() const override;
     bool IsConnected() const override;
+    GroundStationTimeSyncStatus GetTimeSyncStatus() const override;
 
     common::Topic<common::GroundStationTarget>& TargetOutput() override;
     void SetFlightStateInput(

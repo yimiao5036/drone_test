@@ -102,6 +102,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& ground = root.at("ground_station");
     const json& serial = ground.at("serial");
     const json& rates = ground.at("send_interval_ms");
+    const json& time_sync = ground.at("time_sync");
 
     communication::GroundStationLinkConfig config;
     config.aircraft_system_id = ReadUint8(ground, "aircraft_system_id");
@@ -116,6 +117,28 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         ReadPositiveMilliseconds(ground, "heartbeat_send_interval_ms");
     config.heartbeat_timeout =
         ReadPositiveMilliseconds(ground, "heartbeat_timeout_ms");
+    config.enable_time_sync = time_sync.at("enabled").get<bool>();
+    config.time_sync_acquire_interval =
+        ReadPositiveMilliseconds(time_sync, "acquire_interval_ms");
+    config.time_sync_steady_interval =
+        ReadPositiveMilliseconds(time_sync, "steady_interval_ms");
+    config.time_sync_timeout =
+        ReadPositiveMilliseconds(time_sync, "sync_timeout_ms");
+    config.time_sync_max_rtt =
+        ReadPositiveMilliseconds(time_sync, "max_rtt_ms");
+    config.time_sync_max_offset_jump =
+        ReadPositiveMilliseconds(time_sync, "max_offset_jump_ms");
+    const int64_t minimum_samples =
+        time_sync.at("minimum_samples").get<int64_t>();
+    const int64_t window_capacity =
+        time_sync.at("window_capacity").get<int64_t>();
+    if (minimum_samples <= 0 || window_capacity <= 0) {
+        throw std::invalid_argument("TIMESYNC样本数和窗口容量必须为正数");
+    }
+    config.time_sync_minimum_samples =
+        static_cast<std::size_t>(minimum_samples);
+    config.time_sync_window_capacity =
+        static_cast<std::size_t>(window_capacity);
     config.attitude_send_interval = ReadPositiveMilliseconds(rates, "attitude");
     config.local_position_send_interval =
         ReadPositiveMilliseconds(rates, "local_position");
