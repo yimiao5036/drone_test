@@ -6,9 +6,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -78,6 +80,19 @@ uint16_t HeadingCentidegrees(float yaw_rad) {
     return static_cast<uint16_t>(std::lround(degrees * 100.0)) % 36000U;
 }
 
+template <typename T>
+T ReadLe(const uint8_t* payload, std::size_t offset) {
+    T value{};
+    std::memcpy(&value, payload + offset, sizeof(T));
+    return value;
+}
+
+template <typename T>
+void WriteLe(std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN>& payload,
+             std::size_t offset, T value) {
+    std::memcpy(payload.data() + offset, &value, sizeof(T));
+}
+
 }  // namespace
 
 void GroundStationLinkConfig::Validate() const {
@@ -132,6 +147,19 @@ void GroundStationLinkConfig::Validate() const {
     if (flight_state_queue_capacity == 0) {
         throw std::invalid_argument("地面站飞行状态订阅队列容量必须大于0");
     }
+    if (target_minimum_valid_for.count() <= 0 ||
+        target_maximum_valid_for.count() <= 0 ||
+        target_minimum_remaining_valid.count() <= 0 ||
+        target_maximum_transport_delay.count() <= 0 ||
+        target_future_tolerance.count() <= 0) {
+        throw std::invalid_argument("地面站目标输入有效期和延迟门限必须为正数");
+    }
+    if (target_minimum_valid_for > target_maximum_valid_for) {
+        throw std::invalid_argument("地面站目标最小有效期不得大于最大有效期");
+    }
+    if (target_minimum_remaining_valid > target_maximum_valid_for) {
+        throw std::invalid_argument("地面站目标最小剩余有效期不得大于最大有效期");
+    }
     if (time_sync_minimum_samples == 0 || time_sync_window_capacity == 0 ||
         time_sync_minimum_samples > time_sync_window_capacity) {
         throw std::invalid_argument(
@@ -181,6 +209,8 @@ public:
                 config_.flight_state_queue_capacity,
                 common::Topic<common::FlightStateSnapshot>::OverflowPolicy::kDropOldest);
             latest_state_.reset();
+            last_ground_station_boot_id_ = 0;
+            last_target_update_seq_ = 0;
             last_gcs_heartbeat_ms_ = 0;
             ResetTimeSync(true);
             connected_.store(false, std::memory_order_release);
@@ -378,6 +408,8 @@ private:
             HandleHeartbeat(message);
         } else if (message.msgid == MAVLINK_MSG_ID_TIMESYNC) {
             HandleTimeSync(message);
+        } else if (message.msgid == MAVLINK_MSG_ID_V2_EXTENSION) {
+            HandleV2Extension(message);
         }
     }
 
@@ -424,6 +456,257 @@ private:
             return;
         }
         HandleTimeSyncResponse(time_sync);
+    }
+
+    struct TrackTargetUpdatePayload {
+        uint64_t source_time_ms = 0;
+        uint32_t ground_station_boot_id = 0;
+        uint32_t update_seq = 0;
+        uint32_t target_id = 0;
+        uint32_t valid_for_ms = 0;
+        int32_t latitude_1e7 = 0;
+        int32_t longitude_1e7 = 0;
+        int32_t altitude_mm = 0;
+        int16_t velocity_north_cms = 0;
+        int16_t velocity_east_cms = 0;
+        int16_t velocity_down_cms = 0;
+        uint16_t heading_cd = 0;
+        uint16_t horizontal_accuracy_cm = 0;
+        uint16_t vertical_accuracy_cm = 0;
+        uint16_t flags = 0;
+        uint8_t target_system = 0;
+        uint8_t target_component = 0;
+        uint8_t coordinate_frame = 0;
+        uint8_t protocol_version = 0;
+        uint8_t alt_reference = 0;
+    };
+
+    void HandleV2Extension(const mavlink_message_t& message) {
+        if (message.sysid != config_.ground_system_id ||
+            message.compid != config_.ground_component_id) {
+            return;
+        }
+        mavlink_v2_extension_t extension{};
+        mavlink_msg_v2_extension_decode(&message, &extension);
+        if (extension.message_type != kTrackTargetUpdateMessageType) {
+            return;
+        }
+        HandleTrackTargetUpdate(extension);
+    }
+
+    void HandleTrackTargetUpdate(const mavlink_v2_extension_t& extension) {
+        if (extension.target_system != config_.aircraft_system_id ||
+            extension.target_component != config_.aircraft_component_id) {
+            return;
+        }
+
+        const auto payload = DecodeTrackTargetUpdate(extension.payload);
+        if (!payload) {
+            SendTrackTargetAck(0, 0, 0, 0, TrackTargetAckResult::kRejectedInvalidField,
+                               TrackTargetAckReason::kInternalError);
+            return;
+        }
+        const auto& update = *payload;
+        if (update.target_system != config_.aircraft_system_id ||
+            update.target_component != config_.aircraft_component_id) {
+            return;
+        }
+
+        const uint64_t receive_time_ms = MonotonicMs();
+        uint64_t measured_age_ms = 0;
+        const auto reject = [&](TrackTargetAckResult result,
+                                TrackTargetAckReason reason) {
+            SendTrackTargetAck(update.ground_station_boot_id, update.update_seq,
+                               update.target_id, measured_age_ms, result, reason);
+        };
+
+        if (update.protocol_version != kTrackTargetProtocolVersion) {
+            reject(TrackTargetAckResult::kRejectedUnsupportedVersion,
+                   TrackTargetAckReason::kProtocolVersionUnsupported);
+            return;
+        }
+        if (update.coordinate_frame != kTrackTargetCoordinateFrameWgs84) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kLatitudeOrLongitudeInvalid);
+            return;
+        }
+        if (update.ground_station_boot_id == 0) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kBootIdInvalidOrChanged);
+            return;
+        }
+        if (time_sync_state_ != GroundStationTimeSyncState::kSynchronized) {
+            reject(TrackTargetAckResult::kRejectedTimeSyncUnavailable,
+                   TrackTargetAckReason::kTimeSyncUnavailable);
+            return;
+        }
+        if (last_ground_station_boot_id_ != 0 &&
+            update.ground_station_boot_id != last_ground_station_boot_id_) {
+            last_ground_station_boot_id_ = update.ground_station_boot_id;
+            last_target_update_seq_ = 0;
+            ResetTimeSync(false);
+            reject(TrackTargetAckResult::kRejectedTimeSyncUnavailable,
+                   TrackTargetAckReason::kBootIdInvalidOrChanged);
+            return;
+        }
+        if (update.update_seq <= last_target_update_seq_) {
+            reject(TrackTargetAckResult::kRejectedStaleOrDuplicate,
+                   TrackTargetAckReason::kUpdateSequenceStale);
+            return;
+        }
+        if (update.target_id == 0) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kTargetIdInvalid);
+            return;
+        }
+        if (update.latitude_1e7 < -900000000 || update.latitude_1e7 > 900000000 ||
+            update.longitude_1e7 < -1800000000 ||
+            update.longitude_1e7 > 1800000000) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kLatitudeOrLongitudeInvalid);
+            return;
+        }
+        if (update.valid_for_ms <
+                static_cast<uint32_t>(config_.target_minimum_valid_for.count()) ||
+            update.valid_for_ms >
+                static_cast<uint32_t>(config_.target_maximum_valid_for.count())) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kValidForInvalid);
+            return;
+        }
+        if ((update.flags & ~kTrackTargetKnownFlagsMask) != 0) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kFlagsInvalid);
+            return;
+        }
+        if ((update.flags & 0x0001U) != 0 && update.alt_reference > 3) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kAltitudeReferenceInvalid);
+            return;
+        }
+        if ((update.flags & 0x0010U) != 0 && update.heading_cd >= 36000U) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kHeadingInvalid);
+            return;
+        }
+        if (((update.flags & 0x0020U) != 0 && update.horizontal_accuracy_cm == UINT16_MAX) ||
+            ((update.flags & 0x0040U) != 0 && update.vertical_accuracy_cm == UINT16_MAX)) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kAccuracyInvalid);
+            return;
+        }
+
+        const int64_t offset_ms = time_sync_offset_ns_ / 1000000LL;
+        const int64_t source_aircraft_ms =
+            static_cast<int64_t>(update.source_time_ms) - offset_ms;
+        const int64_t receive_ms = static_cast<int64_t>(receive_time_ms);
+        if (source_aircraft_ms > receive_ms +
+                                  config_.target_future_tolerance.count()) {
+            reject(TrackTargetAckResult::kRejectedInvalidField,
+                   TrackTargetAckReason::kSourceTimeInFuture);
+            return;
+        }
+        const int64_t age_ms = std::max<int64_t>(0, receive_ms - source_aircraft_ms);
+        measured_age_ms = static_cast<uint64_t>(age_ms);
+        if (measured_age_ms >
+                static_cast<uint64_t>(config_.target_maximum_transport_delay.count()) ||
+            measured_age_ms >= update.valid_for_ms) {
+            reject(TrackTargetAckResult::kRejectedStaleOrDuplicate,
+                   TrackTargetAckReason::kTargetExpired);
+            return;
+        }
+        const uint64_t remaining_valid_ms = update.valid_for_ms - measured_age_ms;
+        if (remaining_valid_ms <
+            static_cast<uint64_t>(config_.target_minimum_remaining_valid.count())) {
+            reject(TrackTargetAckResult::kRejectedStaleOrDuplicate,
+                   TrackTargetAckReason::kRemainingValidityTooShort);
+            return;
+        }
+
+        common::GroundStationTarget target;
+        target.header.sequence = update.update_seq;
+        target.header.source_time_ms = update.source_time_ms;
+        target.header.receive_time_ms = receive_time_ms;
+        target.header.valid_for_ms = remaining_valid_ms;
+        target.header.source_id = config_.ground_system_id;
+        target.header.health = 1;
+        target.header.frame_id = 1;
+        target.ground_station_boot_id = update.ground_station_boot_id;
+        target.update_seq = update.update_seq;
+        target.target_id = update.target_id;
+        target.latitude_1e7 = update.latitude_1e7;
+        target.longitude_1e7 = update.longitude_1e7;
+        target.altitude_mm = update.altitude_mm;
+        target.alt_reference = update.alt_reference;
+        target.protocol_version = update.protocol_version;
+        target.transport_age_ms = measured_age_ms;
+        target.velocity_north_mps = update.velocity_north_cms / 100.0F;
+        target.velocity_east_mps = update.velocity_east_cms / 100.0F;
+        target.velocity_down_mps = update.velocity_down_cms / 100.0F;
+        target.heading_deg = update.heading_cd / 100.0F;
+        target.horizontal_accuracy_m = update.horizontal_accuracy_cm / 100.0F;
+        target.vertical_accuracy_m = update.vertical_accuracy_cm / 100.0F;
+        target.validity_flags = update.flags;
+        (void)target_output_.Publish(
+            std::make_shared<const common::GroundStationTarget>(target));
+        last_ground_station_boot_id_ = update.ground_station_boot_id;
+        last_target_update_seq_ = update.update_seq;
+        SendTrackTargetAck(update.ground_station_boot_id, update.update_seq,
+                           update.target_id, measured_age_ms,
+                           TrackTargetAckResult::kAccepted,
+                           TrackTargetAckReason::kOk);
+    }
+
+    std::optional<TrackTargetUpdatePayload> DecodeTrackTargetUpdate(
+        const uint8_t* data) const {
+        TrackTargetUpdatePayload payload;
+        payload.source_time_ms = ReadLe<uint64_t>(data, 0);
+        payload.ground_station_boot_id = ReadLe<uint32_t>(data, 8);
+        payload.update_seq = ReadLe<uint32_t>(data, 12);
+        payload.target_id = ReadLe<uint32_t>(data, 16);
+        payload.valid_for_ms = ReadLe<uint32_t>(data, 20);
+        payload.latitude_1e7 = ReadLe<int32_t>(data, 24);
+        payload.longitude_1e7 = ReadLe<int32_t>(data, 28);
+        payload.altitude_mm = ReadLe<int32_t>(data, 32);
+        payload.velocity_north_cms = ReadLe<int16_t>(data, 36);
+        payload.velocity_east_cms = ReadLe<int16_t>(data, 38);
+        payload.velocity_down_cms = ReadLe<int16_t>(data, 40);
+        payload.heading_cd = ReadLe<uint16_t>(data, 42);
+        payload.horizontal_accuracy_cm = ReadLe<uint16_t>(data, 44);
+        payload.vertical_accuracy_cm = ReadLe<uint16_t>(data, 46);
+        payload.flags = ReadLe<uint16_t>(data, 48);
+        payload.target_system = ReadLe<uint8_t>(data, 50);
+        payload.target_component = ReadLe<uint8_t>(data, 51);
+        payload.coordinate_frame = ReadLe<uint8_t>(data, 52);
+        payload.protocol_version = ReadLe<uint8_t>(data, 53);
+        payload.alt_reference = ReadLe<uint8_t>(data, 54);
+        return payload;
+    }
+
+    void SendTrackTargetAck(uint32_t boot_id, uint32_t update_seq,
+                            uint32_t target_id, uint64_t measured_age_ms,
+                            TrackTargetAckResult result,
+                            TrackTargetAckReason reason) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint32_t>(payload, 0, boot_id);
+        WriteLe<uint32_t>(payload, 4, update_seq);
+        WriteLe<uint32_t>(payload, 8, target_id);
+        WriteLe<uint32_t>(payload, 12, static_cast<uint32_t>(std::min<uint64_t>(
+                                          measured_age_ms, UINT32_MAX)));
+        WriteLe<uint32_t>(payload, 16, static_cast<uint32_t>(
+                                          time_sync_round_trip_time_ns_ / 1000000ULL));
+        WriteLe<uint16_t>(payload, 20, static_cast<uint16_t>(reason));
+        WriteLe<uint8_t>(payload, 22, static_cast<uint8_t>(result));
+        WriteLe<uint8_t>(payload, 23, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 24, config_.aircraft_component_id);
+        WriteLe<uint8_t>(payload, 25, kTrackTargetProtocolVersion);
+        (void)EncodeAndWrite([this, &payload](mavlink_status_t* status,
+                                               mavlink_message_t* message) {
+            return mavlink_msg_v2_extension_pack_status(
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
+                message, 0, config_.ground_system_id, config_.ground_component_id,
+                kTrackTargetAckMessageType, payload.data());
+        });
     }
 
     void CheckHeartbeatTimeout(uint64_t now_ms) {
@@ -893,6 +1176,8 @@ private:
     FlightSubscription flight_state_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     common::Topic<common::GroundStationTarget> target_output_;
+    uint32_t last_ground_station_boot_id_ = 0;
+    uint32_t last_target_update_seq_ = 0;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 

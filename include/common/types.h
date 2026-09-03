@@ -101,11 +101,15 @@ struct LaserRangeSample {
 /// 不得按静态航点永久保存。
 struct GroundStationTarget {
     MessageHeader header;
+    uint32_t ground_station_boot_id = 0;
+    uint32_t update_seq = 0;
     uint32_t target_id = 0;
     int32_t latitude_1e7 = 0;     ///< WGS-84 纬度 ×1e7
     int32_t longitude_1e7 = 0;    ///< WGS-84 经度 ×1e7
     int32_t altitude_mm = 0;      ///< 高度（毫米），基准见 alt_reference
     uint8_t alt_reference = 0;    ///< 0=未知 1=MSL 2=AGL 3=WGS84 椭球
+    uint8_t protocol_version = 0; ///< TRACK_TARGET_UPDATE协议版本
+    uint64_t transport_age_ms = 0;///< 基于TIMESYNC扣除得到的传输年龄
     float velocity_north_mps = 0.f;
     float velocity_east_mps = 0.f;
     float velocity_down_mps = 0.f;

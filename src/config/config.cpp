@@ -103,6 +103,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& serial = ground.at("serial");
     const json& rates = ground.at("send_interval_ms");
     const json& time_sync = ground.at("time_sync");
+    const json& target_input = ground.at("target_input");
 
     communication::GroundStationLinkConfig config;
     config.aircraft_system_id = ReadUint8(ground, "aircraft_system_id");
@@ -139,6 +140,16 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         static_cast<std::size_t>(minimum_samples);
     config.time_sync_window_capacity =
         static_cast<std::size_t>(window_capacity);
+    config.target_minimum_valid_for =
+        ReadPositiveMilliseconds(target_input, "minimum_valid_for_ms");
+    config.target_maximum_valid_for =
+        ReadPositiveMilliseconds(target_input, "maximum_valid_for_ms");
+    config.target_minimum_remaining_valid =
+        ReadPositiveMilliseconds(target_input, "minimum_remaining_valid_ms");
+    config.target_maximum_transport_delay =
+        ReadPositiveMilliseconds(target_input, "maximum_transport_delay_ms");
+    config.target_future_tolerance =
+        ReadPositiveMilliseconds(target_input, "future_tolerance_ms");
     config.attitude_send_interval = ReadPositiveMilliseconds(rates, "attitude");
     config.local_position_send_interval =
         ReadPositiveMilliseconds(rates, "local_position");

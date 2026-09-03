@@ -59,8 +59,13 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.ground_station.time_sync_minimum_samples, 5u);
     EXPECT_EQ(config.ground_station.time_sync_window_capacity, 10u);
     EXPECT_EQ(config.ground_station.time_sync_timeout.count(), 5000);
-    EXPECT_EQ(config.ground_station.time_sync_max_rtt.count(), 500);
+    EXPECT_EQ(config.ground_station.time_sync_max_rtt.count(), 300);
     EXPECT_EQ(config.ground_station.time_sync_max_offset_jump.count(), 100);
+    EXPECT_EQ(config.ground_station.target_minimum_valid_for.count(), 100);
+    EXPECT_EQ(config.ground_station.target_maximum_valid_for.count(), 5000);
+    EXPECT_EQ(config.ground_station.target_minimum_remaining_valid.count(), 100);
+    EXPECT_EQ(config.ground_station.target_maximum_transport_delay.count(), 1000);
+    EXPECT_EQ(config.ground_station.target_future_tolerance.count(), 200);
     EXPECT_EQ(config.ground_station.attitude_send_interval.count(), 100);
     EXPECT_EQ(config.yolo.model_path,
               "/opt/drone/models/yolo26n-drone-best.rknn");

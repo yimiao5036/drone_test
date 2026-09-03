@@ -74,8 +74,15 @@
             "minimum_samples": 5,
             "window_capacity": 10,
             "sync_timeout_ms": 5000,
-            "max_rtt_ms": 500,
+            "max_rtt_ms": 300,
             "max_offset_jump_ms": 100
+        },
+        "target_input": {
+            "minimum_valid_for_ms": 100,
+            "maximum_valid_for_ms": 5000,
+            "minimum_remaining_valid_ms": 100,
+            "maximum_transport_delay_ms": 1000,
+            "future_tolerance_ms": 200
         },
         "flight_state_queue_capacity": 2,
         "send_interval_ms": {

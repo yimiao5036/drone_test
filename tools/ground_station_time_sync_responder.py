@@ -11,15 +11,24 @@
 """
 
 import argparse
+import os
 import signal
 import statistics
+import struct
 import sys
 import time
+
+# 必须在导入pymavlink前设置，确保接收端使用MAVLink 2解析。
+os.environ.setdefault("MAVLINK20", "1")
 
 from pymavlink import mavutil
 
 GROUND_SYSTEM_ID = 255
 GROUND_COMPONENT_ID = 190
+MAVLINK2_MAGIC = 0xFD
+MAVLINK_MSG_ID_TIMESYNC = 111
+MAVLINK_MSG_ID_TIMESYNC_CRC_EXTRA = 34
+MAVLINK_MSG_ID_TIMESYNC_LEN = 18
 
 running = True
 
@@ -62,6 +71,12 @@ def parse_args():
         help="地面站主动TIMESYNC请求周期（秒），默认1.0",
     )
     parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=3.0,
+        help="地面站主动TIMESYNC请求超时（秒），默认3.0",
+    )
+    parser.add_argument(
         "--summary-interval",
         type=float,
         default=5.0,
@@ -86,6 +101,52 @@ def send_heartbeat(master):
     )
 
 
+def x25_crc_accumulate(crc, byte):
+    tmp = byte ^ (crc & 0xFF)
+    tmp ^= (tmp << 4) & 0xFF
+    return ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+
+
+def x25_crc(data, crc_extra):
+    crc = 0xFFFF
+    for byte in data:
+        crc = x25_crc_accumulate(crc, byte)
+    crc = x25_crc_accumulate(crc, crc_extra)
+    return crc
+
+
+def send_timesync_manual(master, tc1, ts1, target_system, target_component):
+    """手工发送带MAVLink2扩展字段的TIMESYNC。
+
+    PyPI pymavlink 2.4.49的TIMESYNC生成代码仍可能只有tc1/ts1，
+    因此这里直接按MAVLink2帧格式打包，不依赖生成代码是否包含扩展字段。
+    """
+    sequence = int(getattr(master.mav, "seq", 0)) & 0xFF
+    setattr(master.mav, "seq", (sequence + 1) & 0xFF)
+    payload = struct.pack(
+        "<qqBB",
+        int(tc1),
+        int(ts1),
+        int(target_system),
+        int(target_component),
+    )
+    header_without_magic = struct.pack(
+        "<BBBBBBBH",
+        MAVLINK_MSG_ID_TIMESYNC_LEN,
+        0,  # incompat_flags
+        0,  # compat_flags
+        sequence,
+        GROUND_SYSTEM_ID,
+        GROUND_COMPONENT_ID,
+        MAVLINK_MSG_ID_TIMESYNC & 0xFF,
+        (MAVLINK_MSG_ID_TIMESYNC >> 8) & 0xFFFF,
+    )
+    # 上面的pack得到低8位+高16位，正好是MAVLink2的3字节msgid。
+    frame_without_crc = bytes([MAVLINK2_MAGIC]) + header_without_magic + payload
+    checksum = x25_crc(header_without_magic + payload, MAVLINK_MSG_ID_TIMESYNC_CRC_EXTRA)
+    master.write(frame_without_crc + struct.pack("<H", checksum))
+
+
 def send_timesync(master, tc1, ts1, target_system, target_component):
     try:
         master.mav.timesync_send(
@@ -94,11 +155,29 @@ def send_timesync(master, tc1, ts1, target_system, target_component):
             int(target_system),
             int(target_component),
         )
-    except TypeError as error:
-        raise RuntimeError(
-            "当前pymavlink生成代码不支持TIMESYNC目标扩展字段，"
-            "请升级pymavlink后重试"
-        ) from error
+    except TypeError:
+        send_timesync_manual(master, tc1, ts1, target_system, target_component)
+
+
+def extract_timesync_targets(message):
+    """返回(target_system, target_component, 是否明确携带target扩展字段)。"""
+    if hasattr(message, "target_system") and hasattr(message, "target_component"):
+        return int(message.target_system), int(message.target_component), True
+
+    try:
+        raw = bytes(message.get_msgbuf())
+    except Exception:
+        raw = bytes(getattr(message, "_msgbuf", b""))
+
+    if len(raw) >= 10 and raw[0] == MAVLINK2_MAGIC:
+        payload_len = raw[1]
+        payload_start = 10
+        payload_end = payload_start + payload_len
+        if len(raw) >= payload_end + 2 and payload_len >= MAVLINK_MSG_ID_TIMESYNC_LEN:
+            payload = raw[payload_start:payload_end]
+            return int(payload[16]), int(payload[17]), True
+
+    return 0, 0, False
 
 
 def send_time_sync_response(master, request):
@@ -120,22 +199,37 @@ def percentile(values, ratio):
     return ordered[index]
 
 
-def print_summary(response_count, ignored_count, timeout_count, rtt_ms, offset_ms):
+def print_summary(
+    response_count,
+    active_response_count,
+    pending_count,
+    ignored_count,
+    timeout_count,
+    rtt_ms,
+    offset_ms,
+):
+    completed_active = active_response_count + timeout_count
+    timeout_rate = (timeout_count * 100.0 / completed_active) if completed_active else 0.0
     if not rtt_ms:
         print(
-            f"[INFO] 飞机请求响应={response_count} 主动测量样本=0 "
-            f"超时={timeout_count} 忽略={ignored_count}"
+            f"[INFO] 飞机请求响应={response_count} 主动响应={active_response_count} "
+            f"窗口样本=0 待响应={pending_count} 超时={timeout_count} "
+            f"超时率={timeout_rate:.3f}% 忽略={ignored_count}"
         )
         return
     offset_median = statistics.median(offset_ms)
     offset_jitter = max(abs(value - offset_median) for value in offset_ms)
     print(
-        "[INFO] 飞机请求响应={} 主动样本={} 超时={} 忽略={} "
+        "[INFO] 飞机请求响应={} 主动响应={} 窗口样本={} 待响应={} "
+        "超时={} 超时率={:.3f}% 忽略={} "
         "RTT ms[min/median/p95/max]={:.3f}/{:.3f}/{:.3f}/{:.3f} "
         "aircraft-ground offset ms[median/jitter]={:.3f}/{:.3f}".format(
             response_count,
+            active_response_count,
             len(rtt_ms),
+            pending_count,
             timeout_count,
+            timeout_rate,
             ignored_count,
             min(rtt_ms),
             statistics.median(rtt_ms),
@@ -152,6 +246,7 @@ def main():
     if (
         args.heartbeat_interval <= 0
         or args.request_interval <= 0
+        or args.request_timeout <= 0
         or args.summary_interval <= 0
         or args.window_size <= 0
     ):
@@ -177,6 +272,7 @@ def main():
     )
 
     aircraft_request_response_count = 0
+    active_response_count = 0
     ignored_count = 0
     timeout_count = 0
     pending = {}
@@ -206,8 +302,7 @@ def main():
 
         message = master.recv_match(blocking=True, timeout=0.05)
         if message is not None and message.get_type() == "TIMESYNC":
-            target_system = int(getattr(message, "target_system", 0))
-            target_component = int(getattr(message, "target_component", 0))
+            target_system, target_component, has_target_fields = extract_timesync_targets(message)
             source_system = message.get_srcSystem()
             source_component = message.get_srcComponent()
             is_broadcast = target_system == 0 and target_component == 0
@@ -225,12 +320,13 @@ def main():
             elif (
                 source_system == args.aircraft_system
                 and source_component == args.aircraft_component
-                and is_addressed_to_ground
+                and (is_addressed_to_ground or not has_target_fields)
                 and int(message.ts1) in pending
             ):
                 receive_time_ns = time.monotonic_ns()
                 request_time_ns = pending.pop(int(message.ts1))
                 if receive_time_ns > request_time_ns:
+                    active_response_count += 1
                     round_trip_ns = receive_time_ns - request_time_ns
                     midpoint_ns = request_time_ns + round_trip_ns // 2
                     # 此处offset语义为“飞机时钟 - 地面站时钟”。
@@ -245,7 +341,7 @@ def main():
             else:
                 ignored_count += 1
 
-        expire_before_ns = time.monotonic_ns() - 2_000_000_000
+        expire_before_ns = time.monotonic_ns() - int(args.request_timeout * 1_000_000_000)
         expired = [key for key in pending if key < expire_before_ns]
         for key in expired:
             pending.pop(key, None)
@@ -255,6 +351,8 @@ def main():
         if now - last_summary >= args.summary_interval:
             print_summary(
                 aircraft_request_response_count,
+                active_response_count,
+                len(pending),
                 ignored_count,
                 timeout_count,
                 rtt_ms,
@@ -264,6 +362,8 @@ def main():
 
     print_summary(
         aircraft_request_response_count,
+        active_response_count,
+        len(pending),
         ignored_count,
         timeout_count,
         rtt_ms,

@@ -16,6 +16,45 @@ constexpr uint8_t kNetCaptureAircraftComponentId = 25;
 constexpr uint8_t kRocketAircraftComponentId = 26;
 constexpr uint8_t kGroundStationSystemId = 255;
 constexpr uint8_t kGroundStationComponentId = 190;
+constexpr uint16_t kTrackTargetUpdateMessageType = 65010;
+constexpr uint16_t kTrackTargetAckMessageType = 65011;
+constexpr uint8_t kTrackTargetProtocolVersion = 1;
+constexpr uint8_t kTrackTargetCoordinateFrameWgs84 = 1;
+constexpr uint16_t kTrackTargetKnownFlagsMask = 0x007F;
+
+/// TRACK_TARGET_ACK接收结果。
+enum class TrackTargetAckResult : uint8_t {
+    kAccepted = 0,
+    kRejectedInvalidField = 1,
+    kRejectedStaleOrDuplicate = 2,
+    kRejectedUnsupportedVersion = 3,
+    kRejectedTimeSyncUnavailable = 4,
+    kRejectedNotReady = 5,
+    kRejectedInternalError = 6,
+};
+
+/// TRACK_TARGET_ACK详细原因码。
+enum class TrackTargetAckReason : uint16_t {
+    kOk = 0,
+    kSourceIdInvalid = 1,
+    kTargetAddressMismatch = 2,
+    kProtocolVersionUnsupported = 3,
+    kBootIdInvalidOrChanged = 4,
+    kUpdateSequenceStale = 5,
+    kTargetIdInvalid = 6,
+    kLatitudeOrLongitudeInvalid = 7,
+    kValidForInvalid = 8,
+    kFlagsInvalid = 9,
+    kAltitudeReferenceInvalid = 10,
+    kHeadingInvalid = 11,
+    kAccuracyInvalid = 12,
+    kTimeSyncUnavailable = 13,
+    kSourceTimeInFuture = 14,
+    kTargetExpired = 15,
+    kRemainingValidityTooShort = 16,
+    kModuleNotReady = 17,
+    kInternalError = 100,
+};
 
 /// 地面站与飞机单调时钟的同步状态。
 enum class GroundStationTimeSyncState : uint8_t {
@@ -57,10 +96,15 @@ struct GroundStationLinkConfig {
     std::chrono::milliseconds time_sync_acquire_interval{200};
     std::chrono::milliseconds time_sync_steady_interval{1000};
     std::chrono::milliseconds time_sync_timeout{5000};
-    std::chrono::milliseconds time_sync_max_rtt{500};
+    std::chrono::milliseconds time_sync_max_rtt{300};
     std::chrono::milliseconds time_sync_max_offset_jump{100};
     std::size_t time_sync_minimum_samples = 5;
     std::size_t time_sync_window_capacity = 10;
+    std::chrono::milliseconds target_minimum_valid_for{100};
+    std::chrono::milliseconds target_maximum_valid_for{5000};
+    std::chrono::milliseconds target_minimum_remaining_valid{100};
+    std::chrono::milliseconds target_maximum_transport_delay{1000};
+    std::chrono::milliseconds target_future_tolerance{200};
     std::chrono::milliseconds attitude_send_interval{100};
     std::chrono::milliseconds local_position_send_interval{200};
     std::chrono::milliseconds global_position_send_interval{200};

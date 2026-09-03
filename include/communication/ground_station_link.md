@@ -4,7 +4,7 @@
 
 `GroundStationLink`通过独立串口与自研地面站进行MAVLink 2通信。它订阅`Px4Link::StateOutput()`发布的`FlightStateSnapshot`，按配置频率重新编码为标准MAVLink遥测消息发送给地面站；同时接收并识别`MAV_TYPE_GCS`心跳，维护地面站在线状态，并通过标准`TIMESYNC`估算地面站单调时钟相对飞机时钟的offset、RTT和jitter。
 
-本模块不是PX4原始字节透传器，不允许地面站绕过状态机直接控制PX4。目标位置与时间同步总体协议已在`docs/地面站目标位置与时间同步协议.md`冻结；当前只实现TIMESYNC第一阶段，不解析`TRACK_TARGET_UPDATE`，不发布`GroundStationTarget`。`MissionStatus`和`HealthStatus`输入接口已预留，但在自定义状态协议确定前不编码发送。
+本模块不是PX4原始字节透传器，不允许地面站绕过状态机直接控制PX4。目标位置与时间同步总体协议见`docs/地面站目标位置与时间同步协议.md`；当前已实现TIMESYNC第一阶段，并通过MAVLink `V2_EXTENSION.message_type=65010/65011`实现`TRACK_TARGET_UPDATE/ACK`最小闭环：合法目标发布`GroundStationTarget`，非法本机目标返回拒绝ACK，错误地址静默忽略。`MissionStatus`和`HealthStatus`输入接口已预留，但在自定义状态协议确定前不编码发送。
 
 ## 接口与数据流
 
@@ -15,7 +15,7 @@ class GroundStationLink final : public IGroundStationLink;
 void SetFlightStateInput(Topic<FlightStateSnapshot>&);
 void SetMissionStatusInput(Topic<MissionStatus>&); // 预留
 void SetHealthInput(Topic<HealthStatus>&);          // 预留
-Topic<GroundStationTarget>& TargetOutput();         // 目标消息仍预留
+Topic<GroundStationTarget>& TargetOutput();         // 合法TRACK_TARGET_UPDATE发布到此Topic
 GroundStationTimeSyncStatus GetTimeSyncStatus() const;
 
 struct GroundStationLinkConfig {
@@ -74,10 +74,10 @@ Px4Link::StateOutput()
 - 只在对应有效标志为真时发送姿态、位置、GPS、电池和Home消息；无效数据不伪造成有效零值。
 - `FlightStateSnapshot`只有动力电池总压，没有单体电压，因此总压放在`SYS_STATUS.voltage_battery`；`BATTERY_STATUS.voltages[]`保持未知，禁止把总压误当成首节电芯电压。
 - `GLOBAL_POSITION_INT.relative_alt`仅在Home有效时由MSL高度差计算；Home无效时为0，地面站应结合Home有效消息判断。
-- 接收方向处理来源`255/190`的GCS心跳和TIMESYNC；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。
+- 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。
 - 飞机在收到合法GCS心跳后主动发送定向TIMESYNC请求；请求`tc1=0`、`ts1=飞机单调纳秒`、target=`255/190`。
 - 响应必须来自`255/190`，target必须匹配本机二元身份，`ts1`必须匹配尚未完成的请求。offset按`地面站tc1-(请求ts1+接收时刻)/2`计算。
-- 样本窗口优先选择低RTT样本，对offset和RTT取中位数；达到最小样本数后进入`SYNCHRONIZED`。高RTT、错误target和无匹配请求计入拒绝样本。
+- 样本窗口优先选择低RTT样本，对offset和RTT取中位数；达到最小样本数后进入`SYNCHRONIZED`。高RTT、错误target和无匹配请求计入拒绝样本。捕网-01 HM30实链第一版门限为`max_rtt_ms=300`、`max_offset_jump_ms=100`。
 - GCS心跳超时会清空同步状态；同步样本独立超时也会从`SYNCHRONIZED`退回未同步。
 - 同时支持响应地面站发起的广播或定向TIMESYNC请求，响应target回填`255/190`。
 - `Start()`前必须绑定飞行状态Topic；`Start/Stop`幂等，停止后可以重新启动。
@@ -100,7 +100,7 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启。硬件阶段已在香橙派/HM30/Web闭环确认基础链路，TIMESYNC实机测试使用`tools/ground_station_time_sync_responder.py`。
+`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启。硬件阶段已在香橙派/HM30/Web闭环确认基础链路；TIMESYNC已使用`tools/ground_station_time_sync_responder.py`完成捕网-01实机采样，RTT中位数约78ms，历史最大约203ms，offset jitter常见约20～50ms，主动测量偶发超时率低于1%，忽略包为0。
 
 ## 排查与修改要点
 
@@ -110,5 +110,5 @@ ctest --test-dir build --output-on-failure
 - 有心跳但无GPS/电池：检查PX4快照对应`*_valid`标志；本模块不会发送失效字段。
 - 模式显示：读取机载心跳中的`base_mode/custom_mode`，其中`custom_mode`保持PX4原始编码。
 - 修改发送频率只改JSON；不得在工作循环写死新周期。
-- 增加目标协议时，在接收分支校验来源、字段范围、时间戳和有效期后发布`GroundStationTarget`，禁止直接生成PX4命令。
+- 修改目标协议时，必须同步更新V2_EXTENSION payload布局、ACK语义、测试、地面站工具和协议文档；禁止在通信层直接生成PX4命令。
 - 增加任务/健康自定义消息时同步更新dialect、Vue3解析器、测试和本文档。
