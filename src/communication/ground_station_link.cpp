@@ -54,6 +54,70 @@ const char* TimeSyncStateName(GroundStationTimeSyncState state) {
     return "UNKNOWN";
 }
 
+const char* TrackTargetAckResultName(TrackTargetAckResult result) {
+    switch (result) {
+        case TrackTargetAckResult::kAccepted:
+            return "ACCEPTED";
+        case TrackTargetAckResult::kRejectedInvalidField:
+            return "REJECTED_INVALID_FIELD";
+        case TrackTargetAckResult::kRejectedStaleOrDuplicate:
+            return "REJECTED_STALE_OR_DUPLICATE";
+        case TrackTargetAckResult::kRejectedUnsupportedVersion:
+            return "REJECTED_UNSUPPORTED_VERSION";
+        case TrackTargetAckResult::kRejectedTimeSyncUnavailable:
+            return "REJECTED_TIME_SYNC_UNAVAILABLE";
+        case TrackTargetAckResult::kRejectedNotReady:
+            return "REJECTED_NOT_READY";
+        case TrackTargetAckResult::kRejectedInternalError:
+            return "REJECTED_INTERNAL_ERROR";
+    }
+    return "UNKNOWN";
+}
+
+const char* TrackTargetAckReasonName(TrackTargetAckReason reason) {
+    switch (reason) {
+        case TrackTargetAckReason::kOk:
+            return "OK";
+        case TrackTargetAckReason::kSourceIdInvalid:
+            return "SOURCE_ID_INVALID";
+        case TrackTargetAckReason::kTargetAddressMismatch:
+            return "TARGET_ADDRESS_MISMATCH";
+        case TrackTargetAckReason::kProtocolVersionUnsupported:
+            return "PROTOCOL_VERSION_UNSUPPORTED";
+        case TrackTargetAckReason::kBootIdInvalidOrChanged:
+            return "BOOT_ID_INVALID_OR_CHANGED";
+        case TrackTargetAckReason::kUpdateSequenceStale:
+            return "UPDATE_SEQUENCE_STALE";
+        case TrackTargetAckReason::kTargetIdInvalid:
+            return "TARGET_ID_INVALID";
+        case TrackTargetAckReason::kLatitudeOrLongitudeInvalid:
+            return "LATITUDE_OR_LONGITUDE_INVALID";
+        case TrackTargetAckReason::kValidForInvalid:
+            return "VALID_FOR_INVALID";
+        case TrackTargetAckReason::kFlagsInvalid:
+            return "FLAGS_INVALID";
+        case TrackTargetAckReason::kAltitudeReferenceInvalid:
+            return "ALTITUDE_REFERENCE_INVALID";
+        case TrackTargetAckReason::kHeadingInvalid:
+            return "HEADING_INVALID";
+        case TrackTargetAckReason::kAccuracyInvalid:
+            return "ACCURACY_INVALID";
+        case TrackTargetAckReason::kTimeSyncUnavailable:
+            return "TIME_SYNC_UNAVAILABLE";
+        case TrackTargetAckReason::kSourceTimeInFuture:
+            return "SOURCE_TIME_IN_FUTURE";
+        case TrackTargetAckReason::kTargetExpired:
+            return "TARGET_EXPIRED";
+        case TrackTargetAckReason::kRemainingValidityTooShort:
+            return "REMAINING_VALIDITY_TOO_SHORT";
+        case TrackTargetAckReason::kModuleNotReady:
+            return "MODULE_NOT_READY";
+        case TrackTargetAckReason::kInternalError:
+            return "INTERNAL_ERROR";
+    }
+    return "UNKNOWN";
+}
+
 bool ShouldLogThrottled(uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
@@ -488,6 +552,12 @@ private:
         }
         mavlink_v2_extension_t extension{};
         mavlink_msg_v2_extension_decode(&message, &extension);
+        const uint64_t count = ++target_v2_extension_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO("收到地面站V2_EXTENSION: type={} target={}/{} count={}",
+                        extension.message_type, extension.target_system,
+                        extension.target_component, count);
+        }
         if (extension.message_type != kTrackTargetUpdateMessageType) {
             return;
         }
@@ -495,8 +565,21 @@ private:
     }
 
     void HandleTrackTargetUpdate(const mavlink_v2_extension_t& extension) {
+        const uint64_t receive_count = ++target_update_receive_count_;
+        if (ShouldLogThrottled(receive_count)) {
+            SPDLOG_INFO("收到目标UPDATE: target={}/{} count={}",
+                        extension.target_system, extension.target_component,
+                        receive_count);
+        }
         if (extension.target_system != config_.aircraft_system_id ||
             extension.target_component != config_.aircraft_component_id) {
+            const uint64_t mismatch_count = ++target_update_address_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN("目标UPDATE地址不匹配: target={}/{} local={}/{} count={}",
+                            extension.target_system, extension.target_component,
+                            config_.aircraft_system_id, config_.aircraft_component_id,
+                            mismatch_count);
+            }
             return;
         }
 
@@ -509,6 +592,13 @@ private:
         const auto& update = *payload;
         if (update.target_system != config_.aircraft_system_id ||
             update.target_component != config_.aircraft_component_id) {
+            const uint64_t mismatch_count = ++target_update_address_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN("目标UPDATE payload地址不匹配: target={}/{} local={}/{} count={}",
+                            update.target_system, update.target_component,
+                            config_.aircraft_system_id, config_.aircraft_component_id,
+                            mismatch_count);
+            }
             return;
         }
 
@@ -649,6 +739,13 @@ private:
         target.validity_flags = update.flags;
         (void)target_output_.Publish(
             std::make_shared<const common::GroundStationTarget>(target));
+        const uint64_t publish_count = ++target_publish_count_;
+        if (ShouldLogThrottled(publish_count)) {
+            SPDLOG_INFO("目标UPDATE已发布: boot={} seq={} target_id={} age_ms={} remaining_ms={} count={}",
+                        update.ground_station_boot_id, update.update_seq,
+                        update.target_id, measured_age_ms, remaining_valid_ms,
+                        publish_count);
+        }
         last_ground_station_boot_id_ = update.ground_station_boot_id;
         last_target_update_seq_ = update.update_seq;
         SendTrackTargetAck(update.ground_station_boot_id, update.update_seq,
@@ -700,13 +797,21 @@ private:
         WriteLe<uint8_t>(payload, 23, config_.aircraft_system_id);
         WriteLe<uint8_t>(payload, 24, config_.aircraft_component_id);
         WriteLe<uint8_t>(payload, 25, kTrackTargetProtocolVersion);
-        (void)EncodeAndWrite([this, &payload](mavlink_status_t* status,
-                                               mavlink_message_t* message) {
-            return mavlink_msg_v2_extension_pack_status(
-                config_.aircraft_system_id, config_.aircraft_component_id, status,
-                message, 0, config_.ground_system_id, config_.ground_component_id,
-                kTrackTargetAckMessageType, payload.data());
-        });
+        const bool sent = EncodeAndWrite(
+            [this, &payload](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_v2_extension_pack_status(
+                    config_.aircraft_system_id, config_.aircraft_component_id, status,
+                    message, 0, config_.ground_system_id, config_.ground_component_id,
+                    kTrackTargetAckMessageType, payload.data());
+            });
+        const uint64_t count = ++target_ack_send_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO("目标ACK发送{}: result={} reason={} boot={} seq={} target_id={} age_ms={} rtt_ms={} count={}",
+                        sent ? "成功" : "失败", TrackTargetAckResultName(result),
+                        TrackTargetAckReasonName(reason), boot_id, update_seq,
+                        target_id, measured_age_ms,
+                        time_sync_round_trip_time_ns_ / 1000000ULL, count);
+        }
     }
 
     void CheckHeartbeatTimeout(uint64_t now_ms) {
@@ -1178,6 +1283,11 @@ private:
     common::Topic<common::GroundStationTarget> target_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;
+    uint64_t target_v2_extension_count_ = 0;
+    uint64_t target_update_receive_count_ = 0;
+    uint64_t target_update_address_mismatch_count_ = 0;
+    uint64_t target_publish_count_ = 0;
+    uint64_t target_ack_send_count_ = 0;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 

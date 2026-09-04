@@ -196,9 +196,36 @@ class TimeSyncState:
         return -aircraft_minus_ground
 
 
-def process_message(master, message, aircraft_system, aircraft_component, sync_state):
+def debug_message(args, message, prefix="RX"):
+    if not getattr(args, "debug_messages", False) or message is None:
+        return
+    text = f"[DEBUG] {prefix} type={message.get_type()} source={message.get_srcSystem()}/{message.get_srcComponent()}"
+    if message.get_type() == "V2_EXTENSION":
+        try:
+            if hasattr(message, "message_type"):
+                text += (
+                    f" message_type={int(message.message_type)}"
+                    f" target={int(message.target_system)}/{int(message.target_component)}"
+                )
+            else:
+                raw = bytes(message.get_msgbuf())
+                payload_len = raw[1]
+                ext = raw[10:10 + payload_len]
+                if len(ext) >= 5:
+                    text += f" message_type={le_u16(ext, 0)} target={ext[3]}/{ext[4]}"
+        except Exception as error:
+            text += f" v2_debug_error={error}"
+    elif message.get_type() == "TIMESYNC":
+        target_system, target_component, has_targets = extract_timesync_targets(message)
+        text += f" tc1={int(message.tc1)} ts1={int(message.ts1)} target={target_system}/{target_component} has_target={has_targets}"
+    print(text)
+
+
+def process_message(master, message, aircraft_system, aircraft_component, sync_state, args=None):
     if message is None:
         return None
+    if args is not None:
+        debug_message(args, message)
     if message.get_type() == "TIMESYNC":
         target_system, target_component, has_targets = extract_timesync_targets(message)
         source_system = message.get_srcSystem()
@@ -379,7 +406,7 @@ def wait_for_sync(master, args, sync_state):
             send_timesync_request(master, args.aircraft_system, args.aircraft_component, sync_state)
             last_request = now
         message = master.recv_match(blocking=True, timeout=0.05)
-        process_message(master, message, args.aircraft_system, args.aircraft_component, sync_state)
+        process_message(master, message, args.aircraft_system, args.aircraft_component, sync_state, args)
         prune_timesync_pending(sync_state, args.request_timeout)
         if sync_state.synchronized(args.minimum_sync_samples):
             return True
@@ -399,7 +426,7 @@ def wait_for_ack(master, args, sync_state):
             send_timesync_request(master, args.aircraft_system, args.aircraft_component, sync_state)
             last_request = now
         message = master.recv_match(blocking=True, timeout=0.05)
-        maybe_v2 = process_message(master, message, args.aircraft_system, args.aircraft_component, sync_state)
+        maybe_v2 = process_message(master, message, args.aircraft_system, args.aircraft_component, sync_state, args)
         if maybe_v2 is not None:
             ack = parse_ack(maybe_v2)
             if ack is not None:
@@ -443,7 +470,7 @@ def parse_args():
     parser.add_argument("--request-timeout", type=float, default=3.0)
     parser.add_argument("--minimum-sync-samples", type=int, default=5)
     parser.add_argument("--sync-wait-timeout", type=float, default=10.0)
-    parser.add_argument("--ack-timeout", type=float, default=3.0)
+    parser.add_argument("--ack-timeout", type=float, default=10.0)
     parser.add_argument("--boot-id", type=int, default=None)
     parser.add_argument("--start-seq", type=int, default=1)
     parser.add_argument("--mode", choices=["accepted", "duplicate", "wrong-address", "expired", "invalid-lat", "bad-version", "bad-flags", "all"], default="accepted")
@@ -459,13 +486,21 @@ def parse_args():
     parser.add_argument("--vertical-accuracy-m", type=float, default=2.5)
     parser.add_argument("--valid-for-ms", type=int, default=1000)
     parser.add_argument("--target-id", type=int, default=7)
+    parser.add_argument("--debug-messages", action="store_true", help="打印收到的MAVLink消息类型、来源和V2_EXTENSION类型")
     return parser.parse_args()
 
 
 def run_one_test(master, args, sync_state, boot_id, seq, mode, label=None):
-    ground_offset_ms = sync_state.ground_offset_ms()
-    source_time_ms = int(monotonic_ms() + ground_offset_ms)
+    # 协议要求source_time_ms使用地面站本机单调时钟，不能加offset。
+    # 飞机端会使用TIMESYNC估计的“地面站-飞机”offset自行映射到飞机时钟。
+    source_time_ms = int(monotonic_ms())
     send_track_target_update(master, args, boot_id, seq, source_time_ms, mode)
+    if args.debug_messages:
+        print(
+            f"[DEBUG] TX TRACK_TARGET_UPDATE mode={mode} boot={boot_id} seq={seq} "
+            f"source_time_ms={source_time_ms} ground_offset_ms={sync_state.ground_offset_ms():.3f} "
+            f"target={args.aircraft_system}/{args.aircraft_component}"
+        )
     ack = wait_for_ack(master, args, sync_state)
     print_ack(label or mode, ack)
     return ack
