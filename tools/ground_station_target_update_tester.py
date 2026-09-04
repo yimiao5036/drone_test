@@ -38,6 +38,7 @@ MAVLINK_MSG_ID_V2_EXTENSION = 248
 MAVLINK_MSG_ID_V2_EXTENSION_CRC_EXTRA = 8
 MAVLINK_MSG_ID_V2_EXTENSION_LEN = 254
 V2_EXTENSION_PAYLOAD_LEN = 249
+TRACK_TARGET_UPDATE_USED_LEN = 55
 TRACK_TARGET_UPDATE_TYPE = 65010
 TRACK_TARGET_ACK_TYPE = 65011
 TRACK_TARGET_PROTOCOL_VERSION = 1
@@ -299,7 +300,7 @@ def build_track_target_payload(args, boot_id, seq, source_time_ms, mode):
     elif mode == "bad-flags":
         flags = 0x8000
 
-    payload = bytearray(V2_EXTENSION_PAYLOAD_LEN)
+    payload = bytearray(TRACK_TARGET_UPDATE_USED_LEN)
     struct.pack_into(
         "<QIIIIiii hhh HHHH BBBBB".replace(" ", ""),
         payload,
@@ -329,22 +330,25 @@ def build_track_target_payload(args, boot_id, seq, source_time_ms, mode):
 
 
 def send_track_target_update(master, args, boot_id, seq, source_time_ms, mode):
-    payload249, target_system, target_component = build_track_target_payload(
+    payload_used, target_system, target_component = build_track_target_payload(
         args, boot_id, seq, source_time_ms, mode
     )
+    # MAVLink2允许对尾部0字节做空值截断。目标UPDATE固定字段当前只使用55字节，
+    # 不发送V2_EXTENSION的满长249字节payload，可避免低速串口/数传桥处理约266字节长帧时丢包。
     extension_payload = struct.pack(
         "<HBBB",
         TRACK_TARGET_UPDATE_TYPE,
         0,
         target_system,
         target_component,
-    ) + payload249
+    ) + payload_used
     send_mavlink2_frame(
         master,
         MAVLINK_MSG_ID_V2_EXTENSION,
         extension_payload,
         MAVLINK_MSG_ID_V2_EXTENSION_CRC_EXTRA,
     )
+    return len(extension_payload)
 
 
 def parse_ack(message):
@@ -494,12 +498,12 @@ def run_one_test(master, args, sync_state, boot_id, seq, mode, label=None):
     # 协议要求source_time_ms使用地面站本机单调时钟，不能加offset。
     # 飞机端会使用TIMESYNC估计的“地面站-飞机”offset自行映射到飞机时钟。
     source_time_ms = int(monotonic_ms())
-    send_track_target_update(master, args, boot_id, seq, source_time_ms, mode)
+    payload_len = send_track_target_update(master, args, boot_id, seq, source_time_ms, mode)
     if args.debug_messages:
         print(
             f"[DEBUG] TX TRACK_TARGET_UPDATE mode={mode} boot={boot_id} seq={seq} "
             f"source_time_ms={source_time_ms} ground_offset_ms={sync_state.ground_offset_ms():.3f} "
-            f"target={args.aircraft_system}/{args.aircraft_component}"
+            f"target={args.aircraft_system}/{args.aircraft_component} mavlink_payload_len={payload_len}"
         )
     ack = wait_for_ack(master, args, sync_state)
     print_ack(label or mode, ack)

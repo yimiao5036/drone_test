@@ -74,7 +74,7 @@ Px4Link::StateOutput()
 - 只在对应有效标志为真时发送姿态、位置、GPS、电池和Home消息；无效数据不伪造成有效零值。
 - `FlightStateSnapshot`只有动力电池总压，没有单体电压，因此总压放在`SYS_STATUS.voltage_battery`；`BATTERY_STATUS.voltages[]`保持未知，禁止把总压误当成首节电芯电压。
 - `GLOBAL_POSITION_INT.relative_alt`仅在Home有效时由MSL高度差计算；Home无效时为0，地面站应结合Home有效消息判断。
-- 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。
+- 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。实链验证中`TRACK_TARGET_UPDATE`采用MAVLink2短帧承载：`V2_EXTENSION`头部5字节加目标协议当前有效55字节，不要求发送满长249字节扩展payload。
 - 飞机在收到合法GCS心跳后主动发送定向TIMESYNC请求；请求`tc1=0`、`ts1=飞机单调纳秒`、target=`255/190`。
 - 响应必须来自`255/190`，target必须匹配本机二元身份，`ts1`必须匹配尚未完成的请求。offset按`地面站tc1-(请求ts1+接收时刻)/2`计算。
 - 样本窗口优先选择低RTT样本，对offset和RTT取中位数；达到最小样本数后进入`SYNCHRONIZED`。高RTT、错误target和无匹配请求计入拒绝样本。捕网-01 HM30实链第一版门限为`max_rtt_ms=300`、`max_offset_jump_ms=100`。
@@ -84,8 +84,8 @@ Px4Link::StateOutput()
 
 ## 日志行为
 
-- INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）。
-- WARN：地面站心跳超时、时间同步超时、连续offset突变导致降级。
+- INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果。
+- WARN：地面站心跳超时、时间同步超时、连续offset突变导致降级；目标地址不匹配按第1条及每100条节流警告。
 - ERROR：配置/启动/绑定时序错误和发送失败；错误按第1次及每100次节流。
 - 不逐条记录遥测消息，不在高频发送路径打印成功日志。
 
@@ -110,5 +110,5 @@ ctest --test-dir build --output-on-failure
 - 有心跳但无GPS/电池：检查PX4快照对应`*_valid`标志；本模块不会发送失效字段。
 - 模式显示：读取机载心跳中的`base_mode/custom_mode`，其中`custom_mode`保持PX4原始编码。
 - 修改发送频率只改JSON；不得在工作循环写死新周期。
-- 修改目标协议时，必须同步更新V2_EXTENSION payload布局、ACK语义、测试、地面站工具和协议文档；禁止在通信层直接生成PX4命令。
+- 修改目标协议时，必须同步更新V2_EXTENSION payload布局、ACK语义、测试、地面站工具和协议文档；禁止在通信层直接生成PX4命令。若实链出现`TIMESYNC`正常但`TRACK_TARGET_UPDATE`无ACK，优先检查地面站工具是否发送短帧（debug中`mavlink_payload_len=60`），以及日志中是否出现`收到地面站V2_EXTENSION`。
 - 增加任务/健康自定义消息时同步更新dialect、Vue3解析器、测试和本文档。
