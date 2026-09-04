@@ -10,6 +10,7 @@
 #include "communication/px4_link.h"
 #include "perception/detection_backend.h"
 #include "perception/yolo_detector.h"
+#include "state_machine/mission_state_machine.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
 #include "video/video_decoder.h"
@@ -48,6 +49,11 @@ void DroneApplication::BuildComponents() {
         ground_station_link_ = std::make_unique<communication::GroundStationLink>(
             config_.ground_station);
     }
+
+    // 影子状态机只在PX4状态源与地面站目标源同时存在时创建；本阶段不创建控制器。
+    if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_ = std::make_unique<state_machine::MissionStateMachine>();
+    }
 }
 
 void DroneApplication::BindTopics() {
@@ -61,6 +67,15 @@ void DroneApplication::BindTopics() {
 
     if (ground_station_link_ != nullptr && px4_link_ != nullptr) {
         ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
+    }
+
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr) {
+        mission_state_machine_->SetInputs(ground_station_link_->TargetOutput(),
+                                          px4_link_->StateOutput(),
+                                          health_status_topic_);
+        ground_station_link_->SetMissionStatusInput(
+            mission_state_machine_->StatusOutput());
     }
 
     // 当前正式主程序不绑定Px4Setpoint输入，也不发送控制命令。
@@ -113,6 +128,15 @@ bool DroneApplication::Start() {
         }
     }
 
+    if (mission_state_machine_ != nullptr) {
+        if (!mission_state_machine_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序任务状态机启动失败，任务状态回传降级");
+        } else {
+            any_started = true;
+        }
+    }
+
     // 地面站是PX4状态消费者，必须先于PX4生产者启动。
     if (ground_station_link_ != nullptr) {
         if (!ground_station_link_->Start()) {
@@ -147,9 +171,12 @@ void DroneApplication::Stop() {
     }
 
     SPDLOG_INFO("主程序开始停止");
-    // 先停止PX4状态生产者，再停止地面站消费者。
+    // 先停止PX4状态生产者，再停止状态机和地面站消费者。
     if (px4_link_ != nullptr) {
         px4_link_->Stop();
+    }
+    if (mission_state_machine_ != nullptr) {
+        mission_state_machine_->Stop();
     }
     if (ground_station_link_ != nullptr) {
         ground_station_link_->Stop();

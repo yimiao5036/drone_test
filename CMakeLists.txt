@@ -163,6 +163,7 @@ target_link_libraries(drone_application PUBLIC
     drone_video
     drone_perception
     drone_video_transmission
+    drone_state_machine
     spdlog::spdlog)
 
 add_executable(drone_control
@@ -287,6 +288,23 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # 任务状态机测试：验证地面站目标进入GPS_APPROACH影子状态且不输出控制意图
+        add_executable(mission_state_machine_test
+            tests/state_machine/mission_state_machine_test.cpp)
+        target_link_libraries(mission_state_machine_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mission_state_machine_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mission_state_machine_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mission_state_machine_test)
 
         # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
         add_executable(serial_port_test tests/communication/serial_port_test.cpp)

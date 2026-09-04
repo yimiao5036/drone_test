@@ -2,24 +2,23 @@
  * @file mission_state_machine.h
  * @brief 任务状态机部件接口（IMissionStateMachine）
  *
- * 属于 drone/state_machine 模块。职责：消费目标、飞行状态与健康快照，
+ * 属于 drone/state_machine 模块。职责：消费地面站目标、飞行状态与健康快照，
  * 按任务状态机（S0~S16，见 docs/状态机设计.md）决策，输出控制意图
  * （ControlIntent）与任务状态回传（MissionStatus）。
  *
- * 骨架期说明：
- * - 本接口为纯虚抽象，状态转移规则在实现期按状态机设计文档接入。
- * - MissionStateMachineStub 为骨架占位实现：生命周期可运行，业务方法
- *   记录"未实现"节流日志并返回默认值。
+ * 当前正式实现处于安全影子阶段：只验证 GroundStationTarget 能进入任务链路并
+ * 发布 MissionStatus，不连接 PX4 控制输出。
  *
  * 数据流：
- *   common::Topic<TargetState> ─┐
+ *   common::Topic<GroundStationTarget> ─┐
  *   common::Topic<FlightStateSnapshot> ─┼──► IMissionStateMachine ──┬─► common::Topic<ControlIntent>
- *   common::Topic<HealthStatus> ─┘                                   └─► common::Topic<MissionStatus>
+ *   common::Topic<HealthStatus> ───────┘                            └─► common::Topic<MissionStatus>
  * 可替换边界：不依赖具体设备。
  */
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 #include "common/topic.h"
 #include "common/types.h"
@@ -40,8 +39,8 @@ public:
     virtual bool IsRunning() const = 0;
 
     // ---- 输入 ----
-    /// 绑定目标、飞行状态与健康快照输入主题。
-    virtual void SetInputs(common::Topic<common::TargetState>& target,
+    /// 绑定地面站目标、飞行状态与健康快照输入主题。
+    virtual void SetInputs(common::Topic<common::GroundStationTarget>& ground_target,
                            common::Topic<common::FlightStateSnapshot>& flight,
                            common::Topic<common::HealthStatus>& health) = 0;
 
@@ -60,7 +59,38 @@ public:
     virtual uint64_t ErrorCount() const = 0;
 };
 
-/// 骨架占位实现：生命周期完整，业务方法打印"未实现"节流日志并返回默认值。
+/// 正式任务状态机实现。
+///
+/// 当前版本是安全影子实现：接收地面站目标并发布任务状态，但不发布真实控制意图。
+class MissionStateMachine final : public IMissionStateMachine {
+public:
+    MissionStateMachine();
+    ~MissionStateMachine() override;
+
+    MissionStateMachine(const MissionStateMachine&) = delete;
+    MissionStateMachine& operator=(const MissionStateMachine&) = delete;
+
+    bool Start() override;
+    void Stop() override;
+    bool IsRunning() const override;
+
+    void SetInputs(common::Topic<common::GroundStationTarget>& ground_target,
+                   common::Topic<common::FlightStateSnapshot>& flight,
+                   common::Topic<common::HealthStatus>& health) override;
+
+    common::Topic<common::ControlIntent>& IntentOutput() override;
+    common::Topic<common::MissionStatus>& StatusOutput() override;
+
+    common::MissionState CurrentState() const override;
+    uint64_t TransitionCount() const override;
+    uint64_t ErrorCount() const override;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// 骨架占位实现：生命周期完整，业务方法返回默认值。
 class MissionStateMachineStub final : public IMissionStateMachine {
 public:
     MissionStateMachineStub();
@@ -73,7 +103,7 @@ public:
     void Stop() override;
     bool IsRunning() const override;
 
-    void SetInputs(common::Topic<common::TargetState>& target,
+    void SetInputs(common::Topic<common::GroundStationTarget>& ground_target,
                    common::Topic<common::FlightStateSnapshot>& flight,
                    common::Topic<common::HealthStatus>& health) override;
 
