@@ -23,6 +23,9 @@
 
 namespace drone::video_transmission {
 
+// VideoSender 数据流：标注帧 Topic → 有界订阅队列 → 消费线程 → 编码/推流后端。
+// 队列拥塞或编码失败只影响图传，不阻塞视频采集和感知链路。
+
 /// VideoSender 实现细节（PIMPL）：消费线程、编码后端与计数。
 struct VideoSender::Impl {
     explicit Impl(VideoSenderConfig cfg) : config(std::move(cfg)) {
@@ -46,6 +49,7 @@ struct VideoSender::Impl {
     std::atomic<uint64_t> error_count{0};
 
     /// 消费线程主循环：取标注帧 → 编码推流；失败即丢该帧，不反压。
+    // WaitTakeFor 使用有限等待，既能避免空转，也能让 Stop 在没有帧时及时生效。
     void SendLoop() {
         while (!stop_requested.load()) {
             auto message = input_sub.WaitTakeFor(std::chrono::milliseconds(100));
@@ -68,6 +72,7 @@ struct VideoSender::Impl {
         }
     }
 
+    // 停止顺序：设置停止标志 → 关闭订阅唤醒等待 → 等待消费线程 → 停止编码后端。
     void Stop() {
         if (!thread.joinable()) {
             return;
@@ -96,6 +101,8 @@ VideoSender::~VideoSender() {
     SPDLOG_INFO("图传发送器销毁");
 }
 
+// 启动时创建/复用编码后端，建立会话后重新订阅输入 Topic，再启动消费线程。
+// 后端复用是为了避免 Stop/Start 重启时重复创建工厂对象造成会话抖动。
 bool VideoSender::Start() {
     if (impl_->thread.joinable()) {
         return true;  // 已启动，幂等
@@ -138,6 +145,7 @@ bool VideoSender::IsRunning() const {
     return impl_->thread.joinable();
 }
 
+// 绑定标注帧输入；默认小容量 + kDropOldest 使图传落后时优先淘汰旧帧。
 void VideoSender::SetInput(common::Topic<video::FrameHandle>& input) {
     // 队列容量小（默认 2）+ kDropOldest：图传落后只丢图传帧，不反压感知
     impl_->input_topic = &input;

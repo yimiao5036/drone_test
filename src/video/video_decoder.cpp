@@ -38,6 +38,9 @@ namespace drone::video {
 
 namespace {
 
+// 解码数据流：EncodedFrame 码流块 → FFmpeg 解码 → NV12 → VideoFramePool → FrameHandle Topic。
+// rkmpp 路径用于香橙派硬件解码，开发机或硬解不可用时回退 FFmpeg 软解。
+
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
@@ -104,6 +107,7 @@ struct VideoDecoder::Impl {
 
     /// 创建帧内存池（按解码分辨率）。
     /// @throw std::invalid_argument / std::bad_alloc 池参数非法或内存不足
+    // 池创建后在整个解码会话中复用，避免每帧申请大块 NV12 缓冲。
     void CreatePool(int width, int height) {
         VideoFrameInfo frame_template;
         frame_template.width = static_cast<std::uint32_t>(width);
@@ -121,6 +125,7 @@ struct VideoDecoder::Impl {
 
     /// 创建解码器；优先 rkmpp 硬解，不可用或失败时回退软解。
     /// @param parameter_sets 流级参数集（SPS/PPS 等，可空），在打开解码器前设置。
+    // 硬解创建失败不影响开发机软解验证，但实机需要关注 rkmpp/DRM 日志。
     bool CreateDecoder(common::VideoCodec codec,
                        const std::vector<uint8_t>& parameter_sets) {
         AVCodecID codec_id = AV_CODEC_ID_NONE;
@@ -270,6 +275,7 @@ struct VideoDecoder::Impl {
     }
 
     /// 解码线程主循环。
+    // 参数集消息只负责初始化；数据消息全部送入解码器，避免丢失 IDR 前的 SPS/PPS 小包。
     void DecodeLoop() {
         AVPacket* packet = av_packet_alloc();
         if (packet == nullptr) {
@@ -310,6 +316,7 @@ struct VideoDecoder::Impl {
     }
 
     /// 解码单个码流块并发布所有输出帧。
+    // packet 使用独立 FFmpeg 缓冲，处理完后由下一次 av_packet_unref 回收复用。
     void DecodeOne(const common::EncodedFrame& encoded, AVPacket* packet) {
         // 首个数据帧确定编码类型并创建解码器（参数集随帧或已由参数集消息提供）
         if (codec_ctx == nullptr && !decoder_creation_failed) {
@@ -377,6 +384,7 @@ struct VideoDecoder::Impl {
     }
 
     /// 将解码帧转为 NV12 写入内存池并发布。
+    // 硬件帧先 transfer 到系统内存；NV12 直接按 stride 拷贝，YUV420P 才走 sws 转换。
     void PublishFrame(AVFrame* source) {
         // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
         AVFrame* frame = source;
@@ -493,6 +501,7 @@ struct VideoDecoder::Impl {
         ++decoded_count;
     }
 
+    // 停止时关闭输入订阅并等待解码线程退出，保证不会有线程继续访问池或输出 Topic。
     void Stop() {
         if (!thread.joinable()) {
             return;
@@ -517,6 +526,7 @@ VideoDecoder::~VideoDecoder() {
     SPDLOG_INFO("视频解码器销毁");
 }
 
+// 启动：已知分辨率时预建池；未知分辨率则由首个解码帧懒创建。
 bool VideoDecoder::Start() {
     if (impl_->thread.joinable()) {
         return true;  // 已启动，幂等

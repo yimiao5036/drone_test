@@ -95,6 +95,7 @@ int WaitForFd(int fd, short events, std::chrono::milliseconds timeout,
 
 }  // namespace
 
+// 校验 termios 所需的设备路径、串口格式和超时参数；非法配置在构造阶段拒绝。
 void SerialPortConfig::Validate() const {
     if (device.empty()) {
         throw std::invalid_argument("串口设备路径不能为空");
@@ -133,6 +134,7 @@ SerialPort::~SerialPort() {
     SPDLOG_INFO("串口对象销毁: device={}", config_.device);
 }
 
+// 移动构造转移 fd 所有权；移动后源对象置为关闭状态，避免析构重复 close。
 SerialPort::SerialPort(SerialPort&& other) noexcept
     : config_(std::move(other.config_)),
       fd_(other.fd_),
@@ -142,6 +144,7 @@ SerialPort::SerialPort(SerialPort&& other) noexcept
     other.fd_ = -1;
 }
 
+// 移动赋值前先关闭当前 fd，再接管源对象资源。
 SerialPort& SerialPort::operator=(SerialPort&& other) noexcept {
     if (this != &other) {
         if (fd_ >= 0) {
@@ -157,6 +160,7 @@ SerialPort& SerialPort::operator=(SerialPort&& other) noexcept {
     return *this;
 }
 
+// 打开并配置串口：先建立非阻塞 fd，再应用 raw 模式、波特率、数据位、校验位和停止位。
 void SerialPort::Open() {
     if (fd_ >= 0) {
         return;  // 已打开，幂等
@@ -254,6 +258,7 @@ bool SerialPort::IsOpen() const {
     return fd_ >= 0;
 }
 
+// 读取单次字节流：0 表示超时/暂时无数据，-1 表示运行时错误，正数为实际字节数。
 std::ptrdiff_t SerialPort::Read(uint8_t* buffer, std::size_t size) {
     if (fd_ < 0 || buffer == nullptr || size == 0) {
         return -1;
@@ -298,6 +303,8 @@ std::ptrdiff_t SerialPort::Read(uint8_t* buffer, std::size_t size) {
     }
 }
 
+// 全量写入：循环处理 partial write，整个数据块共享一个绝对截止时间。
+// 超时或设备错误返回 false，禁止上层误以为完整协议帧已经发送。
 bool SerialPort::Write(const uint8_t* data, std::size_t size) {
     if (fd_ < 0 || (data == nullptr && size > 0)) {
         return false;
@@ -354,6 +361,7 @@ bool SerialPort::Write(const uint8_t* data, std::size_t size) {
     return true;
 }
 
+// 清空内核收发缓冲，用于链路重连或协议重新同步前丢弃残留字节。
 void SerialPort::Flush() {
     if (fd_ < 0) {
         return;

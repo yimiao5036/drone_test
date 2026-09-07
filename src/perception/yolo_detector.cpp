@@ -37,6 +37,9 @@ namespace drone::perception {
 
 namespace {
 
+// 检测数据流：解码帧 Topic → 独立推理线程 → IDetectionBackend → 每目标一条 DetectionResult。
+// 后端通过依赖注入隔离 RKNN 与开发机 Mock，检测器本身不绑定具体硬件。
+
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
@@ -54,6 +57,8 @@ std::int64_t SteadyNowMs() {
 // 默认后端工厂（条件编译）：
 // - DRONE_HAVE_RKNN 且模型路径非空 → RKNN 后端（香橙派）
 // - 否则返回 nullptr，由调用方注入或 Start 失败
+// 按编译选项创建默认后端：香橙派启用 RKNN 时创建真实后端，开发机返回空指针，
+// 测试或其它平台应通过构造函数注入 IDetectionBackend。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     const std::string& model_path, float conf_threshold, float nms_threshold) {
 #ifdef DRONE_HAVE_RKNN
@@ -108,6 +113,7 @@ struct YoloDetector::Impl {
     std::atomic<float> avg_inference_ms{0.f};
 
     /// 更新推理平均耗时（EMA）。
+    // α=0.1 在响应近期变化和抑制单帧抖动之间折中，不保存完整历史样本。
     void UpdateAvg(float elapsed_ms) {
         constexpr float kAlpha = 0.1f;
         float current = avg_inference_ms.load();
@@ -117,6 +123,7 @@ struct YoloDetector::Impl {
     }
 
     /// 检测线程主循环。
+    // 订阅队列采用有限等待，Stop 重置订阅后线程能及时从等待中退出。
     void DetectLoop() {
         while (!stop_requested.load()) {
             auto message = input_sub.WaitTakeFor(std::chrono::milliseconds(100));
@@ -135,7 +142,7 @@ struct YoloDetector::Impl {
                 continue;
             }
 
-            // 推理
+            // 推理：后端只返回原图坐标系检测框，检测器负责计时和消息格式转换。
             std::vector<BackendDetection> detections;
             const auto start = std::chrono::steady_clock::now();
             try {
@@ -153,7 +160,8 @@ struct YoloDetector::Impl {
             UpdateAvg(elapsed_ms);
             ++processed_count;
 
-            // 发布检测结果：每个目标一条消息，共享帧序号与推理耗时
+            // 发布检测结果：每个目标一条消息，共享帧序号与推理耗时。
+            // 一帧无目标时不发布消息，由叠加器/融合模块按帧序号处理“无检测”。
             const std::uint64_t frame_sequence = frame.Info().sequence;
             const std::int64_t source_time_ms = frame.Info().timestamp_ms;
             for (const auto& d : detections) {
@@ -178,6 +186,7 @@ struct YoloDetector::Impl {
         }
     }
 
+    // 停止顺序：设置停止标志 → Reset 输入订阅唤醒线程 → join，保证后端不被并发访问。
     void Stop() {
         if (!thread.joinable()) {
             return;
@@ -210,6 +219,7 @@ YoloDetector::~YoloDetector() {
     SPDLOG_INFO("YOLO 检测器销毁");
 }
 
+// 启动必须先确认后端存在且 Load 成功，避免无后端时线程空转；加载失败只记录一次。
 bool YoloDetector::Start() {
     if (impl_->thread.joinable()) {
         return true;  // 已启动，幂等

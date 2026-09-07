@@ -18,6 +18,14 @@
 
 namespace drone::application {
 
+// ============================================================================
+// DroneApplication —— 正式进程的组件所有者与装配根。
+//
+// 负责根据 AppConfig 创建组件、在启动前完成 Topic 接线，并按数据依赖顺序
+// 启动/停止各模块。main.cpp 不承载业务装配逻辑，只负责配置、日志、信号和等待。
+// 当前正式程序仍处于安全阶段：不绑定 Px4Setpoint，不发送飞行控制命令。
+// ============================================================================
+
 DroneApplication::DroneApplication(config::AppConfig config)
     : config_(std::move(config)) {
     BuildComponents();
@@ -32,6 +40,7 @@ DroneApplication::~DroneApplication() {
     SPDLOG_INFO("主程序集成销毁");
 }
 
+// 根据 runtime 开关创建组件。这里只负责所有权，不在此处启动线程或连接设备。
 void DroneApplication::BuildComponents() {
     if (config_.runtime.enable_video) {
         camera_ = std::make_unique<video::CameraReceiver>(config_.camera);
@@ -56,6 +65,7 @@ void DroneApplication::BuildComponents() {
     }
 }
 
+// 在所有组件 Start 前完成 Topic 接线；生产者/消费者的启动顺序由 Start 控制。
 void DroneApplication::BindTopics() {
     if (config_.runtime.enable_video) {
         decoder_->SetInput(camera_->StreamOutput());
@@ -82,6 +92,8 @@ void DroneApplication::BindTopics() {
     // 后续只有在状态机、控制器和真实拆桨台架门禁全部完成后才允许连接控制Topic。
 }
 
+// 启动独立模块。单个模块失败时记录降级并继续尝试其他模块；只要有一个模块
+// 成功启动就返回 true，避免视频、遥测等相互独立的数据链路被连带阻断。
 bool DroneApplication::Start() {
     if (running_) {
         return true;
@@ -165,6 +177,8 @@ bool DroneApplication::Start() {
     return true;
 }
 
+// 停止顺序与数据流相反：先停止状态生产者，再停止消费者，最后关闭视频链路。
+// Stop 幂等，析构阶段可以安全重复调用。
 void DroneApplication::Stop() {
     if (!running_) {
         return;

@@ -31,6 +31,9 @@ namespace drone::video {
 
 namespace {
 
+// CameraReceiver 数据流：avformat 拉取 RTSP 访问单元 → EncodedFrame Topic；
+// 本模块只负责接收与重连，不解码，参数集作为独立流级消息发送给解码器。
+
 /// 单调时钟毫秒（与消息头时间戳约定一致）。
 std::uint64_t SteadyNowMs() {
     return static_cast<std::uint64_t>(
@@ -54,6 +57,7 @@ std::string AvErrorToString(int errnum) {
 }  // namespace
 
 /// CameraReceiver 实现细节（PIMPL）：FFmpeg 上下文与接收线程。
+// PIMPL 隔离 FFmpeg 资源；接收线程独占 format_ctx，外部只读取原子统计量和输出 Topic。
 struct CameraReceiver::Impl {
     explicit Impl(CameraReceiverConfig config) : config(std::move(config)) {
         if (this->config.rtsp_url.empty()) {
@@ -84,12 +88,14 @@ struct CameraReceiver::Impl {
     common::Topic<common::EncodedFrame> stream_output;
 
     /// avformat 中断回调：停止请求时返回 1，打断阻塞中的网络读写。
+    // Stop 只需设置 stop_requested，FFmpeg 的阻塞调用会通过此回调尽快返回。
     static int InterruptCallback(void* opaque) {
         const auto* self = static_cast<Impl*>(opaque);
         return self->stop_requested.load() ? 1 : 0;
     }
 
     /// 打开 RTSP 流并完成探测；失败返回 false（已记录错误日志）。
+    // 建连成功后确定视频流索引和编码类型，并先发布一次流级 extradata 参数集。
     bool OpenStream() {
         if (stop_requested.load()) {
             return false;
@@ -200,6 +206,7 @@ struct CameraReceiver::Impl {
     }
 
     /// 接收线程主循环：建连 → 读包发布 → 断流重连。
+    // av_read_frame 返回的 packet 视为一个可交给解码器的访问单元，不在此处拆码流。
     void ReceiveLoop() {
         while (!stop_requested.load()) {
             if (!OpenStream()) {
@@ -250,6 +257,7 @@ struct CameraReceiver::Impl {
         }
     }
 
+    // 停止接收：先触发 FFmpeg 中断回调，再等待线程退出，最后关闭当前 RTSP 上下文。
     void Stop() {
         if (!thread.joinable()) {
             return;

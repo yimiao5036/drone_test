@@ -15,6 +15,9 @@ namespace drone::video {
 
 namespace {
 
+// 内存池数据流：一次性分配连续槽位 → Acquire 标记在途并生成 FrameHandle →
+// 最后一个 FrameHandle 析构回调 Recycle，槽位重新进入空闲栈。
+
 /// 校验对齐值必须是 2 的幂且非零。
 void ValidateAlignment(std::size_t alignment) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
@@ -30,6 +33,7 @@ bool ShouldLogThrottled(std::uint64_t count) {
 
 }  // namespace
 
+// 根据帧格式和 stride 计算实际像素缓冲大小；显式 buf_size 优先于自动推算。
 std::size_t VideoFramePool::ComputeBufferSize(const VideoFrameInfo& info) noexcept {
     if (info.buf_size > 0) {
         return info.buf_size;
@@ -53,6 +57,7 @@ std::size_t VideoFramePool::ComputeBufferSize(const VideoFrameInfo& info) noexce
     }
 }
 
+// 计算单槽位大小并向上对齐，保证槽位首地址满足 DMA/RGA/cache line 要求。
 std::size_t VideoFramePool::ComputeSlotSize(const VideoFrameInfo& info,
                                             std::size_t alignment) {
     ValidateAlignment(alignment);
@@ -105,6 +110,7 @@ VideoFramePool::VideoFramePool(std::size_t capacity,
                 static_cast<int>(frame_template_.format));
 }
 
+// 析构前要求所有 FrameHandle 已释放并归还槽位；这由 shared_ptr 生命周期闭环保证。
 VideoFramePool::~VideoFramePool() {
     // enable_shared_from_this 保证：只要有在途缓冲，池就不会析构（在途
     // FrameBuffer 持有池引用）。因此析构时全部槽位必然已归还，防御性断言。
@@ -115,6 +121,7 @@ VideoFramePool::~VideoFramePool() {
                 dropped_count_.load(), duplicate_recycle_count_.load());
 }
 
+// 归还槽位：在锁内验证状态并压回 LIFO 空闲栈，防止越界/重复归还破坏池状态。
 void VideoFramePool::Recycle(std::uint32_t slot_index) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     // 越界或重复归还（槽位不在在途状态）一律忽略，仅计数，便于监控逻辑缺陷。
@@ -134,6 +141,7 @@ void VideoFramePool::Recycle(std::uint32_t slot_index) noexcept {
     ++recycled_count_;
 }
 
+// 获取槽位：池空立即返回空句柄；成功后先在锁内标记在途，再在锁外构造 FrameBuffer。
 FrameHandle VideoFramePool::Acquire() noexcept {
     std::uint32_t slot_index = 0;
     {

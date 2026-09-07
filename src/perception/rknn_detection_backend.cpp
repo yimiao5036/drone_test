@@ -40,6 +40,9 @@ namespace drone::perception {
 
 namespace {
 
+// RKNN 后端的核心数据流：NV12 原图经 RGA 完整画面 letterbox 后送入 NPU，
+// 输出张量再转换为后处理需要的布局，最终返回源图像坐标系检测框。
+
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
@@ -68,6 +71,8 @@ inline float ClampF(float value, float min, float max) {
 
 /// NC1HWC2 → NCHW 格式转换（RKNN 硬件最优输出布局 → 后处理期望布局）。
 /// src/dst 布局见原型 NC1HWC2_i8_to_NCHW_i8，channel 为 NCHW 的 C。
+// RKNN 原生输出可能采用 NC1HWC2 布局，其中 C 被拆成 C1×C2；
+// 这里恢复为后处理使用的连续 NCHW，并按逻辑通道数裁掉对齐通道。
 void ConvertNc1hwc2ToNchw(const int8_t* src, int8_t* dst,
                           const rknn_tensor_attr& native_attr, int channel,
                           int h, int w) {
@@ -160,6 +165,7 @@ struct RknnDetectionBackend::Impl {
     std::string last_preprocess_error_;  ///< 最近一次 RGA 错误，仅检测线程访问
 
     /// 查询模型信息并识别单输出 `[1,5,N]` 或旧版多分支结构。
+    // 同时保存逻辑属性和 RKNN 原生属性：前者用于解码，后者用于零拷贝内存绑定。
     bool QueryModelInfo() {
         rknn_sdk_version sdk_version{};
         int ret = rknn_query(ctxs_[0], RKNN_QUERY_SDK_VERSION, &sdk_version,
@@ -276,6 +282,7 @@ struct RknnDetectionBackend::Impl {
     }
 
     /// 分配输入输出内存并绑定。
+    // 每个 NPU 上下文各持有一套输入/输出内存，输出缓冲预先分配，避免逐帧申请释放。
     bool InitializeMems() {
         const int ctx_count = 3;
         input_mems_.assign(ctx_count, {});
@@ -357,6 +364,8 @@ struct RknnDetectionBackend::Impl {
 
     /// NV12 → RGB letterbox 写入模型输入内存（RGA 硬件加速）。
     /// @return 0 成功；-1 参数非法或 RGA 失败
+    // 先对完整原图等比缩放，再把缩放结果复制到填充值为 114 的正方形画布，
+    // letterbox 参数同时保存给后处理做坐标逆变换。
     int Nv12LetterboxToRgb(const uint8_t* src, int src_w, int src_h, int src_wstride,
                            int target_size, uint8_t* dst_rgb, LetterBox* letterbox,
                            uint8_t fill_color = 114) {
@@ -431,6 +440,7 @@ struct RknnDetectionBackend::Impl {
     }
 
     /// 对一帧执行完整推理流程。
+    // 检测线程调用本函数；不在这里打印逐帧成功日志，错误按累计次数节流。
     std::vector<BackendDetection> DetectFrame(const video::FrameHandle& frame) {
         std::vector<BackendDetection> out;
         if (!loaded) {
@@ -559,6 +569,7 @@ struct RknnDetectionBackend::Impl {
     }
 };
 
+// 对外接口只管理 PIMPL 生命周期，RKNN 头文件和设备资源不泄漏到公共接口。
 RknnDetectionBackend::RknnDetectionBackend(std::string model_path,
                                            float conf_threshold,
                                            float nms_threshold)
@@ -567,6 +578,8 @@ RknnDetectionBackend::RknnDetectionBackend(std::string model_path,
 
 RknnDetectionBackend::~RknnDetectionBackend() = default;
 
+// 加载顺序：模型文件 → 主 RKNN 上下文 → 其余 NPU 上下文 → 张量属性 → 零拷贝内存。
+// 中间任一步失败都调用 ReleaseAll，保证部分初始化不会泄漏设备资源。
 bool RknnDetectionBackend::Load() {
     if (impl_->loaded) {
         return true;

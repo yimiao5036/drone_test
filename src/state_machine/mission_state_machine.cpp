@@ -22,6 +22,9 @@
 namespace drone::state_machine {
 namespace {
 
+// 当前实现是安全影子状态机：只消费目标/飞行/健康快照并发布 MissionStatus，
+// 不生成真实 ControlIntent，也不连接 PX4 控制输出。所有决策运行在独立线程中。
+
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
@@ -194,6 +197,7 @@ public:
 
 private:
     /// 状态机主循环：先进入SELF_CHECK，再按周期抽取最新输入并执行影子状态推进。
+    // 工作线程启动后先离开 BOOT 进入 SELF_CHECK；随后每个周期使用最新输入做一次决策。
     void WorkerLoop() {
         TransitionTo(common::MissionState::kSelfCheck, "初始化完成");
         while (running_.load(std::memory_order_acquire)) {
@@ -204,6 +208,7 @@ private:
     }
 
     /// 抽干各输入队列，只保留最新快照。状态判断必须基于同一周期的不可变快照。
+    // 每个决策周期先抽干输入队列，只保留最新快照，避免旧目标或旧飞行状态积压。
     void DrainInputs() {
         while (auto message = ground_target_subscription_.TryTake()) {
             latest_ground_target_ = **message;
@@ -226,6 +231,8 @@ private:
     }
 
     /// 根据当前状态、飞行快照和目标新鲜度推进影子状态，并周期发布MissionStatus。
+    // 影子决策：SELF_CHECK 等待导航就绪，READY 等待新鲜目标，GPS_APPROACH 只做告警维护。
+    // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
     void Evaluate(uint64_t now_ms) {
         uint32_t warnings = 0;
         if (!HasNavigationForGps()) {
@@ -256,6 +263,7 @@ private:
     }
 
     /// GPS位置引导的最低导航前置条件。后续接入控制前还需增加模式/高度/电池等门禁。
+    // GPS 引导最低门禁：连接、3D fix、全局位置和 Home 必须同时有效。
     bool HasNavigationForGps() const {
         if (!latest_flight_) {
             return false;
@@ -266,6 +274,7 @@ private:
     }
 
     /// 判断地面站目标是否仍在飞机端计算出的剩余有效期内。
+    // 目标有效期使用 GroundStationLink 校正后的 receive_time + remaining valid_for 判断。
     bool HasFreshGroundTarget(uint64_t now_ms) const {
         if (!latest_ground_target_) {
             return false;
@@ -301,6 +310,7 @@ private:
     }
 
     /// 发布任务状态回传。影子阶段control_source固定为0，表示未取得真实控制权。
+    // 发布不可变任务状态快照；影子阶段固定 control_source=0 且禁止拦截授权。
     void PublishStatus(uint64_t now_ms) {
         common::MissionStatus status;
         {
