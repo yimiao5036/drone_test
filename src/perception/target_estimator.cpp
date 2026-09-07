@@ -11,6 +11,9 @@
 
 namespace drone::perception {
 
+// 数据流：融合目标 + 地面站目标 → 平滑/预测 → EstimatedOutput Topic。
+// Stub 仅占位生命周期与输出主题，平滑与轨迹预测在实现期接入。
+
 TargetEstimatorStub::TargetEstimatorStub() {
     SPDLOG_INFO("目标估计部件骨架创建");
 }
@@ -37,9 +40,9 @@ bool TargetEstimatorStub::IsRunning() const {
     return running_;
 }
 
+// 骨架期忽略输入绑定；实现期保存订阅并启动消费。
 void TargetEstimatorStub::SetInputs(common::Topic<common::TargetState>& /*fused*/,
                                     common::Topic<common::GroundStationTarget>& /*ground*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动消费
 }
 
 common::Topic<common::TargetState>& TargetEstimatorStub::EstimatedOutput() {
