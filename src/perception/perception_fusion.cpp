@@ -11,6 +11,9 @@
 
 namespace drone::perception {
 
+// 数据流：检测/光流/激光/飞行状态多源 → 时间对齐融合 → TargetState Topic。
+// Stub 仅占位生命周期与输出主题，多源对齐与融合算法在实现期接入。
+
 PerceptionFusionStub::PerceptionFusionStub() {
     SPDLOG_INFO("感知融合部件骨架创建");
 }
@@ -41,7 +44,7 @@ void PerceptionFusionStub::SetInputs(common::Topic<common::DetectionResult>& /*d
                                      common::Topic<common::OpticalFlowResult>& /*flow*/,
                                      common::Topic<common::LaserRangeSample>& /*range*/,
                                      common::Topic<common::FlightStateSnapshot>& /*flight*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动消费
+    // 骨架期忽略输入绑定；实现期保存订阅并启动消费。
 }
 
 common::Topic<common::TargetState>& PerceptionFusionStub::TargetOutput() {

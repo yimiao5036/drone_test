@@ -16,6 +16,10 @@ namespace drone::perception {
 
 namespace {
 
+// 后处理只处理模型输出数值，不依赖 RKNN/RGA/OpenCV。
+// 当前兼容两种输出：旧版多分支 box/score 张量，以及正式模型的 [1,5,N]
+// 归一化 xywh 单输出；最终统一输出源图像坐标系的检测框。
+
 /// 数值夹取（用于量化参数换算）。
 inline std::int32_t ClipFloat(float value, float min, float max) {
     return static_cast<std::int32_t>(value <= min ? min : (value >= max ? max : value));
@@ -69,6 +73,7 @@ void ComputeDfl(const float* tensor, int dfl_len, float* box) {
 
 }  // namespace
 
+// 解码一个特征图分支：先在量化域做阈值过滤，再反量化框参数并转换为模型坐标。
 int DecodeBranch(const BranchOutput& branch, int stride, int num_classes,
                  float threshold, std::vector<float>& boxes_xywh,
                  std::vector<float>& obj_probs, std::vector<int>& class_ids) {
@@ -156,6 +161,7 @@ int DecodeBranch(const BranchOutput& branch, int stride, int num_classes,
     return valid_count;
 }
 
+// 按置信度降序重排分数与原候选索引，后续 NMS 依赖“高分优先保留”。
 void SortDescending(std::vector<float>& scores, std::vector<int>& indices) {
     const std::size_t n = scores.size();
     if (indices.empty()) {
@@ -178,6 +184,7 @@ void SortDescending(std::vector<float>& scores, std::vector<int>& indices) {
     }
 }
 
+// 对单个类别执行原地 NMS：order 中的 -1 表示候选已被更高分框抑制。
 int Nms(int valid_count, const std::vector<float>& boxes_xywh,
         const std::vector<int>& class_ids, std::vector<int>& order,
         int filter_class_id, float threshold) {
@@ -210,6 +217,8 @@ int Nms(int valid_count, const std::vector<float>& boxes_xywh,
     return 0;
 }
 
+// 正式单输出模型后处理：[1,5,N] 按通道优先读取，反量化归一化 xywh，
+// 通过单类别 NMS 后撤销 letterbox 映射回源图坐标。
 int PostProcessNormalizedXywh(const NormalizedXywhTensor& tensor,
                               int model_width, int model_height,
                               float conf_threshold, float nms_threshold,
@@ -230,6 +239,7 @@ int PostProcessNormalizedXywh(const NormalizedXywhTensor& tensor,
 
     const int candidates = tensor.candidate_count;
     for (int i = 0; i < candidates; ++i) {
+        // 张量布局为 [channel][candidate]，第 4 通道是 confidence。
         const float score = DequantToF32(tensor.data[4 * candidates + i],
                                          tensor.zp, tensor.scale);
         if (score < conf_threshold) {
@@ -300,6 +310,7 @@ int PostProcessNormalizedXywh(const NormalizedXywhTensor& tensor,
     return result_count;
 }
 
+// 旧版多分支后处理：逐分支解码后合并候选，再按类别做 NMS 和 letterbox 逆变换。
 int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
                 float conf_threshold, float nms_threshold, int num_classes,
                 const LetterBox& letterbox, std::vector<YoloDetection>* out) {

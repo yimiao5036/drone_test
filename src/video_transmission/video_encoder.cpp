@@ -41,6 +41,9 @@ namespace drone::video_transmission {
 
 namespace {
 
+// FFmpeg 编码后端数据流：NV12 FrameHandle → 编码输入帧 → 编码包 → RTSP/mpegts。
+// rkmpp 路径直接接收 NV12；libx264/libx265 路径先转换为 YUV420P。
+
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
@@ -56,6 +59,8 @@ std::string AvErrorToString(int errnum) {
 }  // namespace
 
 /// 编码后端实现细节（PIMPL）：FFmpeg 编码上下文与 RTSP 输出会话。
+// PIMPL 资源持有者：统一管理编码器、封装器、帧/包缓冲和软编转换上下文。
+// 所有方法由 VideoSender 单线程调用，因此内部不额外加锁。
 struct VideoEncoderImpl {
     EncoderBackendConfig config;
     std::atomic<uint64_t> sent_count{0};
@@ -76,6 +81,7 @@ struct VideoEncoderImpl {
     bool is_file_ = false;   // mpegts 文件输出：由封装器自理 SPS/PPS，不手动拼 extradata
     std::int64_t frame_counter_ = 0;  // 单调递增帧序号（编码输入 PTS）
 
+    // 构造阶段只校验静态配置，不打开网络会话；真正的 FFmpeg 资源在 Start 中创建。
     explicit VideoEncoderImpl(EncoderBackendConfig cfg) : config(std::move(cfg)) {
         if (config.url.empty()) {
             throw std::invalid_argument("图传推送地址 url 不能为空");
@@ -95,6 +101,7 @@ struct VideoEncoderImpl {
     ~VideoEncoderImpl() { Stop(); }
 
     /// 依据配置与可用性选择编码器名字："h264"/"h265" → rkmpp 或软编码。
+    // 硬件编码器不存在时回退到 libx264/libx265，便于开发机验证；香橙派优先 rkmpp。
     std::string PickEncoderName() const {
         const bool h264 = config.codec == "h264";
         const bool h265 = config.codec == "h265";
@@ -111,6 +118,8 @@ struct VideoEncoderImpl {
         return h264 ? "libx264" : "libx265";
     }
 
+    // 启动顺序：选择/打开编码器 → 创建输出封装 → 建立输出流 → 分配帧/包缓冲。
+    // 失败由 catch 统一 Stop 回滚，避免 RTSP 会话或 FFmpeg 对象残留。
     bool Start() {
         if (running.load()) {
             return true;  // 幂等
@@ -265,6 +274,7 @@ struct VideoEncoderImpl {
     }
 
     /// 取出编码器中所有已就绪的包并推流。
+    // 不能依赖 running 标志：Stop 冲刷时 running 已经置 false，必须持续取到 EAGAIN/EOF。
     bool DrainPackets() {
         for (;;) {
             const int ret = avcodec_receive_packet(codec_ctx_, packet_);
@@ -286,6 +296,7 @@ struct VideoEncoderImpl {
     }
 
     /// 编码输出的包做时间戳换算、关键帧补 SPS/PPS 后写出。
+    // RTSP 中途接入时关键帧需要携带参数集；mpegts 文件由封装器自行管理参数集。
     bool WritePacket() {
         av_packet_rescale_ts(packet_, codec_ctx_->time_base, stream_->time_base);
         packet_->stream_index = stream_->index;
@@ -323,6 +334,8 @@ struct VideoEncoderImpl {
         return true;
     }
 
+    // 将共享 NV12 FrameHandle 拷贝到可复用的 FFmpeg 输入帧，再送入编码器并排空输出包。
+    // 拷贝按源/目标 stride 逐行进行，不能假设池内缓冲是紧凑排列。
     bool EncodeFrame(const video::FrameHandle& frame) {
         if (!running.load()) {
             ++error_count;
@@ -404,6 +417,8 @@ struct VideoEncoderImpl {
         return DrainPackets();
     }
 
+    // 停止顺序：停止接收新帧 → 发送空帧冲刷编码器 → 写 trailer → 释放包/帧/封装器/编码器。
+    // 该顺序保证延迟编码包先写出，再关闭 RTSP 或本地文件会话。
     void Stop() {
         if (!running.load()) {
             return;

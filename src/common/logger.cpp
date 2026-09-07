@@ -18,6 +18,9 @@
 namespace drone::common {
 namespace {
 
+// 日志初始化数据流：配置目录/等级 → 创建递增文件名 → 初始化 spdlog 异步线程池 →
+// 设置全局默认 logger，业务模块通过 SPDLOG_* 宏写入同一文件。
+
 // 日志格式：时间(毫秒) / 级别(带颜色) / 线程 ID / 消息
 constexpr char kLogPattern[] = "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [t:%t] %v";
 
@@ -38,6 +41,7 @@ constexpr std::time_t kTrustedTimeEpoch = 1577836800;
 constexpr std::size_t kRandomSuffixLength = 12;
 
 /// 系统时间可信时返回 "yyyyMMdd_HHmmss"，否则返回空。
+// 系统时钟只用于日志文件名；检测到未初始化 RTC 时返回空，避免产生误导性日期。
 std::optional<std::string> FormatNowIfTrusted() {
     const auto now = std::chrono::system_clock::now();
     const std::time_t time_now = std::chrono::system_clock::to_time_t(now);
@@ -58,6 +62,7 @@ std::optional<std::string> FormatNowIfTrusted() {
 }
 
 /// 生成指定长度的随机 hex 字符（用于系统时间不可信时的文件名后缀）。
+// RTC 不可信时生成随机后缀，保证多次启动仍能创建不同日志文件。
 std::string GenerateRandomHex(std::size_t length) {
     static constexpr char kHexDigits[] = "0123456789abcdef";
     std::random_device random_device;
@@ -73,6 +78,7 @@ std::string GenerateRandomHex(std::size_t length) {
 
 /// 扫描日志目录，返回本次运行应使用的编号（已有最大编号 + 1，无则从 1 起）。
 /// 编号取文件名开头 4 位数字，如 "0001_xxx.log" -> 1。
+// 扫描已有日志文件名中的四位前缀，计算本次运行的下一个编号。
 int FindNextRunNumber(const std::filesystem::path& dir) {
     int max_number = 0;
     std::error_code error;
@@ -95,6 +101,7 @@ int FindNextRunNumber(const std::filesystem::path& dir) {
 }
 
 /// 组装本次运行的日志文件路径：<log_dir>/<编号>_<时间或随机字符>.log
+// 创建日志目录并生成 <编号>_<可信时间或随机后缀>.log，绝不覆盖历史文件。
 std::filesystem::path BuildLogFilePath(const std::string& log_dir) {
     const std::filesystem::path dir(log_dir);
     std::error_code error;
@@ -117,6 +124,7 @@ std::filesystem::path BuildLogFilePath(const std::string& log_dir) {
 
 }  // namespace
 
+// 初始化全局异步文件日志。函数幂等，重复调用返回首次创建的 logger。
 std::shared_ptr<spdlog::logger> InitializeAsyncLogger(
     const std::string& log_dir, spdlog::level::level_enum level) {
     // 幂等：已经初始化过则直接返回既有实例
