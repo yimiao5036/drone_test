@@ -15,6 +15,18 @@ namespace {
 
 using json = nlohmann::json;
 
+// ============================================================================
+// config —— 正式主程序配置文件加载与校验。
+//
+// 职责：
+//   - 从 JSON 读取日志、runtime 开关、视频、YOLO、PX4、地面站等配置节；
+//   - 统一做类型/范围/一致性校验（身份、端口、超时、队列容量、开关约束）；
+//   - 将资源相对路径按可执行文件目录解析为绝对路径（如模型、日志目录）；
+//   - 对 video.output_rtsp 的身份占位符做展开（如 /drone_{component}_{system}）。
+// 边界：只做解析与校验，不创建任何设备/线程，不读取业务运行期状态。
+// ============================================================================
+
+// 读取 JSON 文件并解析为 nlohmann::json 对象；失败时抛带上下文的运行时异常。
 json LoadJson(const std::string& path) {
     std::ifstream input(path);
     if (!input.is_open()) {
@@ -27,6 +39,7 @@ json LoadJson(const std::string& path) {
     }
 }
 
+// 读取 1~255 之间的整数（常用于 MAVLink system/component ID 与数据位）。
 uint8_t ReadUint8(const json& object, const char* key) {
     const int value = object.at(key).get<int>();
     if (value <= 0 || value > 255) {
@@ -35,6 +48,7 @@ uint8_t ReadUint8(const json& object, const char* key) {
     return static_cast<uint8_t>(value);
 }
 
+// 读取合法 UDP/TCP 端口（1~65535）。
 uint16_t ReadPort(const json& object, const char* key) {
     const int value = object.at(key).get<int>();
     if (value <= 0 || value > 65535) {
@@ -43,6 +57,7 @@ uint16_t ReadPort(const json& object, const char* key) {
     return static_cast<uint16_t>(value);
 }
 
+// 读取正数毫秒值，用于各类心跳/遥测/超时/发送间隔。
 std::chrono::milliseconds ReadPositiveMilliseconds(const json& object,
                                                    const char* key) {
     const int64_t value = object.at(key).get<int64_t>();
@@ -52,6 +67,8 @@ std::chrono::milliseconds ReadPositiveMilliseconds(const json& object,
     return std::chrono::milliseconds(value);
 }
 
+// 资源相对路径解析：绝对路径（以 / 开头）或空串原样返回，
+// 否则拼接在可执行文件目录后，避免依赖启动时的当前工作目录。
 std::string ResolveAssetPath(const std::string& value,
                              const std::string& executable_directory) {
     if (value.empty() || value.front() == '/') {
@@ -60,10 +77,12 @@ std::string ResolveAssetPath(const std::string& value,
     return executable_directory + '/' + value;
 }
 
+// uint8_t 转十进制字符串，用于输出身份占位符替换。
 std::string ToString(uint8_t value) {
     return std::to_string(static_cast<unsigned int>(value));
 }
 
+// 字符串原地替换所有出现位置（用于占位符展开）。
 void ReplaceAll(std::string& value, const std::string& from,
                 const std::string& to) {
     std::size_t position = 0;
@@ -73,12 +92,15 @@ void ReplaceAll(std::string& value, const std::string& from,
     }
 }
 
+// 判断图传输出地址是否包含任一身份占位符。
 bool HasIdentityPlaceholder(const std::string& value) {
     return value.find("{aircraft_system_id}") != std::string::npos ||
            value.find("{aircraft_component_id}") != std::string::npos ||
            value.find("{aircraft_number}") != std::string::npos;
 }
 
+// 图传 RTSP 输出地址展开：把身份占位符替换为地面站配置中的二元身份/编号，
+// 使不同飞机的推流路径彼此区分（如 /drone_25_1）。含占位符却无地面站配置则报错。
 std::string ResolveVideoOutputRtsp(
     std::string value,
     const communication::GroundStationLinkConfig* ground_station) {
@@ -97,6 +119,7 @@ std::string ResolveVideoOutputRtsp(
     return value;
 }
 
+// 解析地面站配置节：身份、心跳、时间同步、目标协议、遥测发送周期、串口参数。
 communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& root) {
     const json& ground = root.at("ground_station");
@@ -106,11 +129,13 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& target_input = ground.at("target_input");
 
     communication::GroundStationLinkConfig config;
+    // 飞机二元身份：system=同类型编号，component=功能类别（网捕25/火箭26）。
     config.aircraft_system_id = ReadUint8(ground, "aircraft_system_id");
     config.aircraft_component_id = ReadUint8(ground, "aircraft_component_id");
     config.aircraft_type = ground.at("aircraft_type").get<std::string>();
     config.aircraft_number = ReadUint8(ground, "aircraft_number");
     config.callsign = ground.at("callsign").get<std::string>();
+    // 地面站固定来源，生产为 255/190（MAV_TYPE_GCS 心跳）。
     config.ground_system_id = ReadUint8(ground, "ground_system_id");
     config.ground_component_id = ReadUint8(ground, "ground_component_id");
     config.mavlink_version = ReadUint8(ground, "mavlink_version");
@@ -118,6 +143,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         ReadPositiveMilliseconds(ground, "heartbeat_send_interval_ms");
     config.heartbeat_timeout =
         ReadPositiveMilliseconds(ground, "heartbeat_timeout_ms");
+    // TIMESYNC 第一阶段参数：采样周期、同步窗口、超时、RTT/offset 门限与样本窗口。
     config.enable_time_sync = time_sync.at("enabled").get<bool>();
     config.time_sync_acquire_interval =
         ReadPositiveMilliseconds(time_sync, "acquire_interval_ms");
@@ -129,6 +155,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         ReadPositiveMilliseconds(time_sync, "max_rtt_ms");
     config.time_sync_max_offset_jump =
         ReadPositiveMilliseconds(time_sync, "max_offset_jump_ms");
+    // 样本数与窗口容量必须为正数，用于中位数估计与低 RTT 样本窗口。
     const int64_t minimum_samples =
         time_sync.at("minimum_samples").get<int64_t>();
     const int64_t window_capacity =
@@ -140,6 +167,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         static_cast<std::size_t>(minimum_samples);
     config.time_sync_window_capacity =
         static_cast<std::size_t>(window_capacity);
+    // 目标 UPDATE/ACK 协议的有效期上下限、剩余有效/传输延迟/未来容忍门限。
     config.target_minimum_valid_for =
         ReadPositiveMilliseconds(target_input, "minimum_valid_for_ms");
     config.target_maximum_valid_for =
@@ -150,6 +178,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         ReadPositiveMilliseconds(target_input, "maximum_transport_delay_ms");
     config.target_future_tolerance =
         ReadPositiveMilliseconds(target_input, "future_tolerance_ms");
+    // 各类标准遥测的下行发送周期（毫秒），按 JSON 节流限频。
     config.attitude_send_interval = ReadPositiveMilliseconds(rates, "attitude");
     config.local_position_send_interval =
         ReadPositiveMilliseconds(rates, "local_position");
@@ -163,6 +192,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     config.battery_send_interval = ReadPositiveMilliseconds(rates, "battery");
     config.home_send_interval = ReadPositiveMilliseconds(rates, "home");
 
+    // 地面站订阅 PX4 FlightStateSnapshot 的队列容量。
     const int64_t queue_capacity =
         ground.at("flight_state_queue_capacity").get<int64_t>();
     if (queue_capacity <= 0) {
@@ -171,6 +201,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     config.flight_state_queue_capacity =
         static_cast<std::size_t>(queue_capacity);
 
+    // 地面站串口参数（如 /dev/ttyS6 @115200 8N1），parity 必须是单个字符 N/E/O。
     config.serial.device = serial.at("device").get<std::string>();
     config.serial.baud_rate = serial.at("baud_rate").get<int>();
     config.serial.data_bits = ReadUint8(serial, "data_bits");
@@ -189,6 +220,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     return config;
 }
 
+// 解析 PX4 配置节：传输方式、身份、心跳/遥测/命令/setpoint 参数与串口/UDP。
 communication::Px4LinkConfig ParsePx4Config(const json& root) {
     const json& px4 = root.at("px4");
     const json& serial = px4.at("serial");
@@ -197,6 +229,7 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
     communication::Px4LinkConfig config;
     config.transport = px4.at("transport").get<std::string>();
     config.firmware_version = px4.at("firmware_version").get<std::string>();
+    // 机载电脑身份（生产 1/191）与目标 PX4 身份（生产 1/1）。
     config.onboard_system_id = ReadUint8(px4, "onboard_system_id");
     config.onboard_component_id = ReadUint8(px4, "onboard_component_id");
     config.target_system_id = ReadUint8(px4, "target_system_id");
@@ -215,6 +248,7 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
         ReadPositiveMilliseconds(px4, "setpoint_send_interval_ms");
     config.setpoint_timeout = ReadPositiveMilliseconds(px4, "setpoint_timeout_ms");
 
+    // setpoint 丢旧留新，command 有序队列；两者容量都必须为正数。
     const int64_t setpoint_capacity =
         px4.at("setpoint_queue_capacity").get<int64_t>();
     const int64_t command_capacity =
@@ -225,6 +259,7 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
     config.setpoint_queue_capacity = static_cast<std::size_t>(setpoint_capacity);
     config.command_queue_capacity = static_cast<std::size_t>(command_capacity);
 
+    // 一次性遥测请求：AUTOPILOT_VERSION / HOME_POSITION 等。
     for (const auto& item : px4.at("one_shot_message_requests")) {
         const int64_t message_id = item.get<int64_t>();
         if (message_id < 0 || message_id > 0xFFFFFF) {
@@ -232,6 +267,7 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
         }
         config.one_shot_message_requests.push_back(static_cast<uint32_t>(message_id));
     }
+    // 频率性遥测请求：按 message_id + interval_us 设置消息发送周期。
     for (const auto& item : px4.at("message_interval_requests")) {
         const int64_t message_id = item.at("message_id").get<int64_t>();
         const int64_t interval_us = item.at("interval_us").get<int64_t>();
@@ -243,6 +279,7 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
             {static_cast<uint32_t>(message_id), static_cast<int32_t>(interval_us)});
     }
 
+    // PX4 生产串口参数（/dev/ttyS1 @115200 8N1）。
     config.serial.device = serial.at("device").get<std::string>();
     config.serial.baud_rate = serial.at("baud_rate").get<int>();
     config.serial.data_bits = ReadUint8(serial, "data_bits");
@@ -257,6 +294,7 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
     config.serial.write_timeout =
         ReadPositiveMilliseconds(serial, "write_timeout_ms");
 
+    // SITL / 网络数传的 UDP 参数；生产默认 transport=serial 时此节仅作校验用。
     config.udp.bind_address = udp.at("bind_address").get<std::string>();
     config.udp.bind_port = ReadPort(udp, "bind_port");
     config.udp.remote_address = udp.at("remote_address").get<std::string>();
@@ -269,6 +307,9 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
 
 }  // namespace
 
+// 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
+// config/config.json，最后回退当前目录的 ./config/config.json；都失败则抛错。
+// 这样从部署目录直接运行也能稳定加载配置，不依赖启动时的工作目录。
 std::string ResolveConfigPath(const std::string& executable_directory,
                               const std::string& requested_path) {
     if (!requested_path.empty()) {
@@ -294,15 +335,19 @@ std::string ResolveConfigPath(const std::string& executable_directory,
     throw std::runtime_error("未找到config/config.json");
 }
 
+// 加载并校验正式主程序配置。整体流程：读 JSON → 逐节填充 → 交叉约束校验。
+// 资源相对路径（模型、日志目录）按可执行文件目录解析。
 AppConfig LoadAppConfig(const std::string& path,
                         const std::string& executable_directory) {
     const json root = LoadJson(path);
     AppConfig config;
 
+    // 日志配置：输出目录与等级。
     const json log = root.value("log", json::object());
     config.log.directory = log.value("dir", std::string("logs/"));
     config.log.level = log.value("level", std::string("info"));
 
+    // runtime 开关与一致性校验：控制依赖 PX4、地面站依赖 PX4、控制装配未开放。
     const json runtime = root.value("runtime", json::object());
     config.runtime.enable_video = runtime.value("enable_video", true);
     config.runtime.enable_px4 = runtime.value("enable_px4", true);

@@ -25,16 +25,36 @@
 namespace drone::communication {
 namespace {
 
+// ============================================================================
+// GroundStationLink —— 地面站数传链路真实实现。
+//
+// 职责：
+//   - 订阅 Px4Link 的 FlightStateSnapshot，按配置限频编码标准 MAVLink 2 遥测
+//     （HEARTBEAT / ATTITUDE / LOCAL_POSITION_NED / GLOBAL_POSITION_INT /
+//       GPS_RAW_INT / EXTENDED_SYS_STATE / SYS_STATUS / BATTERY_STATUS /
+//       HOME_POSITION）下行给地面站；
+//   - 识别来源 255/190 的 MAV_TYPE_GCS 心跳，维护地面站在线状态；
+//   - 实现标准 MAVLink TIMESYNC 第一阶段，估算飞机相对地面站的 offset/RTT/jitter；
+//   - 通过 V2_EXTENSION(65010/65011) 接收 TRACK_TARGET_UPDATE 并回 ACK，
+//     合法目标发布 GroundStationTarget，错误地址/非法字段回拒绝 ACK；
+//   - 不向 PX4 发送任何控制命令，不转发地面站到飞控的指令。
+// 边界：本模块只做遥测/时间同步/目标接收，任务与健康自定义协议仅预留接口。
+// 线程模型：一条独占通信线程读写串口，通过阻塞读 + Topic 订阅队列获取飞行快照。
+// ============================================================================
+
+// 单调时钟毫秒：用于心跳超时、样本老化等粗粒度判断。
 uint64_t MonotonicMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// 单调时钟纳秒：用于 TIMESYNC 请求/响应的精确时间戳。
 int64_t MonotonicNs() {
     return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// 求两个带符号数的绝对差值，规避负数差值可能带来的符号问题。
 uint64_t AbsoluteDifference(int64_t left, int64_t right) {
     return left >= right ? static_cast<uint64_t>(left - right)
                          : static_cast<uint64_t>(right - left);
@@ -122,6 +142,7 @@ bool ShouldLogThrottled(uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+// 把浮点物理量乘 scale 换算成 MAVLink 整数字段，跳过非有限值并夹逼到 [min,max]。
 template <typename T>
 T ClampRounded(float value, float scale, T minimum, T maximum) {
     if (!std::isfinite(value)) {
@@ -132,6 +153,7 @@ T ClampRounded(float value, float scale, T minimum, T maximum) {
                                      static_cast<double>(maximum)));
 }
 
+// 航向弧度 → 0..35999 厘度；非有限值返回 UINT16_MAX（表示未知）。
 uint16_t HeadingCentidegrees(float yaw_rad) {
     if (!std::isfinite(yaw_rad)) {
         return std::numeric_limits<uint16_t>::max();
@@ -144,6 +166,7 @@ uint16_t HeadingCentidegrees(float yaw_rad) {
     return static_cast<uint16_t>(std::lround(degrees * 100.0)) % 36000U;
 }
 
+// 小端读取 V2_EXTENSION payload 指定偏移的字段（整型直接 memcpy 到目标小端）。
 template <typename T>
 T ReadLe(const uint8_t* payload, std::size_t offset) {
     T value{};
@@ -151,6 +174,7 @@ T ReadLe(const uint8_t* payload, std::size_t offset) {
     return value;
 }
 
+// 小端写入 V2_EXTENSION payload 指定偏移的字段。
 template <typename T>
 void WriteLe(std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN>& payload,
              std::size_t offset, T value) {
@@ -159,8 +183,10 @@ void WriteLe(std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN>& pa
 
 }  // namespace
 
+// 地面站配置校验：身份/类型匹配、来源固定 255/190、版本、各周期与门限为正数。
 void GroundStationLinkConfig::Validate() const {
     serial.Validate();
+    // aircraft_system_id 与 aircraft_number 都是同类型编号，必须一致且非广播(255)。
     if (aircraft_system_id == 0 || aircraft_system_id == 255) {
         throw std::invalid_argument("地面站链路 aircraft_system_id 必须在1~254之间");
     }
@@ -234,6 +260,8 @@ void GroundStationLinkConfig::Validate() const {
     }
 }
 
+// PIMPL：真实实现封装在 Impl，对外只暴露 GroundStationLink 的稳定接口。
+// 内部持有串口、独占 MavlinkHandler（避免与 PX4 链路共享序号/半包）与运行状态。
 class GroundStationLink::Impl final {
 public:
     explicit Impl(GroundStationLinkConfig config)
@@ -255,6 +283,8 @@ public:
         SPDLOG_INFO("地面站通信部件销毁: serial={}", config_.serial.device);
     }
 
+    // 启动：幂等。要求已绑定 FlightStateSnapshot Topic，随后打开串口、复位
+    // MAVLink 状态、订阅飞行快照，并启动工作线程。任一步失败则回滚并返回 false。
     bool Start() {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
         if (running_.load(std::memory_order_acquire)) {
@@ -267,7 +297,7 @@ public:
 
         try {
             serial_.Open();
-            serial_.Flush();
+            serial_.Flush();  // 清空残留字节，避免把旧数据当新帧
             mavlink_.Reset();
             flight_state_subscription_ = flight_state_topic_->Subscribe(
                 config_.flight_state_queue_capacity,
@@ -293,6 +323,7 @@ public:
         return true;
     }
 
+    // 停止：置位停止标志并等待工作线程退出，再关闭串口、清订阅与同步状态。幂等。
     void Stop() {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
         if (!running_.exchange(false, std::memory_order_acq_rel)) {
@@ -319,6 +350,7 @@ public:
 
     common::Topic<common::GroundStationTarget>& TargetOutput() { return target_output_; }
 
+    // 绑定飞行状态输入。必须在 Start 前调用，运行中不允许改绑。
     void SetFlightStateInput(common::Topic<common::FlightStateSnapshot>& topic) {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
         if (running_.load(std::memory_order_acquire)) {
@@ -371,12 +403,15 @@ private:
         std::chrono::steady_clock::time_point home;
     };
 
+    // 工作线程主循环：阻塞读串口 → 增量解析 MAVLink → 消费飞行快照 →
+    // 心跳/时间同步超时检查 → 各类遥测按各自截止时间发送。
     void WorkerLoop() {
         const auto now = std::chrono::steady_clock::now();
         Deadlines deadlines{now, now, now, now, now, now, now, now, now, now};
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
+            // 一次读取尽可能多的串口字节并交给 MavlinkHandler 增量解析。
             const std::ptrdiff_t count = serial_.Read(read_buffer.data(), read_buffer.size());
             if (count > 0) {
                 mavlink_.Feed(read_buffer.data(), static_cast<std::size_t>(count),
@@ -388,6 +423,7 @@ private:
                 std::this_thread::sleep_for(config_.serial.read_timeout);
             }
 
+            // 把 PX4 快照队列里最新的状态捞出，并判断是否有“事件”需要立即下行。
             DrainFlightState();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
@@ -430,6 +466,7 @@ private:
         }
     }
 
+    // 到期的遥测发送；每类维护各自 deadline，按 JSON 周期限频。
     template <typename Sender>
     void SendIfDue(const std::chrono::steady_clock::time_point& now,
                    std::chrono::steady_clock::time_point& deadline,
@@ -441,6 +478,8 @@ private:
         deadline = now + interval;
     }
 
+    // 消费飞行快照队列；对比新旧状态，若关键字段变化则立即发送关键遥测，
+    // 以减少地面站对该事件的显示延迟，不必等周期到点。
     void DrainFlightState() {
         while (auto message = flight_state_subscription_.TryTake()) {
             const common::FlightStateSnapshot& next = **message;
@@ -466,6 +505,7 @@ private:
         }
     }
 
+    // 分发已解析的 MAVLink 消息；目前只处理心跳、TIMESYNC 与 V2_EXTENSION 目标。
     void HandleMessage(const mavlink_message_t& message) {
         receive_count_.fetch_add(1, std::memory_order_relaxed);
         if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
@@ -477,6 +517,7 @@ private:
         }
     }
 
+    // 只接受来源 255/190 且类型为 MAV_TYPE_GCS 的心跳；首次建立时记 INFO 并置在线。
     void HandleHeartbeat(const mavlink_message_t& message) {
         mavlink_heartbeat_t heartbeat{};
         mavlink_msg_heartbeat_decode(&message, &heartbeat);
@@ -492,6 +533,8 @@ private:
         }
     }
 
+    // 处理地面站 TIMESYNC：tc1==0 表示对端请求，我们定向/广播回复；
+    // 否则是本机请求的响应，校验目标身份后进入估计。
     void HandleTimeSync(const mavlink_message_t& message) {
         if (!config_.enable_time_sync ||
             message.sysid != config_.ground_system_id ||
@@ -522,6 +565,7 @@ private:
         HandleTimeSyncResponse(time_sync);
     }
 
+    // TRACK_TARGET_UPDATE 的有效负载镜像（小端，当前用前 55 字节）。
     struct TrackTargetUpdatePayload {
         uint64_t source_time_ms = 0;
         uint32_t ground_station_boot_id = 0;
@@ -545,6 +589,7 @@ private:
         uint8_t alt_reference = 0;
     };
 
+    // 处理 V2_EXTENSION：只收地面站来源，识别目标协议 message_type 并转入更新处理。
     void HandleV2Extension(const mavlink_message_t& message) {
         if (message.sysid != config_.ground_system_id ||
             message.compid != config_.ground_component_id) {
@@ -564,6 +609,9 @@ private:
         HandleTrackTargetUpdate(extension);
     }
 
+    // 处理 TRACK_TARGET_UPDATE：依次做地址匹配、协议版本、坐标、身份、时间同步、
+    // 序号、字段范围与时效校验，全部通过后发布 GroundStationTarget 并回 ACCEPTED ACK；
+    // 任一失败按语义回对应拒绝 ACK。
     void HandleTrackTargetUpdate(const mavlink_v2_extension_t& extension) {
         const uint64_t receive_count = ++target_update_receive_count_;
         if (ShouldLogThrottled(receive_count)) {
@@ -604,32 +652,38 @@ private:
 
         const uint64_t receive_time_ms = MonotonicMs();
         uint64_t measured_age_ms = 0;
+        // reject 统一封装：把 boot/seq/target_id 与当前测得年龄回填到 ACK。
         const auto reject = [&](TrackTargetAckResult result,
                                 TrackTargetAckReason reason) {
             SendTrackTargetAck(update.ground_station_boot_id, update.update_seq,
                                update.target_id, measured_age_ms, result, reason);
         };
 
+        // 协议版本必须匹配；不匹配即拒收（不进入后续严重校验）。
         if (update.protocol_version != kTrackTargetProtocolVersion) {
             reject(TrackTargetAckResult::kRejectedUnsupportedVersion,
                    TrackTargetAckReason::kProtocolVersionUnsupported);
             return;
         }
+        // 仅接受 WGS84 坐标框架。
         if (update.coordinate_frame != kTrackTargetCoordinateFrameWgs84) {
             reject(TrackTargetAckResult::kRejectedInvalidField,
                    TrackTargetAckReason::kLatitudeOrLongitudeInvalid);
             return;
         }
+        // 地面站启动 ID 必须非 0；地面站每次重启会更换，需重新同步。
         if (update.ground_station_boot_id == 0) {
             reject(TrackTargetAckResult::kRejectedInvalidField,
                    TrackTargetAckReason::kBootIdInvalidOrChanged);
             return;
         }
+        // 目标时效依赖时间同步；未同步时拒绝定位类目标。
         if (time_sync_state_ != GroundStationTimeSyncState::kSynchronized) {
             reject(TrackTargetAckResult::kRejectedTimeSyncUnavailable,
                    TrackTargetAckReason::kTimeSyncUnavailable);
             return;
         }
+        // 地面站重启（boot_id 变化）：重置序号与时间同步，并要求重新建立同步。
         if (last_ground_station_boot_id_ != 0 &&
             update.ground_station_boot_id != last_ground_station_boot_id_) {
             last_ground_station_boot_id_ = update.ground_station_boot_id;
@@ -639,11 +693,13 @@ private:
                    TrackTargetAckReason::kBootIdInvalidOrChanged);
             return;
         }
+        // 更新序号必须严格递增，否则视为过期/重复。
         if (update.update_seq <= last_target_update_seq_) {
             reject(TrackTargetAckResult::kRejectedStaleOrDuplicate,
                    TrackTargetAckReason::kUpdateSequenceStale);
             return;
         }
+        // 目标 ID 不能为 0；经纬度范围校验（1e7 定点，单位度）。
         if (update.target_id == 0) {
             reject(TrackTargetAckResult::kRejectedInvalidField,
                    TrackTargetAckReason::kTargetIdInvalid);
@@ -656,6 +712,7 @@ private:
                    TrackTargetAckReason::kLatitudeOrLongitudeInvalid);
             return;
         }
+        // 有效期必须在配置的上下限内。
         if (update.valid_for_ms <
                 static_cast<uint32_t>(config_.target_minimum_valid_for.count()) ||
             update.valid_for_ms >
@@ -664,6 +721,7 @@ private:
                    TrackTargetAckReason::kValidForInvalid);
             return;
         }
+        // flags 只能在已知位掩码内；按位校验 alt/heading/accuracy 等附带字段。
         if ((update.flags & ~kTrackTargetKnownFlagsMask) != 0) {
             reject(TrackTargetAckResult::kRejectedInvalidField,
                    TrackTargetAckReason::kFlagsInvalid);
@@ -686,6 +744,7 @@ private:
             return;
         }
 
+        // 依据时间同步 offset，把地面站的 source_time 换算成飞机时钟，判断是否超前。
         const int64_t offset_ms = time_sync_offset_ns_ / 1000000LL;
         const int64_t source_aircraft_ms =
             static_cast<int64_t>(update.source_time_ms) - offset_ms;
@@ -698,6 +757,7 @@ private:
         }
         const int64_t age_ms = std::max<int64_t>(0, receive_ms - source_aircraft_ms);
         measured_age_ms = static_cast<uint64_t>(age_ms);
+        // 传输年龄超上限或已过有效期 → 目标过期。
         if (measured_age_ms >
                 static_cast<uint64_t>(config_.target_maximum_transport_delay.count()) ||
             measured_age_ms >= update.valid_for_ms) {
@@ -705,6 +765,7 @@ private:
                    TrackTargetAckReason::kTargetExpired);
             return;
         }
+        // 剩余有效期不足最小门限 → 拒收。
         const uint64_t remaining_valid_ms = update.valid_for_ms - measured_age_ms;
         if (remaining_valid_ms <
             static_cast<uint64_t>(config_.target_minimum_remaining_valid.count())) {
@@ -713,6 +774,7 @@ private:
             return;
         }
 
+        // 校验全部通过，组装项目内部 GroundStationTarget 并发布到 TargetOutput。
         common::GroundStationTarget target;
         target.header.sequence = update.update_seq;
         target.header.source_time_ms = update.source_time_ms;
@@ -754,6 +816,7 @@ private:
                            TrackTargetAckReason::kOk);
     }
 
+    // 逐字段小端解码 TRACK_TARGET_UPDATE payload（前 55 字节）。
     std::optional<TrackTargetUpdatePayload> DecodeTrackTargetUpdate(
         const uint8_t* data) const {
         TrackTargetUpdatePayload payload;
@@ -780,6 +843,7 @@ private:
         return payload;
     }
 
+    // 组装并发送 TRACK_TARGET_ACK：回填 boot/seq/target_id/年龄/RTT 与结果/原因码。
     void SendTrackTargetAck(uint32_t boot_id, uint32_t update_seq,
                             uint32_t target_id, uint64_t measured_age_ms,
                             TrackTargetAckResult result,
@@ -814,6 +878,7 @@ private:
         }
     }
 
+    // 地面站心跳超时：超过配置时长则置离线并清空时间同步（同步依赖在线心跳）。
     void CheckHeartbeatTimeout(uint64_t now_ms) {
         if (!connected_.load(std::memory_order_acquire) || last_gcs_heartbeat_ms_ == 0 ||
             now_ms < last_gcs_heartbeat_ms_) {
@@ -828,12 +893,14 @@ private:
         }
     }
 
+    // 同步后改用较慢的稳定期采样；未同步/降级则用较快获取期，加快收敛。
     std::chrono::milliseconds TimeSyncSendInterval() const {
         return time_sync_state_ == GroundStationTimeSyncState::kSynchronized
                    ? config_.time_sync_steady_interval
                    : config_.time_sync_acquire_interval;
     }
 
+    // 清理超时未回的 TIMESYNC 请求：超过最大 RTT 即视为超时丢弃。
     void PrunePendingTimeSyncRequests(int64_t now_ns) {
         const int64_t max_rtt_ns =
             static_cast<int64_t>(config_.time_sync_max_rtt.count()) * 1000000LL;
@@ -848,6 +915,7 @@ private:
         }
     }
 
+    // 主动发起定向 TIMESYNC 请求：tc1=0、ts1=当前飞机单调纳秒，入队用于后续匹配。
     void SendTimeSyncRequest() {
         const int64_t request_time_ns = MonotonicNs();
         PrunePendingTimeSyncRequests(request_time_ns);
@@ -877,6 +945,7 @@ private:
         PublishTimeSyncStatus(request_time_ns);
     }
 
+    // 响应地面站发起的 TIMESYNC：回填 tc1=接收时刻、ts1=对端请求时间。
     void SendTimeSyncResponse(int64_t requester_time_ns) {
         const int64_t response_time_ns = MonotonicNs();
         (void)EncodeAndWrite(
@@ -889,6 +958,7 @@ private:
             });
     }
 
+    // 处理本机请求的响应：按 ts1 匹配在途请求，计算 RTT 与 offset 并进入样本估计。
     void HandleTimeSyncResponse(const mavlink_timesync_t& response) {
         const int64_t receive_time_ns = MonotonicNs();
         PrunePendingTimeSyncRequests(receive_time_ns);
@@ -926,12 +996,14 @@ private:
         ProcessTimeSyncSample({offset_ns, round_trip_time_ns, receive_time_ns});
     }
 
+    // 单条时间同步样本：offset、RTT 与接收时刻（用于窗口老化）。
     struct TimeSyncSample {
         int64_t offset_ns = 0;
         uint64_t round_trip_time_ns = 0;
         int64_t receive_time_ns = 0;
     };
 
+    // 进入样本估计：同步态下若 offset 突变超门限则降级并清空样本。
     void ProcessTimeSyncSample(const TimeSyncSample& sample) {
         const uint64_t max_jump_ns =
             static_cast<uint64_t>(config_.time_sync_max_offset_jump.count()) *
@@ -956,6 +1028,8 @@ private:
         RecomputeTimeSyncEstimate(sample.receive_time_ns);
     }
 
+    // 重新估计：优先选 RTT 最低的样本，对 offset/RTT 取中位数，计算 jitter。
+    // 达到最小样本数且 jitter 不超门限才进入 SYNCHRONIZED。
     void RecomputeTimeSyncEstimate(int64_t now_ns) {
         std::vector<TimeSyncSample> selected = time_sync_samples_;
         std::sort(selected.begin(), selected.end(),
@@ -1019,6 +1093,7 @@ private:
         PublishTimeSyncStatus(now_ns);
     }
 
+    // 同步样本老化超时：超过 time_sync_timeout 即退回未同步。
     void CheckTimeSyncTimeout(uint64_t now_ms) {
         const int64_t now_ns = static_cast<int64_t>(now_ms) * 1000000LL;
         PrunePendingTimeSyncRequests(now_ns);
@@ -1044,6 +1119,7 @@ private:
         }
     }
 
+    // 重置时间同步：清状态、样本与在途请求；可选清空计数（重连/重建场景）。
     void ResetTimeSync(bool reset_counters) {
         time_sync_state_ = GroundStationTimeSyncState::kUnsynchronized;
         time_sync_samples_.clear();
@@ -1061,6 +1137,7 @@ private:
         PublishTimeSyncStatus(MonotonicNs());
     }
 
+    // 把当前时间同步快照发布到 status（带锁复制，供诊断线程查询）。
     void PublishTimeSyncStatus(int64_t now_ns) {
         GroundStationTimeSyncStatus status;
         status.state = time_sync_state_;
@@ -1081,6 +1158,7 @@ private:
         time_sync_status_ = status;
     }
 
+    // 统一发送：Encode 得到完整 MAVLink 帧字节，写入串口并累加发送计数。
     template <typename Packer>
     bool EncodeAndWrite(Packer&& packer) {
         const auto frame = mavlink_.Encode(std::forward<Packer>(packer));
@@ -1092,6 +1170,7 @@ private:
         return true;
     }
 
+    // HEARTBEAT：回传 armed/mode/system_status；未连接时用 UNINIT。
     void SendHeartbeat() {
         const common::FlightStateSnapshot state =
             latest_state_.value_or(common::FlightStateSnapshot{});
@@ -1132,6 +1211,7 @@ private:
         });
     }
 
+    // GLOBAL_POSITION_INT：relative_alt 仅在 Home 有效时由 MSL 高差计算，否则为 0。
     bool SendGlobalPosition(const common::FlightStateSnapshot& state) {
         if (!state.global_position_valid) {
             return false;
@@ -1161,6 +1241,7 @@ private:
         });
     }
 
+    // GPS_RAW_INT：仅在 GPS 状态有效时发送；无全局位置时经纬高填 0，靠 fix_type 表达。
     bool SendGps(const common::FlightStateSnapshot& state) {
         if (!state.gps_state_valid) {
             return false;
@@ -1193,6 +1274,7 @@ private:
         });
     }
 
+    // SYS_STATUS：总压 mV、电流 cA、剩余 %；无效字段用 UINT16_MAX / -1 表示未知。
     bool SendSystemStatus(const common::FlightStateSnapshot& state) {
         const uint16_t voltage = state.battery_valid
                                      ? ClampRounded<uint16_t>(state.battery_voltage_v, 1000.f,
@@ -1216,6 +1298,7 @@ private:
         });
     }
 
+    // BATTERY_STATUS：无单体电压，仅填电流/剩余；三项有效标志全部缺失时不发送。
     bool SendBatteryStatus(const common::FlightStateSnapshot& state) {
         if (!state.battery_valid && !state.battery_current_valid &&
             !state.battery_remaining_valid) {
@@ -1245,6 +1328,7 @@ private:
         });
     }
 
+    // HOME_POSITION：仅在 Home 有效时发送，四元数取单位元（无姿态语义）。
     bool SendHomePosition(const common::FlightStateSnapshot& state) {
         if (!state.home_valid) {
             return false;
@@ -1260,6 +1344,7 @@ private:
         });
     }
 
+    // 统一错误记账：按第 1 次与每满 100 次节流打印。
     void RecordError(const char* message) {
         const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (ShouldLogThrottled(count)) {
