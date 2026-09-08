@@ -154,8 +154,24 @@ TEST(HealthManagerTest, ActiveErrorSetsBitAndNewerDataClearsIt) {
     EXPECT_TRUE(wait_error_bits(0));
 }
 
+TEST(HealthManagerTest, FirstPacketGraceAvoidsImmediateStartupTimeout) {
+    drone::health::HealthManager manager(
+        std::unique_ptr<drone::health::ICpuLoadProvider>{},
+        std::chrono::milliseconds(1000), std::chrono::milliseconds(200));
+    ASSERT_TRUE(manager.RegisterSource(drone::health::source_names::kCamera, 200));
+    auto subscription = manager.Output().Subscribe(4);
+    ASSERT_TRUE(manager.Start());
+
+    const auto message = subscription.WaitTakeFor(std::chrono::milliseconds(100));
+    ASSERT_TRUE(message.has_value());
+    EXPECT_EQ((*message)->data_freshness_bits, 0U);
+    EXPECT_EQ(manager.TimeoutEventCount(), 0U);
+}
+
 TEST(HealthManagerTest, ReportsMissingDataAsTimeoutAndRecovers) {
-    drone::health::HealthManager manager;
+    drone::health::HealthManager manager(
+        std::unique_ptr<drone::health::ICpuLoadProvider>{},
+        std::chrono::milliseconds(1000), std::chrono::milliseconds(20));
     ASSERT_TRUE(manager.RegisterSource(drone::health::source_names::kCamera, 20));
 
     auto subscription = manager.Output().Subscribe(16);

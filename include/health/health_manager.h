@@ -38,8 +38,8 @@ inline constexpr uint32_t kYolo = 1U << 2U;
 inline constexpr uint32_t kPx4 = 1U << 3U;
 inline constexpr uint32_t kGroundStation = 1U << 4U;
 inline constexpr uint32_t kVideo = 1U << 5U;
-inline constexpr uint32_t kLaserRange = 1U << 6U;
-inline constexpr uint32_t kPower = 1U << 7U;
+inline constexpr uint32_t kLaserRange = 1U << 6U;  ///< 协议兼容预留，当前产品不注册。
+inline constexpr uint32_t kPower = 1U << 7U;       ///< 协议兼容预留，当前产品不注册。
 }  // namespace error_bits
 
 /// HealthManager 使用的标准数据源名称。
@@ -48,12 +48,12 @@ namespace source_names {
 inline constexpr char kCamera[] = "camera";
 inline constexpr char kPx4[] = "px4";
 inline constexpr char kGroundStation[] = "ground_station";
-inline constexpr char kLaserRange[] = "laser_range";
+inline constexpr char kLaserRange[] = "laser_range";  ///< 兼容预留，双目深度模块定型后再评审命名。
 inline constexpr char kVideo[] = "video";
 inline constexpr char kVideoDecoder[] = "video_decoder";
 inline constexpr char kYolo[] = "yolo";
-inline constexpr char kPowerA[] = "power_a";
-inline constexpr char kPowerB[] = "power_b";
+inline constexpr char kPowerA[] = "power_a";  ///< 兼容预留，当前电量来自PX4。
+inline constexpr char kPowerB[] = "power_b";  ///< 兼容预留，当前电量来自PX4。
 }  // namespace source_names
 
 /// CPU负载采样结果状态。
@@ -137,7 +137,8 @@ class HealthManager final : public IHealthManager {
 public:
     explicit HealthManager(
         std::unique_ptr<ICpuLoadProvider> cpu_load_provider = {},
-        std::chrono::milliseconds cpu_sample_period = std::chrono::milliseconds(1000));
+        std::chrono::milliseconds cpu_sample_period = std::chrono::milliseconds(1000),
+        std::chrono::milliseconds startup_grace_period = std::chrono::milliseconds(5000));
     ~HealthManager() override;
 
     HealthManager(const HealthManager&) = delete;
@@ -181,9 +182,11 @@ private:
     bool running_ = false;
     bool stop_requested_ = false;
     bool snapshot_requested_ = false;
+    uint64_t monitor_start_ms_ = 0;
     uint64_t output_sequence_ = 0;
     std::unique_ptr<ICpuLoadProvider> cpu_load_provider_;
     std::chrono::milliseconds cpu_sample_period_;
+    std::chrono::milliseconds startup_grace_period_;
     uint64_t last_cpu_sample_ms_ = 0;
     float cpu_load_pct_ = 0.f;
     bool cpu_load_valid_ = false;

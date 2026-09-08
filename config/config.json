@@ -11,6 +11,7 @@
     },
     "health": {
         "cpu_sample_period_ms": 1000,
+        "startup_grace_ms": 5000,
         "camera_max_age_ms": 1000,
         "decoder_max_age_ms": 1000,
         "yolo_max_age_ms": 1000,

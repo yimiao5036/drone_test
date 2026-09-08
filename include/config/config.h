@@ -31,6 +31,7 @@ struct RuntimeConfig {
 /// HealthManager 数据源最大允许无数据时间。各值必须为正数。
 struct HealthManagerConfig {
     std::chrono::milliseconds cpu_sample_period{1000};
+    std::chrono::milliseconds startup_grace_period{5000};
     std::chrono::milliseconds camera_max_age{1000};
     std::chrono::milliseconds decoder_max_age{1000};
     std::chrono::milliseconds yolo_max_age{1000};

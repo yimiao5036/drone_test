@@ -2,7 +2,7 @@
 
 ## 一、功能职责与边界
 
-`IHealthManager` 是系统健康管理与故障汇总接口，负责把摄像头、PX4、地面站、电源、解码器、NPU/YOLO、激光雷达和图传等模块的运行状态，统一转换为可供状态机和地面站消费的 `HealthStatus` 快照。
+`IHealthManager` 是系统健康管理与故障汇总接口，当前负责把双目摄像头（现阶段仍使用单路适配器）、PX4、地面站、解码器、NPU/YOLO和图传等模块的运行状态，统一转换为可供状态机和地面站消费的`HealthStatus`快照。原激光雷达和独立电源项仅保留协议兼容，不作为当前产品健康源。
 
 它解决的问题是：**系统当前是否仍具备执行某一阶段任务的条件，以及故障或数据超时发生在哪里**。它不是单个硬件驱动，也不是控制器，不直接修复故障或发送飞行命令。
 
@@ -69,14 +69,14 @@ Topic<common::HealthStatus>
 
 | 字段 | 含义 |
 |------|------|
-| `link_health_bits` | 链路健康位：bit0 摄像头、bit1 PX4、bit2 地面站电台、bit3 激光雷达、bit4 图传 |
-| `device_health_bits` | 设备健康位：bit0 解码器、bit1 NPU/YOLO、bit2 电源A、bit3 电源B |
+| `link_health_bits` | 链路健康位：bit0双目摄像头、bit1 PX4、bit2地面站电台、bit3兼容预留、bit4图传 |
+| `device_health_bits` | 设备健康位：bit0解码器、bit1 NPU/YOLO、bit2~3兼容预留 |
 | `data_freshness_bits` | 数据新鲜度位，与链路位顺序一致；`0` 表示新鲜，`1` 表示超时 |
-| `error_bits` | 活动错误位：bit0摄像头、bit1解码器、bit2YOLO、bit3PX4、bit4地面站、bit5图传、bit6激光雷达、bit7电源 |
+| `error_bits` | 活动错误位：bit0摄像头、bit1解码器、bit2YOLO、bit3PX4、bit4地面站、bit5图传、bit6~7兼容预留 |
 | `cpu_load_pct` | 算力板CPU总负载百分比；采样预热或读取失败时为NaN |
 | `timeout_event_count` | 累计进入数据超时状态的事件次数；持续超时不重复累计 |
 
-当前实现冻结位语义：健康位中 `1` 表示对应数据源已注册且数据新鲜，`0` 表示未注册或不可用；`data_freshness_bits` 中 `1` 表示对应链路数据超时，`0` 表示未超时。未注册的源不会被当作故障。CPU负载由Linux `/proc/stat` 相邻累计值差分计算，表示所有逻辑核心的整机综合利用率；首个样本只用于预热，读取失败或差分非法时发布NaN，并由状态协议有效位通知地面站显示未知。Linux `top`进程行的`%CPU`通常以单个逻辑核心100%计，与本字段口径不同。现有摄像头、解码器、YOLO、PX4、地面站和图传模块已接入活动错误上报；激光雷达和电源待对应真实模块完成后接入。
+当前实现冻结位语义：健康位中 `1` 表示对应数据源已注册且数据新鲜，`0` 表示未注册或不可用；`data_freshness_bits` 中 `1` 表示对应链路数据超时，`0` 表示未超时。未注册的源不会被当作故障。CPU负载由Linux `/proc/stat` 相邻累计值差分计算，表示所有逻辑核心的整机综合利用率；首个样本只用于预热，读取失败或差分非法时发布NaN，并由状态协议有效位通知地面站显示未知。Linux `top`进程行的`%CPU`通常以单个逻辑核心100%计，与本字段口径不同。现有摄像头、解码器、YOLO、PX4、地面站和图传模块已接入活动错误上报；bit6~7仅保留协议兼容，当前产品不再接入独立激光雷达和电源监测。
 
 ### 2.3 Topic 与生命周期
 
@@ -93,6 +93,7 @@ Topic<common::HealthStatus>
 
 - 所有超时判断使用算力板单调时钟，不使用会回拨的墙上时间；
 - `ReportData()` 只记录最近一次有效到达时间，不能把发送时间误当作接收时间；
+- 启动后每个数据源获得`max(max_age_ms, startup_grace_ms)`首包宽限期；生产默认`startup_grace_ms=5000`，宽限结束仍无数据才置超时，避免视频硬解/NPU初始化期间误报全部源；
 - `now - receive_time_ms > max_age_ms` 时置对应新鲜度超时；
 - 时间戳为零、时间回拨或明显非法时按“不可信/超时”处理，并累计错误；
 - 超时事件应按“进入超时状态”计数，不能每个周期重复累计同一个持续超时事件。
@@ -114,8 +115,8 @@ HealthManager 只发布事实快照，例如 PX4 数据已超时、YOLO 最近�
 正式实现应集中定义数据源名称和位映射，避免各调用方散落字符串。建议至少覆盖：
 
 ```text
-camera / px4 / ground_station / laser_range / video
-video_decoder / yolo / power_a / power_b
+当前启用：camera / px4 / ground_station / video / video_decoder / yolo
+兼容预留：laser_range / power_a / power_b
 ```
 
 具体名称、最大年龄和错误位必须与配置、模块实现和地面站协议同步，不能只修改其中一处。
@@ -132,7 +133,7 @@ video_decoder / yolo / power_a / power_b
 - 状态进入超时和恢复时记录一次状态变化日志；
 - CPU负载已通过可替换的`ICpuLoadProvider`接入，生产使用`ProcStatCpuLoadProvider`读取`/proc/stat`，默认1000ms采样；
 - `DroneApplication` 已创建真实 HealthManager、接入状态机并绑定地面站 HealthStatus 输入 Topic；应用级监控线程把视频、PX4、地面站、解码器、YOLO和图传计数变化转换为 `ReportData()`；地面站已通过V2_EXTENSION 65012下行健康状态；
-- `DroneApplication`已比较摄像头、解码器、YOLO、PX4、地面站和图传的累计错误计数，计数增加时上报活动错误；激光雷达、电源等模块尚未装配。
+- `DroneApplication`已比较摄像头、解码器、YOLO、PX4、地面站和图传的累计错误计数，计数增加时上报活动错误；当前产品不装配独立激光雷达和电源监测源，电池状态统一来自PX4快照。
 
 `HealthManagerStub` 仍固定返回未实现，用于验证旧接口和骨架生命周期，不应与真实类混用。
 
@@ -165,7 +166,8 @@ ctest --test-dir build --output-on-failure
 - 未注册数据和未来时间戳拒绝；
 - 启停、重复启停和重新启动；
 - `/proc/stat`累计值差分计算、CPU采样预热为NaN、注入采样器发布有效负载；
-- 活动错误置位、错误位映射和较新有效数据恢复清除。
+- 活动错误置位、错误位映射和较新有效数据恢复清除；
+- 启动首包宽限期内不产生虚假超时事件。
 
 后续还需补充：
 

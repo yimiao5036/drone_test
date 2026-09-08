@@ -37,6 +37,7 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_TRUE(config.runtime.enable_ground_station);
     EXPECT_FALSE(config.runtime.enable_control);
     EXPECT_EQ(config.health.cpu_sample_period.count(), 1000);
+    EXPECT_EQ(config.health.startup_grace_period.count(), 5000);
     EXPECT_EQ(config.health.camera_max_age.count(), 1000);
     EXPECT_EQ(config.health.decoder_max_age.count(), 1000);
     EXPECT_EQ(config.health.yolo_max_age.count(), 1000);

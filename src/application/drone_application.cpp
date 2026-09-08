@@ -63,7 +63,8 @@ void DroneApplication::BuildComponents() {
 
     // 健康管理器独立于具体数据链路；只注册实际创建的生产模块。
     health_manager_ = std::make_unique<health::HealthManager>(
-        std::unique_ptr<health::ICpuLoadProvider>{}, config_.health.cpu_sample_period);
+        std::unique_ptr<health::ICpuLoadProvider>{}, config_.health.cpu_sample_period,
+        config_.health.startup_grace_period);
     RegisterHealthSources();
 
     // 影子状态机只在PX4状态源与地面站目标源同时存在时创建；本阶段不创建控制器。
@@ -254,8 +255,6 @@ void DroneApplication::HealthReportLoop() {
     std::uint64_t last_decoder_frames = 0;
     std::uint64_t last_yolo_frames = 0;
     std::uint64_t last_video_frames = 0;
-    std::uint64_t last_px4_messages = 0;
-    std::uint64_t last_ground_station_messages = 0;
     std::uint64_t last_camera_errors = 0;
     std::uint64_t last_decoder_errors = 0;
     std::uint64_t last_yolo_errors = 0;
@@ -314,15 +313,19 @@ void DroneApplication::HealthReportLoop() {
                                   video_sender_->ErrorCount(), last_video_errors);
         }
         if (px4_link_ != nullptr) {
-            report_if_changed(health::source_names::kPx4,
-                              px4_link_->ReceiveCount(), last_px4_messages);
+            // PX4健康只接受已通过目标身份校验的心跳连接，不以任意接收包计数代替。
+            if (px4_link_->IsConnected()) {
+                health_manager_->ReportData(health::source_names::kPx4, timestamp_ms);
+            }
             report_error_increase(health::source_names::kPx4,
                                   px4_link_->ErrorCount(), last_px4_errors);
         }
         if (ground_station_link_ != nullptr) {
-            report_if_changed(health::source_names::kGroundStation,
-                              ground_station_link_->ReceiveCount(),
-                              last_ground_station_messages);
+            // 地面站健康只接受255/190 GCS心跳建立后的连接状态，过滤任意/错误来源消息。
+            if (ground_station_link_->IsConnected()) {
+                health_manager_->ReportData(health::source_names::kGroundStation,
+                                            timestamp_ms);
+            }
             report_error_increase(health::source_names::kGroundStation,
                                   ground_station_link_->ErrorCount(),
                                   last_ground_station_errors);

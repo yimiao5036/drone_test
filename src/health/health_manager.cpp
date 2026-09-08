@@ -167,17 +167,19 @@ void ProcStatCpuLoadProvider::Reset() {
 
 HealthManager::HealthManager(
     std::unique_ptr<ICpuLoadProvider> cpu_load_provider,
-    std::chrono::milliseconds cpu_sample_period)
+    std::chrono::milliseconds cpu_sample_period,
+    std::chrono::milliseconds startup_grace_period)
     : cpu_load_provider_(std::move(cpu_load_provider)),
-      cpu_sample_period_(cpu_sample_period) {
-    if (cpu_sample_period_.count() <= 0) {
-        throw std::invalid_argument("CPU负载采样周期必须为正数");
+      cpu_sample_period_(cpu_sample_period),
+      startup_grace_period_(startup_grace_period) {
+    if (cpu_sample_period_.count() <= 0 || startup_grace_period_.count() <= 0) {
+        throw std::invalid_argument("CPU采样周期和健康启动宽限期必须为正数");
     }
     if (!cpu_load_provider_) {
         cpu_load_provider_ = std::make_unique<ProcStatCpuLoadProvider>();
     }
-    SPDLOG_INFO("健康管理部件创建: cpu_sample_period_ms={}",
-                cpu_sample_period_.count());
+    SPDLOG_INFO("健康管理部件创建: cpu_sample_period_ms={} startup_grace_ms={}",
+                cpu_sample_period_.count(), startup_grace_period_.count());
 }
 
 HealthManager::~HealthManager() {
@@ -194,6 +196,7 @@ bool HealthManager::Start() {
     stop_requested_ = false;
     snapshot_requested_ = false;
     last_cpu_sample_ms_ = 0;
+    monitor_start_ms_ = SteadyNowMs();
     cpu_load_pct_ = 0.f;
     cpu_load_valid_ = false;
     cpu_load_provider_->Reset();
@@ -361,8 +364,15 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
         for (auto& [name, source] : sources_) {
             const bool fresh = source.has_data && now_ms >= source.last_receive_time_ms &&
                                now_ms - source.last_receive_time_ms <= source.max_age_ms;
+            // 启动后给每个数据源一个自身max_age的首包宽限期，避免线程刚启动就误报全源超时。
+            const uint64_t first_packet_grace_ms = std::max<uint64_t>(
+                source.max_age_ms,
+                static_cast<uint64_t>(startup_grace_period_.count()));
+            const bool waiting_first_data =
+                !source.has_data && now_ms >= monitor_start_ms_ &&
+                now_ms - monitor_start_ms_ <= first_packet_grace_ms;
             const bool was_timed_out = source.timed_out;
-            source.timed_out = !fresh;
+            source.timed_out = !fresh && !waiting_first_data;
 
             if (source.timed_out) {
                 all_sources_healthy = false;
@@ -380,8 +390,8 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
                 } else {
                     snapshot.link_health_bits |= source.health_bit;
                 }
-            } else if (!source.is_device) {
-                // data_freshness_bits 与 link_health_bits 使用同一位序。
+            } else if (source.timed_out && !source.is_device) {
+                // 数据源仍在首包宽限期时不置超时位；宽限结束后才进入正式超时。
                 snapshot.data_freshness_bits |= source.health_bit;
             }
             if (source.error_active) {
