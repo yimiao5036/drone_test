@@ -37,8 +37,9 @@ namespace {
 //   - 实现标准 MAVLink TIMESYNC 第一阶段，估算飞机相对地面站的 offset/RTT/jitter；
 //   - 通过 V2_EXTENSION(65010/65011) 接收 TRACK_TARGET_UPDATE 并回 ACK，
 //     合法目标发布 GroundStationTarget，错误地址/非法字段回拒绝 ACK；
+//   - 通过 V2_EXTENSION(65012/65013) 下发 HEALTH_STATUS/MISSION_STATUS；
 //   - 不向 PX4 发送任何控制命令，不转发地面站到飞控的指令。
-// 边界：本模块只做遥测/时间同步/目标接收，任务与健康自定义协议仅预留接口。
+// 边界：本模块只做遥测/时间同步/目标接收/状态回传，不执行任务或飞行控制决策。
 // 线程模型：一条独占通信线程读写串口，通过阻塞读 + Topic 订阅队列获取飞行快照。
 // ============================================================================
 
@@ -231,7 +232,9 @@ void GroundStationLinkConfig::Validate() const {
         global_position_send_interval.count() <= 0 || gps_send_interval.count() <= 0 ||
         extended_state_send_interval.count() <= 0 ||
         system_status_send_interval.count() <= 0 ||
-        battery_send_interval.count() <= 0 || home_send_interval.count() <= 0) {
+        battery_send_interval.count() <= 0 || home_send_interval.count() <= 0 ||
+        health_status_send_interval.count() <= 0 ||
+        mission_status_send_interval.count() <= 0) {
         throw std::invalid_argument("地面站链路发送周期和心跳超时必须为正数");
     }
     if (flight_state_queue_capacity == 0) {
@@ -302,7 +305,17 @@ public:
             flight_state_subscription_ = flight_state_topic_->Subscribe(
                 config_.flight_state_queue_capacity,
                 common::Topic<common::FlightStateSnapshot>::OverflowPolicy::kDropOldest);
+            if (mission_status_topic_ != nullptr) {
+                mission_status_subscription_ = mission_status_topic_->Subscribe(
+                    2, common::Topic<common::MissionStatus>::OverflowPolicy::kDropOldest);
+            }
+            if (health_topic_ != nullptr) {
+                health_subscription_ = health_topic_->Subscribe(
+                    2, common::Topic<common::HealthStatus>::OverflowPolicy::kDropOldest);
+            }
             latest_state_.reset();
+            latest_health_.reset();
+            latest_mission_status_.reset();
             last_ground_station_boot_id_ = 0;
             last_target_update_seq_ = 0;
             last_gcs_heartbeat_ms_ = 0;
@@ -333,7 +346,11 @@ public:
             worker_.join();
         }
         flight_state_subscription_.Reset();
+        mission_status_subscription_.Reset();
+        health_subscription_.Reset();
         latest_state_.reset();
+        latest_health_.reset();
+        latest_mission_status_.reset();
         serial_.Close();
         connected_.store(false, std::memory_order_release);
         ResetTimeSync(false);
@@ -389,10 +406,14 @@ public:
 private:
     using FlightSubscription =
         common::Topic<common::FlightStateSnapshot>::Subscription;
+    using HealthSubscription = common::Topic<common::HealthStatus>::Subscription;
+    using MissionSubscription = common::Topic<common::MissionStatus>::Subscription;
 
     struct Deadlines {
         std::chrono::steady_clock::time_point heartbeat;
         std::chrono::steady_clock::time_point time_sync;
+        std::chrono::steady_clock::time_point health_status;
+        std::chrono::steady_clock::time_point mission_status;
         std::chrono::steady_clock::time_point attitude;
         std::chrono::steady_clock::time_point local_position;
         std::chrono::steady_clock::time_point global_position;
@@ -407,7 +428,7 @@ private:
     // 心跳/时间同步超时检查 → 各类遥测按各自截止时间发送。
     void WorkerLoop() {
         const auto now = std::chrono::steady_clock::now();
-        Deadlines deadlines{now, now, now, now, now, now, now, now, now, now};
+        Deadlines deadlines{now, now, now, now, now, now, now, now, now, now, now, now};
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
@@ -423,8 +444,9 @@ private:
                 std::this_thread::sleep_for(config_.serial.read_timeout);
             }
 
-            // 把 PX4 快照队列里最新的状态捞出，并判断是否有“事件”需要立即下行。
+            // 把各输入队列里最新的状态捞出，并判断是否有“事件”需要立即下行。
             DrainFlightState();
+            DrainStatusInputs();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
             CheckTimeSyncTimeout(current_ms);
@@ -438,6 +460,16 @@ private:
                 current >= deadlines.time_sync) {
                 SendTimeSyncRequest();
                 deadlines.time_sync = current + TimeSyncSendInterval();
+            }
+            if (latest_health_) {
+                SendIfDue(current, deadlines.health_status,
+                          config_.health_status_send_interval,
+                          [&] { return SendHealthStatus(*latest_health_); });
+            }
+            if (latest_mission_status_) {
+                SendIfDue(current, deadlines.mission_status,
+                          config_.mission_status_send_interval,
+                          [&] { return SendMissionStatus(*latest_mission_status_); });
             }
             if (!latest_state_) {
                 continue;
@@ -501,6 +533,39 @@ private:
                 (void)SendSystemStatus(next);
                 (void)SendBatteryStatus(next);
                 (void)SendHomePosition(next);
+            }
+        }
+    }
+
+    // 消费健康和任务状态队列。只保留最新快照；关键字段变化时立即发送，
+    // 普通周期发送由 WorkerLoop 的 deadline 控制。
+    void DrainStatusInputs() {
+        while (auto message = health_subscription_.TryTake()) {
+            const common::HealthStatus& next = **message;
+            const bool event = !latest_health_ ||
+                               next.link_health_bits != latest_health_->link_health_bits ||
+                               next.device_health_bits != latest_health_->device_health_bits ||
+                               next.data_freshness_bits != latest_health_->data_freshness_bits ||
+                               next.error_bits != latest_health_->error_bits ||
+                               next.timeout_event_count != latest_health_->timeout_event_count ||
+                               next.cpu_load_pct != latest_health_->cpu_load_pct;
+            latest_health_ = next;
+            if (event) {
+                (void)SendHealthStatus(next);
+            }
+        }
+        while (auto message = mission_status_subscription_.TryTake()) {
+            const common::MissionStatus& next = **message;
+            const bool event = !latest_mission_status_ ||
+                               next.state != latest_mission_status_->state ||
+                               next.control_source != latest_mission_status_->control_source ||
+                               next.task_phase != latest_mission_status_->task_phase ||
+                               next.active_warning_bits != latest_mission_status_->active_warning_bits ||
+                               next.interception_authorized != latest_mission_status_->interception_authorized ||
+                               next.power_status_bits != latest_mission_status_->power_status_bits;
+            latest_mission_status_ = next;
+            if (event) {
+                (void)SendMissionStatus(next);
             }
         }
     }
@@ -876,6 +941,78 @@ private:
                         target_id, measured_age_ms,
                         time_sync_round_trip_time_ns_ / 1000000ULL, count);
         }
+    }
+
+    static uint32_t CpuLoadX100(float cpu_load_pct) {
+        if (!std::isfinite(cpu_load_pct)) {
+            return 0;
+        }
+        const double scaled = std::round(static_cast<double>(cpu_load_pct) * 100.0);
+        return static_cast<uint32_t>(std::clamp(scaled, 0.0, 10000.0));
+    }
+
+    static int32_t DistanceMillimeters(float distance_m) {
+        if (!std::isfinite(distance_m)) {
+            return std::numeric_limits<int32_t>::min();
+        }
+        const double scaled = std::round(static_cast<double>(distance_m) * 1000.0);
+        return static_cast<int32_t>(std::clamp(
+            scaled, static_cast<double>(std::numeric_limits<int32_t>::min() + 1),
+            static_cast<double>(std::numeric_limits<int32_t>::max())));
+    }
+
+    bool SendStatusExtension(
+        uint16_t message_type,
+        const std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN>& payload) {
+        if (config_.mavlink_version != 2) {
+            return false;
+        }
+        return EncodeAndWrite([this, message_type, &payload](mavlink_status_t* status,
+                                                               mavlink_message_t* message) {
+            return mavlink_msg_v2_extension_pack_status(
+                config_.aircraft_system_id, config_.aircraft_component_id, status,
+                message, 0, config_.ground_system_id, config_.ground_component_id,
+                message_type, payload.data());
+        });
+    }
+
+    bool SendHealthStatus(const common::HealthStatus& health) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, kStatusProtocolVersion);
+        WriteLe<uint32_t>(payload, 1, static_cast<uint32_t>(health.header.sequence));
+        WriteLe<uint32_t>(payload, 5, health.link_health_bits);
+        WriteLe<uint32_t>(payload, 9, health.device_health_bits);
+        WriteLe<uint32_t>(payload, 13, health.data_freshness_bits);
+        WriteLe<uint32_t>(payload, 17, health.error_bits);
+        WriteLe<uint32_t>(payload, 21, CpuLoadX100(health.cpu_load_pct));
+        WriteLe<uint32_t>(payload, 25, health.timeout_event_count);
+        WriteLe<uint8_t>(payload, 29, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 30, config_.aircraft_component_id);
+        WriteLe<uint8_t>(payload, 31, 0);
+        WriteLe<uint64_t>(payload, 32, health.header.receive_time_ms);
+        // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
+        WriteLe<uint8_t>(payload, 54, 1);
+        return SendStatusExtension(kHealthStatusMessageType, payload);
+    }
+
+    bool SendMissionStatus(const common::MissionStatus& mission) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, kStatusProtocolVersion);
+        WriteLe<uint32_t>(payload, 1, static_cast<uint32_t>(mission.header.sequence));
+        WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(mission.state));
+        WriteLe<uint8_t>(payload, 6, mission.control_source);
+        WriteLe<uint8_t>(payload, 7, mission.task_phase);
+        WriteLe<uint32_t>(payload, 8, mission.active_warning_bits);
+        WriteLe<uint64_t>(payload, 12, mission.state_entered_ms);
+        WriteLe<int32_t>(payload, 20, DistanceMillimeters(mission.front_distance_m));
+        WriteLe<uint8_t>(payload, 24, mission.interception_authorized ? 1 : 0);
+        WriteLe<uint8_t>(payload, 25, mission.power_status_bits);
+        WriteLe<uint8_t>(payload, 26, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 27, config_.aircraft_component_id);
+        WriteLe<uint64_t>(payload, 32, mission.header.receive_time_ms);
+        // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
+        WriteLe<uint8_t>(payload, 54, 1);
+        return SendStatusExtension(kMissionStatusMessageType, payload);
     }
 
     // 地面站心跳超时：超过配置时长则置离线并清空时间同步（同步依赖在线心跳）。
@@ -1364,7 +1501,11 @@ private:
     common::Topic<common::MissionStatus>* mission_status_topic_ = nullptr;
     common::Topic<common::HealthStatus>* health_topic_ = nullptr;
     FlightSubscription flight_state_subscription_;
+    HealthSubscription health_subscription_;
+    MissionSubscription mission_status_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
+    std::optional<common::HealthStatus> latest_health_;
+    std::optional<common::MissionStatus> latest_mission_status_;
     common::Topic<common::GroundStationTarget> target_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;

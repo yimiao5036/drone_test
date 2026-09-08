@@ -7,8 +7,10 @@
  */
 #include "health/health_manager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -246,6 +248,9 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
         snapshot.header.sequence = ++output_sequence_;
         snapshot.header.receive_time_ms = now_ms;
         snapshot.header.health = sources_.empty() ? 0 : (all_sources_healthy ? 1 : 2);
+        snapshot.timeout_event_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(timeout_event_count_.load(std::memory_order_relaxed),
+                                    std::numeric_limits<std::uint32_t>::max()));
     }
 
     for (const auto& name : timeout_sources) {

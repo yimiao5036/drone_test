@@ -94,6 +94,8 @@
         },
         "flight_state_queue_capacity": 2,
         "send_interval_ms": {
+            "health": 1000,
+            "mission": 500,
             "attitude": 100,
             "local_position": 200,
             "global_position": 200,

@@ -200,6 +200,11 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
         ReadPositiveMilliseconds(rates, "system_status");
     config.battery_send_interval = ReadPositiveMilliseconds(rates, "battery");
     config.home_send_interval = ReadPositiveMilliseconds(rates, "home");
+    const json status_rates = ground.value("status_send_interval_ms", json::object());
+    config.health_status_send_interval = ReadOptionalPositiveMilliseconds(
+        status_rates, "health", config.health_status_send_interval);
+    config.mission_status_send_interval = ReadOptionalPositiveMilliseconds(
+        status_rates, "mission", config.mission_status_send_interval);
 
     // 地面站订阅 PX4 FlightStateSnapshot 的队列容量。
     const int64_t queue_capacity =

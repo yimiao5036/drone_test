@@ -262,6 +262,7 @@ struct HealthStatus {
     uint32_t data_freshness_bits = 0;
     uint32_t error_bits = 0;      ///< 错误位（实现期按模块定义）
     float cpu_load_pct = 0.f;     ///< 算力板负载
+    uint32_t timeout_event_count = 0;  ///< 累计进入超时状态的事件次数
 };
 
 /// 任务与拦截状态回传（状态机 → 地面站）。

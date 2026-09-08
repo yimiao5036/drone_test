@@ -452,6 +452,97 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
     link.Stop();
 }
 
+TEST(GroundStationLinkTest, EncodesHealthAndMissionStatusExtensions) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    common::Topic<common::HealthStatus> health_status;
+    common::Topic<common::MissionStatus> mission_status;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    link.SetHealthInput(health_status);
+    link.SetMissionStatusInput(mission_status);
+    ASSERT_TRUE(link.Start());
+
+    common::HealthStatus health;
+    health.header.sequence = 42;
+    health.header.receive_time_ms = 123456;
+    health.link_health_bits = 0x13;
+    health.device_health_bits = 0x03;
+    health.data_freshness_bits = 0x04;
+    health.error_bits = 0x80;
+    health.cpu_load_pct = 12.34f;
+    health.timeout_event_count = 7;
+    ASSERT_TRUE(health_status.Publish(
+        std::make_shared<const common::HealthStatus>(health)).accepted);
+
+    mavlink_message_t health_message{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            if (message.msgid != MAVLINK_MSG_ID_V2_EXTENSION) {
+                return false;
+            }
+            mavlink_v2_extension_t extension{};
+            mavlink_msg_v2_extension_decode(&message, &extension);
+            return extension.message_type == kHealthStatusMessageType;
+        }, 300ms, &health_message));
+    mavlink_v2_extension_t health_extension{};
+    mavlink_msg_v2_extension_decode(&health_message, &health_extension);
+    EXPECT_EQ(health_message.len, 60);
+    EXPECT_EQ(health_message.sysid, 1);
+    EXPECT_EQ(health_message.compid, kNetCaptureAircraftComponentId);
+    EXPECT_EQ(ReadLe<uint8_t>(health_extension.payload, 0), kStatusProtocolVersion);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 1), 42U);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 5), 0x13U);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 9), 0x03U);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 13), 0x04U);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 17), 0x80U);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 21), 1234U);
+    EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 25), 7U);
+    EXPECT_EQ(ReadLe<uint64_t>(health_extension.payload, 32), 123456U);
+
+    common::MissionStatus mission;
+    mission.header.sequence = 9;
+    mission.header.receive_time_ms = 234567;
+    mission.state = common::MissionState::kGpsApproach;
+    mission.control_source = 2;
+    mission.task_phase = 3;
+    mission.active_warning_bits = 0x22;
+    mission.state_entered_ms = 200000;
+    mission.front_distance_m = 12.345f;
+    mission.interception_authorized = true;
+    mission.power_status_bits = 0x03;
+    ASSERT_TRUE(mission_status.Publish(
+        std::make_shared<const common::MissionStatus>(mission)).accepted);
+
+    mavlink_message_t mission_message{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            if (message.msgid != MAVLINK_MSG_ID_V2_EXTENSION) {
+                return false;
+            }
+            mavlink_v2_extension_t extension{};
+            mavlink_msg_v2_extension_decode(&message, &extension);
+            return extension.message_type == kMissionStatusMessageType;
+        }, 300ms, &mission_message));
+    mavlink_v2_extension_t mission_extension{};
+    mavlink_msg_v2_extension_decode(&mission_message, &mission_extension);
+    EXPECT_EQ(mission_message.len, 60);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 0), kStatusProtocolVersion);
+    EXPECT_EQ(ReadLe<uint32_t>(mission_extension.payload, 1), 9U);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 5),
+              static_cast<uint8_t>(common::MissionState::kGpsApproach));
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 6), 2U);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 7), 3U);
+    EXPECT_EQ(ReadLe<uint32_t>(mission_extension.payload, 8), 0x22U);
+    EXPECT_EQ(ReadLe<uint64_t>(mission_extension.payload, 12), 200000U);
+    EXPECT_EQ(ReadLe<int32_t>(mission_extension.payload, 20), 12345);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 24), 1U);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 25), 3U);
+    EXPECT_EQ(ReadLe<uint64_t>(mission_extension.payload, 32), 234567U);
+
+    link.Stop();
+}
+
 TEST(GroundStationLinkTest, TracksOnlyConfiguredGcsHeartbeatAndTimeout) {
     PseudoTerminal terminal;
     common::Topic<common::FlightStateSnapshot> flight_state;
