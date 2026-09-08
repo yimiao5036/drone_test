@@ -254,9 +254,9 @@ struct Px4Setpoint {
 /// 健康状态（健康管理 → 状态机/地面站回传）。
 struct HealthStatus {
     MessageHeader header;
-    /// 链路健康位：bit0=摄像头 bit1=PX4 bit2=地面站电台 bit3=激光雷达 bit4=图传
+    /// 链路健康位：bit0=摄像头 bit1=PX4 bit2=地面站电台 bit3=激光雷达 bit4=图传；1=已注册且健康
     uint32_t link_health_bits = 0;
-    /// 设备健康位：bit0=解码器 bit1=NPU/YOLO bit2=电源A bit3=电源B
+    /// 设备健康位：bit0=解码器 bit1=NPU/YOLO bit2=电源A bit3=电源B；1=已注册且健康
     uint32_t device_health_bits = 0;
     /// 数据新鲜度位：与 link_health_bits 同序，0=新鲜 1=超时
     uint32_t data_freshness_bits = 0;

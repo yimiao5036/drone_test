@@ -15,13 +15,32 @@
  */
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 
 #include "common/topic.h"
 #include "common/types.h"
 
 namespace drone::health {
+
+/// HealthManager 使用的标准数据源名称。
+/// 名称与 HealthStatus 中的位位置一一对应，调用方不得自行拼写其他别名。
+namespace source_names {
+inline constexpr char kCamera[] = "camera";
+inline constexpr char kPx4[] = "px4";
+inline constexpr char kGroundStation[] = "ground_station";
+inline constexpr char kLaserRange[] = "laser_range";
+inline constexpr char kVideo[] = "video";
+inline constexpr char kVideoDecoder[] = "video_decoder";
+inline constexpr char kYolo[] = "yolo";
+inline constexpr char kPowerA[] = "power_a";
+inline constexpr char kPowerB[] = "power_b";
+}  // namespace source_names
 
 /// 健康管理部件抽象接口。
 class IHealthManager {
@@ -57,6 +76,57 @@ public:
     virtual uint64_t TimeoutEventCount() const = 0;
     /// 累计错误次数。
     virtual uint64_t ErrorCount() const = 0;
+};
+
+/// 真实健康管理实现：按单调时钟检查已注册数据源的新鲜度并发布 HealthStatus。
+///
+/// 数据源必须在 Start() 前注册；ReportData() 可以在启动前预置首个时间戳，
+/// 运行期间由各生产模块在收到有效数据后调用。实现不负责硬件读写、重连或控制决策。
+class HealthManager final : public IHealthManager {
+public:
+    HealthManager();
+    ~HealthManager() override;
+
+    HealthManager(const HealthManager&) = delete;
+    HealthManager& operator=(const HealthManager&) = delete;
+
+    bool Start() override;
+    void Stop() override;
+    bool IsRunning() const override;
+
+    bool RegisterSource(const std::string& name, uint64_t max_age_ms) override;
+    void ReportData(const std::string& name, uint64_t receive_time_ms) override;
+
+    common::Topic<common::HealthStatus>& Output() override;
+
+    uint64_t TimeoutEventCount() const override;
+    uint64_t ErrorCount() const override;
+
+private:
+    struct SourceState {
+        bool is_device = false;
+        uint32_t health_bit = 0;
+        uint64_t max_age_ms = 0;
+        uint64_t last_receive_time_ms = 0;
+        bool has_data = false;
+        bool timed_out = false;
+    };
+
+    void MonitorLoop();
+    void PublishSnapshot(uint64_t now_ms);
+    void RecordError(const char* operation, const std::string& name);
+
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::unordered_map<std::string, SourceState> sources_;
+    common::Topic<common::HealthStatus> output_;
+    std::thread monitor_thread_;
+    bool running_ = false;
+    bool stop_requested_ = false;
+    bool snapshot_requested_ = false;
+    uint64_t output_sequence_ = 0;
+    std::atomic<uint64_t> timeout_event_count_{0};
+    std::atomic<uint64_t> error_count_{0};
 };
 
 /// 骨架占位实现：生命周期完整，业务方法打印"未实现"节流日志并返回默认值。

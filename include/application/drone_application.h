@@ -1,10 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <thread>
 
 #include "common/topic.h"
 #include "common/types.h"
 #include "config/config.h"
+#include "health/health_manager.h"
 
 namespace drone::communication {
 class GroundStationLink;
@@ -45,6 +48,10 @@ public:
 private:
     void BuildComponents();
     void BindTopics();
+    void RegisterHealthSources();
+    void StartHealthReporter();
+    void StopHealthReporter();
+    void HealthReportLoop();
 
     config::AppConfig config_;
     bool running_ = false;
@@ -57,10 +64,10 @@ private:
     std::unique_ptr<communication::Px4Link> px4_link_;
     std::unique_ptr<communication::GroundStationLink> ground_station_link_;
     std::unique_ptr<state_machine::MissionStateMachine> mission_state_machine_;
+    std::unique_ptr<health::HealthManager> health_manager_;
 
-    // 健康管理器尚未接入正式实现，先保留一个主程序级Topic作为状态机输入占位。
-    // 后续接入 HealthManager 后替换为真实 HealthStatus 发布源。
-    common::Topic<common::HealthStatus> health_status_topic_;
+    std::atomic<bool> health_report_running_{false};
+    std::thread health_report_thread_;
 };
 
 }  // namespace drone::application

@@ -36,6 +36,12 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_TRUE(config.runtime.enable_px4);
     EXPECT_TRUE(config.runtime.enable_ground_station);
     EXPECT_FALSE(config.runtime.enable_control);
+    EXPECT_EQ(config.health.camera_max_age.count(), 1000);
+    EXPECT_EQ(config.health.decoder_max_age.count(), 1000);
+    EXPECT_EQ(config.health.yolo_max_age.count(), 1000);
+    EXPECT_EQ(config.health.video_max_age.count(), 1000);
+    EXPECT_EQ(config.health.px4_max_age.count(), 3000);
+    EXPECT_EQ(config.health.ground_station_max_age.count(), 3000);
     EXPECT_EQ(config.px4.transport, "serial");
     EXPECT_EQ(config.px4.onboard_system_id, 1);
     EXPECT_EQ(config.px4.onboard_component_id, 191);
@@ -201,6 +207,16 @@ TEST(ConfigTest, RejectsUnexpectedGroundStationSourceIdentity) {
     json value = ReadSourceConfig();
     value["ground_station"]["ground_system_id"] = 254;
     const auto path = WriteTemporaryConfig(value, "drone_config_gcs_identity_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNegativeHealthTimeout) {
+    json value = ReadSourceConfig();
+    value["health"]["camera_max_age_ms"] = 0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_health_timeout_invalid.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

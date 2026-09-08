@@ -9,6 +9,14 @@
         "enable_ground_station": true,
         "enable_control": false
     },
+    "health": {
+        "camera_max_age_ms": 1000,
+        "decoder_max_age_ms": 1000,
+        "yolo_max_age_ms": 1000,
+        "video_max_age_ms": 1000,
+        "px4_max_age_ms": 3000,
+        "ground_station_max_age_ms": 3000
+    },
     "px4": {
         "transport": "serial",
         "onboard_system_id": 1,

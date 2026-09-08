@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -27,9 +28,20 @@ struct RuntimeConfig {
     bool enable_control = false;
 };
 
+/// HealthManager 数据源最大允许无数据时间。各值必须为正数。
+struct HealthManagerConfig {
+    std::chrono::milliseconds camera_max_age{1000};
+    std::chrono::milliseconds decoder_max_age{1000};
+    std::chrono::milliseconds yolo_max_age{1000};
+    std::chrono::milliseconds video_max_age{1000};
+    std::chrono::milliseconds px4_max_age{3000};
+    std::chrono::milliseconds ground_station_max_age{3000};
+};
+
 struct AppConfig {
     LogConfig log;
     RuntimeConfig runtime;
+    HealthManagerConfig health;
     video::CameraReceiverConfig camera;
     video::VideoDecoderConfig decoder;
     perception::YoloDetectorConfig yolo;

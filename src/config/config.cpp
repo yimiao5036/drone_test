@@ -67,6 +67,15 @@ std::chrono::milliseconds ReadPositiveMilliseconds(const json& object,
     return std::chrono::milliseconds(value);
 }
 
+// 健康阈值允许整个 health 配置节缺省，但只要显式提供字段就必须为正数。
+std::chrono::milliseconds ReadOptionalPositiveMilliseconds(
+    const json& object, const char* key, std::chrono::milliseconds default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    return ReadPositiveMilliseconds(object, key);
+}
+
 // 资源相对路径解析：绝对路径（以 / 开头）或空串原样返回，
 // 否则拼接在可执行文件目录后，避免依赖启动时的当前工作目录。
 std::string ResolveAssetPath(const std::string& value,
@@ -367,6 +376,20 @@ AppConfig LoadAppConfig(const std::string& path,
     if (config.runtime.enable_control) {
         throw std::invalid_argument("正式控制装配尚未开放，enable_control必须为false");
     }
+
+    const json health = root.value("health", json::object());
+    config.health.camera_max_age = ReadOptionalPositiveMilliseconds(
+        health, "camera_max_age_ms", config.health.camera_max_age);
+    config.health.decoder_max_age = ReadOptionalPositiveMilliseconds(
+        health, "decoder_max_age_ms", config.health.decoder_max_age);
+    config.health.yolo_max_age = ReadOptionalPositiveMilliseconds(
+        health, "yolo_max_age_ms", config.health.yolo_max_age);
+    config.health.video_max_age = ReadOptionalPositiveMilliseconds(
+        health, "video_max_age_ms", config.health.video_max_age);
+    config.health.px4_max_age = ReadOptionalPositiveMilliseconds(
+        health, "px4_max_age_ms", config.health.px4_max_age);
+    config.health.ground_station_max_age = ReadOptionalPositiveMilliseconds(
+        health, "ground_station_max_age_ms", config.health.ground_station_max_age);
 
     if (root.find("ground_station") != root.end()) {
         config.ground_station = ParseGroundStationConfig(root);
