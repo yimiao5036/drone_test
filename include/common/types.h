@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace drone::common {
@@ -85,7 +86,7 @@ struct OpticalFlowResult {
     bool valid = false;               ///< 本次估计是否有效
 };
 
-/// 激光雷达单点距离（雷达 → 感知融合）。表达机头前向单点距离，
+/// 距离样本预留类型。当前产品已取消独立单点激光雷达，计划由双目摄像头深度模块输出；
 /// 不得自动解释为任意视觉目标的距离。
 struct LaserRangeSample {
     MessageHeader header;
@@ -254,14 +255,16 @@ struct Px4Setpoint {
 /// 健康状态（健康管理 → 状态机/地面站回传）。
 struct HealthStatus {
     MessageHeader header;
-    /// 链路健康位：bit0=摄像头 bit1=PX4 bit2=地面站电台 bit3=激光雷达 bit4=图传
+    /// 链路健康位：bit0=双目摄像头 bit1=PX4 bit2=地面站电台 bit3=预留（原激光雷达）bit4=图传；1=已注册且健康
     uint32_t link_health_bits = 0;
-    /// 设备健康位：bit0=解码器 bit1=NPU/YOLO bit2=电源A bit3=电源B
+    /// 设备健康位：bit0=解码器 bit1=NPU/YOLO bit2~3=预留（取消独立电源管理）；1=已注册且健康
     uint32_t device_health_bits = 0;
     /// 数据新鲜度位：与 link_health_bits 同序，0=新鲜 1=超时
     uint32_t data_freshness_bits = 0;
-    uint32_t error_bits = 0;      ///< 错误位（实现期按模块定义）
-    float cpu_load_pct = 0.f;     ///< 算力板负载
+    /// 活动错误位：bit0摄像头 bit1解码器 bit2YOLO bit3PX4 bit4地面站 bit5图传 bit6~7预留
+    uint32_t error_bits = 0;
+    float cpu_load_pct = std::numeric_limits<float>::quiet_NaN();  ///< 算力板负载；无有效采样时为NaN
+    uint32_t timeout_event_count = 0;  ///< 累计进入超时状态的事件次数
 };
 
 /// 任务与拦截状态回传（状态机 → 地面站）。
@@ -272,9 +275,9 @@ struct MissionStatus {
     uint8_t control_source = 0;                ///< 当前控制来源（与 ControlIntent 一致）
     uint8_t task_phase = 0;                    ///< 任务阶段（实现期定义）
     uint32_t active_warning_bits = 0;          ///< 激活的告警位
-    float front_distance_m = 0.f;              ///< 前向障碍距离；无效为 NaN
+    float front_distance_m = std::numeric_limits<float>::quiet_NaN();  ///< 前向障碍距离；无效为 NaN
     bool interception_authorized = false;      ///< 拦截授权
-    uint8_t power_status_bits = 0;             ///< bit0=电源A可用 bit1=电源B可用
+    uint8_t power_status_bits = 0;             ///< 兼容保留；当前电量统一使用PX4动力电池状态
 };
 
 /// 目标估计状态（感知融合/目标估计 → 状态机与控制）。

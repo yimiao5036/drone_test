@@ -164,6 +164,7 @@ target_link_libraries(drone_application PUBLIC
     drone_perception
     drone_video_transmission
     drone_state_machine
+    drone_health
     spdlog::spdlog)
 
 add_executable(drone_control
@@ -288,6 +289,22 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # 健康管理测试：数据源注册、新鲜度超时/恢复、位汇总和生命周期
+        add_executable(health_manager_test tests/health/health_manager_test.cpp)
+        target_link_libraries(health_manager_test PRIVATE
+            drone_common
+            drone_health
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(health_manager_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(health_manager_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(health_manager_test)
 
         # 任务状态机测试：验证地面站目标进入GPS_APPROACH影子状态且不输出控制意图
         add_executable(mission_state_machine_test

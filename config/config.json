@@ -9,6 +9,16 @@
         "enable_ground_station": true,
         "enable_control": false
     },
+    "health": {
+        "cpu_sample_period_ms": 1000,
+        "startup_grace_ms": 5000,
+        "camera_max_age_ms": 1000,
+        "decoder_max_age_ms": 1000,
+        "yolo_max_age_ms": 1000,
+        "video_max_age_ms": 1000,
+        "px4_max_age_ms": 3000,
+        "ground_station_max_age_ms": 3000
+    },
     "px4": {
         "transport": "serial",
         "onboard_system_id": 1,
@@ -86,6 +96,8 @@
         },
         "flight_state_queue_capacity": 2,
         "send_interval_ms": {
+            "health": 1000,
+            "mission": 500,
             "attitude": 100,
             "local_position": 200,
             "global_position": 200,

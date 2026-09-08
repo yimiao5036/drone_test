@@ -18,7 +18,10 @@ constexpr uint8_t kGroundStationSystemId = 255;
 constexpr uint8_t kGroundStationComponentId = 190;
 constexpr uint16_t kTrackTargetUpdateMessageType = 65010;
 constexpr uint16_t kTrackTargetAckMessageType = 65011;
+constexpr uint16_t kHealthStatusMessageType = 65012;
+constexpr uint16_t kMissionStatusMessageType = 65013;
 constexpr uint8_t kTrackTargetProtocolVersion = 1;
+constexpr uint8_t kStatusProtocolVersion = 1;
 constexpr uint8_t kTrackTargetCoordinateFrameWgs84 = 1;
 constexpr uint16_t kTrackTargetKnownFlagsMask = 0x007F;
 
@@ -113,6 +116,8 @@ struct GroundStationLinkConfig {
     std::chrono::milliseconds system_status_send_interval{1000};
     std::chrono::milliseconds battery_send_interval{1000};
     std::chrono::milliseconds home_send_interval{5000};
+    std::chrono::milliseconds health_status_send_interval{1000};
+    std::chrono::milliseconds mission_status_send_interval{500};
     std::size_t flight_state_queue_capacity = 2;
 
     void Validate() const;
@@ -137,10 +142,10 @@ public:
     /// 绑定 PX4 飞行状态快照。必须在 Start 前调用。
     virtual void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) = 0;
-    /// 任务状态回传接口预留，当前真实链路暂不编码自定义任务协议。
+    /// 绑定任务状态回传；协议使用 V2_EXTENSION message_type=65013。
     virtual void SetMissionStatusInput(
         common::Topic<common::MissionStatus>& mission_status) = 0;
-    /// 健康状态回传接口预留，当前真实链路暂不编码自定义健康协议。
+    /// 绑定健康状态回传；协议使用 V2_EXTENSION message_type=65012。
     virtual void SetHealthInput(common::Topic<common::HealthStatus>& health) = 0;
 
     virtual uint64_t SendCount() const = 0;

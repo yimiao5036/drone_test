@@ -1,7 +1,9 @@
 #include "application/drone_application.h"
 
+#include <chrono>
 #include <exception>
 #include <memory>
+#include <thread>
 #include <utility>
 
 #include <spdlog/spdlog.h>
@@ -59,9 +61,47 @@ void DroneApplication::BuildComponents() {
             config_.ground_station);
     }
 
+    // 健康管理器独立于具体数据链路；只注册实际创建的生产模块。
+    health_manager_ = std::make_unique<health::HealthManager>(
+        std::unique_ptr<health::ICpuLoadProvider>{}, config_.health.cpu_sample_period,
+        config_.health.startup_grace_period);
+    RegisterHealthSources();
+
     // 影子状态机只在PX4状态源与地面站目标源同时存在时创建；本阶段不创建控制器。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
         mission_state_machine_ = std::make_unique<state_machine::MissionStateMachine>();
+    }
+}
+
+// 注册运行期健康源。阈值全部来自 AppConfig，禁止在装配层写死业务超时。
+void DroneApplication::RegisterHealthSources() {
+    const auto register_source = [this](const char* name,
+                                         std::chrono::milliseconds max_age) {
+        if (!health_manager_->RegisterSource(name,
+                                             static_cast<std::uint64_t>(max_age.count()))) {
+            SPDLOG_ERROR("主程序健康源注册失败: {}", name);
+        }
+    };
+
+    if (camera_ != nullptr) {
+        register_source(health::source_names::kCamera, config_.health.camera_max_age);
+    }
+    if (decoder_ != nullptr) {
+        register_source(health::source_names::kVideoDecoder,
+                       config_.health.decoder_max_age);
+    }
+    if (detector_ != nullptr) {
+        register_source(health::source_names::kYolo, config_.health.yolo_max_age);
+    }
+    if (video_sender_ != nullptr) {
+        register_source(health::source_names::kVideo, config_.health.video_max_age);
+    }
+    if (px4_link_ != nullptr) {
+        register_source(health::source_names::kPx4, config_.health.px4_max_age);
+    }
+    if (ground_station_link_ != nullptr) {
+        register_source(health::source_names::kGroundStation,
+                       config_.health.ground_station_max_age);
     }
 }
 
@@ -79,11 +119,15 @@ void DroneApplication::BindTopics() {
         ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
     }
 
+    if (ground_station_link_ != nullptr && health_manager_ != nullptr) {
+        ground_station_link_->SetHealthInput(health_manager_->Output());
+    }
+
     if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr &&
-        px4_link_ != nullptr) {
+        px4_link_ != nullptr && health_manager_ != nullptr) {
         mission_state_machine_->SetInputs(ground_station_link_->TargetOutput(),
                                           px4_link_->StateOutput(),
-                                          health_status_topic_);
+                                          health_manager_->Output());
         ground_station_link_->SetMissionStatusInput(
             mission_state_machine_->StatusOutput());
     }
@@ -159,6 +203,15 @@ bool DroneApplication::Start() {
         }
     }
 
+    if (health_manager_ != nullptr) {
+        if (!health_manager_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序健康管理启动失败，健康状态汇总不可用");
+        } else {
+            StartHealthReporter();
+        }
+    }
+
     if (px4_link_ != nullptr) {
         if (!px4_link_->Start()) {
             degraded = true;
@@ -170,11 +223,116 @@ bool DroneApplication::Start() {
 
     running_ = any_started;
     if (!any_started) {
+        StopHealthReporter();
+        if (health_manager_ != nullptr) {
+            health_manager_->Stop();
+        }
         SPDLOG_ERROR("主程序没有任何模块成功启动");
         return false;
     }
     SPDLOG_INFO("主程序启动完成: degraded={}", degraded);
     return true;
+}
+
+void DroneApplication::StartHealthReporter() {
+    if (health_report_running_.exchange(true)) {
+        return;
+    }
+    health_report_thread_ = std::thread([this] { HealthReportLoop(); });
+}
+
+void DroneApplication::StopHealthReporter() {
+    if (!health_report_running_.exchange(false)) {
+        return;
+    }
+    if (health_report_thread_.joinable()) {
+        health_report_thread_.join();
+    }
+}
+
+void DroneApplication::HealthReportLoop() {
+    std::uint64_t last_camera_bytes = 0;
+    std::uint64_t last_decoder_frames = 0;
+    std::uint64_t last_yolo_frames = 0;
+    std::uint64_t last_video_frames = 0;
+    std::uint64_t last_camera_errors = 0;
+    std::uint64_t last_decoder_errors = 0;
+    std::uint64_t last_yolo_errors = 0;
+    std::uint64_t last_video_errors = 0;
+    std::uint64_t last_px4_errors = 0;
+    std::uint64_t last_ground_station_errors = 0;
+
+    const auto now_ms = [] {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+    };
+
+    while (health_report_running_.load()) {
+        const std::uint64_t timestamp_ms = now_ms();
+        const auto report_if_changed = [this, timestamp_ms](const char* source,
+                                                             std::uint64_t value,
+                                                             std::uint64_t& last) {
+            if (value != last) {
+                last = value;
+                health_manager_->ReportData(source, timestamp_ms);
+            }
+        };
+        const auto report_error_increase = [this, timestamp_ms](
+                                               const char* source,
+                                               std::uint64_t value,
+                                               std::uint64_t& last) {
+            if (value > last) {
+                health_manager_->ReportError(source, timestamp_ms);
+            }
+            last = value;
+        };
+
+        if (camera_ != nullptr) {
+            report_if_changed(health::source_names::kCamera,
+                              camera_->ReceivedBytes(), last_camera_bytes);
+            report_error_increase(health::source_names::kCamera,
+                                  camera_->ErrorCount(), last_camera_errors);
+        }
+        if (decoder_ != nullptr) {
+            report_if_changed(health::source_names::kVideoDecoder,
+                              decoder_->DecodedFrameCount(), last_decoder_frames);
+            report_error_increase(health::source_names::kVideoDecoder,
+                                  decoder_->ErrorCount(), last_decoder_errors);
+        }
+        if (detector_ != nullptr) {
+            report_if_changed(health::source_names::kYolo,
+                              detector_->ProcessedFrameCount(), last_yolo_frames);
+            report_error_increase(health::source_names::kYolo,
+                                  detector_->ErrorCount(), last_yolo_errors);
+        }
+        if (video_sender_ != nullptr) {
+            report_if_changed(health::source_names::kVideo,
+                              video_sender_->SentFrameCount(), last_video_frames);
+            report_error_increase(health::source_names::kVideo,
+                                  video_sender_->ErrorCount(), last_video_errors);
+        }
+        if (px4_link_ != nullptr) {
+            // PX4健康只接受已通过目标身份校验的心跳连接，不以任意接收包计数代替。
+            if (px4_link_->IsConnected()) {
+                health_manager_->ReportData(health::source_names::kPx4, timestamp_ms);
+            }
+            report_error_increase(health::source_names::kPx4,
+                                  px4_link_->ErrorCount(), last_px4_errors);
+        }
+        if (ground_station_link_ != nullptr) {
+            // 地面站健康只接受255/190 GCS心跳建立后的连接状态，过滤任意/错误来源消息。
+            if (ground_station_link_->IsConnected()) {
+                health_manager_->ReportData(health::source_names::kGroundStation,
+                                            timestamp_ms);
+            }
+            report_error_increase(health::source_names::kGroundStation,
+                                  ground_station_link_->ErrorCount(),
+                                  last_ground_station_errors);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 // 停止顺序与数据流相反：先停止状态生产者，再停止消费者，最后关闭视频链路。
@@ -185,23 +343,29 @@ void DroneApplication::Stop() {
     }
 
     SPDLOG_INFO("主程序开始停止");
-    // 先停止PX4状态生产者，再停止状态机和地面站消费者。
+    // 先停止PX4和视频等数据生产者，避免健康上报线程读取正在析构的组件。
     if (px4_link_ != nullptr) {
         px4_link_->Stop();
     }
-    if (mission_state_machine_ != nullptr) {
-        mission_state_machine_->Stop();
-    }
-    if (ground_station_link_ != nullptr) {
-        ground_station_link_->Stop();
-    }
-
     if (camera_ != nullptr) {
         camera_->Stop();
         decoder_->Stop();
         detector_->Stop();
         compositor_->Stop();
         video_sender_->Stop();
+    }
+
+    StopHealthReporter();
+    if (health_manager_ != nullptr) {
+        health_manager_->Stop();
+    }
+
+    // 健康生产者停止后再停止其消费者。
+    if (mission_state_machine_ != nullptr) {
+        mission_state_machine_->Stop();
+    }
+    if (ground_station_link_ != nullptr) {
+        ground_station_link_->Stop();
     }
 
     running_ = false;
