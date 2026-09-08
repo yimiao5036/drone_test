@@ -1,12 +1,37 @@
 #include "health/health_manager.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 namespace {
+
+class SequenceCpuLoadProvider final : public drone::health::ICpuLoadProvider {
+public:
+    explicit SequenceCpuLoadProvider(std::vector<drone::health::CpuLoadSample> samples)
+        : samples_(std::move(samples)) {}
+
+    drone::health::CpuLoadSample Sample() override {
+        if (index_ >= samples_.size()) {
+            return samples_.back();
+        }
+        return samples_[index_++];
+    }
+
+    void Reset() override { index_ = 0; }
+
+private:
+    std::vector<drone::health::CpuLoadSample> samples_;
+    std::size_t index_ = 0;
+};
 
 std::uint64_t SteadyNowMs() {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -35,6 +60,50 @@ bool WaitForSnapshot(drone::common::Topic<drone::common::HealthStatus>::Subscrip
 }
 
 }  // namespace
+
+TEST(HealthManagerTest, ProcStatProviderCalculatesCpuLoadFromCounterDelta) {
+    const auto path = std::filesystem::temp_directory_path() / "drone_proc_stat_test.txt";
+    {
+        std::ofstream output(path);
+        output << "cpu 100 0 100 800 0 0 0 0 0 0\n";
+    }
+    drone::health::ProcStatCpuLoadProvider provider(path.string());
+    EXPECT_EQ(provider.Sample().status, drone::health::CpuLoadSampleStatus::kWarmup);
+
+    {
+        std::ofstream output(path);
+        output << "cpu 150 0 150 900 0 0 0 0 0 0\n";
+    }
+    const auto sample = provider.Sample();
+    EXPECT_EQ(sample.status, drone::health::CpuLoadSampleStatus::kValid);
+    EXPECT_FLOAT_EQ(sample.load_pct, 50.f);
+    std::filesystem::remove(path);
+}
+
+TEST(HealthManagerTest, PublishesInjectedCpuLoadAndMarksWarmupUnknown) {
+    auto provider = std::make_unique<SequenceCpuLoadProvider>(
+        std::vector<drone::health::CpuLoadSample>{
+            {drone::health::CpuLoadSampleStatus::kWarmup, 0.f},
+            {drone::health::CpuLoadSampleStatus::kValid, 37.5f}});
+    drone::health::HealthManager manager(std::move(provider),
+                                         std::chrono::milliseconds(10));
+    auto subscription = manager.Output().Subscribe(16);
+    ASSERT_TRUE(manager.Start());
+
+    bool saw_unknown = false;
+    bool saw_valid = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline && !saw_valid) {
+        if (const auto message = subscription.TryTake(); message.has_value()) {
+            saw_unknown |= std::isnan((*message)->cpu_load_pct);
+            saw_valid |= std::fabs((*message)->cpu_load_pct - 37.5f) < 0.01f;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    EXPECT_TRUE(saw_unknown);
+    EXPECT_TRUE(saw_valid);
+}
 
 TEST(HealthManagerTest, RegistersSourcesAndPublishesHealthySnapshot) {
     drone::health::HealthManager manager;

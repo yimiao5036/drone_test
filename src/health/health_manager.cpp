@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -85,8 +88,95 @@ bool ShouldLogThrottled(std::uint64_t count) {
 
 }  // namespace
 
-HealthManager::HealthManager() {
-    SPDLOG_INFO("健康管理部件创建");
+ProcStatCpuLoadProvider::ProcStatCpuLoadProvider(std::string path)
+    : path_(std::move(path)) {
+    if (path_.empty()) {
+        throw std::invalid_argument("CPU负载采样路径不能为空");
+    }
+}
+
+CpuLoadSample ProcStatCpuLoadProvider::Sample() {
+    std::ifstream input(path_);
+    std::string line;
+    if (!input.is_open() || !std::getline(input, line)) {
+        return {CpuLoadSampleStatus::kError, 0.f};
+    }
+
+    std::istringstream parser(line);
+    std::string label;
+    uint64_t user = 0;
+    uint64_t nice = 0;
+    uint64_t system = 0;
+    uint64_t idle = 0;
+    uint64_t iowait = 0;
+    uint64_t irq = 0;
+    uint64_t softirq = 0;
+    uint64_t steal = 0;
+    if (!(parser >> label >> user >> nice >> system >> idle) || label != "cpu") {
+        return {CpuLoadSampleStatus::kError, 0.f};
+    }
+    // 旧内核可能缺少尾部字段；缺失项按0处理，前四项必须存在。
+    if (!(parser >> iowait)) {
+        parser.clear();
+    }
+    if (!(parser >> irq)) {
+        parser.clear();
+    }
+    if (!(parser >> softirq)) {
+        parser.clear();
+    }
+    if (!(parser >> steal)) {
+        parser.clear();
+    }
+
+    const uint64_t idle_total = idle + iowait;
+    const uint64_t non_idle_total = user + nice + system + irq + softirq + steal;
+    const uint64_t total = idle_total + non_idle_total;
+    if (!have_previous_) {
+        previous_total_ = total;
+        previous_idle_ = idle_total;
+        have_previous_ = true;
+        return {CpuLoadSampleStatus::kWarmup, 0.f};
+    }
+    if (total < previous_total_ || idle_total < previous_idle_) {
+        previous_total_ = total;
+        previous_idle_ = idle_total;
+        return {CpuLoadSampleStatus::kError, 0.f};
+    }
+
+    const uint64_t total_delta = total - previous_total_;
+    const uint64_t idle_delta = idle_total - previous_idle_;
+    previous_total_ = total;
+    previous_idle_ = idle_total;
+    if (total_delta == 0 || idle_delta > total_delta) {
+        return {CpuLoadSampleStatus::kError, 0.f};
+    }
+
+    const double load = 100.0 * static_cast<double>(total_delta - idle_delta) /
+                        static_cast<double>(total_delta);
+    return {CpuLoadSampleStatus::kValid,
+            static_cast<float>(std::clamp(load, 0.0, 100.0))};
+}
+
+void ProcStatCpuLoadProvider::Reset() {
+    previous_total_ = 0;
+    previous_idle_ = 0;
+    have_previous_ = false;
+}
+
+HealthManager::HealthManager(
+    std::unique_ptr<ICpuLoadProvider> cpu_load_provider,
+    std::chrono::milliseconds cpu_sample_period)
+    : cpu_load_provider_(std::move(cpu_load_provider)),
+      cpu_sample_period_(cpu_sample_period) {
+    if (cpu_sample_period_.count() <= 0) {
+        throw std::invalid_argument("CPU负载采样周期必须为正数");
+    }
+    if (!cpu_load_provider_) {
+        cpu_load_provider_ = std::make_unique<ProcStatCpuLoadProvider>();
+    }
+    SPDLOG_INFO("健康管理部件创建: cpu_sample_period_ms={}",
+                cpu_sample_period_.count());
 }
 
 HealthManager::~HealthManager() {
@@ -102,6 +192,10 @@ bool HealthManager::Start() {
 
     stop_requested_ = false;
     snapshot_requested_ = false;
+    last_cpu_sample_ms_ = 0;
+    cpu_load_pct_ = 0.f;
+    cpu_load_valid_ = false;
+    cpu_load_provider_->Reset();
     running_ = true;
     try {
         monitor_thread_ = std::thread(&HealthManager::MonitorLoop, this);
@@ -209,6 +303,20 @@ void HealthManager::MonitorLoop() {
 }
 
 void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
+    if (last_cpu_sample_ms_ == 0 ||
+        now_ms - last_cpu_sample_ms_ >=
+            static_cast<uint64_t>(cpu_sample_period_.count())) {
+        const CpuLoadSample sample = cpu_load_provider_->Sample();
+        last_cpu_sample_ms_ = now_ms;
+        if (sample.status == CpuLoadSampleStatus::kValid) {
+            cpu_load_pct_ = std::clamp(sample.load_pct, 0.f, 100.f);
+            cpu_load_valid_ = true;
+        } else if (sample.status == CpuLoadSampleStatus::kError) {
+            cpu_load_valid_ = false;
+            RecordError("CpuLoadSample", "/proc/stat");
+        }
+    }
+
     common::HealthStatus snapshot;
     std::vector<std::string> timeout_sources;
     std::vector<std::string> recovered_sources;
@@ -248,6 +356,9 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
         snapshot.header.sequence = ++output_sequence_;
         snapshot.header.receive_time_ms = now_ms;
         snapshot.header.health = sources_.empty() ? 0 : (all_sources_healthy ? 1 : 2);
+        snapshot.cpu_load_pct = cpu_load_valid_
+                                    ? cpu_load_pct_
+                                    : std::numeric_limits<float>::quiet_NaN();
         snapshot.timeout_event_count = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(timeout_event_count_.load(std::memory_order_relaxed),
                                     std::numeric_limits<std::uint32_t>::max()));

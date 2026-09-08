@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -498,7 +499,28 @@ TEST(GroundStationLinkTest, EncodesHealthAndMissionStatusExtensions) {
     EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 17), 0x80U);
     EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 21), 1234U);
     EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 25), 7U);
+    EXPECT_EQ(ReadLe<uint8_t>(health_extension.payload, 31), 0x01U);
     EXPECT_EQ(ReadLe<uint64_t>(health_extension.payload, 32), 123456U);
+
+    health.header.sequence = 43;
+    health.cpu_load_pct = std::numeric_limits<float>::quiet_NaN();
+    ASSERT_TRUE(health_status.Publish(
+        std::make_shared<const common::HealthStatus>(health)).accepted);
+    mavlink_message_t invalid_cpu_message{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            if (message.msgid != MAVLINK_MSG_ID_V2_EXTENSION) {
+                return false;
+            }
+            mavlink_v2_extension_t extension{};
+            mavlink_msg_v2_extension_decode(&message, &extension);
+            return extension.message_type == kHealthStatusMessageType &&
+                   ReadLe<uint32_t>(extension.payload, 1) == 43U;
+        }, 300ms, &invalid_cpu_message));
+    mavlink_v2_extension_t invalid_cpu_extension{};
+    mavlink_msg_v2_extension_decode(&invalid_cpu_message, &invalid_cpu_extension);
+    EXPECT_EQ(ReadLe<uint8_t>(invalid_cpu_extension.payload, 31), 0x00U);
+    EXPECT_EQ(ReadLe<uint32_t>(invalid_cpu_extension.payload, 21), 0U);
 
     common::MissionStatus mission;
     mission.header.sequence = 9;

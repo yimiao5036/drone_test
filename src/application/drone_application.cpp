@@ -62,7 +62,8 @@ void DroneApplication::BuildComponents() {
     }
 
     // 健康管理器独立于具体数据链路；只注册实际创建的生产模块。
-    health_manager_ = std::make_unique<health::HealthManager>();
+    health_manager_ = std::make_unique<health::HealthManager>(
+        std::unique_ptr<health::ICpuLoadProvider>{}, config_.health.cpu_sample_period);
     RegisterHealthSources();
 
     // 影子状态机只在PX4状态源与地面站目标源同时存在时创建；本阶段不创建控制器。

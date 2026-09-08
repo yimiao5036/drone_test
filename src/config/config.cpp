@@ -383,6 +383,8 @@ AppConfig LoadAppConfig(const std::string& path,
     }
 
     const json health = root.value("health", json::object());
+    config.health.cpu_sample_period = ReadOptionalPositiveMilliseconds(
+        health, "cpu_sample_period_ms", config.health.cpu_sample_period);
     config.health.camera_max_age = ReadOptionalPositiveMilliseconds(
         health, "camera_max_age_ms", config.health.camera_max_age);
     config.health.decoder_max_age = ReadOptionalPositiveMilliseconds(

@@ -978,6 +978,7 @@ private:
 
     bool SendHealthStatus(const common::HealthStatus& health) {
         std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        const bool cpu_load_valid = std::isfinite(health.cpu_load_pct);
         WriteLe<uint8_t>(payload, 0, kStatusProtocolVersion);
         WriteLe<uint32_t>(payload, 1, static_cast<uint32_t>(health.header.sequence));
         WriteLe<uint32_t>(payload, 5, health.link_health_bits);
@@ -988,7 +989,7 @@ private:
         WriteLe<uint32_t>(payload, 25, health.timeout_event_count);
         WriteLe<uint8_t>(payload, 29, config_.aircraft_system_id);
         WriteLe<uint8_t>(payload, 30, config_.aircraft_component_id);
-        WriteLe<uint8_t>(payload, 31, 0);
+        WriteLe<uint8_t>(payload, 31, cpu_load_valid ? 0x01U : 0x00U);
         WriteLe<uint64_t>(payload, 32, health.header.receive_time_ms);
         // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
         WriteLe<uint8_t>(payload, 54, 1);

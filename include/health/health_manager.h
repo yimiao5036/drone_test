@@ -16,8 +16,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,6 +43,40 @@ inline constexpr char kYolo[] = "yolo";
 inline constexpr char kPowerA[] = "power_a";
 inline constexpr char kPowerB[] = "power_b";
 }  // namespace source_names
+
+/// CPU负载采样结果状态。
+enum class CpuLoadSampleStatus : uint8_t {
+    kValid = 0,
+    kWarmup,  ///< 仅取得首个累计值，尚不能计算差分负载。
+    kError,
+};
+
+struct CpuLoadSample {
+    CpuLoadSampleStatus status = CpuLoadSampleStatus::kWarmup;
+    float load_pct = 0.f;
+};
+
+/// CPU负载采样抽象，便于测试注入和后续替换平台实现。
+class ICpuLoadProvider {
+public:
+    virtual ~ICpuLoadProvider() = default;
+    virtual CpuLoadSample Sample() = 0;
+    virtual void Reset() = 0;
+};
+
+/// Linux /proc/stat CPU总负载采样器；使用相邻两次累计时间差计算百分比。
+class ProcStatCpuLoadProvider final : public ICpuLoadProvider {
+public:
+    explicit ProcStatCpuLoadProvider(std::string path = "/proc/stat");
+    CpuLoadSample Sample() override;
+    void Reset() override;
+
+private:
+    std::string path_;
+    uint64_t previous_total_ = 0;
+    uint64_t previous_idle_ = 0;
+    bool have_previous_ = false;
+};
 
 /// 健康管理部件抽象接口。
 class IHealthManager {
@@ -84,7 +120,9 @@ public:
 /// 运行期间由各生产模块在收到有效数据后调用。实现不负责硬件读写、重连或控制决策。
 class HealthManager final : public IHealthManager {
 public:
-    HealthManager();
+    explicit HealthManager(
+        std::unique_ptr<ICpuLoadProvider> cpu_load_provider = {},
+        std::chrono::milliseconds cpu_sample_period = std::chrono::milliseconds(1000));
     ~HealthManager() override;
 
     HealthManager(const HealthManager&) = delete;
@@ -125,6 +163,11 @@ private:
     bool stop_requested_ = false;
     bool snapshot_requested_ = false;
     uint64_t output_sequence_ = 0;
+    std::unique_ptr<ICpuLoadProvider> cpu_load_provider_;
+    std::chrono::milliseconds cpu_sample_period_;
+    uint64_t last_cpu_sample_ms_ = 0;
+    float cpu_load_pct_ = 0.f;
+    bool cpu_load_valid_ = false;
     std::atomic<uint64_t> timeout_event_count_{0};
     std::atomic<uint64_t> error_count_{0};
 };

@@ -262,7 +262,7 @@ struct HealthStatus {
     /// 数据新鲜度位：与 link_health_bits 同序，0=新鲜 1=超时
     uint32_t data_freshness_bits = 0;
     uint32_t error_bits = 0;      ///< 错误位（实现期按模块定义）
-    float cpu_load_pct = 0.f;     ///< 算力板负载
+    float cpu_load_pct = std::numeric_limits<float>::quiet_NaN();  ///< 算力板负载；无有效采样时为NaN
     uint32_t timeout_event_count = 0;  ///< 累计进入超时状态的事件次数
 };
 

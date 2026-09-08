@@ -71,10 +71,10 @@ Topic<common::HealthStatus>
 | `device_health_bits` | 设备健康位：bit0 解码器、bit1 NPU/YOLO、bit2 电源A、bit3 电源B |
 | `data_freshness_bits` | 数据新鲜度位，与链路位顺序一致；`0` 表示新鲜，`1` 表示超时 |
 | `error_bits` | 模块错误汇总位，具体位定义需随正式实现冻结，不得在不同模块重复使用同一含义 |
-| `cpu_load_pct` | 算力板负载百分比；无有效采样时不得伪造为健康值 |
+| `cpu_load_pct` | 算力板CPU总负载百分比；采样预热或读取失败时为NaN |
 | `timeout_event_count` | 累计进入数据超时状态的事件次数；持续超时不重复累计 |
 
-当前实现冻结位语义：健康位中 `1` 表示对应数据源已注册且数据新鲜，`0` 表示未注册或不可用；`data_freshness_bits` 中 `1` 表示对应链路数据超时，`0` 表示未超时。未注册的源不会被当作故障。`error_bits` 和 `cpu_load_pct` 暂无上报接口，当前保持默认值，后续扩展时必须同步更新公共类型和地面站协议。
+当前实现冻结位语义：健康位中 `1` 表示对应数据源已注册且数据新鲜，`0` 表示未注册或不可用；`data_freshness_bits` 中 `1` 表示对应链路数据超时，`0` 表示未超时。未注册的源不会被当作故障。CPU负载由Linux `/proc/stat` 相邻累计值差分计算；首个样本只用于预热，读取失败或差分非法时发布NaN，并由状态协议有效位通知地面站显示未知。`error_bits`仍待正式错误源接入。
 
 ### 2.3 Topic 与生命周期
 
@@ -120,9 +120,9 @@ video_decoder / yolo / power_a / power_b
 - 独立监控线程默认每 100ms 检查一次新鲜度；
 - 健康位、新鲜度位、状态序号和超时事件计数已经实现；
 - 状态进入超时和恢复时记录一次状态变化日志；
-- `error_bits` 和 `cpu_load_pct` 尚未接入真实来源，当前保持默认值；
-- `DroneApplication` 已创建真实 HealthManager、接入状态机并绑定地面站 HealthStatus 输入 Topic；应用级监控线程把视频、PX4、地面站、解码器、YOLO和图传计数变化转换为 `ReportData()`；地面站健康状态MAVLink下行协议尚未编码；
-- `error_bits` 和 `cpu_load_pct` 尚未接入真实来源，激光雷达、电源等模块尚未装配。
+- CPU负载已通过可替换的`ICpuLoadProvider`接入，生产使用`ProcStatCpuLoadProvider`读取`/proc/stat`，默认1000ms采样；
+- `DroneApplication` 已创建真实 HealthManager、接入状态机并绑定地面站 HealthStatus 输入 Topic；应用级监控线程把视频、PX4、地面站、解码器、YOLO和图传计数变化转换为 `ReportData()`；地面站已通过V2_EXTENSION 65012下行健康状态；
+- `error_bits`尚未接入真实来源，激光雷达、电源等模块尚未装配。
 
 `HealthManagerStub` 仍固定返回未实现，用于验证旧接口和骨架生命周期，不应与真实类混用。
 
@@ -153,13 +153,14 @@ ctest --test-dir build --output-on-failure
 - 数据新鲜、无数据超时、超时恢复；
 - 链路位、设备位和新鲜度位映射；
 - 未注册数据和未来时间戳拒绝；
-- 启停、重复启停和重新启动。
+- 启停、重复启停和重新启动；
+- `/proc/stat`累计值差分计算、CPU采样预热为NaN、注入采样器发布有效负载。
 
 后续还需补充：
 
 - 多数据源独立超时的长期运行测试；
 - Topic 队列满时不阻塞数据源上报；
-- `error_bits` 和 CPU 负载来源接入；
+- `error_bits`来源接入和活动错误语义测试；
 - 状态机消费健康快照后的安全降级行为。
 
 硬件验证应在香橙派上进行：拔断 PX4、地面站、摄像头或图传链路，分别确认对应健康位和新鲜度位变化，且其他独立模块仍可运行；恢复链路后确认状态恢复，不能发送任何未授权飞行控制命令。
