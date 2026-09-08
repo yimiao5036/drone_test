@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace drone::common {
@@ -273,7 +274,7 @@ struct MissionStatus {
     uint8_t control_source = 0;                ///< 当前控制来源（与 ControlIntent 一致）
     uint8_t task_phase = 0;                    ///< 任务阶段（实现期定义）
     uint32_t active_warning_bits = 0;          ///< 激活的告警位
-    float front_distance_m = 0.f;              ///< 前向障碍距离；无效为 NaN
+    float front_distance_m = std::numeric_limits<float>::quiet_NaN();  ///< 前向障碍距离；无效为 NaN
     bool interception_authorized = false;      ///< 拦截授权
     uint8_t power_status_bits = 0;             ///< bit0=电源A可用 bit1=电源B可用
 };
