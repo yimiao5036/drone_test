@@ -62,6 +62,10 @@ class VideoDecoder final : public IVideoDecoder {
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
 - **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
 
+### 延迟统计
+
+解码器记录三项固定窗口统计：`InputQueueLatency()`（码流进入进程到解码线程开始）、`DecodeLatency()`（H265解码+硬件帧转存+NV12拷贝）、`IngressToDecodedLatency()`（入口到NV12发布）。统计仅在探针读取快照时排序，逐帧不打日志。
+
 ## 4. 日志行为
 
 | 等级 | 场景 |

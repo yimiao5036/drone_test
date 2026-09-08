@@ -168,6 +168,7 @@ TEST(VideoDecoderTest, DecodesH264ToNv12Frames) {
     decoder.Stop();
 
     EXPECT_GT(decoder.DecodedFrameCount(), 0u);
+    EXPECT_GT(decoder.DecodeLatency().total_count, 0u);
     EXPECT_EQ(decoder.ErrorCount(), 0u);
     // 输入 10 帧全部为关键帧，预期解码 10 帧（池容量充足不丢帧）
     EXPECT_GE(received, static_cast<std::size_t>(kTestFrameCount) - 1);

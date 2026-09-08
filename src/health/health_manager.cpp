@@ -359,18 +359,23 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // 必须在取得数据源锁后读取评估时刻：上报线程可能在加锁前写入更晚时间戳，
+        // 若继续使用函数入口的旧now_ms，会同周期误判全源超时并立即恢复。
+        const uint64_t evaluation_now_ms = SteadyNowMs();
         bool all_sources_healthy = !sources_.empty();
 
         for (auto& [name, source] : sources_) {
-            const bool fresh = source.has_data && now_ms >= source.last_receive_time_ms &&
-                               now_ms - source.last_receive_time_ms <= source.max_age_ms;
+            const bool fresh = source.has_data &&
+                               evaluation_now_ms >= source.last_receive_time_ms &&
+                               evaluation_now_ms - source.last_receive_time_ms <=
+                                   source.max_age_ms;
             // 启动后给每个数据源一个自身max_age的首包宽限期，避免线程刚启动就误报全源超时。
             const uint64_t first_packet_grace_ms = std::max<uint64_t>(
                 source.max_age_ms,
                 static_cast<uint64_t>(startup_grace_period_.count()));
             const bool waiting_first_data =
-                !source.has_data && now_ms >= monitor_start_ms_ &&
-                now_ms - monitor_start_ms_ <= first_packet_grace_ms;
+                !source.has_data && evaluation_now_ms >= monitor_start_ms_ &&
+                evaluation_now_ms - monitor_start_ms_ <= first_packet_grace_ms;
             const bool was_timed_out = source.timed_out;
             source.timed_out = !fresh && !waiting_first_data;
 
@@ -400,7 +405,7 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
         }
 
         snapshot.header.sequence = ++output_sequence_;
-        snapshot.header.receive_time_ms = now_ms;
+        snapshot.header.receive_time_ms = evaluation_now_ms;
         snapshot.header.health = sources_.empty() ? 0 : (all_sources_healthy ? 1 : 2);
         snapshot.cpu_load_pct = cpu_load_valid_
                                     ? cpu_load_pct_

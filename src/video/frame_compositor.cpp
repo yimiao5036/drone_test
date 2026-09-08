@@ -41,6 +41,11 @@ bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+std::int64_t MonotonicUs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 /// 像素对齐（向上取整）。
 std::uint32_t AlignUp(std::uint32_t value, std::uint32_t alignment) {
     if (alignment == 0) {
@@ -271,6 +276,9 @@ struct FrameCompositor::Impl {
     std::atomic<uint64_t> annotated_count{0};
     std::atomic<uint64_t> dropped_count{0};
     std::atomic<uint64_t> error_count{0};
+    common::LatencyStatistics input_queue_latency;
+    common::LatencyStatistics compose_latency;
+    common::LatencyStatistics ingress_to_annotated_latency;
 
     void CreatePool(std::uint32_t width, std::uint32_t height) {
         VideoFrameInfo tmpl;
@@ -346,6 +354,10 @@ struct FrameCompositor::Impl {
             // 期间到达的新检测在本帧立即生效，而不是延迟到下一帧。
             DrainDetections();
             ExpireStaleDetections(in_handle.Info().sequence);
+            if (in_handle.Info().timestamp_ms > 0) {
+                input_queue_latency.Add(static_cast<double>(
+                    MonotonicUs() / 1000 - in_handle.Info().timestamp_ms));
+            }
             Compose(in_handle, pending_detections);
         }
     }
@@ -354,6 +366,7 @@ struct FrameCompositor::Impl {
     // 先复制 Y/UV 两个平面，再在副本上绘制框和文字，确保输出帧可独立归还。
     void Compose(const FrameHandle& in,
                  const std::vector<common::DetectionResult>& dets) {
+        const std::int64_t compose_start_us = MonotonicUs();
         const VideoFrameInfo& src = in.Info();
         const std::uint32_t w = src.width;
         const std::uint32_t h = src.height;
@@ -370,7 +383,7 @@ struct FrameCompositor::Impl {
             }
         }
 
-        auto out = pool->Acquire();
+        auto out = pool->Acquire(src.pipeline_ingress_time_ms);
         if (!out.Valid()) {
             ++dropped_count;
             if (ShouldLogThrottled(dropped_count)) {
@@ -418,6 +431,15 @@ struct FrameCompositor::Impl {
             }
         }
 
+        const std::int64_t completed_us = MonotonicUs();
+        const std::int64_t completed_ms = completed_us / 1000;
+        out.SetTiming(completed_ms, src.pipeline_ingress_time_ms);
+        compose_latency.Add(
+            static_cast<double>(completed_us - compose_start_us) / 1000.0);
+        if (src.pipeline_ingress_time_ms > 0) {
+            ingress_to_annotated_latency.Add(static_cast<double>(
+                completed_ms - src.pipeline_ingress_time_ms));
+        }
         (void)annotated_output.Emplace(std::move(out));
         ++annotated_count;
     }
@@ -498,6 +520,18 @@ std::uint64_t FrameCompositor::DroppedFrameCount() const {
 
 std::uint64_t FrameCompositor::ErrorCount() const {
     return impl_->error_count.load();
+}
+
+common::LatencySummary FrameCompositor::InputQueueLatency() const {
+    return impl_->input_queue_latency.Snapshot();
+}
+
+common::LatencySummary FrameCompositor::ComposeLatency() const {
+    return impl_->compose_latency.Snapshot();
+}
+
+common::LatencySummary FrameCompositor::IngressToAnnotatedLatency() const {
+    return impl_->ingress_to_annotated_latency.Snapshot();
 }
 
 }  // namespace drone::video

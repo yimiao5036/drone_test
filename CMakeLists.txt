@@ -184,6 +184,23 @@ add_custom_target(drone_runtime_assets
     COMMENT "同步 models/ 和 config/ 到构建目录"
     VERBATIM)
 add_dependencies(drone_control drone_runtime_assets)
+
+# 香橙派视频链路延迟探针：复用正式装配，仅启用视频并输出阶段P50/P95/P99。
+add_executable(video_latency_probe
+    tools/video_latency_probe.cpp
+    src/common/logger.cpp)
+target_link_libraries(video_latency_probe PRIVATE
+    drone_common
+    drone_application
+    spdlog::spdlog
+    PkgConfig::FFMPEG)
+if(MSVC)
+    target_compile_options(video_latency_probe PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(video_latency_probe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_dependencies(video_latency_probe drone_runtime_assets)
+
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE
@@ -232,6 +249,16 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(topic_test)
+
+        add_executable(latency_statistics_test tests/common/latency_statistics_test.cpp)
+        target_link_libraries(latency_statistics_test PRIVATE drone_common GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(latency_statistics_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(latency_statistics_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(latency_statistics_test)
 
         add_executable(video_frame_test tests/video/video_frame_test.cpp)
         target_link_libraries(video_frame_test PRIVATE drone_common GTest::gtest_main)

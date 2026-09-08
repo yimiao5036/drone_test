@@ -54,6 +54,15 @@ std::string AvErrorToString(int errnum) {
 }
 
 /// 像素对齐（向上取整）。
+std::int64_t MonotonicUs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::int64_t MonotonicMs() {
+    return MonotonicUs() / 1000;
+}
+
 std::uint32_t AlignUp(std::uint32_t value, std::uint32_t alignment) {
     if (alignment == 0) {
         return value;
@@ -104,6 +113,9 @@ struct VideoDecoder::Impl {
     std::atomic<uint64_t> decoded_count{0};
     std::atomic<uint64_t> dropped_count{0};
     std::atomic<uint64_t> error_count{0};
+    common::LatencyStatistics input_queue_latency;
+    common::LatencyStatistics decode_latency;
+    common::LatencyStatistics ingress_to_decoded_latency;
 
     /// 创建帧内存池（按解码分辨率）。
     /// @throw std::invalid_argument / std::bad_alloc 池参数非法或内存不足
@@ -318,6 +330,13 @@ struct VideoDecoder::Impl {
     /// 解码单个码流块并发布所有输出帧。
     // packet 使用独立 FFmpeg 缓冲，处理完后由下一次 av_packet_unref 回收复用。
     void DecodeOne(const common::EncodedFrame& encoded, AVPacket* packet) {
+        const std::int64_t decode_start_us = MonotonicUs();
+        const std::int64_t ingress_ms =
+            static_cast<std::int64_t>(encoded.header.receive_time_ms);
+        if (ingress_ms > 0) {
+            input_queue_latency.Add(
+                static_cast<double>(decode_start_us / 1000 - ingress_ms));
+        }
         // 首个数据帧确定编码类型并创建解码器（参数集随帧或已由参数集消息提供）
         if (codec_ctx == nullptr && !decoder_creation_failed) {
             if (!CreateDecoder(encoded.codec, encoded.parameter_sets)) {
@@ -379,13 +398,14 @@ struct VideoDecoder::Impl {
                 }
                 break;
             }
-            PublishFrame(decoded_frame);
+            PublishFrame(decoded_frame, ingress_ms, decode_start_us);
         }
     }
 
     /// 将解码帧转为 NV12 写入内存池并发布。
     // 硬件帧先 transfer 到系统内存；NV12 直接按 stride 拷贝，YUV420P 才走 sws 转换。
-    void PublishFrame(AVFrame* source) {
+    void PublishFrame(AVFrame* source, std::int64_t ingress_ms,
+                      std::int64_t decode_start_us) {
         // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
         AVFrame* frame = source;
         if (source->format == AV_PIX_FMT_DRM_PRIME ||
@@ -421,7 +441,7 @@ struct VideoDecoder::Impl {
             }
         }
 
-        auto handle = pool->Acquire();
+        auto handle = pool->Acquire(ingress_ms);
         if (!handle.Valid()) {
             ++dropped_count;
             if (ShouldLogThrottled(dropped_count)) {
@@ -497,6 +517,14 @@ struct VideoDecoder::Impl {
                       dst_planes, dst_linesize);
         }
 
+        const std::int64_t completed_us = MonotonicUs();
+        const std::int64_t completed_ms = completed_us / 1000;
+        handle.SetTiming(completed_ms, ingress_ms);
+        decode_latency.Add(static_cast<double>(completed_us - decode_start_us) / 1000.0);
+        if (ingress_ms > 0) {
+            ingress_to_decoded_latency.Add(
+                static_cast<double>(completed_ms - ingress_ms));
+        }
         (void)frame_output.Emplace(std::move(handle));
         ++decoded_count;
     }
@@ -576,6 +604,18 @@ uint64_t VideoDecoder::DroppedFrameCount() const {
 
 uint64_t VideoDecoder::ErrorCount() const {
     return impl_->error_count.load();
+}
+
+common::LatencySummary VideoDecoder::InputQueueLatency() const {
+    return impl_->input_queue_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::DecodeLatency() const {
+    return impl_->decode_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::IngressToDecodedLatency() const {
+    return impl_->ingress_to_decoded_latency.Snapshot();
 }
 
 }  // namespace drone::video

@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 
+#include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
 #include "video/video_frame.h"
@@ -57,6 +58,9 @@ public:
     virtual float InferenceTimeMsAvg() const = 0;
     /// 累计错误次数（模型推理失败等）。
     virtual uint64_t ErrorCount() const = 0;
+    virtual common::LatencySummary InputQueueLatency() const = 0;
+    virtual common::LatencySummary InferenceLatency() const = 0;
+    virtual common::LatencySummary IngressToInferenceLatency() const = 0;
 };
 
 /// YOLO 检测器配置。
@@ -105,6 +109,9 @@ public:
     uint64_t ProcessedFrameCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override;
+    common::LatencySummary InferenceLatency() const override;
+    common::LatencySummary IngressToInferenceLatency() const override;
 
 private:
     struct Impl;
@@ -131,6 +138,9 @@ public:
     uint64_t ProcessedFrameCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override { return {}; }
+    common::LatencySummary InferenceLatency() const override { return {}; }
+    common::LatencySummary IngressToInferenceLatency() const override { return {}; }
 
 private:
     bool running_ = false;

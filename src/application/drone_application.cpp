@@ -376,4 +376,31 @@ bool DroneApplication::IsRunning() const {
     return running_;
 }
 
+VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
+    VideoPipelineLatencySnapshot snapshot;
+    if (decoder_ != nullptr) {
+        snapshot.decode_queue = decoder_->InputQueueLatency();
+        snapshot.decode = decoder_->DecodeLatency();
+        snapshot.ingress_to_decoded = decoder_->IngressToDecodedLatency();
+    }
+    if (detector_ != nullptr) {
+        snapshot.yolo_queue = detector_->InputQueueLatency();
+        snapshot.yolo_inference = detector_->InferenceLatency();
+        snapshot.ingress_to_inference = detector_->IngressToInferenceLatency();
+    }
+    if (compositor_ != nullptr) {
+        snapshot.compositor_queue = compositor_->InputQueueLatency();
+        snapshot.compositor = compositor_->ComposeLatency();
+        snapshot.ingress_to_annotated = compositor_->IngressToAnnotatedLatency();
+    }
+    if (video_sender_ != nullptr) {
+        snapshot.sender_queue = video_sender_->InputQueueLatency();
+        snapshot.frame_prepare = video_sender_->FramePrepareLatency();
+        snapshot.encode_and_push = video_sender_->EncodeAndPushLatency();
+        snapshot.packet_write = video_sender_->PacketWriteLatency();
+        snapshot.ingress_to_rtsp = video_sender_->IngressToRtspLatency();
+    }
+    return snapshot;
+}
+
 }  // namespace drone::application

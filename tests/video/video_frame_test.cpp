@@ -88,6 +88,18 @@ TEST(VideoFrameTest, HandleExposesInfoAndData) {
     EXPECT_EQ(handle.Info().format, PixelFormat::kYuv420SpNv12);
 }
 
+TEST(VideoFrameTest, ProducerCanSetPipelineTimingBeforePublish) {
+    std::byte buffer[1024];
+    auto recycler = std::make_shared<FakeRecycler>();
+    auto frame_buffer = std::make_shared<FrameBuffer>(
+        MakeInfo(), buffer, sizeof(buffer), recycler, 3);
+    FrameHandle handle(frame_buffer);
+
+    handle.SetTiming(20000, 19000);
+    EXPECT_EQ(handle.Info().timestamp_ms, 20000);
+    EXPECT_EQ(handle.Info().pipeline_ingress_time_ms, 19000);
+}
+
 TEST(VideoFrameTest, HandleIsMovableButNotCopyable) {
     static_assert(!std::is_copy_constructible_v<FrameHandle>,
                   "FrameHandle must not be copyable");

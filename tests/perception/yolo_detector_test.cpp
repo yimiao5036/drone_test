@@ -201,6 +201,7 @@ TEST_F(YoloDetectorTest, DetectPublishesResults) {
     // 统计
     EXPECT_TRUE(WaitFor([this] { return detector_->ProcessedFrameCount() == 1; }));
     EXPECT_GT(detector_->InferenceTimeMsAvg(), 0.f);
+    EXPECT_EQ(detector_->InferenceLatency().total_count, 1u);
     EXPECT_EQ(mock_->detect_count, 1u);
 }
 

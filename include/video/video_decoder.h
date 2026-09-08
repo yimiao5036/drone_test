@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
 #include "video/video_frame.h"
@@ -63,6 +64,9 @@ public:
     virtual uint64_t DroppedFrameCount() const = 0;
     /// 累计错误次数。
     virtual uint64_t ErrorCount() const = 0;
+    virtual common::LatencySummary InputQueueLatency() const = 0;
+    virtual common::LatencySummary DecodeLatency() const = 0;
+    virtual common::LatencySummary IngressToDecodedLatency() const = 0;
 };
 
 /// 视频解码器（实现 IVideoDecoder）。
@@ -94,6 +98,9 @@ public:
     uint64_t DecodedFrameCount() const override;
     uint64_t DroppedFrameCount() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override;
+    common::LatencySummary DecodeLatency() const override;
+    common::LatencySummary IngressToDecodedLatency() const override;
 
 private:
     struct Impl;
@@ -120,6 +127,9 @@ public:
     uint64_t DecodedFrameCount() const override;
     uint64_t DroppedFrameCount() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override { return {}; }
+    common::LatencySummary DecodeLatency() const override { return {}; }
+    common::LatencySummary IngressToDecodedLatency() const override { return {}; }
 
 private:
     bool running_ = false;

@@ -51,6 +51,8 @@ public:
     }
     std::uint64_t SentFrameCount() const override { return encode_count; }
     std::uint64_t ErrorCount() const override { return start_result ? error_override : 1; }
+    common::LatencySummary FramePrepareLatency() const override { return {}; }
+    common::LatencySummary PacketWriteLatency() const override { return {}; }
 };
 
 /// 轮询等待条件满足（带超时）。
@@ -142,6 +144,7 @@ TEST_F(VideoSenderTest, SendsFramesToBackend) {
     PublishFrame();
     EXPECT_TRUE(WaitFor([mock] { return mock->encode_count == 1; }));
     EXPECT_EQ(sender->SentFrameCount(), 1u);
+    EXPECT_EQ(sender->EncodeAndPushLatency().total_count, 1u);
     EXPECT_EQ(sender->DroppedFrameCount(), 0u);
 
     sender->Stop();

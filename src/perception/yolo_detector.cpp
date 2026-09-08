@@ -111,6 +111,9 @@ struct YoloDetector::Impl {
     std::atomic<uint64_t> error_count{0};
     std::atomic<uint64_t> sequence{0};
     std::atomic<float> avg_inference_ms{0.f};
+    common::LatencyStatistics input_queue_latency;
+    common::LatencyStatistics inference_latency;
+    common::LatencyStatistics ingress_to_inference_latency;
 
     /// 更新推理平均耗时（EMA）。
     // α=0.1 在响应近期变化和抑制单帧抖动之间折中，不保存完整历史样本。
@@ -145,6 +148,12 @@ struct YoloDetector::Impl {
             // 推理：后端只返回原图坐标系检测框，检测器负责计时和消息格式转换。
             std::vector<BackendDetection> detections;
             const auto start = std::chrono::steady_clock::now();
+            const std::int64_t start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                start.time_since_epoch()).count();
+            if (frame.Info().timestamp_ms > 0) {
+                input_queue_latency.Add(
+                    static_cast<double>(start_ms - frame.Info().timestamp_ms));
+            }
             try {
                 detections = backend->Detect(frame);
             } catch (const std::exception& e) {
@@ -158,6 +167,13 @@ struct YoloDetector::Impl {
             const float elapsed_ms =
                 std::chrono::duration<float, std::milli>(end - start).count();
             UpdateAvg(elapsed_ms);
+            inference_latency.Add(elapsed_ms);
+            if (frame.Info().pipeline_ingress_time_ms > 0) {
+                const auto end_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end.time_since_epoch()).count();
+                ingress_to_inference_latency.Add(static_cast<double>(
+                    end_ms - frame.Info().pipeline_ingress_time_ms));
+            }
             ++processed_count;
 
             // 发布检测结果：每个目标一条消息，共享帧序号与推理耗时。
@@ -284,6 +300,18 @@ float YoloDetector::InferenceTimeMsAvg() const {
 
 uint64_t YoloDetector::ErrorCount() const {
     return impl_->error_count.load();
+}
+
+common::LatencySummary YoloDetector::InputQueueLatency() const {
+    return impl_->input_queue_latency.Snapshot();
+}
+
+common::LatencySummary YoloDetector::InferenceLatency() const {
+    return impl_->inference_latency.Snapshot();
+}
+
+common::LatencySummary YoloDetector::IngressToInferenceLatency() const {
+    return impl_->ingress_to_inference_latency.Snapshot();
 }
 
 }  // namespace drone::perception

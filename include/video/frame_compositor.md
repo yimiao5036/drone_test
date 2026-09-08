@@ -68,6 +68,10 @@ kDetection(DetectionResult) ──────┘
 像 `YoloDetector`：`Stop` `Reset` 订阅唤醒线程；`Start` 通过保存的 `decoded_topic_`/
 `detection_topic_` 在 `IsOpen()==false` 时重新订阅，支持停机后再启动。
 
+### 延迟统计
+
+`InputQueueLatency()`统计解码帧到叠加线程的排队时间；`ComposeLatency()`统计NV12全帧复制和框/文字绘制；`IngressToAnnotatedLatency()`统计机载码流入口到标注帧发布。输出帧继承`pipeline_ingress_time_ms`并在发布前刷新阶段时间。
+
 ## 日志行为
 
 - **INFO**：创建（池容量/线宽/文字开关）、输出池创建、启动、停止、销毁。

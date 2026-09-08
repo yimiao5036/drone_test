@@ -66,6 +66,8 @@ struct VideoEncoderImpl {
     std::atomic<uint64_t> sent_count{0};
     std::atomic<uint64_t> error_count{0};
     std::atomic<bool> running{false};
+    common::LatencyStatistics frame_prepare_latency;
+    common::LatencyStatistics packet_write_latency;
 
     // FFmpeg 状态
     AVFormatContext* format_ctx_ = nullptr;   // RTSP 输出封装上下文
@@ -320,7 +322,11 @@ struct VideoEncoderImpl {
             packet_->size = static_cast<int>(total);
         }
 
+        const auto write_start = std::chrono::steady_clock::now();
         const int ret = av_interleaved_write_frame(format_ctx_, packet_);
+        const auto write_end = std::chrono::steady_clock::now();
+        packet_write_latency.Add(
+            std::chrono::duration<double, std::milli>(write_end - write_start).count());
         av_packet_unref(packet_);
         if (ret < 0) {
             ++error_count;
@@ -337,6 +343,7 @@ struct VideoEncoderImpl {
     // 将共享 NV12 FrameHandle 拷贝到可复用的 FFmpeg 输入帧，再送入编码器并排空输出包。
     // 拷贝按源/目标 stride 逐行进行，不能假设池内缓冲是紧凑排列。
     bool EncodeFrame(const video::FrameHandle& frame) {
+        const auto prepare_start = std::chrono::steady_clock::now();
         if (!running.load()) {
             ++error_count;
             return false;
@@ -403,6 +410,10 @@ struct VideoEncoderImpl {
                       pic_out_->data, pic_out_->linesize);
             encode_input = pic_out_;
         }
+
+        const auto prepare_end = std::chrono::steady_clock::now();
+        frame_prepare_latency.Add(
+            std::chrono::duration<double, std::milli>(prepare_end - prepare_start).count());
 
         const int send_ret = avcodec_send_frame(codec_ctx_, encode_input);
         if (send_ret < 0) {
@@ -491,6 +502,12 @@ public:
     }
     std::uint64_t ErrorCount() const override {
         return impl_->error_count.load();
+    }
+    common::LatencySummary FramePrepareLatency() const override {
+        return impl_->frame_prepare_latency.Snapshot();
+    }
+    common::LatencySummary PacketWriteLatency() const override {
+        return impl_->packet_write_latency.Snapshot();
     }
 
 private:

@@ -4,6 +4,7 @@
 #include <memory>
 #include <thread>
 
+#include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
 #include "config/config.h"
@@ -30,6 +31,23 @@ class VideoSender;
 
 namespace drone::application {
 
+struct VideoPipelineLatencySnapshot {
+    common::LatencySummary decode_queue;
+    common::LatencySummary decode;
+    common::LatencySummary ingress_to_decoded;
+    common::LatencySummary yolo_queue;
+    common::LatencySummary yolo_inference;
+    common::LatencySummary ingress_to_inference;
+    common::LatencySummary compositor_queue;
+    common::LatencySummary compositor;
+    common::LatencySummary ingress_to_annotated;
+    common::LatencySummary sender_queue;
+    common::LatencySummary frame_prepare;
+    common::LatencySummary encode_and_push;
+    common::LatencySummary packet_write;
+    common::LatencySummary ingress_to_rtsp;
+};
+
 /// 正式进程的组件所有者与装配根。main.cpp只负责配置、信号和进程生命周期。
 class DroneApplication final {
 public:
@@ -44,6 +62,7 @@ public:
     /// 按数据流逆序停止全部模块；幂等。
     void Stop();
     bool IsRunning() const;
+    VideoPipelineLatencySnapshot VideoLatencySnapshot() const;
 
 private:
     void BuildComponents();

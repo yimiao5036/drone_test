@@ -75,6 +75,16 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 依赖 `Stop` 在独立线程被调用；开发机文件路径无该问题。若实机出现"推流写包卡死"，需补
 中断回调——**留待香橙派实机验证时处理**（标记 TODO）。
 
+### 延迟统计
+
+- `InputQueueLatency()`：标注帧发布到VideoSender开始处理；
+- `FramePrepareLatency()`：NV12复制到FFmpeg输入帧，软编时含色彩转换；
+- `EncodeAndPushLatency()`：完整`EncodeFrame()`调用，含H264编码、取包和本地RTSP写入；
+- `PacketWriteLatency()`：单个`av_interleaved_write_frame()`调用；
+- `IngressToRtspLatency()`：编码访问单元进入机载进程到本地RTSP写调用完成。
+
+这些指标不包含MediaMTX之后的HM30传输、Web转码和浏览器显示。
+
 ## 日志行为
 
 - **INFO**：创建（编码格式/地址/分辨率/帧率）、启动、停止、销毁、后端就绪。

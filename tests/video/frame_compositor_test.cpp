@@ -124,6 +124,7 @@ TEST_F(FrameCompositorTest, PublishAnnotatedFrame) {
     PublishDecodedFrame();
 
     EXPECT_TRUE(WaitFor([this] { return compositor_->AnnotatedCount() == 1; }));
+    EXPECT_EQ(compositor_->ComposeLatency().total_count, 1u);
 
     auto message = annotated_sub_.WaitTakeFor(std::chrono::milliseconds(1000));
     ASSERT_TRUE(message.has_value());

@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 
+#include "common/latency_statistics.h"
 #include "video/video_frame.h"
 
 namespace drone::video_transmission {
@@ -72,6 +73,10 @@ public:
     virtual std::uint64_t SentFrameCount() const = 0;
     /// 累计错误次数。
     virtual std::uint64_t ErrorCount() const = 0;
+    /// NV12复制/软编色彩转换耗时。
+    virtual common::LatencySummary FramePrepareLatency() const = 0;
+    /// 单个编码输出包写入本地文件/RTSP会话的调用耗时。
+    virtual common::LatencySummary PacketWriteLatency() const = 0;
 };
 
 /// 按配置创建默认编码后端（FFmpeg 封装：rkmpp 硬编优先 / 软编回退）。

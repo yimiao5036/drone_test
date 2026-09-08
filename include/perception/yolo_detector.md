@@ -71,6 +71,10 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 - **分辨率变化**：裁剪缓冲懒分配按需扩容；letterbox 每帧按实际宽高计算，
   解码分辨率变化（断流重连）无需重建后端。
 
+### 延迟统计
+
+`InputQueueLatency()`统计解码帧发布到YOLO开始处理；`InferenceLatency()`统计后端`Detect()`完整时间（RGA预处理、RKNN推理和后处理）；`IngressToInferenceLatency()`统计码流进入机载进程到YOLO完成。无检测帧同样计入推理统计。
+
 ## 日志行为
 
 | 场景 | 等级 | 节流 |
