@@ -42,35 +42,36 @@ constexpr std::chrono::milliseconds kMonitorPeriod{100};
 struct SourceSpec {
     bool is_device = false;
     std::uint32_t health_bit = 0;
+    std::uint32_t error_bit = 0;
 };
 
 std::optional<SourceSpec> FindSourceSpec(const std::string& name) {
     if (name == source_names::kCamera) {
-        return SourceSpec{false, kLinkCameraBit};
+        return SourceSpec{false, kLinkCameraBit, error_bits::kCamera};
     }
     if (name == source_names::kPx4) {
-        return SourceSpec{false, kLinkPx4Bit};
+        return SourceSpec{false, kLinkPx4Bit, error_bits::kPx4};
     }
     if (name == source_names::kGroundStation) {
-        return SourceSpec{false, kLinkGroundStationBit};
+        return SourceSpec{false, kLinkGroundStationBit, error_bits::kGroundStation};
     }
     if (name == source_names::kLaserRange) {
-        return SourceSpec{false, kLinkLaserRangeBit};
+        return SourceSpec{false, kLinkLaserRangeBit, error_bits::kLaserRange};
     }
     if (name == source_names::kVideo) {
-        return SourceSpec{false, kLinkVideoBit};
+        return SourceSpec{false, kLinkVideoBit, error_bits::kVideo};
     }
     if (name == source_names::kVideoDecoder) {
-        return SourceSpec{true, kDeviceDecoderBit};
+        return SourceSpec{true, kDeviceDecoderBit, error_bits::kVideoDecoder};
     }
     if (name == source_names::kYolo) {
-        return SourceSpec{true, kDeviceYoloBit};
+        return SourceSpec{true, kDeviceYoloBit, error_bits::kYolo};
     }
     if (name == source_names::kPowerA) {
-        return SourceSpec{true, kDevicePowerABit};
+        return SourceSpec{true, kDevicePowerABit, error_bits::kPower};
     }
     if (name == source_names::kPowerB) {
-        return SourceSpec{true, kDevicePowerBBit};
+        return SourceSpec{true, kDevicePowerBBit, error_bits::kPower};
     }
     return std::nullopt;
 }
@@ -244,10 +245,13 @@ bool HealthManager::RegisterSource(const std::string& name,
 
     sources_.emplace(name, SourceState{source_spec->is_device,
                                        source_spec->health_bit,
+                                       source_spec->error_bit,
                                        max_age_ms,
                                        0,
                                        false,
-                                       false});
+                                       false,
+                                       false,
+                                       0});
     return true;
 }
 
@@ -263,12 +267,41 @@ void HealthManager::ReportData(const std::string& name,
 
     SourceState& source = iterator->second;
     const bool was_timed_out = source.timed_out;
+    const bool recovered_from_error =
+        source.error_active && receive_time_ms > source.last_error_time_ms;
     source.last_receive_time_ms = receive_time_ms;
     source.has_data = true;
     source.timed_out = false;
+    if (recovered_from_error) {
+        source.error_active = false;
+    }
     snapshot_requested_ = true;
     if (was_timed_out) {
         SPDLOG_INFO("健康数据源恢复: {}", name);
+    }
+    if (recovered_from_error) {
+        SPDLOG_INFO("健康数据源活动错误恢复: {}", name);
+    }
+    condition_.notify_one();
+}
+
+void HealthManager::ReportError(const std::string& name,
+                                std::uint64_t error_time_ms) {
+    const std::uint64_t now_ms = SteadyNowMs();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto iterator = sources_.find(name);
+    if (iterator == sources_.end() || error_time_ms == 0 || error_time_ms > now_ms) {
+        RecordError("ReportError", name);
+        return;
+    }
+
+    SourceState& source = iterator->second;
+    const bool newly_active = !source.error_active;
+    source.error_active = true;
+    source.last_error_time_ms = std::max(source.last_error_time_ms, error_time_ms);
+    snapshot_requested_ = true;
+    if (newly_active) {
+        SPDLOG_WARN("健康数据源活动错误: {}", name);
     }
     condition_.notify_one();
 }
@@ -351,6 +384,9 @@ void HealthManager::PublishSnapshot(std::uint64_t now_ms) {
                 // data_freshness_bits 与 link_health_bits 使用同一位序。
                 snapshot.data_freshness_bits |= source.health_bit;
             }
+            if (source.error_active) {
+                snapshot.error_bits |= source.error_bit;
+            }
         }
 
         snapshot.header.sequence = ++output_sequence_;
@@ -425,6 +461,14 @@ void HealthManagerStub::ReportData(const std::string& /*name*/,
     ++error_count_;
     if (ShouldLogThrottled(error_count_)) {
         SPDLOG_WARN("健康管理部件 ReportData 未实现（骨架占位），累计调用 {}", error_count_);
+    }
+}
+
+void HealthManagerStub::ReportError(const std::string& /*name*/,
+                                    uint64_t /*error_time_ms*/) {
+    ++error_count_;
+    if (ShouldLogThrottled(error_count_)) {
+        SPDLOG_WARN("健康管理部件 ReportError 未实现（骨架占位），累计调用 {}", error_count_);
     }
 }
 

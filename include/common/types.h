@@ -261,7 +261,8 @@ struct HealthStatus {
     uint32_t device_health_bits = 0;
     /// 数据新鲜度位：与 link_health_bits 同序，0=新鲜 1=超时
     uint32_t data_freshness_bits = 0;
-    uint32_t error_bits = 0;      ///< 错误位（实现期按模块定义）
+    /// 活动错误位：bit0摄像头 bit1解码器 bit2YOLO bit3PX4 bit4地面站 bit5图传 bit6激光雷达 bit7电源
+    uint32_t error_bits = 0;
     float cpu_load_pct = std::numeric_limits<float>::quiet_NaN();  ///< 算力板负载；无有效采样时为NaN
     uint32_t timeout_event_count = 0;  ///< 累计进入超时状态的事件次数
 };

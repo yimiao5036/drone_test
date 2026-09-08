@@ -256,6 +256,12 @@ void DroneApplication::HealthReportLoop() {
     std::uint64_t last_video_frames = 0;
     std::uint64_t last_px4_messages = 0;
     std::uint64_t last_ground_station_messages = 0;
+    std::uint64_t last_camera_errors = 0;
+    std::uint64_t last_decoder_errors = 0;
+    std::uint64_t last_yolo_errors = 0;
+    std::uint64_t last_video_errors = 0;
+    std::uint64_t last_px4_errors = 0;
+    std::uint64_t last_ground_station_errors = 0;
 
     const auto now_ms = [] {
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -273,31 +279,53 @@ void DroneApplication::HealthReportLoop() {
                 health_manager_->ReportData(source, timestamp_ms);
             }
         };
+        const auto report_error_increase = [this, timestamp_ms](
+                                               const char* source,
+                                               std::uint64_t value,
+                                               std::uint64_t& last) {
+            if (value > last) {
+                health_manager_->ReportError(source, timestamp_ms);
+            }
+            last = value;
+        };
 
         if (camera_ != nullptr) {
             report_if_changed(health::source_names::kCamera,
                               camera_->ReceivedBytes(), last_camera_bytes);
+            report_error_increase(health::source_names::kCamera,
+                                  camera_->ErrorCount(), last_camera_errors);
         }
         if (decoder_ != nullptr) {
             report_if_changed(health::source_names::kVideoDecoder,
                               decoder_->DecodedFrameCount(), last_decoder_frames);
+            report_error_increase(health::source_names::kVideoDecoder,
+                                  decoder_->ErrorCount(), last_decoder_errors);
         }
         if (detector_ != nullptr) {
             report_if_changed(health::source_names::kYolo,
                               detector_->ProcessedFrameCount(), last_yolo_frames);
+            report_error_increase(health::source_names::kYolo,
+                                  detector_->ErrorCount(), last_yolo_errors);
         }
         if (video_sender_ != nullptr) {
             report_if_changed(health::source_names::kVideo,
                               video_sender_->SentFrameCount(), last_video_frames);
+            report_error_increase(health::source_names::kVideo,
+                                  video_sender_->ErrorCount(), last_video_errors);
         }
         if (px4_link_ != nullptr) {
             report_if_changed(health::source_names::kPx4,
                               px4_link_->ReceiveCount(), last_px4_messages);
+            report_error_increase(health::source_names::kPx4,
+                                  px4_link_->ErrorCount(), last_px4_errors);
         }
         if (ground_station_link_ != nullptr) {
             report_if_changed(health::source_names::kGroundStation,
                               ground_station_link_->ReceiveCount(),
                               last_ground_station_messages);
+            report_error_increase(health::source_names::kGroundStation,
+                                  ground_station_link_->ErrorCount(),
+                                  last_ground_station_errors);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

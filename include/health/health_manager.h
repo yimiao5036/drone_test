@@ -30,6 +30,18 @@
 
 namespace drone::health {
 
+/// HealthStatus.error_bits 活动错误位定义。
+namespace error_bits {
+inline constexpr uint32_t kCamera = 1U << 0U;
+inline constexpr uint32_t kVideoDecoder = 1U << 1U;
+inline constexpr uint32_t kYolo = 1U << 2U;
+inline constexpr uint32_t kPx4 = 1U << 3U;
+inline constexpr uint32_t kGroundStation = 1U << 4U;
+inline constexpr uint32_t kVideo = 1U << 5U;
+inline constexpr uint32_t kLaserRange = 1U << 6U;
+inline constexpr uint32_t kPower = 1U << 7U;
+}  // namespace error_bits
+
 /// HealthManager 使用的标准数据源名称。
 /// 名称与 HealthStatus 中的位位置一一对应，调用方不得自行拼写其他别名。
 namespace source_names {
@@ -103,6 +115,9 @@ public:
     /// @param receive_time_ms 最近一次数据到达时间。
     virtual void ReportData(const std::string& name, uint64_t receive_time_ms) = 0;
 
+    /// 上报数据源发生错误的单调时钟时间。错误保持激活，直到收到时间更新的有效数据。
+    virtual void ReportError(const std::string& name, uint64_t error_time_ms) = 0;
+
     // ---- 输出 ----
     /// 健康状态输出主题：common::HealthStatus。
     virtual common::Topic<common::HealthStatus>& Output() = 0;
@@ -134,6 +149,7 @@ public:
 
     bool RegisterSource(const std::string& name, uint64_t max_age_ms) override;
     void ReportData(const std::string& name, uint64_t receive_time_ms) override;
+    void ReportError(const std::string& name, uint64_t error_time_ms) override;
 
     common::Topic<common::HealthStatus>& Output() override;
 
@@ -144,10 +160,13 @@ private:
     struct SourceState {
         bool is_device = false;
         uint32_t health_bit = 0;
+        uint32_t error_bit = 0;
         uint64_t max_age_ms = 0;
         uint64_t last_receive_time_ms = 0;
         bool has_data = false;
         bool timed_out = false;
+        bool error_active = false;
+        uint64_t last_error_time_ms = 0;
     };
 
     void MonitorLoop();
@@ -187,6 +206,7 @@ public:
 
     bool RegisterSource(const std::string& name, uint64_t max_age_ms) override;
     void ReportData(const std::string& name, uint64_t receive_time_ms) override;
+    void ReportError(const std::string& name, uint64_t error_time_ms) override;
 
     common::Topic<common::HealthStatus>& Output() override;
 
