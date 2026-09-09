@@ -55,6 +55,12 @@ struct VideoPipelineLatencySnapshot {
     common::LatencySummary yolo_queue;
     common::LatencySummary yolo_inference;
     common::LatencySummary ingress_to_inference;
+    common::LatencySummary yolo_preprocess_total;
+    common::LatencySummary yolo_rga_resize_color;
+    common::LatencySummary yolo_letterbox_copy;
+    common::LatencySummary yolo_npu_run;
+    common::LatencySummary yolo_output_layout;
+    common::LatencySummary yolo_postprocess;
     common::LatencySummary compositor_queue;
     common::LatencySummary compositor;
     common::LatencySummary ingress_to_annotated;

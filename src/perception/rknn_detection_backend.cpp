@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,11 @@ namespace {
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
+}
+
+std::int64_t MonotonicUs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 /// 读取整个模型文件到内存。
@@ -163,6 +169,14 @@ struct RknnDetectionBackend::Impl {
     // letterbox 缩放临时 RGB 缓冲（懒分配复用，避免每帧 malloc/free）
     std::vector<uint8_t> resized_rgb_buffer_;
     std::string last_preprocess_error_;  ///< 最近一次 RGA 错误，仅检测线程访问
+
+    // 最近约10秒（256帧）的后端子阶段统计；Snapshot可由探针线程并发读取。
+    common::LatencyStatistics preprocess_total_latency{256};
+    common::LatencyStatistics rga_resize_color_latency{256};
+    common::LatencyStatistics letterbox_copy_latency{256};
+    common::LatencyStatistics npu_run_latency{256};
+    common::LatencyStatistics output_layout_latency{256};
+    common::LatencyStatistics postprocess_latency{256};
 
     /// 查询模型信息并识别单输出 `[1,5,N]` 或旧版多分支结构。
     // 同时保存逻辑属性和 RKNN 原生属性：前者用于解码，后者用于零拷贝内存绑定。
@@ -387,12 +401,16 @@ struct RknnDetectionBackend::Impl {
         if (src_w == target_size && src_h == target_size) {
             rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
                 dst_rgb, target_size, target_size, RK_FORMAT_RGB_888);
+            const std::int64_t rga_start_us = MonotonicUs();
             const IM_STATUS status =
                 imcvtcolor(src_buf, dst_buf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
             if (status != IM_STATUS_SUCCESS) {
                 last_preprocess_error_ = imStrError(status);
                 return -1;
             }
+            rga_resize_color_latency.Add(
+                static_cast<double>(MonotonicUs() - rga_start_us) / 1000.0);
+            letterbox_copy_latency.Add(0.0);
             letterbox->scale = 1.f;
             letterbox->x_pad = 0;
             letterbox->y_pad = 0;
@@ -414,13 +432,17 @@ struct RknnDetectionBackend::Impl {
                                    new_height * 3);
         rga_buffer_t resized_buf = wrapbuffer_virtualaddr(
             resized_rgb_buffer_.data(), new_width, new_height, RK_FORMAT_RGB_888);
+        const std::int64_t rga_start_us = MonotonicUs();
         const IM_STATUS status = imresize(src_buf, resized_buf, scale, scale,
                                           INTER_LINEAR);
         if (status != IM_STATUS_SUCCESS) {
             last_preprocess_error_ = imStrError(status);
             return -1;
         }
+        rga_resize_color_latency.Add(
+            static_cast<double>(MonotonicUs() - rga_start_us) / 1000.0);
 
+        const std::int64_t letterbox_start_us = MonotonicUs();
         std::memset(dst_rgb, fill_color,
                     static_cast<std::size_t>(target_size) * target_size * 3);
         const std::size_t src_row_bytes = static_cast<std::size_t>(new_width) * 3;
@@ -432,6 +454,8 @@ struct RknnDetectionBackend::Impl {
                                                          src_row_bytes,
                         src_row_bytes);
         }
+        letterbox_copy_latency.Add(
+            static_cast<double>(MonotonicUs() - letterbox_start_us) / 1000.0);
         letterbox->scale = scale;
         letterbox->x_pad = pad_left;
         letterbox->y_pad = pad_top;
@@ -471,6 +495,7 @@ struct RknnDetectionBackend::Impl {
         // 对完整原图做 letterbox，与已通过验证的 Python 参考代码一致；不再先
         // 居中裁成正方形，避免丢失 16:9 画面左右区域。
         LetterBox letterbox;
+        const std::int64_t preprocess_start_us = MonotonicUs();
         const int ret = Nv12LetterboxToRgb(
             reinterpret_cast<const uint8_t*>(frame.Data()), width, height, hor_stride,
             model_width_, static_cast<uint8_t*>(input_mems_[0][0]->virt_addr),
@@ -485,8 +510,11 @@ struct RknnDetectionBackend::Impl {
             }
             return out;
         }
+        preprocess_total_latency.Add(
+            static_cast<double>(MonotonicUs() - preprocess_start_us) / 1000.0);
 
         // NPU 推理（3 核上下文，单帧由运行时调度）
+        const std::int64_t npu_start_us = MonotonicUs();
         const int run_ret = rknn_run(ctxs_[0], nullptr);
         if (run_ret != RKNN_SUCC) {
             const uint64_t errors = error_count.fetch_add(1) + 1;
@@ -495,8 +523,11 @@ struct RknnDetectionBackend::Impl {
             }
             return out;
         }
+        npu_run_latency.Add(
+            static_cast<double>(MonotonicUs() - npu_start_us) / 1000.0);
 
         // 输出张量搬运（NC1HWC2 → NCHW，写入预分配缓冲）
+        const std::int64_t output_layout_start_us = MonotonicUs();
         for (uint32_t i = 0; i < io_num_.n_output; ++i) {
             const int8_t* src = static_cast<int8_t*>(output_mems_[0][i]->virt_addr);
             int8_t* dst = output_buffers_[i].data();
@@ -514,7 +545,10 @@ struct RknnDetectionBackend::Impl {
                 std::memcpy(dst, src, output_native_attrs_[i].n_elems);
             }
         }
+        output_layout_latency.Add(
+            static_cast<double>(MonotonicUs() - output_layout_start_us) / 1000.0);
 
+        const std::int64_t postprocess_start_us = MonotonicUs();
         std::vector<YoloDetection> detections;
         if (output_mode_ == OutputMode::kNormalizedXywh) {
             NormalizedXywhTensor tensor;
@@ -565,6 +599,8 @@ struct RknnDetectionBackend::Impl {
                 out.push_back(bd);
             }
         }
+        postprocess_latency.Add(
+            static_cast<double>(MonotonicUs() - postprocess_start_us) / 1000.0);
         return out;
     }
 };
@@ -644,6 +680,17 @@ bool RknnDetectionBackend::IsLoaded() const {
 std::vector<BackendDetection> RknnDetectionBackend::Detect(
     const video::FrameHandle& frame) {
     return impl_->DetectFrame(frame);
+}
+
+DetectionBackendLatencySnapshot RknnDetectionBackend::LatencySnapshot() const {
+    DetectionBackendLatencySnapshot snapshot;
+    snapshot.preprocess_total = impl_->preprocess_total_latency.Snapshot();
+    snapshot.rga_resize_color = impl_->rga_resize_color_latency.Snapshot();
+    snapshot.letterbox_copy = impl_->letterbox_copy_latency.Snapshot();
+    snapshot.npu_run = impl_->npu_run_latency.Snapshot();
+    snapshot.output_layout = impl_->output_layout_latency.Snapshot();
+    snapshot.postprocess = impl_->postprocess_latency.Snapshot();
+    return snapshot;
 }
 
 }  // namespace drone::perception

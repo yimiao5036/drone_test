@@ -35,6 +35,8 @@
 | D4R | RGA DMA-BUF直传 | `wrapbuffer_fd` + `imcopy`直接写入`VideoFramePool` |
 | D5 | NV12内存池复制（回退） | FFmpeg转存后逐行复制；RGA DMA成功时不执行 |
 
+YOLO后端另输出最近256帧细分：Y1预处理总耗时、Y1R RGA缩放/颜色转换、Y1C CPU letterbox复制、Y2 `rknn_run`、Y3输出布局转换、Y4阈值过滤/NMS。用于判断当前约29～30ms究竟消耗在RGA、NPU还是CPU后处理，不再根据总耗时猜测。
+
 不包含：摄像头曝光、摄像头内部编码、摄像头到香橙派网络传输、MediaMTX后续分发、HM30无线传输、Web FFmpeg转码、JSMpeg缓冲和浏览器显示。跨端显示延迟后续需要画面时间码/LED事件或携带时间戳的测试图案单独测量。
 
 ## 构建与运行
@@ -69,7 +71,7 @@ YOLO与叠加/图传是并行支路：当前叠加器使用截至取帧时已到
 
 ## 日志行为
 
-探针每个`--interval`周期输出一次统计，不打印逐帧成功日志。探针设置`prefer_rga_dma_transfer=true`，优先试验RGA DMA-BUF直传；正式`drone_control`默认false。探针同时把`slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P、D4R和未归类耗时，只在第1次及每100次打印WARN。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch。
+探针每个`--interval`周期输出一次统计，不打印逐帧成功日志；区间FPS/码率使用`steady_clock`浮点秒差计算，避免整数秒取整导致531秒等报告处误显示22.8 FPS。探针强制设置`prefer_rga_dma_transfer=true`；正式`drone_control`按JSON读取，当前生产配置经长测后已显式设为true，代码缺省仍为false。探针同时把`slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P、D4R和未归类耗时，只在第1次及每100次打印WARN。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch。
 
 ## 排查要点
 

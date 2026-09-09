@@ -86,8 +86,7 @@ const char* CodecName(drone::common::VideoCodec codec) {
 void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
                    int elapsed_seconds,
                    const drone::application::VideoPipelineLatencySnapshot& previous,
-                   int previous_elapsed_seconds) {
-    const int interval_seconds = elapsed_seconds - previous_elapsed_seconds;
+                   double interval_seconds) {
     const std::uint64_t interval_frames =
         s.encoded_frame_count >= previous.encoded_frame_count
             ? s.encoded_frame_count - previous.encoded_frame_count
@@ -100,13 +99,13 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
         s.key_frame_count >= previous.key_frame_count
             ? s.key_frame_count - previous.key_frame_count
             : 0;
-    const double interval_fps = interval_seconds > 0
+    const double interval_fps = interval_seconds > 0.0
                                     ? static_cast<double>(interval_frames) /
-                                          static_cast<double>(interval_seconds)
+                                          interval_seconds
                                     : 0.0;
-    const double interval_mbps = interval_seconds > 0
+    const double interval_mbps = interval_seconds > 0.0
                                      ? static_cast<double>(interval_bytes) * 8.0 /
-                                           static_cast<double>(interval_seconds) / 1000000.0
+                                           interval_seconds / 1000000.0
                                      : 0.0;
     const std::string decode_name =
         std::string("02 ") + CodecName(s.input_codec) + "解码+NV12转存";
@@ -145,8 +144,17 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
     PrintSummary("D4 DRM硬件帧转存(回退)", s.hardware_transfer);
     PrintSummary("D4R RGA DMA-BUF直传", s.rga_dma_transfer);
     PrintSummary("D5 NV12内存池复制(回退)", s.frame_copy);
+
+    std::cout << "--- YOLO后端细分（最近最多256样本，约10秒）---\n";
+    PrintSummary("Y1 预处理总耗时", s.yolo_preprocess_total);
+    PrintSummary("Y1R RGA缩放+颜色转换", s.yolo_rga_resize_color);
+    PrintSummary("Y1C CPU letterbox复制", s.yolo_letterbox_copy);
+    PrintSummary("Y2 rknn_run", s.yolo_npu_run);
+    PrintSummary("Y3 输出布局转换", s.yolo_output_layout);
+    PrintSummary("Y4 阈值过滤+NMS", s.yolo_postprocess);
     std::cout << "说明：RGA DMA成功时D4/D5为0；D4/D5有计数表示发生FFmpeg回退；"
-                 "不包含摄像头曝光/编码/网络到机载入口，也不包含HM30传输、Web转码和浏览器显示。\n";
+                 "Y1包含Y1R/Y1C及缓冲准备开销；不包含摄像头曝光/编码/网络到机载入口，"
+                 "也不包含HM30传输、Web转码和浏览器显示。\n";
 }
 
 }  // namespace
@@ -181,7 +189,7 @@ int main(int argc, char** argv) {
         const auto start = std::chrono::steady_clock::now();
         auto next_report = start + std::chrono::seconds(options.interval_seconds);
         auto previous_snapshot = application.VideoLatencySnapshot();
-        int previous_elapsed = 0;
+        auto previous_report_time = start;
         while (!g_stop.load(std::memory_order_acquire)) {
             const auto now = std::chrono::steady_clock::now();
             const int elapsed = static_cast<int>(
@@ -189,17 +197,25 @@ int main(int argc, char** argv) {
             if (elapsed >= options.duration_seconds) break;
             if (now >= next_report) {
                 auto snapshot = application.VideoLatencySnapshot();
-                PrintSnapshot(snapshot, elapsed, previous_snapshot, previous_elapsed);
+                const double report_interval_seconds =
+                    std::chrono::duration<double>(now - previous_report_time).count();
+                PrintSnapshot(snapshot, elapsed, previous_snapshot,
+                              report_interval_seconds);
                 previous_snapshot = std::move(snapshot);
-                previous_elapsed = elapsed;
-                next_report = now + std::chrono::seconds(options.interval_seconds);
+                previous_report_time = now;
+                do {
+                    next_report += std::chrono::seconds(options.interval_seconds);
+                } while (next_report <= now);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        const auto final_time = std::chrono::steady_clock::now();
         const int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - start).count());
+            final_time - start).count());
+        const double final_interval_seconds =
+            std::chrono::duration<double>(final_time - previous_report_time).count();
         PrintSnapshot(application.VideoLatencySnapshot(), elapsed,
-                      previous_snapshot, previous_elapsed);
+                      previous_snapshot, final_interval_seconds);
         std::cout.flush();  // 保证最终统计先于MPP停止阶段stderr告警显示
         application.Stop();
         return 0;

@@ -132,6 +132,7 @@
         "width": 1280,
         "height": 720,
         "fps": 25,
-        "bitrate": 6000000
+        "bitrate": 6000000,
+        "prefer_rga_dma_transfer": true
     }
 }

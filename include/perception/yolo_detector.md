@@ -2,7 +2,7 @@
 
 > 对应实现：`src/perception/yolo_detector.cpp`、`src/perception/yolo_postprocess.cpp`、
 > `src/perception/rknn_detection_backend.cpp`（香橙派条件编译）
-> 更新：2026-08-26
+> 更新：2026-09-09
 
 ## 功能职责
 
@@ -57,8 +57,7 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 - **后端抽象与双环境**：推理后端经构造参数注入（`std::unique_ptr<IDetectionBackend>`），
   开发机测试注入 Mock；香橙派默认 `RknnDetectionBackend`。两者都不可用时
   `Start()` 返回 false 并打 ERROR，不静默空转。
-- **耗时统计**：检测线程对 `Detect()` 调用计时，指数滑动平均（EMA, α=0.1），
-  长时间运行不迟钝。热路径不打日志。
+- **耗时统计**：检测线程对`Detect()`完整调用计时并保留EMA；固定窗口统计进一步拆分为RGA缩放/颜色转换、CPU letterbox填充复制、`rknn_run`、输出布局转换及阈值过滤/NMS。热路径不打印逐帧日志。
 - **后处理**（`yolo_postprocess`）：当前模型输出为通道优先 `[1,5,8400]`，每个候选为
   归一化 `[x_center,y_center,width,height,confidence]`。实现按 confidence 过滤，乘模型
   宽高转换为模型像素坐标，执行单类别 NMS，再按 `(coord-pad)/scale` 撤销 letterbox。
@@ -73,7 +72,20 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 
 ### 延迟统计
 
-`InputQueueLatency()`统计解码帧发布到YOLO开始处理；`InferenceLatency()`统计后端`Detect()`完整时间（RGA预处理、RKNN推理和后处理）；`IngressToInferenceLatency()`统计码流进入机载进程到YOLO完成。无检测帧同样计入推理统计。
+`InputQueueLatency()`统计解码帧发布到YOLO开始处理；`InferenceLatency()`统计后端`Detect()`完整时间；`IngressToInferenceLatency()`统计码流进入机载进程到YOLO完成。无检测帧同样计入统计。
+
+`BackendLatencySnapshot()`提供最近256帧的后端细分：
+
+| 探针编号 | 指标 | 代码范围 |
+|---|---|---|
+| Y1 | 预处理总耗时 | RGA、临时缓冲准备和CPU letterbox总和 |
+| Y1R | RGA缩放+颜色转换 | `imresize`或`imcvtcolor` |
+| Y1C | CPU letterbox复制 | 114填充、缩放RGB逐行复制到RKNN输入内存 |
+| Y2 | NPU推理 | `rknn_run(ctxs_[0])` |
+| Y3 | 输出布局转换 | NC1HWC2→NCHW或原生输出`memcpy` |
+| Y4 | 后处理 | INT8反量化、阈值过滤、排序、单类别NMS、坐标还原 |
+
+Y1通常约等于Y1R+Y1C，但还包含缓冲`resize`检查与RGA描述准备。Y1～Y4之和与外层`InferenceLatency()`可能存在少量调用、统计和线程调度开销。
 
 ## 日志行为
 
@@ -91,8 +103,8 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   ```bash
   cmake -S . -B build && cmake --build build -j$(nproc)
   ./build/yolo_postprocess_test   # 后处理纯函数：多分支 + `[1,5,N]`/NMS/letterbox
-  ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理，9 用例
-  ctest --test-dir build          # 当前全工程 79/79 用例应通过
+  ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理
+  ctest --test-dir build --output-on-failure
   ```
   期望结果：`yolo_postprocess_test` 验证多分支量化解码，以及 `[1,5,N]` 的阈值过滤、
   单类别 NMS、1280×720→640×640 letterbox 坐标还原；`yolo_detector_test` 验证
@@ -121,8 +133,7 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   张量不是 INT8 或形状不是 `[1,5,N]`，先核对部署模型是否与 `config.json` 指向文件一致。
 - **检测结果坐标错位**：先核对 letterbox 参数（`x_pad/y_pad/scale`）与后处理逆变换
   一致性；再核对裁剪偏移叠加；用单目标单色场景在香橙派打点验证。
-- **推理耗时异常**：确认 3 核上下文与 `RKNN_NPU_CORE_ALL`；检查是否误用
-  `RKNN_FLAG_COLLECT_PERF_MASK`（原型已去除）。
+- **推理耗时异常**：先读取Y1～Y4确定瓶颈，不再仅凭`Detect()`总耗时推测。当前创建3个上下文但实际只调用`ctxs_[0]`，属于单帧单上下文运行；`ctxs_[0]`设置`RKNN_NPU_CORE_ALL`，另外两个上下文尚未实现帧级并行。检查是否误用`RKNN_FLAG_COLLECT_PERF_MASK`（原型已去除）。
 - **RGA 接口差异**：香橙派当前 `im2d.hpp` 的 `wrapbuffer_virtualaddr` 六参数顺序为
   `地址, width, height, format, wstride, hstride`。若误写成把 format 放在最后，会出现
   `wstride=720, width=1280` 的 Invalid parameters。预处理内部 RGA 错误由外层按第 1 次和

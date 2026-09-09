@@ -404,6 +404,13 @@ VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
         snapshot.yolo_queue = detector_->InputQueueLatency();
         snapshot.yolo_inference = detector_->InferenceLatency();
         snapshot.ingress_to_inference = detector_->IngressToInferenceLatency();
+        const auto backend = detector_->BackendLatencySnapshot();
+        snapshot.yolo_preprocess_total = backend.preprocess_total;
+        snapshot.yolo_rga_resize_color = backend.rga_resize_color;
+        snapshot.yolo_letterbox_copy = backend.letterbox_copy;
+        snapshot.yolo_npu_run = backend.npu_run;
+        snapshot.yolo_output_layout = backend.output_layout;
+        snapshot.yolo_postprocess = backend.postprocess;
     }
     if (compositor_ != nullptr) {
         snapshot.compositor_queue = compositor_->InputQueueLatency();

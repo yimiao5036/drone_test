@@ -314,4 +314,9 @@ common::LatencySummary YoloDetector::IngressToInferenceLatency() const {
     return impl_->ingress_to_inference_latency.Snapshot();
 }
 
+DetectionBackendLatencySnapshot YoloDetector::BackendLatencySnapshot() const {
+    return impl_->backend != nullptr ? impl_->backend->LatencySnapshot()
+                                     : DetectionBackendLatencySnapshot{};
+}
+
 }  // namespace drone::perception

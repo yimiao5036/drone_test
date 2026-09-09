@@ -24,11 +24,10 @@
 #include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
+#include "perception/detection_backend.h"
 #include "video/video_frame.h"
 
 namespace drone::perception {
-
-class IDetectionBackend;
 
 /// YOLO 目标识别部件抽象接口。
 class IYoloDetector {
@@ -61,6 +60,7 @@ public:
     virtual common::LatencySummary InputQueueLatency() const = 0;
     virtual common::LatencySummary InferenceLatency() const = 0;
     virtual common::LatencySummary IngressToInferenceLatency() const = 0;
+    virtual DetectionBackendLatencySnapshot BackendLatencySnapshot() const = 0;
 };
 
 /// YOLO 检测器配置。
@@ -112,6 +112,7 @@ public:
     common::LatencySummary InputQueueLatency() const override;
     common::LatencySummary InferenceLatency() const override;
     common::LatencySummary IngressToInferenceLatency() const override;
+    DetectionBackendLatencySnapshot BackendLatencySnapshot() const override;
 
 private:
     struct Impl;
@@ -141,6 +142,7 @@ public:
     common::LatencySummary InputQueueLatency() const override { return {}; }
     common::LatencySummary InferenceLatency() const override { return {}; }
     common::LatencySummary IngressToInferenceLatency() const override { return {}; }
+    DetectionBackendLatencySnapshot BackendLatencySnapshot() const override { return {}; }
 
 private:
     bool running_ = false;

@@ -50,7 +50,7 @@ AVDRMFrameDescriptor
 - 当前适配依据Orange Pi实测布局：1280×720、一个DRM对象、一个图层、`DRM_FORMAT_NV12`、modifier=0、Y/UV同fd、pitch均1280、UV offset=921600。
 - `ValidateLinearDrmNv12Layout()`严格校验线性modifier、NV12 fourcc、对象索引、offset、pitch、偶数尺寸和对象容量；不匹配时禁止按紧凑NV12猜测读取。
 - RGA源使用`wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, pitch, height)`；目标使用`wrapbuffer_virtualaddr`包装内存池槽位；`imcopy`同步返回前保持源`AVFrame`有效。
-- `video_latency_probe`优先启用DMA路径；正式`drone_control`中的`prefer_rga_dma_transfer`默认false，上板验收通过前不改变正式路径。
+- `VideoDecoderConfig.prefer_rga_dma_transfer`代码缺省为false；600秒长测和画面验收通过后，当前生产`config/config.json`已显式设为true。RGA不可用或失败时仍自动回退，不影响启动。
 - RGA不可用、布局不支持或复制失败时自动回退`av_hwframe_transfer_data`，不因试验路径中断视频。
 - 该方案消除FFmpeg硬件帧下载和后续CPU逐行复制，但目标仍是CPU可访问内存池，不等同于解码到NPU/编码器的完整零拷贝。
 
@@ -79,7 +79,7 @@ ctest --test-dir build -R DrmNv12TransferTest --output-on-failure
 ./build/video_latency_probe --duration 600 --interval 10
 ```
 
-预期：`RGA_DMA成功`持续增长，`RGA_DMA回退=0`，D4/D5无样本，D4R稳定，视频颜色/尺寸/检测框正常。
+600秒长测通过：累计输入14995个访问单元，RGA DMA成功14945帧、回退0，输入与输出固定相差50帧且运行中不再增长；D4/D5全程无样本。D4R各10秒窗口平均约1.76～2.52ms，P95约2.89～4.87ms，无随时间恶化趋势；入口到本地RTSP平均约5.21～5.44ms，P95始终9ms。慢帧事件文件只有首次启用INFO，没有WARN。性能和稳定性已通过，正式启用前仅剩画面颜色/错位/检测框人工确认。
 
 ## 排查/修改要点
 

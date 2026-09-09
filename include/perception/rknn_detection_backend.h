@@ -46,6 +46,7 @@ public:
     bool IsLoaded() const override;
 
     std::vector<BackendDetection> Detect(const video::FrameHandle& frame) override;
+    DetectionBackendLatencySnapshot LatencySnapshot() const override;
 
 private:
     struct Impl;

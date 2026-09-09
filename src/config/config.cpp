@@ -421,6 +421,8 @@ AppConfig LoadAppConfig(const std::string& path,
     config.decoder.stride_alignment = static_cast<uint32_t>(
         video.value("stride_alignment", 64));
     config.decoder.prefer_hardware = video.value("prefer_hardware_decode", true);
+    config.decoder.prefer_rga_dma_transfer =
+        video.value("prefer_rga_dma_transfer", false);
 
     const json yolo = root.value("yolo", json::object());
     config.yolo.model_path = ResolveAssetPath(
