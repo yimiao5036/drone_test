@@ -29,6 +29,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
@@ -134,6 +135,7 @@ struct VideoDecoder::Impl {
     std::atomic<uint64_t> key_frame_count{0};
     std::atomic<uint64_t> slow_decode_count{0};
     std::atomic<uint64_t> hardware_transfer_buffer_build_count{0};
+    std::atomic<bool> drm_layout_logged{false};
     std::atomic<common::VideoCodec> active_codec{common::VideoCodec::kUnknown};
     std::atomic<bool> hardware_decoder_active{false};
     common::LatencyStatistics input_queue_latency;
@@ -143,6 +145,7 @@ struct VideoDecoder::Impl {
     common::LatencyStatistics packet_prepare_latency{256};
     common::LatencyStatistics send_packet_latency{256};
     common::LatencyStatistics receive_frame_latency{256};
+    common::LatencyStatistics hardware_transfer_prepare_latency{256};
     common::LatencyStatistics hardware_transfer_latency{256};
     common::LatencyStatistics frame_copy_latency{256};
 
@@ -454,6 +457,40 @@ struct VideoDecoder::Impl {
         }
     }
 
+    /// 首次收到DRM_PRIME帧时记录DMA-BUF对象/图层/平面布局，为RGA直通适配提供依据。
+    void LogDrmLayoutOnce(const AVFrame* source) {
+        if (source == nullptr || source->format != AV_PIX_FMT_DRM_PRIME ||
+            source->data[0] == nullptr || drm_layout_logged.exchange(true)) {
+            return;
+        }
+        const auto* descriptor =
+            reinterpret_cast<const AVDRMFrameDescriptor*>(source->data[0]);
+        SPDLOG_INFO("DRM帧布局: 显示={}x{} objects={} layers={}",
+                    source->width, source->height, descriptor->nb_objects,
+                    descriptor->nb_layers);
+        for (int object_index = 0; object_index < descriptor->nb_objects;
+             ++object_index) {
+            const auto& object = descriptor->objects[object_index];
+            SPDLOG_INFO(
+                "DRM对象[{}]: fd={} size={} modifier=0x{:016x}",
+                object_index, object.fd, object.size, object.format_modifier);
+        }
+        for (int layer_index = 0; layer_index < descriptor->nb_layers;
+             ++layer_index) {
+            const auto& layer = descriptor->layers[layer_index];
+            SPDLOG_INFO("DRM图层[{}]: format=0x{:08x} planes={}", layer_index,
+                        layer.format, layer.nb_planes);
+            for (int plane_index = 0; plane_index < layer.nb_planes;
+                 ++plane_index) {
+                const auto& plane = layer.planes[plane_index];
+                SPDLOG_INFO(
+                    "DRM图层[{}]平面[{}]: object={} offset={} pitch={}",
+                    layer_index, plane_index, plane.object_index, plane.offset,
+                    plane.pitch);
+            }
+        }
+    }
+
     /// 将解码帧转为 NV12 写入内存池并发布。
     // 硬件帧先 transfer 到系统内存；NV12 直接按 stride 拷贝，YUV420P 才走 sws 转换。
     void PublishFrame(AVFrame* source, const common::EncodedFrame& encoded,
@@ -462,9 +499,12 @@ struct VideoDecoder::Impl {
                       double receive_frame_ms) {
         // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
         AVFrame* frame = source;
+        double hardware_transfer_prepare_ms = 0.0;
         double hardware_transfer_ms = 0.0;
         if (source->format == AV_PIX_FMT_DRM_PRIME ||
             source->hw_frames_ctx != nullptr) {
+            LogDrmLayoutOnce(source);
+            const std::int64_t transfer_prepare_start_us = MonotonicUs();
             // av_hwframe_transfer_data允许复用已分配的目标帧。旧实现每帧unref，
             // 会使FFmpeg每帧重新av_frame_get_buffer；实机已定位到D4偶发从约
             // 1.8ms升至10~15ms，因此保留首帧自动分配的NV12缓冲并重复写入。
@@ -486,6 +526,10 @@ struct VideoDecoder::Impl {
                     return;
                 }
             }
+
+            hardware_transfer_prepare_ms = static_cast<double>(
+                MonotonicUs() - transfer_prepare_start_us) / 1000.0;
+            hardware_transfer_prepare_latency.Add(hardware_transfer_prepare_ms);
 
             const std::int64_t transfer_start_us = MonotonicUs();
             int transfer_ret = av_hwframe_transfer_data(sw_frame, source, 0);
@@ -624,17 +668,19 @@ struct VideoDecoder::Impl {
             const uint64_t count = slow_decode_count.fetch_add(1) + 1;
             if (ShouldLogThrottled(count)) {
                 const double measured_ms = packet_prepare_ms + send_packet_ms +
-                                           receive_frame_ms + hardware_transfer_ms +
-                                           frame_copy_ms;
+                                           receive_frame_ms +
+                                           hardware_transfer_prepare_ms +
+                                           hardware_transfer_ms + frame_copy_ms;
                 const double other_ms = std::max(0.0, total_decode_ms - measured_ms);
                 SPDLOG_WARN(
                     "视频解码慢帧: codec={} 触发包序号={} 字节={} 关键帧={} "
-                    "总耗时={:.3f}ms D1={:.3f} D2={:.3f} D3={:.3f} D4={:.3f} "
-                    "D5={:.3f} 其余={:.3f} 累计={}",
+                    "总耗时={:.3f}ms D1={:.3f} D2={:.3f} D3={:.3f} "
+                    "D4P={:.3f} D4={:.3f} D5={:.3f} 其余={:.3f} 累计={}",
                     CodecName(encoded.codec), encoded.header.sequence,
                     encoded.data.size(), encoded.is_key_frame, total_decode_ms,
                     packet_prepare_ms, send_packet_ms, receive_frame_ms,
-                    hardware_transfer_ms, frame_copy_ms, other_ms, count);
+                    hardware_transfer_prepare_ms, hardware_transfer_ms,
+                    frame_copy_ms, other_ms, count);
             }
         }
         if (ingress_ms > 0) {
@@ -744,6 +790,10 @@ common::LatencySummary VideoDecoder::SendPacketLatency() const {
 
 common::LatencySummary VideoDecoder::ReceiveFrameLatency() const {
     return impl_->receive_frame_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::HardwareTransferPrepareLatency() const {
+    return impl_->hardware_transfer_prepare_latency.Snapshot();
 }
 
 common::LatencySummary VideoDecoder::HardwareTransferLatency() const {

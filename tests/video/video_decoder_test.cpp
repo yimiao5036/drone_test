@@ -172,6 +172,7 @@ TEST(VideoDecoderTest, DecodesH264ToNv12Frames) {
     EXPECT_GT(decoder.PacketPrepareLatency().total_count, 0u);
     EXPECT_GT(decoder.SendPacketLatency().total_count, 0u);
     EXPECT_GT(decoder.ReceiveFrameLatency().total_count, 0u);
+    EXPECT_EQ(decoder.HardwareTransferPrepareLatency().total_count, 0u);
     EXPECT_EQ(decoder.HardwareTransferLatency().total_count, 0u);
     EXPECT_GT(decoder.FrameCopyLatency().total_count, 0u);
     EXPECT_EQ(decoder.ActiveCodec(), common::VideoCodec::kH264);

@@ -65,9 +65,11 @@ class VideoDecoder final : public IVideoDecoder {
 
 解码器记录三项2048样本固定窗口统计：`InputQueueLatency()`（码流进入进程到解码线程开始）、`DecodeLatency()`（当前H.264/H.265解码+硬件帧转存+NV12拷贝）、`IngressToDecodedLatency()`（入口到NV12发布）。
 
-为定位上板间歇出现的解码长尾，另增加最近256样本的五项细分：`PacketPrepareLatency()`、`SendPacketLatency()`、`ReceiveFrameLatency()`、`HardwareTransferLatency()`、`FrameCopyLatency()`。同时提供`ActiveCodec()`、`IsHardwareDecoder()`以及编码访问单元/字节/关键帧累计值，探针据此显示实际格式、解码模式、区间FPS/码率和关键帧数。统计只在探针读取快照时复制排序，逐帧不打日志。
+为定位上板间歇出现的解码长尾，另增加最近256样本的细分：`PacketPrepareLatency()`、`SendPacketLatency()`、`ReceiveFrameLatency()`、`HardwareTransferPrepareLatency()`、`HardwareTransferLatency()`、`FrameCopyLatency()`。其中D4P单独统计分辨率检查和`av_frame_make_writable`，D4只统计`av_hwframe_transfer_data`。同时提供`ActiveCodec()`、`IsHardwareDecoder()`以及编码访问单元/字节/关键帧累计值，探针据此显示实际格式、解码模式、区间FPS/码率和关键帧数。统计只在探针读取快照时复制排序，逐帧不打日志。
 
-`slow_frame_threshold_ms`默认0，不在正式程序打印慢帧；`video_latency_probe`单独设为10ms。超过阈值且跳过前100帧预热后，记录触发包序号、字节数、关键帧标志、总耗时、D1～D5和未归类耗时，日志按第1次及每100次节流。rkmpp是异步流水线，日志中的包是触发本次输出的包，不保证就是输出画面的原始源包。
+`slow_frame_threshold_ms`默认0，不在正式程序打印慢帧；`video_latency_probe`单独设为10ms。超过阈值且跳过前100帧预热后，记录触发包序号、字节数、关键帧标志、总耗时、D1～D5、D4P和未归类耗时，日志按第1次及每100次节流。rkmpp是异步流水线，日志中的包是触发本次输出的包，不保证就是输出画面的原始源包。
+
+首次收到`AV_PIX_FMT_DRM_PRIME`帧时，INFO日志输出`AVDRMFrameDescriptor`：对象fd/size/modifier、图层DRM格式以及各平面的object index/offset/pitch。该日志只打印一次，用于确认当前MPP输出是否能安全通过RGA DMA-BUF接口直接读取，禁止在未知平面布局时假定NV12连续排列。
 
 第三轮300秒上板测试在约250秒后复现长尾，D1/D2/D3/D5保持稳定，D4从约1.7～1.9ms升至平均10.7ms、P95约15ms，确认瓶颈位于`av_hwframe_transfer_data`。因此实现改为复用转存目标缓冲，并通过`HardwareTransferBufferBuildCount()`暴露累计构建次数；稳定分辨率下预期为1。
 

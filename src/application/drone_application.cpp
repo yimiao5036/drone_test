@@ -392,6 +392,8 @@ VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
         snapshot.packet_prepare = decoder_->PacketPrepareLatency();
         snapshot.send_packet = decoder_->SendPacketLatency();
         snapshot.receive_frame = decoder_->ReceiveFrameLatency();
+        snapshot.hardware_transfer_prepare =
+            decoder_->HardwareTransferPrepareLatency();
         snapshot.hardware_transfer = decoder_->HardwareTransferLatency();
         snapshot.frame_copy = decoder_->FrameCopyLatency();
     }

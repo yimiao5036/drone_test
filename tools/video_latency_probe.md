@@ -30,6 +30,7 @@
 | D1 | AVPacket分配+码流复制 | `av_new_packet`和编码数据`memcpy` |
 | D2 | `avcodec_send_packet` | 码流送入FFmpeg/rkmpp解码器的调用时间 |
 | D3 | `avcodec_receive_frame` | 成功取得一个输出帧的调用时间 |
+| D4P | 转存目标帧准备 | 分辨率检查与`av_frame_make_writable`，用于解释旧日志中的“其余”10～20ms台阶 |
 | D4 | DRM硬件帧转存 | `av_hwframe_transfer_data`；目标系统内存帧首帧分配后复用，计数为0表示当前输出不经过该API |
 | D5 | NV12内存池复制 | 内存池取槽及NV12逐行复制；软解时包含像素格式转换 |
 
@@ -51,7 +52,7 @@ cmake --build build -j$(nproc)
 ./build/video_latency_probe --config ./config/config.json --duration 300 --interval 10
 ```
 
-主表输出当前最多2048样本窗口的`avg/P50/P95/P99/max`；D1~D5使用最近最多256样本，约等于25 FPS下10秒窗口，便于定位短时解码长尾。输出中的`count`是启动后的累计有效样本数，`win`是本次百分位实际使用的窗口样本数。前10~20秒包含解码器、NPU和编码器预热，不应用于最终结论；建议至少运行120秒，以最后3~5次报告判断稳定延迟。
+主表输出当前最多2048样本窗口的`avg/P50/P95/P99/max`；D1～D5及D4P使用最近最多256样本，约等于25 FPS下10秒窗口，便于定位短时解码长尾。输出中的`count`是启动后的累计有效样本数，`win`是本次百分位实际使用的窗口样本数。前10～20秒包含解码器、NPU和编码器预热，不应用于最终结论；建议至少运行120秒，以最后3～5次报告判断稳定延迟。
 
 ## 优化判断
 
@@ -67,7 +68,7 @@ YOLO与叠加/图传是并行支路：当前叠加器使用截至取帧时已到
 
 ## 日志行为
 
-探针每个`--interval`周期输出一次统计，不打印逐帧成功日志。探针会把`VideoDecoderConfig.slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5和未归类耗时，只在第1次及每100次打印WARN。正式`drone_control`默认阈值0，不启用该诊断告警。
+探针每个`--interval`周期输出一次统计，不打印逐帧成功日志。探针会把`VideoDecoderConfig.slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P和未归类耗时，只在第1次及每100次打印WARN。正式`drone_control`默认阈值0，不启用该诊断告警。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch，作为RGA DMA-BUF直通适配依据。
 
 ## 排查要点
 

@@ -46,6 +46,7 @@ struct VideoPipelineLatencySnapshot {
     common::LatencySummary packet_prepare;
     common::LatencySummary send_packet;
     common::LatencySummary receive_frame;
+    common::LatencySummary hardware_transfer_prepare;
     common::LatencySummary hardware_transfer;
     common::LatencySummary frame_copy;
     common::LatencySummary yolo_queue;

@@ -139,6 +139,7 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
     PrintSummary("D1 AVPacket分配+码流复制", s.packet_prepare);
     PrintSummary("D2 avcodec_send_packet", s.send_packet);
     PrintSummary("D3 avcodec_receive_frame", s.receive_frame);
+    PrintSummary("D4P 转存目标帧准备", s.hardware_transfer_prepare);
     PrintSummary("D4 DRM硬件帧转存(缓冲复用)", s.hardware_transfer);
     PrintSummary("D5 NV12内存池复制", s.frame_copy);
     std::cout << "说明：D4计数为0表示当前输出不经过av_hwframe_transfer_data；"

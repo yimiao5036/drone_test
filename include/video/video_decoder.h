@@ -72,6 +72,7 @@ public:
     virtual common::LatencySummary PacketPrepareLatency() const = 0;
     virtual common::LatencySummary SendPacketLatency() const = 0;
     virtual common::LatencySummary ReceiveFrameLatency() const = 0;
+    virtual common::LatencySummary HardwareTransferPrepareLatency() const = 0;
     virtual common::LatencySummary HardwareTransferLatency() const = 0;
     virtual common::LatencySummary FrameCopyLatency() const = 0;
     /// 当前输入编码和实际解码模式。
@@ -120,6 +121,7 @@ public:
     common::LatencySummary PacketPrepareLatency() const override;
     common::LatencySummary SendPacketLatency() const override;
     common::LatencySummary ReceiveFrameLatency() const override;
+    common::LatencySummary HardwareTransferPrepareLatency() const override;
     common::LatencySummary HardwareTransferLatency() const override;
     common::LatencySummary FrameCopyLatency() const override;
     common::VideoCodec ActiveCodec() const override;
@@ -160,6 +162,7 @@ public:
     common::LatencySummary PacketPrepareLatency() const override { return {}; }
     common::LatencySummary SendPacketLatency() const override { return {}; }
     common::LatencySummary ReceiveFrameLatency() const override { return {}; }
+    common::LatencySummary HardwareTransferPrepareLatency() const override { return {}; }
     common::LatencySummary HardwareTransferLatency() const override { return {}; }
     common::LatencySummary FrameCopyLatency() const override { return {}; }
     common::VideoCodec ActiveCodec() const override { return common::VideoCodec::kUnknown; }
