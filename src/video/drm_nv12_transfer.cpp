@@ -1,5 +1,6 @@
 #include "video/drm_nv12_transfer.h"
 
+#include <cstring>
 #include <limits>
 #include <utility>
 
