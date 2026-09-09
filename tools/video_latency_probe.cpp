@@ -41,6 +41,7 @@ struct Options {
     int interval_seconds = 10;
     std::size_t yolo_queue_capacity = 0;  // 0=沿用配置
     std::string npu_core_mode;            // 空=沿用配置
+    bool collect_npu_internal_perf = false;
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -59,6 +60,8 @@ Options ParseOptions(int argc, char** argv) {
                 throw std::invalid_argument("yolo-queue必须为正数");
             }
             options.yolo_queue_capacity = static_cast<std::size_t>(capacity);
+        } else if (arg == "--rknn-perf-run") {
+            options.collect_npu_internal_perf = true;
         } else if (arg == "--npu-core" && index + 1 < argc) {
             options.npu_core_mode = argv[++index];
             const auto& mode = options.npu_core_mode;
@@ -71,7 +74,8 @@ Options ParseOptions(int argc, char** argv) {
             throw std::invalid_argument(
                 "用法: video_latency_probe [--config path] [--duration 秒] "
                 "[--interval 秒] [--yolo-queue 容量] "
-                "[--npu-core auto|core0|core01|core012|all]");
+                "[--npu-core auto|core0|core01|core012|all] "
+                "[--rknn-perf-run]");
         }
     }
     if (options.duration_seconds <= 0 || options.interval_seconds <= 0) {
@@ -168,7 +172,10 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
     PrintSummary("Y1 预处理总耗时", s.yolo_preprocess_total);
     PrintSummary("Y1R RGA缩放+颜色转换", s.yolo_rga_resize_color);
     PrintSummary("Y1C CPU letterbox复制", s.yolo_letterbox_copy);
-    PrintSummary("Y2 rknn_run", s.yolo_npu_run);
+    PrintSummary("Y2W rknn_run墙钟", s.yolo_npu_run);
+    PrintSummary("Y2N RKNN内部执行", s.yolo_npu_internal_run);
+    PrintSummary("Y2O 墙钟-内部", s.yolo_npu_wall_overhead);
+    PrintSummary("Y2Q PERF_RUN查询", s.yolo_npu_perf_query);
     PrintSummary("Y3 输出布局转换", s.yolo_output_layout);
     PrintSummary("Y4 阈值过滤+NMS", s.yolo_postprocess);
     std::cout << "说明：RGA DMA成功时D4/D5为0；D4/D5有计数表示发生FFmpeg回退；"
@@ -199,6 +206,9 @@ int main(int argc, char** argv) {
         if (!options.npu_core_mode.empty()) {
             config.yolo.npu_core_mode = options.npu_core_mode;
         }
+        if (options.collect_npu_internal_perf) {
+            config.yolo.collect_npu_internal_perf = true;
+        }
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);
@@ -207,7 +217,9 @@ int main(int argc, char** argv) {
 
         std::cout << "视频延迟探针配置: YOLO输入队列容量="
                   << config.yolo.input_queue_capacity
-                  << " NPU核心模式=" << config.yolo.npu_core_mode << '\n';
+                  << " NPU核心模式=" << config.yolo.npu_core_mode
+                  << " RKNN内部性能统计="
+                  << config.yolo.collect_npu_internal_perf << '\n';
         drone::application::DroneApplication application(std::move(config));
         if (!application.Start()) {
             std::cerr << "视频延迟探针启动失败\n";

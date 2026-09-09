@@ -59,6 +59,9 @@ struct VideoPipelineLatencySnapshot {
     common::LatencySummary yolo_rga_resize_color;
     common::LatencySummary yolo_letterbox_copy;
     common::LatencySummary yolo_npu_run;
+    common::LatencySummary yolo_npu_internal_run;
+    common::LatencySummary yolo_npu_wall_overhead;
+    common::LatencySummary yolo_npu_perf_query;
     common::LatencySummary yolo_output_layout;
     common::LatencySummary yolo_postprocess;
     common::LatencySummary compositor_queue;

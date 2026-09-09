@@ -36,6 +36,9 @@ struct DetectionBackendLatencySnapshot {
     common::LatencySummary rga_resize_color;
     common::LatencySummary letterbox_copy;
     common::LatencySummary npu_run;
+    common::LatencySummary npu_internal_run;
+    common::LatencySummary npu_wall_overhead;
+    common::LatencySummary npu_perf_query;
     common::LatencySummary output_layout;
     common::LatencySummary postprocess;
 };
@@ -78,6 +81,7 @@ public:
 /// - 否则返回 nullptr（调用方需注入自定义后端，或 YoloDetector::Start 失败）。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     const std::string& model_path, float conf_threshold, float nms_threshold,
-    const std::string& npu_core_mode = "all");
+    const std::string& npu_core_mode = "all",
+    bool collect_npu_internal_perf = false);
 
 }  // namespace drone::perception

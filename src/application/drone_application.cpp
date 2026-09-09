@@ -409,6 +409,9 @@ VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
         snapshot.yolo_rga_resize_color = backend.rga_resize_color;
         snapshot.yolo_letterbox_copy = backend.letterbox_copy;
         snapshot.yolo_npu_run = backend.npu_run;
+        snapshot.yolo_npu_internal_run = backend.npu_internal_run;
+        snapshot.yolo_npu_wall_overhead = backend.npu_wall_overhead;
+        snapshot.yolo_npu_perf_query = backend.npu_perf_query;
         snapshot.yolo_output_layout = backend.output_layout;
         snapshot.yolo_postprocess = backend.postprocess;
     }

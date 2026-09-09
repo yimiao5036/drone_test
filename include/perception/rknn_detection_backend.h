@@ -35,8 +35,10 @@ public:
     /// @param conf_threshold 检测置信度阈值
     /// @param nms_threshold NMS IoU 阈值
     /// @param npu_core_mode auto/core0/core01/core012/all
+    /// @param collect_npu_internal_perf 是否查询RKNN_QUERY_PERF_RUN（仅诊断）
     RknnDetectionBackend(std::string model_path, float conf_threshold,
-                         float nms_threshold, std::string npu_core_mode);
+                         float nms_threshold, std::string npu_core_mode,
+                         bool collect_npu_internal_perf);
     ~RknnDetectionBackend() override;
 
     RknnDetectionBackend(const RknnDetectionBackend&) = delete;

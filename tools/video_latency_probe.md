@@ -74,6 +74,15 @@ NPU core mask可做同模型A/B：
 
 支持`auto/core0/core01/core012/all`。每次运行仍是单上下文同步`rknn_run`；`core012`表示该次模型运行使用组合核心，不是三个请求并行。
 
+查询RKNN内部模型执行时间：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 \
+    --yolo-queue 1 --npu-core all --rknn-perf-run
+```
+
+启用后新增：Y2W=`rknn_run`墙钟、Y2N=`RKNN_QUERY_PERF_RUN`内部时间、Y2O=墙钟减内部、Y2Q=查询调用本身开销。该选项只用于探针；正式配置`yolo.collect_npu_internal_perf=false`。如果板端runtime不支持当前零拷贝模式下查询，程序只打印一次WARN并停止后续查询，不影响推理。
+
 主表输出当前最多2048样本窗口的`avg/P50/P95/P99/max`；D1～D5及D4P使用最近最多256样本，约等于25 FPS下10秒窗口，便于定位短时解码长尾。输出中的`count`是启动后的累计有效样本数，`win`是本次百分位实际使用的窗口样本数。前10～20秒包含解码器、NPU和编码器预热，不应用于最终结论；建议至少运行120秒，以最后3～5次报告判断稳定延迟。
 
 ## 优化判断

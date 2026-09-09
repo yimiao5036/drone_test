@@ -136,12 +136,13 @@ QuantTensor MakeTensor(const int8_t* data, const rknn_tensor_attr& attr) {
 /// RknnDetectionBackend 实现细节（PIMPL）：RKNN 上下文、RGA 缓冲与推理流程。
 struct RknnDetectionBackend::Impl {
     explicit Impl(std::string model_path, float conf_threshold, float nms_threshold,
-                  std::string npu_core_mode)
+                  std::string npu_core_mode, bool collect_npu_internal_perf)
         : model_path(std::move(model_path)),
           conf_threshold(conf_threshold),
           nms_threshold(nms_threshold),
           npu_core_mode(std::move(npu_core_mode)),
-          npu_core_mask(ParseCoreMask(this->npu_core_mode)) {
+          npu_core_mask(ParseCoreMask(this->npu_core_mode)),
+          collect_npu_internal_perf(collect_npu_internal_perf) {
         if (conf_threshold < 0.f || conf_threshold > 1.f ||
             nms_threshold < 0.f || nms_threshold > 1.f) {
             throw std::invalid_argument("RKNN 后端阈值必须在 [0,1]");
@@ -159,6 +160,8 @@ struct RknnDetectionBackend::Impl {
     std::atomic<uint64_t> error_count{0};
     std::string npu_core_mode;
     rknn_core_mask npu_core_mask = RKNN_NPU_CORE_ALL;
+    bool collect_npu_internal_perf = false;
+    bool npu_perf_query_available = true;
 
     // 当前逐帧同步推理只需要一个上下文；多核组合由该上下文的core mask决定。
     static constexpr int kContextCount = 1;
@@ -197,6 +200,9 @@ struct RknnDetectionBackend::Impl {
     common::LatencyStatistics rga_resize_color_latency{256};
     common::LatencyStatistics letterbox_copy_latency{256};
     common::LatencyStatistics npu_run_latency{256};
+    common::LatencyStatistics npu_internal_run_latency{256};
+    common::LatencyStatistics npu_wall_overhead_latency{256};
+    common::LatencyStatistics npu_perf_query_latency{256};
     common::LatencyStatistics output_layout_latency{256};
     common::LatencyStatistics postprocess_latency{256};
 
@@ -545,8 +551,31 @@ struct RknnDetectionBackend::Impl {
             }
             return out;
         }
-        npu_run_latency.Add(
-            static_cast<double>(MonotonicUs() - npu_start_us) / 1000.0);
+        const double npu_wall_ms =
+            static_cast<double>(MonotonicUs() - npu_start_us) / 1000.0;
+        npu_run_latency.Add(npu_wall_ms);
+
+        // 官方RKNNRT 2.3.2允许在rknn_run后查询模型内部执行时间。
+        // 该查询仅由探针显式启用，正式程序默认关闭，避免热路径增加诊断调用。
+        if (collect_npu_internal_perf && npu_perf_query_available) {
+            rknn_perf_run perf_run{};
+            const std::int64_t query_start_us = MonotonicUs();
+            const int query_ret = rknn_query(ctxs_[0], RKNN_QUERY_PERF_RUN,
+                                             &perf_run, sizeof(perf_run));
+            const double query_ms =
+                static_cast<double>(MonotonicUs() - query_start_us) / 1000.0;
+            if (query_ret == RKNN_SUCC && perf_run.run_duration >= 0) {
+                const double internal_ms =
+                    static_cast<double>(perf_run.run_duration) / 1000.0;
+                npu_internal_run_latency.Add(internal_ms);
+                npu_wall_overhead_latency.Add(npu_wall_ms - internal_ms);
+                npu_perf_query_latency.Add(query_ms);
+            } else {
+                npu_perf_query_available = false;
+                SPDLOG_WARN("RKNN内部性能查询不可用: ret={} duration_us={}，本次运行后不再查询",
+                            query_ret, perf_run.run_duration);
+            }
+        }
 
         // 输出张量搬运（NC1HWC2 → NCHW，写入预分配缓冲）
         const std::int64_t output_layout_start_us = MonotonicUs();
@@ -631,9 +660,11 @@ struct RknnDetectionBackend::Impl {
 RknnDetectionBackend::RknnDetectionBackend(std::string model_path,
                                            float conf_threshold,
                                            float nms_threshold,
-                                           std::string npu_core_mode)
+                                           std::string npu_core_mode,
+                                           bool collect_npu_internal_perf)
     : impl_(std::make_unique<Impl>(std::move(model_path), conf_threshold,
-                                   nms_threshold, std::move(npu_core_mode))) {}
+                                   nms_threshold, std::move(npu_core_mode),
+                                   collect_npu_internal_perf)) {}
 
 RknnDetectionBackend::~RknnDetectionBackend() = default;
 
@@ -707,6 +738,9 @@ DetectionBackendLatencySnapshot RknnDetectionBackend::LatencySnapshot() const {
     snapshot.rga_resize_color = impl_->rga_resize_color_latency.Snapshot();
     snapshot.letterbox_copy = impl_->letterbox_copy_latency.Snapshot();
     snapshot.npu_run = impl_->npu_run_latency.Snapshot();
+    snapshot.npu_internal_run = impl_->npu_internal_run_latency.Snapshot();
+    snapshot.npu_wall_overhead = impl_->npu_wall_overhead_latency.Snapshot();
+    snapshot.npu_perf_query = impl_->npu_perf_query_latency.Snapshot();
     snapshot.output_layout = impl_->output_layout_latency.Snapshot();
     snapshot.postprocess = impl_->postprocess_latency.Snapshot();
     return snapshot;
