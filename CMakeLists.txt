@@ -23,9 +23,26 @@ add_subdirectory(third_party/spdlog)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 
+# RGA DMA-BUF转存（香橙派默认开启，开发机默认关闭）。视频解码和RKNN预处理共用librga。
+set(DRONE_HAVE_RGA_DMA_DEFAULT OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(DRONE_HAVE_RGA_DMA_DEFAULT ON)
+endif()
+option(DRONE_HAVE_RGA_DMA "启用RGA DMA-BUF到NV12内存池硬件复制"
+       ${DRONE_HAVE_RGA_DMA_DEFAULT})
+set(DRONE_RGA_DIR "/usr/include" CACHE PATH "RGA头文件父目录（其下包含rga/im2d.hpp）")
+if(DRONE_HAVE_RGA_DMA)
+    find_library(DRONE_RGA_LIBRARY NAMES rga)
+    if(NOT DRONE_RGA_LIBRARY)
+        message(FATAL_ERROR "DRONE_HAVE_RGA_DMA=ON但未找到librga.so")
+    endif()
+endif()
+message(STATUS "RGA DMA-BUF转存: ${DRONE_HAVE_RGA_DMA}")
+
 # ---- video 模块（帧句柄、内存池、摄像头接收、解码、叠加） ----
 add_library(drone_video STATIC
     src/video/video_frame_pool.cpp
+    src/video/drm_nv12_transfer.cpp
     src/video/camera_receiver.cpp
     src/video/camera_receiver_stub.cpp
     src/video/video_decoder.cpp
@@ -36,6 +53,11 @@ target_include_directories(drone_video PUBLIC
 target_compile_features(drone_video PUBLIC cxx_std_17)
 # 关键路径日志使用 spdlog；FFmpeg 依赖仅实现内部使用（PIMPL 不泄漏到头文件）
 target_link_libraries(drone_video PRIVATE spdlog::spdlog PkgConfig::FFMPEG)
+if(DRONE_HAVE_RGA_DMA)
+    target_compile_definitions(drone_video PRIVATE DRONE_HAVE_RGA_DMA=1)
+    target_include_directories(drone_video PRIVATE ${DRONE_RGA_DIR})
+    target_link_libraries(drone_video PRIVATE ${DRONE_RGA_LIBRARY})
+endif()
 
 # ---- video_transmission 模块（图传发送接口 + 编码后端） ----
 add_library(drone_video_transmission STATIC
@@ -63,7 +85,6 @@ option(DRONE_HAVE_RKNN "启用 RKNN 推理后端（需香橙派 RKNN runtime 与
        ${DRONE_HAVE_RKNN_DEFAULT})
 message(STATUS "RKNN 推理后端: ${DRONE_HAVE_RKNN}（目标架构=${CMAKE_SYSTEM_PROCESSOR}）")
 set(DRONE_RKNN_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn/include" CACHE PATH "RKNN API 头文件目录（含 rknn_api.h）")
-set(DRONE_RGA_DIR "/usr/include/rga" CACHE PATH "RGA 头文件目录（含 rga.h / im2d.hpp）")
 
 set(PERCEPTION_SOURCES
     src/perception/yolo_detector.cpp
@@ -78,9 +99,11 @@ if(DRONE_HAVE_RKNN)
     if(NOT DRONE_RKNN_LIBRARY)
         message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librknnrt.so（香橙派需安装 RKNN runtime）")
     endif()
-    find_library(DRONE_RGA_LIBRARY NAMES rga)
     if(NOT DRONE_RGA_LIBRARY)
-        message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librga.so（香橙派需安装 librga）")
+        find_library(DRONE_RGA_LIBRARY NAMES rga)
+        if(NOT DRONE_RGA_LIBRARY)
+            message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librga.so（香橙派需安装 librga）")
+        endif()
     endif()
     list(APPEND PERCEPTION_SOURCES src/perception/rknn_detection_backend.cpp)
 endif()
@@ -281,6 +304,17 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(video_frame_pool_test)
+
+        add_executable(drm_nv12_transfer_test tests/video/drm_nv12_transfer_test.cpp)
+        target_link_libraries(drm_nv12_transfer_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(drm_nv12_transfer_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(drm_nv12_transfer_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(drm_nv12_transfer_test)
 
         # 解码器软解测试：用 libx264 编码测试码流，验证 VideoDecoder 输出 NV12 帧
         add_executable(video_decoder_test tests/video/video_decoder_test.cpp)

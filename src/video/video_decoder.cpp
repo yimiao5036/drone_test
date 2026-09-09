@@ -24,6 +24,7 @@
 #include <memory>
 #include <thread>
 
+#include "video/drm_nv12_transfer.h"
 #include "video/video_frame_pool.h"
 
 extern "C" {
@@ -125,6 +126,7 @@ struct VideoDecoder::Impl {
 
     // 帧内存池（懒创建）
     std::shared_ptr<VideoFramePool> pool;
+    std::unique_ptr<IDrmNv12Transfer> drm_nv12_transfer = CreateDrmNv12Transfer();
 
     // 状态计数
     std::atomic<uint64_t> decoded_count{0};
@@ -135,7 +137,10 @@ struct VideoDecoder::Impl {
     std::atomic<uint64_t> key_frame_count{0};
     std::atomic<uint64_t> slow_decode_count{0};
     std::atomic<uint64_t> hardware_transfer_buffer_build_count{0};
+    std::atomic<uint64_t> rga_dma_transfer_count{0};
+    std::atomic<uint64_t> rga_dma_fallback_count{0};
     std::atomic<bool> drm_layout_logged{false};
+    bool rga_dma_disabled = false;  // 仅解码线程访问；布局不支持时会话内关闭
     std::atomic<common::VideoCodec> active_codec{common::VideoCodec::kUnknown};
     std::atomic<bool> hardware_decoder_active{false};
     common::LatencyStatistics input_queue_latency;
@@ -147,6 +152,7 @@ struct VideoDecoder::Impl {
     common::LatencyStatistics receive_frame_latency{256};
     common::LatencyStatistics hardware_transfer_prepare_latency{256};
     common::LatencyStatistics hardware_transfer_latency{256};
+    common::LatencyStatistics rga_dma_transfer_latency{256};
     common::LatencyStatistics frame_copy_latency{256};
 
     /// 创建帧内存池（按解码分辨率）。
@@ -165,6 +171,23 @@ struct VideoDecoder::Impl {
                     config.pool_capacity, frame_template.width,
                     frame_template.height, frame_template.hor_stride,
                     pool->SlotSize());
+    }
+
+    bool EnsurePool(int width, int height) {
+        if (pool != nullptr) {
+            return true;
+        }
+        try {
+            CreatePool(width, height);
+            return true;
+        } catch (const std::exception& e) {
+            ++error_count;
+            if (ShouldLogThrottled(error_count)) {
+                SPDLOG_ERROR("视频解码器创建帧内存池失败: {}，累计 {}",
+                             e.what(), error_count.load());
+            }
+            return false;
+        }
     }
 
     /// 创建解码器；优先 rkmpp 硬解，不可用或失败时回退软解。
@@ -491,19 +514,166 @@ struct VideoDecoder::Impl {
         }
     }
 
+    void CompleteFrame(FrameHandle handle, const common::EncodedFrame& encoded,
+                       std::int64_t ingress_ms, std::int64_t decode_start_us,
+                       double packet_prepare_ms, double send_packet_ms,
+                       double receive_frame_ms,
+                       double hardware_transfer_prepare_ms,
+                       double hardware_transfer_ms, double rga_dma_ms,
+                       double frame_copy_ms) {
+        const std::int64_t completed_us = MonotonicUs();
+        const std::int64_t completed_ms = completed_us / 1000;
+        handle.SetTiming(completed_ms, ingress_ms);
+        const double total_decode_ms =
+            static_cast<double>(completed_us - decode_start_us) / 1000.0;
+        decode_latency.Add(total_decode_ms);
+        if (config.slow_frame_threshold_ms > 0.0 && decoded_count.load() >= 100 &&
+            total_decode_ms >= config.slow_frame_threshold_ms) {
+            const uint64_t count = slow_decode_count.fetch_add(1) + 1;
+            if (ShouldLogThrottled(count)) {
+                const double measured_ms = packet_prepare_ms + send_packet_ms +
+                                           receive_frame_ms +
+                                           hardware_transfer_prepare_ms +
+                                           hardware_transfer_ms + rga_dma_ms +
+                                           frame_copy_ms;
+                const double other_ms = std::max(0.0, total_decode_ms - measured_ms);
+                SPDLOG_WARN(
+                    "视频解码慢帧: codec={} 触发包序号={} 字节={} 关键帧={} "
+                    "总耗时={:.3f}ms D1={:.3f} D2={:.3f} D3={:.3f} "
+                    "D4P={:.3f} D4={:.3f} D4R={:.3f} D5={:.3f} "
+                    "其余={:.3f} 累计={}",
+                    CodecName(encoded.codec), encoded.header.sequence,
+                    encoded.data.size(), encoded.is_key_frame, total_decode_ms,
+                    packet_prepare_ms, send_packet_ms, receive_frame_ms,
+                    hardware_transfer_prepare_ms, hardware_transfer_ms,
+                    rga_dma_ms, frame_copy_ms, other_ms, count);
+            }
+        }
+        if (ingress_ms > 0) {
+            ingress_to_decoded_latency.Add(
+                static_cast<double>(completed_ms - ingress_ms));
+        }
+        (void)frame_output.Emplace(std::move(handle));
+        ++decoded_count;
+    }
+
+    bool TryPublishDrmFrameWithRga(
+        AVFrame* source, const common::EncodedFrame& encoded,
+        std::int64_t ingress_ms, std::int64_t decode_start_us,
+        double packet_prepare_ms, double send_packet_ms,
+        double receive_frame_ms) {
+        if (!config.prefer_rga_dma_transfer || rga_dma_disabled ||
+            source == nullptr || source->format != AV_PIX_FMT_DRM_PRIME ||
+            source->data[0] == nullptr) {
+            return false;
+        }
+        if (drm_nv12_transfer == nullptr || !drm_nv12_transfer->IsAvailable()) {
+            rga_dma_disabled = true;
+            const uint64_t count = rga_dma_fallback_count.fetch_add(1) + 1;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("RGA DMA-BUF转存不可用，回退FFmpeg硬件帧转存");
+            }
+            return false;
+        }
+
+        const auto* descriptor =
+            reinterpret_cast<const AVDRMFrameDescriptor*>(source->data[0]);
+        if (descriptor->nb_objects != 1 || descriptor->nb_layers != 1 ||
+            descriptor->layers[0].nb_planes != 2) {
+            rga_dma_disabled = true;
+            const uint64_t count = rga_dma_fallback_count.fetch_add(1) + 1;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN(
+                    "RGA DMA-BUF不支持当前DRM对象布局: objects={} layers={} "
+                    "planes={}，回退FFmpeg转存",
+                    descriptor->nb_objects, descriptor->nb_layers,
+                    descriptor->nb_layers == 1
+                        ? descriptor->layers[0].nb_planes
+                        : -1);
+            }
+            return false;
+        }
+
+        const auto& object = descriptor->objects[0];
+        const auto& layer = descriptor->layers[0];
+        DrmNv12Layout layout;
+        layout.fd = object.fd;
+        layout.object_size = object.size;
+        layout.format_modifier = object.format_modifier;
+        layout.drm_format = layer.format;
+        layout.width = static_cast<std::uint32_t>(source->width);
+        layout.height = static_cast<std::uint32_t>(source->height);
+        layout.y_object_index = layer.planes[0].object_index;
+        layout.y_offset = layer.planes[0].offset;
+        layout.y_pitch = layer.planes[0].pitch;
+        layout.uv_object_index = layer.planes[1].object_index;
+        layout.uv_offset = layer.planes[1].offset;
+        layout.uv_pitch = layer.planes[1].pitch;
+
+        if (!EnsurePool(source->width, source->height)) {
+            return true;
+        }
+        auto handle = pool->Acquire(ingress_ms);
+        if (!handle.Valid()) {
+            ++dropped_count;
+            if (ShouldLogThrottled(dropped_count)) {
+                SPDLOG_WARN("解码帧内存池已满丢帧，累计 {}", dropped_count.load());
+            }
+            return true;
+        }
+
+        std::string transfer_error;
+        const std::int64_t rga_start_us = MonotonicUs();
+        const DrmNv12TransferStatus status = drm_nv12_transfer->CopyToNv12(
+            layout, handle.Data(), handle.Info().hor_stride, &transfer_error);
+        const double rga_dma_ms =
+            static_cast<double>(MonotonicUs() - rga_start_us) / 1000.0;
+        if (status != DrmNv12TransferStatus::kSuccess) {
+            const uint64_t count = rga_dma_fallback_count.fetch_add(1) + 1;
+            if (status == DrmNv12TransferStatus::kUnsupportedLayout) {
+                rga_dma_disabled = true;
+            }
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("RGA DMA-BUF转存失败并回退FFmpeg: status={} 原因={} 累计={}",
+                            static_cast<int>(status), transfer_error, count);
+            }
+            return false;
+        }
+
+        rga_dma_transfer_latency.Add(rga_dma_ms);
+        const uint64_t success_count = rga_dma_transfer_count.fetch_add(1) + 1;
+        if (success_count == 1) {
+            SPDLOG_INFO(
+                "视频解码启用RGA DMA-BUF直传: fd={} 分辨率={}x{} pitch={} "
+                "目标stride={}",
+                layout.fd, layout.width, layout.height, layout.y_pitch,
+                handle.Info().hor_stride);
+        }
+        CompleteFrame(std::move(handle), encoded, ingress_ms, decode_start_us,
+                      packet_prepare_ms, send_packet_ms, receive_frame_ms,
+                      0.0, 0.0, rga_dma_ms, 0.0);
+        return true;
+    }
+
     /// 将解码帧转为 NV12 写入内存池并发布。
-    // 硬件帧先 transfer 到系统内存；NV12 直接按 stride 拷贝，YUV420P 才走 sws 转换。
+    // 硬件帧优先经RGA DMA-BUF直传到内存池；失败时回退FFmpeg转存。
     void PublishFrame(AVFrame* source, const common::EncodedFrame& encoded,
                       std::int64_t ingress_ms, std::int64_t decode_start_us,
                       double packet_prepare_ms, double send_packet_ms,
                       double receive_frame_ms) {
-        // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
+        LogDrmLayoutOnce(source);
+        if (TryPublishDrmFrameWithRga(
+                source, encoded, ingress_ms, decode_start_us,
+                packet_prepare_ms, send_packet_ms, receive_frame_ms)) {
+            return;
+        }
+
+        // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：回退从DRM转存到系统内存NV12。
         AVFrame* frame = source;
         double hardware_transfer_prepare_ms = 0.0;
         double hardware_transfer_ms = 0.0;
         if (source->format == AV_PIX_FMT_DRM_PRIME ||
             source->hw_frames_ctx != nullptr) {
-            LogDrmLayoutOnce(source);
             const std::int64_t transfer_prepare_start_us = MonotonicUs();
             // av_hwframe_transfer_data允许复用已分配的目标帧。旧实现每帧unref，
             // 会使FFmpeg每帧重新av_frame_get_buffer；实机已定位到D4偶发从约
@@ -564,17 +734,8 @@ struct VideoDecoder::Impl {
         }
 
         // 懒建池：首帧确定分辨率
-        if (pool == nullptr) {
-            try {
-                CreatePool(width, height);
-            } catch (const std::exception& e) {
-                ++error_count;
-                if (ShouldLogThrottled(error_count)) {
-                    SPDLOG_ERROR("视频解码器创建帧内存池失败: {}，累计 {}",
-                                 e.what(), error_count.load());
-                }
-                return;
-            }
+        if (!EnsurePool(width, height)) {
+            return;
         }
 
         const std::int64_t frame_copy_start_us = MonotonicUs();
@@ -654,41 +815,13 @@ struct VideoDecoder::Impl {
                       dst_planes, dst_linesize);
         }
 
-        const std::int64_t completed_us = MonotonicUs();
         const double frame_copy_ms =
-            static_cast<double>(completed_us - frame_copy_start_us) / 1000.0;
+            static_cast<double>(MonotonicUs() - frame_copy_start_us) / 1000.0;
         frame_copy_latency.Add(frame_copy_ms);
-        const std::int64_t completed_ms = completed_us / 1000;
-        handle.SetTiming(completed_ms, ingress_ms);
-        const double total_decode_ms =
-            static_cast<double>(completed_us - decode_start_us) / 1000.0;
-        decode_latency.Add(total_decode_ms);
-        if (config.slow_frame_threshold_ms > 0.0 && decoded_count.load() >= 100 &&
-            total_decode_ms >= config.slow_frame_threshold_ms) {
-            const uint64_t count = slow_decode_count.fetch_add(1) + 1;
-            if (ShouldLogThrottled(count)) {
-                const double measured_ms = packet_prepare_ms + send_packet_ms +
-                                           receive_frame_ms +
-                                           hardware_transfer_prepare_ms +
-                                           hardware_transfer_ms + frame_copy_ms;
-                const double other_ms = std::max(0.0, total_decode_ms - measured_ms);
-                SPDLOG_WARN(
-                    "视频解码慢帧: codec={} 触发包序号={} 字节={} 关键帧={} "
-                    "总耗时={:.3f}ms D1={:.3f} D2={:.3f} D3={:.3f} "
-                    "D4P={:.3f} D4={:.3f} D5={:.3f} 其余={:.3f} 累计={}",
-                    CodecName(encoded.codec), encoded.header.sequence,
-                    encoded.data.size(), encoded.is_key_frame, total_decode_ms,
-                    packet_prepare_ms, send_packet_ms, receive_frame_ms,
-                    hardware_transfer_prepare_ms, hardware_transfer_ms,
-                    frame_copy_ms, other_ms, count);
-            }
-        }
-        if (ingress_ms > 0) {
-            ingress_to_decoded_latency.Add(
-                static_cast<double>(completed_ms - ingress_ms));
-        }
-        (void)frame_output.Emplace(std::move(handle));
-        ++decoded_count;
+        CompleteFrame(std::move(handle), encoded, ingress_ms, decode_start_us,
+                      packet_prepare_ms, send_packet_ms, receive_frame_ms,
+                      hardware_transfer_prepare_ms, hardware_transfer_ms,
+                      0.0, frame_copy_ms);
     }
 
     // 停止时关闭输入订阅并等待解码线程退出，保证不会有线程继续访问池或输出 Topic。
@@ -704,9 +837,13 @@ struct VideoDecoder::Impl {
 
 VideoDecoder::VideoDecoder(VideoDecoderConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {
-    SPDLOG_INFO("视频解码器创建: 池容量={} 预置分辨率={}x{} 硬解优先={}",
-                impl_->config.pool_capacity, impl_->config.width,
-                impl_->config.height, impl_->config.prefer_hardware);
+    SPDLOG_INFO(
+        "视频解码器创建: 池容量={} 预置分辨率={}x{} 硬解优先={} "
+        "RGA_DMA优先={} RGA_DMA可用={}",
+        impl_->config.pool_capacity, impl_->config.width, impl_->config.height,
+        impl_->config.prefer_hardware, impl_->config.prefer_rga_dma_transfer,
+        impl_->drm_nv12_transfer != nullptr &&
+            impl_->drm_nv12_transfer->IsAvailable());
 }
 
 VideoDecoder::~VideoDecoder() {
@@ -800,6 +937,10 @@ common::LatencySummary VideoDecoder::HardwareTransferLatency() const {
     return impl_->hardware_transfer_latency.Snapshot();
 }
 
+common::LatencySummary VideoDecoder::RgaDmaTransferLatency() const {
+    return impl_->rga_dma_transfer_latency.Snapshot();
+}
+
 common::LatencySummary VideoDecoder::FrameCopyLatency() const {
     return impl_->frame_copy_latency.Snapshot();
 }
@@ -826,6 +967,14 @@ uint64_t VideoDecoder::KeyFrameCount() const {
 
 uint64_t VideoDecoder::HardwareTransferBufferBuildCount() const {
     return impl_->hardware_transfer_buffer_build_count.load();
+}
+
+uint64_t VideoDecoder::RgaDmaTransferCount() const {
+    return impl_->rga_dma_transfer_count.load();
+}
+
+uint64_t VideoDecoder::RgaDmaFallbackCount() const {
+    return impl_->rga_dma_fallback_count.load();
 }
 
 }  // namespace drone::video

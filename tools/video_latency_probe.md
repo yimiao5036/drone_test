@@ -31,8 +31,9 @@
 | D2 | `avcodec_send_packet` | 码流送入FFmpeg/rkmpp解码器的调用时间 |
 | D3 | `avcodec_receive_frame` | 成功取得一个输出帧的调用时间 |
 | D4P | 转存目标帧准备 | 分辨率检查与`av_frame_make_writable`，用于解释旧日志中的“其余”10～20ms台阶 |
-| D4 | DRM硬件帧转存 | `av_hwframe_transfer_data`；目标系统内存帧首帧分配后复用，计数为0表示当前输出不经过该API |
-| D5 | NV12内存池复制 | 内存池取槽及NV12逐行复制；软解时包含像素格式转换 |
+| D4 | DRM硬件帧转存（回退） | `av_hwframe_transfer_data`；仅RGA DMA不可用/失败回退时产生样本 |
+| D4R | RGA DMA-BUF直传 | `wrapbuffer_fd` + `imcopy`直接写入`VideoFramePool` |
+| D5 | NV12内存池复制（回退） | FFmpeg转存后逐行复制；RGA DMA成功时不执行 |
 
 不包含：摄像头曝光、摄像头内部编码、摄像头到香橙派网络传输、MediaMTX后续分发、HM30无线传输、Web FFmpeg转码、JSMpeg缓冲和浏览器显示。跨端显示延迟后续需要画面时间码/LED事件或携带时间戳的测试图案单独测量。
 
@@ -68,7 +69,7 @@ YOLO与叠加/图传是并行支路：当前叠加器使用截至取帧时已到
 
 ## 日志行为
 
-探针每个`--interval`周期输出一次统计，不打印逐帧成功日志。探针会把`VideoDecoderConfig.slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P和未归类耗时，只在第1次及每100次打印WARN。正式`drone_control`默认阈值0，不启用该诊断告警。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch，作为RGA DMA-BUF直通适配依据。
+探针每个`--interval`周期输出一次统计，不打印逐帧成功日志。探针设置`prefer_rga_dma_transfer=true`，优先试验RGA DMA-BUF直传；正式`drone_control`默认false。探针同时把`slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P、D4R和未归类耗时，只在第1次及每100次打印WARN。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch。
 
 ## 排查要点
 

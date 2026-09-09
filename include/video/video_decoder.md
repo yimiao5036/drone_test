@@ -25,6 +25,7 @@ struct VideoDecoderConfig {
     std::uint32_t stride_alignment = 64;  // 水平 stride 像素对齐
     bool prefer_hardware = true;       // 优先 rkmpp 硬解
     double slow_frame_threshold_ms = 0.0; // 慢帧关联日志阈值；0=关闭
+    bool prefer_rga_dma_transfer = false; // 优先RGA DMA-BUF直传到内存池
 };
 
 class VideoDecoder final : public IVideoDecoder {
@@ -71,7 +72,7 @@ class VideoDecoder final : public IVideoDecoder {
 
 首次收到`AV_PIX_FMT_DRM_PRIME`帧时，INFO日志输出`AVDRMFrameDescriptor`：对象fd/size/modifier、图层DRM格式以及各平面的object index/offset/pitch。该日志只打印一次，用于确认当前MPP输出是否能安全通过RGA DMA-BUF接口直接读取，禁止在未知平面布局时假定NV12连续排列。
 
-第三轮300秒上板测试在约250秒后复现长尾，D1/D2/D3/D5保持稳定，D4从约1.7～1.9ms升至平均10.7ms、P95约15ms，确认瓶颈位于`av_hwframe_transfer_data`。因此实现改为复用转存目标缓冲，并通过`HardwareTransferBufferBuildCount()`暴露累计构建次数；稳定分辨率下预期为1。
+第三轮300秒上板测试在约250秒后复现长尾，D1/D2/D3/D5保持稳定，D4从约1.7～1.9ms升至平均10.7ms、P95约15ms，确认瓶颈位于`av_hwframe_transfer_data`。缓冲复用后慢帧仍可复现，因此新增`drm_nv12_transfer`：对已确认的单对象线性NV12布局，使用RGA从DMA-BUF fd直接`imcopy`到`VideoFramePool`，成功时绕过D4和D5；失败自动回退原路径。探针默认启用该试验路径，正式程序默认关闭。
 
 ## 4. 日志行为
 
@@ -101,7 +102,7 @@ cmake --build build && cd build && ctest -R VideoDecoder
 | `non-existing PPS 0` / `h265d: pps invalid`（段错误） | ① 若 SPS/PPS 为 IDR 前独立小包：勿按“未初始化跳过非关键帧”（已修复为全量送包）。② HEVC 容器 extradata 勿塞给 rkmpp（已修复）。③ 若已能出帧仍段错误：为输出转存内存问题；纯 NV12 拷贝不再走 sws（已修复），确认源 linesize 与池 stride 匹配 |
 | 解码 0 帧但无错误 | 输入队列容量(8) < 突发帧数挤掉关键帧后无后续关键帧（GOP 过长）；调整队列容量或等关键帧机制确认 |
 | `DroppedFrameCount` 增长 | 池容量 < 输出订阅队列 + 在途；调大 `pool_capacity` |
-| D4运行数分钟后由约2ms升至10～15ms | 已定位到`av_hwframe_transfer_data`；先确认`HardwareTransferBufferBuildCount`稳定为1并对比缓冲复用前后。若仍复现，再采集慢帧日志、温度/频率和FFmpeg/MPP版本，评估DMA-BUF/RGA直通替代整帧下载 |
+| D4运行数分钟后由约2ms升至10～15ms | 已定位到`av_hwframe_transfer_data`并增加RGA DMA-BUF直传试验路径；确认`RGA_DMA成功`增长、回退为0、D4/D5无样本及D4R稳定。实现细节见`drm_nv12_transfer.md` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |
 | 帧率不足 | 软解慢属预期（开发机）；香橙派按实际流确认走`h264_rkmpp`或`hevc_rkmpp`；`sws`在格式不变时不会重建 |
 | 修改输出格式 | 当前固定 NV12；如需 RGB888 改 `sws` 目标格式与 `PixelFormat` |

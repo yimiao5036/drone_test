@@ -39,6 +39,8 @@ struct VideoPipelineLatencySnapshot {
     std::uint64_t encoded_bytes = 0;
     std::uint64_t key_frame_count = 0;
     std::uint64_t hardware_transfer_buffer_build_count = 0;
+    std::uint64_t rga_dma_transfer_count = 0;
+    std::uint64_t rga_dma_fallback_count = 0;
     common::LatencySummary decode_queue;
     common::LatencySummary decode;
     common::LatencySummary ingress_to_decoded;
@@ -48,6 +50,7 @@ struct VideoPipelineLatencySnapshot {
     common::LatencySummary receive_frame;
     common::LatencySummary hardware_transfer_prepare;
     common::LatencySummary hardware_transfer;
+    common::LatencySummary rga_dma_transfer;
     common::LatencySummary frame_copy;
     common::LatencySummary yolo_queue;
     common::LatencySummary yolo_inference;

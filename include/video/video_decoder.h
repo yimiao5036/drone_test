@@ -35,6 +35,7 @@ struct VideoDecoderConfig {
     std::uint32_t stride_alignment = 64;    ///< 水平 stride 像素对齐（MPP/RGA 友好）
     bool prefer_hardware = true;            ///< 优先 rkmpp 硬解码（香橙派）；否则软解
     double slow_frame_threshold_ms = 0.0;   ///< 慢解码诊断阈值；0=关闭逐事件节流日志
+    bool prefer_rga_dma_transfer = false;   ///< 优先RGA DMA-BUF直传到NV12内存池
 };
 
 /// 视频解码部件抽象接口。
@@ -74,6 +75,7 @@ public:
     virtual common::LatencySummary ReceiveFrameLatency() const = 0;
     virtual common::LatencySummary HardwareTransferPrepareLatency() const = 0;
     virtual common::LatencySummary HardwareTransferLatency() const = 0;
+    virtual common::LatencySummary RgaDmaTransferLatency() const = 0;
     virtual common::LatencySummary FrameCopyLatency() const = 0;
     /// 当前输入编码和实际解码模式。
     virtual common::VideoCodec ActiveCodec() const = 0;
@@ -84,6 +86,8 @@ public:
     virtual uint64_t KeyFrameCount() const = 0;
     /// DRM硬件帧转存目标缓冲累计构建次数；稳定分辨率下通常为1。
     virtual uint64_t HardwareTransferBufferBuildCount() const = 0;
+    virtual uint64_t RgaDmaTransferCount() const = 0;
+    virtual uint64_t RgaDmaFallbackCount() const = 0;
 };
 
 /// 视频解码器（实现 IVideoDecoder）。
@@ -123,6 +127,7 @@ public:
     common::LatencySummary ReceiveFrameLatency() const override;
     common::LatencySummary HardwareTransferPrepareLatency() const override;
     common::LatencySummary HardwareTransferLatency() const override;
+    common::LatencySummary RgaDmaTransferLatency() const override;
     common::LatencySummary FrameCopyLatency() const override;
     common::VideoCodec ActiveCodec() const override;
     bool IsHardwareDecoder() const override;
@@ -130,6 +135,8 @@ public:
     uint64_t EncodedBytes() const override;
     uint64_t KeyFrameCount() const override;
     uint64_t HardwareTransferBufferBuildCount() const override;
+    uint64_t RgaDmaTransferCount() const override;
+    uint64_t RgaDmaFallbackCount() const override;
 
 private:
     struct Impl;
@@ -164,6 +171,7 @@ public:
     common::LatencySummary ReceiveFrameLatency() const override { return {}; }
     common::LatencySummary HardwareTransferPrepareLatency() const override { return {}; }
     common::LatencySummary HardwareTransferLatency() const override { return {}; }
+    common::LatencySummary RgaDmaTransferLatency() const override { return {}; }
     common::LatencySummary FrameCopyLatency() const override { return {}; }
     common::VideoCodec ActiveCodec() const override { return common::VideoCodec::kUnknown; }
     bool IsHardwareDecoder() const override { return false; }
@@ -171,6 +179,8 @@ public:
     uint64_t EncodedBytes() const override { return 0; }
     uint64_t KeyFrameCount() const override { return 0; }
     uint64_t HardwareTransferBufferBuildCount() const override { return 0; }
+    uint64_t RgaDmaTransferCount() const override { return 0; }
+    uint64_t RgaDmaFallbackCount() const override { return 0; }
 
 private:
     bool running_ = false;

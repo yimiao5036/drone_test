@@ -174,6 +174,7 @@ TEST(VideoDecoderTest, DecodesH264ToNv12Frames) {
     EXPECT_GT(decoder.ReceiveFrameLatency().total_count, 0u);
     EXPECT_EQ(decoder.HardwareTransferPrepareLatency().total_count, 0u);
     EXPECT_EQ(decoder.HardwareTransferLatency().total_count, 0u);
+    EXPECT_EQ(decoder.RgaDmaTransferLatency().total_count, 0u);
     EXPECT_GT(decoder.FrameCopyLatency().total_count, 0u);
     EXPECT_EQ(decoder.ActiveCodec(), common::VideoCodec::kH264);
     EXPECT_FALSE(decoder.IsHardwareDecoder());
@@ -181,6 +182,8 @@ TEST(VideoDecoderTest, DecodesH264ToNv12Frames) {
     EXPECT_GT(decoder.EncodedBytes(), 0u);
     EXPECT_EQ(decoder.KeyFrameCount(), static_cast<std::uint64_t>(encoded.size()));
     EXPECT_EQ(decoder.HardwareTransferBufferBuildCount(), 0u);
+    EXPECT_EQ(decoder.RgaDmaTransferCount(), 0u);
+    EXPECT_EQ(decoder.RgaDmaFallbackCount(), 0u);
     EXPECT_EQ(decoder.ErrorCount(), 0u);
     // 输入 10 帧全部为关键帧，预期解码 10 帧（池容量充足不丢帧）
     EXPECT_GE(received, static_cast<std::size_t>(kTestFrameCount) - 1);

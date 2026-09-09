@@ -119,7 +119,9 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
               << " FPS/" << interval_mbps << " Mbps"
               << " 区间关键帧=" << interval_key_frames
               << " 累计访问单元=" << s.encoded_frame_count
-              << " DRM转存缓冲构建=" << s.hardware_transfer_buffer_build_count << '\n';
+              << " DRM转存缓冲构建=" << s.hardware_transfer_buffer_build_count
+              << " RGA_DMA成功=" << s.rga_dma_transfer_count
+              << " RGA_DMA回退=" << s.rga_dma_fallback_count << '\n';
     PrintSummary("01 解码输入队列", s.decode_queue);
     PrintSummary(decode_name.c_str(), s.decode);
     PrintSummary("03 入口→解码输出", s.ingress_to_decoded);
@@ -140,9 +142,10 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
     PrintSummary("D2 avcodec_send_packet", s.send_packet);
     PrintSummary("D3 avcodec_receive_frame", s.receive_frame);
     PrintSummary("D4P 转存目标帧准备", s.hardware_transfer_prepare);
-    PrintSummary("D4 DRM硬件帧转存(缓冲复用)", s.hardware_transfer);
-    PrintSummary("D5 NV12内存池复制", s.frame_copy);
-    std::cout << "说明：D4计数为0表示当前输出不经过av_hwframe_transfer_data；"
+    PrintSummary("D4 DRM硬件帧转存(回退)", s.hardware_transfer);
+    PrintSummary("D4R RGA DMA-BUF直传", s.rga_dma_transfer);
+    PrintSummary("D5 NV12内存池复制(回退)", s.frame_copy);
+    std::cout << "说明：RGA DMA成功时D4/D5为0；D4/D5有计数表示发生FFmpeg回退；"
                  "不包含摄像头曝光/编码/网络到机载入口，也不包含HM30传输、Web转码和浏览器显示。\n";
 }
 
@@ -162,6 +165,7 @@ int main(int argc, char** argv) {
         config.runtime.enable_control = false;
         // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
         config.decoder.slow_frame_threshold_ms = 10.0;
+        config.decoder.prefer_rga_dma_transfer = true;
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);

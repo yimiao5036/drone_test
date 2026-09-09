@@ -386,6 +386,8 @@ VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
         snapshot.key_frame_count = decoder_->KeyFrameCount();
         snapshot.hardware_transfer_buffer_build_count =
             decoder_->HardwareTransferBufferBuildCount();
+        snapshot.rga_dma_transfer_count = decoder_->RgaDmaTransferCount();
+        snapshot.rga_dma_fallback_count = decoder_->RgaDmaFallbackCount();
         snapshot.decode_queue = decoder_->InputQueueLatency();
         snapshot.decode = decoder_->DecodeLatency();
         snapshot.ingress_to_decoded = decoder_->IngressToDecodedLatency();
@@ -395,6 +397,7 @@ VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
         snapshot.hardware_transfer_prepare =
             decoder_->HardwareTransferPrepareLatency();
         snapshot.hardware_transfer = decoder_->HardwareTransferLatency();
+        snapshot.rga_dma_transfer = decoder_->RgaDmaTransferLatency();
         snapshot.frame_copy = decoder_->FrameCopyLatency();
     }
     if (detector_ != nullptr) {
