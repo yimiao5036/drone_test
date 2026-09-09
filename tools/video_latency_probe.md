@@ -55,6 +55,15 @@ cmake --build build -j$(nproc)
 ./build/video_latency_probe --config ./config/config.json --duration 300 --interval 10
 ```
 
+YOLO输入队列A/B测试可用命令行临时覆盖，不修改正式JSON：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 1
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 2
+```
+
+容量必须为正数；未提供时沿用`yolo.input_queue_capacity`，当前缺省为2。
+
 主表输出当前最多2048样本窗口的`avg/P50/P95/P99/max`；D1～D5及D4P使用最近最多256样本，约等于25 FPS下10秒窗口，便于定位短时解码长尾。输出中的`count`是启动后的累计有效样本数，`win`是本次百分位实际使用的窗口样本数。前10～20秒包含解码器、NPU和编码器预热，不应用于最终结论；建议至少运行120秒，以最后3～5次报告判断稳定延迟。
 
 ## 优化判断

@@ -87,6 +87,8 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 
 Y1通常约等于Y1R+Y1C，但还包含缓冲`resize`检查与RGA描述准备。Y1～Y4之和与外层`InferenceLatency()`可能存在少量调用、统计和线程调度开销。
 
+2026-09-09香橙派120秒实测表明：Y1平均约2.8～3.6ms，其中Y1R约2.5～3.2ms、Y1C约0.3ms；Y2平均约24～29ms，占后端总耗时约80%～90%；Y3约0.01ms、Y4约0.13～0.20ms。当前主要计算瓶颈已确认是`rknn_run`，不是CPU letterbox、输出布局或NMS。外层YOLO输入队列平均约14ms、P95约36ms，是端到端检测延迟的另一主要来源；先使用探针`--yolo-queue 1/2`做最新帧策略A/B，不直接修改生产容量。
+
 ## 日志行为
 
 | 场景 | 等级 | 节流 |

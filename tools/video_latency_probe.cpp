@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -38,6 +39,7 @@ struct Options {
     std::string config_path;
     int duration_seconds = 60;
     int interval_seconds = 10;
+    std::size_t yolo_queue_capacity = 0;  // 0=沿用配置
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -50,9 +52,16 @@ Options ParseOptions(int argc, char** argv) {
             options.duration_seconds = std::stoi(argv[++index]);
         } else if (arg == "--interval" && index + 1 < argc) {
             options.interval_seconds = std::stoi(argv[++index]);
+        } else if (arg == "--yolo-queue" && index + 1 < argc) {
+            const int capacity = std::stoi(argv[++index]);
+            if (capacity <= 0) {
+                throw std::invalid_argument("yolo-queue必须为正数");
+            }
+            options.yolo_queue_capacity = static_cast<std::size_t>(capacity);
         } else {
             throw std::invalid_argument(
-                "用法: video_latency_probe [--config path] [--duration 秒] [--interval 秒]");
+                "用法: video_latency_probe [--config path] [--duration 秒] "
+                "[--interval 秒] [--yolo-queue 容量]");
         }
     }
     if (options.duration_seconds <= 0 || options.interval_seconds <= 0) {
@@ -174,12 +183,17 @@ int main(int argc, char** argv) {
         // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
         config.decoder.slow_frame_threshold_ms = 10.0;
         config.decoder.prefer_rga_dma_transfer = true;
+        if (options.yolo_queue_capacity > 0) {
+            config.yolo.input_queue_capacity = options.yolo_queue_capacity;
+        }
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 
+        std::cout << "视频延迟探针配置: YOLO输入队列容量="
+                  << config.yolo.input_queue_capacity << '\n';
         drone::application::DroneApplication application(std::move(config));
         if (!application.Start()) {
             std::cerr << "视频延迟探针启动失败\n";
