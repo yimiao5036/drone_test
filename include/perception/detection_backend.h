@@ -77,6 +77,7 @@ public:
 /// - 编译时启用 RKNN（DRONE_HAVE_RKNN）且模型路径非空：返回 RknnDetectionBackend。
 /// - 否则返回 nullptr（调用方需注入自定义后端，或 YoloDetector::Start 失败）。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
-    const std::string& model_path, float conf_threshold, float nms_threshold);
+    const std::string& model_path, float conf_threshold, float nms_threshold,
+    const std::string& npu_core_mode = "all");
 
 }  // namespace drone::perception

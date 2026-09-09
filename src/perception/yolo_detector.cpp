@@ -60,16 +60,18 @@ std::int64_t SteadyNowMs() {
 // 按编译选项创建默认后端：香橙派启用 RKNN 时创建真实后端，开发机返回空指针，
 // 测试或其它平台应通过构造函数注入 IDetectionBackend。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
-    const std::string& model_path, float conf_threshold, float nms_threshold) {
+    const std::string& model_path, float conf_threshold, float nms_threshold,
+    const std::string& npu_core_mode) {
 #ifdef DRONE_HAVE_RKNN
     if (!model_path.empty()) {
         return std::make_unique<RknnDetectionBackend>(model_path, conf_threshold,
-                                                      nms_threshold);
+                                                      nms_threshold, npu_core_mode);
     }
 #else
     (void)model_path;
     (void)conf_threshold;
     (void)nms_threshold;
+    (void)npu_core_mode;
 #endif
     return nullptr;
 }
@@ -86,6 +88,12 @@ struct YoloDetector::Impl {
         }
         if (this->config.nms_threshold < 0.f || this->config.nms_threshold > 1.f) {
             throw std::invalid_argument("YOLO NMS 阈值必须在 [0,1]");
+        }
+        const auto& mode = this->config.npu_core_mode;
+        if (mode != "auto" && mode != "core0" && mode != "core01" &&
+            mode != "core012" && mode != "all") {
+            throw std::invalid_argument(
+                "YOLO npu_core_mode仅支持auto/core0/core01/core012/all");
         }
     }
 
@@ -218,13 +226,14 @@ YoloDetector::YoloDetector(YoloDetectorConfig config,
     if (backend == nullptr) {
         backend = CreateDefaultDetectionBackend(config.model_path,
                                                 config.conf_threshold,
-                                                config.nms_threshold);
+                                                config.nms_threshold,
+                                                config.npu_core_mode);
     }
     impl_ = std::make_unique<Impl>(std::move(config), std::move(backend));
-    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} 后端={}",
+    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 后端={}",
                 impl_->config.model_path.empty() ? "(注入后端)" : impl_->config.model_path,
                 impl_->config.conf_threshold, impl_->config.nms_threshold,
-                impl_->config.input_queue_capacity,
+                impl_->config.input_queue_capacity, impl_->config.npu_core_mode,
                 impl_->backend != nullptr ? "已配置" : "缺失(启动将失败)");
 }
 

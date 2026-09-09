@@ -10,7 +10,7 @@
  * 推理链路（对应原型 videoPart/yolo26-rknn）：
  *
  *   NV12 解码帧 ──► RGA 预处理（完整画面等比缩放 + RGB letterbox）
- *              ──► RKNN NPU 推理（3 核上下文，单帧由运行时调度）
+ *              ──► RKNN NPU 推理（单上下文，可配置组合核心模式）
  *              ──► 输出张量 NC1HWC2→NCHW 转换（预分配缓冲）
  *              ──► `[1,5,N]` 归一化 xywh 解码 + NMS + letterbox 逆变换
  *              ──► 原图坐标 BackendDetection
@@ -34,8 +34,9 @@ public:
     /// @param model_path RKNN 模型文件路径（yolo26n_int8.rknn 等）
     /// @param conf_threshold 检测置信度阈值
     /// @param nms_threshold NMS IoU 阈值
+    /// @param npu_core_mode auto/core0/core01/core012/all
     RknnDetectionBackend(std::string model_path, float conf_threshold,
-                         float nms_threshold);
+                         float nms_threshold, std::string npu_core_mode);
     ~RknnDetectionBackend() override;
 
     RknnDetectionBackend(const RknnDetectionBackend&) = delete;

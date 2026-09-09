@@ -69,6 +69,7 @@ struct YoloDetectorConfig {
     float conf_threshold = 0.25f;         ///< 检测置信度阈值 [0,1]
     float nms_threshold = 0.45f;          ///< NMS IoU 阈值 [0,1]
     std::size_t input_queue_capacity = 2; ///< 解码帧订阅队列容量（丢最旧）
+    std::string npu_core_mode = "all";   ///< auto/core0/core01/core012/all
 };
 
 /// YOLO 检测器（实现 IYoloDetector）。

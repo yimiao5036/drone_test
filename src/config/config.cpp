@@ -432,6 +432,15 @@ AppConfig LoadAppConfig(const std::string& path,
     config.yolo.nms_threshold = yolo.value("nms_threshold", 0.45f);
     config.yolo.input_queue_capacity = static_cast<std::size_t>(
         yolo.value("input_queue_capacity", 2));
+    config.yolo.npu_core_mode = yolo.value("npu_core_mode", std::string("all"));
+    if (config.yolo.npu_core_mode != "auto" &&
+        config.yolo.npu_core_mode != "core0" &&
+        config.yolo.npu_core_mode != "core01" &&
+        config.yolo.npu_core_mode != "core012" &&
+        config.yolo.npu_core_mode != "all") {
+        throw std::invalid_argument(
+            "yolo.npu_core_mode仅支持auto/core0/core01/core012/all");
+    }
 
     config.compositor.pool_capacity = static_cast<std::size_t>(
         video.value("compositor_pool_capacity", 8));

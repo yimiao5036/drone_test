@@ -40,6 +40,7 @@ struct Options {
     int duration_seconds = 60;
     int interval_seconds = 10;
     std::size_t yolo_queue_capacity = 0;  // 0=沿用配置
+    std::string npu_core_mode;            // 空=沿用配置
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -58,10 +59,19 @@ Options ParseOptions(int argc, char** argv) {
                 throw std::invalid_argument("yolo-queue必须为正数");
             }
             options.yolo_queue_capacity = static_cast<std::size_t>(capacity);
+        } else if (arg == "--npu-core" && index + 1 < argc) {
+            options.npu_core_mode = argv[++index];
+            const auto& mode = options.npu_core_mode;
+            if (mode != "auto" && mode != "core0" && mode != "core01" &&
+                mode != "core012" && mode != "all") {
+                throw std::invalid_argument(
+                    "npu-core仅支持auto/core0/core01/core012/all");
+            }
         } else {
             throw std::invalid_argument(
                 "用法: video_latency_probe [--config path] [--duration 秒] "
-                "[--interval 秒] [--yolo-queue 容量]");
+                "[--interval 秒] [--yolo-queue 容量] "
+                "[--npu-core auto|core0|core01|core012|all]");
         }
     }
     if (options.duration_seconds <= 0 || options.interval_seconds <= 0) {
@@ -186,6 +196,9 @@ int main(int argc, char** argv) {
         if (options.yolo_queue_capacity > 0) {
             config.yolo.input_queue_capacity = options.yolo_queue_capacity;
         }
+        if (!options.npu_core_mode.empty()) {
+            config.yolo.npu_core_mode = options.npu_core_mode;
+        }
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);
@@ -193,7 +206,8 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, OnSignal);
 
         std::cout << "视频延迟探针配置: YOLO输入队列容量="
-                  << config.yolo.input_queue_capacity << '\n';
+                  << config.yolo.input_queue_capacity
+                  << " NPU核心模式=" << config.yolo.npu_core_mode << '\n';
         drone::application::DroneApplication application(std::move(config));
         if (!application.Start()) {
             std::cerr << "视频延迟探针启动失败\n";

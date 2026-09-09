@@ -5,8 +5,8 @@
  * 整合原型 videoPart/yolo26-rknn 的 rknn_model.cpp / rga_utils.cpp /
  * yolo26_detector.cpp 三部分：
  * - RGA 预处理：完整 NV12 解码帧 → 等比例缩放 → RGB letterbox 写入模型输入内存
- * - RKNN：3 核上下文（rknn_dup_context + RKNN_NPU_CORE_ALL），
- *   输入输出零拷贝内存（rknn_create_mem / rknn_set_io_mem）
+ * - RKNN：单上下文 + 可配置core mask，输入输出零拷贝内存
+ *   （rknn_create_mem / rknn_set_io_mem）
  * - 后处理：NC1HWC2→NCHW 转换（预分配缓冲）→ `[1,5,N]` 归一化
  *   xywh 解码 + NMS + letterbox 逆变换，直接得到原图坐标
  *
@@ -104,6 +104,22 @@ void ConvertNc1hwc2ToNchw(const int8_t* src, int8_t* dst,
 }
 
 /// 将 RKNN 张量属性转换为后处理 QuantTensor（数据指针由调用方指定）。
+rknn_core_mask ParseCoreMask(const std::string& mode) {
+    if (mode == "auto") {
+        return RKNN_NPU_CORE_AUTO;
+    }
+    if (mode == "core0") {
+        return RKNN_NPU_CORE_0;
+    }
+    if (mode == "core01") {
+        return RKNN_NPU_CORE_0_1;
+    }
+    if (mode == "core012") {
+        return RKNN_NPU_CORE_0_1_2;
+    }
+    return RKNN_NPU_CORE_ALL;
+}
+
 QuantTensor MakeTensor(const int8_t* data, const rknn_tensor_attr& attr) {
     QuantTensor tensor;
     tensor.data = data;
@@ -119,10 +135,13 @@ QuantTensor MakeTensor(const int8_t* data, const rknn_tensor_attr& attr) {
 
 /// RknnDetectionBackend 实现细节（PIMPL）：RKNN 上下文、RGA 缓冲与推理流程。
 struct RknnDetectionBackend::Impl {
-    explicit Impl(std::string model_path, float conf_threshold, float nms_threshold)
+    explicit Impl(std::string model_path, float conf_threshold, float nms_threshold,
+                  std::string npu_core_mode)
         : model_path(std::move(model_path)),
           conf_threshold(conf_threshold),
-          nms_threshold(nms_threshold) {
+          nms_threshold(nms_threshold),
+          npu_core_mode(std::move(npu_core_mode)),
+          npu_core_mask(ParseCoreMask(this->npu_core_mode)) {
         if (conf_threshold < 0.f || conf_threshold > 1.f ||
             nms_threshold < 0.f || nms_threshold > 1.f) {
             throw std::invalid_argument("RKNN 后端阈值必须在 [0,1]");
@@ -138,10 +157,13 @@ struct RknnDetectionBackend::Impl {
     float nms_threshold = 0.45f;
     bool loaded = false;
     std::atomic<uint64_t> error_count{0};
+    std::string npu_core_mode;
+    rknn_core_mask npu_core_mask = RKNN_NPU_CORE_ALL;
 
-    // RKNN 上下文（3 个 NPU 核）
-    rknn_context ctxs_[3] = {0, 0, 0};
-    bool ctx_created_[3] = {false, false, false};
+    // 当前逐帧同步推理只需要一个上下文；多核组合由该上下文的core mask决定。
+    static constexpr int kContextCount = 1;
+    rknn_context ctxs_[kContextCount] = {};
+    bool ctx_created_[kContextCount] = {};
 
     // 模型张量属性
     std::vector<rknn_tensor_attr> input_attrs_;
@@ -298,7 +320,7 @@ struct RknnDetectionBackend::Impl {
     /// 分配输入输出内存并绑定。
     // 每个 NPU 上下文各持有一套输入/输出内存，输出缓冲预先分配，避免逐帧申请释放。
     bool InitializeMems() {
-        const int ctx_count = 3;
+        const int ctx_count = kContextCount;
         input_mems_.assign(ctx_count, {});
         output_mems_.assign(ctx_count, {});
 
@@ -349,7 +371,7 @@ struct RknnDetectionBackend::Impl {
 
     /// 释放全部 RKNN 资源（幂等）。
     void ReleaseAll() noexcept {
-        const int ctx_count = 3;
+        const int ctx_count = kContextCount;
         for (int i = 0; i < ctx_count; ++i) {
             if (static_cast<std::size_t>(i) < input_mems_.size()) {
                 for (auto* mem : input_mems_[i]) {
@@ -513,7 +535,7 @@ struct RknnDetectionBackend::Impl {
         preprocess_total_latency.Add(
             static_cast<double>(MonotonicUs() - preprocess_start_us) / 1000.0);
 
-        // NPU 推理（3 核上下文，单帧由运行时调度）
+        // NPU同步推理；组合核心模式由当前单上下文的core mask控制。
         const std::int64_t npu_start_us = MonotonicUs();
         const int run_ret = rknn_run(ctxs_[0], nullptr);
         if (run_ret != RKNN_SUCC) {
@@ -608,13 +630,14 @@ struct RknnDetectionBackend::Impl {
 // 对外接口只管理 PIMPL 生命周期，RKNN 头文件和设备资源不泄漏到公共接口。
 RknnDetectionBackend::RknnDetectionBackend(std::string model_path,
                                            float conf_threshold,
-                                           float nms_threshold)
+                                           float nms_threshold,
+                                           std::string npu_core_mode)
     : impl_(std::make_unique<Impl>(std::move(model_path), conf_threshold,
-                                   nms_threshold)) {}
+                                   nms_threshold, std::move(npu_core_mode))) {}
 
 RknnDetectionBackend::~RknnDetectionBackend() = default;
 
-// 加载顺序：模型文件 → 主 RKNN 上下文 → 其余 NPU 上下文 → 张量属性 → 零拷贝内存。
+// 加载顺序：模型文件 → 单RKNN上下文/core mask → 张量属性 → 零拷贝内存。
 // 中间任一步失败都调用 ReleaseAll，保证部分初始化不会泄漏设备资源。
 bool RknnDetectionBackend::Load() {
     if (impl_->loaded) {
@@ -636,18 +659,13 @@ bool RknnDetectionBackend::Load() {
     }
     impl_->ctx_created_[0] = true;
 
-    // 复制上下文到 3 个 NPU 核心并全部启用
-    for (int i = 1; i < 3; ++i) {
-        ret = rknn_dup_context(&impl_->ctxs_[0], &impl_->ctxs_[i]);
-        if (ret < 0) {
-            SPDLOG_ERROR("RKNN 复制上下文失败: ctx={} ret={}", i, ret);
-            impl_->ReleaseAll();
-            return false;
-        }
-        impl_->ctx_created_[i] = true;
-        rknn_set_core_mask(impl_->ctxs_[i], RKNN_NPU_CORE_ALL);
+    ret = rknn_set_core_mask(impl_->ctxs_[0], impl_->npu_core_mask);
+    if (ret != RKNN_SUCC) {
+        SPDLOG_ERROR("RKNN设置NPU核心模式失败: mode={} ret={}",
+                     impl_->npu_core_mode, ret);
+        impl_->ReleaseAll();
+        return false;
     }
-    rknn_set_core_mask(impl_->ctxs_[0], RKNN_NPU_CORE_ALL);
 
     if (!impl_->QueryModelInfo()) {
         impl_->ReleaseAll();
@@ -659,8 +677,9 @@ bool RknnDetectionBackend::Load() {
     }
 
     impl_->loaded = true;
-    SPDLOG_INFO("RKNN 后端加载成功: 模型={} 输入={}x{} 输出模式={}",
+    SPDLOG_INFO("RKNN 后端加载成功: 模型={} 输入={}x{} NPU核心={} 上下文数=1 输出模式={}",
                 impl_->model_path, impl_->model_width_, impl_->model_height_,
+                impl_->npu_core_mode,
                 impl_->output_mode_ == Impl::OutputMode::kNormalizedXywh
                     ? "单输出归一化xywh"
                     : "多分支");

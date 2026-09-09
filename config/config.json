@@ -121,6 +121,8 @@
         "model_path": "models/yolo26n-drone-best.rknn",
         "conf_threshold": 0.60,
         "nms_threshold": 0.45,
+        "input_queue_capacity": 1,
+        "npu_core_mode": "all",
         "max_detection_frame_lag": 10,
         "class_names": [
             "drone"
