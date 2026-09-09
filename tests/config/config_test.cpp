@@ -83,6 +83,7 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
     EXPECT_EQ(config.yolo.npu_core_mode, "all");
     EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
+    EXPECT_FALSE(config.yolo.collect_npu_perf_detail);
     EXPECT_EQ(config.video_sender.encode.url,
               "rtsp://127.0.0.1:8554/drone_25_1");
 }

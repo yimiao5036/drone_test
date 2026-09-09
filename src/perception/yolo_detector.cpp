@@ -61,12 +61,13 @@ std::int64_t SteadyNowMs() {
 // 测试或其它平台应通过构造函数注入 IDetectionBackend。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     const std::string& model_path, float conf_threshold, float nms_threshold,
-    const std::string& npu_core_mode, bool collect_npu_internal_perf) {
+    const std::string& npu_core_mode, bool collect_npu_internal_perf,
+    bool collect_npu_perf_detail) {
 #ifdef DRONE_HAVE_RKNN
     if (!model_path.empty()) {
         return std::make_unique<RknnDetectionBackend>(
             model_path, conf_threshold, nms_threshold, npu_core_mode,
-            collect_npu_internal_perf);
+            collect_npu_internal_perf, collect_npu_perf_detail);
     }
 #else
     (void)model_path;
@@ -74,6 +75,7 @@ std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     (void)nms_threshold;
     (void)npu_core_mode;
     (void)collect_npu_internal_perf;
+    (void)collect_npu_perf_detail;
 #endif
     return nullptr;
 }
@@ -230,14 +232,16 @@ YoloDetector::YoloDetector(YoloDetectorConfig config,
                                                 config.conf_threshold,
                                                 config.nms_threshold,
                                                 config.npu_core_mode,
-                                                config.collect_npu_internal_perf);
+                                                config.collect_npu_internal_perf,
+                                                config.collect_npu_perf_detail);
     }
     impl_ = std::make_unique<Impl>(std::move(config), std::move(backend));
-    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 内部性能统计={} 后端={}",
+    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 内部性能统计={} 逐层性能报告={} 后端={}",
                 impl_->config.model_path.empty() ? "(注入后端)" : impl_->config.model_path,
                 impl_->config.conf_threshold, impl_->config.nms_threshold,
                 impl_->config.input_queue_capacity, impl_->config.npu_core_mode,
                 impl_->config.collect_npu_internal_perf,
+                impl_->config.collect_npu_perf_detail,
                 impl_->backend != nullptr ? "已配置" : "缺失(启动将失败)");
 }
 

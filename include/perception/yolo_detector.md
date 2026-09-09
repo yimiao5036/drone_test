@@ -42,7 +42,8 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   `conf_threshold`（默认 0.25）、`nms_threshold`（默认 0.45）、
   `input_queue_capacity`（解码帧订阅队列容量，默认2，生产为1）、
   `npu_core_mode`（`auto/core0/core01/core012/all`，生产当前`all`）、
-  `collect_npu_internal_perf`（仅诊断`RKNN_QUERY_PERF_RUN`，生产为`false`）。
+  `collect_npu_internal_perf`（仅诊断`RKNN_QUERY_PERF_RUN`，生产为`false`）、
+  `collect_npu_perf_detail`（仅诊断一次逐层报告，生产为`false`）。
 - `IDetectionBackend`：`Load() / Unload() / IsLoaded() / Detect(FrameHandle) →
   vector<BackendDetection>`（原图坐标系像素框）。工厂 `CreateDefaultDetectionBackend`
   在 `DRONE_HAVE_RKNN` 编译时返回 RKNN 后端，否则返回 nullptr。
@@ -138,7 +139,7 @@ YOLO队列容量2→1的120秒A/B中，容量1仅少处理约38/2945帧（约1.3
   张量不是 INT8 或形状不是 `[1,5,N]`，先核对部署模型是否与 `config.json` 指向文件一致。
 - **检测结果坐标错位**：先核对 letterbox 参数（`x_pad/y_pad/scale`）与后处理逆变换
   一致性；再核对裁剪偏移叠加；用单目标单色场景在香橙派打点验证。
-- **推理耗时异常**：先读取Y1～Y4确定瓶颈，不再仅凭`Detect()`总耗时推测。探针可用`--npu-core all/core012/core01/core0/auto`做同模型A/B；组合core mask仍是单次同步推理，不等于多上下文并发或把单核耗时除以核心数。使用`--rknn-perf-run`后同时输出Y2W墙钟、Y2N RKNN内部、Y2O差值和Y2Q查询开销；该总耗时查询不需要`RKNN_FLAG_COLLECT_PERF_MASK`，逐层PERF_DETAIL才需要且会降低帧率。
+- **推理耗时异常**：先读取Y1～Y4确定瓶颈，不再仅凭`Detect()`总耗时推测。探针可用`--npu-core all/core012/core01/core0/auto`做同模型A/B；组合core mask仍是单次同步推理，不等于多上下文并发或把单核耗时除以核心数。使用`--rknn-perf-run`后同时输出Y2W墙钟、Y2N RKNN内部、Y2O差值和Y2Q查询开销；该总耗时查询不需要`RKNN_FLAG_COLLECT_PERF_MASK`。`--rknn-perf-detail`会用该标志初始化，在第100次成功推理后打印一次逐层报告；官方明确说明会降低帧率，因此只用于独占短时诊断。
 - **RGA 接口差异**：香橙派当前 `im2d.hpp` 的 `wrapbuffer_virtualaddr` 六参数顺序为
   `地址, width, height, format, wstride, hstride`。若误写成把 format 放在最后，会出现
   `wstride=720, width=1280` 的 Invalid parameters。预处理内部 RGA 错误由外层按第 1 次和

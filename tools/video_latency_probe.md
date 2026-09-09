@@ -83,6 +83,15 @@ NPU core mask可做同模型A/B：
 
 启用后新增：Y2W=`rknn_run`墙钟、Y2N=`RKNN_QUERY_PERF_RUN`内部时间、Y2O=墙钟减内部、Y2Q=查询调用本身开销。该选项只用于探针；正式配置`yolo.collect_npu_internal_perf=false`。如果板端runtime不支持当前零拷贝模式下查询，程序只打印一次WARN并停止后续查询，不影响推理。
 
+采集一次逐层性能报告：
+
+```bash
+./build/video_latency_probe --duration 20 --interval 10 \
+    --yolo-queue 1 --npu-core all --rknn-perf-detail
+```
+
+该选项会使用`RKNN_FLAG_COLLECT_PERF_MASK`初始化，并在第100次成功推理后打印一次`RKNN_QUERY_PERF_DETAIL`原始报告。官方明确说明采集逐层性能会降低帧率，所以结果只用于定位耗时OP和核心分配，不能与正常吞吐基线直接比较；正式配置`yolo.collect_npu_perf_detail=false`。
+
 主表输出当前最多2048样本窗口的`avg/P50/P95/P99/max`；D1～D5及D4P使用最近最多256样本，约等于25 FPS下10秒窗口，便于定位短时解码长尾。输出中的`count`是启动后的累计有效样本数，`win`是本次百分位实际使用的窗口样本数。前10～20秒包含解码器、NPU和编码器预热，不应用于最终结论；建议至少运行120秒，以最后3～5次报告判断稳定延迟。
 
 ## 优化判断

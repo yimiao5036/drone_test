@@ -71,6 +71,7 @@ struct YoloDetectorConfig {
     std::size_t input_queue_capacity = 2; ///< 解码帧订阅队列容量（丢最旧）
     std::string npu_core_mode = "all";   ///< auto/core0/core01/core012/all
     bool collect_npu_internal_perf = false; ///< 仅诊断：查询RKNN内部推理时间
+    bool collect_npu_perf_detail = false;   ///< 仅诊断：采集一次RKNN逐层性能报告
 };
 
 /// YOLO 检测器（实现 IYoloDetector）。

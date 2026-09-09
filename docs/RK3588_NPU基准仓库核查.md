@@ -188,9 +188,10 @@ bool stop_test = false;
 
 ## 6. 后续验证顺序
 
-1. 现有探针已增加可选`--rknn-perf-run`，输出Y2W墙钟、Y2N NPU内部时间、Y2O差值和Y2Q查询开销；当前Core0约50%首先反映的是约24ms服务时间乘以约25 FPS输入形成的约60%占空比，而不是NPU最大吞吐只有25 FPS；
-2. 使用官方风格单context静态输入基准，分别测试core mask 1/2/4/7，warmup后至少1000次；
-3. 查询DDR当前governor、频率和支持频率，只做DDR单变量A/B；
-4. 获取本项目ONNX、RKNN转换脚本、校准集和转换日志，核查模型图；
-5. 若目标是降低正式链路队列帧龄，新增双context（Core0/Core1）探针，每个context独立线程和I/O内存，并按frame sequence丢弃乱序旧结果；
-6. 不在飞行生产配置中锁死CPU/GPU/DDR/NPU最高频率，除非完成温度、功耗和长时稳定性验收。
+1. `--rknn-perf-run`实测Y2W墙钟与Y2N RKNN内部时间在平均/P50/P95/P99上均只差约0.01ms，已证明23～26ms几乎全部是模型内部NPU执行，不是CPU调度、runtime阻塞或I/O设置等待；当前Core0约50%首先反映的是约24ms服务时间乘以约25 FPS输入形成的约60%占空比，而不是NPU最大吞吐只有25 FPS；
+2. 探针已增加`--rknn-perf-detail`，使用官方`RKNN_FLAG_COLLECT_PERF_MASK`并在第100次推理后打印一次逐层报告；用它定位最慢OP和fallback核心，报告模式不能与正常吞吐直接比较；
+3. 使用官方风格单context静态输入基准，分别测试core mask 1/2/4/7，warmup后至少1000次；
+4. 当前内核未暴露DMC devfreq节点，跳过基于该sysfs路径的DDR A/B；
+5. 获取本项目ONNX、RKNN转换脚本、校准集和转换日志，核查模型图；
+6. 若目标是降低正式链路队列帧龄，新增双context（Core0/Core1）探针，每个context独立线程和I/O内存，并按frame sequence丢弃乱序旧结果；
+7. 不在飞行生产配置中锁死CPU/GPU/DDR/NPU最高频率，除非完成温度、功耗和长时稳定性验收。

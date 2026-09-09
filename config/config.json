@@ -124,6 +124,7 @@
         "input_queue_capacity": 1,
         "npu_core_mode": "all",
         "collect_npu_internal_perf": false,
+        "collect_npu_perf_detail": false,
         "max_detection_frame_lag": 10,
         "class_names": [
             "drone"

@@ -136,13 +136,15 @@ QuantTensor MakeTensor(const int8_t* data, const rknn_tensor_attr& attr) {
 /// RknnDetectionBackend 实现细节（PIMPL）：RKNN 上下文、RGA 缓冲与推理流程。
 struct RknnDetectionBackend::Impl {
     explicit Impl(std::string model_path, float conf_threshold, float nms_threshold,
-                  std::string npu_core_mode, bool collect_npu_internal_perf)
+                  std::string npu_core_mode, bool collect_npu_internal_perf,
+                  bool collect_npu_perf_detail)
         : model_path(std::move(model_path)),
           conf_threshold(conf_threshold),
           nms_threshold(nms_threshold),
           npu_core_mode(std::move(npu_core_mode)),
           npu_core_mask(ParseCoreMask(this->npu_core_mode)),
-          collect_npu_internal_perf(collect_npu_internal_perf) {
+          collect_npu_internal_perf(collect_npu_internal_perf),
+          collect_npu_perf_detail(collect_npu_perf_detail) {
         if (conf_threshold < 0.f || conf_threshold > 1.f ||
             nms_threshold < 0.f || nms_threshold > 1.f) {
             throw std::invalid_argument("RKNN 后端阈值必须在 [0,1]");
@@ -161,7 +163,10 @@ struct RknnDetectionBackend::Impl {
     std::string npu_core_mode;
     rknn_core_mask npu_core_mask = RKNN_NPU_CORE_ALL;
     bool collect_npu_internal_perf = false;
+    bool collect_npu_perf_detail = false;
     bool npu_perf_query_available = true;
+    bool npu_perf_detail_reported = false;
+    std::uint64_t successful_run_count = 0;
 
     // 当前逐帧同步推理只需要一个上下文；多核组合由该上下文的core mask决定。
     static constexpr int kContextCount = 1;
@@ -219,6 +224,22 @@ struct RknnDetectionBackend::Impl {
         SPDLOG_INFO("RKNN SDK API={} 驱动={}", sdk_version.api_version,
                     sdk_version.drv_version);
 
+        rknn_mem_size mem_size{};
+        ret = rknn_query(ctxs_[0], RKNN_QUERY_MEM_SIZE, &mem_size,
+                         sizeof(mem_size));
+        if (ret == RKNN_SUCC) {
+            const std::uint32_t used_sram =
+                mem_size.total_sram_size >= mem_size.free_sram_size
+                    ? mem_size.total_sram_size - mem_size.free_sram_size
+                    : 0;
+            SPDLOG_INFO("RKNN内存: 权重={}B 中间张量={}B DMA={}B SRAM已用={}/{}B",
+                        mem_size.total_weight_size, mem_size.total_internal_size,
+                        mem_size.total_dma_allocated_size, used_sram,
+                        mem_size.total_sram_size);
+        } else {
+            SPDLOG_WARN("RKNN查询模型内存信息失败: ret={}", ret);
+        }
+
         ret = rknn_query(ctxs_[0], RKNN_QUERY_IN_OUT_NUM, &io_num_, sizeof(io_num_));
         if (ret < 0) {
             SPDLOG_ERROR("RKNN 查询输入输出数量失败: ret={}", ret);
@@ -244,6 +265,19 @@ struct RknnDetectionBackend::Impl {
                 SPDLOG_ERROR("RKNN 查询硬件最优输入属性失败: ret={}", ret);
                 return false;
             }
+        }
+
+        for (uint32_t i = 0; i < io_num_.n_input; ++i) {
+            SPDLOG_INFO("RKNN输入[{}]: 逻辑fmt/type={}/{} size={}；原生fmt/type={}/{} size/stride={} / {} w/h_stride={}/{} pass_through={}",
+                        i, static_cast<int>(input_attrs_[i].fmt),
+                        static_cast<int>(input_attrs_[i].type), input_attrs_[i].size,
+                        static_cast<int>(input_native_attrs_[i].fmt),
+                        static_cast<int>(input_native_attrs_[i].type),
+                        input_native_attrs_[i].size,
+                        input_native_attrs_[i].size_with_stride,
+                        input_native_attrs_[i].w_stride,
+                        input_native_attrs_[i].h_stride,
+                        input_native_attrs_[i].pass_through);
         }
 
         output_attrs_.resize(io_num_.n_output);
@@ -275,8 +309,13 @@ struct RknnDetectionBackend::Impl {
                 }
                 dims_str += std::to_string(output_attrs_[i].dims[d]);
             }
-            SPDLOG_INFO("RKNN 输出[{}]: 形状={} 布局={}", i, dims_str,
-                        static_cast<int>(output_attrs_[i].fmt));
+            SPDLOG_INFO("RKNN输出[{}]: 形状={} 逻辑fmt/type={}/{} 原生fmt/type={}/{} size/stride={} / {}",
+                        i, dims_str, static_cast<int>(output_attrs_[i].fmt),
+                        static_cast<int>(output_attrs_[i].type),
+                        static_cast<int>(output_native_attrs_[i].fmt),
+                        static_cast<int>(output_native_attrs_[i].type),
+                        output_native_attrs_[i].size,
+                        output_native_attrs_[i].size_with_stride);
         }
 
         // 解析模型输入尺寸（NCHW 或 NHWC）
@@ -557,6 +596,7 @@ struct RknnDetectionBackend::Impl {
 
         // 官方RKNNRT 2.3.2允许在rknn_run后查询模型内部执行时间。
         // 该查询仅由探针显式启用，正式程序默认关闭，避免热路径增加诊断调用。
+        ++successful_run_count;
         if (collect_npu_internal_perf && npu_perf_query_available) {
             rknn_perf_run perf_run{};
             const std::int64_t query_start_us = MonotonicUs();
@@ -574,6 +614,24 @@ struct RknnDetectionBackend::Impl {
                 npu_perf_query_available = false;
                 SPDLOG_WARN("RKNN内部性能查询不可用: ret={} duration_us={}，本次运行后不再查询",
                             query_ret, perf_run.run_duration);
+            }
+        }
+
+        if (collect_npu_perf_detail && !npu_perf_detail_reported &&
+            successful_run_count >= 100) {
+            npu_perf_detail_reported = true;
+            rknn_perf_detail perf_detail{};
+            const int detail_ret = rknn_query(ctxs_[0], RKNN_QUERY_PERF_DETAIL,
+                                              &perf_detail, sizeof(perf_detail));
+            if (detail_ret == RKNN_SUCC && perf_detail.perf_data != nullptr &&
+                perf_detail.data_len > 0) {
+                SPDLOG_INFO("RKNN逐层性能报告（第{}次推理后，单位见报告）:\n{}",
+                            successful_run_count,
+                            std::string(perf_detail.perf_data,
+                                        static_cast<std::size_t>(perf_detail.data_len)));
+            } else {
+                SPDLOG_WARN("RKNN逐层性能报告查询失败: ret={} data_len={}",
+                            detail_ret, perf_detail.data_len);
             }
         }
 
@@ -661,10 +719,12 @@ RknnDetectionBackend::RknnDetectionBackend(std::string model_path,
                                            float conf_threshold,
                                            float nms_threshold,
                                            std::string npu_core_mode,
-                                           bool collect_npu_internal_perf)
+                                           bool collect_npu_internal_perf,
+                                           bool collect_npu_perf_detail)
     : impl_(std::make_unique<Impl>(std::move(model_path), conf_threshold,
                                    nms_threshold, std::move(npu_core_mode),
-                                   collect_npu_internal_perf)) {}
+                                   collect_npu_internal_perf,
+                                   collect_npu_perf_detail)) {}
 
 RknnDetectionBackend::~RknnDetectionBackend() = default;
 
@@ -681,9 +741,14 @@ bool RknnDetectionBackend::Load() {
         return false;
     }
 
-    // 初始化 RKNN 上下文（SRAM 加速）
+    // 初始化RKNN上下文：生产使用SRAM；逐层报告仅由探针显式开启，
+    // 官方说明COLLECT_PERF会降低帧率，不得常驻正式链路。
+    std::uint32_t init_flags = RKNN_FLAG_ENABLE_SRAM;
+    if (impl_->collect_npu_perf_detail) {
+        init_flags |= RKNN_FLAG_COLLECT_PERF_MASK;
+    }
     int ret = rknn_init(&impl_->ctxs_[0], model_data.data(), model_data.size(),
-                        RKNN_FLAG_ENABLE_SRAM, nullptr);
+                        init_flags, nullptr);
     if (ret < 0) {
         SPDLOG_ERROR("RKNN 初始化失败: ret={}，模型={}", ret, impl_->model_path);
         return false;

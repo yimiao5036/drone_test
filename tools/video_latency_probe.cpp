@@ -42,6 +42,7 @@ struct Options {
     std::size_t yolo_queue_capacity = 0;  // 0=沿用配置
     std::string npu_core_mode;            // 空=沿用配置
     bool collect_npu_internal_perf = false;
+    bool collect_npu_perf_detail = false;
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -62,6 +63,8 @@ Options ParseOptions(int argc, char** argv) {
             options.yolo_queue_capacity = static_cast<std::size_t>(capacity);
         } else if (arg == "--rknn-perf-run") {
             options.collect_npu_internal_perf = true;
+        } else if (arg == "--rknn-perf-detail") {
+            options.collect_npu_perf_detail = true;
         } else if (arg == "--npu-core" && index + 1 < argc) {
             options.npu_core_mode = argv[++index];
             const auto& mode = options.npu_core_mode;
@@ -75,7 +78,7 @@ Options ParseOptions(int argc, char** argv) {
                 "用法: video_latency_probe [--config path] [--duration 秒] "
                 "[--interval 秒] [--yolo-queue 容量] "
                 "[--npu-core auto|core0|core01|core012|all] "
-                "[--rknn-perf-run]");
+                "[--rknn-perf-run] [--rknn-perf-detail]");
         }
     }
     if (options.duration_seconds <= 0 || options.interval_seconds <= 0) {
@@ -209,6 +212,9 @@ int main(int argc, char** argv) {
         if (options.collect_npu_internal_perf) {
             config.yolo.collect_npu_internal_perf = true;
         }
+        if (options.collect_npu_perf_detail) {
+            config.yolo.collect_npu_perf_detail = true;
+        }
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);
@@ -219,7 +225,9 @@ int main(int argc, char** argv) {
                   << config.yolo.input_queue_capacity
                   << " NPU核心模式=" << config.yolo.npu_core_mode
                   << " RKNN内部性能统计="
-                  << config.yolo.collect_npu_internal_perf << '\n';
+                  << config.yolo.collect_npu_internal_perf
+                  << " RKNN逐层性能报告="
+                  << config.yolo.collect_npu_perf_detail << '\n';
         drone::application::DroneApplication application(std::move(config));
         if (!application.Start()) {
             std::cerr << "视频延迟探针启动失败\n";

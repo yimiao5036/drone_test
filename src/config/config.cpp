@@ -435,6 +435,8 @@ AppConfig LoadAppConfig(const std::string& path,
     config.yolo.npu_core_mode = yolo.value("npu_core_mode", std::string("all"));
     config.yolo.collect_npu_internal_perf =
         yolo.value("collect_npu_internal_perf", false);
+    config.yolo.collect_npu_perf_detail =
+        yolo.value("collect_npu_perf_detail", false);
     if (config.yolo.npu_core_mode != "auto" &&
         config.yolo.npu_core_mode != "core0" &&
         config.yolo.npu_core_mode != "core01" &&
