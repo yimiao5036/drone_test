@@ -1,11 +1,13 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -62,6 +64,7 @@ Options ParseOptions(int argc, char** argv) {
 void PrintSummary(const char* name, const drone::common::LatencySummary& value) {
     std::cout << std::left << std::setw(26) << name
               << " count=" << std::setw(8) << value.total_count
+              << " win=" << std::setw(5) << value.window_count
               << " avg=" << std::fixed << std::setprecision(2) << std::setw(8)
               << value.average_ms << " p50=" << std::setw(8) << value.p50_ms
               << " p95=" << std::setw(8) << value.p95_ms
@@ -69,12 +72,55 @@ void PrintSummary(const char* name, const drone::common::LatencySummary& value) 
               << " max=" << std::setw(8) << value.maximum_ms << " ms\n";
 }
 
+const char* CodecName(drone::common::VideoCodec codec) {
+    switch (codec) {
+        case drone::common::VideoCodec::kH264:
+            return "H.264/AVC";
+        case drone::common::VideoCodec::kH265:
+            return "H.265/HEVC";
+        default:
+            return "未知";
+    }
+}
+
 void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
-                   int elapsed_seconds) {
+                   int elapsed_seconds,
+                   const drone::application::VideoPipelineLatencySnapshot& previous,
+                   int previous_elapsed_seconds) {
+    const int interval_seconds = elapsed_seconds - previous_elapsed_seconds;
+    const std::uint64_t interval_frames =
+        s.encoded_frame_count >= previous.encoded_frame_count
+            ? s.encoded_frame_count - previous.encoded_frame_count
+            : 0;
+    const std::uint64_t interval_bytes =
+        s.encoded_bytes >= previous.encoded_bytes
+            ? s.encoded_bytes - previous.encoded_bytes
+            : 0;
+    const std::uint64_t interval_key_frames =
+        s.key_frame_count >= previous.key_frame_count
+            ? s.key_frame_count - previous.key_frame_count
+            : 0;
+    const double interval_fps = interval_seconds > 0
+                                    ? static_cast<double>(interval_frames) /
+                                          static_cast<double>(interval_seconds)
+                                    : 0.0;
+    const double interval_mbps = interval_seconds > 0
+                                     ? static_cast<double>(interval_bytes) * 8.0 /
+                                           static_cast<double>(interval_seconds) / 1000000.0
+                                     : 0.0;
+    const std::string decode_name =
+        std::string("02 ") + CodecName(s.input_codec) + "解码+NV12转存";
+
     std::cout << "\n========== 机载视频延迟统计 elapsed=" << elapsed_seconds
-              << "s（滑动窗口最多2048样本）==========\n";
+              << "s（滑动窗口最多2048样本）==========\n"
+              << "输入编码=" << CodecName(s.input_codec)
+              << " 解码模式=" << (s.hardware_decoder ? "rkmpp硬解" : "软件解码")
+              << " 区间输入=" << std::fixed << std::setprecision(2) << interval_fps
+              << " FPS/" << interval_mbps << " Mbps"
+              << " 区间关键帧=" << interval_key_frames
+              << " 累计访问单元=" << s.encoded_frame_count << '\n';
     PrintSummary("01 解码输入队列", s.decode_queue);
-    PrintSummary("02 H265硬解+NV12转存", s.decode);
+    PrintSummary(decode_name.c_str(), s.decode);
     PrintSummary("03 入口→解码输出", s.ingress_to_decoded);
     PrintSummary("04 YOLO输入队列", s.yolo_queue);
     PrintSummary("05 YOLO/RKNN推理", s.yolo_inference);
@@ -87,7 +133,15 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
     PrintSummary("12 H264编码+RTSP推送调用", s.encode_and_push);
     PrintSummary("13 RTSP单包写入", s.packet_write);
     PrintSummary("14 入口→本地RTSP发布完成", s.ingress_to_rtsp);
-    std::cout << "说明：不包含摄像头曝光/编码/网络到机载入口，也不包含HM30传输、Web转码和浏览器显示。\n";
+
+    std::cout << "--- 解码细分（最近最多256样本，约10秒）---\n";
+    PrintSummary("D1 AVPacket分配+码流复制", s.packet_prepare);
+    PrintSummary("D2 avcodec_send_packet", s.send_packet);
+    PrintSummary("D3 avcodec_receive_frame", s.receive_frame);
+    PrintSummary("D4 DRM硬件帧转存", s.hardware_transfer);
+    PrintSummary("D5 NV12内存池复制", s.frame_copy);
+    std::cout << "说明：D4计数为0表示当前输出不经过av_hwframe_transfer_data；"
+                 "不包含摄像头曝光/编码/网络到机载入口，也不包含HM30传输、Web转码和浏览器显示。\n";
 }
 
 }  // namespace
@@ -118,20 +172,26 @@ int main(int argc, char** argv) {
 
         const auto start = std::chrono::steady_clock::now();
         auto next_report = start + std::chrono::seconds(options.interval_seconds);
+        auto previous_snapshot = application.VideoLatencySnapshot();
+        int previous_elapsed = 0;
         while (!g_stop.load(std::memory_order_acquire)) {
             const auto now = std::chrono::steady_clock::now();
             const int elapsed = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::seconds>(now - start).count());
             if (elapsed >= options.duration_seconds) break;
             if (now >= next_report) {
-                PrintSnapshot(application.VideoLatencySnapshot(), elapsed);
+                auto snapshot = application.VideoLatencySnapshot();
+                PrintSnapshot(snapshot, elapsed, previous_snapshot, previous_elapsed);
+                previous_snapshot = std::move(snapshot);
+                previous_elapsed = elapsed;
                 next_report = now + std::chrono::seconds(options.interval_seconds);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         const int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start).count());
-        PrintSnapshot(application.VideoLatencySnapshot(), elapsed);
+        PrintSnapshot(application.VideoLatencySnapshot(), elapsed,
+                      previous_snapshot, previous_elapsed);
         application.Stop();
         return 0;
     } catch (const std::exception& error) {

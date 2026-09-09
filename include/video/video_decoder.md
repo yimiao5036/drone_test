@@ -56,15 +56,16 @@ class VideoDecoder final : public IVideoDecoder {
   解码线程）。修复：**NV12 帧不走 sws**，直接按 `frame->linesize` 源 stride 逐行 `memcpy`
   Y/UV 平面到内存池；仅软解 YUV420P 才用 `sws_scale` 转 NV12。硬解识别条件兼看
   `hw_frames_ctx`。
-- **本相机实测**：H.265/HEVC Main、1280x720、25fps、LIVE555 RTSP；`ffprobe` 确认；
-  rkmpp 硬解经实验确认可正常出帧。
+- **当前链路**：本轮上板输入由维护者确认为H.264/AVC、1280x720、25fps；探针不再硬编码格式名称，而是根据`EncodedFrame.codec`显示实际编码。解码器仍同时保留H.264和H.265的rkmpp适配。
 - **内存池**：配置给分辨率则 `Start()` 预建池；否则首帧确定尺寸懒建池。
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
 - **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
 
 ### 延迟统计
 
-解码器记录三项固定窗口统计：`InputQueueLatency()`（码流进入进程到解码线程开始）、`DecodeLatency()`（H265解码+硬件帧转存+NV12拷贝）、`IngressToDecodedLatency()`（入口到NV12发布）。统计仅在探针读取快照时排序，逐帧不打日志。
+解码器记录三项2048样本固定窗口统计：`InputQueueLatency()`（码流进入进程到解码线程开始）、`DecodeLatency()`（当前H.264/H.265解码+硬件帧转存+NV12拷贝）、`IngressToDecodedLatency()`（入口到NV12发布）。
+
+为定位上板运行约90秒后出现的解码长尾，另增加最近256样本的五项细分：`PacketPrepareLatency()`、`SendPacketLatency()`、`ReceiveFrameLatency()`、`HardwareTransferLatency()`、`FrameCopyLatency()`。同时提供`ActiveCodec()`、`IsHardwareDecoder()`以及编码访问单元/字节/关键帧累计值，探针据此显示实际格式、解码模式、区间FPS/码率和关键帧数。统计只在探针读取快照时复制排序，逐帧不打日志。
 
 ## 4. 日志行为
 
@@ -95,5 +96,5 @@ cmake --build build && cd build && ctest -R VideoDecoder
 | 解码 0 帧但无错误 | 输入队列容量(8) < 突发帧数挤掉关键帧后无后续关键帧（GOP 过长）；调整队列容量或等关键帧机制确认 |
 | `DroppedFrameCount` 增长 | 池容量 < 输出订阅队列 + 在途；调大 `pool_capacity` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |
-| 帧率不足 | 软解慢属预期（开发机）；香橙派确认走 `hevc_rkmpp`；`sws` 在格式不变时不会重建 |
+| 帧率不足 | 软解慢属预期（开发机）；香橙派按实际流确认走`h264_rkmpp`或`hevc_rkmpp`；`sws`在格式不变时不会重建 |
 | 修改输出格式 | 当前固定 NV12；如需 RGB888 改 `sws` 目标格式与 `PixelFormat` |

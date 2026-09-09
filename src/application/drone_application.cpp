@@ -379,9 +379,19 @@ bool DroneApplication::IsRunning() const {
 VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
     VideoPipelineLatencySnapshot snapshot;
     if (decoder_ != nullptr) {
+        snapshot.input_codec = decoder_->ActiveCodec();
+        snapshot.hardware_decoder = decoder_->IsHardwareDecoder();
+        snapshot.encoded_frame_count = decoder_->EncodedFrameCount();
+        snapshot.encoded_bytes = decoder_->EncodedBytes();
+        snapshot.key_frame_count = decoder_->KeyFrameCount();
         snapshot.decode_queue = decoder_->InputQueueLatency();
         snapshot.decode = decoder_->DecodeLatency();
         snapshot.ingress_to_decoded = decoder_->IngressToDecodedLatency();
+        snapshot.packet_prepare = decoder_->PacketPrepareLatency();
+        snapshot.send_packet = decoder_->SendPacketLatency();
+        snapshot.receive_frame = decoder_->ReceiveFrameLatency();
+        snapshot.hardware_transfer = decoder_->HardwareTransferLatency();
+        snapshot.frame_copy = decoder_->FrameCopyLatency();
     }
     if (detector_ != nullptr) {
         snapshot.yolo_queue = detector_->InputQueueLatency();

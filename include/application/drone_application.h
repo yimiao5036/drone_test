@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <thread>
 
@@ -32,9 +33,20 @@ class VideoSender;
 namespace drone::application {
 
 struct VideoPipelineLatencySnapshot {
+    common::VideoCodec input_codec = common::VideoCodec::kUnknown;
+    bool hardware_decoder = false;
+    std::uint64_t encoded_frame_count = 0;
+    std::uint64_t encoded_bytes = 0;
+    std::uint64_t key_frame_count = 0;
     common::LatencySummary decode_queue;
     common::LatencySummary decode;
     common::LatencySummary ingress_to_decoded;
+    // 最近最多256帧的解码细分，专用于定位rkmpp长尾。
+    common::LatencySummary packet_prepare;
+    common::LatencySummary send_packet;
+    common::LatencySummary receive_frame;
+    common::LatencySummary hardware_transfer;
+    common::LatencySummary frame_copy;
     common::LatencySummary yolo_queue;
     common::LatencySummary yolo_inference;
     common::LatencySummary ingress_to_inference;

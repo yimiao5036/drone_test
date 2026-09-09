@@ -113,9 +113,20 @@ struct VideoDecoder::Impl {
     std::atomic<uint64_t> decoded_count{0};
     std::atomic<uint64_t> dropped_count{0};
     std::atomic<uint64_t> error_count{0};
+    std::atomic<uint64_t> encoded_frame_count{0};
+    std::atomic<uint64_t> encoded_bytes{0};
+    std::atomic<uint64_t> key_frame_count{0};
+    std::atomic<common::VideoCodec> active_codec{common::VideoCodec::kUnknown};
+    std::atomic<bool> hardware_decoder_active{false};
     common::LatencyStatistics input_queue_latency;
     common::LatencyStatistics decode_latency;
     common::LatencyStatistics ingress_to_decoded_latency;
+    // 细分统计使用约10秒的256样本窗口，便于观察长时间运行后的突发变化。
+    common::LatencyStatistics packet_prepare_latency{256};
+    common::LatencyStatistics send_packet_latency{256};
+    common::LatencyStatistics receive_frame_latency{256};
+    common::LatencyStatistics hardware_transfer_latency{256};
+    common::LatencyStatistics frame_copy_latency{256};
 
     /// 创建帧内存池（按解码分辨率）。
     /// @throw std::invalid_argument / std::bad_alloc 池参数非法或内存不足
@@ -160,6 +171,8 @@ struct VideoDecoder::Impl {
             if (hw_decoder != nullptr) {
                 hardware_attempted = true;
                 if (TryCreateCodec(hw_decoder, true, parameter_sets)) {
+                    active_codec.store(codec);
+                    hardware_decoder_active.store(true);
                     return true;
                 }
             }
@@ -175,6 +188,8 @@ struct VideoDecoder::Impl {
         if (!TryCreateCodec(sw_decoder, false, parameter_sets)) {
             return false;
         }
+        active_codec.store(codec);
+        hardware_decoder_active.store(false);
         if (hardware_attempted) {
             SPDLOG_WARN("视频解码器回退软解（rkmpp 不可用）: {}", sw_decoder->name);
         } else {
@@ -331,6 +346,11 @@ struct VideoDecoder::Impl {
     // packet 使用独立 FFmpeg 缓冲，处理完后由下一次 av_packet_unref 回收复用。
     void DecodeOne(const common::EncodedFrame& encoded, AVPacket* packet) {
         const std::int64_t decode_start_us = MonotonicUs();
+        encoded_frame_count.fetch_add(1);
+        encoded_bytes.fetch_add(static_cast<uint64_t>(encoded.data.size()));
+        if (encoded.is_key_frame) {
+            key_frame_count.fetch_add(1);
+        }
         const std::int64_t ingress_ms =
             static_cast<std::int64_t>(encoded.header.receive_time_ms);
         if (ingress_ms > 0) {
@@ -360,6 +380,7 @@ struct VideoDecoder::Impl {
 
         // 拷贝码流数据到 packet（packet 拥有缓冲，unref 语义安全；
         // 骨架期接受拷贝开销，实测不足时再优化为零拷贝引用）
+        const std::int64_t packet_prepare_start_us = MonotonicUs();
         av_packet_unref(packet);
         const int alloc_ret =
             av_new_packet(packet, static_cast<int>(encoded.data.size()));
@@ -372,8 +393,13 @@ struct VideoDecoder::Impl {
             return;
         }
         std::memcpy(packet->data, encoded.data.data(), encoded.data.size());
+        packet_prepare_latency.Add(
+            static_cast<double>(MonotonicUs() - packet_prepare_start_us) / 1000.0);
 
+        const std::int64_t send_start_us = MonotonicUs();
         const int send_ret = avcodec_send_packet(codec_ctx, packet);
+        send_packet_latency.Add(
+            static_cast<double>(MonotonicUs() - send_start_us) / 1000.0);
         if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
             ++error_count;
             if (ShouldLogThrottled(error_count)) {
@@ -386,7 +412,9 @@ struct VideoDecoder::Impl {
         // 取出全部可用输出帧
         for (;;) {
             av_frame_unref(decoded_frame);
+            const std::int64_t receive_start_us = MonotonicUs();
             const int recv_ret = avcodec_receive_frame(codec_ctx, decoded_frame);
+            const std::int64_t receive_elapsed_us = MonotonicUs() - receive_start_us;
             if (recv_ret == AVERROR(EAGAIN) || recv_ret == AVERROR_EOF) {
                 break;
             }
@@ -398,6 +426,8 @@ struct VideoDecoder::Impl {
                 }
                 break;
             }
+            receive_frame_latency.Add(
+                static_cast<double>(receive_elapsed_us) / 1000.0);
             PublishFrame(decoded_frame, ingress_ms, decode_start_us);
         }
     }
@@ -411,6 +441,7 @@ struct VideoDecoder::Impl {
         if (source->format == AV_PIX_FMT_DRM_PRIME ||
             source->hw_frames_ctx != nullptr) {
             av_frame_unref(sw_frame);
+            const std::int64_t transfer_start_us = MonotonicUs();
             if (av_hwframe_transfer_data(sw_frame, source, 0) < 0) {
                 ++error_count;
                 if (ShouldLogThrottled(error_count)) {
@@ -418,6 +449,8 @@ struct VideoDecoder::Impl {
                 }
                 return;
             }
+            hardware_transfer_latency.Add(
+                static_cast<double>(MonotonicUs() - transfer_start_us) / 1000.0);
             frame = sw_frame;
         }
 
@@ -441,6 +474,7 @@ struct VideoDecoder::Impl {
             }
         }
 
+        const std::int64_t frame_copy_start_us = MonotonicUs();
         auto handle = pool->Acquire(ingress_ms);
         if (!handle.Valid()) {
             ++dropped_count;
@@ -518,6 +552,8 @@ struct VideoDecoder::Impl {
         }
 
         const std::int64_t completed_us = MonotonicUs();
+        frame_copy_latency.Add(
+            static_cast<double>(completed_us - frame_copy_start_us) / 1000.0);
         const std::int64_t completed_ms = completed_us / 1000;
         handle.SetTiming(completed_ms, ingress_ms);
         decode_latency.Add(static_cast<double>(completed_us - decode_start_us) / 1000.0);
@@ -616,6 +652,46 @@ common::LatencySummary VideoDecoder::DecodeLatency() const {
 
 common::LatencySummary VideoDecoder::IngressToDecodedLatency() const {
     return impl_->ingress_to_decoded_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::PacketPrepareLatency() const {
+    return impl_->packet_prepare_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::SendPacketLatency() const {
+    return impl_->send_packet_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::ReceiveFrameLatency() const {
+    return impl_->receive_frame_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::HardwareTransferLatency() const {
+    return impl_->hardware_transfer_latency.Snapshot();
+}
+
+common::LatencySummary VideoDecoder::FrameCopyLatency() const {
+    return impl_->frame_copy_latency.Snapshot();
+}
+
+common::VideoCodec VideoDecoder::ActiveCodec() const {
+    return impl_->active_codec.load();
+}
+
+bool VideoDecoder::IsHardwareDecoder() const {
+    return impl_->hardware_decoder_active.load();
+}
+
+uint64_t VideoDecoder::EncodedFrameCount() const {
+    return impl_->encoded_frame_count.load();
+}
+
+uint64_t VideoDecoder::EncodedBytes() const {
+    return impl_->encoded_bytes.load();
+}
+
+uint64_t VideoDecoder::KeyFrameCount() const {
+    return impl_->key_frame_count.load();
 }
 
 }  // namespace drone::video
