@@ -38,6 +38,7 @@ struct VideoPipelineLatencySnapshot {
     std::uint64_t encoded_frame_count = 0;
     std::uint64_t encoded_bytes = 0;
     std::uint64_t key_frame_count = 0;
+    std::uint64_t hardware_transfer_buffer_build_count = 0;
     common::LatencySummary decode_queue;
     common::LatencySummary decode;
     common::LatencySummary ingress_to_decoded;

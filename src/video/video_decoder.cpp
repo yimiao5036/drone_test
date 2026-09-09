@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -44,6 +45,17 @@ namespace {
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
+}
+
+const char* CodecName(common::VideoCodec codec) {
+    switch (codec) {
+        case common::VideoCodec::kH264:
+            return "H.264";
+        case common::VideoCodec::kH265:
+            return "H.265";
+        default:
+            return "未知";
+    }
 }
 
 /// 将 FFmpeg 错误码转换为可读字符串。
@@ -81,6 +93,10 @@ struct VideoDecoder::Impl {
         if (this->config.stride_alignment == 0) {
             throw std::invalid_argument("水平 stride 对齐必须大于 0");
         }
+        if (!std::isfinite(this->config.slow_frame_threshold_ms) ||
+            this->config.slow_frame_threshold_ms < 0.0) {
+            throw std::invalid_argument("慢解码诊断阈值必须是非负有限值");
+        }
     }
 
     ~Impl() {
@@ -116,6 +132,8 @@ struct VideoDecoder::Impl {
     std::atomic<uint64_t> encoded_frame_count{0};
     std::atomic<uint64_t> encoded_bytes{0};
     std::atomic<uint64_t> key_frame_count{0};
+    std::atomic<uint64_t> slow_decode_count{0};
+    std::atomic<uint64_t> hardware_transfer_buffer_build_count{0};
     std::atomic<common::VideoCodec> active_codec{common::VideoCodec::kUnknown};
     std::atomic<bool> hardware_decoder_active{false};
     common::LatencyStatistics input_queue_latency;
@@ -393,13 +411,15 @@ struct VideoDecoder::Impl {
             return;
         }
         std::memcpy(packet->data, encoded.data.data(), encoded.data.size());
-        packet_prepare_latency.Add(
-            static_cast<double>(MonotonicUs() - packet_prepare_start_us) / 1000.0);
+        const double packet_prepare_ms =
+            static_cast<double>(MonotonicUs() - packet_prepare_start_us) / 1000.0;
+        packet_prepare_latency.Add(packet_prepare_ms);
 
         const std::int64_t send_start_us = MonotonicUs();
         const int send_ret = avcodec_send_packet(codec_ctx, packet);
-        send_packet_latency.Add(
-            static_cast<double>(MonotonicUs() - send_start_us) / 1000.0);
+        const double send_packet_ms =
+            static_cast<double>(MonotonicUs() - send_start_us) / 1000.0;
+        send_packet_latency.Add(send_packet_ms);
         if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
             ++error_count;
             if (ShouldLogThrottled(error_count)) {
@@ -426,31 +446,70 @@ struct VideoDecoder::Impl {
                 }
                 break;
             }
-            receive_frame_latency.Add(
-                static_cast<double>(receive_elapsed_us) / 1000.0);
-            PublishFrame(decoded_frame, ingress_ms, decode_start_us);
+            const double receive_frame_ms =
+                static_cast<double>(receive_elapsed_us) / 1000.0;
+            receive_frame_latency.Add(receive_frame_ms);
+            PublishFrame(decoded_frame, encoded, ingress_ms, decode_start_us,
+                         packet_prepare_ms, send_packet_ms, receive_frame_ms);
         }
     }
 
     /// 将解码帧转为 NV12 写入内存池并发布。
     // 硬件帧先 transfer 到系统内存；NV12 直接按 stride 拷贝，YUV420P 才走 sws 转换。
-    void PublishFrame(AVFrame* source, std::int64_t ingress_ms,
-                      std::int64_t decode_start_us) {
+    void PublishFrame(AVFrame* source, const common::EncodedFrame& encoded,
+                      std::int64_t ingress_ms, std::int64_t decode_start_us,
+                      double packet_prepare_ms, double send_packet_ms,
+                      double receive_frame_ms) {
         // 硬解帧（DRM_PRIME 或带 hw_frames_ctx）：先从 DRM 显存转存到系统内存（NV12）
         AVFrame* frame = source;
+        double hardware_transfer_ms = 0.0;
         if (source->format == AV_PIX_FMT_DRM_PRIME ||
             source->hw_frames_ctx != nullptr) {
-            av_frame_unref(sw_frame);
+            // av_hwframe_transfer_data允许复用已分配的目标帧。旧实现每帧unref，
+            // 会使FFmpeg每帧重新av_frame_get_buffer；实机已定位到D4偶发从约
+            // 1.8ms升至10~15ms，因此保留首帧自动分配的NV12缓冲并重复写入。
+            bool needs_build = sw_frame->buf[0] == nullptr;
+            if (!needs_build &&
+                (sw_frame->width != source->width ||
+                 sw_frame->height != source->height)) {
+                av_frame_unref(sw_frame);
+                needs_build = true;
+            }
+            if (!needs_build) {
+                const int writable_ret = av_frame_make_writable(sw_frame);
+                if (writable_ret < 0) {
+                    ++error_count;
+                    if (ShouldLogThrottled(error_count)) {
+                        SPDLOG_ERROR("视频解码器硬件转存目标帧不可写: {}，累计 {}",
+                                     AvErrorToString(writable_ret), error_count.load());
+                    }
+                    return;
+                }
+            }
+
             const std::int64_t transfer_start_us = MonotonicUs();
-            if (av_hwframe_transfer_data(sw_frame, source, 0) < 0) {
+            int transfer_ret = av_hwframe_transfer_data(sw_frame, source, 0);
+            // 像素格式或硬件上下文变化时，复用缓冲可能不再兼容；清空后允许
+            // FFmpeg按新硬件帧参数重建一次，避免整条视频链路中断。
+            if (transfer_ret < 0 && !needs_build) {
+                av_frame_unref(sw_frame);
+                needs_build = true;
+                transfer_ret = av_hwframe_transfer_data(sw_frame, source, 0);
+            }
+            if (transfer_ret < 0) {
                 ++error_count;
                 if (ShouldLogThrottled(error_count)) {
-                    SPDLOG_ERROR("视频解码器硬件帧转存失败，累计 {}", error_count.load());
+                    SPDLOG_ERROR("视频解码器硬件帧转存失败: {}，累计 {}",
+                                 AvErrorToString(transfer_ret), error_count.load());
                 }
                 return;
             }
-            hardware_transfer_latency.Add(
-                static_cast<double>(MonotonicUs() - transfer_start_us) / 1000.0);
+            if (needs_build) {
+                hardware_transfer_buffer_build_count.fetch_add(1);
+            }
+            hardware_transfer_ms =
+                static_cast<double>(MonotonicUs() - transfer_start_us) / 1000.0;
+            hardware_transfer_latency.Add(hardware_transfer_ms);
             frame = sw_frame;
         }
 
@@ -552,11 +611,32 @@ struct VideoDecoder::Impl {
         }
 
         const std::int64_t completed_us = MonotonicUs();
-        frame_copy_latency.Add(
-            static_cast<double>(completed_us - frame_copy_start_us) / 1000.0);
+        const double frame_copy_ms =
+            static_cast<double>(completed_us - frame_copy_start_us) / 1000.0;
+        frame_copy_latency.Add(frame_copy_ms);
         const std::int64_t completed_ms = completed_us / 1000;
         handle.SetTiming(completed_ms, ingress_ms);
-        decode_latency.Add(static_cast<double>(completed_us - decode_start_us) / 1000.0);
+        const double total_decode_ms =
+            static_cast<double>(completed_us - decode_start_us) / 1000.0;
+        decode_latency.Add(total_decode_ms);
+        if (config.slow_frame_threshold_ms > 0.0 && decoded_count.load() >= 100 &&
+            total_decode_ms >= config.slow_frame_threshold_ms) {
+            const uint64_t count = slow_decode_count.fetch_add(1) + 1;
+            if (ShouldLogThrottled(count)) {
+                const double measured_ms = packet_prepare_ms + send_packet_ms +
+                                           receive_frame_ms + hardware_transfer_ms +
+                                           frame_copy_ms;
+                const double other_ms = std::max(0.0, total_decode_ms - measured_ms);
+                SPDLOG_WARN(
+                    "视频解码慢帧: codec={} 触发包序号={} 字节={} 关键帧={} "
+                    "总耗时={:.3f}ms D1={:.3f} D2={:.3f} D3={:.3f} D4={:.3f} "
+                    "D5={:.3f} 其余={:.3f} 累计={}",
+                    CodecName(encoded.codec), encoded.header.sequence,
+                    encoded.data.size(), encoded.is_key_frame, total_decode_ms,
+                    packet_prepare_ms, send_packet_ms, receive_frame_ms,
+                    hardware_transfer_ms, frame_copy_ms, other_ms, count);
+            }
+        }
         if (ingress_ms > 0) {
             ingress_to_decoded_latency.Add(
                 static_cast<double>(completed_ms - ingress_ms));
@@ -692,6 +772,10 @@ uint64_t VideoDecoder::EncodedBytes() const {
 
 uint64_t VideoDecoder::KeyFrameCount() const {
     return impl_->key_frame_count.load();
+}
+
+uint64_t VideoDecoder::HardwareTransferBufferBuildCount() const {
+    return impl_->hardware_transfer_buffer_build_count.load();
 }
 
 }  // namespace drone::video

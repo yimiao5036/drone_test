@@ -118,7 +118,8 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
               << " 区间输入=" << std::fixed << std::setprecision(2) << interval_fps
               << " FPS/" << interval_mbps << " Mbps"
               << " 区间关键帧=" << interval_key_frames
-              << " 累计访问单元=" << s.encoded_frame_count << '\n';
+              << " 累计访问单元=" << s.encoded_frame_count
+              << " DRM转存缓冲构建=" << s.hardware_transfer_buffer_build_count << '\n';
     PrintSummary("01 解码输入队列", s.decode_queue);
     PrintSummary(decode_name.c_str(), s.decode);
     PrintSummary("03 入口→解码输出", s.ingress_to_decoded);
@@ -138,7 +139,7 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
     PrintSummary("D1 AVPacket分配+码流复制", s.packet_prepare);
     PrintSummary("D2 avcodec_send_packet", s.send_packet);
     PrintSummary("D3 avcodec_receive_frame", s.receive_frame);
-    PrintSummary("D4 DRM硬件帧转存", s.hardware_transfer);
+    PrintSummary("D4 DRM硬件帧转存(缓冲复用)", s.hardware_transfer);
     PrintSummary("D5 NV12内存池复制", s.frame_copy);
     std::cout << "说明：D4计数为0表示当前输出不经过av_hwframe_transfer_data；"
                  "不包含摄像头曝光/编码/网络到机载入口，也不包含HM30传输、Web转码和浏览器显示。\n";
@@ -158,6 +159,8 @@ int main(int argc, char** argv) {
         config.runtime.enable_px4 = false;
         config.runtime.enable_ground_station = false;
         config.runtime.enable_control = false;
+        // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
+        config.decoder.slow_frame_threshold_ms = 10.0;
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);
@@ -192,6 +195,7 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now() - start).count());
         PrintSnapshot(application.VideoLatencySnapshot(), elapsed,
                       previous_snapshot, previous_elapsed);
+        std::cout.flush();  // 保证最终统计先于MPP停止阶段stderr告警显示
         application.Stop();
         return 0;
     } catch (const std::exception& error) {

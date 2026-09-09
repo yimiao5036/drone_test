@@ -384,6 +384,8 @@ VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
         snapshot.encoded_frame_count = decoder_->EncodedFrameCount();
         snapshot.encoded_bytes = decoder_->EncodedBytes();
         snapshot.key_frame_count = decoder_->KeyFrameCount();
+        snapshot.hardware_transfer_buffer_build_count =
+            decoder_->HardwareTransferBufferBuildCount();
         snapshot.decode_queue = decoder_->InputQueueLatency();
         snapshot.decode = decoder_->DecodeLatency();
         snapshot.ingress_to_decoded = decoder_->IngressToDecodedLatency();

@@ -34,6 +34,7 @@ struct VideoDecoderConfig {
     std::uint32_t height = 0;               ///< 预知分辨率高；0=首帧确定（懒建池）
     std::uint32_t stride_alignment = 64;    ///< 水平 stride 像素对齐（MPP/RGA 友好）
     bool prefer_hardware = true;            ///< 优先 rkmpp 硬解码（香橙派）；否则软解
+    double slow_frame_threshold_ms = 0.0;   ///< 慢解码诊断阈值；0=关闭逐事件节流日志
 };
 
 /// 视频解码部件抽象接口。
@@ -80,6 +81,8 @@ public:
     virtual uint64_t EncodedFrameCount() const = 0;
     virtual uint64_t EncodedBytes() const = 0;
     virtual uint64_t KeyFrameCount() const = 0;
+    /// DRM硬件帧转存目标缓冲累计构建次数；稳定分辨率下通常为1。
+    virtual uint64_t HardwareTransferBufferBuildCount() const = 0;
 };
 
 /// 视频解码器（实现 IVideoDecoder）。
@@ -124,6 +127,7 @@ public:
     uint64_t EncodedFrameCount() const override;
     uint64_t EncodedBytes() const override;
     uint64_t KeyFrameCount() const override;
+    uint64_t HardwareTransferBufferBuildCount() const override;
 
 private:
     struct Impl;
@@ -163,6 +167,7 @@ public:
     uint64_t EncodedFrameCount() const override { return 0; }
     uint64_t EncodedBytes() const override { return 0; }
     uint64_t KeyFrameCount() const override { return 0; }
+    uint64_t HardwareTransferBufferBuildCount() const override { return 0; }
 
 private:
     bool running_ = false;
