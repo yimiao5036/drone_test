@@ -28,6 +28,7 @@ struct VideoFrameInfo {
     std::uint64_t sequence;            // 递增帧序号
     std::int64_t timestamp_ms;         // 单调时钟时间戳（超龄过滤依据）
     std::int64_t source_timestamp_ms;  // 源端时间戳（可选，如 RTP）
+    std::int64_t pipeline_ingress_time_ms; // 编码访问单元进入机载进程时间
 };
 
 // 归还接口（内存池实现），FrameBuffer 析构时调用
@@ -43,6 +44,7 @@ class FrameHandle {
     std::byte* Data();                     // 像素缓冲（可写）
     const std::byte* Data() const;         // 像素缓冲（只读）
     std::size_t Capacity() const;
+    void SetTiming(std::int64_t stage_time_ms, std::int64_t ingress_time_ms); // 仅发布前
     void Reset() noexcept;                 // 立即归还（幂等）
 };
 ```
@@ -55,7 +57,8 @@ class FrameHandle {
 - **发布即移动**：`Emplace(std::move(handle))` 后源句柄变空。
 - **stride 单位约定**（对齐 MPP/RGA）：`hor_stride` 为像素、`ver_stride` 为行；
   `LineSizeBytes() = hor_stride × BytesPerPixel(format)`。
-- 时间戳统一单调时钟毫秒，用于帧率统计与超龄过滤；源端时间戳（RTP）单独存放，不参与超龄判断。
+- `timestamp_ms`表示当前阶段产出时间，`pipeline_ingress_time_ms`沿解码→叠加→编码传递，用于机载端总延迟；源端时间戳（RTP）单独存放，不参与端内延迟。
+- `SetTiming()`只能由生产者在Topic发布前调用；发布后的`const FrameHandle`不能修改元数据。
 
 ## 4. 日志行为
 
@@ -63,14 +66,14 @@ class FrameHandle {
 
 ## 5. 测试方式
 
-`tests/video/video_frame_test.cpp`（7 个用例）：
+`tests/video/video_frame_test.cpp`：
 
 ```bash
 cmake --build build && cd build && ctest -R VideoFrameTest
 ```
 
 覆盖：BytesPerPixel、LineSizeBytes、空句柄安全读、Info/Data 暴露、可移动不可拷贝、
-最后引用释放自动归还、Reset 幂等、无 recycler 时跳过归还。
+最后引用释放自动归还、Reset幂等、无recycler时跳过归还，以及端内时间戳发布前设置。
 
 ## 6. 排查/修改要点
 
@@ -79,4 +82,4 @@ cmake --build build && cd build && ctest -R VideoFrameTest
 | 句柄空（`Valid()==false`） | 池耗尽（Acquire 失败）或已移动（发布后源句柄） |
 | 帧数据对不上 | 检查 stride 是否按像素/行正确设置（`hor_stride ≥ width`） |
 | 想加新像素格式 | 枚举加值 + `BytesPerPixel` 分支 + `VideoFramePool::ComputeBufferSize` 分支 |
-| 时间戳异常 | `timestamp_ms` 由池在 Acquire 时打点；`source_timestamp_ms` 由生产者设置 |
+| 时间戳异常 | 检查生产者是否在发布前调用`SetTiming`并保留`pipeline_ingress_time_ms`；跨设备时间不得混入 |

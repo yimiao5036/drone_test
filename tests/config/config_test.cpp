@@ -77,10 +77,35 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.ground_station.attitude_send_interval.count(), 100);
     EXPECT_EQ(config.ground_station.health_status_send_interval.count(), 1000);
     EXPECT_EQ(config.ground_station.mission_status_send_interval.count(), 500);
+    EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
     EXPECT_EQ(config.yolo.model_path,
               "/opt/drone/models/yolo26n-drone-best.rknn");
+    EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
+    EXPECT_EQ(config.yolo.npu_core_mode, "all");
+    EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
+    EXPECT_FALSE(config.yolo.collect_npu_perf_detail);
     EXPECT_EQ(config.video_sender.encode.url,
               "rtsp://127.0.0.1:8554/drone_25_1");
+}
+
+TEST(ConfigTest, DefaultsRgaDmaTransferToDisabledWhenFieldMissing) {
+    json value = ReadSourceConfig();
+    value["video"].erase("prefer_rga_dma_transfer");
+    const auto path = WriteTemporaryConfig(value, "drone_config_rga_dma_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_FALSE(config.decoder.prefer_rga_dma_transfer);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidYoloNpuCoreMode) {
+    json value = ReadSourceConfig();
+    value["yolo"]["npu_core_mode"] = "invalid";
+    const auto path = WriteTemporaryConfig(value, "drone_config_yolo_core_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
 }
 
 TEST(ConfigTest, RejectsControlBeforeFormalAssemblyIsEnabled) {

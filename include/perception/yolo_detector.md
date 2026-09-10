@@ -2,7 +2,7 @@
 
 > 对应实现：`src/perception/yolo_detector.cpp`、`src/perception/yolo_postprocess.cpp`、
 > `src/perception/rknn_detection_backend.cpp`（香橙派条件编译）
-> 更新：2026-08-26
+> 更新：2026-09-09
 
 ## 功能职责
 
@@ -40,7 +40,10 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   `docs/数据接口文档.md` §4.4，本实现不改变签名）。
 - `YoloDetectorConfig`：`model_path`（RKNN 模型路径，空 = 必须注入后端）、
   `conf_threshold`（默认 0.25）、`nms_threshold`（默认 0.45）、
-  `input_queue_capacity`（解码帧订阅队列容量，默认 2）。
+  `input_queue_capacity`（解码帧订阅队列容量，默认2，生产为1）、
+  `npu_core_mode`（`auto/core0/core01/core012/all`，生产当前`all`）、
+  `collect_npu_internal_perf`（仅诊断`RKNN_QUERY_PERF_RUN`，生产为`false`）、
+  `collect_npu_perf_detail`（仅诊断一次逐层报告，生产为`false`）。
 - `IDetectionBackend`：`Load() / Unload() / IsLoaded() / Detect(FrameHandle) →
   vector<BackendDetection>`（原图坐标系像素框）。工厂 `CreateDefaultDetectionBackend`
   在 `DRONE_HAVE_RKNN` 编译时返回 RKNN 后端，否则返回 nullptr。
@@ -57,19 +60,38 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 - **后端抽象与双环境**：推理后端经构造参数注入（`std::unique_ptr<IDetectionBackend>`），
   开发机测试注入 Mock；香橙派默认 `RknnDetectionBackend`。两者都不可用时
   `Start()` 返回 false 并打 ERROR，不静默空转。
-- **耗时统计**：检测线程对 `Detect()` 调用计时，指数滑动平均（EMA, α=0.1），
-  长时间运行不迟钝。热路径不打日志。
+- **耗时统计**：检测线程对`Detect()`完整调用计时并保留EMA；固定窗口统计进一步拆分为RGA缩放/颜色转换、CPU letterbox填充复制、`rknn_run`、输出布局转换及阈值过滤/NMS。热路径不打印逐帧日志。
 - **后处理**（`yolo_postprocess`）：当前模型输出为通道优先 `[1,5,8400]`，每个候选为
   归一化 `[x_center,y_center,width,height,confidence]`。实现按 confidence 过滤，乘模型
   宽高转换为模型像素坐标，执行单类别 NMS，再按 `(coord-pad)/scale` 撤销 letterbox。
   模型不输出类别，当前统一写入 `class_id=0`。旧版多分支量化解码继续保留兼容。
-- **RKNN 后端**（香橙派）：使用 `rknn_init` + `rknn_dup_context`×2、
-  `RKNN_NPU_CORE_ALL`、`rknn_create_mem` / `rknn_set_io_mem`。`QueryModelInfo` 自动识别
+- **RKNN 后端**（香橙派）：使用单个`rknn_context`，通过配置选择`RKNN_NPU_CORE_AUTO/0/0_1/0_1_2/ALL`，并使用`rknn_create_mem` / `rknn_set_io_mem`。旧实现额外复制两个上下文却始终只运行`ctxs_[0]`，现已删除无效上下文和对应两套I/O内存；组合多核由单上下文core mask控制。`QueryModelInfo`自动识别
   单输出 `[1,5,N]` 与旧版多分支格式；单输出当前要求 INT8。输出为 NC1HWC2 时转换成
   通道优先连续缓冲。预处理严格对齐已通过验证的 Python 参考代码：完整原图等比缩放，
   缩放宽高使用 round，RGB 画布以 114 居中填充，不再先裁掉 16:9 画面的左右区域。
 - **分辨率变化**：裁剪缓冲懒分配按需扩容；letterbox 每帧按实际宽高计算，
   解码分辨率变化（断流重连）无需重建后端。
+
+### 延迟统计
+
+`InputQueueLatency()`统计解码帧发布到YOLO开始处理；`InferenceLatency()`统计后端`Detect()`完整时间；`IngressToInferenceLatency()`统计码流进入机载进程到YOLO完成。无检测帧同样计入统计。
+
+`BackendLatencySnapshot()`提供最近256帧的后端细分：
+
+| 探针编号 | 指标 | 代码范围 |
+|---|---|---|
+| Y1 | 预处理总耗时 | RGA、临时缓冲准备和CPU letterbox总和 |
+| Y1R | RGA缩放+颜色转换 | `imresize`或`imcvtcolor` |
+| Y1C | CPU letterbox复制 | 114填充、缩放RGB逐行复制到RKNN输入内存 |
+| Y2 | NPU推理 | `rknn_run(ctxs_[0])` |
+| Y3 | 输出布局转换 | NC1HWC2→NCHW或原生输出`memcpy` |
+| Y4 | 后处理 | INT8反量化、阈值过滤、排序、单类别NMS、坐标还原 |
+
+Y1通常约等于Y1R+Y1C，但还包含缓冲`resize`检查与RGA描述准备。Y1～Y4之和与外层`InferenceLatency()`可能存在少量调用、统计和线程调度开销。
+
+2026-09-09香橙派120秒实测表明：Y1平均约2.8～3.6ms，其中Y1R约2.5～3.2ms、Y1C约0.3ms；Y2平均约24～29ms，占后端总耗时约80%～90%；Y3约0.01ms、Y4约0.13～0.20ms。当前主要计算瓶颈已确认是`rknn_run`，不是CPU letterbox、输出布局或NMS。
+
+YOLO队列容量2→1的120秒A/B中，容量1仅少处理约38/2945帧（约1.3%），队列平均14.21→12.12ms、P99 54→37ms、最大77→42ms；入口到YOLO完成平均46.22→43.99ms、P99 91.53→81ms、最大127→89ms。实时性收益明显且吞吐损失较小，因此当前生产配置已设`yolo.input_queue_capacity=1`，保留探针参数继续复测。
 
 ## 日志行为
 
@@ -87,8 +109,8 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   ```bash
   cmake -S . -B build && cmake --build build -j$(nproc)
   ./build/yolo_postprocess_test   # 后处理纯函数：多分支 + `[1,5,N]`/NMS/letterbox
-  ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理，9 用例
-  ctest --test-dir build          # 当前全工程 79/79 用例应通过
+  ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理
+  ctest --test-dir build --output-on-failure
   ```
   期望结果：`yolo_postprocess_test` 验证多分支量化解码，以及 `[1,5,N]` 的阈值过滤、
   单类别 NMS、1280×720→640×640 letterbox 坐标还原；`yolo_detector_test` 验证
@@ -117,8 +139,7 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   张量不是 INT8 或形状不是 `[1,5,N]`，先核对部署模型是否与 `config.json` 指向文件一致。
 - **检测结果坐标错位**：先核对 letterbox 参数（`x_pad/y_pad/scale`）与后处理逆变换
   一致性；再核对裁剪偏移叠加；用单目标单色场景在香橙派打点验证。
-- **推理耗时异常**：确认 3 核上下文与 `RKNN_NPU_CORE_ALL`；检查是否误用
-  `RKNN_FLAG_COLLECT_PERF_MASK`（原型已去除）。
+- **推理耗时异常**：先读取Y1～Y4确定瓶颈，不再仅凭`Detect()`总耗时推测。探针可用`--npu-core all/core012/core01/core0/auto`做同模型A/B；组合core mask仍是单次同步推理，不等于多上下文并发或把单核耗时除以核心数。使用`--rknn-perf-run`后同时输出Y2W墙钟、Y2N RKNN内部、Y2O差值和Y2Q查询开销；该总耗时查询不需要`RKNN_FLAG_COLLECT_PERF_MASK`。`--rknn-perf-detail`会用该标志初始化，在第100次成功推理后打印一次逐层报告；官方明确说明会降低帧率，因此只用于独占短时诊断。
 - **RGA 接口差异**：香橙派当前 `im2d.hpp` 的 `wrapbuffer_virtualaddr` 六参数顺序为
   `地址, width, height, format, wstride, hstride`。若误写成把 format 放在最后，会出现
   `wstride=720, width=1280` 的 Invalid parameters。预处理内部 RGA 错误由外层按第 1 次和

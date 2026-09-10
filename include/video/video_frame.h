@@ -68,8 +68,9 @@ struct VideoFrameInfo {
     std::size_t buf_size = 0;       ///< 缓冲实际占用字节数（含对齐填充）
     PixelFormat format = PixelFormat::kUnknown;  ///< 像素格式
     std::uint64_t sequence = 0;     ///< 递增帧序号，用于调试与丢帧检测
-    std::int64_t timestamp_ms = 0;  ///< 单调时钟时间戳（毫秒），超龄过滤依据
+    std::int64_t timestamp_ms = 0;  ///< 当前处理阶段产出时间（单调毫秒），队列等待/超龄依据
     std::int64_t source_timestamp_ms = 0;  ///< 源端时间戳（可选，如 RTP），同步用
+    std::int64_t pipeline_ingress_time_ms = 0;  ///< 编码访问单元进入机载进程的单调时间，用于端内总延迟
 
     /// 单行字节数 = 水平 stride × 每像素字节数。
     [[nodiscard]] std::size_t LineSizeBytes() const noexcept {
@@ -129,6 +130,13 @@ public:
 
     /// 帧元数据（只读）。
     [[nodiscard]] const VideoFrameInfo& Info() const noexcept { return info_; }
+
+    /// 仅供生产者在发布前更新处理阶段产出时间与端内入口时间。
+    void SetTiming(std::int64_t timestamp_ms,
+                   std::int64_t pipeline_ingress_time_ms) noexcept {
+        info_.timestamp_ms = timestamp_ms;
+        info_.pipeline_ingress_time_ms = pipeline_ingress_time_ms;
+    }
 
     /// 像素缓冲首地址（可写）。仅供发布前的采集线程使用。
     [[nodiscard]] std::byte* Data() noexcept { return data_; }
@@ -201,6 +209,14 @@ public:
     /// 像素缓冲首地址（只读）；空句柄返回 nullptr。
     [[nodiscard]] const std::byte* Data() const noexcept {
         return buffer_ ? buffer_->Data() : nullptr;
+    }
+
+    /// 仅允许生产者在发布前调用；Topic中的const FrameHandle无法调用此非const方法。
+    void SetTiming(std::int64_t timestamp_ms,
+                   std::int64_t pipeline_ingress_time_ms) noexcept {
+        if (buffer_) {
+            buffer_->SetTiming(timestamp_ms, pipeline_ingress_time_ms);
+        }
     }
 
     /// 池内缓冲容量（字节）；空句柄返回 0。

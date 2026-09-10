@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -67,6 +68,14 @@ bool WaitFor(const std::function<bool()>& condition, int timeout_ms = 3000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return condition();
+}
+
+TEST(YoloDetectorConfigTest, RejectsInvalidNpuCoreMode) {
+    YoloDetectorConfig config;
+    config.npu_core_mode = "invalid";
+    EXPECT_THROW(
+        YoloDetector detector(config, std::make_unique<MockBackend>()),
+        std::invalid_argument);
 }
 
 class YoloDetectorTest : public Test {
@@ -201,6 +210,8 @@ TEST_F(YoloDetectorTest, DetectPublishesResults) {
     // 统计
     EXPECT_TRUE(WaitFor([this] { return detector_->ProcessedFrameCount() == 1; }));
     EXPECT_GT(detector_->InferenceTimeMsAvg(), 0.f);
+    EXPECT_EQ(detector_->InferenceLatency().total_count, 1u);
+    EXPECT_EQ(detector_->BackendLatencySnapshot().npu_run.total_count, 0u);
     EXPECT_EQ(mock_->detect_count, 1u);
 }
 

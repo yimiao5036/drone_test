@@ -61,6 +61,11 @@ public:
     virtual uint64_t DroppedFrameCount() const = 0;
     /// 累计错误次数。
     virtual uint64_t ErrorCount() const = 0;
+    virtual common::LatencySummary InputQueueLatency() const = 0;
+    virtual common::LatencySummary EncodeAndPushLatency() const = 0;
+    virtual common::LatencySummary IngressToRtspLatency() const = 0;
+    virtual common::LatencySummary FramePrepareLatency() const = 0;
+    virtual common::LatencySummary PacketWriteLatency() const = 0;
 };
 
 /// 图传发送器（实现 IVideoSender）。
@@ -90,6 +95,11 @@ public:
     uint64_t SentFrameCount() const override;
     uint64_t DroppedFrameCount() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override;
+    common::LatencySummary EncodeAndPushLatency() const override;
+    common::LatencySummary IngressToRtspLatency() const override;
+    common::LatencySummary FramePrepareLatency() const override;
+    common::LatencySummary PacketWriteLatency() const override;
 
 private:
     struct Impl;
@@ -114,6 +124,11 @@ public:
     uint64_t SentFrameCount() const override;
     uint64_t DroppedFrameCount() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override { return {}; }
+    common::LatencySummary EncodeAndPushLatency() const override { return {}; }
+    common::LatencySummary IngressToRtspLatency() const override { return {}; }
+    common::LatencySummary FramePrepareLatency() const override { return {}; }
+    common::LatencySummary PacketWriteLatency() const override { return {}; }
 
 private:
     bool running_ = false;

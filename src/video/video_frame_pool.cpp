@@ -142,7 +142,7 @@ void VideoFramePool::Recycle(std::uint32_t slot_index) noexcept {
 }
 
 // 获取槽位：池空立即返回空句柄；成功后先在锁内标记在途，再在锁外构造 FrameBuffer。
-FrameHandle VideoFramePool::Acquire() noexcept {
+FrameHandle VideoFramePool::Acquire(std::int64_t pipeline_ingress_time_ms) noexcept {
     std::uint32_t slot_index = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -166,6 +166,7 @@ FrameHandle VideoFramePool::Acquire() noexcept {
     VideoFrameInfo info = frame_template_;
     info.sequence = next_sequence_.fetch_add(1);
     info.timestamp_ms = SteadyNowMs();
+    info.pipeline_ingress_time_ms = pipeline_ingress_time_ms;
 
     // 帧缓冲强持有池引用（shared_from_this），保证在途期间池不被析构。
     auto buffer = std::make_shared<FrameBuffer>(

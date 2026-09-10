@@ -21,13 +21,13 @@
 #include <memory>
 #include <string>
 
+#include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
+#include "perception/detection_backend.h"
 #include "video/video_frame.h"
 
 namespace drone::perception {
-
-class IDetectionBackend;
 
 /// YOLO 目标识别部件抽象接口。
 class IYoloDetector {
@@ -57,6 +57,10 @@ public:
     virtual float InferenceTimeMsAvg() const = 0;
     /// 累计错误次数（模型推理失败等）。
     virtual uint64_t ErrorCount() const = 0;
+    virtual common::LatencySummary InputQueueLatency() const = 0;
+    virtual common::LatencySummary InferenceLatency() const = 0;
+    virtual common::LatencySummary IngressToInferenceLatency() const = 0;
+    virtual DetectionBackendLatencySnapshot BackendLatencySnapshot() const = 0;
 };
 
 /// YOLO 检测器配置。
@@ -65,6 +69,9 @@ struct YoloDetectorConfig {
     float conf_threshold = 0.25f;         ///< 检测置信度阈值 [0,1]
     float nms_threshold = 0.45f;          ///< NMS IoU 阈值 [0,1]
     std::size_t input_queue_capacity = 2; ///< 解码帧订阅队列容量（丢最旧）
+    std::string npu_core_mode = "all";   ///< auto/core0/core01/core012/all
+    bool collect_npu_internal_perf = false; ///< 仅诊断：查询RKNN内部推理时间
+    bool collect_npu_perf_detail = false;   ///< 仅诊断：采集一次RKNN逐层性能报告
 };
 
 /// YOLO 检测器（实现 IYoloDetector）。
@@ -105,6 +112,10 @@ public:
     uint64_t ProcessedFrameCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override;
+    common::LatencySummary InferenceLatency() const override;
+    common::LatencySummary IngressToInferenceLatency() const override;
+    DetectionBackendLatencySnapshot BackendLatencySnapshot() const override;
 
 private:
     struct Impl;
@@ -131,6 +142,10 @@ public:
     uint64_t ProcessedFrameCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override { return {}; }
+    common::LatencySummary InferenceLatency() const override { return {}; }
+    common::LatencySummary IngressToInferenceLatency() const override { return {}; }
+    DetectionBackendLatencySnapshot BackendLatencySnapshot() const override { return {}; }
 
 private:
     bool running_ = false;

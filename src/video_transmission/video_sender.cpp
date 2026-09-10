@@ -47,6 +47,9 @@ struct VideoSender::Impl {
     std::atomic<uint64_t> sent_count{0};
     std::atomic<uint64_t> dropped_count{0};
     std::atomic<uint64_t> error_count{0};
+    common::LatencyStatistics input_queue_latency;
+    common::LatencyStatistics encode_and_push_latency;
+    common::LatencyStatistics ingress_to_rtsp_latency;
 
     /// 消费线程主循环：取标注帧 → 编码推流；失败即丢该帧，不反压。
     // WaitTakeFor 使用有限等待，既能避免空转，也能让 Stop 在没有帧时及时生效。
@@ -62,9 +65,28 @@ struct VideoSender::Impl {
                 ++dropped_count;
                 continue;
             }
+            const auto encode_start = std::chrono::steady_clock::now();
+            const auto encode_start_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    encode_start.time_since_epoch()).count();
+            if (handle.Info().timestamp_ms > 0) {
+                input_queue_latency.Add(static_cast<double>(
+                    encode_start_ms - handle.Info().timestamp_ms));
+            }
             if (backend != nullptr && !backend->EncodeFrame(handle)) {
                 ++dropped_count;   // 编码/推流失败：丢图传帧，不反压
                 continue;
+            }
+            const auto encode_end = std::chrono::steady_clock::now();
+            encode_and_push_latency.Add(
+                std::chrono::duration<double, std::milli>(encode_end - encode_start)
+                    .count());
+            if (handle.Info().pipeline_ingress_time_ms > 0) {
+                const auto encode_end_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        encode_end.time_since_epoch()).count();
+                ingress_to_rtsp_latency.Add(static_cast<double>(
+                    encode_end_ms - handle.Info().pipeline_ingress_time_ms));
             }
             if (backend != nullptr) {
                 ++sent_count;
@@ -162,6 +184,28 @@ uint64_t VideoSender::DroppedFrameCount() const {
 
 uint64_t VideoSender::ErrorCount() const {
     return impl_->error_count.load();
+}
+
+common::LatencySummary VideoSender::InputQueueLatency() const {
+    return impl_->input_queue_latency.Snapshot();
+}
+
+common::LatencySummary VideoSender::EncodeAndPushLatency() const {
+    return impl_->encode_and_push_latency.Snapshot();
+}
+
+common::LatencySummary VideoSender::IngressToRtspLatency() const {
+    return impl_->ingress_to_rtsp_latency.Snapshot();
+}
+
+common::LatencySummary VideoSender::FramePrepareLatency() const {
+    return impl_->backend ? impl_->backend->FramePrepareLatency()
+                          : common::LatencySummary{};
+}
+
+common::LatencySummary VideoSender::PacketWriteLatency() const {
+    return impl_->backend ? impl_->backend->PacketWriteLatency()
+                          : common::LatencySummary{};
 }
 
 // ---------------------------------------------------------------------------

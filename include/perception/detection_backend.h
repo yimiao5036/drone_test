@@ -24,11 +24,25 @@
 #include <string>
 #include <vector>
 
+#include "common/latency_statistics.h"
 #include "video/video_frame.h"
 
 namespace drone::perception {
 
 /// 后端检测结果（原图坐标系，像素）。
+/// 检测后端各子阶段固定窗口延迟，单位毫秒。
+struct DetectionBackendLatencySnapshot {
+    common::LatencySummary preprocess_total;
+    common::LatencySummary rga_resize_color;
+    common::LatencySummary letterbox_copy;
+    common::LatencySummary npu_run;
+    common::LatencySummary npu_internal_run;
+    common::LatencySummary npu_wall_overhead;
+    common::LatencySummary npu_perf_query;
+    common::LatencySummary output_layout;
+    common::LatencySummary postprocess;
+};
+
 struct BackendDetection {
     int class_id = 0;    ///< 模型类别 ID
     float confidence = 0.f;
@@ -57,12 +71,18 @@ public:
     /// @param frame 解码帧（NV12）；后端自行处理分辨率变化与格式校验。
     /// @return 检测结果列表（原图坐标系）；推理失败返回空列表并计数错误。
     virtual std::vector<BackendDetection> Detect(const video::FrameHandle& frame) = 0;
+
+    /// 后端内部子阶段统计；不支持细分的Mock/第三方后端返回空快照。
+    virtual DetectionBackendLatencySnapshot LatencySnapshot() const { return {}; }
 };
 
 /// 创建默认后端。
 /// - 编译时启用 RKNN（DRONE_HAVE_RKNN）且模型路径非空：返回 RknnDetectionBackend。
 /// - 否则返回 nullptr（调用方需注入自定义后端，或 YoloDetector::Start 失败）。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
-    const std::string& model_path, float conf_threshold, float nms_threshold);
+    const std::string& model_path, float conf_threshold, float nms_threshold,
+    const std::string& npu_core_mode = "all",
+    bool collect_npu_internal_perf = false,
+    bool collect_npu_perf_detail = false);
 
 }  // namespace drone::perception

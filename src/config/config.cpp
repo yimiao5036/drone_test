@@ -421,6 +421,8 @@ AppConfig LoadAppConfig(const std::string& path,
     config.decoder.stride_alignment = static_cast<uint32_t>(
         video.value("stride_alignment", 64));
     config.decoder.prefer_hardware = video.value("prefer_hardware_decode", true);
+    config.decoder.prefer_rga_dma_transfer =
+        video.value("prefer_rga_dma_transfer", false);
 
     const json yolo = root.value("yolo", json::object());
     config.yolo.model_path = ResolveAssetPath(
@@ -430,6 +432,19 @@ AppConfig LoadAppConfig(const std::string& path,
     config.yolo.nms_threshold = yolo.value("nms_threshold", 0.45f);
     config.yolo.input_queue_capacity = static_cast<std::size_t>(
         yolo.value("input_queue_capacity", 2));
+    config.yolo.npu_core_mode = yolo.value("npu_core_mode", std::string("all"));
+    config.yolo.collect_npu_internal_perf =
+        yolo.value("collect_npu_internal_perf", false);
+    config.yolo.collect_npu_perf_detail =
+        yolo.value("collect_npu_perf_detail", false);
+    if (config.yolo.npu_core_mode != "auto" &&
+        config.yolo.npu_core_mode != "core0" &&
+        config.yolo.npu_core_mode != "core01" &&
+        config.yolo.npu_core_mode != "core012" &&
+        config.yolo.npu_core_mode != "all") {
+        throw std::invalid_argument(
+            "yolo.npu_core_mode仅支持auto/core0/core01/core012/all");
+    }
 
     config.compositor.pool_capacity = static_cast<std::size_t>(
         video.value("compositor_pool_capacity", 8));

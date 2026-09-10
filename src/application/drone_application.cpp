@@ -376,4 +376,58 @@ bool DroneApplication::IsRunning() const {
     return running_;
 }
 
+VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
+    VideoPipelineLatencySnapshot snapshot;
+    if (decoder_ != nullptr) {
+        snapshot.input_codec = decoder_->ActiveCodec();
+        snapshot.hardware_decoder = decoder_->IsHardwareDecoder();
+        snapshot.encoded_frame_count = decoder_->EncodedFrameCount();
+        snapshot.encoded_bytes = decoder_->EncodedBytes();
+        snapshot.key_frame_count = decoder_->KeyFrameCount();
+        snapshot.hardware_transfer_buffer_build_count =
+            decoder_->HardwareTransferBufferBuildCount();
+        snapshot.rga_dma_transfer_count = decoder_->RgaDmaTransferCount();
+        snapshot.rga_dma_fallback_count = decoder_->RgaDmaFallbackCount();
+        snapshot.decode_queue = decoder_->InputQueueLatency();
+        snapshot.decode = decoder_->DecodeLatency();
+        snapshot.ingress_to_decoded = decoder_->IngressToDecodedLatency();
+        snapshot.packet_prepare = decoder_->PacketPrepareLatency();
+        snapshot.send_packet = decoder_->SendPacketLatency();
+        snapshot.receive_frame = decoder_->ReceiveFrameLatency();
+        snapshot.hardware_transfer_prepare =
+            decoder_->HardwareTransferPrepareLatency();
+        snapshot.hardware_transfer = decoder_->HardwareTransferLatency();
+        snapshot.rga_dma_transfer = decoder_->RgaDmaTransferLatency();
+        snapshot.frame_copy = decoder_->FrameCopyLatency();
+    }
+    if (detector_ != nullptr) {
+        snapshot.yolo_queue = detector_->InputQueueLatency();
+        snapshot.yolo_inference = detector_->InferenceLatency();
+        snapshot.ingress_to_inference = detector_->IngressToInferenceLatency();
+        const auto backend = detector_->BackendLatencySnapshot();
+        snapshot.yolo_preprocess_total = backend.preprocess_total;
+        snapshot.yolo_rga_resize_color = backend.rga_resize_color;
+        snapshot.yolo_letterbox_copy = backend.letterbox_copy;
+        snapshot.yolo_npu_run = backend.npu_run;
+        snapshot.yolo_npu_internal_run = backend.npu_internal_run;
+        snapshot.yolo_npu_wall_overhead = backend.npu_wall_overhead;
+        snapshot.yolo_npu_perf_query = backend.npu_perf_query;
+        snapshot.yolo_output_layout = backend.output_layout;
+        snapshot.yolo_postprocess = backend.postprocess;
+    }
+    if (compositor_ != nullptr) {
+        snapshot.compositor_queue = compositor_->InputQueueLatency();
+        snapshot.compositor = compositor_->ComposeLatency();
+        snapshot.ingress_to_annotated = compositor_->IngressToAnnotatedLatency();
+    }
+    if (video_sender_ != nullptr) {
+        snapshot.sender_queue = video_sender_->InputQueueLatency();
+        snapshot.frame_prepare = video_sender_->FramePrepareLatency();
+        snapshot.encode_and_push = video_sender_->EncodeAndPushLatency();
+        snapshot.packet_write = video_sender_->PacketWriteLatency();
+        snapshot.ingress_to_rtsp = video_sender_->IngressToRtspLatency();
+    }
+    return snapshot;
+}
+
 }  // namespace drone::application

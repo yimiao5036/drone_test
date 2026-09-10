@@ -1,0 +1,127 @@
+# 视频链路延迟探针
+
+## 功能职责
+
+`video_latency_probe`复用正式`DroneApplication`视频链路，在香橙派上统计“编码访问单元进入机载进程”之后的各阶段延迟。探针只启用视频，不启用PX4、地面站或控制输出。
+
+## 测量范围
+
+| 序号 | 指标 | 定义 |
+|---:|---|---|
+| 01 | 解码输入队列 | `EncodedFrame.receive_time_ms`到解码线程开始处理 |
+| 02 | 输入码流解码+NV12转存 | 解码线程处理开始到NV12帧发布；名称按实际流自动显示H.264/AVC或H.265/HEVC |
+| 03 | 入口→解码输出 | 码流进入机载进程到NV12帧发布 |
+| 04 | YOLO输入队列 | 解码帧发布到YOLO开始推理 |
+| 05 | YOLO/RKNN推理 | 后端`Detect()`调用时间，含RGA预处理、NPU推理和后处理 |
+| 06 | 入口→YOLO完成 | 码流进入机载进程到推理结束 |
+| 07 | 叠加输入队列 | 解码帧发布到叠加线程开始处理 |
+| 08 | NV12复制+框文字叠加 | 独立帧池复制和绘制耗时 |
+| 09 | 入口→标注输出 | 码流进入机载进程到标注帧发布 |
+| 10 | 编码输入队列 | 标注帧发布到VideoSender开始编码 |
+| 11 | H264输入帧准备 | NV12复制到FFmpeg输入帧；软编时含NV12→YUV420P |
+| 12 | H264编码+RTSP推送调用 | `EncodeFrame()`完整调用，含编码器取包和本地RTSP写入 |
+| 13 | RTSP单包写入 | 单次`av_interleaved_write_frame()`调用 |
+| 14 | 入口→本地RTSP发布完成 | 码流进入机载进程到编码/本地RTSP写调用完成 |
+
+探针同时输出FFmpeg识别到的实际输入编码、实际解码模式、最近一个报告区间的输入FPS/码率/关键帧数、DRM转存目标缓冲累计构建次数，并输出最近最多256帧的解码细分：
+
+| 编号 | 解码细分 | 定义 |
+|---:|---|---|
+| D1 | AVPacket分配+码流复制 | `av_new_packet`和编码数据`memcpy` |
+| D2 | `avcodec_send_packet` | 码流送入FFmpeg/rkmpp解码器的调用时间 |
+| D3 | `avcodec_receive_frame` | 成功取得一个输出帧的调用时间 |
+| D4P | 转存目标帧准备 | 分辨率检查与`av_frame_make_writable`，用于解释旧日志中的“其余”10～20ms台阶 |
+| D4 | DRM硬件帧转存（回退） | `av_hwframe_transfer_data`；仅RGA DMA不可用/失败回退时产生样本 |
+| D4R | RGA DMA-BUF直传 | `wrapbuffer_fd` + `imcopy`直接写入`VideoFramePool` |
+| D5 | NV12内存池复制（回退） | FFmpeg转存后逐行复制；RGA DMA成功时不执行 |
+
+YOLO后端另输出最近256帧细分：Y1预处理总耗时、Y1R RGA缩放/颜色转换、Y1C CPU letterbox复制、Y2 `rknn_run`、Y3输出布局转换、Y4阈值过滤/NMS。用于判断当前约29～30ms究竟消耗在RGA、NPU还是CPU后处理，不再根据总耗时猜测。
+
+不包含：摄像头曝光、摄像头内部编码、摄像头到香橙派网络传输、MediaMTX后续分发、HM30无线传输、Web FFmpeg转码、JSMpeg缓冲和浏览器显示。跨端显示延迟后续需要画面时间码/LED事件或携带时间戳的测试图案单独测量。
+
+## 构建与运行
+
+香橙派停止正式`drone_control`后运行，避免争抢摄像头和RTSP推流地址：
+
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
+./build/video_latency_probe --duration 120 --interval 10
+```
+
+可指定配置：
+
+```bash
+./build/video_latency_probe --config ./config/config.json --duration 300 --interval 10
+```
+
+YOLO输入队列A/B测试可用命令行临时覆盖，不修改正式JSON：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 1
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 2
+```
+
+容量必须为正数；未提供时沿用`yolo.input_queue_capacity`，代码缺省为2、当前生产为1。
+
+可用`--yolo-model`临时指定候选模型，不修改生产JSON：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 \
+    --yolo-model ./models/candidates/model.rknn --yolo-queue 1 --npu-core all
+```
+
+相对路径按探针启动时的当前目录解析；模型不存在时启动前直接拒绝。
+
+NPU core mask可做同模型A/B：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 1 --npu-core all
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 1 --npu-core core012
+./build/video_latency_probe --duration 120 --interval 10 --yolo-queue 1 --npu-core core0
+```
+
+支持`auto/core0/core01/core012/all`。每次运行仍是单上下文同步`rknn_run`；`core012`表示该次模型运行使用组合核心，不是三个请求并行。
+
+查询RKNN内部模型执行时间：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 \
+    --yolo-queue 1 --npu-core all --rknn-perf-run
+```
+
+启用后新增：Y2W=`rknn_run`墙钟、Y2N=`RKNN_QUERY_PERF_RUN`内部时间、Y2O=墙钟减内部、Y2Q=查询调用本身开销。该选项只用于探针；正式配置`yolo.collect_npu_internal_perf=false`。如果板端runtime不支持当前零拷贝模式下查询，程序只打印一次WARN并停止后续查询，不影响推理。
+
+采集一次逐层性能报告：
+
+```bash
+./build/video_latency_probe --duration 20 --interval 10 \
+    --yolo-queue 1 --npu-core all --rknn-perf-detail
+```
+
+该选项会使用`RKNN_FLAG_COLLECT_PERF_MASK`初始化，并在第100次成功推理后打印一次`RKNN_QUERY_PERF_DETAIL`原始报告。官方明确说明采集逐层性能会降低帧率，所以结果只用于定位耗时OP和核心分配，不能与正常吞吐基线直接比较；正式配置`yolo.collect_npu_perf_detail=false`。
+
+主表输出当前最多2048样本窗口的`avg/P50/P95/P99/max`；D1～D5及D4P使用最近最多256样本，约等于25 FPS下10秒窗口，便于定位短时解码长尾。输出中的`count`是启动后的累计有效样本数，`win`是本次百分位实际使用的窗口样本数。前10～20秒包含解码器、NPU和编码器预热，不应用于最终结论；建议至少运行120秒，以最后3～5次报告判断稳定延迟。
+
+## 优化判断
+
+- 队列P95持续升高：生产速度高于消费速度，应降低帧率、减小处理时间或检查线程调度；
+- 解码总耗时升高：用D1~D5判断发生在码流复制、送包、取帧等待、DRM转存还是NV12复制，并结合区间码率/关键帧变化判断；当前实测已定位到D4，优化版应确认`DRM转存缓冲构建=1`且不随帧数增长；
+- YOLO推理P95高：检查RGA零拷贝、NPU核心配置和模型；
+- 叠加耗时高：NV12全帧复制和点阵绘制是重点；
+- H264输入准备高：检查CPU帧拷贝，后续评估DRM/MPP零拷贝；
+- RTSP写包P95高：MediaMTX或本机socket出现阻塞；
+- 总延迟远高于各处理项之和：主要由并行支路、排队和帧对齐造成。
+
+YOLO与叠加/图传是并行支路：当前叠加器使用截至取帧时已到达的最新检测结果，不等待同一帧YOLO完成。因此`入口→本地RTSP`不能与`入口→YOLO完成`简单相加；检测框相对画面的滞后需要结合`frame_sequence`另行观察。
+
+## 日志行为
+
+探针每个`--interval`周期输出一次统计，不打印逐帧成功日志；区间FPS/码率使用`steady_clock`浮点秒差计算，避免整数秒取整导致531秒等报告处误显示22.8 FPS。探针强制设置`prefer_rga_dma_transfer=true`；正式`drone_control`按JSON读取，当前生产配置经长测后已显式设为true，代码缺省仍为false。探针同时把`slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P、D4R和未归类耗时，只在第1次及每100次打印WARN。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch。
+
+## 排查要点
+
+- 全部count为0：检查摄像头RTSP、解码和输出MediaMTX；
+- YOLO count为0：确认香橙派构建启用了RKNN且模型存在；
+- RTSP写入count为0：确认MediaMTX监听8554且推流地址可用；
+- 直接运行正式程序与探针会争抢资源，必须二选一。

@@ -5,8 +5,8 @@
  * 整合原型 videoPart/yolo26-rknn 的 rknn_model.cpp / rga_utils.cpp /
  * yolo26_detector.cpp 三部分：
  * - RGA 预处理：完整 NV12 解码帧 → 等比例缩放 → RGB letterbox 写入模型输入内存
- * - RKNN：3 核上下文（rknn_dup_context + RKNN_NPU_CORE_ALL），
- *   输入输出零拷贝内存（rknn_create_mem / rknn_set_io_mem）
+ * - RKNN：单上下文 + 可配置core mask，输入输出零拷贝内存
+ *   （rknn_create_mem / rknn_set_io_mem）
  * - 后处理：NC1HWC2→NCHW 转换（预分配缓冲）→ `[1,5,N]` 归一化
  *   xywh 解码 + NMS + letterbox 逆变换，直接得到原图坐标
  *
@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,11 @@ namespace {
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
+}
+
+std::int64_t MonotonicUs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 /// 读取整个模型文件到内存。
@@ -98,6 +104,22 @@ void ConvertNc1hwc2ToNchw(const int8_t* src, int8_t* dst,
 }
 
 /// 将 RKNN 张量属性转换为后处理 QuantTensor（数据指针由调用方指定）。
+rknn_core_mask ParseCoreMask(const std::string& mode) {
+    if (mode == "auto") {
+        return RKNN_NPU_CORE_AUTO;
+    }
+    if (mode == "core0") {
+        return RKNN_NPU_CORE_0;
+    }
+    if (mode == "core01") {
+        return RKNN_NPU_CORE_0_1;
+    }
+    if (mode == "core012") {
+        return RKNN_NPU_CORE_0_1_2;
+    }
+    return RKNN_NPU_CORE_ALL;
+}
+
 QuantTensor MakeTensor(const int8_t* data, const rknn_tensor_attr& attr) {
     QuantTensor tensor;
     tensor.data = data;
@@ -113,10 +135,16 @@ QuantTensor MakeTensor(const int8_t* data, const rknn_tensor_attr& attr) {
 
 /// RknnDetectionBackend 实现细节（PIMPL）：RKNN 上下文、RGA 缓冲与推理流程。
 struct RknnDetectionBackend::Impl {
-    explicit Impl(std::string model_path, float conf_threshold, float nms_threshold)
+    explicit Impl(std::string model_path, float conf_threshold, float nms_threshold,
+                  std::string npu_core_mode, bool collect_npu_internal_perf,
+                  bool collect_npu_perf_detail)
         : model_path(std::move(model_path)),
           conf_threshold(conf_threshold),
-          nms_threshold(nms_threshold) {
+          nms_threshold(nms_threshold),
+          npu_core_mode(std::move(npu_core_mode)),
+          npu_core_mask(ParseCoreMask(this->npu_core_mode)),
+          collect_npu_internal_perf(collect_npu_internal_perf),
+          collect_npu_perf_detail(collect_npu_perf_detail) {
         if (conf_threshold < 0.f || conf_threshold > 1.f ||
             nms_threshold < 0.f || nms_threshold > 1.f) {
             throw std::invalid_argument("RKNN 后端阈值必须在 [0,1]");
@@ -132,10 +160,18 @@ struct RknnDetectionBackend::Impl {
     float nms_threshold = 0.45f;
     bool loaded = false;
     std::atomic<uint64_t> error_count{0};
+    std::string npu_core_mode;
+    rknn_core_mask npu_core_mask = RKNN_NPU_CORE_ALL;
+    bool collect_npu_internal_perf = false;
+    bool collect_npu_perf_detail = false;
+    bool npu_perf_query_available = true;
+    bool npu_perf_detail_reported = false;
+    std::uint64_t successful_run_count = 0;
 
-    // RKNN 上下文（3 个 NPU 核）
-    rknn_context ctxs_[3] = {0, 0, 0};
-    bool ctx_created_[3] = {false, false, false};
+    // 当前逐帧同步推理只需要一个上下文；多核组合由该上下文的core mask决定。
+    static constexpr int kContextCount = 1;
+    rknn_context ctxs_[kContextCount] = {};
+    bool ctx_created_[kContextCount] = {};
 
     // 模型张量属性
     std::vector<rknn_tensor_attr> input_attrs_;
@@ -164,6 +200,17 @@ struct RknnDetectionBackend::Impl {
     std::vector<uint8_t> resized_rgb_buffer_;
     std::string last_preprocess_error_;  ///< 最近一次 RGA 错误，仅检测线程访问
 
+    // 最近约10秒（256帧）的后端子阶段统计；Snapshot可由探针线程并发读取。
+    common::LatencyStatistics preprocess_total_latency{256};
+    common::LatencyStatistics rga_resize_color_latency{256};
+    common::LatencyStatistics letterbox_copy_latency{256};
+    common::LatencyStatistics npu_run_latency{256};
+    common::LatencyStatistics npu_internal_run_latency{256};
+    common::LatencyStatistics npu_wall_overhead_latency{256};
+    common::LatencyStatistics npu_perf_query_latency{256};
+    common::LatencyStatistics output_layout_latency{256};
+    common::LatencyStatistics postprocess_latency{256};
+
     /// 查询模型信息并识别单输出 `[1,5,N]` 或旧版多分支结构。
     // 同时保存逻辑属性和 RKNN 原生属性：前者用于解码，后者用于零拷贝内存绑定。
     bool QueryModelInfo() {
@@ -176,6 +223,22 @@ struct RknnDetectionBackend::Impl {
         }
         SPDLOG_INFO("RKNN SDK API={} 驱动={}", sdk_version.api_version,
                     sdk_version.drv_version);
+
+        rknn_mem_size mem_size{};
+        ret = rknn_query(ctxs_[0], RKNN_QUERY_MEM_SIZE, &mem_size,
+                         sizeof(mem_size));
+        if (ret == RKNN_SUCC) {
+            const std::uint32_t used_sram =
+                mem_size.total_sram_size >= mem_size.free_sram_size
+                    ? mem_size.total_sram_size - mem_size.free_sram_size
+                    : 0;
+            SPDLOG_INFO("RKNN内存: 权重={}B 中间张量={}B DMA={}B SRAM已用={}/{}B",
+                        mem_size.total_weight_size, mem_size.total_internal_size,
+                        mem_size.total_dma_allocated_size, used_sram,
+                        mem_size.total_sram_size);
+        } else {
+            SPDLOG_WARN("RKNN查询模型内存信息失败: ret={}", ret);
+        }
 
         ret = rknn_query(ctxs_[0], RKNN_QUERY_IN_OUT_NUM, &io_num_, sizeof(io_num_));
         if (ret < 0) {
@@ -202,6 +265,19 @@ struct RknnDetectionBackend::Impl {
                 SPDLOG_ERROR("RKNN 查询硬件最优输入属性失败: ret={}", ret);
                 return false;
             }
+        }
+
+        for (uint32_t i = 0; i < io_num_.n_input; ++i) {
+            SPDLOG_INFO("RKNN输入[{}]: 逻辑fmt/type={}/{} size={}；原生fmt/type={}/{} size/stride={} / {} w/h_stride={}/{} pass_through={}",
+                        i, static_cast<int>(input_attrs_[i].fmt),
+                        static_cast<int>(input_attrs_[i].type), input_attrs_[i].size,
+                        static_cast<int>(input_native_attrs_[i].fmt),
+                        static_cast<int>(input_native_attrs_[i].type),
+                        input_native_attrs_[i].size,
+                        input_native_attrs_[i].size_with_stride,
+                        input_native_attrs_[i].w_stride,
+                        input_native_attrs_[i].h_stride,
+                        input_native_attrs_[i].pass_through);
         }
 
         output_attrs_.resize(io_num_.n_output);
@@ -233,8 +309,13 @@ struct RknnDetectionBackend::Impl {
                 }
                 dims_str += std::to_string(output_attrs_[i].dims[d]);
             }
-            SPDLOG_INFO("RKNN 输出[{}]: 形状={} 布局={}", i, dims_str,
-                        static_cast<int>(output_attrs_[i].fmt));
+            SPDLOG_INFO("RKNN输出[{}]: 形状={} 逻辑fmt/type={}/{} 原生fmt/type={}/{} size/stride={} / {}",
+                        i, dims_str, static_cast<int>(output_attrs_[i].fmt),
+                        static_cast<int>(output_attrs_[i].type),
+                        static_cast<int>(output_native_attrs_[i].fmt),
+                        static_cast<int>(output_native_attrs_[i].type),
+                        output_native_attrs_[i].size,
+                        output_native_attrs_[i].size_with_stride);
         }
 
         // 解析模型输入尺寸（NCHW 或 NHWC）
@@ -284,7 +365,7 @@ struct RknnDetectionBackend::Impl {
     /// 分配输入输出内存并绑定。
     // 每个 NPU 上下文各持有一套输入/输出内存，输出缓冲预先分配，避免逐帧申请释放。
     bool InitializeMems() {
-        const int ctx_count = 3;
+        const int ctx_count = kContextCount;
         input_mems_.assign(ctx_count, {});
         output_mems_.assign(ctx_count, {});
 
@@ -335,7 +416,7 @@ struct RknnDetectionBackend::Impl {
 
     /// 释放全部 RKNN 资源（幂等）。
     void ReleaseAll() noexcept {
-        const int ctx_count = 3;
+        const int ctx_count = kContextCount;
         for (int i = 0; i < ctx_count; ++i) {
             if (static_cast<std::size_t>(i) < input_mems_.size()) {
                 for (auto* mem : input_mems_[i]) {
@@ -387,12 +468,16 @@ struct RknnDetectionBackend::Impl {
         if (src_w == target_size && src_h == target_size) {
             rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
                 dst_rgb, target_size, target_size, RK_FORMAT_RGB_888);
+            const std::int64_t rga_start_us = MonotonicUs();
             const IM_STATUS status =
                 imcvtcolor(src_buf, dst_buf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
             if (status != IM_STATUS_SUCCESS) {
                 last_preprocess_error_ = imStrError(status);
                 return -1;
             }
+            rga_resize_color_latency.Add(
+                static_cast<double>(MonotonicUs() - rga_start_us) / 1000.0);
+            letterbox_copy_latency.Add(0.0);
             letterbox->scale = 1.f;
             letterbox->x_pad = 0;
             letterbox->y_pad = 0;
@@ -414,13 +499,17 @@ struct RknnDetectionBackend::Impl {
                                    new_height * 3);
         rga_buffer_t resized_buf = wrapbuffer_virtualaddr(
             resized_rgb_buffer_.data(), new_width, new_height, RK_FORMAT_RGB_888);
+        const std::int64_t rga_start_us = MonotonicUs();
         const IM_STATUS status = imresize(src_buf, resized_buf, scale, scale,
                                           INTER_LINEAR);
         if (status != IM_STATUS_SUCCESS) {
             last_preprocess_error_ = imStrError(status);
             return -1;
         }
+        rga_resize_color_latency.Add(
+            static_cast<double>(MonotonicUs() - rga_start_us) / 1000.0);
 
+        const std::int64_t letterbox_start_us = MonotonicUs();
         std::memset(dst_rgb, fill_color,
                     static_cast<std::size_t>(target_size) * target_size * 3);
         const std::size_t src_row_bytes = static_cast<std::size_t>(new_width) * 3;
@@ -432,6 +521,8 @@ struct RknnDetectionBackend::Impl {
                                                          src_row_bytes,
                         src_row_bytes);
         }
+        letterbox_copy_latency.Add(
+            static_cast<double>(MonotonicUs() - letterbox_start_us) / 1000.0);
         letterbox->scale = scale;
         letterbox->x_pad = pad_left;
         letterbox->y_pad = pad_top;
@@ -471,6 +562,7 @@ struct RknnDetectionBackend::Impl {
         // 对完整原图做 letterbox，与已通过验证的 Python 参考代码一致；不再先
         // 居中裁成正方形，避免丢失 16:9 画面左右区域。
         LetterBox letterbox;
+        const std::int64_t preprocess_start_us = MonotonicUs();
         const int ret = Nv12LetterboxToRgb(
             reinterpret_cast<const uint8_t*>(frame.Data()), width, height, hor_stride,
             model_width_, static_cast<uint8_t*>(input_mems_[0][0]->virt_addr),
@@ -485,8 +577,11 @@ struct RknnDetectionBackend::Impl {
             }
             return out;
         }
+        preprocess_total_latency.Add(
+            static_cast<double>(MonotonicUs() - preprocess_start_us) / 1000.0);
 
-        // NPU 推理（3 核上下文，单帧由运行时调度）
+        // NPU同步推理；组合核心模式由当前单上下文的core mask控制。
+        const std::int64_t npu_start_us = MonotonicUs();
         const int run_ret = rknn_run(ctxs_[0], nullptr);
         if (run_ret != RKNN_SUCC) {
             const uint64_t errors = error_count.fetch_add(1) + 1;
@@ -495,8 +590,53 @@ struct RknnDetectionBackend::Impl {
             }
             return out;
         }
+        const double npu_wall_ms =
+            static_cast<double>(MonotonicUs() - npu_start_us) / 1000.0;
+        npu_run_latency.Add(npu_wall_ms);
+
+        // 官方RKNNRT 2.3.2允许在rknn_run后查询模型内部执行时间。
+        // 该查询仅由探针显式启用，正式程序默认关闭，避免热路径增加诊断调用。
+        ++successful_run_count;
+        if (collect_npu_internal_perf && npu_perf_query_available) {
+            rknn_perf_run perf_run{};
+            const std::int64_t query_start_us = MonotonicUs();
+            const int query_ret = rknn_query(ctxs_[0], RKNN_QUERY_PERF_RUN,
+                                             &perf_run, sizeof(perf_run));
+            const double query_ms =
+                static_cast<double>(MonotonicUs() - query_start_us) / 1000.0;
+            if (query_ret == RKNN_SUCC && perf_run.run_duration >= 0) {
+                const double internal_ms =
+                    static_cast<double>(perf_run.run_duration) / 1000.0;
+                npu_internal_run_latency.Add(internal_ms);
+                npu_wall_overhead_latency.Add(npu_wall_ms - internal_ms);
+                npu_perf_query_latency.Add(query_ms);
+            } else {
+                npu_perf_query_available = false;
+                SPDLOG_WARN("RKNN内部性能查询不可用: ret={} duration_us={}，本次运行后不再查询",
+                            query_ret, perf_run.run_duration);
+            }
+        }
+
+        if (collect_npu_perf_detail && !npu_perf_detail_reported &&
+            successful_run_count >= 100) {
+            npu_perf_detail_reported = true;
+            rknn_perf_detail perf_detail{};
+            const int detail_ret = rknn_query(ctxs_[0], RKNN_QUERY_PERF_DETAIL,
+                                              &perf_detail, sizeof(perf_detail));
+            if (detail_ret == RKNN_SUCC && perf_detail.perf_data != nullptr &&
+                perf_detail.data_len > 0) {
+                SPDLOG_INFO("RKNN逐层性能报告（第{}次推理后，单位见报告）:\n{}",
+                            successful_run_count,
+                            std::string(perf_detail.perf_data,
+                                        static_cast<std::size_t>(perf_detail.data_len)));
+            } else {
+                SPDLOG_WARN("RKNN逐层性能报告查询失败: ret={} data_len={}",
+                            detail_ret, perf_detail.data_len);
+            }
+        }
 
         // 输出张量搬运（NC1HWC2 → NCHW，写入预分配缓冲）
+        const std::int64_t output_layout_start_us = MonotonicUs();
         for (uint32_t i = 0; i < io_num_.n_output; ++i) {
             const int8_t* src = static_cast<int8_t*>(output_mems_[0][i]->virt_addr);
             int8_t* dst = output_buffers_[i].data();
@@ -514,7 +654,10 @@ struct RknnDetectionBackend::Impl {
                 std::memcpy(dst, src, output_native_attrs_[i].n_elems);
             }
         }
+        output_layout_latency.Add(
+            static_cast<double>(MonotonicUs() - output_layout_start_us) / 1000.0);
 
+        const std::int64_t postprocess_start_us = MonotonicUs();
         std::vector<YoloDetection> detections;
         if (output_mode_ == OutputMode::kNormalizedXywh) {
             NormalizedXywhTensor tensor;
@@ -565,6 +708,8 @@ struct RknnDetectionBackend::Impl {
                 out.push_back(bd);
             }
         }
+        postprocess_latency.Add(
+            static_cast<double>(MonotonicUs() - postprocess_start_us) / 1000.0);
         return out;
     }
 };
@@ -572,13 +717,18 @@ struct RknnDetectionBackend::Impl {
 // 对外接口只管理 PIMPL 生命周期，RKNN 头文件和设备资源不泄漏到公共接口。
 RknnDetectionBackend::RknnDetectionBackend(std::string model_path,
                                            float conf_threshold,
-                                           float nms_threshold)
+                                           float nms_threshold,
+                                           std::string npu_core_mode,
+                                           bool collect_npu_internal_perf,
+                                           bool collect_npu_perf_detail)
     : impl_(std::make_unique<Impl>(std::move(model_path), conf_threshold,
-                                   nms_threshold)) {}
+                                   nms_threshold, std::move(npu_core_mode),
+                                   collect_npu_internal_perf,
+                                   collect_npu_perf_detail)) {}
 
 RknnDetectionBackend::~RknnDetectionBackend() = default;
 
-// 加载顺序：模型文件 → 主 RKNN 上下文 → 其余 NPU 上下文 → 张量属性 → 零拷贝内存。
+// 加载顺序：模型文件 → 单RKNN上下文/core mask → 张量属性 → 零拷贝内存。
 // 中间任一步失败都调用 ReleaseAll，保证部分初始化不会泄漏设备资源。
 bool RknnDetectionBackend::Load() {
     if (impl_->loaded) {
@@ -591,27 +741,27 @@ bool RknnDetectionBackend::Load() {
         return false;
     }
 
-    // 初始化 RKNN 上下文（SRAM 加速）
+    // 初始化RKNN上下文：生产使用SRAM；逐层报告仅由探针显式开启，
+    // 官方说明COLLECT_PERF会降低帧率，不得常驻正式链路。
+    std::uint32_t init_flags = RKNN_FLAG_ENABLE_SRAM;
+    if (impl_->collect_npu_perf_detail) {
+        init_flags |= RKNN_FLAG_COLLECT_PERF_MASK;
+    }
     int ret = rknn_init(&impl_->ctxs_[0], model_data.data(), model_data.size(),
-                        RKNN_FLAG_ENABLE_SRAM, nullptr);
+                        init_flags, nullptr);
     if (ret < 0) {
         SPDLOG_ERROR("RKNN 初始化失败: ret={}，模型={}", ret, impl_->model_path);
         return false;
     }
     impl_->ctx_created_[0] = true;
 
-    // 复制上下文到 3 个 NPU 核心并全部启用
-    for (int i = 1; i < 3; ++i) {
-        ret = rknn_dup_context(&impl_->ctxs_[0], &impl_->ctxs_[i]);
-        if (ret < 0) {
-            SPDLOG_ERROR("RKNN 复制上下文失败: ctx={} ret={}", i, ret);
-            impl_->ReleaseAll();
-            return false;
-        }
-        impl_->ctx_created_[i] = true;
-        rknn_set_core_mask(impl_->ctxs_[i], RKNN_NPU_CORE_ALL);
+    ret = rknn_set_core_mask(impl_->ctxs_[0], impl_->npu_core_mask);
+    if (ret != RKNN_SUCC) {
+        SPDLOG_ERROR("RKNN设置NPU核心模式失败: mode={} ret={}",
+                     impl_->npu_core_mode, ret);
+        impl_->ReleaseAll();
+        return false;
     }
-    rknn_set_core_mask(impl_->ctxs_[0], RKNN_NPU_CORE_ALL);
 
     if (!impl_->QueryModelInfo()) {
         impl_->ReleaseAll();
@@ -623,8 +773,9 @@ bool RknnDetectionBackend::Load() {
     }
 
     impl_->loaded = true;
-    SPDLOG_INFO("RKNN 后端加载成功: 模型={} 输入={}x{} 输出模式={}",
+    SPDLOG_INFO("RKNN 后端加载成功: 模型={} 输入={}x{} NPU核心={} 上下文数=1 输出模式={}",
                 impl_->model_path, impl_->model_width_, impl_->model_height_,
+                impl_->npu_core_mode,
                 impl_->output_mode_ == Impl::OutputMode::kNormalizedXywh
                     ? "单输出归一化xywh"
                     : "多分支");
@@ -644,6 +795,20 @@ bool RknnDetectionBackend::IsLoaded() const {
 std::vector<BackendDetection> RknnDetectionBackend::Detect(
     const video::FrameHandle& frame) {
     return impl_->DetectFrame(frame);
+}
+
+DetectionBackendLatencySnapshot RknnDetectionBackend::LatencySnapshot() const {
+    DetectionBackendLatencySnapshot snapshot;
+    snapshot.preprocess_total = impl_->preprocess_total_latency.Snapshot();
+    snapshot.rga_resize_color = impl_->rga_resize_color_latency.Snapshot();
+    snapshot.letterbox_copy = impl_->letterbox_copy_latency.Snapshot();
+    snapshot.npu_run = impl_->npu_run_latency.Snapshot();
+    snapshot.npu_internal_run = impl_->npu_internal_run_latency.Snapshot();
+    snapshot.npu_wall_overhead = impl_->npu_wall_overhead_latency.Snapshot();
+    snapshot.npu_perf_query = impl_->npu_perf_query_latency.Snapshot();
+    snapshot.output_layout = impl_->output_layout_latency.Snapshot();
+    snapshot.postprocess = impl_->postprocess_latency.Snapshot();
+    return snapshot;
 }
 
 }  // namespace drone::perception

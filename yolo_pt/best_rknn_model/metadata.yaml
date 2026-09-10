@@ -1,0 +1,25 @@
+description: Ultralytics YOLO26n model trained on data.yaml
+author: Ultralytics
+date: '2026-09-09T23:11:40.392272+08:00'
+version: 8.4.131
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+head: Detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: Drone
+args:
+  data: /mnt/e/dswj/无人机/香橙派的代码/drone_test/yolo_pt/drone.v1i.yolo26/data.yaml
+  batch: 1
+  name: rk3588
+  fraction: 1.0
+  quantize: 8
+  simplify: true
+  opset: 19
+channels: 3
+end2end: false
