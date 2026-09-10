@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -40,6 +41,7 @@ struct Options {
     int duration_seconds = 60;
     int interval_seconds = 10;
     std::size_t yolo_queue_capacity = 0;  // 0=沿用配置
+    std::string yolo_model_path;          // 空=沿用配置
     std::string npu_core_mode;            // 空=沿用配置
     bool collect_npu_internal_perf = false;
     bool collect_npu_perf_detail = false;
@@ -55,6 +57,8 @@ Options ParseOptions(int argc, char** argv) {
             options.duration_seconds = std::stoi(argv[++index]);
         } else if (arg == "--interval" && index + 1 < argc) {
             options.interval_seconds = std::stoi(argv[++index]);
+        } else if (arg == "--yolo-model" && index + 1 < argc) {
+            options.yolo_model_path = argv[++index];
         } else if (arg == "--yolo-queue" && index + 1 < argc) {
             const int capacity = std::stoi(argv[++index]);
             if (capacity <= 0) {
@@ -76,7 +80,7 @@ Options ParseOptions(int argc, char** argv) {
         } else {
             throw std::invalid_argument(
                 "用法: video_latency_probe [--config path] [--duration 秒] "
-                "[--interval 秒] [--yolo-queue 容量] "
+                "[--interval 秒] [--yolo-model path] [--yolo-queue 容量] "
                 "[--npu-core auto|core0|core01|core012|all] "
                 "[--rknn-perf-run] [--rknn-perf-detail]");
         }
@@ -203,6 +207,14 @@ int main(int argc, char** argv) {
         // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
         config.decoder.slow_frame_threshold_ms = 10.0;
         config.decoder.prefer_rga_dma_transfer = true;
+        if (!options.yolo_model_path.empty()) {
+            const auto model_path =
+                std::filesystem::absolute(options.yolo_model_path).lexically_normal();
+            if (!std::filesystem::is_regular_file(model_path)) {
+                throw std::invalid_argument("YOLO模型不存在: " + model_path.string());
+            }
+            config.yolo.model_path = model_path.string();
+        }
         if (options.yolo_queue_capacity > 0) {
             config.yolo.input_queue_capacity = options.yolo_queue_capacity;
         }
@@ -221,8 +233,8 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 
-        std::cout << "视频延迟探针配置: YOLO输入队列容量="
-                  << config.yolo.input_queue_capacity
+        std::cout << "视频延迟探针配置: YOLO模型=" << config.yolo.model_path
+                  << " YOLO输入队列容量=" << config.yolo.input_queue_capacity
                   << " NPU核心模式=" << config.yolo.npu_core_mode
                   << " RKNN内部性能统计="
                   << config.yolo.collect_npu_internal_perf

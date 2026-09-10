@@ -64,6 +64,15 @@ YOLO输入队列A/B测试可用命令行临时覆盖，不修改正式JSON：
 
 容量必须为正数；未提供时沿用`yolo.input_queue_capacity`，代码缺省为2、当前生产为1。
 
+可用`--yolo-model`临时指定候选模型，不修改生产JSON：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 \
+    --yolo-model ./models/candidates/model.rknn --yolo-queue 1 --npu-core all
+```
+
+相对路径按探针启动时的当前目录解析；模型不存在时启动前直接拒绝。
+
 NPU core mask可做同模型A/B：
 
 ```bash
