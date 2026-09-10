@@ -107,9 +107,9 @@ ControlGroupConfig LoadControl(const Json& root) {
     c.frequency_hz = RequirePositive(RequireNumber(s, "control", "frequency_hz"),
                                      "control.frequency_hz");
     c.visual_stale_ms = RequireInteger(s, "control", "visual_stale_ms");
-    c.radar_stale_ms = RequireInteger(s, "control", "radar_stale_ms");
+    c.distance_stale_ms = RequireInteger(s, "control", "distance_stale_ms");
     c.attitude_stale_ms = RequireInteger(s, "control", "attitude_stale_ms");
-    if (c.visual_stale_ms <= 0 || c.radar_stale_ms <= 0 || c.attitude_stale_ms <= 0) {
+    if (c.visual_stale_ms <= 0 || c.distance_stale_ms <= 0 || c.attitude_stale_ms <= 0) {
         throw std::runtime_error("配置非法: control.*_stale_ms 必须为正");
     }
     return c;
@@ -193,6 +193,13 @@ DistanceGroupConfig LoadDistance(const Json& root) {
     d.no_distance_approach_limit_mps = RequireNonNegative(
         RequireNumber(s, "distance", "no_distance_approach_limit_mps"),
         "distance.no_distance_approach_limit_mps");
+    // 0 容许：等效旧版"首个无效拍即退出"行为
+    d.no_distance_exit_grace_ms = RequireInteger(s, "distance",
+                                                 "no_distance_exit_grace_ms");
+    if (d.no_distance_exit_grace_ms < 0) {
+        throw std::runtime_error(
+            "配置非法(不得为负): distance.no_distance_exit_grace_ms");
+    }
     return d;
 }
 

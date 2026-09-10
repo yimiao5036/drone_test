@@ -179,11 +179,11 @@ int main(int argc, char** argv) {
         snapshot.track = tracker.LastResult();
         snapshot.track_time_ms = now_ms;
 
-        // 雷达：正常阶段关联成立；Coast/刹车阶段取消关联（演示 §6.3 降级路径）
-        snapshot.radar_distance_m = 40.0 - 3.0 * elapsed_s;
-        snapshot.associated_to_target = (tick < normal_ticks) &&
-                                        snapshot.radar_distance_m > 0.0;
-        snapshot.radar_time_ms = now_ms;
+        // 双目距离：正常阶段有效；Coast/刹车阶段置无效（演示 §6.3 降级路径）
+        snapshot.target_distance_m = 40.0 - 3.0 * elapsed_s;
+        snapshot.distance_valid = (tick < normal_ticks) &&
+                                  snapshot.target_distance_m > 0.0;
+        snapshot.distance_time_ms = now_ms;
 
         // 自机姿态：演示中始终新鲜有效（接入主工程时来自 FlightStateSnapshot）
         snapshot.attitude_present = true;
@@ -209,11 +209,11 @@ int main(int argc, char** argv) {
         if (tick % 10 == 0) {
             spdlog::info(
                 "[t={:5.1f}s] 阶段={} 模式={}{} tracked={} vx={:+.2f} vy={:+.2f} "
-                "vz={:+.2f} yaw_rate={:+.1f}dps d={:5.1f}m 关联={}",
+                "vz={:+.2f} yaw_rate={:+.1f}dps d={:5.1f}m 有效={}",
                 elapsed_s, phase, ModeName(output.mode),
                 output.coast_active ? "(Coast)" : "", snapshot.track.tracked,
                 output.vx_mps, output.vy_mps, output.vz_mps, output.yaw_rate_dps,
-                snapshot.radar_distance_m, snapshot.associated_to_target);
+                snapshot.target_distance_m, snapshot.distance_valid);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));

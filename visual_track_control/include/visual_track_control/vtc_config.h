@@ -33,18 +33,19 @@ enum class HeadingMode : std::uint8_t {
     kPosition,  // 位置式：β → 修正量，与当前航向合成绝对航向输出 yaw_deg
 };
 
-/// 雷达距离不可用（未关联/超龄）时的距离通道降级动作（§6.3，具体动作待定）
+/// 目标距离不可用（无效/超龄）时的距离通道降级动作（§6.3）
 enum class NoDistanceAction : std::uint8_t {
     kHold,         // 保持：前向速度指令清零（安全占位语义）
     kSlowApproach, // 限速接近：按 no_distance_approach_limit_mps 缓速接近
-    kExit,         // 退出近距操作：输出降级保持（kDegradedHold）
+    kExit,         // 退出近距操作：持续无距离达 no_distance_exit_grace_ms 才
+                   // 降级保持（kDegradedHold）；grace 期间按 kSlowApproach 行为
 };
 
 /// control 组：控制周期与各输入超龄阈值（§7）
 struct ControlGroupConfig {
     double frequency_hz = 20.0;             // 控制频率（Hz，§7.1 待定）
     std::int64_t visual_stale_ms = 200;     // 视觉追踪结果超龄阈值（毫秒）
-    std::int64_t radar_stale_ms = 500;      // 雷达距离超龄阈值（毫秒）
+    std::int64_t distance_stale_ms = 500;   // 目标距离超龄阈值（毫秒）
     std::int64_t attitude_stale_ms = 300;   // 自机姿态超龄阈值（毫秒）
 };
 
@@ -84,8 +85,12 @@ struct DistanceGroupConfig {
     double derivative_filter_coef = 0.0;  // 微分一阶低通系数 ∈ [0,1)：0=不滤波
     double approach_velocity_limit_mps = 3.0;  // 接近速度限幅（米/秒，§8）
     double retreat_velocity_limit_mps = 1.0;   // 后退速度限幅（米/秒，§8）
-    NoDistanceAction no_distance_action = NoDistanceAction::kHold;  // 无距离降级（§6.3）
+    // 默认定速接近（D4 远场策略）：双目有效域外无距离是常态，退出仅留给
+    // 持续无距离（传感器级故障）场景
+    NoDistanceAction no_distance_action = NoDistanceAction::kSlowApproach;  // 无距离降级（§6.3）
     double no_distance_approach_limit_mps = 0.5;  // kSlowApproach 限速值（米/秒）
+    std::int64_t no_distance_exit_grace_ms = 3000;  // kExit 门限：持续无距离达
+                                                    // 此时长才退出（毫秒，占位）
 };
 
 /// accel_limit 组：各轴加速度限幅（§8，待定）

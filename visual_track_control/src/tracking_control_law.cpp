@@ -9,7 +9,8 @@
 //             消息，丢弃同周期距离通道前向速度导致逼近停滞，详见
 //             vtc_types.h ControlMode 注释）
 //   §6.2/§6.3 距离通道：Δd = d − d_exp → PID → 前向速度（限幅）；
-//             未关联/超龄 → 按配置降级动作（hold / slow_approach / exit）
+//             无效/超龄 → 按配置降级动作（hold / slow_approach / exit，
+//             exit 需持续无距离达 no_distance_exit_grace_ms 门限）
 //   §6.4      Coast（is_predicted）清航向/距离积分；判丢（!tracked）零速刹车
 //   §7.1      超龄数据只触发降级：姿态过期 → 禁止控制；视觉过期 → 降级保持
 //   §8        所有输出统一限幅；首条指令经变化率限幅（S6）
@@ -123,6 +124,7 @@ ControlOutput TrackingControlLaw::Update(const ControlSnapshot& snapshot,
 
     // ---- ② 判丢 → 零速刹车（§6.4：tracked == false 执行 kBrakeHover） ----
     if (!snapshot.track.tracked) {
+        no_distance_active_ = false;  // 刹车期间不计 kExit 无距离时长
         if (last_mode_ != ControlMode::kBrakeHover) {
             // 进入刹车：清积分与限幅器历史，恢复跟踪后指令从零渐变（S6 首条限幅）
             distance_pid_.Reset();
@@ -181,14 +183,16 @@ ControlOutput TrackingControlLaw::Update(const ControlSnapshot& snapshot,
     }
 
     // ---- ⑦ 距离通道（§6.2 / §6.3） ----
-    // 雷达距离不得直接当目标距离：仅关联成立且未超龄才可用（§6.3、FR-041）
+    // 目标距离来自检测框自身的双目测距：仅 distance_valid 且未超龄才可用
+    // （§6.3、FR-041）
     const bool distance_available =
-        snapshot.associated_to_target && snapshot.radar_distance_m > 0.0 &&
-        !StalenessChecker::IsStale(snapshot.radar_time_ms, now_ms,
-                                   cfg_.control.radar_stale_ms);
+        snapshot.distance_valid && snapshot.target_distance_m > 0.0 &&
+        !StalenessChecker::IsStale(snapshot.distance_time_ms, now_ms,
+                                   cfg_.control.distance_stale_ms);
     if (distance_available) {
+        no_distance_active_ = false;  // 任一有效距离帧重置 kExit 计时
         // Δd = d − d_exp：d > d_exp 前向接近，d < d_exp 减速/后退（§6.2）
-        const double delta_d = snapshot.radar_distance_m - cfg_.distance.d_exp_m;
+        const double delta_d = snapshot.target_distance_m - cfg_.distance.d_exp_m;
         const double vx_raw = distance_pid_.Update(delta_d, dt_s);
         const double slewed = vx_limiter_.Limit(vx_raw, dt_s);  // 加速度限幅（§8）
         out.vx_mps = Clamp(slewed, -cfg_.distance.retreat_velocity_limit_mps,
@@ -208,10 +212,24 @@ ControlOutput TrackingControlLaw::Update(const ControlSnapshot& snapshot,
                     cfg_.distance.no_distance_approach_limit_mps, dt_s);
                 break;
             case NoDistanceAction::kExit:
-                // 退出近距操作：整体降级保持
-                out.mode = ControlMode::kDegradedHold;
-                out.degraded_reason = DegradedReason::kNoDistanceExit;
-                return FinishAndLog("距离未关联，退出近距操作");
+                // 退出近距操作：双目有效域外无距离是常态（D4 远场定速接近），
+                // 首个无效拍不退出；持续无距离达 no_distance_exit_grace_ms
+                // （疑似传感器级故障）才降级。grace 期间按 kSlowApproach 行为
+                // 执行（经加速度限幅，vx 平滑过渡）；grace=0 保留旧"立即退出"
+                // 行为
+                if (!no_distance_active_) {
+                    no_distance_active_ = true;
+                    no_distance_since_ms_ = now_ms;
+                }
+                if (now_ms - no_distance_since_ms_ >=
+                    cfg_.distance.no_distance_exit_grace_ms) {
+                    out.mode = ControlMode::kDegradedHold;
+                    out.degraded_reason = DegradedReason::kNoDistanceExit;
+                    return FinishAndLog("持续无距离达门限，退出近距操作");
+                }
+                out.vx_mps = vx_limiter_.Limit(
+                    cfg_.distance.no_distance_approach_limit_mps, dt_s);
+                break;
         }
     }
 
@@ -232,6 +250,7 @@ void TrackingControlLaw::Reset() {
     yaw_rate_limiter_.Reset();
     vx_limiter_.Reset();
     vz_limiter_.Reset();
+    no_distance_active_ = false;
     last_now_ms_ = 0;
     last_mode_ = ControlMode::kDegradedHold;
 }

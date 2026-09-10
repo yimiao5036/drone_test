@@ -6,7 +6,7 @@
 // 对应规格：docs/物理追踪思路.md
 //   §4  水平航向控制（增益 → slew → 角速度限幅，位置式/速率式按配置）
 //   §5  垂直/高度控制（统一速度支路：α → 垂直速度，原双支路已合并）
-//   §6  距离控制（PID(Δd) → 前向速度；未关联按配置降级，§6.3）
+//   §6  距离控制（PID(Δd) → 前向速度；距离无效按配置降级，§6.3）
 //   §6.4 Coast 清积分、判丢零速刹车
 //   §7.1 超龄判定（姿态/视觉超龄 → 降级保持）
 //   §8   统一限幅
@@ -58,6 +58,11 @@ private:
     // ---- 节拍与状态（仅打日志用，不参与数学） ----
     std::int64_t last_now_ms_ = 0;                       // 上次计算时刻
     ControlMode last_mode_ = ControlMode::kDegradedHold; // 上次输出模式（状态切换日志）
+
+    // ---- kExit 无距离计时（§6.3：持续无距离达 no_distance_exit_grace_ms
+    //      才退出，任一有效距离帧重置） ----
+    bool no_distance_active_ = false;        // 当前是否处于连续无距离状态
+    std::int64_t no_distance_since_ms_ = 0;  // 连续无距离起始时刻（单调时钟）
 };
 
 }  // namespace drone::vtc

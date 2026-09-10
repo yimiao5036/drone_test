@@ -13,8 +13,8 @@
 //   - ControlSnapshot / ControlOutput 均为纯值类型（POD 风格），
 //     控制律热路径零堆分配；
 //   - 本库不依赖主工程 include/ 的任何类型，独立可编译；
-//   - 雷达距离必须带 associated_to_target 关联标志：未关联不得当作
-//     目标距离（§6.3、需求分析.md FR-041）。
+//   - 目标距离必须带 distance_valid 有效标志：无效值不得当作目标距离
+//     （§6.3、需求分析.md FR-041）。
 // =============================================================================
 
 #include <cstdint>
@@ -54,10 +54,11 @@ struct ControlSnapshot {
     drone::tracker::TrackResult track;  // 追踪库结果（值拷贝）
     std::int64_t track_time_ms = 0;     // 取样单调时钟（毫秒），<=0 视为从未取样
 
-    // ---- 雷达距离（§6.3：未关联仅为前向安全距离，不得当目标距离） ----
-    double radar_distance_m = 0.0;      // 机头前向单点距离（米）
-    bool associated_to_target = false;  // 相机—雷达空间关联成立标志
-    std::int64_t radar_time_ms = 0;     // 取样单调时钟（毫秒）
+    // ---- 目标距离（双目立体测距，§6.3：distance_valid == false 时不得
+    //      当作目标距离） ----
+    double target_distance_m = 0.0;     // 目标距离（米，双目前向分量 Z）
+    bool distance_valid = false;        // 距离有效标志（测距来自检测框自身，无跨模态关联）
+    std::int64_t distance_time_ms = 0;  // 取样单调时钟（毫秒）
 
     // ---- 自机姿态/速度 ----
     // 姿态过期 → 禁止控制（§9.2）。`yaw_rad` 参与输出端机体系→NED 旋转
