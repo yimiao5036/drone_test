@@ -4,7 +4,7 @@
     "control": {
         "frequency_hz": 20.0,
         "visual_stale_ms": 200,
-        "radar_stale_ms": 500,
+        "distance_stale_ms": 500,
         "attitude_stale_ms": 300
     },
 
@@ -36,8 +36,9 @@
         "derivative_filter_coef": 0.2,
         "approach_velocity_limit_mps": 3.0,
         "retreat_velocity_limit_mps": 1.0,
-        "no_distance_action": "hold",
-        "no_distance_approach_limit_mps": 0.5
+        "no_distance_action": "slow_approach",
+        "no_distance_approach_limit_mps": 0.5,
+        "no_distance_exit_grace_ms": 3000
     },
 
     "accel_limit": {

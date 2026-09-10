@@ -30,7 +30,7 @@ const char* kFullJson = R"({
     "control": {
         "frequency_hz": 20.0,
         "visual_stale_ms": 200,
-        "radar_stale_ms": 500,
+        "distance_stale_ms": 500,
         "attitude_stale_ms": 300
     },
     "camera": {
@@ -59,7 +59,8 @@ const char* kFullJson = R"({
         "approach_velocity_limit_mps": 3.0,
         "retreat_velocity_limit_mps": 1.0,
         "no_distance_action": "hold",
-        "no_distance_approach_limit_mps": 0.5
+        "no_distance_approach_limit_mps": 0.5,
+        "no_distance_exit_grace_ms": 3000
     },
     "accel_limit": {
         "ax_mps2": 2.0,
@@ -96,7 +97,9 @@ TEST(VtcConfigTest, LoadRealConfigSucceeds) {
     EXPECT_DOUBLE_EQ(cfg.vertical.vz_gain_mps_per_deg, 0.1);
     EXPECT_DOUBLE_EQ(cfg.vertical.vz_limit_mps, 2.0);
     EXPECT_DOUBLE_EQ(cfg.distance.d_exp_m, 10.0);
-    EXPECT_EQ(cfg.distance.no_distance_action, NoDistanceAction::kHold);
+    EXPECT_EQ(cfg.distance.no_distance_action, NoDistanceAction::kSlowApproach);
+    EXPECT_EQ(cfg.distance.no_distance_exit_grace_ms, 3000);
+    EXPECT_EQ(cfg.control.distance_stale_ms, 500);
     EXPECT_DOUBLE_EQ(cfg.accel_limit.ax_mps2, 2.0);
 }
 
@@ -217,6 +220,27 @@ TEST(VtcConfigTest, FovOutOfRangeThrows) {
         FAIL() << "应当抛出异常";
     } catch (const std::runtime_error& e) {
         EXPECT_NE(std::string(e.what()).find("camera.fov_h_deg"), std::string::npos);
+    }
+    std::remove(path.c_str());
+}
+
+TEST(VtcConfigTest, DefaultNoDistanceActionIsSlowApproach) {
+    // S1 拍板：双目有效域外无距离是常态，默认定速接近（纪要 D4/S1）
+    const TrackingConfig cfg;
+    EXPECT_EQ(cfg.distance.no_distance_action, NoDistanceAction::kSlowApproach);
+}
+
+TEST(VtcConfigTest, NegativeExitGraceThrows) {
+    std::string json = kFullJson;
+    ReplaceOnce(json, "\"no_distance_exit_grace_ms\": 3000",
+                "\"no_distance_exit_grace_ms\": -1");
+    const std::string path = WriteTempJson(json, "vtc_cfg_badgrace.json");
+    try {
+        TrackingConfig::LoadFromJson(path);
+        FAIL() << "应当抛出异常";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("no_distance_exit_grace_ms"),
+                  std::string::npos);
     }
     std::remove(path.c_str());
 }
