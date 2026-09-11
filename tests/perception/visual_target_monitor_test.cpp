@@ -246,6 +246,24 @@ TEST_F(VisualTargetMonitorTest, MultipleCandidatesUseHighestConfidenceAndCountEr
     EXPECT_EQ(monitor_->LastStatus().state, common::VisualTargetState::kAcquiring);
 }
 
+TEST_F(VisualTargetMonitorTest, CountsOnlyRealStateTransitions) {
+    // 计数只反映真实状态变化，而不是逐帧推进，便于通过累计转换数发现检测抖动。
+    ASSERT_TRUE(monitor_->Start());
+
+    Publish(MakeObservation(1, true));   // ACQUIRING
+    Publish(MakeObservation(2, true));   // 仍为 ACQUIRING
+    Publish(MakeObservation(3, true));   // LOCKED
+    Publish(MakeObservation(4, false));  // 锁定容忍，仍为 LOCKED
+    Publish(MakeObservation(5, false));  // 仍为 LOCKED
+    Publish(MakeObservation(6, false));  // LOST
+
+    ASSERT_TRUE(WaitFor([this] { return monitor_->ObservationCount() == 6; }));
+    ASSERT_TRUE(WaitFor([this] {
+        return monitor_->LastStatus().state == common::VisualTargetState::kLost;
+    }));
+    EXPECT_EQ(monitor_->StateTransitionCount(), 3u);
+}
+
 TEST_F(VisualTargetMonitorTest, RestartResetsStabilityState) {
     ASSERT_TRUE(monitor_->Start());
     for (uint64_t i = 1; i <= 3; ++i) {

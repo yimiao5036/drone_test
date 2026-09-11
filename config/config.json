@@ -85,7 +85,9 @@
         "observation_timeout_ms": 500,
         "lock_frames": 5,
         "lost_frames": 10,
-        "smoothing_alpha": 0.3
+        "smoothing_alpha": 0.3,
+        "transition_log_interval_ms": 1000,
+        "status_log_interval_ms": 5000
     },
     "ground_station": {
         "aircraft_system_id": 1,

@@ -90,9 +90,11 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.visual_monitor.lock_frames, 5);
     EXPECT_EQ(config.visual_monitor.lost_frames, 10);
     EXPECT_DOUBLE_EQ(config.visual_monitor.smoothing_alpha, 0.3);
+    EXPECT_EQ(config.visual_monitor.transition_log_interval.count(), 1000);
+    EXPECT_EQ(config.visual_monitor.status_log_interval.count(), 5000);
     EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
     EXPECT_EQ(config.yolo.model_path,
-              "/opt/drone/models/yolo26n-drone-best.rknn");
+              "/opt/drone/models/yolo26n-drone-relu6-e184.rknn");
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
     EXPECT_EQ(config.yolo.npu_core_mode, "all");
     EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
@@ -158,6 +160,17 @@ TEST(ConfigTest, RejectsInvalidVisualMonitorThreshold) {
     value["visual_monitor"]["lock_frames"] = 0;
     const auto path = WriteTemporaryConfig(
         value, "drone_config_visual_monitor_threshold_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualMonitorLogInterval) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["status_log_interval_ms"] = 0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_log_interval_invalid.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

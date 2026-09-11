@@ -52,6 +52,21 @@ bool ShouldLogThrottled(uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+/// 状态名，用于日志与排查时对应文档中的状态机。
+const char* StateName(common::VisualTargetState state) {
+    switch (state) {
+        case common::VisualTargetState::kSearching:
+            return "SEARCHING";
+        case common::VisualTargetState::kAcquiring:
+            return "ACQUIRING";
+        case common::VisualTargetState::kLocked:
+            return "LOCKED";
+        case common::VisualTargetState::kLost:
+            return "LOST";
+    }
+    return "UNKNOWN";
+}
+
 }  // namespace
 
 void VisualTargetMonitorConfig::Validate() const {
@@ -73,6 +88,12 @@ void VisualTargetMonitorConfig::Validate() const {
     if (!(smoothing_alpha > 0.0) || smoothing_alpha > 1.0) {
         throw std::invalid_argument("视觉稳定性判定平滑系数必须在(0,1]");
     }
+    if (transition_log_interval.count() <= 0) {
+        throw std::invalid_argument("视觉稳定性判定状态日志间隔必须为正数");
+    }
+    if (status_log_interval.count() <= 0) {
+        throw std::invalid_argument("视觉稳定性判定摘要日志间隔必须为正数");
+    }
 }
 
 struct VisualTargetMonitor::Impl {
@@ -88,6 +109,7 @@ struct VisualTargetMonitor::Impl {
 
     std::atomic<uint64_t> observation_count{0};
     std::atomic<uint64_t> error_count{0};
+    std::atomic<uint64_t> state_transition_count{0};
     uint64_t status_sequence = 0;
 
     // 以下状态为消费线程独占，无需加锁。
@@ -104,11 +126,33 @@ struct VisualTargetMonitor::Impl {
     uint32_t frame_width = 0;
     uint32_t frame_height = 0;
 
+    // 状态变化与摘要日志：状态可能因检测间歇而高频翻转，因此按时间节流；
+    // 被压制的变化保持 pending，等到间隔满足后仍会被记录，避免丢掉最终状态。
+    common::VisualTargetState last_logged_state =
+        common::VisualTargetState::kSearching;
+    bool state_log_pending = false;
+    uint64_t last_transition_log_ms = 0;
+    uint64_t last_status_log_ms = 0;
+
     mutable std::mutex last_status_mutex;
     common::VisualTargetStatus last_status;
 
+    /// 统一入口的状态赋值，负责变化检测与日志 pending 标记。
+    void SetState(common::VisualTargetState next) {
+        if (next == state) {
+            return;
+        }
+        state = next;
+        state_log_pending = true;
+        ++state_transition_count;
+    }
+
     void ResetState() {
         state = common::VisualTargetState::kSearching;
+        last_logged_state = common::VisualTargetState::kSearching;
+        state_log_pending = false;
+        last_transition_log_ms = 0;
+        last_status_log_ms = 0;
         consecutive_detected = 0;
         consecutive_missed = 0;
         smoothing_initialized = false;
@@ -162,9 +206,9 @@ struct VisualTargetMonitor::Impl {
             UpdateSmoothing(observation.center_pixel_x, observation.center_pixel_y,
                             observation.confidence);
             last_seen_ms = now_ms;
-            state = consecutive_detected >= config.lock_frames
-                        ? common::VisualTargetState::kLocked
-                        : common::VisualTargetState::kAcquiring;
+            SetState(consecutive_detected >= config.lock_frames
+                         ? common::VisualTargetState::kLocked
+                         : common::VisualTargetState::kAcquiring);
             return;
         }
 
@@ -172,10 +216,10 @@ struct VisualTargetMonitor::Impl {
         consecutive_detected = 0;
         consecutive_missed += 1;
         if (consecutive_missed >= config.lost_frames) {
-            state = common::VisualTargetState::kLost;
+            SetState(common::VisualTargetState::kLost);
         } else if (state != common::VisualTargetState::kLocked) {
             // 未锁定时的漏检直接退回搜索；已锁定则容忍到丢失门限。
-            state = common::VisualTargetState::kSearching;
+            SetState(common::VisualTargetState::kSearching);
         }
     }
 
@@ -189,7 +233,7 @@ struct VisualTargetMonitor::Impl {
             return;
         }
         if (state != common::VisualTargetState::kLost) {
-            state = common::VisualTargetState::kLost;
+            SetState(common::VisualTargetState::kLost);
             consecutive_detected = 0;
             const uint64_t count = ++error_count;
             if (ShouldLogThrottled(count)) {
@@ -222,6 +266,35 @@ struct VisualTargetMonitor::Impl {
         return status;
     }
 
+    /// 状态变化日志与周期摘要。两者都是低频日志，不进入逐帧热路径。
+    void MaybeLog(uint64_t now_ms) {
+        if (state_log_pending &&
+            now_ms - last_transition_log_ms >=
+                static_cast<uint64_t>(config.transition_log_interval.count())) {
+            SPDLOG_INFO(
+                "视觉稳定性状态变化: {} -> {} 连续检测={} 连续丢失={} 置信度={:.2f} 累计转换={} 累计观测={}",
+                StateName(last_logged_state), StateName(state),
+                consecutive_detected, consecutive_missed, smoothed_confidence,
+                state_transition_count.load(), observation_count.load());
+            last_logged_state = state;
+            state_log_pending = false;
+            last_transition_log_ms = now_ms;
+        }
+
+        if (now_ms - last_status_log_ms >=
+            static_cast<uint64_t>(config.status_log_interval.count())) {
+            const uint64_t seen_age_ms =
+                last_seen_ms == 0 ? 0 : now_ms - last_seen_ms;
+            SPDLOG_INFO(
+                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 上次检测={}ms前 累计观测={} 累计转换={}",
+                StateName(state), state == common::VisualTargetState::kLocked,
+                consecutive_detected, consecutive_missed, smoothed_confidence,
+                smoothed_cx, smoothed_cy, seen_age_ms, observation_count.load(),
+                state_transition_count.load());
+            last_status_log_ms = now_ms;
+        }
+    }
+
     void PublishStatus(uint64_t now_ms) {
         common::VisualTargetStatus status = BuildStatus(now_ms);
         ++status_sequence;
@@ -245,6 +318,7 @@ struct VisualTargetMonitor::Impl {
             }
             const uint64_t now_ms = SteadyNowMs();
             CheckObservationTimeout(now_ms);
+            MaybeLog(now_ms);
             if (now_ms >= next_publish_ms) {
                 PublishStatus(now_ms);
                 next_publish_ms = SaturatingAddMs(
@@ -330,6 +404,10 @@ common::VisualTargetStatus VisualTargetMonitor::LastStatus() const {
 
 uint64_t VisualTargetMonitor::ObservationCount() const {
     return impl_->observation_count.load();
+}
+
+uint64_t VisualTargetMonitor::StateTransitionCount() const {
+    return impl_->state_transition_count.load();
 }
 
 uint64_t VisualTargetMonitor::ErrorCount() const {

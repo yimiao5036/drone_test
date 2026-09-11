@@ -47,6 +47,11 @@ struct VisualTargetMonitorConfig {
     int lost_frames = 10;          ///< 连续丢失达到该帧数判定为丢失
     /// 像素中心与置信度的指数滑动平均系数，范围(0,1]；1.0 表示不平滑。
     double smoothing_alpha = 0.3;
+    /// 状态变化日志的最小间隔。检测间歇抖动时状态可能高频翻转，
+    /// 按时间节流而不是按次数节流，保证“最后一次变化”仍会被记录。
+    std::chrono::milliseconds transition_log_interval{1000};
+    /// 周期性状态摘要日志间隔，用于长时间观察锁定/丢失趋势。
+    std::chrono::milliseconds status_log_interval{5000};
 
     void Validate() const;
 };
@@ -77,7 +82,9 @@ public:
 
     /// 累计消费的观测数（等于YOLO成功推理帧数）。
     uint64_t ObservationCount() const;
-    /// 累计错误次数（当前为观测队列溢出丢帧等异常）。
+    /// 累计状态转换次数；远大于预期值时说明检测在间歇抖动。
+    uint64_t StateTransitionCount() const;
+    /// 累计错误次数（观测超时、多候选等异常）。
     uint64_t ErrorCount() const;
 
 private:

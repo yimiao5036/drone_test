@@ -508,6 +508,13 @@ AppConfig LoadAppConfig(const std::string& path,
     if (config.visual_monitor.smoothing_alpha > 1.0) {
         throw std::invalid_argument("visual_monitor.smoothing_alpha必须在(0,1]");
     }
+    config.visual_monitor.transition_log_interval =
+        ReadOptionalPositiveMilliseconds(visual_monitor,
+                                         "transition_log_interval_ms",
+                                         config.visual_monitor.transition_log_interval);
+    config.visual_monitor.status_log_interval =
+        ReadOptionalPositiveMilliseconds(visual_monitor, "status_log_interval_ms",
+                                         config.visual_monitor.status_log_interval);
     config.visual_monitor.Validate();
 
     if (root.find("ground_station") != root.end()) {
