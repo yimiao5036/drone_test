@@ -204,6 +204,8 @@ int main(int argc, char** argv) {
         config.runtime.enable_px4 = false;
         config.runtime.enable_ground_station = false;
         config.runtime.enable_target_estimator = false;
+        // 探针只测视频阶段延迟：关闭视觉稳定性判定，避免额外线程干扰计时。
+        config.runtime.enable_visual_monitor = false;
         config.runtime.enable_control = false;
         // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
         config.decoder.slow_frame_threshold_ms = 10.0;

@@ -1,6 +1,17 @@
 # drone_test
 
-运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前视频/YOLO、PX4遥测、地面站MAVLink 2、TIMESYNC、目标UPDATE/ACK、健康/任务状态回传均已完成实机闭环；MissionStateMachine处于安全影子阶段。单目标`TargetEstimator`第一阶段已接入正式应用，将地面站WGS-84目标和PX4 Home转换为局部NED并进行恒速度线性卡尔曼影子估计。正式配置继续保持`enable_control=false`，不向PX4发送飞行控制。
+运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前视频/YOLO、PX4遥测、地面站MAVLink 2、TIMESYNC、目标UPDATE/ACK、健康/任务状态回传均已完成实机闭环；MissionStateMachine处于安全影子阶段。单目标`TargetEstimator`第一阶段已接入正式应用，将地面站WGS-84目标和PX4 Home转换为局部NED并进行恒速度线性卡尔曼影子估计。单目标视觉观测帧级链路也已接入：`YoloDetector`对每个成功推理帧发布一条`VisualTargetObservation`（允许无目标），`VisualTargetMonitor`据此输出视觉稳定性影子状态。正式配置继续保持`enable_control=false`，不向PX4发送飞行控制。
+
+## 第一次接触项目先看这里
+
+不要从某个大型`.cpp`文件开始猜数据流。按以下顺序阅读：
+
+1. [项目总览与数据流](docs/项目总览与数据流.md)：正式/影子/Stub边界、全部数据流、线程和当前硬件能力；
+2. [模块索引](docs/模块索引.md)：每个类的代码、Topic、配置、计数、测试和实现文档；
+3. [故障排查手册](docs/故障排查手册.md)：按“无画面、无检测、无图传、串口不通、无ACK”等现象定位；
+4. [新增设备接入指南](docs/新增设备接入指南.md)：以后替换摄像头、接双目或增加其他设备时的固定修改步骤。
+
+当前现场硬件只有香橙派、摄像头、图传/HM30和地面站，暂时没有PX4。当前可以完整验证视频和地面站物理链路；依赖PX4 Home、位置和姿态的目标NED实链、状态机导航和控制不能标记为当前已验证。
 
 ## 系统目标
 
@@ -18,6 +29,8 @@
 ```
 
 ## 已确认硬件与软件
+
+下表是产品设计目标，不等同于当前台架全部设备都在场；当前PX4不在现场。
 
 | 项目 | 当前方案 |
 |------|----------|
@@ -59,6 +72,15 @@
 
 ## 文档
 
+### 维护入口
+
+- [项目总览与数据流](docs/项目总览与数据流.md)
+- [模块索引](docs/模块索引.md)
+- [故障排查手册](docs/故障排查手册.md)
+- [新增设备接入指南](docs/新增设备接入指南.md)
+
+### 设计与阶段文档
+
 - [需求分析](docs/需求分析.md)
 - [系统架构设计](docs/系统架构设计.md)
 - [状态机设计](docs/状态机设计.md)
@@ -75,6 +97,7 @@
 - [YOLO26 RKNN逐层性能分析](docs/YOLO26_RKNN逐层性能分析.md)
 - [目标追踪库实现文档](target_tracker/target_tracker.md)
 - [视觉跟踪控制律实现文档](visual_track_control/视觉跟踪控制律实现文档.md)
+- [视觉目标稳定性判定实现文档](include/perception/视觉目标稳定性判定.md)
 - [Topic 发布订阅使用文档](include/common/topic.md)
 
 ### 模块实现文档（与代码同目录，随实现更新）
@@ -137,4 +160,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式视频链路已在香橙派闭环：H.265 RTSP → rkmpp硬解 → RGA DMA-BUF转存 → RKNN YOLO → 红色动态框叠加 → h264_rkmpp → MediaMTX/HM30；RGA DMA 600秒长测回退0。PX4链路已完成MAVLink解析、遥测快照、命令ACK基础和NED setpoint底层能力，SITL第3A~3D已验证Offboard、起降、水平运动和失联降级，但正式应用只接入遥测。地面站链路已完成捕网-01=`1/25`多机身份、TIMESYNC、65010/65011目标UPDATE/ACK、65012健康状态和65013任务状态回传，Web/HM30实链闭环已通过。`MissionStateMachine`当前只运行影子状态；正式单目标`TargetEstimator`也已并行接入，但其输出尚不参与状态机或控制。`target_tracker`独立目录保持不动，`visual_track_control`仍未接入`DroneApplication`。主工程在WSL2 Ubuntu 24.04下188/188测试通过；下一步是在香橙派/HM30实链验证目标NED方向、数量级、时效和噪声参数。正式配置继续保持`enable_control=false`。
+正式视频链路已在香橙派闭环：H.265 RTSP → rkmpp硬解 → RGA DMA-BUF转存 → RKNN YOLO → 红色动态框叠加 → h264_rkmpp → MediaMTX/HM30；RGA DMA 600秒长测回退0。PX4链路已完成MAVLink解析、遥测快照、命令ACK基础和NED setpoint底层能力，SITL第3A~3D已验证Offboard、起降、水平运动和失联降级，但正式应用只接入遥测。地面站链路已完成捕网-01=`1/25`多机身份、TIMESYNC、65010/65011目标UPDATE/ACK、65012健康状态和65013任务状态回传，Web/HM30实链闭环已通过。`MissionStateMachine`当前只运行影子状态；正式单目标`TargetEstimator`也已并行接入，但其输出尚不参与状态机或控制。`target_tracker`独立目录保持不动，`visual_track_control`仍未接入`DroneApplication`。主工程在WSL2 Ubuntu 24.04下203/203测试通过。由于当前没有PX4，目标NED实链暂不能验证；下一步在香橙派验证视觉稳定性时序（锁定/丢失/观测超时）并用实拍视频复核门限。正式配置继续保持`enable_control=false`。

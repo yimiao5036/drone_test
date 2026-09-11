@@ -2,7 +2,7 @@
 
 > 对应实现：`src/perception/yolo_detector.cpp`、`src/perception/yolo_postprocess.cpp`、
 > `src/perception/rknn_detection_backend.cpp`（香橙派条件编译）
-> 更新：2026-09-09
+> 更新：2026-09-11
 
 ## 功能职责
 
@@ -18,9 +18,9 @@
 
 边界：
 - 不做：目标跟踪（track_id 保持 0）、类别语义映射（class_id 透传模型类别，反无人机
-  专用模型定稿后由配置映射 0=无人机 1=障碍物）、帧级聚合（一帧多目标发布多条消息，
-  融合侧按 frame_sequence 聚合并做超时判丢）。
-- 不做：图像叠加标注（第 5 步图传链路）、光流（optical_flow_estimator 独立部件）。
+  专用模型定稿后由配置映射 0=无人机 1=障碍物）、多目标ID关联与主目标选举。
+- 不做：图像叠加标注（由 FrameCompositor 承担）、光流（optical_flow_estimator 独立部件）。
+- 视觉稳定性判定（连续检测/丢失、锁定状态）由 `visual_target_monitor` 承担，不在本部件内实现。
 
 ## 接口与数据流
 
@@ -31,9 +31,12 @@ IVideoDecoder::FrameOutput()
 YoloDetector::DetectLoop（独立线程）
         │  IDetectionBackend::Detect(frame)   ← 后端依赖注入
         ▼
-YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一条）
+        ├─► YoloDetector::DetectionOutput()  Topic<common::DetectionResult>
+        │     每目标一条，供 FrameCompositor 画框；一帧无目标时不发布
         │
-        ▼  IPerceptionFusion（第 4.7 步）
+        └─► YoloDetector::ObservationOutput() Topic<common::VisualTargetObservation>
+              每个成功推理帧恰好一条，允许 detected=false；
+              作为视觉链路的帧级节拍，供 VisualTargetMonitor 判定锁定/丢失
 ```
 
 - 接口签名：见 `include/perception/yolo_detector.h`（IYoloDetector 冻结于
@@ -50,6 +53,12 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 - 发布约定：每条 `DetectionResult` 一个目标；`frame_sequence` = 帧 `Info().sequence`；
   `header.source_time_ms` = 帧单调时间戳；`header.sequence` 检测器内递增；
   `inference_time_ms` 同帧多目标相同；一帧无检测不发布。
+- 帧级观测约定：`VisualTargetObservation` **每个成功推理帧发布且仅发布一条**，
+  一帧无目标时 `detected=false` 仍然发布。当前按单目标约定取置信度最高者为唯一目标，
+  `candidate_count` 记录本帧候选总数。推理失败或被跳过的帧不发布观测。
+  该消息解决了一个关键歧义：解码帧会被输入队列丢弃（容量为1），因此不能拿解码帧
+  序号判断“本帧推理完成”，下游只能靠本消息区分“本帧确实无目标”与“本帧未推理完”。
+  配套计数：`ObservationCount()`（成功推理帧数）、`DetectedObservationCount()`。
 
 ## 关键实现点
 
@@ -115,7 +124,8 @@ YOLO队列容量2→1的120秒A/B中，容量1仅少处理约38/2945帧（约1.3
   期望结果：`yolo_postprocess_test` 验证多分支量化解码，以及 `[1,5,N]` 的阈值过滤、
   单类别 NMS、1280×720→640×640 letterbox 坐标还原；`yolo_detector_test` 验证
   Start/Stop 幂等、无后端失败、检测字段完整、帧序号关联、后端故障恢复、无效帧跳过、
-  停机后停止消费、停止后重启。
+  停机后停止消费、停止后重启，以及帧级观测契约：无目标帧仍发布一条观测、
+  多候选取置信度最高者、逐帧观测序号推进且不重复。
 - **香橙派实机**：CMake 在目标架构为 `aarch64/arm64` 时默认开启 `DRONE_HAVE_RKNN`；
   x86_64 开发机默认关闭。已有 `build/CMakeCache.txt` 会保留旧值，香橙派首次切换可执行
   `cmake -S . -B build -U DRONE_HAVE_RKNN` 让架构默认值重新生效，或显式执行
@@ -144,7 +154,11 @@ YOLO队列容量2→1的120秒A/B中，容量1仅少处理约38/2945帧（约1.3
   `地址, width, height, format, wstride, hstride`。若误写成把 format 放在最后，会出现
   `wstride=720, width=1280` 的 Invalid parameters。预处理内部 RGA 错误由外层按第 1 次和
   每 100 次节流，避免逐帧刷屏。`/usr/include/rga` 缺失时安装对应 librga 开发包。
-- **修改关联**：`DetectionResult` 字段与 `docs/数据接口文档.md` §2 冻结，改动需同步
+- **下游一直不锁定目标**：先确认 `ObservationCount()` 是否随帧增长。若不增长，说明
+  推理未成功（后端异常/无输入），而不是视觉稳定性门限问题；`VisualTargetMonitor`
+  会在观测超时后报“视觉观测超时”。
+- **修改关联**：`DetectionResult` 与 `VisualTargetObservation` 字段与
+  `docs/数据接口文档.md` §2 冻结，改动需同步
   文档并重跑 `yolo_detector_test`；后处理数值逻辑改动需同步原型
   `videoPart/yolo26-rknn`（避免两套实现漂移）；`IDetectionBackend` 新增后端时
   同步 `CreateDefaultDetectionBackend` 工厂与 CMake 条件编译。

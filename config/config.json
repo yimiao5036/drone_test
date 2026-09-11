@@ -8,6 +8,7 @@
         "enable_px4": true,
         "enable_ground_station": true,
         "enable_target_estimator": true,
+        "enable_visual_monitor": true,
         "enable_control": false
     },
     "health": {
@@ -78,6 +79,14 @@
         "default_vertical_accuracy_m": 15.0,
         "minimum_measurement_std_m": 0.5
     },
+    "visual_monitor": {
+        "input_queue_capacity": 2,
+        "publish_interval_ms": 100,
+        "observation_timeout_ms": 500,
+        "lock_frames": 5,
+        "lost_frames": 10,
+        "smoothing_alpha": 0.3
+    },
     "ground_station": {
         "aircraft_system_id": 1,
         "aircraft_component_id": 25,
@@ -130,7 +139,7 @@
         }
     },
     "yolo": {
-        "model_path": "models/yolo26n-drone-best.rknn",
+        "model_path": "models/yolo26n-drone-relu6-e184.rknn",
         "conf_threshold": 0.60,
         "nms_threshold": 0.45,
         "input_queue_capacity": 1,

@@ -102,6 +102,18 @@ std::size_t ReadOptionalPositiveSize(const json& object, const char* key,
     return static_cast<std::size_t>(value);
 }
 
+int ReadOptionalPositiveInt(const json& object, const char* key,
+                            int default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const int64_t value = object.at(key).get<int64_t>();
+    if (value <= 0 || value > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(std::string(key) + " 必须为正整数");
+    }
+    return static_cast<int>(value);
+}
+
 // 资源相对路径解析：绝对路径（以 / 开头）或空串原样返回，
 // 否则拼接在可执行文件目录后，避免依赖启动时的当前工作目录。
 std::string ResolveAssetPath(const std::string& value,
@@ -395,6 +407,8 @@ AppConfig LoadAppConfig(const std::string& path,
         runtime.value("enable_ground_station", false);
     config.runtime.enable_target_estimator =
         runtime.value("enable_target_estimator", false);
+    config.runtime.enable_visual_monitor =
+        runtime.value("enable_visual_monitor", false);
     config.runtime.enable_control = runtime.value("enable_control", false);
     if (!config.runtime.enable_video && !config.runtime.enable_px4 &&
         !config.runtime.enable_ground_station) {
@@ -410,6 +424,10 @@ AppConfig LoadAppConfig(const std::string& path,
         (!config.runtime.enable_ground_station || !config.runtime.enable_px4)) {
         throw std::invalid_argument(
             "enable_target_estimator=true时必须同时启用地面站和PX4链路");
+    }
+    if (config.runtime.enable_visual_monitor && !config.runtime.enable_video) {
+        throw std::invalid_argument(
+            "enable_visual_monitor=true时必须启用视频链路（观测来源为YoloDetector）");
     }
     if (config.runtime.enable_control) {
         throw std::invalid_argument("正式控制装配尚未开放，enable_control必须为false");
@@ -469,6 +487,28 @@ AppConfig LoadAppConfig(const std::string& path,
                                    "minimum_measurement_std_m",
                                    config.target_estimator.minimum_measurement_std_m);
     config.target_estimator.Validate();
+
+    // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。
+    const json visual_monitor = root.value("visual_monitor", json::object());
+    config.visual_monitor.input_queue_capacity = ReadOptionalPositiveSize(
+        visual_monitor, "input_queue_capacity",
+        config.visual_monitor.input_queue_capacity);
+    config.visual_monitor.publish_interval = ReadOptionalPositiveMilliseconds(
+        visual_monitor, "publish_interval_ms",
+        config.visual_monitor.publish_interval);
+    config.visual_monitor.observation_timeout = ReadOptionalPositiveMilliseconds(
+        visual_monitor, "observation_timeout_ms",
+        config.visual_monitor.observation_timeout);
+    config.visual_monitor.lock_frames = ReadOptionalPositiveInt(
+        visual_monitor, "lock_frames", config.visual_monitor.lock_frames);
+    config.visual_monitor.lost_frames = ReadOptionalPositiveInt(
+        visual_monitor, "lost_frames", config.visual_monitor.lost_frames);
+    config.visual_monitor.smoothing_alpha = ReadOptionalPositiveDouble(
+        visual_monitor, "smoothing_alpha", config.visual_monitor.smoothing_alpha);
+    if (config.visual_monitor.smoothing_alpha > 1.0) {
+        throw std::invalid_argument("visual_monitor.smoothing_alpha必须在(0,1]");
+    }
+    config.visual_monitor.Validate();
 
     if (root.find("ground_station") != root.end()) {
         config.ground_station = ParseGroundStationConfig(root);

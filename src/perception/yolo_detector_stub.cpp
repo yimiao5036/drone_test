@@ -49,8 +49,20 @@ common::Topic<common::DetectionResult>& YoloDetectorStub::DetectionOutput() {
     return detection_output_;
 }
 
+common::Topic<common::VisualTargetObservation>& YoloDetectorStub::ObservationOutput() {
+    return observation_output_;
+}
+
 uint64_t YoloDetectorStub::ProcessedFrameCount() const {
     return processed_count_;
+}
+
+uint64_t YoloDetectorStub::ObservationCount() const {
+    return 0;
+}
+
+uint64_t YoloDetectorStub::DetectedObservationCount() const {
+    return 0;
 }
 
 float YoloDetectorStub::InferenceTimeMsAvg() const {

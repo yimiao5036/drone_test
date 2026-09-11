@@ -75,6 +75,54 @@ struct DetectionResult {
     float inference_time_ms = 0.f;///< 推理耗时
 };
 
+/// 单目标视觉观测（YOLO → 视觉稳定性判定/后续视觉跟踪）。
+/// YoloDetector 对每一个成功完成推理的帧发布且仅发布一条：
+/// - 本帧检测到目标：detected=true，几何字段有效，取置信度最高者作为唯一目标；
+/// - 本帧没有目标：detected=false，几何字段无效。
+/// 这是视觉链路的帧级节拍。解码帧会被实时队列丢弃（YOLO输入队列容量为1），
+/// 因此不能拿解码帧序号判断“本帧推理完成”，只有本消息能表达“该帧确实推理完成且结果为空”。
+struct VisualTargetObservation {
+    MessageHeader header;
+    uint64_t frame_sequence = 0;  ///< 对应已完成推理的图像帧序号
+    bool detected = false;        ///< 本帧是否检测到目标；false时后续几何字段无效
+    uint32_t class_id = 0;        ///< 类别：0=无人机
+    float confidence = 0.f;       ///< 唯一目标置信度 [0,1]
+    float bbox_x = 0.f;           ///< 像素坐标框左上角 x
+    float bbox_y = 0.f;           ///< 像素坐标框左上角 y
+    float bbox_w = 0.f;           ///< 像素坐标框宽
+    float bbox_h = 0.f;           ///< 像素坐标框高
+    float center_pixel_x = 0.f;   ///< 目标中心像素 x
+    float center_pixel_y = 0.f;   ///< 目标中心像素 y
+    uint32_t candidate_count = 0; ///< 本帧过滤后候选目标数（用于观测多目标出现）
+    uint32_t frame_width = 0;     ///< 图像有效宽，供归一化和后续标定使用
+    uint32_t frame_height = 0;    ///< 图像有效高
+    float inference_time_ms = 0.f;///< 本帧推理耗时
+};
+
+/// 单目标视觉稳定性状态。当前仅影子发布，不驱动飞行控制。
+enum class VisualTargetState : uint8_t {
+    kSearching = 0,  ///< 尚无稳定检测（从未检测到或短时丢失后未重新确认）
+    kAcquiring = 1,  ///< 连续检测但未达锁定门限
+    kLocked = 2,     ///< 连续稳定检测，可用于后续视觉跟踪门禁
+    kLost = 3,       ///< 连续丢失或观测超时
+};
+
+/// 单目标视觉稳定性状态（视觉稳定性判定 → 状态机/诊断影子消费者）。
+struct VisualTargetStatus {
+    MessageHeader header;
+    VisualTargetState state = VisualTargetState::kSearching;
+    uint64_t frame_sequence = 0;        ///< 最近一次观测对应的图像帧序号
+    uint64_t last_seen_ms = 0;          ///< 最近一次有效检测的单调时钟时间；从未检测为0
+    int consecutive_detected_frames = 0;///< 连续检测到目标的帧数
+    int consecutive_missed_frames = 0;  ///< 连续未检测到目标的帧数
+    float confidence = 0.f;             ///< 平滑后置信度
+    float center_pixel_x = 0.f;         ///< 平滑后目标中心像素 x
+    float center_pixel_y = 0.f;         ///< 平滑后目标中心像素 y
+    uint32_t frame_width = 0;           ///< 最近观测的图像宽
+    uint32_t frame_height = 0;          ///< 最近观测的图像高
+    bool valid = false;                 ///< 是否处于可用锁定状态（当前仅诊断用途）
+};
+
 /// 光流结果（光流估计 → 感知融合）。
 struct OpticalFlowResult {
     MessageHeader header;
@@ -301,6 +349,8 @@ namespace topics {
 inline constexpr char kCameraStream[] = "camera_stream";      ///< EncodedFrame
 inline constexpr char kDecodedFrame[] = "decoded_frame";      ///< video::FrameHandle
 inline constexpr char kDetection[] = "detection";             ///< DetectionResult
+inline constexpr char kVisualTarget[] = "visual_target";      ///< VisualTargetObservation
+inline constexpr char kVisualTargetStatus[] = "visual_target_status";  ///< VisualTargetStatus
 inline constexpr char kOpticalFlow[] = "optical_flow";        ///< OpticalFlowResult
 inline constexpr char kLaserRange[] = "laser_range";          ///< LaserRangeSample
 inline constexpr char kFusedTarget[] = "fused_target";        ///< TargetState（融合输出）

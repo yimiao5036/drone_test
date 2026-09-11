@@ -117,11 +117,16 @@ struct YoloDetector::Impl {
     common::Topic<video::FrameHandle>::Subscription input_sub;
     common::Topic<video::FrameHandle>* input_topic = nullptr;  // SetInput 记录，重启时重新订阅
     common::Topic<common::DetectionResult> detection_output;
+    // 帧级单目标观测输出：每个成功推理帧一条（允许无目标）。
+    common::Topic<common::VisualTargetObservation> observation_output;
 
     // 统计
     std::atomic<uint64_t> processed_count{0};
     std::atomic<uint64_t> error_count{0};
     std::atomic<uint64_t> sequence{0};
+    std::atomic<uint64_t> observation_count{0};
+    std::atomic<uint64_t> detected_observation_count{0};
+    std::atomic<uint64_t> observation_sequence{0};
     std::atomic<float> avg_inference_ms{0.f};
     common::LatencyStatistics input_queue_latency;
     common::LatencyStatistics inference_latency;
@@ -210,6 +215,47 @@ struct YoloDetector::Impl {
                 result.center_pixel_y = (d.y1 + d.y2) * 0.5f;
                 result.inference_time_ms = elapsed_ms;
                 (void)detection_output.Emplace(std::move(result));
+            }
+
+            // 帧级单目标观测：每个成功推理的帧发布且仅发布一条，允许无目标。
+            // 解码帧会被输入队列丢弃，因此下游只能靠本消息区分
+            // “本帧确实没有目标” 与 “本帧还没推理完”。
+            // 当前按“单目标”约定取置信度最高者，不做ID关联或NMS后重选。
+            const BackendDetection* primary = nullptr;
+            for (const auto& d : detections) {
+                if (primary == nullptr || d.confidence > primary->confidence) {
+                    primary = &d;
+                }
+            }
+
+            common::VisualTargetObservation observation;
+            observation.header.sequence = observation_sequence.fetch_add(1) + 1;
+            observation.header.source_time_ms =
+                static_cast<std::uint64_t>(source_time_ms);
+            observation.header.receive_time_ms =
+                static_cast<std::uint64_t>(SteadyNowMs());
+            observation.frame_sequence = frame_sequence;
+            observation.candidate_count =
+                static_cast<std::uint32_t>(detections.size());
+            observation.frame_width = frame.Info().width;
+            observation.frame_height = frame.Info().height;
+            observation.inference_time_ms = elapsed_ms;
+            if (primary != nullptr) {
+                observation.detected = true;
+                observation.class_id = static_cast<std::uint32_t>(primary->class_id);
+                observation.confidence = primary->confidence;
+                observation.bbox_x = primary->x1;
+                observation.bbox_y = primary->y1;
+                observation.bbox_w = primary->x2 - primary->x1;
+                observation.bbox_h = primary->y2 - primary->y1;
+                observation.center_pixel_x = (primary->x1 + primary->x2) * 0.5f;
+                observation.center_pixel_y = (primary->y1 + primary->y2) * 0.5f;
+            }
+            const bool detected = observation.detected;
+            (void)observation_output.Emplace(std::move(observation));
+            ++observation_count;
+            if (detected) {
+                ++detected_observation_count;
             }
         }
     }
@@ -307,8 +353,20 @@ common::Topic<common::DetectionResult>& YoloDetector::DetectionOutput() {
     return impl_->detection_output;
 }
 
+common::Topic<common::VisualTargetObservation>& YoloDetector::ObservationOutput() {
+    return impl_->observation_output;
+}
+
 uint64_t YoloDetector::ProcessedFrameCount() const {
     return impl_->processed_count.load();
+}
+
+uint64_t YoloDetector::ObservationCount() const {
+    return impl_->observation_count.load();
+}
+
+uint64_t YoloDetector::DetectedObservationCount() const {
+    return impl_->detected_observation_count.load();
 }
 
 float YoloDetector::InferenceTimeMsAvg() const {

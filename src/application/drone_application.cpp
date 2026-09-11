@@ -12,6 +12,7 @@
 #include "communication/px4_link.h"
 #include "perception/detection_backend.h"
 #include "perception/target_estimator.h"
+#include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
 #include "state_machine/mission_state_machine.h"
 #include "video/camera_receiver.h"
@@ -54,6 +55,12 @@ void DroneApplication::BuildComponents() {
         compositor_ = std::make_unique<video::FrameCompositor>(config_.compositor);
         video_sender_ =
             std::make_unique<video_transmission::VideoSender>(config_.video_sender);
+    }
+
+    // 视觉稳定性判定只消费YOLO帧级观测，属纯影子输出：不接状态机、不接控制。
+    if (config_.runtime.enable_visual_monitor && detector_ != nullptr) {
+        visual_monitor_ = std::make_unique<perception::VisualTargetMonitor>(
+            config_.visual_monitor);
     }
 
     if (config_.runtime.enable_px4) {
@@ -126,6 +133,10 @@ void DroneApplication::BindTopics() {
         video_sender_->SetInput(compositor_->AnnotatedOutput());
     }
 
+    if (visual_monitor_ != nullptr && detector_ != nullptr) {
+        visual_monitor_->SetInput(detector_->ObservationOutput());
+    }
+
     if (ground_station_link_ != nullptr && px4_link_ != nullptr) {
         ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
     }
@@ -163,6 +174,17 @@ bool DroneApplication::Start() {
 
     bool any_started = false;
     bool degraded = false;
+
+    // 视觉稳定性判定是YOLO帧级观测的消费者，必须先于检测器启动；
+    // 它只是影子状态，失败不影响视频链路本身。
+    if (visual_monitor_ != nullptr) {
+        if (!visual_monitor_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序视觉稳定性判定启动失败，视觉影子状态不可用");
+        } else {
+            any_started = true;
+        }
+    }
 
     if (video_sender_ != nullptr) {
         if (video_sender_->Start()) {
@@ -381,6 +403,11 @@ void DroneApplication::Stop() {
         detector_->Stop();
         compositor_->Stop();
         video_sender_->Stop();
+    }
+
+    // 视频生产者已停止，再停止其观测消费者。
+    if (visual_monitor_ != nullptr) {
+        visual_monitor_->Stop();
     }
 
     StopHealthReporter();

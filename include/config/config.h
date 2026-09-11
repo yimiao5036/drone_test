@@ -9,6 +9,7 @@
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "perception/target_estimator.h"
+#include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
@@ -27,6 +28,7 @@ struct RuntimeConfig {
     bool enable_px4 = true;
     bool enable_ground_station = false;
     bool enable_target_estimator = false;
+    bool enable_visual_monitor = false;
     bool enable_control = false;
 };
 
@@ -54,6 +56,7 @@ struct AppConfig {
     communication::Px4LinkConfig px4;
     communication::GroundStationLinkConfig ground_station;
     perception::TargetEstimatorConfig target_estimator;
+    perception::VisualTargetMonitorConfig visual_monitor;
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

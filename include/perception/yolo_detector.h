@@ -47,12 +47,20 @@ public:
     virtual void SetInput(common::Topic<video::FrameHandle>& input) = 0;
 
     // ---- 输出 ----
-    /// 检测结果输出主题：common::DetectionResult。
+    /// 检测结果输出主题：common::DetectionResult（每目标一条，供叠加器使用）。
     virtual common::Topic<common::DetectionResult>& DetectionOutput() = 0;
+    /// 帧级单目标观测输出主题：common::VisualTargetObservation。
+    /// 每个成功推理的帧发布且仅发布一条，允许 detected=false；
+    /// 供视觉稳定性判定和后续视觉跟踪区分“本帧无目标”与“本帧未推理完”。
+    virtual common::Topic<common::VisualTargetObservation>& ObservationOutput() = 0;
 
     // ---- 状态查询 ----
     /// 累计处理帧数。
     virtual uint64_t ProcessedFrameCount() const = 0;
+    /// 累计发布的帧级观测数（等于成功推理帧数）。
+    virtual uint64_t ObservationCount() const = 0;
+    /// 累计发布的“检测到目标”观测数。
+    virtual uint64_t DetectedObservationCount() const = 0;
     /// 最近推理平均耗时（毫秒）；未启动或未推理时为 0。
     virtual float InferenceTimeMsAvg() const = 0;
     /// 累计错误次数（模型推理失败等）。
@@ -82,8 +90,11 @@ struct YoloDetectorConfig {
 ///
 /// 检测结果发布约定：
 /// - 每个检测目标发布一条 DetectionResult，同一帧的多目标共享
-///   frame_sequence（= 帧 Info().sequence）与 inference_time_ms。
-/// - 一帧无检测时不发布（融合侧按帧超时判断跟踪丢失）。
+///   frame_sequence（= 帧 Info().sequence）与 inference_time_ms；
+///   一帧无检测时 DetectionResult 不发布。
+/// - 每个成功推理的帧另外发布且仅发布一条 VisualTargetObservation
+///   （detected 标志 + 置信度最高的唯一目标），一帧无目标时同样发布，
+///   作为视觉链路的帧级节拍供下游可靠判定丢失。
 ///
 /// 日志约定：创建/销毁（INFO）、启动失败/后端加载失败（ERROR）、
 /// 推理失败（ERROR 节流：第 1 次 + 每满 100 次）、无效帧跳过（WARN 节流）。
@@ -108,8 +119,11 @@ public:
     void SetInput(common::Topic<video::FrameHandle>& input) override;
 
     common::Topic<common::DetectionResult>& DetectionOutput() override;
+    common::Topic<common::VisualTargetObservation>& ObservationOutput() override;
 
     uint64_t ProcessedFrameCount() const override;
+    uint64_t ObservationCount() const override;
+    uint64_t DetectedObservationCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
     common::LatencySummary InputQueueLatency() const override;
@@ -138,8 +152,11 @@ public:
     void SetInput(common::Topic<video::FrameHandle>& input) override;
 
     common::Topic<common::DetectionResult>& DetectionOutput() override;
+    common::Topic<common::VisualTargetObservation>& ObservationOutput() override;
 
     uint64_t ProcessedFrameCount() const override;
+    uint64_t ObservationCount() const override;
+    uint64_t DetectedObservationCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
     common::LatencySummary InputQueueLatency() const override { return {}; }
@@ -153,6 +170,7 @@ private:
     float inference_time_ms_avg_ = 0.f;
     uint64_t error_count_ = 0;
     common::Topic<common::DetectionResult> detection_output_;
+    common::Topic<common::VisualTargetObservation> observation_output_;
 };
 
 }  // namespace drone::perception
