@@ -1,4 +1,6 @@
 /build/
+build_tracker/
+build_vtc/
 /cmake-build-*/
 /.idea/
 *.log

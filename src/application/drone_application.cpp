@@ -11,6 +11,7 @@
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "perception/detection_backend.h"
+#include "perception/target_estimator.h"
 #include "perception/yolo_detector.h"
 #include "state_machine/mission_state_machine.h"
 #include "video/camera_receiver.h"
@@ -32,9 +33,11 @@ DroneApplication::DroneApplication(config::AppConfig config)
     : config_(std::move(config)) {
     BuildComponents();
     BindTopics();
-    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} control={}",
+    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={}",
                 config_.runtime.enable_video, config_.runtime.enable_px4,
-                config_.runtime.enable_ground_station, config_.runtime.enable_control);
+                config_.runtime.enable_ground_station,
+                config_.runtime.enable_target_estimator,
+                config_.runtime.enable_control);
 }
 
 DroneApplication::~DroneApplication() {
@@ -59,6 +62,14 @@ void DroneApplication::BuildComponents() {
     if (config_.runtime.enable_ground_station) {
         ground_station_link_ = std::make_unique<communication::GroundStationLink>(
             config_.ground_station);
+    }
+
+    // 第一阶段目标估计器只消费地面站单目标和PX4 Home，以局部NED线性卡尔曼
+    // 发布影子TargetState；不创建控制器、不产生ControlIntent或Px4Setpoint。
+    if (config_.runtime.enable_target_estimator && px4_link_ != nullptr &&
+        ground_station_link_ != nullptr) {
+        target_estimator_ = std::make_unique<perception::TargetEstimator>(
+            config_.target_estimator);
     }
 
     // 健康管理器独立于具体数据链路；只注册实际创建的生产模块。
@@ -123,6 +134,13 @@ void DroneApplication::BindTopics() {
         ground_station_link_->SetHealthInput(health_manager_->Output());
     }
 
+    if (target_estimator_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr) {
+        target_estimator_->SetGroundTargetInput(
+            ground_station_link_->TargetOutput());
+        target_estimator_->SetFlightStateInput(px4_link_->StateOutput());
+    }
+
     if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr &&
         px4_link_ != nullptr && health_manager_ != nullptr) {
         mission_state_machine_->SetInputs(ground_station_link_->TargetOutput(),
@@ -179,6 +197,16 @@ bool DroneApplication::Start() {
         if (!camera_->Start()) {
             degraded = true;
             SPDLOG_ERROR("主程序摄像头接收启动失败，视频链路降级");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 影子目标估计器必须先于地面站/PX4生产者启动，避免漏掉首个Home或目标。
+    if (target_estimator_ != nullptr) {
+        if (!target_estimator_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序目标估计器启动失败，TargetState影子输出不可用");
         } else {
             any_started = true;
         }
@@ -363,6 +391,9 @@ void DroneApplication::Stop() {
     // 健康生产者停止后再停止其消费者。
     if (mission_state_machine_ != nullptr) {
         mission_state_machine_->Stop();
+    }
+    if (target_estimator_ != nullptr) {
+        target_estimator_->Stop();
     }
     if (ground_station_link_ != nullptr) {
         ground_station_link_->Stop();

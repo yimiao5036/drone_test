@@ -117,8 +117,8 @@ struct GroundStationTarget {
     float heading_deg = 0.f;      ///< 相对真北；无效为 NaN
     float horizontal_accuracy_m = 0.f;  ///< 水平定位精度
     float vertical_accuracy_m = 0.f;    ///< 垂直定位精度
-    /// 可选字段有效标志：bit0=vN bit1=vE bit2=vD bit3=heading
-    /// bit4=horizontal_accuracy bit5=vertical_accuracy
+    /// 可选字段有效标志：bit0=altitude bit1=vN bit2=vE bit3=vD
+    /// bit4=heading bit5=horizontal_accuracy bit6=vertical_accuracy
     uint32_t validity_flags = 0;
 };
 
@@ -286,13 +286,13 @@ struct TargetState {
     uint32_t target_id = 0;
     float pos_x_m = 0.f;       ///< 目标位置（坐标系见 frame_id）
     float pos_y_m = 0.f;
-    float pos_z_m = 0.f;
+    float pos_z_m = 0.f;       ///< 垂直状态无效时为NaN
     float vel_x_mps = 0.f;     ///< 目标速度
     float vel_y_mps = 0.f;
-    float vel_z_mps = 0.f;
+    float vel_z_mps = 0.f;     ///< 垂直状态无效时为NaN
     float confidence = 0.f;    ///< 估计置信度 [0,1]
     uint64_t last_observed_ms = 0;  ///< 最近有效观测时间
-    bool valid = false;        ///< 估计是否可被控制使用
+    bool valid = false;        ///< 水平估计是否新鲜有效；需要三维的消费者还必须检查Z/VZ有限
 };
 
 /// Topic 名称常量。全工程统一引用，禁止字符串散落。

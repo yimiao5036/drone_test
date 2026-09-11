@@ -1,6 +1,7 @@
 #include "config/config.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -74,6 +75,31 @@ std::chrono::milliseconds ReadOptionalPositiveMilliseconds(
         return default_value;
     }
     return ReadPositiveMilliseconds(object, key);
+}
+
+// 目标估计器噪声参数允许配置节缺省；显式提供时必须为有限正数。
+double ReadOptionalPositiveDouble(const json& object, const char* key,
+                                  double default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const double value = object.at(key).get<double>();
+    if (!std::isfinite(value) || value <= 0.0) {
+        throw std::invalid_argument(std::string(key) + " 必须为有限正数");
+    }
+    return value;
+}
+
+std::size_t ReadOptionalPositiveSize(const json& object, const char* key,
+                                     std::size_t default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const int64_t value = object.at(key).get<int64_t>();
+    if (value <= 0) {
+        throw std::invalid_argument(std::string(key) + " 必须为正数");
+    }
+    return static_cast<std::size_t>(value);
 }
 
 // 资源相对路径解析：绝对路径（以 / 开头）或空串原样返回，
@@ -367,6 +393,8 @@ AppConfig LoadAppConfig(const std::string& path,
     config.runtime.enable_px4 = runtime.value("enable_px4", true);
     config.runtime.enable_ground_station =
         runtime.value("enable_ground_station", false);
+    config.runtime.enable_target_estimator =
+        runtime.value("enable_target_estimator", false);
     config.runtime.enable_control = runtime.value("enable_control", false);
     if (!config.runtime.enable_video && !config.runtime.enable_px4 &&
         !config.runtime.enable_ground_station) {
@@ -377,6 +405,11 @@ AppConfig LoadAppConfig(const std::string& path,
     }
     if (config.runtime.enable_ground_station && !config.runtime.enable_px4) {
         throw std::invalid_argument("当前地面站遥测链路启用时必须同时启用PX4链路");
+    }
+    if (config.runtime.enable_target_estimator &&
+        (!config.runtime.enable_ground_station || !config.runtime.enable_px4)) {
+        throw std::invalid_argument(
+            "enable_target_estimator=true时必须同时启用地面站和PX4链路");
     }
     if (config.runtime.enable_control) {
         throw std::invalid_argument("正式控制装配尚未开放，enable_control必须为false");
@@ -399,6 +432,43 @@ AppConfig LoadAppConfig(const std::string& path,
         health, "px4_max_age_ms", config.health.px4_max_age);
     config.health.ground_station_max_age = ReadOptionalPositiveMilliseconds(
         health, "ground_station_max_age_ms", config.health.ground_station_max_age);
+
+    // 单目标线性卡尔曼影子参数。数值为第一阶段初值，必须由录制数据复核整定。
+    const json target_estimator =
+        root.value("target_estimator", json::object());
+    config.target_estimator.ground_target_queue_capacity =
+        ReadOptionalPositiveSize(target_estimator, "ground_target_queue_capacity",
+                                 config.target_estimator.ground_target_queue_capacity);
+    config.target_estimator.flight_state_queue_capacity =
+        ReadOptionalPositiveSize(target_estimator, "flight_state_queue_capacity",
+                                 config.target_estimator.flight_state_queue_capacity);
+    config.target_estimator.publish_interval =
+        ReadOptionalPositiveMilliseconds(target_estimator, "publish_interval_ms",
+                                         config.target_estimator.publish_interval);
+    config.target_estimator.process_acceleration_std_mps2 =
+        ReadOptionalPositiveDouble(target_estimator,
+                                   "process_acceleration_std_mps2",
+                                   config.target_estimator.process_acceleration_std_mps2);
+    config.target_estimator.initial_velocity_std_mps =
+        ReadOptionalPositiveDouble(target_estimator, "initial_velocity_std_mps",
+                                   config.target_estimator.initial_velocity_std_mps);
+    config.target_estimator.velocity_measurement_std_mps =
+        ReadOptionalPositiveDouble(target_estimator,
+                                   "velocity_measurement_std_mps",
+                                   config.target_estimator.velocity_measurement_std_mps);
+    config.target_estimator.default_horizontal_accuracy_m =
+        ReadOptionalPositiveDouble(target_estimator,
+                                   "default_horizontal_accuracy_m",
+                                   config.target_estimator.default_horizontal_accuracy_m);
+    config.target_estimator.default_vertical_accuracy_m =
+        ReadOptionalPositiveDouble(target_estimator,
+                                   "default_vertical_accuracy_m",
+                                   config.target_estimator.default_vertical_accuracy_m);
+    config.target_estimator.minimum_measurement_std_m =
+        ReadOptionalPositiveDouble(target_estimator,
+                                   "minimum_measurement_std_m",
+                                   config.target_estimator.minimum_measurement_std_m);
+    config.target_estimator.Validate();
 
     if (root.find("ground_station") != root.end()) {
         config.ground_station = ParseGroundStationConfig(root);

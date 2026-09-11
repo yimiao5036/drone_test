@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
         config.runtime.enable_video = true;
         config.runtime.enable_px4 = false;
         config.runtime.enable_ground_station = false;
+        config.runtime.enable_target_estimator = false;
         config.runtime.enable_control = false;
         // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
         config.decoder.slow_frame_threshold_ms = 10.0;

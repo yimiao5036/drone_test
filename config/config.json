@@ -7,6 +7,7 @@
         "enable_video": true,
         "enable_px4": true,
         "enable_ground_station": true,
+        "enable_target_estimator": true,
         "enable_control": false
     },
     "health": {
@@ -65,6 +66,17 @@
             "write_timeout_ms": 100
         },
         "reconnect_interval_ms": 1000
+    },
+    "target_estimator": {
+        "ground_target_queue_capacity": 4,
+        "flight_state_queue_capacity": 2,
+        "publish_interval_ms": 100,
+        "process_acceleration_std_mps2": 8.0,
+        "initial_velocity_std_mps": 20.0,
+        "velocity_measurement_std_mps": 5.0,
+        "default_horizontal_accuracy_m": 10.0,
+        "default_vertical_accuracy_m": 15.0,
+        "minimum_measurement_std_m": 0.5
     },
     "ground_station": {
         "aircraft_system_id": 1,
