@@ -11,3 +11,6 @@ build_vtc/
 yolo_pt/
 23H1628889HV1规格书(中英).pdf
 
+yolo_pt/模型导出与转换说明.md
+yolo_pt/export_rknn_candidates.py
+yolo_pt/pt_rknn.py

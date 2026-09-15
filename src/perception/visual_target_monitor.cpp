@@ -27,6 +27,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -108,6 +109,7 @@ struct VisualTargetMonitor::Impl {
     std::thread thread;
 
     std::atomic<uint64_t> observation_count{0};
+    std::atomic<uint64_t> detected_observation_count{0};
     std::atomic<uint64_t> error_count{0};
     std::atomic<uint64_t> state_transition_count{0};
     uint64_t status_sequence = 0;
@@ -133,6 +135,7 @@ struct VisualTargetMonitor::Impl {
     bool state_log_pending = false;
     uint64_t last_transition_log_ms = 0;
     uint64_t last_status_log_ms = 0;
+    uint64_t transitions_at_last_log = 0;
 
     mutable std::mutex last_status_mutex;
     common::VisualTargetStatus last_status;
@@ -153,6 +156,7 @@ struct VisualTargetMonitor::Impl {
         state_log_pending = false;
         last_transition_log_ms = 0;
         last_status_log_ms = 0;
+        transitions_at_last_log = state_transition_count.load();
         consecutive_detected = 0;
         consecutive_missed = 0;
         smoothing_initialized = false;
@@ -201,11 +205,18 @@ struct VisualTargetMonitor::Impl {
         }
 
         if (observation.detected) {
+            ++detected_observation_count;
             consecutive_detected += 1;
             consecutive_missed = 0;
             UpdateSmoothing(observation.center_pixel_x, observation.center_pixel_y,
                             observation.confidence);
             last_seen_ms = now_ms;
+            // 已锁定后只要再次看到目标就维持锁定，不因中间单帧漏检把
+            // consecutive_detected 清零后重新计门限，否则“锁定”会在偶发漏检时频繁抖动。
+            // 掉出锁定只能靠连续丢失达到 lost_frames。
+            if (state == common::VisualTargetState::kLocked) {
+                return;
+            }
             SetState(consecutive_detected >= config.lock_frames
                          ? common::VisualTargetState::kLocked
                          : common::VisualTargetState::kAcquiring);
@@ -271,26 +282,39 @@ struct VisualTargetMonitor::Impl {
         if (state_log_pending &&
             now_ms - last_transition_log_ms >=
                 static_cast<uint64_t>(config.transition_log_interval.count())) {
+            const uint64_t transitions = state_transition_count.load();
+            // 新增转换揭示节流窗口内被压制的翻转次数：同名转移（如 LOCKED -> LOCKED）
+            // 说明状态在窗口内反复跳动后又回到同名状态，不能误读为“没变化”。
             SPDLOG_INFO(
-                "视觉稳定性状态变化: {} -> {} 连续检测={} 连续丢失={} 置信度={:.2f} 累计转换={} 累计观测={}",
+                "视觉稳定性状态变化: {} -> {} 连续检测={} 连续丢失={} 置信度={:.2f} 新增转换={} 累计转换={} 累计观测={}",
                 StateName(last_logged_state), StateName(state),
                 consecutive_detected, consecutive_missed, smoothed_confidence,
-                state_transition_count.load(), observation_count.load());
+                transitions - transitions_at_last_log, transitions,
+                observation_count.load());
             last_logged_state = state;
             state_log_pending = false;
             last_transition_log_ms = now_ms;
+            transitions_at_last_log = transitions;
         }
 
         if (now_ms - last_status_log_ms >=
             static_cast<uint64_t>(config.status_log_interval.count())) {
-            const uint64_t seen_age_ms =
-                last_seen_ms == 0 ? 0 : now_ms - last_seen_ms;
+            const uint64_t observations = observation_count.load();
+            const uint64_t detected = detected_observation_count.load();
+            const double detection_rate =
+                observations == 0
+                    ? 0.0
+                    : 100.0 * static_cast<double>(detected) /
+                          static_cast<double>(observations);
             SPDLOG_INFO(
-                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 上次检测={}ms前 累计观测={} 累计转换={}",
+                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) {} 累计检测率={:.1f}% 累计观测={} 累计转换={}",
                 StateName(state), state == common::VisualTargetState::kLocked,
                 consecutive_detected, consecutive_missed, smoothed_confidence,
-                smoothed_cx, smoothed_cy, seen_age_ms, observation_count.load(),
-                state_transition_count.load());
+                smoothed_cx, smoothed_cy,
+                last_seen_ms == 0
+                    ? "从未检测"
+                    : "上次检测=" + std::to_string(now_ms - last_seen_ms) + "ms前",
+                detection_rate, observations, state_transition_count.load());
             last_status_log_ms = now_ms;
         }
     }

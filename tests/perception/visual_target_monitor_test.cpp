@@ -246,6 +246,30 @@ TEST_F(VisualTargetMonitorTest, MultipleCandidatesUseHighestConfidenceAndCountEr
     EXPECT_EQ(monitor_->LastStatus().state, common::VisualTargetState::kAcquiring);
 }
 
+TEST_F(VisualTargetMonitorTest, LockedSurvivesSingleMissAndReDetection) {
+    // 回归用例：锁定后单帧漏检再恢复，必须继续锁定。
+    // 早期实现在漏检后的首个检测帧按 consecutive_detected 重新计门限，
+    // 导致“连续检测321帧、漏1帧就掉回 ACQUIRING”的频繁抖动。
+    ASSERT_TRUE(monitor_->Start());
+    for (uint64_t i = 1; i <= 3; ++i) {
+        Publish(MakeObservation(i, true));
+    }
+    ASSERT_TRUE(WaitFor([this] { return monitor_->ObservationCount() == 3; }));
+    ASSERT_TRUE(WaitFor([this] {
+        return monitor_->LastStatus().state == common::VisualTargetState::kLocked;
+    }));
+    const uint64_t transitions_after_lock = monitor_->StateTransitionCount();
+
+    Publish(MakeObservation(4, false));  // 单帧漏检
+    Publish(MakeObservation(5, true));   // 立即恢复检测
+    ASSERT_TRUE(WaitFor([this] { return monitor_->ObservationCount() == 5; }));
+    EXPECT_TRUE(WaitFor([this] {
+        return monitor_->LastStatus().consecutive_detected_frames == 1;
+    }));
+    EXPECT_EQ(monitor_->LastStatus().state, common::VisualTargetState::kLocked);
+    EXPECT_EQ(monitor_->StateTransitionCount(), transitions_after_lock);
+}
+
 TEST_F(VisualTargetMonitorTest, CountsOnlyRealStateTransitions) {
     // 计数只反映真实状态变化，而不是逐帧推进，便于通过累计转换数发现检测抖动。
     ASSERT_TRUE(monitor_->Start());
