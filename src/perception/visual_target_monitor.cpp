@@ -130,6 +130,13 @@ struct VisualTargetMonitor::Impl {
     // 最近一次有效检测的框尺寸：判断“目标是否太小”的直接依据。
     double last_bbox_w = 0.0;
     double last_bbox_h = 0.0;
+    // 目标在画面中的移动速度（像素/帧，相邻检测帧之间的中心位移）。
+    // 运动模糊是漏检的主要外部原因，这个值把“晃得厉不厉害”量化，
+    // 用于判断当前场景是否具备稳定跟踪条件。
+    bool has_last_raw_center = false;
+    double last_raw_cx = 0.0;
+    double last_raw_cy = 0.0;
+    double smoothed_speed_px_per_frame = 0.0;
 
     // 状态变化与摘要日志：状态可能因检测间歇而高频翻转，因此按时间节流；
     // 被压制的变化保持 pending，等到间隔满足后仍会被记录，避免丢掉最终状态。
@@ -179,6 +186,10 @@ struct VisualTargetMonitor::Impl {
         frame_height = 0;
         last_bbox_w = 0.0;
         last_bbox_h = 0.0;
+        has_last_raw_center = false;
+        last_raw_cx = 0.0;
+        last_raw_cy = 0.0;
+        smoothed_speed_px_per_frame = 0.0;
     }
 
     /// 平滑目标中心与置信度。首帧直接采用观测值，避免从0开始收敛。
@@ -225,6 +236,18 @@ struct VisualTargetMonitor::Impl {
                             observation.confidence);
             last_bbox_w = observation.bbox_w;
             last_bbox_h = observation.bbox_h;
+            // 只在相邻检测帧之间计算位移；丢失后重新出现不纳入，避免跳变污染。
+            if (has_last_raw_center && consecutive_detected >= 2) {
+                const double dx = observation.center_pixel_x - last_raw_cx;
+                const double dy = observation.center_pixel_y - last_raw_cy;
+                const double alpha = config.smoothing_alpha;
+                smoothed_speed_px_per_frame =
+                    smoothed_speed_px_per_frame * (1.0 - alpha) +
+                    std::hypot(dx, dy) * alpha;
+            }
+            last_raw_cx = observation.center_pixel_x;
+            last_raw_cy = observation.center_pixel_y;
+            has_last_raw_center = true;
             last_seen_ms = now_ms;
             // 已锁定后只要再次看到目标就维持锁定，不因中间单帧漏检把
             // consecutive_detected 清零后重新计门限，否则“锁定”会在偶发漏检时频繁抖动。
@@ -239,6 +262,7 @@ struct VisualTargetMonitor::Impl {
         }
 
         // 本帧推理完成但没有目标：这是有效的丢失证据，与数据中断不同。
+        has_last_raw_center = false;  // 跨丢失不做位移计算
         consecutive_detected = 0;
         consecutive_missed += 1;
         if (consecutive_missed >= config.lost_frames) {
@@ -329,10 +353,11 @@ struct VisualTargetMonitor::Impl {
             // 近期检测率是判断当前目标是否可跟踪的主指标；
             // 累计检测率含启动初期无目标时段，只能作为整体参考。
             SPDLOG_INFO(
-                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
+                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px 画面速度={:.1f}px/帧 {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
                 StateName(state), state == common::VisualTargetState::kLocked,
                 consecutive_detected, consecutive_missed, smoothed_confidence,
                 smoothed_cx, smoothed_cy, last_bbox_w, last_bbox_h,
+                smoothed_speed_px_per_frame,
                 last_seen_ms == 0
                     ? "从未检测"
                     : "上次检测=" + std::to_string(now_ms - last_seen_ms) + "ms前",
