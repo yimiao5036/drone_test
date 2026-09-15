@@ -127,6 +127,9 @@ struct VisualTargetMonitor::Impl {
     uint64_t frame_sequence = 0;
     uint32_t frame_width = 0;
     uint32_t frame_height = 0;
+    // 最近一次有效检测的框尺寸：判断“目标是否太小”的直接依据。
+    double last_bbox_w = 0.0;
+    double last_bbox_h = 0.0;
 
     // 状态变化与摘要日志：状态可能因检测间歇而高频翻转，因此按时间节流；
     // 被压制的变化保持 pending，等到间隔满足后仍会被记录，避免丢掉最终状态。
@@ -136,6 +139,10 @@ struct VisualTargetMonitor::Impl {
     uint64_t last_transition_log_ms = 0;
     uint64_t last_status_log_ms = 0;
     uint64_t transitions_at_last_log = 0;
+    // 近期窗口计数：每次摘要后清零，用于反映“当前”检测质量。
+    // 累计检测率会被启动初期无目标时段拉低，不适合判断当前是否可靠。
+    uint64_t window_observation_count = 0;
+    uint64_t window_detected_count = 0;
 
     mutable std::mutex last_status_mutex;
     common::VisualTargetStatus last_status;
@@ -157,6 +164,8 @@ struct VisualTargetMonitor::Impl {
         last_transition_log_ms = 0;
         last_status_log_ms = 0;
         transitions_at_last_log = state_transition_count.load();
+        window_observation_count = 0;
+        window_detected_count = 0;
         consecutive_detected = 0;
         consecutive_missed = 0;
         smoothing_initialized = false;
@@ -168,6 +177,8 @@ struct VisualTargetMonitor::Impl {
         frame_sequence = 0;
         frame_width = 0;
         frame_height = 0;
+        last_bbox_w = 0.0;
+        last_bbox_h = 0.0;
     }
 
     /// 平滑目标中心与置信度。首帧直接采用观测值，避免从0开始收敛。
@@ -204,12 +215,16 @@ struct VisualTargetMonitor::Impl {
             }
         }
 
+        ++window_observation_count;
         if (observation.detected) {
             ++detected_observation_count;
+            ++window_detected_count;
             consecutive_detected += 1;
             consecutive_missed = 0;
             UpdateSmoothing(observation.center_pixel_x, observation.center_pixel_y,
                             observation.confidence);
+            last_bbox_w = observation.bbox_w;
+            last_bbox_h = observation.bbox_h;
             last_seen_ms = now_ms;
             // 已锁定后只要再次看到目标就维持锁定，不因中间单帧漏检把
             // consecutive_detected 清零后重新计门限，否则“锁定”会在偶发漏检时频繁抖动。
@@ -301,21 +316,31 @@ struct VisualTargetMonitor::Impl {
             static_cast<uint64_t>(config.status_log_interval.count())) {
             const uint64_t observations = observation_count.load();
             const uint64_t detected = detected_observation_count.load();
-            const double detection_rate =
+            const double cumulative_rate =
                 observations == 0
                     ? 0.0
                     : 100.0 * static_cast<double>(detected) /
                           static_cast<double>(observations);
+            const double window_rate =
+                window_observation_count == 0
+                    ? 0.0
+                    : 100.0 * static_cast<double>(window_detected_count) /
+                          static_cast<double>(window_observation_count);
+            // 近期检测率是判断当前目标是否可跟踪的主指标；
+            // 累计检测率含启动初期无目标时段，只能作为整体参考。
             SPDLOG_INFO(
-                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) {} 累计检测率={:.1f}% 累计观测={} 累计转换={}",
+                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
                 StateName(state), state == common::VisualTargetState::kLocked,
                 consecutive_detected, consecutive_missed, smoothed_confidence,
-                smoothed_cx, smoothed_cy,
+                smoothed_cx, smoothed_cy, last_bbox_w, last_bbox_h,
                 last_seen_ms == 0
                     ? "从未检测"
                     : "上次检测=" + std::to_string(now_ms - last_seen_ms) + "ms前",
-                detection_rate, observations, state_transition_count.load());
+                window_rate, window_detected_count, window_observation_count,
+                cumulative_rate, observations, state_transition_count.load());
             last_status_log_ms = now_ms;
+            window_observation_count = 0;
+            window_detected_count = 0;
         }
     }
 

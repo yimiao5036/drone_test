@@ -94,7 +94,7 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.visual_monitor.status_log_interval.count(), 5000);
     EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
     EXPECT_EQ(config.yolo.model_path,
-              "/opt/drone/models/yolo26n-drone-relu6-e184.rknn");
+              "/opt/drone/models/yolo26n-drone-relu6-e184-09-13.rknn");
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
     EXPECT_EQ(config.yolo.npu_core_mode, "all");
     EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
