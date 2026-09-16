@@ -131,12 +131,16 @@ struct VisualTargetMonitor::Impl {
     double last_bbox_w = 0.0;
     double last_bbox_h = 0.0;
     // 目标在画面中的移动速度（像素/帧，相邻检测帧之间的中心位移）。
-    // 运动模糊是漏检的主要外部原因，这个值把“晃得厉不厉害”量化，
-    // 用于判断当前场景是否具备稳定跟踪条件。
+    // 运动模糊是漏检的主要外部原因，这个值把“晃得厉不厉害”量化。
+    // 注意局限：只在相邻两帧都检出时才能计算，运动最剧烈、最模糊的那几帧往往
+    // 本身就漏检，因此该值系统性偏低；同时输出窗口均值、峰值和样本数，
+    // 样本数过少说明当前窗口几乎没有可用的速度样本。
     bool has_last_raw_center = false;
     double last_raw_cx = 0.0;
     double last_raw_cy = 0.0;
-    double smoothed_speed_px_per_frame = 0.0;
+    double window_speed_sum = 0.0;
+    double window_speed_max = 0.0;
+    uint64_t window_speed_samples = 0;
 
     // 状态变化与摘要日志：状态可能因检测间歇而高频翻转，因此按时间节流；
     // 被压制的变化保持 pending，等到间隔满足后仍会被记录，避免丢掉最终状态。
@@ -189,7 +193,9 @@ struct VisualTargetMonitor::Impl {
         has_last_raw_center = false;
         last_raw_cx = 0.0;
         last_raw_cy = 0.0;
-        smoothed_speed_px_per_frame = 0.0;
+        window_speed_sum = 0.0;
+        window_speed_max = 0.0;
+        window_speed_samples = 0;
     }
 
     /// 平滑目标中心与置信度。首帧直接采用观测值，避免从0开始收敛。
@@ -240,10 +246,10 @@ struct VisualTargetMonitor::Impl {
             if (has_last_raw_center && consecutive_detected >= 2) {
                 const double dx = observation.center_pixel_x - last_raw_cx;
                 const double dy = observation.center_pixel_y - last_raw_cy;
-                const double alpha = config.smoothing_alpha;
-                smoothed_speed_px_per_frame =
-                    smoothed_speed_px_per_frame * (1.0 - alpha) +
-                    std::hypot(dx, dy) * alpha;
+                const double speed = std::hypot(dx, dy);
+                window_speed_sum += speed;
+                window_speed_max = std::max(window_speed_max, speed);
+                ++window_speed_samples;
             }
             last_raw_cx = observation.center_pixel_x;
             last_raw_cy = observation.center_pixel_y;
@@ -350,14 +356,19 @@ struct VisualTargetMonitor::Impl {
                     ? 0.0
                     : 100.0 * static_cast<double>(window_detected_count) /
                           static_cast<double>(window_observation_count);
+            const double speed_mean =
+                window_speed_samples == 0
+                    ? 0.0
+                    : window_speed_sum /
+                          static_cast<double>(window_speed_samples);
             // 近期检测率是判断当前目标是否可跟踪的主指标；
             // 累计检测率含启动初期无目标时段，只能作为整体参考。
             SPDLOG_INFO(
-                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px 画面速度={:.1f}px/帧 {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
+                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px 画面速度=均{:.1f}/峰{:.1f}(n={}) {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
                 StateName(state), state == common::VisualTargetState::kLocked,
                 consecutive_detected, consecutive_missed, smoothed_confidence,
-                smoothed_cx, smoothed_cy, last_bbox_w, last_bbox_h,
-                smoothed_speed_px_per_frame,
+                smoothed_cx, smoothed_cy, last_bbox_w, last_bbox_h, speed_mean,
+                window_speed_max, window_speed_samples,
                 last_seen_ms == 0
                     ? "从未检测"
                     : "上次检测=" + std::to_string(now_ms - last_seen_ms) + "ms前",
@@ -366,6 +377,9 @@ struct VisualTargetMonitor::Impl {
             last_status_log_ms = now_ms;
             window_observation_count = 0;
             window_detected_count = 0;
+            window_speed_sum = 0.0;
+            window_speed_max = 0.0;
+            window_speed_samples = 0;
         }
     }
 
