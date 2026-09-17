@@ -98,6 +98,7 @@ protected:
         detector_ = std::make_unique<YoloDetector>(config, std::move(backend));
         detector_->SetInput(frame_topic_);
         result_sub_ = detector_->DetectionOutput().Subscribe(8);
+        observation_sub_ = detector_->ObservationOutput().Subscribe(8);
     }
 
     void TearDown() override {
@@ -128,11 +129,23 @@ protected:
         return false;
     }
 
+    /// 阻塞等待一条帧级观测。
+    bool WaitObservation(common::VisualTargetObservation* out, int timeout_ms = 3000) {
+        auto message =
+            observation_sub_.WaitTakeFor(std::chrono::milliseconds(timeout_ms));
+        if (message) {
+            *out = **message;
+            return true;
+        }
+        return false;
+    }
+
     std::shared_ptr<video::VideoFramePool> pool_;
     MockBackend* mock_ = nullptr;  // 所有权归 YoloDetector，裸指针仅测试读取
     std::unique_ptr<YoloDetector> detector_;
     common::Topic<video::FrameHandle> frame_topic_;
     common::Topic<common::DetectionResult>::Subscription result_sub_;
+    common::Topic<common::VisualTargetObservation>::Subscription observation_sub_;
 };
 
 TEST_F(YoloDetectorTest, StartWithoutBackendFails) {
@@ -224,6 +237,71 @@ TEST_F(YoloDetectorTest, NoDetectionsNoPublish) {
     EXPECT_TRUE(WaitFor([this] { return detector_->ProcessedFrameCount() == 1; }));
     EXPECT_EQ(result_sub_.PendingCount(), 0u);
     EXPECT_TRUE(result_sub_.TryTake() == std::nullopt);
+}
+
+TEST_F(YoloDetectorTest, EmptyFrameStillPublishesObservationAsFrameTick) {
+    // 帧级契约的核心：本帧推理完成但没有目标时必须仍然发布一条观测，
+    // 下游据此区分“本帧无目标”和“本帧还没推理完”。
+    mock_->detections = {};
+    ASSERT_TRUE(detector_->Start());
+
+    PublishFrame();
+
+    common::VisualTargetObservation observation;
+    ASSERT_TRUE(WaitObservation(&observation));
+    EXPECT_FALSE(observation.detected);
+    EXPECT_EQ(observation.candidate_count, 0u);
+    EXPECT_EQ(observation.frame_sequence, 0u);
+    EXPECT_EQ(observation.frame_width, 64u);
+    EXPECT_EQ(observation.frame_height, 64u);
+    EXPECT_GT(observation.inference_time_ms, 0.f);
+
+    // 检测结果侧仍保持“一帧无目标不发布”。
+    EXPECT_EQ(result_sub_.PendingCount(), 0u);
+    EXPECT_TRUE(WaitFor([this] { return detector_->ObservationCount() == 1; }));
+    EXPECT_EQ(detector_->DetectedObservationCount(), 0u);
+}
+
+TEST_F(YoloDetectorTest, ObservationPicksHighestConfidenceSingleTarget) {
+    mock_->detections = {
+        {0, 0.62f, 10.f, 10.f, 30.f, 30.f},
+        {0, 0.91f, 100.f, 40.f, 160.f, 100.f},
+        {0, 0.75f, 200.f, 200.f, 240.f, 240.f},
+    };
+    ASSERT_TRUE(detector_->Start());
+
+    PublishFrame();
+
+    common::VisualTargetObservation observation;
+    ASSERT_TRUE(WaitObservation(&observation));
+    EXPECT_TRUE(observation.detected);
+    EXPECT_EQ(observation.candidate_count, 3u);
+    EXPECT_NEAR(observation.confidence, 0.91f, 1e-6f);
+    EXPECT_NEAR(observation.bbox_x, 100.f, 1e-6f);
+    EXPECT_NEAR(observation.bbox_w, 60.f, 1e-6f);
+    EXPECT_NEAR(observation.center_pixel_x, 130.f, 1e-6f);
+    EXPECT_NEAR(observation.center_pixel_y, 70.f, 1e-6f);
+    EXPECT_TRUE(WaitFor([this] { return detector_->ObservationCount() == 1; }));
+    EXPECT_EQ(detector_->DetectedObservationCount(), 1u);
+}
+
+TEST_F(YoloDetectorTest, ObservationPerFrameSharesFrameSequence) {
+    mock_->detections = {{0, 0.8f, 1.f, 1.f, 5.f, 5.f}};
+    ASSERT_TRUE(detector_->Start());
+
+    PublishFrame();
+    PublishFrame();
+
+    common::VisualTargetObservation first;
+    common::VisualTargetObservation second;
+    ASSERT_TRUE(WaitObservation(&first));
+    ASSERT_TRUE(WaitObservation(&second));
+    EXPECT_TRUE(first.detected);
+    EXPECT_TRUE(second.detected);
+    // 每个推理帧恰好一条观测，帧序号随之推进且不重复。
+    EXPECT_NE(first.frame_sequence, second.frame_sequence);
+    EXPECT_GT(second.header.sequence, first.header.sequence);
+    EXPECT_TRUE(WaitFor([this] { return detector_->ObservationCount() == 2; }));
 }
 
 TEST_F(YoloDetectorTest, BackendThrowCountsErrorAndContinues) {

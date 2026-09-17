@@ -35,6 +35,8 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_TRUE(config.runtime.enable_video);
     EXPECT_TRUE(config.runtime.enable_px4);
     EXPECT_TRUE(config.runtime.enable_ground_station);
+    EXPECT_TRUE(config.runtime.enable_target_estimator);
+    EXPECT_TRUE(config.runtime.enable_visual_monitor);
     EXPECT_FALSE(config.runtime.enable_control);
     EXPECT_EQ(config.health.cpu_sample_period.count(), 1000);
     EXPECT_EQ(config.health.startup_grace_period.count(), 5000);
@@ -77,9 +79,22 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.ground_station.attitude_send_interval.count(), 100);
     EXPECT_EQ(config.ground_station.health_status_send_interval.count(), 1000);
     EXPECT_EQ(config.ground_station.mission_status_send_interval.count(), 500);
+    EXPECT_EQ(config.target_estimator.ground_target_queue_capacity, 4U);
+    EXPECT_EQ(config.target_estimator.flight_state_queue_capacity, 2U);
+    EXPECT_EQ(config.target_estimator.publish_interval.count(), 100);
+    EXPECT_DOUBLE_EQ(config.target_estimator.process_acceleration_std_mps2, 8.0);
+    EXPECT_DOUBLE_EQ(config.target_estimator.default_horizontal_accuracy_m, 10.0);
+    EXPECT_EQ(config.visual_monitor.input_queue_capacity, 2U);
+    EXPECT_EQ(config.visual_monitor.publish_interval.count(), 100);
+    EXPECT_EQ(config.visual_monitor.observation_timeout.count(), 500);
+    EXPECT_EQ(config.visual_monitor.lock_frames, 5);
+    EXPECT_EQ(config.visual_monitor.lost_frames, 10);
+    EXPECT_DOUBLE_EQ(config.visual_monitor.smoothing_alpha, 0.3);
+    EXPECT_EQ(config.visual_monitor.transition_log_interval.count(), 1000);
+    EXPECT_EQ(config.visual_monitor.status_log_interval.count(), 5000);
     EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
     EXPECT_EQ(config.yolo.model_path,
-              "/opt/drone/models/yolo26n-drone-best.rknn");
+              "/opt/drone/models/yolov26_09_16_720p-rk3588.rknn");
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
     EXPECT_EQ(config.yolo.npu_core_mode, "all");
     EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
@@ -118,6 +133,61 @@ TEST(ConfigTest, RejectsControlBeforeFormalAssemblyIsEnabled) {
     std::filesystem::remove(path);
 }
 
+TEST(ConfigTest, RejectsTargetEstimatorWithoutGroundStation) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_ground_station"] = false;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_estimator_without_ground.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsVisualMonitorWithoutVideo) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_video"] = false;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_without_video.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualMonitorThreshold) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["lock_frames"] = 0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_threshold_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualMonitorLogInterval) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["status_log_interval_ms"] = 0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_log_interval_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidTargetEstimatorNoise) {
+    json value = ReadSourceConfig();
+    value["target_estimator"]["process_acceleration_std_mps2"] = 0.0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_estimator_noise_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsGroundStationWithoutPx4StateSource) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_px4"] = false;
@@ -131,6 +201,7 @@ TEST(ConfigTest, RejectsGroundStationWithoutPx4StateSource) {
 TEST(ConfigTest, AllowsMissingGroundStationSectionWhenDisabled) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_ground_station"] = false;
+    value["runtime"]["enable_target_estimator"] = false;
     value.erase("ground_station");
     value["video"]["output_rtsp"] = "rtsp://127.0.0.1:8554/drone_out";
     const auto path = WriteTemporaryConfig(value, "drone_config_ground_disabled.json");
@@ -267,6 +338,8 @@ TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
     value["runtime"]["enable_video"] = false;
     value["runtime"]["enable_px4"] = false;
     value["runtime"]["enable_ground_station"] = false;
+    value["runtime"]["enable_target_estimator"] = false;
+    value["runtime"]["enable_visual_monitor"] = false;
     const auto path = WriteTemporaryConfig(value, "drone_config_empty_runtime.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),

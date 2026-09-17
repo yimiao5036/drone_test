@@ -1,4 +1,6 @@
 /build/
+build_tracker/
+build_vtc/
 /cmake-build-*/
 /.idea/
 *.log
@@ -6,7 +8,9 @@
 /logs/
 /HM30_用户手册_v1_7_1294f55e.pdf
 /tools/web平台
-yolo_pt/drone.v1i.yolo26
-yolo_pt/drone.v1i.yolo26.zip
-yolo_pt/__pycache__
+yolo_pt/
+23H1628889HV1规格书(中英).pdf
 
+yolo_pt/模型导出与转换说明.md
+yolo_pt/export_rknn_candidates.py
+yolo_pt/pt_rknn.py

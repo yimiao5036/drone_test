@@ -11,6 +11,8 @@
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "perception/detection_backend.h"
+#include "perception/target_estimator.h"
+#include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
 #include "state_machine/mission_state_machine.h"
 #include "video/camera_receiver.h"
@@ -32,9 +34,11 @@ DroneApplication::DroneApplication(config::AppConfig config)
     : config_(std::move(config)) {
     BuildComponents();
     BindTopics();
-    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} control={}",
+    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={}",
                 config_.runtime.enable_video, config_.runtime.enable_px4,
-                config_.runtime.enable_ground_station, config_.runtime.enable_control);
+                config_.runtime.enable_ground_station,
+                config_.runtime.enable_target_estimator,
+                config_.runtime.enable_control);
 }
 
 DroneApplication::~DroneApplication() {
@@ -53,12 +57,26 @@ void DroneApplication::BuildComponents() {
             std::make_unique<video_transmission::VideoSender>(config_.video_sender);
     }
 
+    // 视觉稳定性判定只消费YOLO帧级观测，属纯影子输出：不接状态机、不接控制。
+    if (config_.runtime.enable_visual_monitor && detector_ != nullptr) {
+        visual_monitor_ = std::make_unique<perception::VisualTargetMonitor>(
+            config_.visual_monitor);
+    }
+
     if (config_.runtime.enable_px4) {
         px4_link_ = std::make_unique<communication::Px4Link>(config_.px4);
     }
     if (config_.runtime.enable_ground_station) {
         ground_station_link_ = std::make_unique<communication::GroundStationLink>(
             config_.ground_station);
+    }
+
+    // 第一阶段目标估计器只消费地面站单目标和PX4 Home，以局部NED线性卡尔曼
+    // 发布影子TargetState；不创建控制器、不产生ControlIntent或Px4Setpoint。
+    if (config_.runtime.enable_target_estimator && px4_link_ != nullptr &&
+        ground_station_link_ != nullptr) {
+        target_estimator_ = std::make_unique<perception::TargetEstimator>(
+            config_.target_estimator);
     }
 
     // 健康管理器独立于具体数据链路；只注册实际创建的生产模块。
@@ -115,12 +133,23 @@ void DroneApplication::BindTopics() {
         video_sender_->SetInput(compositor_->AnnotatedOutput());
     }
 
+    if (visual_monitor_ != nullptr && detector_ != nullptr) {
+        visual_monitor_->SetInput(detector_->ObservationOutput());
+    }
+
     if (ground_station_link_ != nullptr && px4_link_ != nullptr) {
         ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
     }
 
     if (ground_station_link_ != nullptr && health_manager_ != nullptr) {
         ground_station_link_->SetHealthInput(health_manager_->Output());
+    }
+
+    if (target_estimator_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr) {
+        target_estimator_->SetGroundTargetInput(
+            ground_station_link_->TargetOutput());
+        target_estimator_->SetFlightStateInput(px4_link_->StateOutput());
     }
 
     if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr &&
@@ -145,6 +174,17 @@ bool DroneApplication::Start() {
 
     bool any_started = false;
     bool degraded = false;
+
+    // 视觉稳定性判定是YOLO帧级观测的消费者，必须先于检测器启动；
+    // 它只是影子状态，失败不影响视频链路本身。
+    if (visual_monitor_ != nullptr) {
+        if (!visual_monitor_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序视觉稳定性判定启动失败，视觉影子状态不可用");
+        } else {
+            any_started = true;
+        }
+    }
 
     if (video_sender_ != nullptr) {
         if (video_sender_->Start()) {
@@ -179,6 +219,16 @@ bool DroneApplication::Start() {
         if (!camera_->Start()) {
             degraded = true;
             SPDLOG_ERROR("主程序摄像头接收启动失败，视频链路降级");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 影子目标估计器必须先于地面站/PX4生产者启动，避免漏掉首个Home或目标。
+    if (target_estimator_ != nullptr) {
+        if (!target_estimator_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序目标估计器启动失败，TargetState影子输出不可用");
         } else {
             any_started = true;
         }
@@ -355,6 +405,11 @@ void DroneApplication::Stop() {
         video_sender_->Stop();
     }
 
+    // 视频生产者已停止，再停止其观测消费者。
+    if (visual_monitor_ != nullptr) {
+        visual_monitor_->Stop();
+    }
+
     StopHealthReporter();
     if (health_manager_ != nullptr) {
         health_manager_->Stop();
@@ -363,6 +418,9 @@ void DroneApplication::Stop() {
     // 健康生产者停止后再停止其消费者。
     if (mission_state_machine_ != nullptr) {
         mission_state_machine_->Stop();
+    }
+    if (target_estimator_ != nullptr) {
+        target_estimator_->Stop();
     }
     if (ground_station_link_ != nullptr) {
         ground_station_link_->Stop();

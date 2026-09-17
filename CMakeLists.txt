@@ -93,7 +93,10 @@ set(PERCEPTION_SOURCES
     src/perception/optical_flow_estimator.cpp
     src/perception/laser_range_finder.cpp
     src/perception/perception_fusion.cpp
-    src/perception/target_estimator.cpp)
+    src/perception/geodetic_converter.cpp
+    src/perception/linear_target_kalman_filter.cpp
+    src/perception/target_estimator.cpp
+    src/perception/visual_target_monitor.cpp)
 if(DRONE_HAVE_RKNN)
     find_library(DRONE_RKNN_LIBRARY NAMES rknnrt)
     if(NOT DRONE_RKNN_LIBRARY)
@@ -490,6 +493,34 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(yolo_detector_test)
+
+        # 单目标估计第一阶段：WGS84→NED、线性卡尔曼和地面站/PX4影子接线。
+        add_executable(target_estimator_test
+            tests/perception/target_estimator_test.cpp)
+        target_link_libraries(target_estimator_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(target_estimator_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(target_estimator_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(target_estimator_test)
+
+        # 单目标视觉稳定性判定：帧级观测驱动的锁定/丢失影子状态机
+        add_executable(visual_target_monitor_test
+            tests/perception/visual_target_monitor_test.cpp)
+        target_link_libraries(visual_target_monitor_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(visual_target_monitor_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(visual_target_monitor_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(visual_target_monitor_test)
 
         # 叠加器测试：验证 NV12 帧 + 检测 → 标注帧（不依赖硬件）
         add_executable(frame_compositor_test tests/video/frame_compositor_test.cpp)

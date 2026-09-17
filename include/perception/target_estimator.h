@@ -1,60 +1,85 @@
-/**
- * @file target_estimator.h
- * @brief 目标估计部件接口（ITargetEstimator）
- *
- * 属于 drone/perception 模块。职责：融合感知目标与地面站目标，
- * 平滑、预测并维护目标状态（卡尔曼或其他估计器），输出可供
- * 状态机/控制直接使用的 TargetState。
- *
- * 骨架期说明：
- * - 本接口为纯虚抽象，估计器算法在实现期接入。
- * - TargetEstimatorStub 为骨架占位实现：生命周期可运行，业务方法
- *   记录"未实现"节流日志并返回默认值。
- *
- * 数据流：
- *   common::Topic<TargetState>（感知融合输出）──┐
- *   common::Topic<GroundStationTarget>（地面站）─┼──► ITargetEstimator ──► common::Topic<TargetState>
- * 可替换边界：卡尔曼或其他估计器。
- */
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 
 #include "common/topic.h"
 #include "common/types.h"
+#include "perception/linear_target_kalman_filter.h"
 
 namespace drone::perception {
 
-/// 目标估计部件抽象接口。
+/// 单目标估计器配置。第一阶段仅融合地面站目标，并以PX4 Home为局部NED原点。
+struct TargetEstimatorConfig {
+    std::size_t ground_target_queue_capacity = 4;
+    std::size_t flight_state_queue_capacity = 2;
+    std::chrono::milliseconds publish_interval{100};
+    double process_acceleration_std_mps2 = 8.0;
+    double initial_velocity_std_mps = 20.0;
+    double velocity_measurement_std_mps = 5.0;
+    double default_horizontal_accuracy_m = 10.0;
+    double default_vertical_accuracy_m = 15.0;
+    double minimum_measurement_std_m = 0.5;
+
+    void Validate() const;
+};
+
+/// 目标估计部件接口。第一阶段输入地面站单目标和PX4状态，输出局部NED TargetState。
 class ITargetEstimator {
 public:
     virtual ~ITargetEstimator() = default;
 
-    // ---- 生命周期 ----
-    /// 启动估计（启动消费线程）。返回是否成功启动。
     virtual bool Start() = 0;
-    /// 停止估计；幂等。
     virtual void Stop() = 0;
-    /// 是否已启动。
     virtual bool IsRunning() const = 0;
 
-    // ---- 输入 ----
-    /// 绑定融合目标与地面站目标输入主题。
-    virtual void SetInputs(common::Topic<common::TargetState>& fused,
-                           common::Topic<common::GroundStationTarget>& ground) = 0;
+    virtual void SetGroundTargetInput(
+        common::Topic<common::GroundStationTarget>& ground) = 0;
+    virtual void SetFlightStateInput(
+        common::Topic<common::FlightStateSnapshot>& flight) = 0;
 
-    // ---- 输出 ----
-    /// 估计目标状态输出主题：common::TargetState。
     virtual common::Topic<common::TargetState>& EstimatedOutput() = 0;
+    virtual common::TargetState LastState() const = 0;
 
-    // ---- 状态查询 ----
-    /// 累计更新次数。
+    /// 累计接受并更新滤波器的地面站目标数。
     virtual uint64_t UpdateCount() const = 0;
-    /// 累计错误次数。
+    /// 累计拒绝的非法、过期或乱序观测数。
     virtual uint64_t ErrorCount() const = 0;
 };
 
-/// 骨架占位实现：生命周期完整，业务方法打印"未实现"节流日志并返回默认值。
+/// 正式单目标线性卡尔曼估计器。仅发布影子TargetState，不产生ControlIntent/Px4Setpoint。
+class TargetEstimator final : public ITargetEstimator {
+public:
+    explicit TargetEstimator(TargetEstimatorConfig config = TargetEstimatorConfig{});
+    ~TargetEstimator() override;
+
+    TargetEstimator(const TargetEstimator&) = delete;
+    TargetEstimator& operator=(const TargetEstimator&) = delete;
+
+    bool Start() override;
+    void Stop() override;
+    bool IsRunning() const override;
+
+    void SetGroundTargetInput(
+        common::Topic<common::GroundStationTarget>& ground) override;
+    void SetFlightStateInput(
+        common::Topic<common::FlightStateSnapshot>& flight) override;
+
+    common::Topic<common::TargetState>& EstimatedOutput() override;
+    common::TargetState LastState() const override;
+
+    uint64_t UpdateCount() const override;
+    uint64_t ErrorCount() const override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// 保留骨架实现供接口冒烟测试；正式DroneApplication不再使用该类。
 class TargetEstimatorStub final : public ITargetEstimator {
 public:
     TargetEstimatorStub();
@@ -67,18 +92,19 @@ public:
     void Stop() override;
     bool IsRunning() const override;
 
-    void SetInputs(common::Topic<common::TargetState>& fused,
-                   common::Topic<common::GroundStationTarget>& ground) override;
+    void SetGroundTargetInput(
+        common::Topic<common::GroundStationTarget>& ground) override;
+    void SetFlightStateInput(
+        common::Topic<common::FlightStateSnapshot>& flight) override;
 
     common::Topic<common::TargetState>& EstimatedOutput() override;
+    common::TargetState LastState() const override;
 
     uint64_t UpdateCount() const override;
     uint64_t ErrorCount() const override;
 
 private:
     bool running_ = false;
-    uint64_t update_count_ = 0;
-    uint64_t error_count_ = 0;
     common::Topic<common::TargetState> estimated_output_;
 };
 

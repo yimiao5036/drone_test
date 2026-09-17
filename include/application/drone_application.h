@@ -16,6 +16,8 @@ class GroundStationLink;
 class Px4Link;
 }
 namespace drone::perception {
+class TargetEstimator;
+class VisualTargetMonitor;
 class YoloDetector;
 }
 namespace drone::state_machine {
@@ -104,10 +106,12 @@ private:
     std::unique_ptr<video::CameraReceiver> camera_;
     std::unique_ptr<video::VideoDecoder> decoder_;
     std::unique_ptr<perception::YoloDetector> detector_;
+    std::unique_ptr<perception::VisualTargetMonitor> visual_monitor_;
     std::unique_ptr<video::FrameCompositor> compositor_;
     std::unique_ptr<video_transmission::VideoSender> video_sender_;
     std::unique_ptr<communication::Px4Link> px4_link_;
     std::unique_ptr<communication::GroundStationLink> ground_station_link_;
+    std::unique_ptr<perception::TargetEstimator> target_estimator_;
     std::unique_ptr<state_machine::MissionStateMachine> mission_state_machine_;
     std::unique_ptr<health::HealthManager> health_manager_;
 

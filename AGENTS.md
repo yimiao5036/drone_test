@@ -98,6 +98,10 @@ drone_test/
 - **头文件保护统一使用 `#pragma once`**；已有头文件（如 `topic.h`、
   `logger.h`、`video_frame.h`）沿用原 include guard，不再改动，新头文件
   一律使用 `#pragma once`
+- **行尾统一为 LF**，由根 `.gitattributes` 强制（`text=auto eol=lf`）：Windows 侧
+  编辑器会把文件改写成 CRLF，产生大量“忽略空白后 diff 为空”的假改动并淹没真实改动。
+  禁止用编辑器批量转换行尾；`third_party/` 必须保持上游原始行尾不变。
+  判断文件是否真的改动以 `git diff` 是否为空为准，不看 `git status`（见 `.gitattributes` 内排查提示）。
 
 ### 命名规范
 - 类名：大驼峰，如 `SerialPort`、`YoloDetector`
