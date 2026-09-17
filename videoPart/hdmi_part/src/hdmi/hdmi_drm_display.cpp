@@ -29,7 +29,7 @@
  */
 #ifndef DRONE_HAVE_HDMI_KMS
 
-#include "video_transmission/hdmi/hdmi_display_backend.h"
+#include "hdmi/hdmi_display_backend.h"
 
 #include <memory>
 #include <string>
@@ -44,7 +44,11 @@ std::unique_ptr<IHdmiDisplay> CreateHdmiDrmDisplay() { return nullptr; }
 std::string DescribeHdmiDrmResources(const std::string& device,
                                      std::uint32_t /*target_width*/,
                                      std::uint32_t /*target_height*/,
-                                     int /*target_refresh_hz*/) {
+                                     int /*target_refresh_hz*/,
+                                     bool* device_opened) {
+    if (device_opened != nullptr) {
+        *device_opened = false;  // 未编译 DRM 支持，本探针无法完成枚举
+    }
     return "本构建未启用 DRM/KMS 支持（缺少 libdrm/libgbm/libEGL），无法枚举 " +
            device + "。请在香橙派上安装开发包后重新构建。";
 }
@@ -53,7 +57,7 @@ std::string DescribeHdmiDrmResources(const std::string& device,
 
 #else  // DRONE_HAVE_HDMI_KMS
 
-#include "video_transmission/hdmi/hdmi_display_backend.h"
+#include "hdmi/hdmi_display_backend.h"
 
 #include <cerrno>
 #include <chrono>
@@ -206,10 +210,11 @@ bool SynthesizeMode(std::uint32_t width, std::uint32_t height, int refresh_hz,
     const double refresh =
         static_cast<double>(mode.clock) * 1000.0 /
         (static_cast<double>(mode.htotal) * static_cast<double>(mode.vtotal));
-    mode.vrefresh = static_cast<int>(std::lround(refresh));
+    mode.vrefresh = static_cast<std::uint32_t>(std::lround(refresh));
     mode.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC;
     mode.type = DRM_MODE_TYPE_DRIVER;
-    std::snprintf(mode.name, sizeof(mode.name), "1280x720@%d(合成)", mode.vrefresh);
+    std::snprintf(mode.name, sizeof(mode.name), "1280x720@%u(合成)",
+                  static_cast<unsigned>(mode.vrefresh));
     *out = mode;
     return true;
 }
@@ -231,7 +236,9 @@ bool PickOutputMode(drmModeConnector* connector, const HdmiDisplayConfig& config
         if (mode.hdisplay != config.width || mode.vdisplay != config.height) {
             continue;
         }
-        const int delta = std::abs(mode.vrefresh - config.refresh_hz);
+        // vrefresh 为 __u32，与 int 相减会得到无符号数，必须先显式转 int
+        const int delta =
+            std::abs(static_cast<int>(mode.vrefresh) - config.refresh_hz);
         if (best_index < 0 || delta < best_delta) {
             best_index = i;
             best_delta = delta;
@@ -1221,10 +1228,15 @@ std::unique_ptr<IHdmiDisplay> CreateHdmiDrmDisplay() {
 std::string DescribeHdmiDrmResources(const std::string& device,
                                      std::uint32_t target_width,
                                      std::uint32_t target_height,
-                                     int target_refresh_hz) {
+                                     int target_refresh_hz,
+                                     bool* device_opened) {
+    if (device_opened != nullptr) {
+        *device_opened = false;
+    }
     const int fd = ::open(device.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        return "打开 " + device + " 失败: " + DescribeDrmError(errno) + "\n";
+        return "打开 " + device + " 失败: " + DescribeDrmError(errno) +
+               "（需 root 或 CAP_SYS_ADMIN；开发机无此节点属正常）\n";
     }
     std::string report = "DRM 设备: " + device + "\n";
 
@@ -1233,6 +1245,9 @@ std::string DescribeHdmiDrmResources(const std::string& device,
         report += std::string("读取 DRM 资源失败: ") + DescribeDrmError(errno) + "\n";
         ::close(fd);
         return report;
+    }
+    if (device_opened != nullptr) {
+        *device_opened = true;  // 资源已读到，后续枚举结论有效
     }
     report += "CRTC 数量: " + std::to_string(resources->count_crtcs) +
               ", 连接器数量: " + std::to_string(resources->count_connectors) + "\n";
@@ -1268,8 +1283,9 @@ std::string DescribeHdmiDrmResources(const std::string& device,
             const drmModeModeInfo& mode = connector->modes[m];
             char line[160];
             std::snprintf(line, sizeof(line),
-                          "  [%2d] %-28s %4dx%-4d @%3dHz clock=%ukHz%s\n", m,
-                          mode.name, mode.hdisplay, mode.vdisplay, mode.vrefresh,
+                          "  [%2d] %-28s %4dx%-4d @%3uHz clock=%ukHz%s\n", m,
+                          mode.name, mode.hdisplay, mode.vdisplay,
+                          static_cast<unsigned>(mode.vrefresh),
                           static_cast<unsigned>(mode.clock),
                           (mode.type & DRM_MODE_TYPE_PREFERRED) ? "  <- 优选" : "");
             report += line;

@@ -14,7 +14,7 @@
  * 与 video_decoder_stub.cpp / camera_receiver_stub.cpp 的约定保持一致：
  * 生命周期方法记录 INFO 日志，业务方法直接返回成功并累加计数。
  */
-#include "video_transmission/hdmi/hdmi_display_backend.h"
+#include "hdmi/hdmi_display_backend.h"
 
 #include <cstdint>
 #include <memory>

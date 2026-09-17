@@ -20,7 +20,7 @@
  *
  * 构建与用法见同目录 hdmi_display_backend.md。
  */
-#include "video_transmission/hdmi/hdmi_display_backend.h"
+#include "hdmi/hdmi_display_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -83,21 +83,29 @@ void PrintUsage(const char* program) {
         << "      test/nv12 会独占 DRM master 并改变 HDMI 输出，请先停止正式程序。\n";
 }
 
-/// 解析命令行。返回 false 表示参数错误或已打印帮助。
-bool ParseArgs(int argc, char** argv, Options* out) {
+/// 参数解析结果：区分"可执行""用户请求帮助""参数错误"，
+/// 使 main 能给出正确的进程退出码（供脚本/CI 判定）。
+enum class ParseOutcome {
+    kOk = 0,   ///< 参数有效，可以执行
+    kHelp,     ///< 已打印帮助，属正常退出
+    kError,    ///< 参数错误
+};
+
+/// 解析命令行。
+ParseOutcome ParseArgs(int argc, char** argv, Options* out) {
     if (argc < 2) {
         PrintUsage(argv[0]);
-        return false;
+        return ParseOutcome::kError;  // 缺少子命令
     }
     out->command = argv[1];
     if (out->command == "-h" || out->command == "--help") {
         PrintUsage(argv[0]);
-        return false;
+        return ParseOutcome::kHelp;
     }
     if (out->command != "modes" && out->command != "test" && out->command != "nv12") {
         std::cerr << "未知子命令: " << out->command << "\n\n";
         PrintUsage(argv[0]);
-        return false;
+        return ParseOutcome::kError;
     }
 
     const auto need_value = [&](int& i) -> const char* {
@@ -132,7 +140,7 @@ bool ParseArgs(int argc, char** argv, Options* out) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
             PrintUsage(argv[0]);
-            return false;
+            return ParseOutcome::kHelp;
         }
         if (arg == "--bt601") {
             out->bt601 = true;
@@ -144,35 +152,45 @@ bool ParseArgs(int argc, char** argv, Options* out) {
             out->blank_on_stop = false;
         } else if (arg == "--device") {
             const char* value = need_value(i);
-            if (value == nullptr) return false;
+            if (value == nullptr) return ParseOutcome::kError;
             out->device = value;
         } else if (arg == "--connector") {
             const char* value = need_value(i);
-            if (value == nullptr) return false;
+            if (value == nullptr) return ParseOutcome::kError;
             out->connector = value;
         } else if (arg == "--width") {
             const char* value = need_value(i);
-            if (value == nullptr || !parse_uint(value, &out->width)) return false;
+            if (value == nullptr || !parse_uint(value, &out->width)) {
+                return ParseOutcome::kError;
+            }
         } else if (arg == "--height") {
             const char* value = need_value(i);
-            if (value == nullptr || !parse_uint(value, &out->height)) return false;
+            if (value == nullptr || !parse_uint(value, &out->height)) {
+                return ParseOutcome::kError;
+            }
         } else if (arg == "--stride") {
             const char* value = need_value(i);
-            if (value == nullptr || !parse_uint(value, &out->stride)) return false;
+            if (value == nullptr || !parse_uint(value, &out->stride)) {
+                return ParseOutcome::kError;
+            }
         } else if (arg == "--refresh") {
             const char* value = need_value(i);
-            if (value == nullptr || !parse_int(value, &out->refresh_hz)) return false;
+            if (value == nullptr || !parse_int(value, &out->refresh_hz)) {
+                return ParseOutcome::kError;
+            }
         } else if (arg == "--frames") {
             const char* value = need_value(i);
-            if (value == nullptr || !parse_int(value, &out->frames)) return false;
+            if (value == nullptr || !parse_int(value, &out->frames)) {
+                return ParseOutcome::kError;
+            }
         } else if (arg.rfind("--", 0) == 0) {
             std::cerr << "未知选项: " << arg << "\n";
-            return false;
+            return ParseOutcome::kError;
         } else if (out->command == "nv12" && out->nv12_path.empty()) {
             out->nv12_path = arg;  // nv12 子命令的首个位置参数是文件路径
         } else {
             std::cerr << "多余的位置参数: " << arg << "\n";
-            return false;
+            return ParseOutcome::kError;
         }
     }
 
@@ -181,25 +199,25 @@ bool ParseArgs(int argc, char** argv, Options* out) {
     }
     if (out->command == "nv12" && out->nv12_path.empty()) {
         std::cerr << "nv12 子命令需要提供 NV12 文件路径\n";
-        return false;
+        return ParseOutcome::kError;
     }
     if (out->frames <= 0) {
         std::cerr << "--frames 必须为正数\n";
-        return false;
+        return ParseOutcome::kError;
     }
     if (out->width == 0 || out->height == 0) {
         std::cerr << "--width/--height 必须为正数\n";
-        return false;
+        return ParseOutcome::kError;
     }
     if (out->refresh_hz <= 0) {
         std::cerr << "--refresh 必须为正数（帧间隔按刷新率计算）\n";
-        return false;
+        return ParseOutcome::kError;
     }
     if (out->stride < out->width) {
         std::cerr << "--stride 不能小于 --width（NV12 行必须容纳整行像素）\n";
-        return false;
+        return ParseOutcome::kError;
     }
-    return true;
+    return ParseOutcome::kOk;
 }
 
 HdmiDisplayConfig ToConfig(const Options& options) {
@@ -330,10 +348,13 @@ std::unique_ptr<IHdmiDisplay> MakeDisplay(bool* using_stub) {
 }
 
 int RunModes(const Options& options) {
+    bool device_opened = false;
     std::cout << drone::video_transmission::DescribeHdmiDrmResources(
                      options.device, options.width, options.height,
-                     options.refresh_hz);
-    return 0;
+                     options.refresh_hz, &device_opened);
+    // 退出码反映"是否真的枚举到了资源"，供脚本/CI 判断：
+    // 无设备节点、无权限、未编译 DRM 支持时均返回非 0。
+    return device_opened ? 0 : 1;
 }
 
 int RunFrames(const Options& options, bool from_file) {
@@ -386,17 +407,22 @@ int RunFrames(const Options& options, bool from_file) {
     spdlog::info("输出模式: {}", display->ActiveModeName());
 
     const auto frame_interval = std::chrono::microseconds(1000000 / options.refresh_hz);
+    // 按绝对时刻排程，使节拍严格对齐标称刷新率：
+    // 若把 deadline 放在每帧生成之后计算，单帧耗时会累加进节拍（彩条生成约 20ms@720p），
+    // 探针就跑不到标称帧率，"源与输出同速"这一前提也就不成立了。
+    auto next_deadline = std::chrono::steady_clock::now();
+    const auto loop_start = next_deadline;
     std::uint64_t submitted = 0;
     std::uint64_t busy = 0;
     std::uint64_t failed = 0;
     for (int index = 0; index < options.frames; ++index) {
+        next_deadline += frame_interval;
         if (!from_file) {
             std::uint8_t* y_plane = frame.data();
             std::uint8_t* uv_plane =
                 frame.data() + static_cast<std::size_t>(options.stride) * options.height;
             FillColorBars(y_plane, uv_plane, options, index);
         }
-        const auto deadline = std::chrono::steady_clock::now() + frame_interval;
         const HdmiSubmitResult result =
             display->Submit(frame.data(), options.width, options.height,
                             options.stride);
@@ -407,13 +433,24 @@ int RunFrames(const Options& options, bool from_file) {
         } else {
             ++failed;
         }
-        std::this_thread::sleep_until(deadline);
+        // 生成+提交超过一个帧间隔时 sleep_until 立即返回，自动退化为"尽力而为"
+        std::this_thread::sleep_until(next_deadline);
     }
 
     const auto flip = display->FlipLatency();
     const auto prepare = display->PrepareLatency();
-    spdlog::info("上屏结束: 提交 {} 帧, 繁忙丢弃 {} 帧, 失败 {} 次",
-                 submitted, busy, failed);
+    // 实际达成帧率：明显低于标称刷新率说明 GPU 或 DRM 提交成为瓶颈，
+    // 图传发射机端会表现为输出帧率不足。
+    const double elapsed_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - loop_start)
+            .count();
+    const double achieved_fps =
+        elapsed_s > 0.0 ? static_cast<double>(submitted + busy + failed) / elapsed_s
+                        : 0.0;
+    spdlog::info("上屏结束: 提交 {} 帧, 繁忙丢弃 {} 帧, 失败 {} 次; "
+                 "耗时 {:.2f}s, 实际提交 {:.1f}fps(标称 {}Hz)",
+                 submitted, busy, failed, elapsed_s, achieved_fps,
+                 options.refresh_hz);
     spdlog::info("准备耗时 P50={:.2f}ms P99={:.2f}ms; 翻转提交 P50={:.2f}ms P99={:.2f}ms",
                  prepare.p50_ms, prepare.p99_ms, flip.p50_ms, flip.p99_ms);
     if (busy > 0) {
@@ -442,8 +479,13 @@ int main(int argc, char** argv) {
     spdlog::set_default_logger(logger);
 
     Options options;
-    if (!ParseArgs(argc, argv, &options)) {
-        return 2;
+    switch (ParseArgs(argc, argv, &options)) {
+        case ParseOutcome::kHelp:
+            return 0;  // 用户显式请求帮助属正常退出
+        case ParseOutcome::kError:
+            return 2;
+        case ParseOutcome::kOk:
+            break;
     }
     if (options.command == "modes") {
         return RunModes(options);

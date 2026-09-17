@@ -1,17 +1,17 @@
 # HDMI 直显后端（DRM/KMS + GBM + EGL/GLES）构建片段
 #
-# 本文件是新增子目录的一部分，**不修改任何既有文件**。两种接入方式：
+# 本模块位于 videoPart/hdmi_part，**不修改任何既有文件**。两种接入方式：
 #
-# 1) 主工程接入（推荐）
+# 1) 独立编译验证（推荐先做：不需要 FFmpeg 等主工程其余依赖）
+#        cmake -S videoPart/hdmi_part/src/hdmi -B build_hdmi
+#        cmake --build build_hdmi -j$(nproc)
+#    只构建本模块静态库、hdmi_probe 自检工具与自检单元测试。
+#
+# 2) 主工程接入
 #    在仓库根 CMakeLists.txt **末尾**（即 drone_video_transmission 定义之后）增加一行：
-#        add_subdirectory(src/video_transmission/hdmi)
+#        add_subdirectory(videoPart/hdmi_part/src/hdmi)
 #    本文件会新建独立静态库 drone_hdmi_display，并把它挂到 drone_video_transmission 上。
 #    刻意不把源文件追加进既有目标：这样既有源文件的编译选项完全不受影响。
-#
-# 2) 独立编译验证
-#        cmake -S src/video_transmission/hdmi -B build_hdmi
-#        cmake --build build_hdmi -j$(nproc)
-#    只构建本模块与 hdmi_probe 自检工具，用于快速确认本子目录可编译。
 #
 # 依赖安装（香橙派 / Ubuntu 24.04）：
 #     sudo apt install libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev
@@ -25,9 +25,28 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_CXX_EXTENSIONS OFF)
 endif()
 
-# 项目根目录：本目录为 <根>/src/video_transmission/hdmi
-get_filename_component(DRONE_PROJECT_ROOT
-                       "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+# 本模块头文件目录：<hdmi_part>/include（对外以 hdmi/ 前缀暴露）
+get_filename_component(HDMI_PART_INCLUDE_DIR
+                       "${CMAKE_CURRENT_SOURCE_DIR}/../../include" ABSOLUTE)
+
+# 仓库根目录：自本目录向上逐级查找标志文件，不依赖固定层级。
+# （本文件位于 <根>/videoPart/hdmi_part/src/hdmi，共 4 层；整目录复制到别处时仍能定位。）
+set(DRONE_PROJECT_ROOT "")
+set(_drone_probe "${CMAKE_CURRENT_SOURCE_DIR}")
+foreach(_level RANGE 0 6)
+    if(EXISTS "${_drone_probe}/include/video_transmission/video_encoder.h"
+       AND EXISTS "${_drone_probe}/third_party/spdlog/CMakeLists.txt")
+        set(DRONE_PROJECT_ROOT "${_drone_probe}")
+        break()
+    endif()
+    get_filename_component(_drone_probe "${_drone_probe}/.." ABSOLUTE)
+endforeach()
+if(NOT DRONE_PROJECT_ROOT)
+    message(FATAL_ERROR
+        "未能自 ${CMAKE_CURRENT_SOURCE_DIR} 向上定位仓库根："
+        "应存在 include/video_transmission/video_encoder.h 与 third_party/spdlog。")
+endif()
+message(STATUS "HDMI 直显模块: 仓库根=${DRONE_PROJECT_ROOT}")
 
 # ---- DRM/KMS 依赖开关（沿用项目 DRONE_HAVE_* 命名与默认值风格） ----
 # ARM64（香橙派）默认开启；x86_64 开发机默认关闭，此时自动回退占位显示器，
@@ -80,6 +99,7 @@ endif()
 if(NOT TARGET drone_hdmi_display)
     add_library(drone_hdmi_display STATIC ${HDMI_DISPLAY_SOURCES})
     target_include_directories(drone_hdmi_display PUBLIC
+        $<BUILD_INTERFACE:${HDMI_PART_INCLUDE_DIR}>
         $<BUILD_INTERFACE:${DRONE_PROJECT_ROOT}/include>)
     target_compile_features(drone_hdmi_display PUBLIC cxx_std_17)
     # EGL 原生句柄按 GBM 语义使用（无 X11/Wayland 平台），关闭 EGL 头文件的 X11 类型
@@ -107,8 +127,31 @@ elseif(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # 此时会静默编译但不会被链接进图传模块，故显式告警。
     message(WARNING
         "未找到 drone_video_transmission 目标："
-        "add_subdirectory(src/video_transmission/hdmi) 必须写在该目标定义之后"
+        "add_subdirectory(videoPart/hdmi_part/src/hdmi) 必须写在该目标定义之后"
         "（建议放在根 CMakeLists.txt 末尾），否则 HDMI 后端不会被链接进图传模块。")
+endif()
+
+# ---- 开发者自检单元测试（不依赖 DRM 设备，任意开发机可跑） ----
+# 与根工程一致：由 BUILD_TESTING 与 GTest 可用性决定是否构建。
+include(CTest)
+if(BUILD_TESTING)
+    find_package(GTest QUIET)
+    if(GTest_FOUND)
+        add_executable(hdmi_display_backend_selftest
+            hdmi_display_backend_selftest.cpp)
+        target_compile_features(hdmi_display_backend_selftest PRIVATE cxx_std_17)
+        target_link_libraries(hdmi_display_backend_selftest PRIVATE
+            drone_hdmi_display spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(hdmi_display_backend_selftest PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(hdmi_display_backend_selftest PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(hdmi_display_backend_selftest)
+    else()
+        message(STATUS "GoogleTest not found; HDMI 自检单元测试将不构建")
+    endif()
 endif()
 
 # ---- 带外自检工具 ----

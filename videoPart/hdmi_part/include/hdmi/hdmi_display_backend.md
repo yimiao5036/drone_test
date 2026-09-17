@@ -1,8 +1,12 @@
 # HDMI 直显后端（HdmiDisplayBackend）实现文档
 
-> 对应实现：`include/video_transmission/hdmi/hdmi_display_backend.h`
->（实现 `src/video_transmission/hdmi/hdmi_display_backend.cpp`、
+> 对应实现：`videoPart/hdmi_part/include/hdmi/hdmi_display_backend.h`
+>（实现 `videoPart/hdmi_part/src/hdmi/hdmi_display_backend.cpp`、
 >`hdmi_display_stub.cpp`、`hdmi_drm_display.cpp`、`hdmi_probe.cpp`、`CMakeLists.txt`）
+>
+> **模块位置**：`videoPart/hdmi_part/`。自包含子目录，可脱离主工程单独构建验证；
+> 头文件以 `hdmi/hdmi_display_backend.h` 前缀引入（该目录是 `drone_hdmi_display`
+> 的 PUBLIC include 路径）。
 
 ## 功能职责
 
@@ -42,7 +46,7 @@ kAnnotatedFrame (Topic<FrameHandle>, NV12)
 | `HdmiConfigFromEncoderConfig(encode)` | 从既有 `EncoderBackendConfig` 桥接出 HDMI 配置 |
 | `CreateHdmiDisplay()` | 编译期分派：有 DRM 依赖用真实实现，否则用占位实现 |
 | `CreateHdmiDrmDisplay()` / `CreateHdmiDisplayStub()` | 显式创建（测试/自检用） |
-| `DescribeHdmiDrmResources(...)` | 只读枚举 DRM 资源报告，供 `hdmi_probe modes` |
+| `DescribeHdmiDrmResources(dev, w, h, hz, &opened)` | 只读枚举 DRM 资源报告，供 `hdmi_probe modes`；`device_opened` 回传是否真的读到资源，作为探针退出码依据 |
 
 ### 语义映射（接口名沿用编码后端，避免改动冻结接口）
 
@@ -167,7 +171,7 @@ sudo apt install libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev
 
 ```bash
 cd /mnt/d/ProgramData/drone_test/drone_test
-cmake -S src/video_transmission/hdmi_part -B build_hdmi
+cmake -S videoPart/hdmi_part/src/hdmi -B build_hdmi
 cmake --build build_hdmi -j$(nproc)
 ```
 
@@ -179,10 +183,12 @@ ARM64 默认 `DRONE_HAVE_HDMI_KMS=ON`；x86_64 开发机默认 OFF，
 1. **根 `CMakeLists.txt` 末尾**追加一行（必须在 `drone_video_transmission` 定义之后）：
 
    ```cmake
-   add_subdirectory(src/video_transmission/hdmi)
+   add_subdirectory(videoPart/hdmi_part/src/hdmi)
    ```
 
    本子目录会新建独立静态库 `drone_hdmi_display` 并挂到 `drone_video_transmission` 上。
+   该库的 PUBLIC include 目录为 `videoPart/hdmi_part/include`，
+   因此装配处按 `#include "hdmi/hdmi_display_backend.h"` 引入头文件。
    刻意不把源文件塞进既有目标，因此既有源文件的编译选项完全不变。
 
 2. **装配处**（`src/application/drone_application.cpp` 中创建 `VideoSender` 之前）
@@ -204,13 +210,118 @@ ARM64 默认 `DRONE_HAVE_HDMI_KMS=ON`；x86_64 开发机默认 OFF，
 
    ```json
    "video": {
-       "output_backend": "hdmi_part",
-       "hdmi_part": { "width": 1280, "height": 720, "refresh_hz": 30,
+       "output_backend": "hdmi",
+       "hdmi": { "width": 1280, "height": 720, "refresh_hz": 30,
                  "connector_name": "", "color_space": "bt709", "full_range": false }
    }
    ```
 
    选 `"rtsp"`（或字段缺省）时保持原有行为完全不变。
+
+### 开发机验证脚本（`verify/`）
+
+四个脚本都在 WSL2 Ubuntu 中执行，源码与构建产物分离（构建目录在 `~/drone_hdmi_build`，
+不写入仓库）：
+
+```bash
+cd /mnt/d/ProgramData/drone_test/drone_test
+
+# 1) 环境探测：发行版、编译器、DRM/GBM/EGL 头与 pkg-config、/dev/dri
+bash videoPart/hdmi_part/src/hdmi/verify/hdmi_env_probe.sh
+
+# 2) 完整验证：KMS=ON / OFF 两轮，各含编译 + 单测 + 探针退出码断言
+bash videoPart/hdmi_part/src/hdmi/verify/hdmi_build_check.sh all
+
+# 3) 探针运行时行为：占位显示器下跑通完整帧循环与参数处理
+bash videoPart/hdmi_part/src/hdmi/verify/hdmi_probe_run.sh
+
+# 4) 主工程接入路径：临时工程模拟主工程，验证 add_subdirectory 接入 +
+#    PUBLIC include/link 向下游传播（不改仓库根 CMakeLists.txt）
+bash videoPart/hdmi_part/src/hdmi/verify/hdmi_subdir_check.sh
+```
+
+> ⚠️ 这些脚本**必须按文件执行**。不要用 `wsl.exe -- bash -c '...'` 内联传带 `$` 的
+> 命令：Windows 侧 shell 会吞掉变量展开，导致退出码/计数测出假结果
+> （本文档的退出码结论就是踩过这个坑后重新测的）。
+
+## 已完成的开发机验证（WSL2 Ubuntu）
+
+环境（`verify/hdmi_env_probe.sh` 实测）：
+
+| 项 | 值 |
+|---|---|
+| 发行版 | **Ubuntu 22.04.5 LTS** |
+| 内核 | 6.6.114.1-microsoft-standard-WSL2 |
+| 架构 | x86_64 |
+| 编译器 | g++ 11.4.0 |
+| CMake | 3.22.1 |
+| libdrm / gbm | 2.4.113 / 23.2.1 |
+| EGL / GLESv2 | 1.5 / 3.2（头文件与 `pkg-config` 均可用） |
+| `/dev/dri` | 不存在（WSL2 正常现象，无法真实上屏） |
+
+> ⚠️ AGENTS.md 规定唯一合法构建环境是 **WSL2 Ubuntu 24.04**，本次可用发行版为
+> **22.04.5**。g++ 11 与 libdrm 2.4.113 对 C++17 及本模块所用 API 足够，
+> 但**不能替代 24.04 的提交前验证**——正式提交前请在 Ubuntu 24.04 复跑
+> `verify/hdmi_build_check.sh`。
+
+结果（`verify/hdmi_build_check.sh all`）：
+
+| 配置 | 编译 | 单元测试 |
+|---|---|---|
+| `DRONE_HAVE_HDMI_KMS=ON`（DRM/GBM/EGL 实现参与编译与链接） | 通过，0 error / 0 warning（`-Wall -Wextra -Wpedantic`） | 23 项全通过（实机冒烟 1 项自动跳过） |
+| `DRONE_HAVE_HDMI_KMS=OFF`（占位实现） | 通过，0 error / 0 warning | 23 项全通过（同上） |
+
+`hdmi_probe` 退出码契约（脚本据此判定成败）：`modes` 无设备时 `1`、`--help` 为 `0`、
+非法子命令 `2`、非法参数 `2`。
+
+运行期实测（占位显示器、`verify/hdmi_probe_run.sh`）：`test --frames 30` 得
+"提交 30 帧、繁忙丢弃 0、耗时 1.00s、实际提交 30.0fps（标称 30Hz）"；
+`--refresh 25` 得 25.0fps；NV12 文件过小与文件不存在均报错并返回 `1`。
+
+### 模块位置：`videoPart/hdmi_part`
+
+本模块最初落在 `include/video_transmission/hdmi/` 与 `src/video_transmission/hdmi/`，
+后整体搬入 **`videoPart/hdmi_part/`**（与 `videoPart/` 下其他独立子工程并列）。
+搬移前后对应关系：
+
+| 搬移前 | 搬移后 |
+|---|---|
+| `include/video_transmission/hdmi/hdmi_display_backend.h` / `.md` | `videoPart/hdmi_part/include/hdmi/` |
+| `src/video_transmission/hdmi/*.cpp`、`CMakeLists.txt`、`verify/` | `videoPart/hdmi_part/src/hdmi/` |
+
+随之调整的三处（均在本模块内，**仍未触碰任何既有文件**）：
+
+1. **include 前缀**：源码由 `"video_transmission/hdmi/hdmi_display_backend.h"`
+   改为 `"hdmi/hdmi_display_backend.h"`；`CMakeLists.txt` 把
+   `videoPart/hdmi_part/include` 加入 `drone_hdmi_display` 的 PUBLIC include 目录。
+   主工程装配处同样按 `#include "hdmi/hdmi_display_backend.h"` 引入。
+2. **仓库根定位不再写死相对层级**：改为自本目录**向上逐级查找标志文件**
+   （`include/video_transmission/video_encoder.h` + `third_party/spdlog/CMakeLists.txt`），
+   最多上溯 6 级，找不到即 `FATAL_ERROR`。整目录被复制到别处也不会静默定位错。
+   配置阶段会打印 `-- HDMI 直显模块: 仓库根=...` 供核对。
+3. **`verify/*.sh`** 内的源码路径与用法示例同步更新为
+   `videoPart/hdmi_part/src/hdmi`。
+
+搬移后已在新位置复跑 `verify/hdmi_build_check.sh all`：两种配置均 0 error / 0 warning、
+23 项单测全通过、探针退出码契约不变；`verify/hdmi_probe_run.sh` 的帧率读数与搬移前
+一致（30.0fps / 25.0fps），确认路径改动未引入回归。
+
+另外新增并跑通 `verify/hdmi_subdir_check.sh`：用临时工程模拟主工程（先建
+`drone_video_transmission` 再 `add_subdirectory`），实测通过 —— 仓库根自动定位正确、
+无「未找到 drone_video_transmission 目标」告警、0 error / 0 warning，且下游**只链
+`drone_video_transmission`** 就能 `#include "hdmi/hdmi_display_backend.h"` 并成功调用
+`HdmiMakeBackendFactory()`（验证 PUBLIC include 与链接传播）。
+
+编译/运行验证中发现并修复的缺陷（**其中前两条只有真编译器能抓到**）：
+
+| 问题 | 后果 | 修复 |
+|---|---|---|
+| `std::abs(mode.vrefresh - config.refresh_hz)`：`vrefresh` 是 `__u32`，相减得无符号，`std::abs` 无匹配重载 | **编译失败**（重载歧义） | 显式 `static_cast<int>` 后再相减 |
+| `snprintf` 用 `%d` 打印 `__u32` 的 `vrefresh`（合成模式名、模式列表各一处） | 格式串类型不匹配 | 改 `%u` 并显式转型 |
+| 探针把 deadline 放在每帧生成之后计算，彩条生成耗时（720p 约 20ms/帧）被累加进节拍 | 实际只跑到约 19fps，**压不出 `kBusy` 丢帧路径**，读数失真 | 改为绝对时刻排程 `next_deadline += interval` |
+| 探针各失败路径一律 `return 0` | 脚本/CI 无法判断成败 | 引入 `ParseOutcome{kOk,kHelp,kError}`，`modes` 以 `device_opened` 决定退出码 |
+| 单测在 `std::move(mock)` 之后仍用 `mock->` 访问成员 | 空指针解引用 **SEGFAULT** | 改用 move 前保存的 `raw` 指针 |
+| 单测写 `EXPECT_THROW(HdmiDisplayBackend(cfg), ...)` | 被解析为变量声明（most vexing parse），**测不到目标行为** | 改用 `ctor_rejects()` 辅助函数执行构造 |
 
 ## 测试方式
 
@@ -229,25 +340,41 @@ sudo ./build_hdmi/hdmi_probe test --frames 180
 sudo ./build_hdmi/hdmi_probe nv12 frame.nv12 --width 1280 --height 720 --stride 1280
 ```
 
-### 单元与集成测试
+### 单元测试（已交付，开发机可跑）
 
-- 注入 Mock 可完全绕开 DRM：`HdmiDisplayBackend(config, std::move(mock))`，
-  参照 `tests/video_transmission/video_sender_test.cpp` 的 `MockBackend` 写法。
-  可验证：输入帧非法/尺寸不匹配丢帧、`kBusy` 不计错误、`kFailed` 计错误、
-  计数与延迟接口。
-- `CreateHdmiDisplayStub()` 可在开发机跑通 `VideoSender` 全链路
-  （`backend_factory` 返回 `HdmiDisplayBackend` 且注入 stub），
-  验证线程、订阅队列、`DroppedFrameCount` 统计。
+`videoPart/hdmi_part/src/hdmi/hdmi_display_backend_selftest.cpp`，23 个用例，
+**不依赖 DRM 设备**，覆盖：
 
-> **本次交付未附带新测试文件**（约束为不改动既有目录）。若需要，可在
-> `tests/video_transmission/` 下新增 `hdmi_display_backend_test.cpp`，
-> 参考上表断言点；它只依赖 `drone_hdmi_display`，不需要 DRM 设备。
+| 分组 | 覆盖点 |
+|---|---|
+| 装配辅助 | 工厂类型与 `VideoSenderConfig::backend_factory` 一致；非法配置收敛为 `nullptr` 不抛异常；`HdmiConfigFromEncoderConfig` 的尺寸/帧率桥接与默认值保留 |
+| 生命周期 | 配置透传、`Start/Stop` 幂等、Open 失败降级、停止后可重启、析构自动 `Close` |
+| 帧校验 | 未启动提交、空句柄、非 NV12、尺寸不匹配均拒绝并计错误且不触碰设备 |
+| 提交语义 | `hor_stride` 与缓冲地址透传；`kBusy` 只丢帧不计错误；`kFailed` 计错误；混合负载下计数正确 |
+| 统计映射 | 用不同数值验证 `FramePrepareLatency` / `PacketWriteLatency` 未写反；未启动时查询安全 |
+| 健壮性 | 连续 250 帧非法输入的节流日志路径不崩溃、计数不丢 |
+| 实机冒烟 | `RealDrmDeviceLifecycleSmoke`：有 `/dev/dri` 时跑真实设备，开发机自动 `GTEST_SKIP` |
+
+关键构造点为**注入式**：`HdmiDisplayBackend(config, std::move(mock))` 把
+`IHdmiDisplay` 换成正交的 `MockHdmiDisplay`，因此后端主体逻辑与图形栈完全解耦。
+
+> 踩坑记录：写 `EXPECT_THROW(HdmiDisplayBackend(cfg), ...)` 会被解析成
+> "声明了一个名为 `cfg` 的对象"（most vexing parse），实际调用默认构造函数；
+> 测试里改用 `ctor_rejects()` 辅助函数执行构造，避免这类假测试。
 
 ### 无法在开发机验证的部分
 
-WSL2 Ubuntu 24.04 无 `/dev/dri`，**HDMI 上屏只能在香橙派实机验证**。
-开发机能保证的只有：编译通过、参数校验与丢帧逻辑正确、无设备时 `Start()` 返回
-`false` 且日志给出原因。
+WSL2 无 `/dev/dri`，**HDMI 上屏只能在香橙派实机验证**。开发机能保证的只有：
+编译通过（含 DRM 实现的全量类型检查与链接）、参数校验与丢帧逻辑正确、
+无设备时 `Start()` 返回 `false` 且日志给出原因。
+
+以下必须上板确认，开发机无法覆盖：
+
+- EDID 实际给出的模式列表、`PickOutputMode()` 的真实回退级别；
+- GBM/EGL/GLES3 初始化是否成功（Mesa 与厂商 libmali 行为差异大）；
+- NV12 双纹理 + `GL_UNPACK_ROW_LENGTH` 的实际画面正确性（斜纹、色彩、上下方向）；
+- 页面翻转的真实时序、`kBusy` 丢帧比例、`flip_timeout_ms` 是否够用；
+- 图传发射机能否锁定 HDMI 信号。
 
 ## 排查 / 修改要点
 
@@ -276,6 +403,9 @@ WSL2 Ubuntu 24.04 无 `/dev/dri`，**HDMI 上屏只能在香橙派实机验证**
 - 改色彩矩阵/范围 → 同步 `kColorMatrixBt601/709`、`SetupGl()` 里的 offset/scale、
   `hdmi_probe.cpp` 的 `RgbToNv12Yuv()`（两者必须互补，否则彩条颜色会偏）。
 - 改日志 → 遵守 AGENTS.md 日志纪律：热路径不打日志，异常节流。
+- 再搬移本模块目录 → 头文件必须处于某 include 根下的 `hdmi/` 子目录内，并在
+  `CMakeLists.txt` 中把该根加进 `drone_hdmi_display` 的 PUBLIC include 目录；
+  仓库根由向上查找自动适配，无需改层级常量。搬完务必复跑 `verify/hdmi_build_check.sh all`。
 
 ## 已知限制与后续优化
 
@@ -289,4 +419,9 @@ WSL2 Ubuntu 24.04 无 `/dev/dri`，**HDMI 上屏只能在香橙派实机验证**
    若源分辨率与输出模式不同，应在 `FrameCompositor` 侧统一，不在本模块隐性拉伸。
 4. **未提供 `interrupt_callback` 类的中断机制**：所有 DRM 调用均已非阻塞，
    无阻塞写包问题（与 FFmpeg 后端不同）。
-5. **未附带单元测试文件**：受"不改动既有目录"约束，见上文"单元与集成测试"。
+5. **占位实现不模拟真实翻转时序**：`hdmi_display_stub.cpp` 的 `Submit` 立即返回
+   `kSubmitted`，不模拟垂直同步等待，故开发机无法触发真实的 `kBusy` 丢帧时机；
+   该分支由注入 Mock 的单测（`BusyFrameIsDroppedWithoutError`）覆盖。
+6. **探针的彩条生成有 CPU 开销**：720p 每帧约 20ms、1080p 约 43ms（逐像素浮点
+   色彩转换）。探针按绝对时刻排程，因此仍能跑满标称刷新率；但若观察到
+   "实际提交帧率低于标称"，先确认是 GPU/DRM 瓶颈而非彩条生成。
