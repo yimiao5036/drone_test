@@ -14,7 +14,7 @@
  * 本文件刻意不引用任何图形库：libdrm/libgbm/EGL 只出现在
  * hdmi_drm_display.cpp 内，因此本文件与占位实现可在任意开发机编译与单测。
  */
-#include "video_transmission/hdmi/hdmi_display_backend.h"
+#include "hdmi/hdmi_display_backend.h"
 
 #include <atomic>
 #include <cstdint>

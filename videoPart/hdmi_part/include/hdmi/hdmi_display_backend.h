@@ -139,11 +139,14 @@ std::unique_ptr<IHdmiDisplay> CreateHdmiDisplayStub();
 /// @param target_width  目标模式宽；非 0 时额外给出模式匹配结论
 /// @param target_height 目标模式高
 /// @param target_refresh_hz 目标刷新率；<=0 表示不限定刷新率
+/// @param device_opened 输出参数：成功打开设备并读到资源时置 true，否则置 false。
+///        供 hdmi_probe 决定进程退出码；传 nullptr 表示不关心。
 /// @return 多行文本报告；未定义 DRONE_HAVE_HDMI_KMS 时返回说明字符串。
 std::string DescribeHdmiDrmResources(const std::string& device,
                                      std::uint32_t target_width = 0,
                                      std::uint32_t target_height = 0,
-                                     int target_refresh_hz = 0);
+                                     int target_refresh_hz = 0,
+                                     bool* device_opened = nullptr);
 
 /// HDMI 直显后端：实现 IVideoEncoderBackend，供 VideoSender 的 backend_factory 注入。
 ///
