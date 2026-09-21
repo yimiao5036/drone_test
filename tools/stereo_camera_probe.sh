@@ -72,7 +72,7 @@ run v4l2-ctl --list-devices
 NODES=()
 for n in /dev/video*; do
     [ -e "$n" ] || continue
-    caps="$(v4l2-ctl -d "$n" --all 2>/dev/null | awk -F: '/Device Caps/{print $2}')"
+    caps="$(v4l2-ctl -d "$n" --all 2>/dev/null | grep -A 6 '^Device Caps')"
     if echo "${caps}" | grep -q "Video Capture" && ! echo "${caps}" | grep -q "Multiplanar"; then
         NODES+=("$n")
         log "采集节点: $n  (Device Caps:${caps})"
