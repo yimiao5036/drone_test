@@ -525,6 +525,36 @@ AppConfig LoadAppConfig(const std::string& path,
     }
 
     const json video = root.value("video", json::object());
+
+    // 输入源二选一：rtsp（现有单目链路，默认）| uvc（USB 双目 SBS 链路）。
+    config.video_source.camera_source =
+        video.value("camera_source", std::string("rtsp"));
+    if (config.video_source.camera_source != "rtsp" &&
+        config.video_source.camera_source != "uvc") {
+        throw std::invalid_argument("video.camera_source仅支持rtsp/uvc");
+    }
+    config.video_source.stereo_split = video.value("stereo_split", false);
+    if (config.video_source.stereo_split &&
+        config.video_source.camera_source != "uvc") {
+        throw std::invalid_argument(
+            "stereo_split=true时camera_source必须为uvc（拆分依赖USB双目源）");
+    }
+
+    // UVC 双目采集参数；camera_source=uvc 时强制 SBS 偶数宽（左右拆分前提）。
+    config.uvc_camera.device = video.value("uvc_device", std::string("/dev/video0"));
+    config.uvc_camera.width = static_cast<std::uint32_t>(
+        ReadOptionalPositiveInt(video, "uvc_width", 2560));
+    config.uvc_camera.height = static_cast<std::uint32_t>(
+        ReadOptionalPositiveInt(video, "uvc_height", 720));
+    config.uvc_camera.fps = static_cast<std::uint32_t>(
+        ReadOptionalPositiveInt(video, "uvc_fps", 30));
+    if (config.video_source.camera_source == "uvc" &&
+        (config.uvc_camera.width % 2) != 0) {
+        throw std::invalid_argument("camera_source=uvc时video.uvc_width必须为偶数");
+    }
+    config.stereo_splitter.width = config.uvc_camera.width;
+    config.stereo_splitter.height = config.uvc_camera.height;
+
     config.camera.rtsp_url = video.value(
         "input_rtsp", std::string("rtsp://192.168.1.100:8554/live"));
     config.camera.rtsp_transport = video.value("rtsp_transport", std::string("tcp"));

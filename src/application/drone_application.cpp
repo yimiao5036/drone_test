@@ -17,6 +17,8 @@
 #include "state_machine/mission_state_machine.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
+#include "video/stereo_frame_splitter.h"
+#include "video/uvc_camera_receiver.h"
 #include "video/video_decoder.h"
 #include "video_transmission/video_sender.h"
 
@@ -34,11 +36,12 @@ DroneApplication::DroneApplication(config::AppConfig config)
     : config_(std::move(config)) {
     BuildComponents();
     BindTopics();
-    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={}",
+    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={} camera_source={} stereo_split={}",
                 config_.runtime.enable_video, config_.runtime.enable_px4,
                 config_.runtime.enable_ground_station,
                 config_.runtime.enable_target_estimator,
-                config_.runtime.enable_control);
+                config_.runtime.enable_control, config_.video_source.camera_source,
+                config_.video_source.stereo_split);
 }
 
 DroneApplication::~DroneApplication() {
@@ -49,8 +52,18 @@ DroneApplication::~DroneApplication() {
 // 根据 runtime 开关创建组件。这里只负责所有权，不在此处启动线程或连接设备。
 void DroneApplication::BuildComponents() {
     if (config_.runtime.enable_video) {
-        camera_ = std::make_unique<video::CameraReceiver>(config_.camera);
+        // 输入源二选一：UVC 双目（USB）与 RTSP 单目共用 ICameraReceiver 接口，
+        // 下游解码/健康/启停接线对具体类型无感。
+        if (config_.video_source.camera_source == "uvc") {
+            camera_ = std::make_unique<video::UvcCameraReceiver>(config_.uvc_camera);
+        } else {
+            camera_ = std::make_unique<video::CameraReceiver>(config_.camera);
+        }
         decoder_ = std::make_unique<video::VideoDecoder>(config_.decoder);
+        if (config_.video_source.stereo_split) {
+            stereo_splitter_ =
+                std::make_unique<video::StereoFrameSplitter>(config_.stereo_splitter);
+        }
         detector_ = std::make_unique<perception::YoloDetector>(config_.yolo);
         compositor_ = std::make_unique<video::FrameCompositor>(config_.compositor);
         video_sender_ =
@@ -127,8 +140,16 @@ void DroneApplication::RegisterHealthSources() {
 void DroneApplication::BindTopics() {
     if (config_.runtime.enable_video) {
         decoder_->SetInput(camera_->StreamOutput());
-        detector_->SetInput(decoder_->FrameOutput());
-        compositor_->SetDecodedInput(decoder_->FrameOutput());
+        if (stereo_splitter_ != nullptr) {
+            // 双目拆分链路：YOLO/叠加改消费拆分后左目（与 RTSP 解码帧同为
+            // 1280×720 NV12，下游无差异）；右目仅统计，无订阅者。
+            stereo_splitter_->SetInput(decoder_->FrameOutput());
+            detector_->SetInput(stereo_splitter_->LeftOutput());
+            compositor_->SetDecodedInput(stereo_splitter_->LeftOutput());
+        } else {
+            detector_->SetInput(decoder_->FrameOutput());
+            compositor_->SetDecodedInput(decoder_->FrameOutput());
+        }
         compositor_->SetDetectionInput(detector_->DetectionOutput());
         video_sender_->SetInput(compositor_->AnnotatedOutput());
     }
@@ -209,6 +230,15 @@ bool DroneApplication::Start() {
         } catch (const std::exception& error) {
             degraded = true;
             SPDLOG_ERROR("主程序YOLO启动异常: {}", error.what());
+        }
+        // 拆分器是解码器的消费者、YOLO/叠加的生产者：在二者之后、解码器之前启动。
+        if (stereo_splitter_ != nullptr) {
+            if (!stereo_splitter_->Start()) {
+                degraded = true;
+                SPDLOG_ERROR("主程序双目拆分器启动失败，视频链路降级");
+            } else {
+                any_started = true;
+            }
         }
         if (!decoder_->Start()) {
             degraded = true;
@@ -400,6 +430,9 @@ void DroneApplication::Stop() {
     if (camera_ != nullptr) {
         camera_->Stop();
         decoder_->Stop();
+        if (stereo_splitter_ != nullptr) {
+            stereo_splitter_->Stop();
+        }
         detector_->Stop();
         compositor_->Stop();
         video_sender_->Stop();

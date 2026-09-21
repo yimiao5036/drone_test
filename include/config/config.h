@@ -13,6 +13,8 @@
 #include "perception/yolo_detector.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
+#include "video/stereo_frame_splitter.h"
+#include "video/uvc_camera_receiver.h"
 #include "video/video_decoder.h"
 #include "video_transmission/video_sender.h"
 
@@ -44,12 +46,21 @@ struct HealthManagerConfig {
     std::chrono::milliseconds ground_station_max_age{3000};
 };
 
+/// 视频输入源选择（video 配置节）：RTSP 单目链路与 USB UVC 双目链路二选一。
+struct VideoSourceConfig {
+    std::string camera_source = "rtsp";  ///< rtsp | uvc
+    bool stereo_split = false;           ///< uvc 时是否装配 StereoFrameSplitter 左右拆分
+};
+
 struct AppConfig {
     LogConfig log;
     RuntimeConfig runtime;
     HealthManagerConfig health;
+    VideoSourceConfig video_source;
     video::CameraReceiverConfig camera;
+    video::UvcCameraReceiverConfig uvc_camera;
     video::VideoDecoderConfig decoder;
+    video::StereoFrameSplitterConfig stereo_splitter;
     perception::YoloDetectorConfig yolo;
     video::CompositorConfig compositor;
     video_transmission::VideoSenderConfig video_sender;

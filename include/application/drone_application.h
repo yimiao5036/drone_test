@@ -24,8 +24,9 @@ namespace drone::state_machine {
 class MissionStateMachine;
 }
 namespace drone::video {
-class CameraReceiver;
+class ICameraReceiver;
 class FrameCompositor;
+class StereoFrameSplitter;
 class VideoDecoder;
 }
 namespace drone::video_transmission {
@@ -103,8 +104,9 @@ private:
     config::AppConfig config_;
     bool running_ = false;
 
-    std::unique_ptr<video::CameraReceiver> camera_;
+    std::unique_ptr<video::ICameraReceiver> camera_;
     std::unique_ptr<video::VideoDecoder> decoder_;
+    std::unique_ptr<video::StereoFrameSplitter> stereo_splitter_;
     std::unique_ptr<perception::YoloDetector> detector_;
     std::unique_ptr<perception::VisualTargetMonitor> visual_monitor_;
     std::unique_ptr<video::FrameCompositor> compositor_;
