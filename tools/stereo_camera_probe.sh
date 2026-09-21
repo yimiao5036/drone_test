@@ -12,6 +12,11 @@
 # 用法：bash tools/stereo_camera_probe.sh [输出根目录=.]
 #       可用 DEV=/dev/videoN 环境变量指定探测节点（默认取第一个采集节点）
 # 注意：运行期间确保没有其他进程占用相机节点；脚本每步失败仅记录不中断。
+#
+# 修订记录：
+#   - 修复采集节点识别：v4l2-ctl --all 输出中 "Device Caps" 行有缩进、
+#     能力名称在该行之后的缩进行上，原 awk 同行提取与 ^ 锚点匹配均失效；
+#     改为 grep -A 3 'Device Caps' 抓取后续能力名。
 
 set -u
 
@@ -72,10 +77,12 @@ run v4l2-ctl --list-devices
 NODES=()
 for n in /dev/video*; do
     [ -e "$n" ] || continue
-    caps="$(v4l2-ctl -d "$n" --all 2>/dev/null | grep -A 6 '^Device Caps')"
+    # Device Caps 行有前导缩进，能力名（Video Capture 等）在其后的缩进行上
+    caps="$(v4l2-ctl -d "$n" --all 2>/dev/null | grep -A 3 'Device Caps')"
     if echo "${caps}" | grep -q "Video Capture" && ! echo "${caps}" | grep -q "Multiplanar"; then
         NODES+=("$n")
-        log "采集节点: $n  (Device Caps:${caps})"
+        caps_oneline="$(echo "${caps}" | tr '\n' ' ' | tr -s ' ')"
+        log "采集节点: $n  (${caps_oneline})"
     fi
 done
 if [ "${#NODES[@]}" -eq 0 ]; then
