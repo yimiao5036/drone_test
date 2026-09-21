@@ -48,6 +48,7 @@ add_library(drone_video STATIC
     src/video/uvc_camera_receiver.cpp
     src/video/video_decoder.cpp
     src/video/video_decoder_stub.cpp
+    src/video/stereo_frame_splitter.cpp
     src/video/frame_compositor.cpp)
 target_include_directories(drone_video PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
