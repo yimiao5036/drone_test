@@ -42,8 +42,8 @@
   `ICameraReceiver` 接口，下游组件零改动
 - 拆分后左目与现有 RTSP 链路的解码帧同为 1280×720 NV12，YOLO 输入侧无差异
 - 时间戳：v4l2 buffer 时间戳（monotonic/soe，主机侧接收时刻）写入
-  `EncodedFrame.capture_time_ms`；splitter 输出帧时间戳与序号**透传源帧**，
-  便于左右目帧率一致性核对
+  `EncodedFrame.capture_time_ms`；splitter 输出帧沿用帧元数据语义
+  （ingress 透传、timestamp 为拆分完成时刻，见 §3.4）
 
 ## 3. 组件设计
 
@@ -89,7 +89,10 @@
 - 输入校验：帧宽非偶数或尺寸与配置不符 → 丢弃计错（节流日志）
 - x86 开发机无 RGA 时回退逐行 memcpy（NV12 裁剪简单），保证 WSL2 可测；
   RGA 失败亦回退 memcpy 并计 fallback 数
-- 输出帧时间戳/序号透传源帧；池满丢帧分左右计数（DroppedFrameCount）
+- 帧元数据沿用现有语义（与解码器一致）：`pipeline_ingress_time_ms` 透传源帧
+  （端内总延迟基准），`timestamp_ms` 为拆分完成时刻（经 `SetTiming` 写入）；
+  序号由左右各自内存池分配（FrameHandle 接口不支持序号透传），
+  左右帧率一致性以计数器与 ingress 时间戳核对
 - **左右目对应关系**：SBS 左半幅是否为物理左目未经实证（探测只确认了左右视差）。
   本轮任取左半幅为主用目（不影响出图/统计验收）；测距阶段开始前必须实证
   （如遮挡单侧镜头看画面变化），届时若相反仅交换两个裁剪 rect 即可
@@ -113,8 +116,10 @@ config.json `video` 节新增（默认值保持现状零回归）：
   改绑 `kDecodedFrameLeft`；否则维持 `kDecodedFrame`
 - `camera_source=uvc` 且 `stereo_split=false` 为过渡态：全幅 2560×720 直进
   YOLO/Compositor（非本轮验收对象，仅调试用）
-- 健康监控沿用现有 `register_source` 模式：UVC 接收器复用 `kCamera` 源名，
-  splitter 注册新源名
+- 健康监控：UVC 接收器复用 `kCamera` 源名注册；splitter 本轮**不注册健康源**
+  （`health::error_bits` 新增位涉及地面站健康协议语义，留待双目定型后评审），
+  帧率一致性经计数器与日志核对
+- 池满丢帧分左右计数（DroppedFrameCount）
 - `enable_control: false` 安全基线不动
 
 ## 4. 错误处理与日志
