@@ -2,6 +2,7 @@
 
 > 对应实现：`include/video/camera_receiver.h`、`src/video/camera_receiver.cpp`
 > 接口：`ICameraReceiver`（同头文件）；占位实现 `CameraReceiverStub`（`src/video/camera_receiver_stub.cpp`）
+> 同接口另一实现：USB UVC 双目接收 `uvc_camera_receiver.md`（按 `video.camera_source` 二选一装配）
 > 下游：解码器 `video_decoder.md`
 
 ## 1. 功能职责

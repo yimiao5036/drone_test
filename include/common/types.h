@@ -41,10 +41,12 @@ enum class VideoCodec : uint8_t {
     kUnknown = 0,  ///< 未知编码
     kH264,         ///< H.264 / AVC
     kH265,         ///< H.265 / HEVC
+    kMjpeg,        ///< MJPEG（USB UVC 双目相机，一帧一个访问单元）
 };
 
-/// H.265/H.264 码流块（摄像头采集 → 视频解码器）。
+/// H.265/H.264/MJPEG 码流块（摄像头采集 → 视频解码器）。
 /// 骨架期使用字节容器；大数据零拷贝优化在实现期按性能实测决定。
+/// MJPEG 语义：一帧=一个访问单元、is_key_frame=true、parameter_sets 为空。
 struct EncodedFrame {
     MessageHeader header;
     VideoCodec codec = VideoCodec::kUnknown;  ///< 编码类型
@@ -348,6 +350,8 @@ struct TargetState {
 namespace topics {
 inline constexpr char kCameraStream[] = "camera_stream";      ///< EncodedFrame
 inline constexpr char kDecodedFrame[] = "decoded_frame";      ///< video::FrameHandle
+inline constexpr char kDecodedFrameLeft[] = "decoded_frame_left";    ///< video::FrameHandle（双目拆分左目）
+inline constexpr char kDecodedFrameRight[] = "decoded_frame_right";  ///< video::FrameHandle（双目拆分右目，仅统计）
 inline constexpr char kDetection[] = "detection";             ///< DetectionResult
 inline constexpr char kVisualTarget[] = "visual_target";      ///< VisualTargetObservation
 inline constexpr char kVisualTargetStatus[] = "visual_target_status";  ///< VisualTargetStatus

@@ -45,6 +45,7 @@ add_library(drone_video STATIC
     src/video/drm_nv12_transfer.cpp
     src/video/camera_receiver.cpp
     src/video/camera_receiver_stub.cpp
+    src/video/uvc_camera_receiver.cpp
     src/video/video_decoder.cpp
     src/video/video_decoder_stub.cpp
     src/video/frame_compositor.cpp)

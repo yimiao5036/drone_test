@@ -2,7 +2,7 @@
  * @file video_decoder.h
  * @brief 视频解码部件接口（IVideoDecoder）
  *
- * 属于 drone/video 模块。职责：订阅 H.264/H.265 码流块，解码为图像帧
+ * 属于 drone/video 模块。职责：订阅 H.264/H.265/MJPEG 码流块，解码为图像帧
  * （当前链路为 NV12，后续按需扩展），解码帧以 video::FrameHandle
  * 形式发布，多订阅者零拷贝共享，底层缓冲最后引用释放时归还内存池。
  *

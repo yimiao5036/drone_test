@@ -2,13 +2,15 @@
  * @file video_decoder.cpp
  * @brief 视频解码器实现（VideoDecoder）
  *
- * 订阅 H.264/H.265 码流块（common::EncodedFrame），解码为 NV12 帧，
+ * 订阅 H.264/H.265/MJPEG 码流块（common::EncodedFrame），解码为 NV12 帧，
  * 从内存池分配 FrameHandle 发布（零拷贝共享，最后引用释放自动归还）。
  *
  * 设计要点：
  * - PIMPL 隔离 FFmpeg 头文件，接口头文件不依赖 FFmpeg。
  * - 解码器优先 rkmpp 硬解（香橙派，输出 NV12）；不可用或打开失败时
- *   回退 FFmpeg 软解（开发机验证，YUV420P 经 swscale 转 NV12）。
+ *   回退 FFmpeg 软解（开发机验证，YUV420P/YUVJ420P 经 swscale 转 NV12）。
+ * - MJPEG（USB UVC 双目）：一帧一个访问单元、无参数集、帧间无依赖，
+ *   单帧解码失败计丢帧继续，无 H.26x 的参数集同步问题。
  * - 帧内存池懒创建：配置未给分辨率时首帧确定尺寸后创建。
  * - 输出统一 NV12（与 video_frame.h PixelFormat::kYuv420SpNv12 对应），
  *   后续 YOLO 经 RGA 转 RGB 输入。
@@ -55,8 +57,26 @@ const char* CodecName(common::VideoCodec codec) {
             return "H.264";
         case common::VideoCodec::kH265:
             return "H.265";
+        case common::VideoCodec::kMjpeg:
+            return "MJPEG";
         default:
             return "未知";
+    }
+}
+
+/// 各编码对应的 rkmpp 硬解器名；无 rkmpp 版本时返回 nullptr（直接软解）。
+const char* RkmppDecoderName(AVCodecID codec_id) {
+    switch (codec_id) {
+        case AV_CODEC_ID_HEVC:
+            return "hevc_rkmpp";
+        case AV_CODEC_ID_H264:
+            return "h264_rkmpp";
+        case AV_CODEC_ID_MJPEG:
+            // ffmpeg-rockchip 是否提供 mjpeg_rkmpp 由查找结果决定；
+            // 找不到时走既有软解回退，MJPG 软解负载低。
+            return "mjpeg_rkmpp";
+        default:
+            return nullptr;
     }
 }
 
@@ -200,6 +220,8 @@ struct VideoDecoder::Impl {
             codec_id = AV_CODEC_ID_HEVC;
         } else if (codec == common::VideoCodec::kH264) {
             codec_id = AV_CODEC_ID_H264;
+        } else if (codec == common::VideoCodec::kMjpeg) {
+            codec_id = AV_CODEC_ID_MJPEG;
         }
         if (codec_id == AV_CODEC_ID_NONE) {
             ++error_count;
@@ -207,11 +229,11 @@ struct VideoDecoder::Impl {
             return false;
         }
 
-        // 硬解优先：RK3588 的 rkmpp 解码器
+        // 硬解优先：RK3588 的 rkmpp 解码器（无对应 rkmpp 名时直接软解）
         bool hardware_attempted = false;
-        if (config.prefer_hardware) {
-            const AVCodec* hw_decoder = avcodec_find_decoder_by_name(
-                codec_id == AV_CODEC_ID_HEVC ? "hevc_rkmpp" : "h264_rkmpp");
+        const char* rkmpp_name = RkmppDecoderName(codec_id);
+        if (config.prefer_hardware && rkmpp_name != nullptr) {
+            const AVCodec* hw_decoder = avcodec_find_decoder_by_name(rkmpp_name);
             if (hw_decoder != nullptr) {
                 hardware_attempted = true;
                 if (TryCreateCodec(hw_decoder, true, parameter_sets)) {

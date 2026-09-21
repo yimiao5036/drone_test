@@ -2,15 +2,16 @@
 
 > 对应实现：`include/video/video_decoder.h`、`src/video/video_decoder.cpp`
 > 接口：`IVideoDecoder`（同头文件）；占位实现 `VideoDecoderStub`（`src/video/video_decoder_stub.cpp`）
-> 上游：RTSP 接收 `camera_receiver.md`；下游：内存池 `video_frame_pool.md`
+> 上游：RTSP 接收 `camera_receiver.md`、UVC 双目接收 `uvc_camera_receiver.md`；下游：内存池 `video_frame_pool.md`、双目拆分 `stereo_frame_splitter.md`
 
 ## 1. 功能职责
 
-订阅 H.264/H.265 码流块（`common::EncodedFrame`），解码为 **NV12** 帧，从内存池分配
+订阅 H.264/H.265/MJPEG 码流块（`common::EncodedFrame`），解码为 **NV12** 帧，从内存池分配
 `FrameHandle` 发布（零拷贝共享、最后引用归还内存池）：
 
 - 解码器优先 rkmpp 硬解（香橙派 DRM 路径），不可用时回退 FFmpeg 软解（开发机验证路径）。
 - 解码器未创建前不丢弃任何包：首个数据帧（任意类型，含 IDR 前独立到达的 SPS/PPS 小包）创建解码器并送包，之后全量送包，由解码器自行完成参数集同步与关键帧等待（对齐原型 `videoPart/rtsp_yolo_stream`）。
+- MJPEG（USB UVC 双目）语义：一帧一个访问单元、皆关键帧、无参数集、帧间无依赖；单帧解码失败计 `DroppedFrameCount` 继续，无 H.26x 的参数集同步问题。
 - 池满丢帧不阻塞（WARN 节流）。
 
 不做什么：不负责拉流（上游 `CameraReceiver`）；不负责色彩转换到 RGB（后续 YOLO 用 RGA 转）。
@@ -39,10 +40,12 @@ class VideoDecoder final : public IVideoDecoder {
 
 ## 3. 关键实现点
 
-- **解码器选择**：`avcodec_find_decoder_by_name("hevc_rkmpp"/"h264_rkmpp")` 优先；
-  硬解打开失败（如无 DRM 设备）回退 `avcodec_find_decoder` 软解。
+- **解码器选择**：`RkmppDecoderName()` 按编码给出 rkmpp 名（hevc/h264/mjpeg_rkmpp），
+  `avcodec_find_decoder_by_name` 找到才尝试硬解；无 rkmpp 名或打开失败回退
+  `avcodec_find_decoder` 软解。mjpeg_rkmpp 是否存在取决于 ffmpeg-rockchip 版本，
+  找不到走软解属预期（MJPG 软解负载低）。
 - **硬解路径**：`av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_DRM)` + 绑定解码器；输出`AV_PIX_FMT_DRM_PRIME`后通过`av_hwframe_transfer_data`转存系统内存NV12。转存目标`sw_frame`由首帧让FFmpeg按硬件上下文自动分配，后续使用`av_frame_make_writable`后复用；仅在分辨率/格式不兼容时清空重建，避免旧实现每帧`av_frame_unref`造成的目标缓冲重复分配。
-- **软解路径**：YUV420P → swscale 转 NV12；`sws_ctx` 按源格式缓存，格式变化时重建。
+- **软解路径**：YUV420P/YUVJ420P（MJPG 软解输出）→ swscale 转 NV12；`sws_ctx` 按源格式缓存，格式变化时重建。
 - **参数集**：`EncodedFrame.parameter_sets` 写入 `codec_ctx->extradata`（RTSP 流级参数集）；
   无参数集时解码器从关键帧内嵌 SPS/PPS 解析。
 - **参数集与送包策略（关键）**：不再按“未初始化跳过非关键帧”。本款摄像头 RTSP 的
@@ -92,6 +95,8 @@ cmake --build build && cd build && ctest -R VideoDecoder
 
 - `DecodesH264ToNv12Frames`：libx264 软编 10 帧（ultrafast 预设，SPS/PPS 随关键帧）→ 发布 →
   软解 → 断言输出帧数、320x240、NV12 格式、缓冲可写、`DroppedFrameCount==0`。
+- `DecodesMjpegToNv12Frames`：内置 mjpeg 编码器软编 10 帧（YUVJ420P，皆关键帧、无参数集）→
+  软解 → 断言 NV12 输出、`ActiveCodec()==kMjpeg`、`IsHardwareDecoder()==false`、计数正确。
 - `StopsCleanlyWhenIdle`：无输入启停干净（确定性停机）。
 - 硬解路径（rkmpp/DRM）需香橙派实机验证。
 
