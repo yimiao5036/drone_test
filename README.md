@@ -120,6 +120,8 @@
 - [地面站目标位置与时间同步协议](docs/地面站目标位置与时间同步协议.md)
 - [地面站时间同步响应工具](tools/地面站时间同步响应工具.md)
 - [通信传输抽象](include/communication/communication_transport.md)
+- [视频链路延迟探针](tools/video_latency_probe.md)
+- [NPU 性能分析探针使用方法](tools/NPU性能分析探针使用方法.md)
 
 ## 当前正式工程目录
 

@@ -4,6 +4,8 @@
 
 `video_latency_probe`复用正式`DroneApplication`视频链路，在香橙派上统计“编码访问单元进入机载进程”之后的各阶段延迟。探针只启用视频，不启用PX4、地面站或控制输出。
 
+NPU相关的细分选项（`--rknn-perf-run`、`--rknn-perf-detail`、`--npu-core`）的用法与判读方法另见[NPU性能分析探针使用方法](NPU性能分析探针使用方法.md)。
+
 ## 测量范围
 
 | 序号 | 指标 | 定义 |
