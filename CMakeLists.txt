@@ -334,6 +334,30 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(video_decoder_test)
 
+        # 双目拆分测试：SBS 全幅→左右目 NV12 裁剪、元数据语义、丢帧与错误计数
+        add_executable(stereo_frame_splitter_test tests/video/stereo_frame_splitter_test.cpp)
+        target_link_libraries(stereo_frame_splitter_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(stereo_frame_splitter_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(stereo_frame_splitter_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(stereo_frame_splitter_test)
+
+        # UVC 接收器测试：配置校验、设备不存在错误路径与生命周期（采集正确性板上验收）
+        add_executable(uvc_camera_receiver_test tests/video/uvc_camera_receiver_test.cpp)
+        target_link_libraries(uvc_camera_receiver_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(uvc_camera_receiver_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(uvc_camera_receiver_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(uvc_camera_receiver_test)
+
         # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
         add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)
         target_link_libraries(stub_smoke_test PRIVATE

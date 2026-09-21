@@ -93,6 +93,14 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.visual_monitor.transition_log_interval.count(), 1000);
     EXPECT_EQ(config.visual_monitor.status_log_interval.count(), 5000);
     EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
+    EXPECT_EQ(config.video_source.camera_source, "rtsp");
+    EXPECT_FALSE(config.video_source.stereo_split);
+    EXPECT_EQ(config.uvc_camera.device, "/dev/video0");
+    EXPECT_EQ(config.uvc_camera.width, 2560u);
+    EXPECT_EQ(config.uvc_camera.height, 720u);
+    EXPECT_EQ(config.uvc_camera.fps, 30u);
+    EXPECT_EQ(config.stereo_splitter.width, 2560u);
+    EXPECT_EQ(config.stereo_splitter.height, 720u);
     EXPECT_EQ(config.yolo.model_path,
               "/opt/drone/models/yolo26n-drone-relu6-e184-09-13.rknn");
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
@@ -120,6 +128,80 @@ TEST(ConfigTest, RejectsInvalidYoloNpuCoreMode) {
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, DefaultsVideoSourceWhenFieldsMissing) {
+    json value = ReadSourceConfig();
+    value["video"].erase("camera_source");
+    value["video"].erase("stereo_split");
+    value["video"].erase("uvc_device");
+    value["video"].erase("uvc_width");
+    value["video"].erase("uvc_height");
+    value["video"].erase("uvc_fps");
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_video_source_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.video_source.camera_source, "rtsp");
+    EXPECT_FALSE(config.video_source.stereo_split);
+    EXPECT_EQ(config.uvc_camera.device, "/dev/video0");
+    EXPECT_EQ(config.uvc_camera.width, 2560u);
+    EXPECT_EQ(config.uvc_camera.height, 720u);
+    EXPECT_EQ(config.uvc_camera.fps, 30u);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidCameraSource) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "usb";
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_camera_source_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsStereoSplitWithoutUvcSource) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "rtsp";
+    value["video"]["stereo_split"] = true;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_split_without_uvc.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsOddUvcWidthForUvcSource) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "uvc";
+    value["video"]["uvc_width"] = 2561;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_uvc_odd_width.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ParsesUvcStereoConfiguration) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "uvc";
+    value["video"]["stereo_split"] = true;
+    value["video"]["uvc_width"] = 3840;
+    value["video"]["uvc_height"] = 1080;
+    const auto path = WriteTemporaryConfig(value, "drone_config_uvc_stereo.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.video_source.camera_source, "uvc");
+    EXPECT_TRUE(config.video_source.stereo_split);
+    EXPECT_EQ(config.uvc_camera.width, 3840u);
+    EXPECT_EQ(config.uvc_camera.height, 1080u);
+    EXPECT_EQ(config.stereo_splitter.width, 3840u);
+    EXPECT_EQ(config.stereo_splitter.height, 1080u);
     std::filesystem::remove(path);
 }
 
