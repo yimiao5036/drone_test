@@ -8,7 +8,7 @@
 #   4) 确认 buffer 时间戳来源（印证设计文档 §3.3）
 #   5) 目标档位抓帧存图（SBS 判读 + 画质检查）
 #
-# 依赖：v4l-utils（sudo apt install -y v4l-utils）；python3 或 ffmpeg 可选（用于拆分抓帧）
+# 依赖：v4l-utils 与 usbutils（sudo apt install -y v4l-utils usbutils）；python3 或 ffmpeg 可选（用于拆分抓帧）
 # 用法：bash tools/stereo_camera_probe.sh [输出根目录=.]
 #       可用 DEV=/dev/videoN 环境变量指定探测节点（默认取第一个采集节点）
 # 注意：运行期间确保没有其他进程占用相机节点；脚本每步失败仅记录不中断。
@@ -152,9 +152,9 @@ for res in "${GRAB_RES[@]}"; do
         continue
     fi
     grabbed_any=1
-    # 拆分 MJPG 拼接流为单帧 JPEG：优先 python3，其次 ffmpeg
+    # 拆分 MJPG 拼接流为单帧 JPEG：优先 python3，其次 ffmpeg；失败保留拼接文件
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${raw}" "${FRAMES_DIR}/${res}" <<'PY'
+        python3 - "${raw}" "${FRAMES_DIR}/${res}" >>"${REPORT}" 2>&1 <<'PY'
 import sys
 src, prefix = sys.argv[1], sys.argv[2]
 data = open(src, 'rb').read()
@@ -170,13 +170,26 @@ for i, f in enumerate(frames):
         fp.write(f)
 print(f"split {len(frames)} frames")
 PY
-        log "python3 拆分完成: ${FRAMES_DIR}/${res}_NN.jpg"
+        rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            log "python3 拆分完成: ${FRAMES_DIR}/${res}_NN.jpg"
+            rm -f "${raw}"
+        else
+            log "!! python3 拆分失败 rc=${rc}，保留拼接文件 ${raw}"
+        fi
     elif command -v ffmpeg >/dev/null 2>&1; then
-        run ffmpeg -hide_banner -loglevel error -y -i "${raw}" "${FRAMES_DIR}/${res}_%02d.jpg"
+        log "\$ ffmpeg -i ${raw} ${FRAMES_DIR}/${res}_%02d.jpg"
+        ffmpeg -hide_banner -loglevel error -y -i "${raw}" "${FRAMES_DIR}/${res}_%02d.jpg" >>"${REPORT}" 2>&1
+        rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            log "ffmpeg 拆分完成: ${FRAMES_DIR}/${res}_%02d.jpg"
+            rm -f "${raw}"
+        else
+            log "!! ffmpeg 拆分失败 rc=${rc}，保留拼接文件 ${raw}"
+        fi
     else
         log "!! 无 python3/ffmpeg，保留拼接文件 ${raw}（可在 Windows 端用 ffmpeg 拆分）"
     fi
-    rm -f "${raw}"
 done
 [ "${grabbed_any}" -eq 0 ] && log "!! 未抓到任何帧"
 
