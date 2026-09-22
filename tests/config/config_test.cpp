@@ -93,8 +93,9 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.visual_monitor.transition_log_interval.count(), 1000);
     EXPECT_EQ(config.visual_monitor.status_log_interval.count(), 5000);
     EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
-    EXPECT_EQ(config.video_source.camera_source, "rtsp");
-    EXPECT_FALSE(config.video_source.stereo_split);
+    // 生产配置已切换 USB 双目 UVC 链路（提交 cd1b4eb），RTSP 为保留备份
+    EXPECT_EQ(config.video_source.camera_source, "uvc");
+    EXPECT_TRUE(config.video_source.stereo_split);
     EXPECT_EQ(config.uvc_camera.device, "/dev/video0");
     EXPECT_EQ(config.uvc_camera.width, 2560u);
     EXPECT_EQ(config.uvc_camera.height, 720u);
