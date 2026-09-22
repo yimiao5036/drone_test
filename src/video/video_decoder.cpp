@@ -7,8 +7,11 @@
  *
  * 设计要点：
  * - PIMPL 隔离 FFmpeg 头文件，接口头文件不依赖 FFmpeg。
- * - 解码器优先 rkmpp 硬解（香橙派，输出 NV12）；不可用或打开失败时
- *   回退 FFmpeg 软解（开发机验证，YUV420P/YUVJ420P 经 swscale 转 NV12）。
+ * - 解码器优先 rkmpp 硬解（香橙派）：hevc/h264 输出 NV12；mjpeg_rkmpp 输出
+ *   NV16（YCbCr422SP），经 RGA imcvtcolor 转 NV12 写入内存池。硬解不可用或
+ *   打开失败时回退 FFmpeg 软解（开发机验证，YUV420P/YUVJ420P 经 swscale 转
+ *   NV12；RGA 拒绝的硬件帧经 av_hwframe_transfer_data 转存后也走 sws，sws
+ *   支持 NV16 输入）。
  * - MJPEG（USB UVC 双目）：一帧一个访问单元、无参数集、帧间无依赖，
  *   单帧解码失败计丢帧继续，无 H.26x 的参数集同步问题。
  * - 帧内存池懒创建：配置未给分辨率时首帧确定尺寸后创建。
@@ -24,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
 
 #include "video/drm_nv12_transfer.h"
@@ -87,6 +91,42 @@ std::string AvErrorToString(int errnum) {
     return std::string(buf);
 }
 
+/// DRM fourcc 转可读字符（如 "NV12"/"NV16"）；不可打印字节以 '.' 代替。
+std::string FourccToString(std::uint32_t fourcc) {
+    char text[5] = {0};
+    for (int i = 0; i < 4; ++i) {
+        const char c = static_cast<char>((fourcc >> (8 * i)) & 0xFFU);
+        text[i] = (c >= 32 && c < 127) ? c : '.';
+    }
+    return std::string(text, 4);
+}
+
+/// 创建 RK 硬解设备上下文（hevc/h264/mjpeg 三编码统一入口）。
+/// 优先运行时探测 ffmpeg-rockchip 的 "rkmpp" 设备类型——编译期绝不引用
+/// AV_HWDEVICE_TYPE_RKMMPP 枚举（FFmpeg 6.1 头文件没有，8.1 才有）；
+/// 探测不到则回退 AV_HWDEVICE_TYPE_DRM（旧 fork 行为，6.1 也支持）。
+/// 成功返回设备并输出设备类型名（供日志定位）；失败返回 nullptr。
+AVBufferRef* CreateRkHardwareDevice(const char** device_name) {
+    AVHWDeviceType type = av_hwdevice_find_type_by_name("rkmpp");
+    const char* name = "rkmpp";
+    if (type == AV_HWDEVICE_TYPE_NONE) {
+        type = AV_HWDEVICE_TYPE_DRM;
+        name = "drm";
+    }
+    AVBufferRef* device = av_hwdevice_ctx_alloc(type);
+    if (device == nullptr) {
+        return nullptr;
+    }
+    if (av_hwdevice_ctx_init(device) != 0) {
+        av_buffer_unref(&device);
+        return nullptr;
+    }
+    if (device_name != nullptr) {
+        *device_name = name;
+    }
+    return device;
+}
+
 /// 像素对齐（向上取整）。
 std::int64_t MonotonicUs() {
     return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -136,8 +176,9 @@ struct VideoDecoder::Impl {
     // FFmpeg 解码上下文
     const AVCodec* decoder = nullptr;
     AVCodecContext* codec_ctx = nullptr;
-    AVBufferRef* hw_device = nullptr;  // DRM 硬件设备（硬解路径）
+    AVBufferRef* hw_device = nullptr;  // RK 硬件设备（硬解路径，rkmpp 或 drm 类型）
     bool is_hardware = false;
+    const char* hw_device_type_name = "";  // 硬解设备类型名（rkmpp/drm），供日志
     bool decoder_creation_failed = false;  // 创建失败后不再重试（避免刷屏）
     SwsContext* sws_ctx = nullptr;
     int sws_src_format = -1;  // 当前 sws 上下文对应的源格式（缓存）
@@ -303,35 +344,43 @@ struct VideoDecoder::Impl {
         }
 
         if (is_hardware) {
-            hw_device = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_DRM);
-            if (hw_device != nullptr && av_hwdevice_ctx_init(hw_device) == 0) {
-                codec_ctx->hw_device_ctx = av_buffer_ref(hw_device);
-            } else {
-                if (hw_device != nullptr) {
-                    av_buffer_unref(&hw_device);
-                }
-                hw_device = nullptr;
+            hw_device = CreateRkHardwareDevice(&hw_device_type_name);
+            if (hw_device == nullptr) {
                 ++error_count;
                 if (ShouldLogThrottled(error_count)) {
-                    SPDLOG_WARN("视频解码器初始化 DRM 硬件设备失败，回退软解，累计 {}",
+                    SPDLOG_WARN("视频解码器初始化 RK 硬件设备失败，回退软解，累计 {}",
                                 error_count.load());
                 }
                 return false;
             }
+            codec_ctx->hw_device_ctx = av_buffer_ref(hw_device);
         }
 
         const int open_ret = avcodec_open2(codec_ctx, decoder, nullptr);
         if (open_ret < 0) {
             ++error_count;
             if (ShouldLogThrottled(error_count)) {
-                SPDLOG_WARN("视频解码器打开失败: {} ({})，累计 {}",
-                            decoder->name, AvErrorToString(open_ret), error_count.load());
+                // 不做设备类型重试矩阵：打开失败直接走既有软解回退，
+                // WARN 带设备名便于定位是哪种设备上下文被拒。
+                if (is_hardware) {
+                    SPDLOG_WARN("视频解码器打开失败: {} 设备={} ({})，累计 {}",
+                                decoder->name, hw_device_type_name,
+                                AvErrorToString(open_ret), error_count.load());
+                } else {
+                    SPDLOG_WARN("视频解码器打开失败: {} ({})，累计 {}",
+                                decoder->name, AvErrorToString(open_ret),
+                                error_count.load());
+                }
             }
             return false;
         }
 
-        SPDLOG_INFO("视频解码器创建: {} 模式={}", decoder->name,
-                    is_hardware ? "rkmpp 硬解" : "软解");
+        if (is_hardware) {
+            SPDLOG_INFO("视频解码器创建: {} 模式=rkmpp 硬解 设备={}", decoder->name,
+                        hw_device_type_name);
+        } else {
+            SPDLOG_INFO("视频解码器创建: {} 模式=软解", decoder->name);
+        }
         return true;
     }
 
@@ -358,6 +407,7 @@ struct VideoDecoder::Impl {
             av_buffer_unref(&hw_device);
             hw_device = nullptr;
         }
+        hw_device_type_name = "";
         decoder = nullptr;
         is_hardware = false;
     }
@@ -525,8 +575,9 @@ struct VideoDecoder::Impl {
         for (int layer_index = 0; layer_index < descriptor->nb_layers;
              ++layer_index) {
             const auto& layer = descriptor->layers[layer_index];
-            SPDLOG_INFO("DRM图层[{}]: format=0x{:08x} planes={}", layer_index,
-                        layer.format, layer.nb_planes);
+            SPDLOG_INFO("DRM图层[{}]: format=0x{:08x}({}) planes={}", layer_index,
+                        layer.format, FourccToString(layer.format),
+                        layer.nb_planes);
             for (int plane_index = 0; plane_index < layer.nb_planes;
                  ++plane_index) {
                 const auto& plane = layer.planes[plane_index];
@@ -668,10 +719,13 @@ struct VideoDecoder::Impl {
         const uint64_t success_count = rga_dma_transfer_count.fetch_add(1) + 1;
         if (success_count == 1) {
             SPDLOG_INFO(
-                "视频解码启用RGA DMA-BUF直传: fd={} 分辨率={}x{} pitch={} "
+                "视频解码启用RGA DMA-BUF直传: fd={} 分辨率={}x{} 源格式={} pitch={} "
                 "目标stride={}",
-                layout.fd, layout.width, layout.height, layout.y_pitch,
-                handle.Info().hor_stride);
+                layout.fd, layout.width, layout.height,
+                ClassifyDrmSpFormat(layout.drm_format) == DrmSpFormat::kNv16
+                    ? "NV16转NV12"
+                    : "NV12复制",
+                layout.y_pitch, handle.Info().hor_stride);
         }
         CompleteFrame(std::move(handle), encoded, ingress_ms, decode_start_us,
                       packet_prepare_ms, send_packet_ms, receive_frame_ms,
