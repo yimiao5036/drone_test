@@ -108,6 +108,8 @@ const char* CodecName(drone::common::VideoCodec codec) {
             return "H.264/AVC";
         case drone::common::VideoCodec::kH265:
             return "H.265/HEVC";
+        case drone::common::VideoCodec::kMjpeg:
+            return "MJPEG";
         default:
             return "未知";
     }
