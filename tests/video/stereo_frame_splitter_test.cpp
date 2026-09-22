@@ -82,6 +82,8 @@ protected:
     }
 
     /// 发布一帧左半 kLeftY/kLeftUv、右半 kRightY/kRightUv 的全幅 NV12 帧。
+    /// 注意：实证 SBS 左半幅=物理右目，拆分器已交换 x_offset——
+    /// 左目输出承载右半幅内容（kRight*），右目输出承载左半幅内容（kLeft*）。
     void PublishSplitPatternFrame(std::int64_t ingress_ms = 0) {
         auto handle = source_pool_->Acquire(ingress_ms);
         ASSERT_TRUE(handle.Valid());
@@ -168,8 +170,8 @@ TEST_F(StereoFrameSplitterTest, SplitsLeftAndRightEyesByMemcpy) {
     auto right = right_sub_.TryTake();
     ASSERT_TRUE(left.has_value());
     ASSERT_TRUE(right.has_value());
-    ExpectEyeContent(**left, kLeftY, kLeftUv, kIngress);
-    ExpectEyeContent(**right, kRightY, kRightUv, kIngress);
+    ExpectEyeContent(**left, kRightY, kRightUv, kIngress);
+    ExpectEyeContent(**right, kLeftY, kLeftUv, kIngress);
     // 序号由左右各自内存池独立分配：首帧均为各自池的第 0 号
     EXPECT_EQ((*left)->Info().sequence, 0u);
     EXPECT_EQ((*right)->Info().sequence, 0u);
@@ -190,8 +192,8 @@ TEST_F(StereoFrameSplitterTest, SplitsWithPreferRgaEnabled) {
     auto right = right_sub_.TryTake();
     ASSERT_TRUE(left.has_value());
     ASSERT_TRUE(right.has_value());
-    ExpectEyeContent(**left, kLeftY, kLeftUv, 0);
-    ExpectEyeContent(**right, kRightY, kRightUv, 0);
+    ExpectEyeContent(**left, kRightY, kRightUv, 0);
+    ExpectEyeContent(**right, kLeftY, kLeftUv, 0);
     EXPECT_EQ(splitter_->ErrorCount(), 0u);
 }
 

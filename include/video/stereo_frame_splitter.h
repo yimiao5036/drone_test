@@ -8,8 +8,9 @@
  *
  * 本轮（USB 双目接入 B 层）语义：
  * - 左目输出接现有 YOLO/叠加链路出图；右目输出仅统计，无订阅者。
- * - 左右目对应关系：SBS 左半幅是否为物理左目未经实证，本轮任取左半幅为
- *   主用目；测距阶段开始前必须实证，若相反仅交换两个裁剪 rect 即可。
+ * - 左右目对应关系（2026-09-22 实证）：SBS 左半幅=物理右目、右半幅=物理左目；
+ *   裁剪偏移已按此交换——左目输出取右半幅（x_offset=width/2），
+ *   右目输出取左半幅（x_offset=0），Topic 语义与物理方位一致。
  *
  * 数据流：Topic<FrameHandle>(全幅) ──► StereoFrameSplitter ──► Topic<FrameHandle>(左目)
  *                                                          └──► Topic<FrameHandle>(右目)

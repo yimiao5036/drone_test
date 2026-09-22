@@ -221,11 +221,12 @@ struct StereoFrameSplitter::Impl {
             }
             return;
         }
-        // 左半幅为主用目（本轮未实证物理左右，若相反仅交换两个 x_offset）。
-        PublishEye(frame, 0, left_pool, left_output, left_frame_count,
-                   left_dropped_count, "左");
-        PublishEye(frame, config.width / 2, right_pool, right_output,
-                   right_frame_count, right_dropped_count, "右");
+        // 实证（2026-09-22 地面站画面）：SBS 左半幅=物理右目、右半幅=物理左目，
+        // 故左目输出取右半幅（x_offset=width/2），右目输出取左半幅（x_offset=0）。
+        PublishEye(frame, config.width / 2, left_pool, left_output,
+                   left_frame_count, left_dropped_count, "左");
+        PublishEye(frame, 0, right_pool, right_output, right_frame_count,
+                   right_dropped_count, "右");
     }
 
     /// 消费线程主循环。

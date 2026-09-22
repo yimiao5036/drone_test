@@ -58,9 +58,10 @@ class StereoFrameSplitter final {
 - **线程模型**：独立消费线程，输入订阅容量 1 + `kDropOldest`（只处理最新帧）；
   `WaitTakeFor(100ms)` + Stop 经 `input_sub.Reset()` 唤醒（对齐 compositor 停机模式）；
   Start/Stop 幂等，Stop 后重启按已存主题指针重新订阅。
-- **左右目对应关系**：SBS 左半幅是否为物理左目未经实证（探测只确认了左右视差）。
-  本轮任取左半幅为主用目（不影响出图/统计验收）；测距阶段开始前必须实证（遮挡单侧
-  镜头看画面变化），若相反仅交换 `ProcessOne` 中两个 x_offset 即可。
+- **左右目对应关系（2026-09-22 已实证并交换）**：SBS **左半幅 = 物理右目**（摄像头朝前
+  方位定义左右；地面站实测主用目画面为右目视角）。`ProcessOne` 两个 x_offset 已交换：
+  **左目 Topic 取右半幅（x_offset=width/2）= 物理左目，右目 Topic 取左半幅（x_offset=0）
+  = 物理右目**，Topic 语义与物理方位一致。实证方法：遮挡单侧镜头看地面站画面变化。
 
 ## 4. 日志行为
 
@@ -81,8 +82,9 @@ cmake --build build && cd build && ctest -R StereoFrameSplitter
 ```
 
 - `SplitsLeftAndRightEyesByMemcpy` / `SplitsWithPreferRgaEnabled`：64×64 假帧左右半幅
-  不同图案 → 断言左右输出各 32×64 NV12、与对应半幅逐字节一致、ingress 透传、
-  timestamp>0、首帧序号各为 0（独立池）、计数正确；
+  不同图案 → 断言左右输出各 32×64 NV12、与对应**物理目**半幅逐字节一致（已实证左半幅
+  =物理右目：左目输出=右半幅内容）、ingress 透传、timestamp>0、首帧序号各为 0
+  （独立池）、计数正确；
 - `CountsInvalidInputWithoutPublishing`：空句柄 → ErrorCount 增、不发布；
 - `DropsWhenOutputPoolExhausted`：池容量 2 且输出不消费 → 左右各发布 2 丢 4；
 - `RejectsInvalidConfig`：奇数宽/0 高/0 池/0 输入队列 → 构造抛出。
