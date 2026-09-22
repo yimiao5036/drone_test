@@ -74,12 +74,12 @@ void ComputeDfl(const float* tensor, int dfl_len, float* box) {
 }  // namespace
 
 // 解码一个特征图分支：先在量化域做阈值过滤，再反量化框参数并转换为模型坐标。
-int DecodeBranch(const BranchOutput& branch, int stride, int num_classes,
-                 float threshold, std::vector<float>& boxes_xywh,
+int DecodeBranch(const BranchOutput& branch, int stride_x, int stride_y,
+                 int num_classes, float threshold, std::vector<float>& boxes_xywh,
                  std::vector<float>& obj_probs, std::vector<int>& class_ids) {
     if (branch.box.data == nullptr || branch.score.data == nullptr ||
-        branch.box.grid_h <= 0 || branch.box.grid_w <= 0 || stride <= 0 ||
-        num_classes <= 0) {
+        branch.box.grid_h <= 0 || branch.box.grid_w <= 0 || stride_x <= 0 ||
+        stride_y <= 0 || num_classes <= 0) {
         return 0;
     }
 
@@ -142,11 +142,11 @@ int DecodeBranch(const BranchOutput& branch, int stride, int num_classes,
                 }
             }
 
-            // 解码为模型坐标（左上角 + 宽高）
-            const float x1 = (-box[0] + static_cast<float>(j) + 0.5f) * stride;
-            const float y1 = (-box[1] + static_cast<float>(i) + 0.5f) * stride;
-            const float x2 = (box[2] + static_cast<float>(j) + 0.5f) * stride;
-            const float y2 = (box[3] + static_cast<float>(i) + 0.5f) * stride;
+            // 解码为模型坐标（左上角 + 宽高）；矩形输入按轴分别乘各自步长
+            const float x1 = (-box[0] + static_cast<float>(j) + 0.5f) * stride_x;
+            const float y1 = (-box[1] + static_cast<float>(i) + 0.5f) * stride_y;
+            const float x2 = (box[2] + static_cast<float>(j) + 0.5f) * stride_x;
+            const float y2 = (box[3] + static_cast<float>(i) + 0.5f) * stride_y;
 
             boxes_xywh.push_back(x1);
             boxes_xywh.push_back(y1);
@@ -311,10 +311,12 @@ int PostProcessNormalizedXywh(const NormalizedXywhTensor& tensor,
 }
 
 // 旧版多分支后处理：逐分支解码后合并候选，再按类别做 NMS 和 letterbox 逆变换。
-int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
-                float conf_threshold, float nms_threshold, int num_classes,
-                const LetterBox& letterbox, std::vector<YoloDetection>* out) {
-    if (branches.empty() || model_size <= 0 || num_classes <= 0) {
+int PostProcess(const std::vector<BranchOutput>& branches, int model_width,
+                int model_height, float conf_threshold, float nms_threshold,
+                int num_classes, const LetterBox& letterbox,
+                std::vector<YoloDetection>* out) {
+    if (branches.empty() || model_width <= 0 || model_height <= 0 ||
+        num_classes <= 0) {
         return 0;
     }
 
@@ -330,12 +332,15 @@ int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
         if (branch.box.data == nullptr || branch.score.data == nullptr) {
             continue;
         }
-        const int stride = model_size / branch.box.grid_h;
-        if (stride <= 0) {
+        // 矩形输入网格纵横不同，步长按轴分别计算
+        const int stride_x = model_width / branch.box.grid_w;
+        const int stride_y = model_height / branch.box.grid_h;
+        if (stride_x <= 0 || stride_y <= 0) {
             continue;
         }
-        valid_count += DecodeBranch(branch, stride, num_classes, conf_threshold,
-                                    boxes_xywh, obj_probs, class_ids);
+        valid_count += DecodeBranch(branch, stride_x, stride_y, num_classes,
+                                    conf_threshold, boxes_xywh, obj_probs,
+                                    class_ids);
     }
 
     if (valid_count <= 0) {
@@ -370,10 +375,10 @@ int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
 
         if (out != nullptr) {
             YoloDetection det;
-            det.x1 = static_cast<float>(ClampToInt(x1, 0, model_size)) / letterbox.scale;
-            det.y1 = static_cast<float>(ClampToInt(y1, 0, model_size)) / letterbox.scale;
-            det.x2 = static_cast<float>(ClampToInt(x2, 0, model_size)) / letterbox.scale;
-            det.y2 = static_cast<float>(ClampToInt(y2, 0, model_size)) / letterbox.scale;
+            det.x1 = static_cast<float>(ClampToInt(x1, 0, model_width)) / letterbox.scale;
+            det.y1 = static_cast<float>(ClampToInt(y1, 0, model_height)) / letterbox.scale;
+            det.x2 = static_cast<float>(ClampToInt(x2, 0, model_width)) / letterbox.scale;
+            det.y2 = static_cast<float>(ClampToInt(y2, 0, model_height)) / letterbox.scale;
             det.confidence = obj_probs[static_cast<std::size_t>(i)];
             det.class_id = class_ids[static_cast<std::size_t>(n)];
             out->push_back(det);

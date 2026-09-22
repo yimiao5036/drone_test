@@ -2,7 +2,7 @@
 
 > 对应实现：`src/perception/yolo_detector.cpp`、`src/perception/yolo_postprocess.cpp`、
 > `src/perception/rknn_detection_backend.cpp`（香橙派条件编译）
-> 更新：2026-09-17
+> 更新：2026-09-22
 
 ## 功能职责
 
@@ -15,8 +15,10 @@
   不依赖任何硬件库，开发机可单测。
 - **RknnDetectionBackend**（`IDetectionBackend` 实现，仅 `DRONE_HAVE_RKNN=ON` 编译）：
   RGA 预处理（完整 NV12 帧等比例缩放 → RGB letterbox）+ RKNN NPU 推理（3 核上下文）+
-  `[1,5,N]` 后处理 + 坐标还原原图。模型输入边长（正方形）与输出 N 均在 `Load()`
-  时从 `.rknn` 读取，换模型无需改动前/后处理代码。
+  `[1,5,N]` 后处理 + 坐标还原原图。模型输入宽高（支持矩形，如 640×384）与输出 N
+  均在 `Load()` 时从 `.rknn` 读取，换模型无需改动前/后处理代码；letterbox 画布/
+  缩放/pad 按宽高分别计算，多分支后处理步长按轴分离（stride_x=model_w/grid_w、
+  stride_y=model_h/grid_h）。
 
 边界：
 - 不做：目标跟踪（track_id 保持 0）、类别语义映射（class_id 透传模型类别，反无人机
@@ -124,8 +126,8 @@ YOLO队列容量2→1的120秒A/B中，容量1仅少处理约38/2945帧（约1.3
   ctest --test-dir build --output-on-failure
   ```
   期望结果：`yolo_postprocess_test` 验证多分支量化解码，以及 `[1,5,N]` 的阈值过滤、
-  单类别 NMS、letterbox 坐标还原（用例以 1280×720→640×640 为例，生产输入尺寸以
-  模型为准，当前 640×640）；`yolo_detector_test` 验证
+  单类别 NMS、letterbox 坐标还原（用例覆盖 1280×720→640×640 正方形与 128×64 矩形
+  输入的按轴步长/钳制，生产输入尺寸以模型为准）；`yolo_detector_test` 验证
   Start/Stop 幂等、无后端失败、检测字段完整、帧序号关联、后端故障恢复、无效帧跳过、
   停机后停止消费、停止后重启，以及帧级观测契约：无目标帧仍发布一条观测、
   多候选取置信度最高者、逐帧观测序号推进且不重复。

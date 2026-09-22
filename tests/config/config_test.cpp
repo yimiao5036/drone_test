@@ -102,8 +102,9 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.uvc_camera.fps, 30u);
     EXPECT_EQ(config.stereo_splitter.width, 2560u);
     EXPECT_EQ(config.stereo_splitter.height, 720u);
+    // 生产配置已切换 384x640 矩形输入模型（提交 cdde006）
     EXPECT_EQ(config.yolo.model_path,
-              "/opt/drone/models/yolo26n-drone-relu6-e184-09-13.rknn");
+              "/opt/drone/models/yolov26_ReLU6_09_13-rk3588_384_640.rknn");
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
     EXPECT_EQ(config.yolo.npu_core_mode, "all");
     EXPECT_FALSE(config.yolo.collect_npu_internal_perf);

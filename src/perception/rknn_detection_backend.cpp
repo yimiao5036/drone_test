@@ -445,14 +445,14 @@ struct RknnDetectionBackend::Impl {
 
     /// NV12 → RGB letterbox 写入模型输入内存（RGA 硬件加速）。
     /// @return 0 成功；-1 参数非法或 RGA 失败
-    // 先对完整原图等比缩放，再把缩放结果复制到填充值为 114 的正方形画布，
-    // letterbox 参数同时保存给后处理做坐标逆变换。
+    // 先对完整原图等比缩放，再把缩放结果复制到填充值为 114 的模型输入画布
+    // （支持矩形输入），letterbox 参数同时保存给后处理做坐标逆变换。
     int Nv12LetterboxToRgb(const uint8_t* src, int src_w, int src_h, int src_wstride,
-                           int target_size, uint8_t* dst_rgb, LetterBox* letterbox,
-                           uint8_t fill_color = 114) {
+                           int target_w, int target_h, uint8_t* dst_rgb,
+                           LetterBox* letterbox, uint8_t fill_color = 114) {
         last_preprocess_error_.clear();
-        if (src == nullptr || dst_rgb == nullptr || target_size <= 0 ||
-            letterbox == nullptr) {
+        if (src == nullptr || dst_rgb == nullptr || target_w <= 0 ||
+            target_h <= 0 || letterbox == nullptr) {
             last_preprocess_error_ = "输入指针或尺寸非法";
             return -1;
         }
@@ -465,9 +465,9 @@ struct RknnDetectionBackend::Impl {
             wstride, src_h);
 
         // 源已是目标尺寸：RGA 完成 NV12→RGB 色彩转换
-        if (src_w == target_size && src_h == target_size) {
+        if (src_w == target_w && src_h == target_h) {
             rga_buffer_t dst_buf = wrapbuffer_virtualaddr(
-                dst_rgb, target_size, target_size, RK_FORMAT_RGB_888);
+                dst_rgb, target_w, target_h, RK_FORMAT_RGB_888);
             const std::int64_t rga_start_us = MonotonicUs();
             const IM_STATUS status =
                 imcvtcolor(src_buf, dst_buf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
@@ -485,12 +485,12 @@ struct RknnDetectionBackend::Impl {
         }
 
         // 与通过验证的 Python 参考实现一致：round 后等比缩放，再居中填充 114。
-        const float scale = std::min(static_cast<float>(target_size) / src_w,
-                                     static_cast<float>(target_size) / src_h);
+        const float scale = std::min(static_cast<float>(target_w) / src_w,
+                                     static_cast<float>(target_h) / src_h);
         const int new_width = static_cast<int>(std::lround(src_w * scale));
         const int new_height = static_cast<int>(std::lround(src_h * scale));
-        const int pad_left = (target_size - new_width) / 2;
-        const int pad_top = (target_size - new_height) / 2;
+        const int pad_left = (target_w - new_width) / 2;
+        const int pad_top = (target_h - new_height) / 2;
 
         // RGA 输出先写入连续的缩放 RGB 缓冲，再逐行放入带目标 stride 的
         // letterbox 画布；不能把画布内部地址包装成紧凑 new_width stride，
@@ -511,9 +511,9 @@ struct RknnDetectionBackend::Impl {
 
         const std::int64_t letterbox_start_us = MonotonicUs();
         std::memset(dst_rgb, fill_color,
-                    static_cast<std::size_t>(target_size) * target_size * 3);
+                    static_cast<std::size_t>(target_w) * target_h * 3);
         const std::size_t src_row_bytes = static_cast<std::size_t>(new_width) * 3;
-        const std::size_t dst_row_bytes = static_cast<std::size_t>(target_size) * 3;
+        const std::size_t dst_row_bytes = static_cast<std::size_t>(target_w) * 3;
         for (int row = 0; row < new_height; ++row) {
             std::memcpy(dst_rgb + (static_cast<std::size_t>(pad_top + row) *
                                   dst_row_bytes + static_cast<std::size_t>(pad_left) * 3),
@@ -550,23 +550,15 @@ struct RknnDetectionBackend::Impl {
         const int height = static_cast<int>(info.height);
         const int hor_stride = static_cast<int>(info.hor_stride);
 
-        if (model_width_ != model_height_) {
-            const uint64_t errors = error_count.fetch_add(1) + 1;
-            if (ShouldLogThrottled(errors)) {
-                SPDLOG_ERROR("RKNN 后端暂只支持正方形模型输入，实际={}x{}，累计 {}",
-                             model_width_, model_height_, errors);
-            }
-            return out;
-        }
-
         // 对完整原图做 letterbox，与已通过验证的 Python 参考代码一致；不再先
-        // 居中裁成正方形，避免丢失 16:9 画面左右区域。
+        // 居中裁成正方形，避免丢失 16:9 画面左右区域。模型输入支持矩形
+        // （画布/缩放/pad 按宽高分别计算，后处理步长按轴分离）。
         LetterBox letterbox;
         const std::int64_t preprocess_start_us = MonotonicUs();
         const int ret = Nv12LetterboxToRgb(
             reinterpret_cast<const uint8_t*>(frame.Data()), width, height, hor_stride,
-            model_width_, static_cast<uint8_t*>(input_mems_[0][0]->virt_addr),
-            &letterbox);
+            model_width_, model_height_,
+            static_cast<uint8_t*>(input_mems_[0][0]->virt_addr), &letterbox);
         if (ret != 0) {
             const uint64_t errors = error_count.fetch_add(1) + 1;
             if (ShouldLogThrottled(errors)) {
@@ -690,8 +682,8 @@ struct RknnDetectionBackend::Impl {
                 }
                 branches.push_back(std::move(branch));
             }
-            (void)PostProcess(branches, model_width_, conf_threshold, nms_threshold,
-                              num_classes_, letterbox, &detections);
+            (void)PostProcess(branches, model_width_, model_height_, conf_threshold,
+                              nms_threshold, num_classes_, letterbox, &detections);
         }
 
         // 后处理已撤销完整原图的 letterbox，直接限制到原图范围并过滤退化框。
