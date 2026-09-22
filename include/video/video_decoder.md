@@ -63,7 +63,12 @@ class VideoDecoder final : public IVideoDecoder {
 - **当前链路实测**：动态探针根据FFmpeg `AVCodecParameters.codec_id`确认当前输入实际为H.265/HEVC、1280x720、25fps，并使用`hevc_rkmpp`硬解；RTSP路径名中的`.264`不能作为编码格式依据。解码器同时保留H.264和H.265的rkmpp适配。
 - **内存池**：配置给分辨率则 `Start()` 预建池；否则首帧确定尺寸懒建池。
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
-- **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
+- **packet 拷贝**：`av_grow_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝；
+  `av_new_packet` 已在 FFmpeg 8 删除）。
+- **FFmpeg 版本兼容**：同源兼容 FFmpeg 6.1（开发机 WSL2）与 ffmpeg-rockchip 8.1（香橙派），
+  不再支持 4.4；版本差异一律运行时探测吸收，不用版本宏。sws 上下文用现代创建路径
+  （`sws_alloc_context`+`av_opt`+`sws_init_context`），规避 libswscale 9 对旧式
+  `sws_getContext` 的弃用风险。
 
 ### 延迟统计
 

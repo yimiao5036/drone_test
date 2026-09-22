@@ -31,7 +31,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 
@@ -229,11 +229,23 @@ struct VideoEncoderImpl {
             }
             // 软编路径：NV12 -> YUV420P（libx264 输入需 YUV420P，需转换 + 独立输出帧）
             if (codec_ctx_->pix_fmt == AV_PIX_FMT_YUV420P) {
-                sws_ctx_ = sws_getContext(
-                    static_cast<int>(config.width), static_cast<int>(config.height),
-                    AV_PIX_FMT_NV12, static_cast<int>(config.width),
-                    static_cast<int>(config.height), AV_PIX_FMT_YUV420P,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+                // 现代创建路径（sws_alloc_context + av_opt + sws_init_context）：
+                // FFmpeg 8 libswscale 9 下旧式 sws_getContext 有弃用风险，
+                // 该写法 5.1+ 引入，6.1/8.1 双版本通用
+                sws_ctx_ = sws_alloc_context();
+                if (sws_ctx_ != nullptr) {
+                    av_opt_set_int(sws_ctx_, "srcw", static_cast<int>(config.width), 0);
+                    av_opt_set_int(sws_ctx_, "srch", static_cast<int>(config.height), 0);
+                    av_opt_set_int(sws_ctx_, "dstw", static_cast<int>(config.width), 0);
+                    av_opt_set_int(sws_ctx_, "dsth", static_cast<int>(config.height), 0);
+                    av_opt_set_pixel_fmt(sws_ctx_, "src_format", AV_PIX_FMT_NV12, 0);
+                    av_opt_set_pixel_fmt(sws_ctx_, "dst_format", AV_PIX_FMT_YUV420P, 0);
+                    av_opt_set_int(sws_ctx_, "sws_flags", SWS_BILINEAR, 0);
+                    if (sws_init_context(sws_ctx_, nullptr, nullptr) < 0) {
+                        sws_freeContext(sws_ctx_);
+                        sws_ctx_ = nullptr;
+                    }
+                }
                 if (sws_ctx_ == nullptr) {
                     ++error_count;
                     SPDLOG_ERROR("图传创建 NV12→YUV420P 转换上下文失败");

@@ -16,6 +16,10 @@
 
 #include <spdlog/spdlog.h>
 
+extern "C" {
+#include <libavformat/avformat.h>
+}
+
 #include "application/drone_application.h"
 #include "common/logger.h"
 #include "config/config.h"
@@ -235,6 +239,9 @@ int main(int argc, char** argv) {
 
         drone::common::InitializeAsyncLogger(executable_directory + "/logs",
                                               spdlog::level::info);
+        // FFmpeg 网络子系统初始化（RTSP 拉流/推流前提；Linux 上近似 no-op，
+        // 进程退出即回收，无需 deinit）
+        (void)avformat_network_init();
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 

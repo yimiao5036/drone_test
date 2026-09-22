@@ -29,7 +29,7 @@ NPU相关的细分选项（`--rknn-perf-run`、`--rknn-perf-detail`、`--npu-cor
 
 | 编号 | 解码细分 | 定义 |
 |---:|---|---|
-| D1 | AVPacket分配+码流复制 | `av_new_packet`和编码数据`memcpy` |
+| D1 | AVPacket分配+码流复制 | `av_grow_packet`和编码数据`memcpy` |
 | D2 | `avcodec_send_packet` | 码流送入FFmpeg/rkmpp解码器的调用时间 |
 | D3 | `avcodec_receive_frame` | 成功取得一个输出帧的调用时间 |
 | D4P | 转存目标帧准备 | 分辨率检查与`av_frame_make_writable`，用于解释旧日志中的“其余”10～20ms台阶 |

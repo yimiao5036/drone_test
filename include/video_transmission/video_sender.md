@@ -53,7 +53,9 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 3. 帧输入：NV12 帧按行拷入 `nv12_in_`（Y 平面 `hor_stride`，UV 平面偏移
    `hor_stride*height`，每行 `w` 字节）。
    - **硬编（rkmpp）**：rkmpp 编码器直接收 NV12 软件帧（内部自行导入 MPP 缓冲），直接送。
-   - **软编（libx264/265）**：需 YUV420P，`sws_scale` NV12→YUV420P 到 `pic_out_` 再送编码器。
+   - **软编（libx264/265）**：需 YUV420P，`sws_scale` NV12→YUV420P 到 `pic_out_` 再送编码器
+     （sws 上下文用现代创建路径 `sws_alloc_context`+`av_opt`+`sws_init_context`，
+     兼容 FFmpeg 6.1/8.1，规避 libswscale 9 对旧式 `sws_getContext` 的弃用风险）。
 4. `EncodeFrame`：`avcodec_send_frame` → `DrainPackets`（`avcodec_receive_packet` →
    `WritePacket`，`av_interleaved_write_frame`）。
 5. `WritePacket`：时间戳换算；**RTSP** 关键帧前手动拼 `extradata`（提高中途接入兼容性）。

@@ -12,6 +12,10 @@
 
 #include <spdlog/spdlog.h>
 
+extern "C" {
+#include <libavformat/avformat.h>
+}
+
 #include "application/drone_application.h"
 #include "common/logger.h"
 #include "config/config.h"
@@ -69,6 +73,10 @@ int main(int argc, char** argv) {
             ResolveLogDirectory(config.log.directory, executable_directory), log_level);
         SPDLOG_INFO("正式主程序加载配置: path={} log_level={}", config_path,
                     spdlog::level::to_string_view(log_level));
+
+        // FFmpeg 网络子系统初始化（RTSP 拉流/推流的前提；Linux 上近似 no-op，
+        // 但 FFmpeg 文档要求网络使用前调用；进程退出即回收，无需 deinit）
+        (void)avformat_network_init();
 
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);

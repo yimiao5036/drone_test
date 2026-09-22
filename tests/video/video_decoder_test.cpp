@@ -203,7 +203,10 @@ std::vector<common::EncodedFrame> EncodeMjpegTestFrames() {
     enc_ctx->height = kTestHeight;
     enc_ctx->time_base = AVRational{1, 30};
     enc_ctx->framerate = AVRational{30, 1};
-    enc_ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;  // mjpeg 编码器要求全范围 JPEG 色域
+    // mjpeg 编码器要求全范围 JPEG 色域：AV_PIX_FMT_YUVJ420P 已在 FFmpeg 8 删除，
+    // 官方迁移路径为 YUV420P + color_range=JPEG，6.1/8.1 双版本通用
+    enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    enc_ctx->color_range = AVCOL_RANGE_JPEG;
     if (avcodec_open2(enc_ctx, encoder, nullptr) < 0) {
         avcodec_free_context(&enc_ctx);
         throw std::runtime_error("打开 mjpeg 编码器失败");
@@ -212,7 +215,8 @@ std::vector<common::EncodedFrame> EncodeMjpegTestFrames() {
     AVFrame* frame = av_frame_alloc();
     frame->width = kTestWidth;
     frame->height = kTestHeight;
-    frame->format = AV_PIX_FMT_YUVJ420P;
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->color_range = AVCOL_RANGE_JPEG;
     av_frame_get_buffer(frame, 0);
 
     AVPacket* packet = av_packet_alloc();

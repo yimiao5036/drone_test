@@ -21,7 +21,7 @@ RTSP 拉流（TCP/UDP），逐访问单元读取 H.264/H.265 码流并发布到�
 struct CameraReceiverConfig {
     std::string rtsp_url;                    // 如 rtsp://192.168.1.100:8554/live
     std::string rtsp_transport = "tcp";      // tcp / udp
-    std::chrono::milliseconds open_timeout{5000};    // 建连探测超时（stimeout）
+    std::chrono::milliseconds open_timeout{5000};    // 建连探测超时（RTSP timeout 选项，微秒）
     std::chrono::milliseconds reconnect_delay{3000}; // 断线重连间隔
 };
 
@@ -39,7 +39,8 @@ class CameraReceiver final : public ICameraReceiver {
 - **FFmpeg avformat**：`avformat_open_input` + `avformat_find_stream_info`，选项：
   `rtsp_transport`（tcp/udp）、`fflags=nobuffer+discardcorrupt`、`reorder_queue_size=0`
   （禁用 RTP 重排，防 SPS/PPS 与 IDR 顺序打乱）、`max_delay=0`、`buffer_size=102400`、
-  `probesize/analyzeduration` 限制探测时间、`stimeout` 超时（微秒）。
+  `probesize/analyzeduration` 限制探测时间、`timeout` 建连超时（微秒；旧名 `stimeout`
+  已在 FFmpeg 8 删除，迁移后兼容 FFmpeg 6.1/8.1，不再支持 4.4）。
   以上选项与实测可稳定拉本摄像头 H265 流的原型 `videoPart/rtsp_yolo_stream` 一致。
 - **中断回调**：`format_ctx->interrupt_callback` 的 `opaque` 指向实现对象，回调检查停止标志；
   `Stop()` 置位后阻塞中的 `av_read_frame` 尽快返回（`AVERROR_EXIT`），保证确定性停机。

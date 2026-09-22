@@ -33,7 +33,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
-#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 
@@ -448,8 +448,10 @@ struct VideoDecoder::Impl {
         // 骨架期接受拷贝开销，实测不足时再优化为零拷贝引用）
         const std::int64_t packet_prepare_start_us = MonotonicUs();
         av_packet_unref(packet);
+        // av_grow_packet 在空包上等价 av_new_packet（分配缓冲+padding）；
+        // av_new_packet 已在 FFmpeg 8 删除，此写法 6.1/8.1 双版本通用
         const int alloc_ret =
-            av_new_packet(packet, static_cast<int>(encoded.data.size()));
+            av_grow_packet(packet, static_cast<int>(encoded.data.size()));
         if (alloc_ret < 0) {
             ++error_count;
             if (ShouldLogThrottled(error_count)) {
@@ -818,10 +820,24 @@ struct VideoDecoder::Impl {
                 if (sws_ctx != nullptr) {
                     sws_freeContext(sws_ctx);
                 }
-                sws_ctx = sws_getContext(width, height,
-                                         static_cast<AVPixelFormat>(frame->format),
-                                         width, height, AV_PIX_FMT_NV12,
-                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+                // 现代创建路径（sws_alloc_context + av_opt + sws_init_context）：
+                // FFmpeg 8 libswscale 9 下旧式 sws_getContext 有弃用风险，
+                // 该写法 5.1+ 引入，6.1/8.1 双版本通用
+                sws_ctx = sws_alloc_context();
+                if (sws_ctx != nullptr) {
+                    av_opt_set_int(sws_ctx, "srcw", width, 0);
+                    av_opt_set_int(sws_ctx, "srch", height, 0);
+                    av_opt_set_int(sws_ctx, "dstw", width, 0);
+                    av_opt_set_int(sws_ctx, "dsth", height, 0);
+                    av_opt_set_pixel_fmt(sws_ctx, "src_format",
+                                         static_cast<AVPixelFormat>(frame->format), 0);
+                    av_opt_set_pixel_fmt(sws_ctx, "dst_format", AV_PIX_FMT_NV12, 0);
+                    av_opt_set_int(sws_ctx, "sws_flags", SWS_BILINEAR, 0);
+                    if (sws_init_context(sws_ctx, nullptr, nullptr) < 0) {
+                        sws_freeContext(sws_ctx);
+                        sws_ctx = nullptr;
+                    }
+                }
                 sws_src_format = frame->format;
                 if (sws_ctx == nullptr) {
                     ++error_count;
