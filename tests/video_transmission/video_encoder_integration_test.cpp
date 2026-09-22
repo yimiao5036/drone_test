@@ -85,5 +85,45 @@ TEST_F(VideoEncoderIntegrationTest, EncodesSyntheticFramesToTsFile) {
     EXPECT_GT(size, 0L);
 }
 
+// prefer_hardware=true 时的回退结构：开发机无 h264_rkmpp，应回退 libx264 正常编码；
+// 香橙派上同一用例天然走真实硬编（h264_rkmpp 存在且可打开）。
+TEST_F(VideoEncoderIntegrationTest, PreferHardwareFallsBackToSoftwareWhenNoRkmpp) {
+    EncoderBackendConfig config;
+    config.url = OutputPath();
+    config.output_url = OutputPath();
+    config.output_format = "mpegts";
+    config.codec = "h264";
+    config.width = 128;
+    config.height = 128;
+    config.fps = 25;
+    config.prefer_hardware = true;     // 无 rkmpp 时必须自动回退软编
+    config.gop = 25;
+
+    auto backend = CreateVideoEncoderBackend(config);
+    ASSERT_NE(backend, nullptr);
+    ASSERT_TRUE(backend->Start());
+    EXPECT_TRUE(backend->IsRunning());
+
+    for (int i = 0; i < 10; ++i) {
+        auto handle = pool_->Acquire();
+        ASSERT_TRUE(handle.Valid());
+        std::memset(handle.Data(), static_cast<int>((i * 29) % 256),
+                    pool_->SlotSize());
+        EXPECT_TRUE(backend->EncodeFrame(handle));
+    }
+
+    backend->Stop();
+    EXPECT_GT(backend->SentFrameCount(), 0u);
+    EXPECT_EQ(backend->ErrorCount(), 0u);
+
+    std::FILE* f = std::fopen(OutputPath().c_str(), "rb");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    std::fclose(f);
+    std::remove(OutputPath().c_str());
+    EXPECT_GT(size, 0L);
+}
+
 }  // namespace
 }  // namespace drone::video_transmission

@@ -41,9 +41,21 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 - 消费线程与编码后端同一线程串行推进（单消费者订阅句柄，无需锁），与解码器/合成线程解耦。
 
 ### 编码链路（FFmpeg，PIMPL 隔离）
-1. `Start`：`PickEncoderName` 按 `codec=h264/h265` 与 `prefer_hardware` 选择
-   `h264_rkmpp/hevc_rkmpp`（香橙派）或 `libx264/libx265`（软解回退）；打开编码器，
-   `AV_CODEC_FLAG_GLOBAL_HEADER` 使 SPS/PPS 进 `extradata`。
+1. `Start`：`OpenEncoderWithFallback` 按 `codec=h264/h265` 与 `prefer_hardware` 组候选列表：
+   `h264_rkmpp/hevc_rkmpp` 存在则先试硬编（香橙派），失败或不存在回退
+   `libx264/libx265`（软编，开发机正常路径）。单个候选由 `TryOpenEncoder(name, is_rkmpp)`
+   打开，幂等自清场（重试前释放半成品上下文）；日志对齐解码器模式——无 rkmpp 打 INFO
+   属正常，rkmpp 存在但打开失败打 WARN。`AV_CODEC_FLAG_GLOBAL_HEADER` 使 SPS/PPS 进
+   `extradata`。
+   - **rkmpp 私有选项**（AVDictionary，仅硬编分支；内部常量不进 config.json）：
+
+     | 选项 | 值 | 说明 |
+     |------|-----|------|
+     | `rc_mode` | `VBR` | 动态码率模式 |
+     | `rc_max_rate` | `config.bitrate` | 峰值码率上限（bps） |
+
+     open 后检查 dict 残留：未被编码器识别的选项打 WARN（启动期护栏，FFmpeg 版本/拼写
+     漂移立即可见）。libx264/265 路径不开选项（行为与旧版一致）。
 2. 输出格式：
    - **RTSP**：`avformat_alloc_output_context2(nullptr, "rtsp", url)`，
      `avformat_write_header` 内部建立网络会话；`rtsp_transport=tcp/udp`。
@@ -53,6 +65,10 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 3. 帧输入：NV12 帧按行拷入 `nv12_in_`（Y 平面 `hor_stride`，UV 平面偏移
    `hor_stride*height`，每行 `w` 字节）。
    - **硬编（rkmpp）**：rkmpp 编码器直接收 NV12 软件帧（内部自行导入 MPP 缓冲），直接送。
+     **hwupload 预案（未实现，触发条件）**：若 ffmpeg-rockchip 某版本拒收 CPU NV12 帧
+     （送帧报格式不支持/段错误），需在解码侧保留 DMA-BUF 并 hwupload 到 rkmpp 帧队列
+     再送编码；骨架设计见 `docs/superpowers/plans/2026-09-22-ffmpeg-rockchip硬解硬编.md`，
+     触发前不预先实现。
    - **软编（libx264/265）**：需 YUV420P，`sws_scale` NV12→YUV420P 到 `pic_out_` 再送编码器
      （sws 上下文用现代创建路径 `sws_alloc_context`+`av_opt`+`sws_init_context`，
      兼容 FFmpeg 6.1/8.1，规避 libswscale 9 对旧式 `sws_getContext` 的弃用风险）。
@@ -101,7 +117,8 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
   （`backend_factory`）验证线程/生命周期/发送计数/后端失败丢帧不反压/停机/重启/后端启动失败。
 - **集成测试** `tests/video_transmission/video_encoder_integration_test.cpp`：走真实
   FFmpeg 后端，开发机软编码（libx264）合成 NV12 → 编码到**本地 mpegts 文件**，验证
-  编码器可开、帧可送、文件非空、计数正确。自动清理文件。
+  编码器可开、帧可送、文件非空、计数正确。含 `prefer_hardware=true` 回退用例（开发机
+  无 rkmpp 自动回退 libx264；香橙派上同用例天然走真实硬编）。自动清理文件。
   ```bash
   cmake --build build -j$(nproc) && cd build && ctest -R "Encoder|Sender|Compositor"
   ```

@@ -102,9 +102,69 @@ struct VideoEncoderImpl {
 
     ~VideoEncoderImpl() { Stop(); }
 
-    /// 依据配置与可用性选择编码器名字："h264"/"h265" → rkmpp 或软编码。
-    // 硬件编码器不存在时回退到 libx264/libx265，便于开发机验证；香橙派优先 rkmpp。
-    std::string PickEncoderName() const {
+    /// 用指定编码器创建上下文并打开；失败时自清场（幂等）返回 false。
+    /// rkmpp 分支附带私有选项 rc_mode=VBR / rc_max_rate=码率（AVDictionary，
+    /// 属内部常量不进 config.json）；open 后检查 dict 残留，未识别选项打 WARN
+    /// （启动期护栏，版本/拼写漂移立即可见）。
+    bool TryOpenEncoder(const char* name, bool is_rkmpp) {
+        if (codec_ctx_ != nullptr) {
+            avcodec_free_context(&codec_ctx_);
+            codec_ctx_ = nullptr;
+        }
+        encoder_ = avcodec_find_encoder_by_name(name);
+        if (encoder_ == nullptr) {
+            return false;  // 编码器不存在属正常分支（如开发机无 rkmpp），日志由调用方定级
+        }
+        codec_ctx_ = avcodec_alloc_context3(encoder_);
+        if (codec_ctx_ == nullptr) {
+            ++error_count;
+            SPDLOG_ERROR("图传编码器分配上下文失败: {}", name);
+            return false;
+        }
+        codec_ctx_->codec_id = encoder_->id;
+        codec_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
+        codec_ctx_->bit_rate = config.bitrate;
+        codec_ctx_->width = static_cast<int>(config.width);
+        codec_ctx_->height = static_cast<int>(config.height);
+        codec_ctx_->time_base = AVRational{1, config.fps};
+        codec_ctx_->framerate = AVRational{config.fps, 1};
+        codec_ctx_->gop_size = config.gop;
+        codec_ctx_->max_b_frames = 0;
+        codec_ctx_->pix_fmt = is_rkmpp ? AV_PIX_FMT_NV12     // rkmpp 直接收 NV12
+                                       : AV_PIX_FMT_YUV420P;  // libx264/265 需 YUV420P
+        // SPS/PPS 放入 extradata（RTSP SDP 需要）
+        codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+        AVDictionary* opts = nullptr;
+        if (is_rkmpp) {
+            av_dict_set(&opts, "rc_mode", "VBR", 0);
+            av_dict_set_int(&opts, "rc_max_rate", config.bitrate, 0);
+        }
+        const int open_ret = avcodec_open2(codec_ctx_, encoder_, &opts);
+        if (opts != nullptr) {
+            const AVDictionaryEntry* entry = nullptr;
+            std::string leftovers;
+            while ((entry = av_dict_get(opts, "", entry, AV_DICT_IGNORE_SUFFIX)) !=
+                   nullptr) {
+                if (!leftovers.empty()) {
+                    leftovers += ',';
+                }
+                leftovers += entry->key;
+            }
+            av_dict_free(&opts);
+            SPDLOG_WARN("图传编码器 {} 未识别私有选项: {}", name, leftovers);
+        }
+        if (open_ret < 0) {
+            ++error_count;
+            SPDLOG_WARN("图传编码器打开失败: {} ({})", name, AvErrorToString(open_ret));
+            return false;
+        }
+        return true;
+    }
+
+    /// 选择并打开编码器：prefer_hardware 且 rkmpp 存在时先硬编，失败回退软编。
+    // 对齐解码器 CreateDecoder 模式：无 rkmpp 属正常（INFO），存在但打开失败打 WARN。
+    bool OpenEncoderWithFallback() {
         const bool h264 = config.codec == "h264";
         const bool h265 = config.codec == "h265";
         if (!h264 && !h265) {
@@ -113,11 +173,22 @@ struct VideoEncoderImpl {
         if (config.prefer_hardware) {
             const char* hw_name = h264 ? "h264_rkmpp" : "hevc_rkmpp";
             if (avcodec_find_encoder_by_name(hw_name) != nullptr) {
-                return hw_name;
+                if (TryOpenEncoder(hw_name, true)) {
+                    return true;
+                }
+                SPDLOG_WARN("图传硬编码器 {} 存在但打开失败，回退软编码", hw_name);
+            } else {
+                SPDLOG_INFO("图传无 rkmpp 硬编码器（{}），使用软编码", hw_name);
             }
         }
-        // 软编码回退（开发机无 rkmpp 为正常路径）
-        return h264 ? "libx264" : "libx265";
+        const char* sw_name = h264 ? "libx264" : "libx265";
+        if (!TryOpenEncoder(sw_name, false)) {
+            ++error_count;
+            SPDLOG_ERROR("图传软编码器不可用或打开失败: {}（需 FFmpeg 5.0+ 或 ffmpeg-rockchip）",
+                         sw_name);
+            return false;
+        }
+        return true;
     }
 
     // 启动顺序：选择/打开编码器 → 创建输出封装 → 建立输出流 → 分配帧/包缓冲。
@@ -127,41 +198,7 @@ struct VideoEncoderImpl {
             return true;  // 幂等
         }
         try {
-            const std::string encoder_name = PickEncoderName();
-            encoder_ = avcodec_find_encoder_by_name(encoder_name.c_str());
-            if (encoder_ == nullptr) {
-                ++error_count;
-                SPDLOG_ERROR("图传编码器未找到: {}（需 FFmpeg 5.0+ 或 ffmpeg-rockchip）",
-                             encoder_name);
-                return false;
-            }
-
-            codec_ctx_ = avcodec_alloc_context3(encoder_);
-            if (codec_ctx_ == nullptr) {
-                ++error_count;
-                SPDLOG_ERROR("图传编码器分配上下文失败: {}", encoder_name);
-                return false;
-            }
-            codec_ctx_->codec_id = encoder_->id;
-            codec_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
-            codec_ctx_->bit_rate = config.bitrate;
-            codec_ctx_->width = static_cast<int>(config.width);
-            codec_ctx_->height = static_cast<int>(config.height);
-            codec_ctx_->time_base = AVRational{1, config.fps};
-            codec_ctx_->framerate = AVRational{config.fps, 1};
-            codec_ctx_->gop_size = config.gop;
-            codec_ctx_->max_b_frames = 0;
-            codec_ctx_->pix_fmt = (encoder_name == "libx264" || encoder_name == "libx265")
-                                      ? AV_PIX_FMT_YUV420P
-                                      : AV_PIX_FMT_NV12;  // rkmpp 直接收 NV12
-            // SPS/PPS 放入 extradata（RTSP SDP 需要）
-            codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-            const int open_ret = avcodec_open2(codec_ctx_, encoder_, nullptr);
-            if (open_ret < 0) {
-                ++error_count;
-                SPDLOG_ERROR("图传编码器打开失败: {} ({})", encoder_name,
-                             AvErrorToString(open_ret));
+            if (!OpenEncoderWithFallback()) {
                 return false;
             }
 
@@ -276,7 +313,7 @@ struct VideoEncoderImpl {
 
             running = true;
             SPDLOG_INFO("图传编码器就绪: {} → {}, {}x{}@{}fps, {}bps",
-                        encoder_name, config.url, config.width, config.height,
+                        encoder_->name, config.url, config.width, config.height,
                         config.fps, config.bitrate);
             return true;
         } catch (const std::exception& e) {
