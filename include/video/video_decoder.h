@@ -30,8 +30,10 @@ namespace drone::video {
 /// 视频解码配置。
 struct VideoDecoderConfig {
     std::size_t pool_capacity = 8;          ///< 解码帧内存池容量（槽位数）
-    std::uint32_t width = 0;                ///< 预知分辨率宽；0=首帧确定（懒建池）
-    std::uint32_t height = 0;               ///< 预知分辨率高；0=首帧确定（懒建池）
+    std::uint32_t width = 0;                ///< 预知分辨率宽；0=首帧确定（懒建池）。非0时写入
+                                            ///< codec_ctx（mjpeg_rkmpp 按宽高预分配输出缓冲，必需）；
+                                            ///< UVC 链路由配置解析自动透传 uvc_width
+    std::uint32_t height = 0;               ///< 预知分辨率高；同 width，UVC 透传 uvc_height
     std::uint32_t stride_alignment = 64;    ///< 水平 stride 像素对齐（MPP/RGA 友好）
     bool prefer_hardware = true;            ///< 优先 rkmpp 硬解码（香橙派）；否则软解
     double slow_frame_threshold_ms = 0.0;   ///< 慢解码诊断阈值；0=关闭逐事件节流日志

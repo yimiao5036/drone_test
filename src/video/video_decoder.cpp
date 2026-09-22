@@ -144,6 +144,10 @@ std::uint32_t AlignUp(std::uint32_t value, std::uint32_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+/// 硬解持续性失败的会话级回退阈值（约 30fps×3 秒）：解码器能 open 但送包/取帧
+/// 持续全败（如 MPP 输出缓冲分配失败）时，重建为软解，避免无限报错且永不出图。
+constexpr std::uint32_t kHwFailureFallbackThreshold = 90;
+
 }  // namespace
 
 /// VideoDecoder 实现细节（PIMPL）：FFmpeg 解码上下文、内存池与解码线程。
@@ -202,6 +206,8 @@ struct VideoDecoder::Impl {
     std::atomic<uint64_t> rga_dma_fallback_count{0};
     std::atomic<bool> drm_layout_logged{false};
     bool rga_dma_disabled = false;  // 仅解码线程访问；布局不支持时会话内关闭
+    bool hardware_disabled_session = false;  // 硬解持续失败后本会话禁用（仅解码线程）
+    std::uint32_t consecutive_hw_failures = 0;  // 仅解码线程访问
     std::atomic<common::VideoCodec> active_codec{common::VideoCodec::kUnknown};
     std::atomic<bool> hardware_decoder_active{false};
     common::LatencyStatistics input_queue_latency;
@@ -271,9 +277,12 @@ struct VideoDecoder::Impl {
         }
 
         // 硬解优先：RK3588 的 rkmpp 解码器（无对应 rkmpp 名时直接软解）
+        // hardware_disabled_session：硬解能 open 但持续解码失败时被置位，
+        // 本会话不再尝试硬解（NoteHardwareDecodeFailure）。
         bool hardware_attempted = false;
         const char* rkmpp_name = RkmppDecoderName(codec_id);
-        if (config.prefer_hardware && rkmpp_name != nullptr) {
+        if (config.prefer_hardware && !hardware_disabled_session &&
+            rkmpp_name != nullptr) {
             const AVCodec* hw_decoder = avcodec_find_decoder_by_name(rkmpp_name);
             if (hw_decoder != nullptr) {
                 hardware_attempted = true;
@@ -320,6 +329,16 @@ struct VideoDecoder::Impl {
             return false;
         }
         codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+        // 预知分辨率写入解码上下文（0 则不写）：ffmpeg-rockchip 8.1 的
+        // mjpeg_rkmpp 在送包路径（rkmpp_mjpeg_put_packet）按
+        // avctx->width×height 预分配输出缓冲，宽高为 0 时 mpp_buffer_get(0)
+        // 失败、首包即被拒，永远触发不了 info_change 形成死锁；其余解码器
+        // 仅把它当初始 hint，码流内分辨率变化仍会覆盖。
+        if (config.width > 0 && config.height > 0) {
+            codec_ctx->width = static_cast<int>(config.width);
+            codec_ctx->height = static_cast<int>(config.height);
+        }
 
         // 流级参数集（SPS/PPS 等）：RTSP/容器流在流头而非逐帧码流中。
         // 重要（对齐已验证成功的原型 videoPart/rtsp_yolo_stream）：
@@ -458,6 +477,24 @@ struct VideoDecoder::Impl {
         av_packet_free(&packet);
     }
 
+    /// 硬解持续性失败保护（仅解码线程）：能 open 但送包/取帧持续全败时，
+    /// 会话级禁用硬解并释放解码器，下个数据帧到来时重建为软解。
+    // 一次性切换不反复：此后 hardware_disabled_session 保持置位到进程重启。
+    void NoteHardwareDecodeFailure() {
+        if (!is_hardware) {
+            return;
+        }
+        ++consecutive_hw_failures;
+        if (consecutive_hw_failures < kHwFailureFallbackThreshold) {
+            return;
+        }
+        SPDLOG_WARN("视频解码器硬解连续 {} 次送包/取帧失败，本会话回退软解",
+                    consecutive_hw_failures);
+        hardware_disabled_session = true;
+        consecutive_hw_failures = 0;
+        CleanupCodec();
+    }
+
     /// 解码单个码流块并发布所有输出帧。
     // packet 使用独立 FFmpeg 缓冲，处理完后由下一次 av_packet_unref 回收复用。
     void DecodeOne(const common::EncodedFrame& encoded, AVPacket* packet) {
@@ -526,6 +563,7 @@ struct VideoDecoder::Impl {
                 SPDLOG_ERROR("视频解码器送包失败: {}，累计 {}",
                              AvErrorToString(send_ret), error_count.load());
             }
+            NoteHardwareDecodeFailure();
             return;
         }
 
@@ -544,8 +582,10 @@ struct VideoDecoder::Impl {
                     SPDLOG_ERROR("视频解码器取帧失败: {}，累计 {}",
                                  AvErrorToString(recv_ret), error_count.load());
                 }
+                NoteHardwareDecodeFailure();
                 break;
             }
+            consecutive_hw_failures = 0;  // 成功出帧，硬解失败计数清零
             const double receive_frame_ms =
                 static_cast<double>(receive_elapsed_us) / 1000.0;
             receive_frame_latency.Add(receive_frame_ms);

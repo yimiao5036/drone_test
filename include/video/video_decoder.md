@@ -52,6 +52,15 @@ class VideoDecoder final : public IVideoDecoder {
   `AV_HWDEVICE_TYPE_DRM`（旧 fork/6.1 兼容）。hevc/h264/mjpeg 三编码统一走此入口；
   创建成功与打开失败日志均带设备类型名（rkmpp/drm），不做设备类型重试矩阵，
   打开失败直接走既有软解回退。
+- **预知分辨率写入解码上下文（mjpeg_rkmpp 死锁坑）**：`config.width/height > 0` 时
+  创建解码器即写入 `codec_ctx->width/height`。ffmpeg-rockchip 8.1 的 mjpeg_rkmpp 在送包
+  路径按 `avctx->width×height` 预分配输出缓冲（`rkmpp_mjpeg_put_packet` 的 `buf_sz`），
+  宽高为 0 时 `mpp_buffer_get(0)` 失败、首包即被拒，永远触发不了 info_change——表现为
+  `Failed to get buffer for frame: -2` + `Decoder failed to send packet` 无限刷屏且不出图。
+  UVC 链路由配置解析透传 uvc 宽高（`config.cpp`），RTSP 链路保持 0 由码流参数集确定。
+- **硬解持续失败会话级回退**：解码器能 open 但送包/取帧连续 90 次（约 30fps×3s）全败时，
+  `NoteHardwareDecodeFailure()` 置 `hardware_disabled_session` 并释放解码器，下个数据帧
+  重建为软解（WARN 一次）；一次性切换不反复，进程重启前不再尝试硬解。成功出帧即清零计数。
 - **硬解路径**：硬解输出 `AV_PIX_FMT_DRM_PRIME`（DRM_PRIME 描述符：hevc/h264 为
   NV12，mjpeg_rkmpp 为 NV16）。优先经 `drm_nv12_transfer` RGA 直传（按图层 fourcc
   分派：NV12 `imcopy` / NV16 `imcvtcolor` 转 NV12，见 `drm_nv12_transfer.md`）；
@@ -101,7 +110,7 @@ class VideoDecoder final : public IVideoDecoder {
 | 等级 | 场景 |
 |------|------|
 | INFO | 创建（配置）、启动、停止、销毁、解码器创建（名称/硬解或软解，硬解带设备类型 rkmpp/drm）、池创建（容量/分辨率/stride） |
-| WARN | rkmpp存在但打开失败回退软解、池满丢帧；探针启用阈值后的慢解码帧关联信息（均节流） |
+| WARN | rkmpp存在但打开失败回退软解、池满丢帧、硬解连续90次失败会话级回退软解（一次）；探针启用阈值后的慢解码帧关联信息（均节流） |
 | ERROR（节流） | 送包失败、取帧失败、sws 创建失败、池创建失败、硬件帧转存失败 |
 
 ## 5. 测试方式
@@ -129,5 +138,6 @@ cmake --build build && cd build && ctest -R VideoDecoder
 | D4运行数分钟后由约2ms升至10～15ms | 已定位到`av_hwframe_transfer_data`并增加RGA DMA-BUF直传试验路径；确认`RGA_DMA成功`增长、回退为0、D4/D5无样本及D4R稳定。实现细节见`drm_nv12_transfer.md` |
 | 硬解画面偏色/错位（mjpeg_rkmpp） | 看会话首次 DRM 图层日志 fourcc 是否为 `NV16`；NV16 应走 RGA `imcvtcolor` 转 NV12（首次 RGA 成功日志带“NV16转NV12”），布局规则与排查见 `drm_nv12_transfer.md` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |
+| mjpeg_rkmpp 刷屏 `Failed to get buffer for frame: -2` | 解码上下文宽高为 0 导致 MPP 按 0 尺寸分配输出缓冲：确认 UVC 链路 `decoder.width/height` 已被配置解析透传（`config.cpp`），RTSP 链路无此问题；兜底是连续 90 次失败后自动回退软解 |
 | 帧率不足 | 软解慢属预期（开发机）；香橙派按实际流确认走`h264_rkmpp`或`hevc_rkmpp`；`sws`在格式不变时不会重建 |
 | 修改输出格式 | 当前固定 NV12；如需 RGB888 改 `sws` 目标格式与 `PixelFormat` |

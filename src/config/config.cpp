@@ -554,6 +554,14 @@ AppConfig LoadAppConfig(const std::string& path,
     }
     config.stereo_splitter.width = config.uvc_camera.width;
     config.stereo_splitter.height = config.uvc_camera.height;
+    // UVC 链路解码器预知 SBS 全幅分辨率：ffmpeg-rockchip 8.1 的 mjpeg_rkmpp
+    // 在送包路径按 avctx->width×height 预分配输出缓冲，宽高为 0 会首包即失败
+    // 且永远触发不了 info_change（详见 video_decoder.cpp TryCreateCodec 注释）。
+    // RTSP 链路保持 0，分辨率由码流参数集到达后再确定。
+    if (config.video_source.camera_source == "uvc") {
+        config.decoder.width = config.uvc_camera.width;
+        config.decoder.height = config.uvc_camera.height;
+    }
 
     config.camera.rtsp_url = video.value(
         "input_rtsp", std::string("rtsp://192.168.1.100:8554/live"));
