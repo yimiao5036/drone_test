@@ -154,8 +154,8 @@
         ]
     },
     "video": {
-        "camera_source": "rtsp",
-        "stereo_split": false,
+        "camera_source": "uvc",
+        "stereo_split": true,
         "uvc_device": "/dev/video0",
         "uvc_width": 2560,
         "uvc_height": 720,
