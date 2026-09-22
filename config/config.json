@@ -141,7 +141,7 @@
         }
     },
     "yolo": {
-        "model_path": "models/yolo26n-drone-relu6-e184-09-13.rknn",
+        "model_path": "models/yolov26_ReLU6_09_13-rk3588_384_640.rknn",
         "conf_threshold": 0.30,
         "nms_threshold": 0.45,
         "input_queue_capacity": 1,
