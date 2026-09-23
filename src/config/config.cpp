@@ -90,6 +90,19 @@ double ReadOptionalPositiveDouble(const json& object, const char* key,
     return value;
 }
 
+// 视觉跟踪 PID 等增益允许为零（整定前占位）；显式提供时必须为有限非负数。
+double ReadOptionalNonNegativeDouble(const json& object, const char* key,
+                                     double default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const double value = object.at(key).get<double>();
+    if (!std::isfinite(value) || value < 0.0) {
+        throw std::invalid_argument(std::string(key) + " 必须为有限非负数");
+    }
+    return value;
+}
+
 std::size_t ReadOptionalPositiveSize(const json& object, const char* key,
                                      std::size_t default_value) {
     if (object.find(key) == object.end()) {
@@ -409,6 +422,8 @@ AppConfig LoadAppConfig(const std::string& path,
         runtime.value("enable_target_estimator", false);
     config.runtime.enable_visual_monitor =
         runtime.value("enable_visual_monitor", false);
+    config.runtime.enable_visual_tracking =
+        runtime.value("enable_visual_tracking", false);
     config.runtime.enable_control = runtime.value("enable_control", false);
     if (!config.runtime.enable_video && !config.runtime.enable_px4 &&
         !config.runtime.enable_ground_station) {
@@ -428,6 +443,12 @@ AppConfig LoadAppConfig(const std::string& path,
     if (config.runtime.enable_visual_monitor && !config.runtime.enable_video) {
         throw std::invalid_argument(
             "enable_visual_monitor=true时必须启用视频链路（观测来源为YoloDetector）");
+    }
+    if (config.runtime.enable_visual_tracking &&
+        (!config.runtime.enable_visual_monitor || !config.runtime.enable_video)) {
+        throw std::invalid_argument(
+            "enable_visual_tracking=true时必须启用视频链路与视觉稳定性判定"
+            "（视觉输入来源为VisualTargetMonitor）");
     }
     if (config.runtime.enable_control) {
         throw std::invalid_argument("正式控制装配尚未开放，enable_control必须为false");
@@ -516,6 +537,112 @@ AppConfig LoadAppConfig(const std::string& path,
         ReadOptionalPositiveMilliseconds(visual_monitor, "status_log_interval_ms",
                                          config.visual_monitor.status_log_interval);
     config.visual_monitor.Validate();
+
+    // 视觉跟踪控制律（影子）：全部字段可选，缺席用默认值（camera 组默认值即
+    // 2026-09-23 标定实测）；Validate 做跨字段校验。
+    const json visual_tracking = root.value("visual_tracking", json::object());
+    {
+        const json control = visual_tracking.value("control", json::object());
+        config.visual_tracking.control.frequency_hz = ReadOptionalPositiveDouble(
+            control, "frequency_hz", config.visual_tracking.control.frequency_hz);
+        const json camera = visual_tracking.value("camera", json::object());
+        config.visual_tracking.camera.image_width = ReadOptionalPositiveInt(
+            camera, "image_width", config.visual_tracking.camera.image_width);
+        config.visual_tracking.camera.image_height = ReadOptionalPositiveInt(
+            camera, "image_height", config.visual_tracking.camera.image_height);
+        config.visual_tracking.camera.fx_px =
+            camera.value("fx_px", config.visual_tracking.camera.fx_px);
+        config.visual_tracking.camera.fy_px =
+            camera.value("fy_px", config.visual_tracking.camera.fy_px);
+        config.visual_tracking.camera.cx_px =
+            camera.value("cx_px", config.visual_tracking.camera.cx_px);
+        config.visual_tracking.camera.cy_px =
+            camera.value("cy_px", config.visual_tracking.camera.cy_px);
+        const json heading = visual_tracking.value("heading", json::object());
+        const std::string heading_mode = heading.value("mode", std::string("rate"));
+        if (heading_mode == "rate") {
+            config.visual_tracking.heading.mode = control::HeadingMode::kRate;
+        } else if (heading_mode == "position") {
+            config.visual_tracking.heading.mode = control::HeadingMode::kPosition;
+        } else {
+            throw std::invalid_argument(
+                "visual_tracking.heading.mode 仅支持 rate/position");
+        }
+        config.visual_tracking.heading.gain = ReadOptionalNonNegativeDouble(
+            heading, "gain", config.visual_tracking.heading.gain);
+        config.visual_tracking.heading.yaw_rate_limit_dps =
+            ReadOptionalPositiveDouble(heading, "yaw_rate_limit_dps",
+                                       config.visual_tracking.heading.yaw_rate_limit_dps);
+        config.visual_tracking.heading.yaw_slew_limit_dps2 =
+            ReadOptionalPositiveDouble(heading, "yaw_slew_limit_dps2",
+                                       config.visual_tracking.heading.yaw_slew_limit_dps2);
+        const json vertical = visual_tracking.value("vertical", json::object());
+        config.visual_tracking.vertical.vz_gain_mps_per_deg =
+            ReadOptionalNonNegativeDouble(
+                vertical, "vz_gain_mps_per_deg",
+                config.visual_tracking.vertical.vz_gain_mps_per_deg);
+        config.visual_tracking.vertical.vz_limit_mps = ReadOptionalPositiveDouble(
+            vertical, "vz_limit_mps", config.visual_tracking.vertical.vz_limit_mps);
+        const json distance = visual_tracking.value("distance", json::object());
+        config.visual_tracking.distance.d_exp_m = ReadOptionalPositiveDouble(
+            distance, "d_exp_m", config.visual_tracking.distance.d_exp_m);
+        config.visual_tracking.distance.kp = ReadOptionalNonNegativeDouble(
+            distance, "kp", config.visual_tracking.distance.kp);
+        config.visual_tracking.distance.ki = ReadOptionalNonNegativeDouble(
+            distance, "ki", config.visual_tracking.distance.ki);
+        config.visual_tracking.distance.kd = ReadOptionalNonNegativeDouble(
+            distance, "kd", config.visual_tracking.distance.kd);
+        config.visual_tracking.distance.integral_limit = ReadOptionalNonNegativeDouble(
+            distance, "integral_limit", config.visual_tracking.distance.integral_limit);
+        config.visual_tracking.distance.derivative_filter_coef =
+            distance.value("derivative_filter_coef",
+                           config.visual_tracking.distance.derivative_filter_coef);
+        config.visual_tracking.distance.approach_velocity_limit_mps =
+            ReadOptionalPositiveDouble(
+                distance, "approach_velocity_limit_mps",
+                config.visual_tracking.distance.approach_velocity_limit_mps);
+        config.visual_tracking.distance.retreat_velocity_limit_mps =
+            ReadOptionalPositiveDouble(
+                distance, "retreat_velocity_limit_mps",
+                config.visual_tracking.distance.retreat_velocity_limit_mps);
+        const std::string no_distance_action =
+            distance.value("no_distance_action", std::string("slow_approach"));
+        if (no_distance_action == "hold") {
+            config.visual_tracking.distance.no_distance_action =
+                control::NoDistanceAction::kHold;
+        } else if (no_distance_action == "slow_approach") {
+            config.visual_tracking.distance.no_distance_action =
+                control::NoDistanceAction::kSlowApproach;
+        } else if (no_distance_action == "exit") {
+            config.visual_tracking.distance.no_distance_action =
+                control::NoDistanceAction::kExit;
+        } else {
+            throw std::invalid_argument(
+                "visual_tracking.distance.no_distance_action 仅支持 "
+                "hold/slow_approach/exit");
+        }
+        config.visual_tracking.distance.no_distance_approach_limit_mps =
+            ReadOptionalNonNegativeDouble(
+                distance, "no_distance_approach_limit_mps",
+                config.visual_tracking.distance.no_distance_approach_limit_mps);
+        const json accel_limit = visual_tracking.value("accel_limit", json::object());
+        config.visual_tracking.accel_limit.ax_mps2 = ReadOptionalPositiveDouble(
+            accel_limit, "ax_mps2", config.visual_tracking.accel_limit.ax_mps2);
+        config.visual_tracking.accel_limit.ay_mps2 = ReadOptionalPositiveDouble(
+            accel_limit, "ay_mps2", config.visual_tracking.accel_limit.ay_mps2);
+        config.visual_tracking.accel_limit.az_mps2 = ReadOptionalPositiveDouble(
+            accel_limit, "az_mps2", config.visual_tracking.accel_limit.az_mps2);
+        const json shadow = visual_tracking.value("shadow", json::object());
+        config.visual_tracking_shadow.virtual_attitude_when_absent =
+            shadow.value("virtual_attitude_when_absent",
+                         config.visual_tracking_shadow.virtual_attitude_when_absent);
+        config.visual_tracking_shadow.summary_log_interval =
+            ReadOptionalPositiveMilliseconds(
+                shadow, "summary_log_interval_ms",
+                config.visual_tracking_shadow.summary_log_interval);
+        config.visual_tracking.Validate();
+        config.visual_tracking_shadow.Validate();
+    }
 
     if (root.find("ground_station") != root.end()) {
         config.ground_station = ParseGroundStationConfig(root);

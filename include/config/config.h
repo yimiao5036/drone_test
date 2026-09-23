@@ -8,6 +8,8 @@
 
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
+#include "control/tracking_config.h"
+#include "control/visual_tracking_shadow.h"
 #include "perception/target_estimator.h"
 #include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
@@ -31,6 +33,7 @@ struct RuntimeConfig {
     bool enable_ground_station = false;
     bool enable_target_estimator = false;
     bool enable_visual_monitor = false;
+    bool enable_visual_tracking = false;  ///< 视觉跟踪控制律影子（kControlIntent 无消费者）
     bool enable_control = false;
 };
 
@@ -68,6 +71,8 @@ struct AppConfig {
     communication::GroundStationLinkConfig ground_station;
     perception::TargetEstimatorConfig target_estimator;
     perception::VisualTargetMonitorConfig visual_monitor;
+    control::TrackingConfig visual_tracking;              ///< 视觉跟踪控制律（含标定内参）
+    control::VisualTrackingShadowConfig visual_tracking_shadow;
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

@@ -9,7 +9,8 @@
         "enable_ground_station": true,
         "enable_target_estimator": true,
         "enable_visual_monitor": true,
-        "enable_control": false
+        "enable_control": false,
+        "enable_visual_tracking": true
     },
     "health": {
         "cpu_sample_period_ms": 1000,
@@ -38,16 +39,43 @@
         "setpoint_timeout_ms": 500,
         "setpoint_queue_capacity": 4,
         "command_queue_capacity": 16,
-        "one_shot_message_requests": [148, 242],
+        "one_shot_message_requests": [
+            148,
+            242
+        ],
         "message_interval_requests": [
-            {"message_id": 1, "interval_us": 1000000},
-            {"message_id": 24, "interval_us": 200000},
-            {"message_id": 30, "interval_us": 100000},
-            {"message_id": 32, "interval_us": 100000},
-            {"message_id": 33, "interval_us": 200000},
-            {"message_id": 65, "interval_us": 200000},
-            {"message_id": 147, "interval_us": 1000000},
-            {"message_id": 245, "interval_us": 500000}
+            {
+                "message_id": 1,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 24,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 30,
+                "interval_us": 100000
+            },
+            {
+                "message_id": 32,
+                "interval_us": 100000
+            },
+            {
+                "message_id": 33,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 65,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 147,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 245,
+                "interval_us": 500000
+            }
         ],
         "serial": {
             "device": "/dev/ttyS1",
@@ -142,7 +170,7 @@
     },
     "yolo": {
         "model_path": "models/yolov26_ReLU6_09_13-rk3588_384_640.rknn",
-        "conf_threshold": 0.30,
+        "conf_threshold": 0.3,
         "nms_threshold": 0.45,
         "input_queue_capacity": 1,
         "npu_core_mode": "all",
@@ -167,5 +195,56 @@
         "fps": 25,
         "bitrate": 6000000,
         "prefer_rga_dma_transfer": true
+    },
+    "visual_tracking": {
+        "_comment": "视觉跟踪控制律（影子运行，不接 Px4Link）。camera 组为 2026-09-23 左目标定实测内参（1280x720 档，cy 偏离画面中心为实测值）；heading/vertical/distance 增益与 PID 为占位初值，待整定。",
+        "control": {
+            "frequency_hz": 20.0,
+            "visual_stale_ms": 200,
+            "distance_stale_ms": 500,
+            "attitude_stale_ms": 300
+        },
+        "camera": {
+            "_comment": "2026-09-23 左目标定实测（config/camera_calibration_uvc_1280x720.json）；只对 1280x720 档有效，换档必须重标定",
+            "image_width": 1280,
+            "image_height": 720,
+            "fx_px": 1007.82,
+            "fy_px": 1008.02,
+            "cx_px": 620.73,
+            "cy_px": 532.07
+        },
+        "heading": {
+            "mode": "rate",
+            "gain": 1.0,
+            "yaw_rate_limit_dps": 30.0,
+            "yaw_slew_limit_dps2": 60.0
+        },
+        "vertical": {
+            "vz_gain_mps_per_deg": 0.1,
+            "vz_limit_mps": 2.0
+        },
+        "distance": {
+            "d_exp_m": 10.0,
+            "kp": 0.5,
+            "ki": 0.05,
+            "kd": 0.1,
+            "integral_limit": 2.0,
+            "derivative_filter_coef": 0.2,
+            "approach_velocity_limit_mps": 3.0,
+            "retreat_velocity_limit_mps": 1.0,
+            "no_distance_action": "slow_approach",
+            "no_distance_approach_limit_mps": 0.5,
+            "no_distance_exit_grace_ms": 3000
+        },
+        "accel_limit": {
+            "ax_mps2": 2.0,
+            "ay_mps2": 2.0,
+            "az_mps2": 1.5
+        },
+        "shadow": {
+            "_comment": "现场无 PX4 姿态时以零姿态继续计算（仅供观察）；摘要日志 10s",
+            "virtual_attitude_when_absent": true,
+            "summary_log_interval_ms": 10000
+        }
     }
 }

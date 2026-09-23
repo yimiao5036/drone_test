@@ -10,6 +10,7 @@
 
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
+#include "control/visual_tracking_shadow.h"
 #include "perception/detection_backend.h"
 #include "perception/target_estimator.h"
 #include "perception/visual_target_monitor.h"
@@ -74,6 +75,13 @@ void DroneApplication::BuildComponents() {
     if (config_.runtime.enable_visual_monitor && detector_ != nullptr) {
         visual_monitor_ = std::make_unique<perception::VisualTargetMonitor>(
             config_.visual_monitor);
+    }
+
+    // 视觉跟踪控制律影子：消费视觉稳定性状态（+ PX4 姿态，可选）发布影子
+    // ControlIntent；kControlIntent 无消费者，不产生真实控制输出。
+    if (config_.runtime.enable_visual_tracking && visual_monitor_ != nullptr) {
+        visual_tracking_shadow_ = std::make_unique<control::VisualTrackingShadow>(
+            config_.visual_tracking, config_.visual_tracking_shadow);
     }
 
     if (config_.runtime.enable_px4) {
@@ -158,6 +166,13 @@ void DroneApplication::BindTopics() {
         visual_monitor_->SetInput(detector_->ObservationOutput());
     }
 
+    if (visual_tracking_shadow_ != nullptr && visual_monitor_ != nullptr) {
+        visual_tracking_shadow_->SetVisualInput(visual_monitor_->StatusOutput());
+        if (px4_link_ != nullptr) {
+            visual_tracking_shadow_->SetFlightInput(px4_link_->StateOutput());
+        }
+    }
+
     if (ground_station_link_ != nullptr && px4_link_ != nullptr) {
         ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
     }
@@ -202,6 +217,17 @@ bool DroneApplication::Start() {
         if (!visual_monitor_->Start()) {
             degraded = true;
             SPDLOG_ERROR("主程序视觉稳定性判定启动失败，视觉影子状态不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 视觉跟踪影子是视觉稳定性状态的消费者，紧随其启动；纯影子输出，
+    // 失败不影响任何数据链路。
+    if (visual_tracking_shadow_ != nullptr) {
+        if (!visual_tracking_shadow_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序视觉跟踪影子启动失败，控制律影子观察不可用");
         } else {
             any_started = true;
         }
@@ -441,6 +467,11 @@ void DroneApplication::Stop() {
     // 视频生产者已停止，再停止其观测消费者。
     if (visual_monitor_ != nullptr) {
         visual_monitor_->Stop();
+    }
+
+    // 视觉跟踪影子在视觉状态源停止后停止。
+    if (visual_tracking_shadow_ != nullptr) {
+        visual_tracking_shadow_->Stop();
     }
 
     StopHealthReporter();

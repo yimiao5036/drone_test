@@ -274,7 +274,9 @@ struct ControlIntent {
     float target_x = 0.f;        ///< 目标位置或速度分量（坐标系见 frame_id）
     float target_y = 0.f;
     float target_z = 0.f;
-    float yaw_deg = 0.f;
+    float yaw_deg = 0.f;         ///< 绝对航向（度，NED；位置式航向通道）
+    float yaw_rate_dps = 0.f;    ///< 偏航角速度指令（度/秒；速率式航向通道，
+                                 ///< 2026-09-23 视觉跟踪移植新增，默认 0=不使用）
     float max_speed_mps = 0.f;   ///< 速度限制；0=不限制
     uint32_t reason_code = 0;    ///< 产生原因编码（见 docs/数据接口文档.md 附录）
     uint64_t valid_until_ms = 0; ///< 有效期截止（单调时钟）

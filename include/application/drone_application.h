@@ -15,6 +15,9 @@ namespace drone::communication {
 class GroundStationLink;
 class Px4Link;
 }
+namespace drone::control {
+class VisualTrackingShadow;
+}
 namespace drone::perception {
 class TargetEstimator;
 class VisualTargetMonitor;
@@ -109,6 +112,7 @@ private:
     std::unique_ptr<video::StereoFrameSplitter> stereo_splitter_;
     std::unique_ptr<perception::YoloDetector> detector_;
     std::unique_ptr<perception::VisualTargetMonitor> visual_monitor_;
+    std::unique_ptr<control::VisualTrackingShadow> visual_tracking_shadow_;
     std::unique_ptr<video::FrameCompositor> compositor_;
     std::unique_ptr<video_transmission::VideoSender> video_sender_;
     std::unique_ptr<communication::Px4Link> px4_link_;

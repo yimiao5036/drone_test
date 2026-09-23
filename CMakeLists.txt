@@ -150,13 +150,18 @@ target_include_directories(drone_state_machine PUBLIC
 target_compile_features(drone_state_machine PUBLIC cxx_std_17)
 target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog)
 
-# ---- control 模块（飞行控制接口；库名加 _core 避免与可执行 drone_control 冲突） ----
+# ---- control 模块（飞行控制接口+视觉跟踪控制律；库名加 _core 避免与可执行 drone_control 冲突） ----
 add_library(drone_control_core STATIC
-    src/control/flight_controller.cpp)
+    src/control/flight_controller.cpp
+    src/control/line_of_sight.cpp
+    src/control/pid_controller.cpp
+    src/control/tracking_config.cpp
+    src/control/tracking_control_law.cpp
+    src/control/visual_tracking_shadow.cpp)
 target_include_directories(drone_control_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_control_core PUBLIC cxx_std_17)
-target_link_libraries(drone_control_core PRIVATE spdlog::spdlog)
+target_link_libraries(drone_control_core PUBLIC drone_common PRIVATE spdlog::spdlog)
 
 # ---- health 模块（健康管理接口） ----
 add_library(drone_health STATIC
@@ -175,6 +180,7 @@ target_compile_features(drone_config PUBLIC cxx_std_17)
 target_link_libraries(drone_config PUBLIC
     drone_common
     drone_communication
+    drone_control_core
     drone_video
     drone_perception
     drone_video_transmission)
@@ -188,6 +194,7 @@ target_compile_features(drone_application PUBLIC cxx_std_17)
 target_link_libraries(drone_application PUBLIC
     drone_config
     drone_communication
+    drone_control_core
     drone_video
     drone_perception
     drone_video_transmission
@@ -357,6 +364,28 @@ if(BUILD_TESTING)
         endif()
         include(GoogleTest)
         gtest_discover_tests(uvc_camera_receiver_test)
+
+        # 视觉跟踪控制律测试（自 visual_track_control 移植 + 内参/影子新增用例）
+        foreach(control_test IN ITEMS
+                line_of_sight_test
+                pid_controller_test
+                rate_limiter_test
+                staleness_checker_test
+                frame_transform_test
+                tracking_config_test
+                tracking_control_law_test
+                visual_tracking_shadow_test)
+            add_executable(${control_test} tests/control/${control_test}.cpp)
+            target_link_libraries(${control_test} PRIVATE
+                drone_common drone_control_core GTest::gtest_main)
+            if(MSVC)
+                target_compile_options(${control_test} PRIVATE /W4 /permissive-)
+            else()
+                target_compile_options(${control_test} PRIVATE -Wall -Wextra -Wpedantic)
+            endif()
+            include(GoogleTest)
+            gtest_discover_tests(${control_test})
+        endforeach()
 
         # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
         add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)

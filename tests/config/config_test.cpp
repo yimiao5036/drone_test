@@ -111,6 +111,59 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_FALSE(config.yolo.collect_npu_perf_detail);
     EXPECT_EQ(config.video_sender.encode.url,
               "rtsp://127.0.0.1:8554/drone_25_1");
+    // 视觉跟踪控制律（影子）：camera 组为 2026-09-23 左目标定实测内参
+    EXPECT_TRUE(config.runtime.enable_visual_tracking);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.fx_px, 1007.82);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.fy_px, 1008.02);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cx_px, 620.73);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cy_px, 532.07);
+    EXPECT_EQ(config.visual_tracking.camera.image_width, 1280);
+    EXPECT_EQ(config.visual_tracking.camera.image_height, 720);
+    EXPECT_TRUE(config.visual_tracking_shadow.virtual_attitude_when_absent);
+}
+
+TEST(ConfigTest, DefaultsVisualTrackingWhenSectionMissing) {
+    json value = ReadSourceConfig();
+    value.erase("visual_tracking");
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 段缺席回退默认值（即 2026-09-23 标定实测内参）
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.fx_px, 1007.82);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cy_px, 532.07);
+    EXPECT_EQ(config.visual_tracking.heading.mode,
+              drone::control::HeadingMode::kRate);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualTrackingHeadingMode) {
+    json value = ReadSourceConfig();
+    value["visual_tracking"]["heading"]["mode"] = "invalid";
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_mode_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsVisualTrackingPrincipalPointOutOfFrame) {
+    json value = ReadSourceConfig();
+    value["visual_tracking"]["camera"]["cy_px"] = 5000.0;  // 超出画面高 720
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_cy_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsVisualTrackingWithoutVisualMonitor) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_visual_monitor"] = false;
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_no_monitor.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
 }
 
 TEST(ConfigTest, DefaultsRgaDmaTransferToDisabledWhenFieldMissing) {
