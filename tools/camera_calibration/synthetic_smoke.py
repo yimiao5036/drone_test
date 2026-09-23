@@ -64,7 +64,10 @@ for idx, (rvec, tvec) in enumerate(poses):
     for name, img in (("left", left), ("right", right)):
         noise = rng.normal(0, 1.5, img.shape).astype(np.float32)
         img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(session / f"{name}_{idx:03d}.png"), img)
+        # imencode+write_bytes：Unicode 路径安全（cv2.imwrite 不支持非 ASCII 路径）
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        (session / f"{name}_{idx:03d}.png").write_bytes(buf.tobytes())
 
 meta = {
     "image_width_full": 2560, "image_height": 720, "fps": 30,

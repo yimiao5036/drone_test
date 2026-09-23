@@ -14,6 +14,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 import cv2
 
@@ -21,6 +22,18 @@ import cv2
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def SaveImageUnicode(path: Path, image) -> bool:
+    """Unicode 路径安全写图（cv2.imwrite 在 Windows 不支持非 ASCII 路径，静默失败）。"""
+    ok, buf = cv2.imencode(".png", image)
+    if not ok:
+        return False
+    try:
+        path.write_bytes(buf.tobytes())
+    except OSError:
+        return False
+    return path.is_file()
 
 
 def ParseArgs() -> argparse.Namespace:
@@ -60,7 +73,8 @@ def main() -> int:
         (args.cols, args.rows), args.square_mm / 1000.0, args.marker_mm / 1000.0,
         cv2.aruco.getPredefinedDictionary(dictionary_id))
     image = board.generateImage((out_w, out_h), marginSize=margin_px)
-    cv2.imwrite(args.out, image)
+    if not SaveImageUnicode(Path(args.out), image):
+        raise SystemExit(f"标定板写入失败：{args.out}")
 
     print(f"标定板已生成：{args.out}")
     print(f"  格子：{args.cols}x{args.rows}，边长 {args.square_mm}mm，"

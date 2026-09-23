@@ -34,6 +34,18 @@ if sys.platform == "win32":
 EYE_NAMES = ("left", "right")
 
 
+def SaveImageUnicode(path: Path, image: np.ndarray) -> bool:
+    """Unicode 路径安全写图（cv2.imwrite 在 Windows 不支持非 ASCII 路径，静默失败）。"""
+    ok, buf = cv2.imencode(".png", image)
+    if not ok:
+        return False
+    try:
+        path.write_bytes(buf.tobytes())
+    except OSError:
+        return False
+    return path.is_file()
+
+
 def ParseArgs() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="USB 双目 ChArUco 标定采集")
     parser.add_argument("--camera", type=int, default=0, help="摄像头设备序号")
@@ -212,9 +224,16 @@ def main() -> int:
             break
         if key == ord(" "):
             if all(counts[name] >= args.min_corners for name in EYE_NAMES):
-                for name in EYE_NAMES:
-                    cv2.imwrite(str(session_dir / f"{name}_{pair_count:03d}.png"),
-                                halves[name])
+                saved = all(
+                    SaveImageUnicode(session_dir / f"{name}_{pair_count:03d}.png",
+                                     halves[name])
+                    for name in EYE_NAMES)
+                if not saved:
+                    print(f"错误：图片写入失败（目录 {session_dir}），"
+                          "采集终止以避免白采")
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    raise SystemExit(3)
                 covered_cells |= CoverageCells(detections["left"][0], eye_w, eye_h)
                 pair_count += 1
                 print(f"已采 {pair_count} 对（L={counts['left']} "

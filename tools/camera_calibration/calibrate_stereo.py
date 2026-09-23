@@ -36,6 +36,29 @@ NOMINAL_BASELINE_M = 0.060   # 模组标称基线（规格书），仅作偏差�
 BASELINE_WARN_RATIO = 0.10
 
 
+def LoadImageUnicode(path: Path, flags=cv2.IMREAD_GRAYSCALE):
+    """Unicode 路径安全读图（cv2.imread 在 Windows 不支持非 ASCII 路径）。"""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
+
+
+def SaveImageUnicode(path: Path, image: np.ndarray) -> bool:
+    """Unicode 路径安全写图（cv2.imwrite 在 Windows 不支持非 ASCII 路径）。"""
+    ok, buf = cv2.imencode(".png", image)
+    if not ok:
+        return False
+    try:
+        path.write_bytes(buf.tobytes())
+    except OSError:
+        return False
+    return path.is_file()
+
+
 def ParseArgs() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="双目 ChArUco 离线立体标定")
     parser.add_argument("--session", default=None,
@@ -96,8 +119,8 @@ def DetectPairs(session: Path, pairs: list, detector, min_corners: int):
     for suffix, excluded in pairs:
         if excluded:
             continue
-        left = cv2.imread(str(session / f"left{suffix}.png"), cv2.IMREAD_GRAYSCALE)
-        right = cv2.imread(str(session / f"right{suffix}.png"), cv2.IMREAD_GRAYSCALE)
+        left = LoadImageUnicode(session / f"left{suffix}.png")
+        right = LoadImageUnicode(session / f"right{suffix}.png")
         if left is None or right is None:
             skipped += 1
             continue
@@ -214,15 +237,17 @@ def main() -> int:
     imgs = {}
     for eye, k, d, r, p in (("left", k_l, d_l, r1, p1),
                             ("right", k_r, d_r, r2, p2)):
-        img = cv2.imread(str(session / f"{eye}{suffix}.png"))
+        img = LoadImageUnicode(session / f"{eye}{suffix}.png", cv2.IMREAD_COLOR)
         map_x, map_y = cv2.initUndistortRectifyMap(k, d, r, p, image_size, cv2.CV_32FC1)
         imgs[eye] = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR)
     stacked = np.hstack([imgs["left"], imgs["right"]])
     for y in range(0, height, 40):
         cv2.line(stacked, (0, y), (2 * width, y), (0, 255, 0), 1)
     preview_path = session / "rectified_preview.png"
-    cv2.imwrite(str(preview_path), stacked)
-    print(f"校正预览（目视查同名点是否落在同一水平绿线）：{preview_path}")
+    if SaveImageUnicode(preview_path, stacked):
+        print(f"校正预览（目视查同名点是否落在同一水平绿线）：{preview_path}")
+    else:
+        print(f"警告：校正预览写入失败：{preview_path}")
 
     output = {
         "image_width": width,
