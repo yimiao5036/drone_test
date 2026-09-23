@@ -20,3 +20,5 @@ yolo_pt/pt_rknn.py
 stereo_probe_*/
 # 相机标定采集图片（体积大，不入库；calibration.json 也不入库，标定结果另行归档）
 tools/camera_calibration/captures/
+__pycache__/
+*.pyc
