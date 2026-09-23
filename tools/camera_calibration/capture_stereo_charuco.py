@@ -62,35 +62,80 @@ def BuildBoard(args: argparse.Namespace) -> cv2.aruco.CharucoBoard:
         cv2.aruco.getPredefinedDictionary(dictionary_id))
 
 
-def OpenCamera(args: argparse.Namespace) -> cv2.VideoCapture:
-    """按采集档位打开摄像头；失败时探测可用设备号后报错退出。"""
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-    if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        cap.set(cv2.CAP_PROP_FPS, args.fps)
-        ok, frame = cap.read()
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if ok and actual_w == args.width and actual_h == args.height:
-            return cap
-        print(f"摄像头 {args.camera} 档位设置失败：实际 {actual_w}x{actual_h}，"
-              f"要求 {args.width}x{args.height}")
-        cap.release()
-    else:
-        print(f"摄像头 {args.camera} 打不开")
+def TryOpenWithMode(index: int, backend: int, backend_name: str,
+                    width: int, height: int, fps: int, fourcc_first: bool):
+    """按指定后端与设置顺序打开并协商档位；成功返回 cap，否则 None。
 
-    # 探测可用设备号，帮助用户选 --camera
+    同一 UVC 相机在 DirectShow/Media Foundation 下、以及 fourcc 与分辨率
+    设置先后顺序不同，高分辨率 MJPG 模式的协商结果会不同，逐一尝试。
+    """
+    cap = cv2.VideoCapture(index, backend)
+    if not cap.isOpened():
+        return None
+    if fourcc_first:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    if not fourcc_first:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    ok, _ = cap.read()
+    actual = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+              int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    if ok and actual == (width, height):
+        print(f"档位协商成功：后端={backend_name} "
+          f"fourcc{'先' if fourcc_first else '后'}置")
+        return cap
+    cap.release()
+    return None
+
+
+def ProbeSupportedModes(index: int, backend: int) -> list:
+    """枚举常见档位，返回该后端下摄像头实际接受的 (宽, 高) 列表。"""
+    supported = []
+    cap = cv2.VideoCapture(index, backend)
+    if not cap.isOpened():
+        return supported
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    for w, h in [(3840, 1080), (2560, 720), (1920, 1080), (1280, 720), (640, 480)]:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        if (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))) == (w, h):
+            supported.append((w, h))
+    cap.release()
+    return supported
+
+
+def OpenCamera(args: argparse.Namespace) -> cv2.VideoCapture:
+    """多后端多顺序协商采集档位；全部失败时枚举实际支持档位后报错退出。"""
+    backends = [(cv2.CAP_DSHOW, "DSHOW"), (cv2.CAP_MSMF, "MSMF")]
+    for backend, name in backends:
+        for fourcc_first in (True, False):
+            cap = TryOpenWithMode(args.camera, backend, name,
+                                  args.width, args.height, args.fps, fourcc_first)
+            if cap is not None:
+                return cap
+
+    # 协商全部失败：报告各后端实际支持的档位与可用设备号，帮助定位
+    print(f"摄像头 {args.camera} 无法设置 {args.width}x{args.height}@{args.fps} MJPG")
+    for backend, name in backends:
+        modes = ProbeSupportedModes(args.camera, backend)
+        print(f"  后端 {name} 支持的档位："
+              f"{modes if modes else '打不开或无匹配'}")
     available = []
     for index in range(6):
+        if index == args.camera:
+            continue
         probe = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if probe.isOpened():
             ok, frame = probe.read()
             if ok and frame is not None:
                 available.append(f"{index}({frame.shape[1]}x{frame.shape[0]})")
         probe.release()
-    print(f"可用设备：{', '.join(available) if available else '未探测到任何摄像头'}")
+    print(f"  其他设备号：{', '.join(available) if available else '无'}")
+    print("  提示：若支持列表含 3840x1080，可改用 --width 3840 --height 1080 "
+          "采集（内参按分辨率比例换算，优先用生产档位 2560x720）")
     raise SystemExit(2)
 
 
