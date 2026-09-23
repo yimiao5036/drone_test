@@ -47,15 +47,15 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
    打开，幂等自清场（重试前释放半成品上下文）；日志对齐解码器模式——无 rkmpp 打 INFO
    属正常，rkmpp 存在但打开失败打 WARN。`AV_CODEC_FLAG_GLOBAL_HEADER` 使 SPS/PPS 进
    `extradata`。
-   - **rkmpp 私有选项**（AVDictionary，仅硬编分支；内部常量不进 config.json）：
+   - **rkmpp 码率控制**（仅硬编分支；内部常量不进 config.json）：
 
-     | 选项 | 值 | 说明 |
+     | 项 | 值 | 说明 |
      |------|-----|------|
-     | `rc_mode` | `VBR` | 动态码率模式 |
-     | `rc_max_rate` | `config.bitrate` | 峰值码率上限（bps） |
+     | `rc_mode`（AVDictionary 私有选项） | `VBR` | 动态码率模式 |
+     | `AVCodecContext::rc_max_rate`（字段直设） | `config.bitrate` | VBR 峰值码率上限（bps）。**勿走 dict**：同名键在 ffmpeg-rockchip 8.1 的 h264_rkmpp 上不被识别（2026-09-23 板上 WARN 实证） |
 
      open 后检查 dict 残留：未被编码器识别的选项打 WARN（启动期护栏，FFmpeg 版本/拼写
-     漂移立即可见）。libx264/265 路径不开选项（行为与旧版一致）。
+     漂移立即可见——上述 rc_max_rate 问题就是它抓到的）。libx264/265 路径不开选项（行为与旧版一致）。
 2. 输出格式：
    - **RTSP**：`avformat_alloc_output_context2(nullptr, "rtsp", url)`，
      `avformat_write_header` 内部建立网络会话；`rtsp_transport=tcp/udp`。

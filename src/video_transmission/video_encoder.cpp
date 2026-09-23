@@ -103,9 +103,10 @@ struct VideoEncoderImpl {
     ~VideoEncoderImpl() { Stop(); }
 
     /// 用指定编码器创建上下文并打开；失败时自清场（幂等）返回 false。
-    /// rkmpp 分支附带私有选项 rc_mode=VBR / rc_max_rate=码率（AVDictionary，
-    /// 属内部常量不进 config.json）；open 后检查 dict 残留，未识别选项打 WARN
-    /// （启动期护栏，版本/拼写漂移立即可见）。
+    /// rkmpp 分支：VBR 峰值码率走 AVCodecContext::rc_max_rate 字段直设（板上
+    /// 实测 h264_rkmpp 不消费同名 AVDictionary 键，WARN 护栏抓到的），
+    /// rc_mode=VBR 仍走 AVDictionary 私有选项；open 后检查 dict 残留，
+    /// 未识别选项打 WARN（启动期护栏，版本/拼写漂移立即可见）。
     bool TryOpenEncoder(const char* name, bool is_rkmpp) {
         if (codec_ctx_ != nullptr) {
             avcodec_free_context(&codec_ctx_);
@@ -124,6 +125,11 @@ struct VideoEncoderImpl {
         codec_ctx_->codec_id = encoder_->id;
         codec_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
         codec_ctx_->bit_rate = config.bitrate;
+        if (is_rkmpp) {
+            // VBR 峰值码率：字段直设（dict 键 rc_max_rate 在 ffmpeg-rockchip
+            // 8.1 的 h264_rkmpp 上不被识别，2026-09-23 板上 WARN 实证）
+            codec_ctx_->rc_max_rate = config.bitrate;
+        }
         codec_ctx_->width = static_cast<int>(config.width);
         codec_ctx_->height = static_cast<int>(config.height);
         codec_ctx_->time_base = AVRational{1, config.fps};
@@ -138,7 +144,6 @@ struct VideoEncoderImpl {
         AVDictionary* opts = nullptr;
         if (is_rkmpp) {
             av_dict_set(&opts, "rc_mode", "VBR", 0);
-            av_dict_set_int(&opts, "rc_max_rate", config.bitrate, 0);
         }
         const int open_ret = avcodec_open2(codec_ctx_, encoder_, &opts);
         if (opts != nullptr) {
