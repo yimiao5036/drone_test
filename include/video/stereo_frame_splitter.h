@@ -7,7 +7,8 @@
  * 左右两个 1280×720 NV12 帧，分别发布到左目/右目输出主题。
  *
  * 本轮（USB 双目接入 B 层）语义：
- * - 左目输出接现有 YOLO/叠加链路出图；右目输出仅统计，无订阅者。
+ * - 左目输出接现有 YOLO/叠加链路出图；右目输出默认仅统计，
+ *   runtime.enable_stereo_ranging=true 时接右目 YoloDetector（双目测距）。
  * - 左右目对应关系（2026-09-22 实证）：SBS 左半幅=物理右目、右半幅=物理左目；
  *   裁剪偏移已按此交换——左目输出取右半幅（x_offset=width/2），
  *   右目输出取左半幅（x_offset=0），Topic 语义与物理方位一致。
@@ -70,7 +71,7 @@ public:
     // ---- 输出 ----
     /// 左目输出主题（width/2 × height NV12）。
     common::Topic<FrameHandle>& LeftOutput();
-    /// 右目输出主题（本轮仅统计，无订阅者）。
+    /// 右目输出主题（仅统计；启用双目测距时接右目检测器）。
     common::Topic<FrameHandle>& RightOutput();
 
     // ---- 状态查询 ----

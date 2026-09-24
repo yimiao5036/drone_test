@@ -12,6 +12,7 @@
 #include "communication/px4_link.h"
 #include "control/visual_tracking_shadow.h"
 #include "perception/detection_backend.h"
+#include "perception/stereo_ranger.h"
 #include "perception/target_estimator.h"
 #include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
@@ -37,12 +38,13 @@ DroneApplication::DroneApplication(config::AppConfig config)
     : config_(std::move(config)) {
     BuildComponents();
     BindTopics();
-    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={} camera_source={} stereo_split={}",
+    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={} camera_source={} stereo_split={} stereo_ranging={}",
                 config_.runtime.enable_video, config_.runtime.enable_px4,
                 config_.runtime.enable_ground_station,
                 config_.runtime.enable_target_estimator,
                 config_.runtime.enable_control, config_.video_source.camera_source,
-                config_.video_source.stereo_split);
+                config_.video_source.stereo_split,
+                config_.runtime.enable_stereo_ranging);
 }
 
 DroneApplication::~DroneApplication() {
@@ -66,6 +68,14 @@ void DroneApplication::BuildComponents() {
                 std::make_unique<video::StereoFrameSplitter>(config_.stereo_splitter);
         }
         detector_ = std::make_unique<perception::YoloDetector>(config_.yolo);
+        // 双目测距（影子）：配置校验已保证 stereo_split 与视觉跟踪就位。
+        // 右目检测器与测距组件不注册新健康源（本轮设计决定，文档注明）。
+        if (config_.runtime.enable_stereo_ranging) {
+            detector_right_ =
+                std::make_unique<perception::YoloDetector>(config_.yolo_right);
+            stereo_ranger_ = std::make_unique<perception::StereoRanger>(
+                config_.stereo_ranger);
+        }
         compositor_ = std::make_unique<video::FrameCompositor>(config_.compositor);
         video_sender_ =
             std::make_unique<video_transmission::VideoSender>(config_.video_sender);
@@ -150,10 +160,20 @@ void DroneApplication::BindTopics() {
         decoder_->SetInput(camera_->StreamOutput());
         if (stereo_splitter_ != nullptr) {
             // 双目拆分链路：YOLO/叠加改消费拆分后左目（与 RTSP 解码帧同为
-            // 1280×720 NV12，下游无差异）；右目仅统计，无订阅者。
+            // 1280×720 NV12，下游无差异）；右目默认仅统计，启用双目测距时
+            // 接右目检测器。
             stereo_splitter_->SetInput(decoder_->FrameOutput());
             detector_->SetInput(stereo_splitter_->LeftOutput());
             compositor_->SetDecodedInput(stereo_splitter_->LeftOutput());
+            if (stereo_ranger_ != nullptr) {
+                // 右目检测消费拆分器右目输出；测距组件双订阅左右检测结果，
+                // 距离输出接视觉跟踪影子距离通道（影子，无真实控制）。
+                detector_right_->SetInput(stereo_splitter_->RightOutput());
+                stereo_ranger_->SetLeftInput(detector_->DetectionOutput());
+                stereo_ranger_->SetRightInput(detector_right_->DetectionOutput());
+                visual_tracking_shadow_->SetDistanceInput(
+                    stereo_ranger_->DistanceOutput());
+            }
         } else {
             detector_->SetInput(decoder_->FrameOutput());
             compositor_->SetDecodedInput(decoder_->FrameOutput());
@@ -233,6 +253,16 @@ bool DroneApplication::Start() {
         }
     }
 
+    // 双目测距是左右检测结果的消费者，必须先于检测器启动；纯影子，失败不阻断。
+    if (stereo_ranger_ != nullptr) {
+        if (!stereo_ranger_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序双目测距启动失败，距离通道影子不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
     if (video_sender_ != nullptr) {
         if (video_sender_->Start()) {
             any_started = true;
@@ -256,6 +286,20 @@ bool DroneApplication::Start() {
         } catch (const std::exception& error) {
             degraded = true;
             SPDLOG_ERROR("主程序YOLO启动异常: {}", error.what());
+        }
+        // 右目检测器与左目同款启动；仅双目测距开启时存在。
+        if (detector_right_ != nullptr) {
+            try {
+                if (!detector_right_->Start()) {
+                    degraded = true;
+                    SPDLOG_ERROR("主程序右目YOLO启动失败，双目测距降级");
+                } else {
+                    any_started = true;
+                }
+            } catch (const std::exception& error) {
+                degraded = true;
+                SPDLOG_ERROR("主程序右目YOLO启动异常: {}", error.what());
+            }
         }
         // 拆分器是解码器的消费者、YOLO/叠加的生产者：在二者之后、解码器之前启动。
         if (stereo_splitter_ != nullptr) {
@@ -460,8 +504,16 @@ void DroneApplication::Stop() {
             stereo_splitter_->Stop();
         }
         detector_->Stop();
+        if (detector_right_ != nullptr) {
+            detector_right_->Stop();
+        }
         compositor_->Stop();
         video_sender_->Stop();
+    }
+
+    // 检测生产者已停止，再停止测距消费者。
+    if (stereo_ranger_ != nullptr) {
+        stereo_ranger_->Stop();
     }
 
     // 视频生产者已停止，再停止其观测消费者。
