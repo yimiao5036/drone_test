@@ -90,6 +90,7 @@ public:
     /// @param matcher 为空时使用 GreedyStereoMatcher 默认实现
     explicit StereoRangerCore(StereoRangerConfig config,
                               std::shared_ptr<const IStereoMatcher> matcher = {});
+    ~StereoRangerCore();  // 源文件默认实现（PIMPL 完整类型要求）
 
     /// 处理一对已时间配准的左右帧检测结果；每个左目目标恰好输出一条
     /// （未匹配目标 valid=false、距离字段 NaN、方位字段取左目）。
