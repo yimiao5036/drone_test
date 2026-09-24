@@ -470,6 +470,125 @@ TEST(ConfigTest, RejectsNegativeHealthTimeout) {
     std::filesystem::remove(path);
 }
 
+TEST(ConfigTest, StereoRangerDefaultsWhenSectionAbsent) {
+    json value = ReadSourceConfig();
+    value.erase("stereo_ranger");
+    value.erase("yolo_right");
+    value["runtime"].erase("enable_stereo_ranging");
+    const auto path = WriteTemporaryConfig(value, "drone_config_stereo_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 段缺席回退默认值（即 2026-09-23 标定实测内参/基线）
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.baseline_m, 0.060085);
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.cx_right_px, 674.76);
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.distance_max_m, 11.0);
+    EXPECT_FALSE(config.runtime.enable_stereo_ranging);
+    // yolo_right 段缺席时默认继承 yolo 全部值
+    EXPECT_EQ(config.yolo_right.model_path, config.yolo.model_path);
+    EXPECT_EQ(config.yolo_right.npu_core_mode, config.yolo.npu_core_mode);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, StereoRangingRequiresUvcSplitAndVisualTracking) {
+    // 依赖链：enable_video + camera_source=uvc + stereo_split + 视觉跟踪影子，
+    // 任一环节缺失都必须拒绝。
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = true;
+        value["video"]["stereo_split"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_no_split.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = true;
+        value["video"]["camera_source"] = "rtsp";
+        value["video"]["stereo_split"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_rtsp.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = true;
+        value["runtime"]["enable_visual_tracking"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_no_tracking.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, YoloRightOverridesOnlySpecifiedFields) {
+    json value = ReadSourceConfig();
+    value["yolo_right"] = json::object({{"npu_core_mode", "core01"}});
+    const auto path = WriteTemporaryConfig(value, "drone_config_yolo_right.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 仅覆盖 npu_core_mode，其余字段全部继承左目 yolo
+    EXPECT_EQ(config.yolo_right.npu_core_mode, "core01");
+    EXPECT_EQ(config.yolo.npu_core_mode, "all");
+    EXPECT_EQ(config.yolo_right.model_path, config.yolo.model_path);
+    EXPECT_FLOAT_EQ(config.yolo_right.conf_threshold, config.yolo.conf_threshold);
+    EXPECT_FLOAT_EQ(config.yolo_right.nms_threshold, config.yolo.nms_threshold);
+    EXPECT_EQ(config.yolo_right.input_queue_capacity,
+              config.yolo.input_queue_capacity);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidYoloRightNpuCoreMode) {
+    json value = ReadSourceConfig();
+    value["yolo_right"] = json::object({{"npu_core_mode", "invalid"}});
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_yolo_right_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, StereoRangerRejectsInvalidValues) {
+    {
+        json value = ReadSourceConfig();
+        value["stereo_ranger"]["disparity_min_px"] = 0.0;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_disparity_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["stereo_ranger"]["distance_min_m"] = 11.0;
+        value["stereo_ranger"]["distance_max_m"] = 11.0;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_range_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, VisualTrackingStaleFieldsAreParsed) {
+    // 回归：visual_stale_ms/distance_stale_ms/attitude_stale_ms 此前在
+    // config.json 声明但 config.cpp 未解析，静默失效。
+    json value = ReadSourceConfig();
+    value["visual_tracking"]["control"]["distance_stale_ms"] = 250;
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_stale.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.visual_tracking.control.distance_stale_ms, 250);
+    EXPECT_EQ(config.visual_tracking.control.visual_stale_ms, 200);
+    EXPECT_EQ(config.visual_tracking.control.attitude_stale_ms, 300);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_video"] = false;

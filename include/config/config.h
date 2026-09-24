@@ -10,6 +10,7 @@
 #include "communication/px4_link.h"
 #include "control/tracking_config.h"
 #include "control/visual_tracking_shadow.h"
+#include "perception/stereo_ranger_core.h"
 #include "perception/target_estimator.h"
 #include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
@@ -34,6 +35,7 @@ struct RuntimeConfig {
     bool enable_target_estimator = false;
     bool enable_visual_monitor = false;
     bool enable_visual_tracking = false;  ///< 视觉跟踪控制律影子（kControlIntent 无消费者）
+    bool enable_stereo_ranging = false;  ///< 双目测距影子（依赖 uvc+stereo_split+视觉跟踪）
     bool enable_control = false;
 };
 
@@ -65,6 +67,7 @@ struct AppConfig {
     video::VideoDecoderConfig decoder;
     video::StereoFrameSplitterConfig stereo_splitter;
     perception::YoloDetectorConfig yolo;
+    perception::YoloDetectorConfig yolo_right;     ///< 右目检测实例（默认继承 yolo）
     video::CompositorConfig compositor;
     video_transmission::VideoSenderConfig video_sender;
     communication::Px4LinkConfig px4;
@@ -73,6 +76,7 @@ struct AppConfig {
     perception::VisualTargetMonitorConfig visual_monitor;
     control::TrackingConfig visual_tracking;              ///< 视觉跟踪控制律（含标定内参）
     control::VisualTrackingShadowConfig visual_tracking_shadow;
+    perception::StereoRangerConfig stereo_ranger;  ///< 双目测距（默认值即标定实测）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

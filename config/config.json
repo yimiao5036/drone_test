@@ -10,7 +10,8 @@
         "enable_target_estimator": true,
         "enable_visual_monitor": true,
         "enable_control": false,
-        "enable_visual_tracking": true
+        "enable_visual_tracking": true,
+        "enable_stereo_ranging": false
     },
     "health": {
         "cpu_sample_period_ms": 1000,
@@ -246,5 +247,30 @@
             "virtual_attitude_when_absent": true,
             "summary_log_interval_ms": 10000
         }
+    },
+    "stereo_ranger": {
+        "_comment": "双目测距 v1.0（影子）。内参/基线为 2026-09-23 标定实测（camera_calibration_uvc_1280x720.json）；tau_y_px 为初值待板上回填",
+        "baseline_m": 0.060085,
+        "fx_left_px": 1007.82,
+        "fy_left_px": 1008.02,
+        "cx_left_px": 620.73,
+        "cy_left_px": 532.07,
+        "fx_right_px": 1006.59,
+        "fy_right_px": 1006.07,
+        "cx_right_px": 674.76,
+        "cy_right_px": 526.7,
+        "disparity_min_px": 3.0,
+        "distance_min_m": 1.0,
+        "distance_max_m": 11.0,
+        "tau_y_px": 2.0,
+        "tau_h_ratio": 0.25,
+        "smooth_alpha": 0.3,
+        "jump_reset_m": 5.0,
+        "pair_window_ms": 20,
+        "summary_log_interval_ms": 10000
+    },
+    "yolo_right": {
+        "_comment": "右目检测实例；缺省字段全部继承 yolo 段，仅 npu_core_mode 独立（绑核 vs all 板上实测定案）",
+        "npu_core_mode": "all"
     }
 }

@@ -424,6 +424,8 @@ AppConfig LoadAppConfig(const std::string& path,
         runtime.value("enable_visual_monitor", false);
     config.runtime.enable_visual_tracking =
         runtime.value("enable_visual_tracking", false);
+    config.runtime.enable_stereo_ranging =
+        runtime.value("enable_stereo_ranging", false);
     config.runtime.enable_control = runtime.value("enable_control", false);
     if (!config.runtime.enable_video && !config.runtime.enable_px4 &&
         !config.runtime.enable_ground_station) {
@@ -538,6 +540,50 @@ AppConfig LoadAppConfig(const std::string& path,
                                          config.visual_monitor.status_log_interval);
     config.visual_monitor.Validate();
 
+    // 双目测距（影子）：全部字段可选，默认值即 2026-09-23 标定实测。
+    const json stereo_ranger = root.value("stereo_ranger", json::object());
+    config.stereo_ranger.baseline_m = ReadOptionalPositiveDouble(
+        stereo_ranger, "baseline_m", config.stereo_ranger.baseline_m);
+    config.stereo_ranger.fx_left_px =
+        stereo_ranger.value("fx_left_px", config.stereo_ranger.fx_left_px);
+    config.stereo_ranger.fy_left_px =
+        stereo_ranger.value("fy_left_px", config.stereo_ranger.fy_left_px);
+    config.stereo_ranger.cx_left_px =
+        stereo_ranger.value("cx_left_px", config.stereo_ranger.cx_left_px);
+    config.stereo_ranger.cy_left_px =
+        stereo_ranger.value("cy_left_px", config.stereo_ranger.cy_left_px);
+    config.stereo_ranger.fx_right_px =
+        stereo_ranger.value("fx_right_px", config.stereo_ranger.fx_right_px);
+    config.stereo_ranger.fy_right_px =
+        stereo_ranger.value("fy_right_px", config.stereo_ranger.fy_right_px);
+    config.stereo_ranger.cx_right_px =
+        stereo_ranger.value("cx_right_px", config.stereo_ranger.cx_right_px);
+    config.stereo_ranger.cy_right_px =
+        stereo_ranger.value("cy_right_px", config.stereo_ranger.cy_right_px);
+    config.stereo_ranger.disparity_min_px = ReadOptionalPositiveDouble(
+        stereo_ranger, "disparity_min_px", config.stereo_ranger.disparity_min_px);
+    config.stereo_ranger.distance_min_m = ReadOptionalPositiveDouble(
+        stereo_ranger, "distance_min_m", config.stereo_ranger.distance_min_m);
+    config.stereo_ranger.distance_max_m = ReadOptionalPositiveDouble(
+        stereo_ranger, "distance_max_m", config.stereo_ranger.distance_max_m);
+    config.stereo_ranger.tau_y_px = ReadOptionalPositiveDouble(
+        stereo_ranger, "tau_y_px", config.stereo_ranger.tau_y_px);
+    config.stereo_ranger.tau_h_ratio = ReadOptionalPositiveDouble(
+        stereo_ranger, "tau_h_ratio", config.stereo_ranger.tau_h_ratio);
+    config.stereo_ranger.smooth_alpha = ReadOptionalPositiveDouble(
+        stereo_ranger, "smooth_alpha", config.stereo_ranger.smooth_alpha);
+    config.stereo_ranger.jump_reset_m = ReadOptionalPositiveDouble(
+        stereo_ranger, "jump_reset_m", config.stereo_ranger.jump_reset_m);
+    config.stereo_ranger.input_queue_capacity = ReadOptionalPositiveSize(
+        stereo_ranger, "input_queue_capacity",
+        config.stereo_ranger.input_queue_capacity);
+    config.stereo_ranger.pair_window = ReadOptionalPositiveMilliseconds(
+        stereo_ranger, "pair_window_ms", config.stereo_ranger.pair_window);
+    config.stereo_ranger.summary_log_interval = ReadOptionalPositiveMilliseconds(
+        stereo_ranger, "summary_log_interval_ms",
+        config.stereo_ranger.summary_log_interval);
+    config.stereo_ranger.Validate();
+
     // 视觉跟踪控制律（影子）：全部字段可选，缺席用默认值（camera 组默认值即
     // 2026-09-23 标定实测）；Validate 做跨字段校验。
     const json visual_tracking = root.value("visual_tracking", json::object());
@@ -545,6 +591,15 @@ AppConfig LoadAppConfig(const std::string& path,
         const json control = visual_tracking.value("control", json::object());
         config.visual_tracking.control.frequency_hz = ReadOptionalPositiveDouble(
             control, "frequency_hz", config.visual_tracking.control.frequency_hz);
+        config.visual_tracking.control.visual_stale_ms = ReadOptionalPositiveInt(
+            control, "visual_stale_ms",
+            static_cast<int>(config.visual_tracking.control.visual_stale_ms));
+        config.visual_tracking.control.distance_stale_ms = ReadOptionalPositiveInt(
+            control, "distance_stale_ms",
+            static_cast<int>(config.visual_tracking.control.distance_stale_ms));
+        config.visual_tracking.control.attitude_stale_ms = ReadOptionalPositiveInt(
+            control, "attitude_stale_ms",
+            static_cast<int>(config.visual_tracking.control.attitude_stale_ms));
         const json camera = visual_tracking.value("camera", json::object());
         config.visual_tracking.camera.image_width = ReadOptionalPositiveInt(
             camera, "image_width", config.visual_tracking.camera.image_width);
@@ -690,6 +745,17 @@ AppConfig LoadAppConfig(const std::string& path,
         config.decoder.height = config.uvc_camera.height;
     }
 
+    // 双目测距依赖链：右目帧来自 uvc 拆分，距离消费者是视觉跟踪影子。
+    if (config.runtime.enable_stereo_ranging &&
+        (!config.runtime.enable_video ||
+         config.video_source.camera_source != "uvc" ||
+         !config.video_source.stereo_split ||
+         !config.runtime.enable_visual_tracking)) {
+        throw std::invalid_argument(
+            "enable_stereo_ranging=true时必须启用视频链路、camera_source=uvc、"
+            "stereo_split=true且启用视觉跟踪影子");
+    }
+
     config.camera.rtsp_url = video.value(
         "input_rtsp", std::string("rtsp://192.168.1.100:8554/live"));
     config.camera.rtsp_transport = video.value("rtsp_transport", std::string("tcp"));
@@ -726,6 +792,36 @@ AppConfig LoadAppConfig(const std::string& path,
         config.yolo.npu_core_mode != "all") {
         throw std::invalid_argument(
             "yolo.npu_core_mode仅支持auto/core0/core01/core012/all");
+    }
+
+    // 右目检测实例：默认继承 yolo 全部值，yolo_right 段仅覆盖差异字段
+    // （设计 §4：npu_core_mode 独立，绑核 vs all 板上实测定案）。
+    config.yolo_right = config.yolo;
+    const json yolo_right = root.value("yolo_right", json::object());
+    if (yolo_right.contains("model_path")) {
+        config.yolo_right.model_path = ResolveAssetPath(
+            yolo_right.value("model_path", std::string{}), executable_directory);
+    }
+    config.yolo_right.conf_threshold =
+        yolo_right.value("conf_threshold", config.yolo_right.conf_threshold);
+    config.yolo_right.nms_threshold =
+        yolo_right.value("nms_threshold", config.yolo_right.nms_threshold);
+    config.yolo_right.input_queue_capacity = static_cast<std::size_t>(
+        yolo_right.value("input_queue_capacity",
+                         config.yolo_right.input_queue_capacity));
+    config.yolo_right.npu_core_mode =
+        yolo_right.value("npu_core_mode", config.yolo_right.npu_core_mode);
+    config.yolo_right.collect_npu_internal_perf = yolo_right.value(
+        "collect_npu_internal_perf", config.yolo_right.collect_npu_internal_perf);
+    config.yolo_right.collect_npu_perf_detail = yolo_right.value(
+        "collect_npu_perf_detail", config.yolo_right.collect_npu_perf_detail);
+    if (config.yolo_right.npu_core_mode != "auto" &&
+        config.yolo_right.npu_core_mode != "core0" &&
+        config.yolo_right.npu_core_mode != "core01" &&
+        config.yolo_right.npu_core_mode != "core012" &&
+        config.yolo_right.npu_core_mode != "all") {
+        throw std::invalid_argument(
+            "yolo_right.npu_core_mode仅支持auto/core0/core01/core012/all");
     }
 
     config.compositor.pool_capacity = static_cast<std::size_t>(
