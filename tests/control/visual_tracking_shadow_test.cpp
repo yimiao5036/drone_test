@@ -20,6 +20,7 @@ namespace {
 using drone::common::ControlIntent;
 using drone::common::ControlIntentType;
 using drone::common::FlightStateSnapshot;
+using drone::common::StereoTargetDistance;
 using drone::common::Topic;
 using drone::common::VisualTargetState;
 using drone::common::VisualTargetStatus;
@@ -63,6 +64,15 @@ void PublishStatus(Topic<VisualTargetStatus>& topic, VisualTargetState state,
     (void)topic.Publish(std::move(status));
 }
 
+void PublishDistance(Topic<StereoTargetDistance>& topic, bool valid,
+                     float forward_m) {
+    auto distance = std::make_shared<StereoTargetDistance>();
+    distance->valid = valid;
+    distance->forward_distance_m = forward_m;
+    distance->header.receive_time_ms = static_cast<std::uint64_t>(NowMs());
+    (void)topic.Publish(std::move(distance));
+}
+
 /// 轮询等待条件成立（最长 2s）。
 template <typename F>
 bool WaitFor(F&& pred) {
@@ -102,6 +112,7 @@ protected:
 
     Topic<VisualTargetStatus> status_topic_;
     Topic<FlightStateSnapshot> flight_topic_;
+    Topic<StereoTargetDistance> distance_topic_;
     std::unique_ptr<VisualTrackingShadow> shadow_;
     Topic<ControlIntent>::Subscription intent_sub_;
 };
@@ -229,6 +240,71 @@ TEST_F(VisualTrackingShadowTest, AcquiringIsNotTracked) {
         return intent.has_value() &&
                intent->type == ControlIntentType::kBrakeHover;
     }));
+}
+
+// 双目测距 v1.0 Task 4：距离通道接通
+// NoDistanceInputKeepsLegacyBehavior 已由 LockedStateProducesVelocityHeadingIntent
+// 覆盖（未接距离输入时 vx=0.5 定速接近），不再重复用例。
+
+TEST_F(VisualTrackingShadowTest, ValidDistanceDrivesDistancePid) {
+    // 显式 PID 与宽加速度限幅排除积分/压摆干扰；d_exp=10 默认
+    auto tracking = MakeTrackingConfig();
+    tracking.distance.kp = 0.5;
+    tracking.distance.ki = 0.0;
+    tracking.distance.kd = 0.0;
+    tracking.accel_limit.ax_mps2 = 100.0;
+    shadow_ = std::make_unique<VisualTrackingShadow>(tracking, MakeShadowConfig());
+    shadow_->SetVisualInput(status_topic_);
+    shadow_->SetDistanceInput(distance_topic_);
+    auto sub = shadow_->IntentOutput().Subscribe(64);
+    intent_sub_ = std::move(sub);
+    ASSERT_TRUE(shadow_->Start());
+
+    // 持续发布 LOCKED 状态（fresh）与 valid 距离 15m（>d_exp=10 → 接近），
+    // 跑约 500ms 等加速度爬坡收敛后取最新意图
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        PublishStatus(status_topic_, VisualTargetState::kLocked);
+        PublishDistance(distance_topic_, true, 15.f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto found = TakeLatestIntent();
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->type, ControlIntentType::kVelocityHeading);
+    EXPECT_EQ(found->reason_code, 100u);
+    // Δd=15−10=5 → vx=kp·5=2.5（小于接近限幅 3），不是 0.5 定速接近
+    EXPECT_NEAR(found->target_x, 2.5, 0.2);
+    EXPECT_NE(found->target_x, 0.5f);
+}
+
+TEST_F(VisualTrackingShadowTest, InvalidDistanceFallsBackToSlowApproach) {
+    auto tracking = MakeTrackingConfig();
+    tracking.distance.kp = 0.5;
+    tracking.distance.ki = 0.0;
+    tracking.distance.kd = 0.0;
+    tracking.accel_limit.ax_mps2 = 100.0;
+    shadow_ = std::make_unique<VisualTrackingShadow>(tracking, MakeShadowConfig());
+    shadow_->SetVisualInput(status_topic_);
+    shadow_->SetDistanceInput(distance_topic_);
+    auto sub = shadow_->IntentOutput().Subscribe(64);
+    intent_sub_ = std::move(sub);
+    ASSERT_TRUE(shadow_->Start());
+
+    // 距离 valid=false → distance_valid 不透传 → no_distance_action=
+    // kSlowApproach → vx = no_distance_approach_limit_mps = 0.5
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        PublishStatus(status_topic_, VisualTargetState::kLocked);
+        PublishDistance(distance_topic_, false, 15.f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto found = TakeLatestIntent();
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->type, ControlIntentType::kVelocityHeading);
+    EXPECT_EQ(found->reason_code, 100u);
+    EXPECT_NEAR(found->target_x, 0.5, 0.1);
 }
 
 }  // namespace

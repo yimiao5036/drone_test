@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -70,6 +71,8 @@ struct VisualTrackingShadow::Impl {
     common::Topic<common::VisualTargetStatus>::Subscription visual_sub;
     common::Topic<common::FlightStateSnapshot>* flight_topic = nullptr;
     common::Topic<common::FlightStateSnapshot>::Subscription flight_sub;
+    common::Topic<common::StereoTargetDistance>* distance_topic = nullptr;
+    common::Topic<common::StereoTargetDistance>::Subscription distance_sub;
     common::Topic<common::ControlIntent> intent_output;
 
     std::atomic<bool> running{false};
@@ -84,6 +87,8 @@ struct VisualTrackingShadow::Impl {
     bool has_status = false;
     common::FlightStateSnapshot last_flight;
     bool has_flight = false;
+    common::StereoTargetDistance last_distance;
+    bool has_distance = false;
     bool virtual_attitude_logged = false;  // 虚拟姿态启用只提示一次
 
     /// 排空订阅队列取最新消息（容量 1 + 丢最旧，语义上只需最新）。
@@ -108,9 +113,16 @@ struct VisualTrackingShadow::Impl {
             snapshot.track_time_ms =
                 static_cast<std::int64_t>(last_status.header.receive_time_ms);
         }
-        // 距离：双目测距未实现，恒无效（走配置的 no_distance_action 支路）
+        // 距离：双目测距影子输入（可选）；有效则透传，超龄判定由控制律执行
         snapshot.distance_valid = false;
         snapshot.distance_time_ms = 0;
+        if (has_distance && last_distance.valid &&
+            last_distance.header.receive_time_ms > 0) {
+            snapshot.target_distance_m = last_distance.forward_distance_m;
+            snapshot.distance_valid = true;
+            snapshot.distance_time_ms =
+                static_cast<std::int64_t>(last_distance.header.receive_time_ms);
+        }
         // 姿态：真实优先；缺失/超龄且配置允许时零姿态兜底（仅供观察）
         const bool attitude_fresh =
             has_flight && last_flight.attitude_valid &&
@@ -207,6 +219,8 @@ struct VisualTrackingShadow::Impl {
 
             DrainLatest(visual_sub, last_status, has_status);
             DrainLatest(flight_sub, last_flight, has_flight);
+            // 未接线时 distance_sub 为空 Subscription，TryTake 恒 nullopt，安全
+            DrainLatest(distance_sub, last_distance, has_distance);
 
             const ControlSnapshot snapshot = BuildSnapshot(now_ms);
             last_out = law.Update(snapshot, now_ms);
@@ -219,12 +233,19 @@ struct VisualTrackingShadow::Impl {
 
             if (now_ms - last_summary_ms >= shadow_config.summary_log_interval.count()) {
                 last_summary_ms = now_ms;
+                char distance_buf[32];
+                if (has_distance && last_distance.valid) {
+                    std::snprintf(distance_buf, sizeof(distance_buf), "%.2fm(有效=1)",
+                                  static_cast<double>(last_distance.forward_distance_m));
+                } else {
+                    std::snprintf(distance_buf, sizeof(distance_buf), "--(有效=0)");
+                }
                 SPDLOG_INFO("视觉跟踪影子摘要: 模式={} 有效={} vx={:.2f} vy={:.2f} "
-                            "vz={:.2f} yaw_rate={:.1f}dps coast={} 虚拟姿态={}",
+                            "vz={:.2f} yaw_rate={:.1f}dps coast={} 虚拟姿态={} 距离={}",
                             ModeName(last_out.mode), last_out.valid,
                             last_out.vx_mps, last_out.vy_mps, last_out.vz_mps,
                             last_out.yaw_rate_dps, last_out.coast_active,
-                            last_virtual_attitude.load());
+                            last_virtual_attitude.load(), distance_buf);
             }
 
             std::this_thread::sleep_until(next_tick);
@@ -262,12 +283,17 @@ bool VisualTrackingShadow::Start() {
         impl_->flight_sub = impl_->flight_topic->Subscribe(
             1, common::Topic<common::FlightStateSnapshot>::OverflowPolicy::kDropOldest);
     }
+    if (impl_->distance_topic != nullptr) {
+        impl_->distance_sub = impl_->distance_topic->Subscribe(
+            1, common::Topic<common::StereoTargetDistance>::OverflowPolicy::kDropOldest);
+    }
     impl_->running.store(true);
     impl_->thread = std::thread([this] { impl_->Run(); });
-    SPDLOG_INFO("视觉跟踪影子启动: 频率={}Hz 虚拟姿态={} 姿态输入={}",
+    SPDLOG_INFO("视觉跟踪影子启动: 频率={}Hz 虚拟姿态={} 姿态输入={} 距离输入={}",
                 impl_->tracking_config.control.frequency_hz,
                 impl_->shadow_config.virtual_attitude_when_absent,
-                impl_->flight_topic != nullptr);
+                impl_->flight_topic != nullptr,
+                impl_->distance_topic != nullptr);
     return true;
 }
 
@@ -293,6 +319,11 @@ void VisualTrackingShadow::SetVisualInput(
 void VisualTrackingShadow::SetFlightInput(
     common::Topic<common::FlightStateSnapshot>& input) {
     impl_->flight_topic = &input;
+}
+
+void VisualTrackingShadow::SetDistanceInput(
+    common::Topic<common::StereoTargetDistance>& input) {
+    impl_->distance_topic = &input;
 }
 
 common::Topic<common::ControlIntent>& VisualTrackingShadow::IntentOutput() {

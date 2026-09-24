@@ -12,8 +12,10 @@
 //   消费者，enable_control=false 基线不动，不产生任何真实控制输出。
 //
 // 边界：
-//   - 双目测距未实现：distance_valid 恒 false（距离通道走配置的
-//     no_distance_action 支路，默认 kSlowApproach）；
+//   - 双目测距（可选输入 kStereoTargetDistance）：最新一条 valid 且
+//     receive_time_ms>0 → distance_valid=true 并填 target_distance_m；
+//     否则维持 no_distance_action 支路（超龄判定由控制律按
+//     control.distance_stale_ms 执行，影子只透传）；
 //   - 现场无 PX4 时姿态缺失：virtual_attitude_when_absent=true（默认）用
 //     零姿态继续计算（仅供观察控制律行为，日志明确标注）；false 时保持
 //     真实语义（姿态缺失每拍降级保持）；
@@ -30,9 +32,9 @@
 // kDegradedHold→kNone。
 //
 // 数据流：
-//   Topic<VisualTargetStatus> ─┐
-//                              ├─► VisualTrackingShadow ──► Topic<ControlIntent>
-//   Topic<FlightStateSnapshot>─┘   （20Hz 固定节拍）
+//   Topic<VisualTargetStatus> ──┐
+//   Topic<FlightStateSnapshot>──┼─► VisualTrackingShadow ──► Topic<ControlIntent>
+//   Topic<StereoTargetDistance>─┘   （20Hz 固定节拍）
 //
 // 线程模型：独立节拍线程（固定周期，不等待消息被动触发，§7.1）。
 // Stop() 置停止标志后 join；Start/Stop 幂等。
@@ -81,6 +83,8 @@ public:
     void SetVisualInput(common::Topic<common::VisualTargetStatus>& input);
     /// 飞行姿态输入（可选；未接线时按姿态缺失处理，由虚拟姿态配置兜底）。
     void SetFlightInput(common::Topic<common::FlightStateSnapshot>& input);
+    /// 双目测距距离输入（可选，kStereoTargetDistance；未接线时距离恒无效）。
+    void SetDistanceInput(common::Topic<common::StereoTargetDistance>& input);
 
     // ---- 输出 ----
     common::Topic<common::ControlIntent>& IntentOutput();
