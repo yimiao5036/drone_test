@@ -374,7 +374,7 @@ namespace topics {
 inline constexpr char kCameraStream[] = "camera_stream";      ///< EncodedFrame
 inline constexpr char kDecodedFrame[] = "decoded_frame";      ///< video::FrameHandle
 inline constexpr char kDecodedFrameLeft[] = "decoded_frame_left";    ///< video::FrameHandle（双目拆分左目）
-inline constexpr char kDecodedFrameRight[] = "decoded_frame_right";  ///< video::FrameHandle（双目拆分右目，仅统计）
+inline constexpr char kDecodedFrameRight[] = "decoded_frame_right";  ///< video::FrameHandle（双目拆分右目，仅统计；启用双目测距时接右目检测器）
 inline constexpr char kDetection[] = "detection";             ///< DetectionResult
 inline constexpr char kDetectionRight[] = "detection_right";  ///< DetectionResult（双目右目）
 inline constexpr char kStereoTargetDistance[] = "stereo_target_distance";  ///< StereoTargetDistance

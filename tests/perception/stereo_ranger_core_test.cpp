@@ -1,6 +1,7 @@
 #include "perception/stereo_ranger_core.h"
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include <gtest/gtest.h>

@@ -127,7 +127,7 @@ std::vector<StereoMatch> GreedyStereoMatcher::Match(
     return result;
 }
 
-// ---- StereoRangerCore：本任务只建骨架（Process 在 Task 2 实现） ----
+// ---- StereoRangerCore 实现 ----
 
 struct StereoRangerCore::Impl {
     Impl(StereoRangerConfig cfg, std::shared_ptr<const IStereoMatcher> m)

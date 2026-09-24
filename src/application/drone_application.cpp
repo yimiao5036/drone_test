@@ -298,7 +298,7 @@ bool DroneApplication::Start() {
                 }
             } catch (const std::exception& error) {
                 degraded = true;
-                SPDLOG_ERROR("主程序右目YOLO启动异常: {}", error.what());
+                SPDLOG_ERROR("主程序右目YOLO启动异常: {}，双目测距降级", error.what());
             }
         }
         // 拆分器是解码器的消费者、YOLO/叠加的生产者：在二者之后、解码器之前启动。

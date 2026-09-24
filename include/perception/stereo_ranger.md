@@ -93,9 +93,12 @@ config.cpp 校验）。
 
 - **去主点视差（v1.0 最大的坑）**：两目主点 cx 实测差约 54px
   （左 620.73 / 右 674.76），直接用框 x 坐标差算视差会在近距出现符号反转。
-  实现按去主点视差 `D_norm = (xL − cx_left) − (xR − cx_right)`，再按左右目
-  焦距差异归一化折算回左目像素视差，三角测量 `Z = F·B / D_norm`，
-  实测 `F·B ≈ 1007.82 × 0.060085 ≈ 60.57`。有专门的近距符号回归用例
+  实现先做焦距归一化 `uL = (xL − cx_left)/fx_left`、
+  `uR = (xR − cx_right)/fx_right`（uL/uR 无量纲），取归一化视差
+  `D_norm = uL − uR`，三角测量 `Z = B / D_norm`（B = baseline_m）。
+  折算左目像素视差 `D_px = D_norm·fx_left`（消息 `disparity_px` 字段即此值），
+  等价写法 `Z = fx_left·B / D_px`，实测 `fx_left·B ≈ 1007.82 × 0.060085 ≈ 60.57`。
+  有专门的近距符号回归用例
   （`NearDistanceSignRegression_PrincipalPointGap54px`）。
 - **贪心匹配**（设计 §3.2 原样）：硬约束——类别一致；|Δy|（去 cy）≤
   `tau_y_px`；去主点视差对应距离在 `[distance_min_m, distance_max_m]`；
@@ -120,8 +123,9 @@ config.cpp 校验）。
 - **装配**（`DroneApplication`）：`enable_stereo_ranging=true` 时创建右目
   YoloDetector（订阅 `kDecodedFrameRight`）与 StereoRanger（左输入接左目
   `DetectionOutput()`，右输入接右目 `DetectionOutput()`），`DistanceOutput()`
-  接 `VisualTrackingShadow::SetDistanceInput()`；右目检测器接入既有 YOLO
-  健康上报，StereoRanger 不注册新健康源。
+  接 `VisualTrackingShadow::SetDistanceInput()`；右目检测器不接入健康上报
+  （本轮设计决定），右目链路降级经 StereoRanger 摘要的配对率/有效域占比
+  可观测；StereoRanger 不注册新健康源。
 
 ## 日志行为
 
@@ -132,6 +136,10 @@ config.cpp 校验）。
 | \|Δy\| P95 连续 3 个摘要周期超 tau_y_px | WARN | 摘要节拍（提示评估升级 remap v1.1） |
 | 启动时左/右目输入未接线 | ERROR | 否（启动路径一次性，Start 返回 false） |
 | 逐帧配对/测距 | 不打日志 | — |
+
+口径说明：摘要中配对率/有效域占比为启动以来累计计数（`ProcessedPairCount()`/
+`MatchedPairCount()`/`ValidDistanceCount()` 单调累计），测距耗时 avg/max
+按摘要周期重置（每周期清零重新统计）。
 
 排查计数：`ProcessedPairCount()`（已处理左目帧数，含超龄未配对）、
 `MatchedPairCount()`、`ValidDistanceCount()`、`ErrorCount()`、
