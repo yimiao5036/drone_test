@@ -11,7 +11,7 @@
         "enable_visual_monitor": true,
         "enable_control": false,
         "enable_visual_tracking": true,
-        "enable_stereo_ranging": false
+        "enable_stereo_ranging": true
     },
     "health": {
         "cpu_sample_period_ms": 1000,
