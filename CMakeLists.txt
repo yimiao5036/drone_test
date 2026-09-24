@@ -99,6 +99,7 @@ set(PERCEPTION_SOURCES
     src/perception/linear_target_kalman_filter.cpp
     src/perception/target_estimator.cpp
     src/perception/stereo_ranger_core.cpp
+    src/perception/stereo_ranger.cpp
     src/perception/visual_target_monitor.cpp)
 if(DRONE_HAVE_RKNN)
     find_library(DRONE_RKNN_LIBRARY NAMES rknnrt)
@@ -591,6 +592,20 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stereo_ranger_core_test)
+
+        # 双目测距组件壳：双订阅时间窗配对 + 超龄处理 + 摘要日志
+        add_executable(stereo_ranger_test
+            tests/perception/stereo_ranger_test.cpp)
+        target_link_libraries(stereo_ranger_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(stereo_ranger_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(stereo_ranger_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(stereo_ranger_test)
 
         # 叠加器测试：验证 NV12 帧 + 检测 → 标注帧（不依赖硬件）
         add_executable(frame_compositor_test tests/video/frame_compositor_test.cpp)
