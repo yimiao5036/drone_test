@@ -125,6 +125,27 @@ struct VisualTargetStatus {
     bool valid = false;                 ///< 是否处于可用锁定状态（当前仅诊断用途）
 };
 
+/// 双目测距目标距离（StereoRanger → 视觉跟踪影子距离通道）。
+/// 对应设计 docs/superpowers/specs/2026-09-23-双目测距v1.0-design.md。
+/// v1.0 单目标约定：track_id 恒 0；valid=false 时距离字段为 NaN 不可用，
+/// 方位字段（左目框、中心）照常有效。
+struct StereoTargetDistance {
+    MessageHeader header;
+    uint64_t frame_sequence = 0;    ///< 左目帧序号
+    uint32_t class_id = 0;          ///< 类别：0=无人机
+    uint32_t track_id = 0;          ///< v1.0 恒 0（多目标关联留 v1.1）
+    float forward_distance_m = std::numeric_limits<float>::quiet_NaN();  ///< 前向距离Z（米，滤波后）
+    float slant_range_m = std::numeric_limits<float>::quiet_NaN();       ///< 斜距R（米）
+    float disparity_px = std::numeric_limits<float>::quiet_NaN();  ///< 归一化视差折算左目像素视差
+    float confidence = 0.f;         ///< 左右目置信度取小；未匹配时为左目置信度
+    bool valid = false;             ///< 匹配成功且在有效域内（disparity≥最小视差且距离在域内）
+    float center_pixel_x_mid = 0.f; ///< 双目中心x中值；未匹配时为左目中心x
+    float bbox_x = 0.f;             ///< 左目框（像素）
+    float bbox_y = 0.f;
+    float bbox_w = 0.f;
+    float bbox_h = 0.f;
+};
+
 /// 光流结果（光流估计 → 感知融合）。
 struct OpticalFlowResult {
     MessageHeader header;
@@ -355,6 +376,8 @@ inline constexpr char kDecodedFrame[] = "decoded_frame";      ///< video::FrameH
 inline constexpr char kDecodedFrameLeft[] = "decoded_frame_left";    ///< video::FrameHandle（双目拆分左目）
 inline constexpr char kDecodedFrameRight[] = "decoded_frame_right";  ///< video::FrameHandle（双目拆分右目，仅统计）
 inline constexpr char kDetection[] = "detection";             ///< DetectionResult
+inline constexpr char kDetectionRight[] = "detection_right";  ///< DetectionResult（双目右目）
+inline constexpr char kStereoTargetDistance[] = "stereo_target_distance";  ///< StereoTargetDistance
 inline constexpr char kVisualTarget[] = "visual_target";      ///< VisualTargetObservation
 inline constexpr char kVisualTargetStatus[] = "visual_target_status";  ///< VisualTargetStatus
 inline constexpr char kOpticalFlow[] = "optical_flow";        ///< OpticalFlowResult
