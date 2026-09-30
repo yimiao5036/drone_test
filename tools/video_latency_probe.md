@@ -117,9 +117,24 @@ NPU core mask可做同模型A/B：
 
 YOLO与叠加/图传是并行支路：当前叠加器使用截至取帧时已到达的最新检测结果，不等待同一帧YOLO完成。因此`入口→本地RTSP`不能与`入口→YOLO完成`简单相加；检测框相对画面的滞后需要结合`frame_sequence`另行观察。
 
+## 首尾统计模式（--end-to-end-only）
+
+中间阶段细分统计本身有开销（每帧多次取时间戳、写环形缓冲），属于探针的观察者效应。需要测“一帧实际端到端处理时间”的干净基线时，使用首尾统计模式：
+
+```bash
+./build/video_latency_probe --duration 120 --interval 10 --end-to-end-only
+```
+
+该开关启动时强制覆盖以下配置，不修改正式JSON：
+
+- `decoder/yolo/yolo_right/compositor/video_sender/video_sender.encode`的`collect_detailed_latency`全部置false，只保留ingress→各出口的端到端链；
+- `decoder.slow_frame_threshold_ms`置0，同步关闭慢帧关联日志（全量模式下探针才强制设为10ms）。
+
+输出只保留头部块（输入编码/解码模式/区间FPS/码率/关键帧/RGA计数）加四条链路统计：03入口→解码输出、06入口→YOLO完成、09入口→标注输出、14入口→本地RTSP发布完成。仍不包含摄像头曝光/编码/网络到机载入口，也不包含HM30与显示端。该模式可与`--yolo-queue`、`--npu-core`等参数组合，用于A/B对比各配置下的端到端延迟。
+
 ## 日志行为
 
-探针每个`--interval`周期输出一次统计，不打印逐帧成功日志；区间FPS/码率使用`steady_clock`浮点秒差计算，避免整数秒取整导致531秒等报告处误显示22.8 FPS。探针强制设置`prefer_rga_dma_transfer=true`；正式`drone_control`按JSON读取，当前生产配置经长测后已显式设为true，代码缺省仍为false。探针同时把`slow_frame_threshold_ms`设为10ms并跳过前100帧预热；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P、D4R和未归类耗时，只在第1次及每100次打印WARN。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch。
+探针每个`--interval`周期输出一次统计，不打印逐帧成功日志；区间FPS/码率使用`steady_clock`浮点秒差计算，避免整数秒取整导致531秒等报告处误显示22.8 FPS。探针强制设置`prefer_rga_dma_transfer=true`；正式`drone_control`按JSON读取，当前生产配置经长测后已显式设为true，代码缺省仍为false。全量模式下探针把`slow_frame_threshold_ms`设为10ms并跳过前100帧预热（`--end-to-end-only`时置0关闭）；慢解码帧记录触发包序号/大小/关键帧、总耗时、D1～D5、D4P、D4R和未归类耗时，只在第1次及每100次打印WARN。首次DRM_PRIME帧还会在INFO日志记录DMA-BUF对象fd/size/modifier及每个图层平面的object/offset/pitch。
 
 ## 排查要点
 

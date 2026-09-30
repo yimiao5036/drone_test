@@ -49,6 +49,7 @@ struct Options {
     std::string npu_core_mode;            // 空=沿用配置
     bool collect_npu_internal_perf = false;
     bool collect_npu_perf_detail = false;
+    bool end_to_end_only = false;         // true=只统计入口→各出口端到端链
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -73,6 +74,8 @@ Options ParseOptions(int argc, char** argv) {
             options.collect_npu_internal_perf = true;
         } else if (arg == "--rknn-perf-detail") {
             options.collect_npu_perf_detail = true;
+        } else if (arg == "--end-to-end-only") {
+            options.end_to_end_only = true;
         } else if (arg == "--npu-core" && index + 1 < argc) {
             options.npu_core_mode = argv[++index];
             const auto& mode = options.npu_core_mode;
@@ -86,7 +89,7 @@ Options ParseOptions(int argc, char** argv) {
                 "用法: video_latency_probe [--config path] [--duration 秒] "
                 "[--interval 秒] [--yolo-model path] [--yolo-queue 容量] "
                 "[--npu-core auto|core0|core01|core012|all] "
-                "[--rknn-perf-run] [--rknn-perf-detail]");
+                "[--rknn-perf-run] [--rknn-perf-detail] [--end-to-end-only]");
         }
     }
     if (options.duration_seconds <= 0 || options.interval_seconds <= 0) {
@@ -119,10 +122,10 @@ const char* CodecName(drone::common::VideoCodec codec) {
     }
 }
 
-void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
-                   int elapsed_seconds,
-                   const drone::application::VideoPipelineLatencySnapshot& previous,
-                   double interval_seconds) {
+void PrintIntervalHeader(const drone::application::VideoPipelineLatencySnapshot& s,
+                         int elapsed_seconds,
+                         const drone::application::VideoPipelineLatencySnapshot& previous,
+                         double interval_seconds) {
     const std::uint64_t interval_frames =
         s.encoded_frame_count >= previous.encoded_frame_count
             ? s.encoded_frame_count - previous.encoded_frame_count
@@ -143,8 +146,6 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
                                      ? static_cast<double>(interval_bytes) * 8.0 /
                                            interval_seconds / 1000000.0
                                      : 0.0;
-    const std::string decode_name =
-        std::string("02 ") + CodecName(s.input_codec) + "解码+NV12转存";
 
     std::cout << "\n========== 机载视频延迟统计 elapsed=" << elapsed_seconds
               << "s（滑动窗口最多2048样本）==========\n"
@@ -157,6 +158,16 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
               << " DRM转存缓冲构建=" << s.hardware_transfer_buffer_build_count
               << " RGA_DMA成功=" << s.rga_dma_transfer_count
               << " RGA_DMA回退=" << s.rga_dma_fallback_count << '\n';
+}
+
+void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
+                   int elapsed_seconds,
+                   const drone::application::VideoPipelineLatencySnapshot& previous,
+                   double interval_seconds) {
+    const std::string decode_name =
+        std::string("02 ") + CodecName(s.input_codec) + "解码+NV12转存";
+
+    PrintIntervalHeader(s, elapsed_seconds, previous, interval_seconds);
     PrintSummary("01 解码输入队列", s.decode_queue);
     PrintSummary(decode_name.c_str(), s.decode);
     PrintSummary("03 入口→解码输出", s.ingress_to_decoded);
@@ -196,6 +207,20 @@ void PrintSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
                  "也不包含HM30传输、Web转码和浏览器显示。\n";
 }
 
+void PrintEndToEndSnapshot(const drone::application::VideoPipelineLatencySnapshot& s,
+                           int elapsed_seconds,
+                           const drone::application::VideoPipelineLatencySnapshot& previous,
+                           double interval_seconds) {
+    PrintIntervalHeader(s, elapsed_seconds, previous, interval_seconds);
+    PrintSummary("03 入口→解码输出", s.ingress_to_decoded);
+    PrintSummary("06 入口→YOLO完成", s.ingress_to_inference);
+    PrintSummary("09 入口→标注输出", s.ingress_to_annotated);
+    PrintSummary("14 入口→本地RTSP发布完成", s.ingress_to_rtsp);
+    std::cout << "说明：端到端模式已关闭全部中间统计与慢帧日志；"
+                 "03/06/09/14为入口到各阶段出口的一帧实际处理时间，"
+                 "不包含摄像头曝光/编码/网络到机载入口，也不包含HM30与显示端。\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -213,8 +238,20 @@ int main(int argc, char** argv) {
         // 探针只测视频阶段延迟：关闭视觉稳定性判定，避免额外线程干扰计时。
         config.runtime.enable_visual_monitor = false;
         config.runtime.enable_control = false;
-        // 仅探针启用慢帧关联日志；正式程序默认0，不增加运行期告警。
-        config.decoder.slow_frame_threshold_ms = 10.0;
+        if (options.end_to_end_only) {
+            // 首尾模式：关闭全部中间阶段统计与慢帧日志，只留 03/06/09/14 四条
+            // ingress→出口链，最大限度消除探针观察者效应。
+            config.decoder.collect_detailed_latency = false;
+            config.yolo.collect_detailed_latency = false;
+            config.yolo_right.collect_detailed_latency = false;
+            config.compositor.collect_detailed_latency = false;
+            config.video_sender.collect_detailed_latency = false;
+            config.video_sender.encode.collect_detailed_latency = false;
+            config.decoder.slow_frame_threshold_ms = 0.0;
+        } else {
+            // 仅全量模式启用慢帧关联日志；正式程序默认0，不增加运行期告警。
+            config.decoder.slow_frame_threshold_ms = 10.0;
+        }
         config.decoder.prefer_rga_dma_transfer = true;
         if (!options.yolo_model_path.empty()) {
             const auto model_path =
@@ -251,7 +288,8 @@ int main(int argc, char** argv) {
                   << " RKNN内部性能统计="
                   << config.yolo.collect_npu_internal_perf
                   << " RKNN逐层性能报告="
-                  << config.yolo.collect_npu_perf_detail << '\n';
+                  << config.yolo.collect_npu_perf_detail
+                  << " 端到端模式=" << options.end_to_end_only << '\n';
         drone::application::DroneApplication application(std::move(config));
         if (!application.Start()) {
             std::cerr << "视频延迟探针启动失败\n";
@@ -271,8 +309,13 @@ int main(int argc, char** argv) {
                 auto snapshot = application.VideoLatencySnapshot();
                 const double report_interval_seconds =
                     std::chrono::duration<double>(now - previous_report_time).count();
-                PrintSnapshot(snapshot, elapsed, previous_snapshot,
-                              report_interval_seconds);
+                if (options.end_to_end_only) {
+                    PrintEndToEndSnapshot(snapshot, elapsed, previous_snapshot,
+                                          report_interval_seconds);
+                } else {
+                    PrintSnapshot(snapshot, elapsed, previous_snapshot,
+                                  report_interval_seconds);
+                }
                 previous_snapshot = std::move(snapshot);
                 previous_report_time = now;
                 do {
@@ -286,8 +329,13 @@ int main(int argc, char** argv) {
             final_time - start).count());
         const double final_interval_seconds =
             std::chrono::duration<double>(final_time - previous_report_time).count();
-        PrintSnapshot(application.VideoLatencySnapshot(), elapsed,
-                      previous_snapshot, final_interval_seconds);
+        if (options.end_to_end_only) {
+            PrintEndToEndSnapshot(application.VideoLatencySnapshot(), elapsed,
+                                  previous_snapshot, final_interval_seconds);
+        } else {
+            PrintSnapshot(application.VideoLatencySnapshot(), elapsed,
+                          previous_snapshot, final_interval_seconds);
+        }
         std::cout.flush();  // 保证最终统计先于MPP停止阶段stderr告警显示
         application.Stop();
         return 0;
