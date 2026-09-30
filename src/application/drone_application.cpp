@@ -166,13 +166,16 @@ void DroneApplication::BindTopics() {
             detector_->SetInput(stereo_splitter_->LeftOutput());
             compositor_->SetDecodedInput(stereo_splitter_->LeftOutput());
             if (stereo_ranger_ != nullptr) {
-                // 右目检测消费拆分器右目输出；测距组件双订阅左右检测结果，
-                // 距离输出接视觉跟踪影子距离通道（影子，无真实控制）。
+                // 右目检测消费拆分器右目输出；测距组件双订阅左右检测结果。
                 detector_right_->SetInput(stereo_splitter_->RightOutput());
                 stereo_ranger_->SetLeftInput(detector_->DetectionOutput());
                 stereo_ranger_->SetRightInput(detector_right_->DetectionOutput());
-                visual_tracking_shadow_->SetDistanceInput(
-                    stereo_ranger_->DistanceOutput());
+                // 距离输出只接视觉跟踪影子（影子，无真实控制）；视觉跟踪未装配时
+                // （如探针裁剪配置）距离通道仅由测距组件统计，不允许空指针解引用。
+                if (visual_tracking_shadow_ != nullptr) {
+                    visual_tracking_shadow_->SetDistanceInput(
+                        stereo_ranger_->DistanceOutput());
+                }
             }
         } else {
             detector_->SetInput(decoder_->FrameOutput());

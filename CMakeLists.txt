@@ -646,6 +646,20 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(video_encoder_integration_test)
+
+        # 主程序集成装配回归：裁剪配置（探针场景）下构造不得段错误
+        add_executable(drone_application_test
+            tests/application/drone_application_test.cpp)
+        target_link_libraries(drone_application_test PRIVATE
+            drone_application GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(drone_application_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(drone_application_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(drone_application_test)
     else()
         message(STATUS "GoogleTest not found; topic tests will not be built")
     endif()
