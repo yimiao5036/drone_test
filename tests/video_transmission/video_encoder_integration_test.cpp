@@ -125,5 +125,40 @@ TEST_F(VideoEncoderIntegrationTest, PreferHardwareFallsBackToSoftwareWhenNoRkmpp
     EXPECT_GT(size, 0L);
 }
 
+// collect_detailed_latency=false：编码后端不写帧准备/写包细分统计（探针首尾模式）。
+TEST_F(VideoEncoderIntegrationTest, DetailedLatencyDisabledSkipsFrameStats) {
+    EncoderBackendConfig config;
+    config.url = OutputPath();
+    config.output_url = OutputPath();
+    config.output_format = "mpegts";
+    config.codec = "h264";
+    config.width = 128;
+    config.height = 128;
+    config.fps = 25;
+    config.prefer_hardware = false;
+    config.gop = 25;
+    config.collect_detailed_latency = false;
+
+    auto backend = CreateVideoEncoderBackend(config);
+    ASSERT_NE(backend, nullptr);
+    ASSERT_TRUE(backend->Start());
+
+    for (int i = 0; i < 10; ++i) {
+        auto handle = pool_->Acquire();
+        ASSERT_TRUE(handle.Valid());
+        std::memset(handle.Data(), static_cast<int>((i * 17) % 256),
+                    pool_->SlotSize());
+        EXPECT_TRUE(backend->EncodeFrame(handle));
+    }
+
+    backend->Stop();
+    EXPECT_GT(backend->SentFrameCount(), 0u);
+    EXPECT_EQ(backend->ErrorCount(), 0u);
+    EXPECT_EQ(backend->FramePrepareLatency().total_count, 0u);
+    EXPECT_EQ(backend->PacketWriteLatency().total_count, 0u);
+
+    std::remove(OutputPath().c_str());
+}
+
 }  // namespace
 }  // namespace drone::video_transmission

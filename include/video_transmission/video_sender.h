@@ -32,6 +32,7 @@ namespace drone::video_transmission {
 struct VideoSenderConfig {
     EncoderBackendConfig encode;  ///< 编码 + 图传推流后端配置
     std::size_t input_queue = 2;  ///< 标注帧订阅队列容量（丢最旧）
+    bool collect_detailed_latency = true;  ///< 中间阶段延迟统计；false=只留ingress→RTSP链（探针首尾模式）
 
     /// 编码后端注入工厂（测试用）：为空时用默认 FFmpeg 后端。
     /// 测试注入 Mock 以验证发送线程/计数逻辑而不依赖真实 RTSP 目标。

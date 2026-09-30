@@ -69,7 +69,7 @@ struct VideoSender::Impl {
             const auto encode_start_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     encode_start.time_since_epoch()).count();
-            if (handle.Info().timestamp_ms > 0) {
+            if (config.collect_detailed_latency && handle.Info().timestamp_ms > 0) {
                 input_queue_latency.Add(static_cast<double>(
                     encode_start_ms - handle.Info().timestamp_ms));
             }
@@ -78,9 +78,11 @@ struct VideoSender::Impl {
                 continue;
             }
             const auto encode_end = std::chrono::steady_clock::now();
-            encode_and_push_latency.Add(
-                std::chrono::duration<double, std::milli>(encode_end - encode_start)
-                    .count());
+            if (config.collect_detailed_latency) {
+                encode_and_push_latency.Add(
+                    std::chrono::duration<double, std::milli>(encode_end - encode_start)
+                        .count());
+            }
             if (handle.Info().pipeline_ingress_time_ms > 0) {
                 const auto encode_end_ms =
                     std::chrono::duration_cast<std::chrono::milliseconds>(

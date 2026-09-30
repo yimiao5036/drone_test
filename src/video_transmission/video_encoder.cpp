@@ -379,8 +379,10 @@ struct VideoEncoderImpl {
         const auto write_start = std::chrono::steady_clock::now();
         const int ret = av_interleaved_write_frame(format_ctx_, packet_);
         const auto write_end = std::chrono::steady_clock::now();
-        packet_write_latency.Add(
-            std::chrono::duration<double, std::milli>(write_end - write_start).count());
+        if (config.collect_detailed_latency) {
+            packet_write_latency.Add(
+                std::chrono::duration<double, std::milli>(write_end - write_start).count());
+        }
         av_packet_unref(packet_);
         if (ret < 0) {
             ++error_count;
@@ -466,8 +468,10 @@ struct VideoEncoderImpl {
         }
 
         const auto prepare_end = std::chrono::steady_clock::now();
-        frame_prepare_latency.Add(
-            std::chrono::duration<double, std::milli>(prepare_end - prepare_start).count());
+        if (config.collect_detailed_latency) {
+            frame_prepare_latency.Add(
+                std::chrono::duration<double, std::milli>(prepare_end - prepare_start).count());
+        }
 
         const int send_ret = avcodec_send_frame(codec_ctx_, encode_input);
         if (send_ret < 0) {

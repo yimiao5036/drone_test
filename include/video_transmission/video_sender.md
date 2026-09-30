@@ -101,6 +101,11 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 - `PacketWriteLatency()`：单个`av_interleaved_write_frame()`调用；
 - `IngressToRtspLatency()`：编码访问单元进入机载进程到本地RTSP写调用完成。
 
+`collect_detailed_latency=false` 时中间统计不采集：10 输入排队/12 编码推送由
+`VideoSenderConfig::collect_detailed_latency` 控制，11 帧准备/13 写包由
+`EncoderBackendConfig::collect_detailed_latency` 控制（经 `encode` 字段自动透传给默认后端）；
+仅保留 ingress→RTSP 链 `IngressToRtspLatency()`。正式配置恒为 true，仅探针首尾模式两者同关。
+
 这些指标不包含MediaMTX之后的HM30传输、Web转码和浏览器显示。
 
 ## 日志行为

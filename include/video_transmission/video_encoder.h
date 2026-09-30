@@ -44,6 +44,7 @@ struct EncoderBackendConfig {
     std::string output_format = "rtsp";  ///< 输出封装：rtsp(默认) / mpegts(本地文件调试)
     std::string output_url = "";         ///< 实际输出地址（非空时优先于 url，本地文件调试用）
     bool prefer_hardware = true;    ///< 优先 rkmpp 硬编码（香橙派）；否则软编码
+    bool collect_detailed_latency = true;  ///< 帧准备/写包细分统计；false=只留ingress→RTSP链（探针首尾模式）
 };
 
 /// 视频编码 + 图传推送后端抽象接口。
