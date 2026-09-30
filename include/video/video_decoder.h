@@ -38,7 +38,7 @@ struct VideoDecoderConfig {
     bool prefer_hardware = true;            ///< 优先 rkmpp 硬解码（香橙派）；否则软解
     double slow_frame_threshold_ms = 0.0;   ///< 慢解码诊断阈值；0=关闭逐事件节流日志
     bool prefer_rga_dma_transfer = false;   ///< 优先RGA DMA-BUF直传到NV12内存池
-    bool collect_detailed_latency = true;  ///< 中间阶段延迟细分统计；false=只留ingress→解码输出链（探针首尾模式）
+    bool collect_detailed_latency = true;   ///< 中间阶段延迟细分统计；false=只留ingress→解码输出链（探针首尾模式）
 };
 
 /// 视频解码部件抽象接口。

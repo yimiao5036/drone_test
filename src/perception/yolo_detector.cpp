@@ -287,12 +287,13 @@ YoloDetector::YoloDetector(YoloDetectorConfig config,
                                                 config.collect_detailed_latency);
     }
     impl_ = std::make_unique<Impl>(std::move(config), std::move(backend));
-    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 内部性能统计={} 逐层性能报告={} 后端={}",
+    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 内部性能统计={} 逐层性能报告={} 细分延迟统计={} 后端={}",
                 impl_->config.model_path.empty() ? "(注入后端)" : impl_->config.model_path,
                 impl_->config.conf_threshold, impl_->config.nms_threshold,
                 impl_->config.input_queue_capacity, impl_->config.npu_core_mode,
                 impl_->config.collect_npu_internal_perf,
                 impl_->config.collect_npu_perf_detail,
+                impl_->config.collect_detailed_latency,
                 impl_->backend != nullptr ? "已配置" : "缺失(启动将失败)");
 }
 
