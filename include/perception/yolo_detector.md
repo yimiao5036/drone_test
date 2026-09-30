@@ -50,7 +50,8 @@ YoloDetector::DetectLoop（独立线程）
   `input_queue_capacity`（解码帧订阅队列容量，默认2，生产为1）、
   `npu_core_mode`（`auto/core0/core01/core012/all`，生产当前`all`）、
   `collect_npu_internal_perf`（仅诊断`RKNN_QUERY_PERF_RUN`，生产为`false`）、
-  `collect_npu_perf_detail`（仅诊断一次逐层报告，生产为`false`）。
+  `collect_npu_perf_detail`（仅诊断一次逐层报告，生产为`false`）、
+  `collect_detailed_latency`（中间阶段延迟细分统计，生产恒为`true`）。
 - `IDetectionBackend`：`Load() / Unload() / IsLoaded() / Detect(FrameHandle) →
   vector<BackendDetection>`（原图坐标系像素框）。工厂 `CreateDefaultDetectionBackend`
   在 `DRONE_HAVE_RKNN` 编译时返回 RKNN 后端，否则返回 nullptr。
@@ -88,6 +89,8 @@ YoloDetector::DetectLoop（独立线程）
 ### 延迟统计
 
 `InputQueueLatency()`统计解码帧发布到YOLO开始处理；`InferenceLatency()`统计后端`Detect()`完整时间；`IngressToInferenceLatency()`统计码流进入机载进程到YOLO完成。无检测帧同样计入统计。
+
+`collect_detailed_latency=false` 时 04/05（`InputQueueLatency()`/`InferenceLatency()`）与后端 Y1-Y4 细分不采集，仅保留 ingress→推理完成链 `IngressToInferenceLatency()`；正式配置恒为 true，仅探针首尾模式使用。`InferenceTimeMsAvg()` 是功能字段不受影响，RKNN 内部性能统计（Y2N/Y2O/Y2Q）仍由 `collect_npu_internal_perf` 独立控制。
 
 `BackendLatencySnapshot()`提供最近256帧的后端细分：
 

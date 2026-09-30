@@ -37,10 +37,12 @@ public:
     /// @param npu_core_mode auto/core0/core01/core012/all
     /// @param collect_npu_internal_perf 是否查询RKNN_QUERY_PERF_RUN（仅诊断）
     /// @param collect_npu_perf_detail 是否采集一次RKNN_QUERY_PERF_DETAIL（仅诊断）
+    /// @param collect_detailed_latency 是否采集子阶段延迟细分（false=探针首尾模式）
     RknnDetectionBackend(std::string model_path, float conf_threshold,
                          float nms_threshold, std::string npu_core_mode,
                          bool collect_npu_internal_perf,
-                         bool collect_npu_perf_detail);
+                         bool collect_npu_perf_detail,
+                         bool collect_detailed_latency = true);
     ~RknnDetectionBackend() override;
 
     RknnDetectionBackend(const RknnDetectionBackend&) = delete;

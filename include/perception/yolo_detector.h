@@ -80,6 +80,7 @@ struct YoloDetectorConfig {
     std::string npu_core_mode = "all";   ///< auto/core0/core01/core012/all
     bool collect_npu_internal_perf = false; ///< 仅诊断：查询RKNN内部推理时间
     bool collect_npu_perf_detail = false;   ///< 仅诊断：采集一次RKNN逐层性能报告
+    bool collect_detailed_latency = true;   ///< 中间阶段延迟细分统计；false=只留ingress→推理完成链（探针首尾模式）
 };
 
 /// YOLO 检测器（实现 IYoloDetector）。

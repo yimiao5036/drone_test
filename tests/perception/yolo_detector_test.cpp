@@ -383,5 +383,32 @@ TEST_F(YoloDetectorTest, RestartAfterStop) {
     detector_->Stop();
 }
 
+TEST_F(YoloDetectorTest, DetailedLatencyDisabledCollectsOnlyIngress) {
+    // 夹具 detector_ 用默认配置；本用例自建 detail=false 实例
+    YoloDetectorConfig config;
+    config.input_queue_capacity = 2;
+    config.collect_detailed_latency = false;
+    std::unique_ptr<IDetectionBackend> backend(new MockBackend());
+    auto detector = std::make_unique<YoloDetector>(config, std::move(backend));
+    detector->SetInput(frame_topic_);
+
+    ASSERT_TRUE(detector->Start());
+    auto handle = pool_->Acquire();
+    ASSERT_TRUE(handle.Valid());
+    std::memset(handle.Data(), 0, pool_->SlotSize());
+    // 同时打帧时间戳与 ingress 时间戳，使队列/ingress 两条统计路径都走到
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    handle.SetTiming(now_ms, now_ms);
+    (void)frame_topic_.Emplace(std::move(handle));
+
+    ASSERT_TRUE(WaitFor([&] { return detector->ProcessedFrameCount() == 1; }));
+    detector->Stop();
+
+    EXPECT_EQ(detector->InputQueueLatency().total_count, 0u);
+    EXPECT_EQ(detector->InferenceLatency().total_count, 0u);
+    EXPECT_EQ(detector->IngressToInferenceLatency().total_count, 1u);
+}
+
 }  // namespace
 }  // namespace drone::perception

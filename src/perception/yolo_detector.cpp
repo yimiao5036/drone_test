@@ -62,12 +62,13 @@ std::int64_t SteadyNowMs() {
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     const std::string& model_path, float conf_threshold, float nms_threshold,
     const std::string& npu_core_mode, bool collect_npu_internal_perf,
-    bool collect_npu_perf_detail) {
+    bool collect_npu_perf_detail, bool collect_detailed_latency) {
 #ifdef DRONE_HAVE_RKNN
     if (!model_path.empty()) {
         return std::make_unique<RknnDetectionBackend>(
             model_path, conf_threshold, nms_threshold, npu_core_mode,
-            collect_npu_internal_perf, collect_npu_perf_detail);
+            collect_npu_internal_perf, collect_npu_perf_detail,
+            collect_detailed_latency);
     }
 #else
     (void)model_path;
@@ -76,6 +77,7 @@ std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     (void)npu_core_mode;
     (void)collect_npu_internal_perf;
     (void)collect_npu_perf_detail;
+    (void)collect_detailed_latency;
 #endif
     return nullptr;
 }
@@ -167,7 +169,7 @@ struct YoloDetector::Impl {
             const auto start = std::chrono::steady_clock::now();
             const std::int64_t start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 start.time_since_epoch()).count();
-            if (frame.Info().timestamp_ms > 0) {
+            if (config.collect_detailed_latency && frame.Info().timestamp_ms > 0) {
                 input_queue_latency.Add(
                     static_cast<double>(start_ms - frame.Info().timestamp_ms));
             }
@@ -184,7 +186,9 @@ struct YoloDetector::Impl {
             const float elapsed_ms =
                 std::chrono::duration<float, std::milli>(end - start).count();
             UpdateAvg(elapsed_ms);
-            inference_latency.Add(elapsed_ms);
+            if (config.collect_detailed_latency) {
+                inference_latency.Add(elapsed_ms);
+            }
             if (frame.Info().pipeline_ingress_time_ms > 0) {
                 const auto end_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     end.time_since_epoch()).count();
@@ -279,7 +283,8 @@ YoloDetector::YoloDetector(YoloDetectorConfig config,
                                                 config.nms_threshold,
                                                 config.npu_core_mode,
                                                 config.collect_npu_internal_perf,
-                                                config.collect_npu_perf_detail);
+                                                config.collect_npu_perf_detail,
+                                                config.collect_detailed_latency);
     }
     impl_ = std::make_unique<Impl>(std::move(config), std::move(backend));
     SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 内部性能统计={} 逐层性能报告={} 后端={}",

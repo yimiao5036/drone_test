@@ -83,6 +83,7 @@ std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
     const std::string& model_path, float conf_threshold, float nms_threshold,
     const std::string& npu_core_mode = "all",
     bool collect_npu_internal_perf = false,
-    bool collect_npu_perf_detail = false);
+    bool collect_npu_perf_detail = false,
+    bool collect_detailed_latency = true);
 
 }  // namespace drone::perception
