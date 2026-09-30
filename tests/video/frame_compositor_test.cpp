@@ -330,5 +330,42 @@ TEST_F(FrameCompositorTest, RestartAfterStop) {
     compositor_->Stop();
 }
 
+TEST_F(FrameCompositorTest, DetailedLatencyDisabledCollectsOnlyIngress) {
+    // 夹具 compositor_ 用默认配置；本用例自建 detail=false 实例
+    common::Topic<video::FrameHandle> decoded;
+    common::Topic<common::DetectionResult> detections;
+
+    video::CompositorConfig config;
+    config.collect_detailed_latency = false;
+    video::FrameCompositor compositor(config);
+    compositor.SetDecodedInput(decoded);
+    compositor.SetDetectionInput(detections);
+    auto out_sub = compositor.AnnotatedOutput().Subscribe(4);
+
+    video::VideoFrameInfo tmpl;
+    tmpl.width = 64;
+    tmpl.height = 64;
+    tmpl.hor_stride = 64;
+    tmpl.ver_stride = 64;
+    tmpl.format = video::PixelFormat::kYuv420SpNv12;
+    auto pool = std::make_shared<video::VideoFramePool>(4, tmpl);
+
+    ASSERT_TRUE(compositor.Start());
+    auto handle = pool->Acquire();
+    ASSERT_TRUE(handle.Valid());
+    std::memset(handle.Data(), 0, pool->SlotSize());
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    handle.SetTiming(now_ms, now_ms);
+    (void)decoded.Emplace(std::move(handle));
+
+    ASSERT_TRUE(out_sub.WaitTakeFor(std::chrono::milliseconds(3000)) != nullptr);
+    compositor.Stop();
+
+    EXPECT_EQ(compositor.InputQueueLatency().total_count, 0u);
+    EXPECT_EQ(compositor.ComposeLatency().total_count, 0u);
+    EXPECT_EQ(compositor.IngressToAnnotatedLatency().total_count, 1u);
+}
+
 }  // namespace
 }  // namespace drone::video

@@ -45,6 +45,7 @@ struct CompositorConfig {
     std::vector<std::string> class_names{"UAV", "OBS"};
     /// 当前解码帧比最近检测帧领先超过该数量时清除旧框；25fps 下默认约 400ms。
     std::uint64_t max_detection_frame_lag = 10;
+    bool collect_detailed_latency = true;  ///< 中间阶段延迟统计；false=只留ingress→标注输出链（探针首尾模式）
 };
 
 /// 视频帧叠加器。

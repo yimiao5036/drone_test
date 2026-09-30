@@ -25,7 +25,8 @@ kDetection(DetectionResult) ──────┘
 
 - `CompositorConfig`：`pool_capacity`（输出池容量）、`stride_alignment`、`box_line_thickness`、
   `draw_text`（是否画类型+置信度）、`text_scale`、`class_names`（数组下标即 `class_id`）、
-  `max_detection_frame_lag`（无新检测时旧框最多沿用的解码帧数，默认 10）。
+  `max_detection_frame_lag`（无新检测时旧框最多沿用的解码帧数，默认 10）、
+  `collect_detailed_latency`（中间阶段延迟统计开关，默认 true，见"延迟统计"节）。
   根 `main.cpp` 从 `yolo.class_names` 与 `yolo.max_detection_frame_lag` 读取后注入；
   配置缺失时类别默认 `UAV/OBS`、旧框最多沿用 10 帧。
 - `SetDecodedInput(Topic<FrameHandle>&)`：绑定解码帧（队列容量 4，丢最旧）。
@@ -71,6 +72,11 @@ kDetection(DetectionResult) ──────┘
 ### 延迟统计
 
 `InputQueueLatency()`统计解码帧到叠加线程的排队时间；`ComposeLatency()`统计NV12全帧复制和框/文字绘制；`IngressToAnnotatedLatency()`统计机载码流入口到标注帧发布。输出帧继承`pipeline_ingress_time_ms`并在发布前刷新阶段时间。
+
+`CompositorConfig::collect_detailed_latency`（默认 true）为中间阶段统计开关：置 false 时
+`input_queue_latency`/`compose_latency` 不再 Add（`InputQueueLatency()/ComposeLatency()` 恒为空），
+只保留 `IngressToAnnotatedLatency()` 首尾链，供视频延迟探针首尾统计模式使用；该开关不影响
+叠加与发布逻辑。
 
 ## 日志行为
 

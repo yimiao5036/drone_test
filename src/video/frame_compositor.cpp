@@ -354,7 +354,7 @@ struct FrameCompositor::Impl {
             // 期间到达的新检测在本帧立即生效，而不是延迟到下一帧。
             DrainDetections();
             ExpireStaleDetections(in_handle.Info().sequence);
-            if (in_handle.Info().timestamp_ms > 0) {
+            if (config.collect_detailed_latency && in_handle.Info().timestamp_ms > 0) {
                 input_queue_latency.Add(static_cast<double>(
                     MonotonicUs() / 1000 - in_handle.Info().timestamp_ms));
             }
@@ -434,8 +434,10 @@ struct FrameCompositor::Impl {
         const std::int64_t completed_us = MonotonicUs();
         const std::int64_t completed_ms = completed_us / 1000;
         out.SetTiming(completed_ms, src.pipeline_ingress_time_ms);
-        compose_latency.Add(
-            static_cast<double>(completed_us - compose_start_us) / 1000.0);
+        if (config.collect_detailed_latency) {
+            compose_latency.Add(
+                static_cast<double>(completed_us - compose_start_us) / 1000.0);
+        }
         if (src.pipeline_ingress_time_ms > 0) {
             ingress_to_annotated_latency.Add(static_cast<double>(
                 completed_ms - src.pipeline_ingress_time_ms));
