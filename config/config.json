@@ -170,7 +170,7 @@
         }
     },
     "yolo": {
-        "model_path": "models/yolov26_ReLU6_09_13-rk3588_384_640.rknn",
+        "model_path": "models/dronedet_rk_s_r1-rk3588.rknn",
         "conf_threshold": 0.3,
         "nms_threshold": 0.45,
         "input_queue_capacity": 1,
