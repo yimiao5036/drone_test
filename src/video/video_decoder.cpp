@@ -506,7 +506,7 @@ struct VideoDecoder::Impl {
         }
         const std::int64_t ingress_ms =
             static_cast<std::int64_t>(encoded.header.receive_time_ms);
-        if (ingress_ms > 0) {
+        if (ingress_ms > 0 && config.collect_detailed_latency) {
             input_queue_latency.Add(
                 static_cast<double>(decode_start_us / 1000 - ingress_ms));
         }
@@ -550,13 +550,17 @@ struct VideoDecoder::Impl {
         std::memcpy(packet->data, encoded.data.data(), encoded.data.size());
         const double packet_prepare_ms =
             static_cast<double>(MonotonicUs() - packet_prepare_start_us) / 1000.0;
-        packet_prepare_latency.Add(packet_prepare_ms);
+        if (config.collect_detailed_latency) {
+            packet_prepare_latency.Add(packet_prepare_ms);
+        }
 
         const std::int64_t send_start_us = MonotonicUs();
         const int send_ret = avcodec_send_packet(codec_ctx, packet);
         const double send_packet_ms =
             static_cast<double>(MonotonicUs() - send_start_us) / 1000.0;
-        send_packet_latency.Add(send_packet_ms);
+        if (config.collect_detailed_latency) {
+            send_packet_latency.Add(send_packet_ms);
+        }
         if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
             ++error_count;
             if (ShouldLogThrottled(error_count)) {
@@ -588,7 +592,9 @@ struct VideoDecoder::Impl {
             consecutive_hw_failures = 0;  // 成功出帧，硬解失败计数清零
             const double receive_frame_ms =
                 static_cast<double>(receive_elapsed_us) / 1000.0;
-            receive_frame_latency.Add(receive_frame_ms);
+            if (config.collect_detailed_latency) {
+                receive_frame_latency.Add(receive_frame_ms);
+            }
             PublishFrame(decoded_frame, encoded, ingress_ms, decode_start_us,
                          packet_prepare_ms, send_packet_ms, receive_frame_ms);
         }
@@ -641,7 +647,9 @@ struct VideoDecoder::Impl {
         handle.SetTiming(completed_ms, ingress_ms);
         const double total_decode_ms =
             static_cast<double>(completed_us - decode_start_us) / 1000.0;
-        decode_latency.Add(total_decode_ms);
+        if (config.collect_detailed_latency) {
+            decode_latency.Add(total_decode_ms);
+        }
         if (config.slow_frame_threshold_ms > 0.0 && decoded_count.load() >= 100 &&
             total_decode_ms >= config.slow_frame_threshold_ms) {
             const uint64_t count = slow_decode_count.fetch_add(1) + 1;
@@ -755,7 +763,9 @@ struct VideoDecoder::Impl {
             return false;
         }
 
-        rga_dma_transfer_latency.Add(rga_dma_ms);
+        if (config.collect_detailed_latency) {
+            rga_dma_transfer_latency.Add(rga_dma_ms);
+        }
         const uint64_t success_count = rga_dma_transfer_count.fetch_add(1) + 1;
         if (success_count == 1) {
             SPDLOG_INFO(
@@ -817,7 +827,9 @@ struct VideoDecoder::Impl {
 
             hardware_transfer_prepare_ms = static_cast<double>(
                 MonotonicUs() - transfer_prepare_start_us) / 1000.0;
-            hardware_transfer_prepare_latency.Add(hardware_transfer_prepare_ms);
+            if (config.collect_detailed_latency) {
+                hardware_transfer_prepare_latency.Add(hardware_transfer_prepare_ms);
+            }
 
             const std::int64_t transfer_start_us = MonotonicUs();
             int transfer_ret = av_hwframe_transfer_data(sw_frame, source, 0);
@@ -841,7 +853,9 @@ struct VideoDecoder::Impl {
             }
             hardware_transfer_ms =
                 static_cast<double>(MonotonicUs() - transfer_start_us) / 1000.0;
-            hardware_transfer_latency.Add(hardware_transfer_ms);
+            if (config.collect_detailed_latency) {
+                hardware_transfer_latency.Add(hardware_transfer_ms);
+            }
             frame = sw_frame;
         }
 
@@ -949,7 +963,9 @@ struct VideoDecoder::Impl {
 
         const double frame_copy_ms =
             static_cast<double>(MonotonicUs() - frame_copy_start_us) / 1000.0;
-        frame_copy_latency.Add(frame_copy_ms);
+        if (config.collect_detailed_latency) {
+            frame_copy_latency.Add(frame_copy_ms);
+        }
         CompleteFrame(std::move(handle), encoded, ingress_ms, decode_start_us,
                       packet_prepare_ms, send_packet_ms, receive_frame_ms,
                       hardware_transfer_prepare_ms, hardware_transfer_ms,

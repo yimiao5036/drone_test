@@ -343,4 +343,57 @@ TEST(VideoDecoderTest, StopsCleanlyWhenIdle) {
     decoder.Stop();  // 幂等
 }
 
+TEST(VideoDecoderTest, DetailedLatencyDisabledCollectsOnlyIngress) {
+    std::vector<common::EncodedFrame> encoded;
+    try {
+        encoded = EncodeTestFrames();
+    } catch (const std::runtime_error& e) {
+        GTEST_SKIP() << e.what();
+    }
+    ASSERT_FALSE(encoded.empty());
+
+    common::Topic<common::EncodedFrame> input;
+    video::VideoDecoderConfig config;
+    config.pool_capacity = 10;
+    config.width = kTestWidth;
+    config.height = kTestHeight;
+    config.prefer_hardware = false;
+    config.collect_detailed_latency = false;  // 首尾模式：只留 ingress 链
+
+    video::VideoDecoder decoder(config);
+    decoder.SetInput(input);
+    auto sub = decoder.FrameOutput().Subscribe(4);
+
+    ASSERT_TRUE(decoder.Start());
+    // receive_time_ms 即解码侧 ingress 时间戳；生产由 CameraReceiver 打，测试手动打
+    const auto now_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    for (auto frame : encoded) {
+        frame.header.receive_time_ms = now_ms;
+        (void)input.Emplace(frame);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        while (sub.TryTake()) {
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!sub.WaitTakeFor(std::chrono::milliseconds(100))) {
+            break;
+        }
+    }
+    decoder.Stop();
+
+    EXPECT_GT(decoder.DecodedFrameCount(), 0u);
+    // 中间统计全部为空
+    EXPECT_EQ(decoder.InputQueueLatency().total_count, 0u);
+    EXPECT_EQ(decoder.DecodeLatency().total_count, 0u);
+    EXPECT_EQ(decoder.PacketPrepareLatency().total_count, 0u);
+    EXPECT_EQ(decoder.SendPacketLatency().total_count, 0u);
+    EXPECT_EQ(decoder.ReceiveFrameLatency().total_count, 0u);
+    EXPECT_EQ(decoder.FrameCopyLatency().total_count, 0u);
+    // ingress→解码输出链不受影响
+    EXPECT_GT(decoder.IngressToDecodedLatency().total_count, 0u);
+}
+
 }  // namespace

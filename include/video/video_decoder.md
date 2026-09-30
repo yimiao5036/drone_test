@@ -29,6 +29,7 @@ struct VideoDecoderConfig {
     bool prefer_hardware = true;       // 优先 rkmpp 硬解
     double slow_frame_threshold_ms = 0.0; // 慢帧关联日志阈值；0=关闭
     bool prefer_rga_dma_transfer = false; // 优先RGA DMA-BUF直传到内存池
+    bool collect_detailed_latency = true; // 中间阶段延迟细分统计；false=只留ingress→解码输出链（探针首尾模式）
 };
 
 class VideoDecoder final : public IVideoDecoder {
@@ -100,6 +101,8 @@ class VideoDecoder final : public IVideoDecoder {
 为定位上板间歇出现的解码长尾，另增加最近256样本的细分：`PacketPrepareLatency()`、`SendPacketLatency()`、`ReceiveFrameLatency()`、`HardwareTransferPrepareLatency()`、`HardwareTransferLatency()`、`FrameCopyLatency()`。其中D4P单独统计分辨率检查和`av_frame_make_writable`，D4只统计`av_hwframe_transfer_data`。同时提供`ActiveCodec()`、`IsHardwareDecoder()`以及编码访问单元/字节/关键帧累计值，探针据此显示实际格式、解码模式、区间FPS/码率和关键帧数。统计只在探针读取快照时复制排序，逐帧不打日志。
 
 `slow_frame_threshold_ms`默认0，不在正式程序打印慢帧；`video_latency_probe`单独设为10ms。超过阈值且跳过前100帧预热后，记录触发包序号、字节数、关键帧标志、总耗时、D1～D5、D4P和未归类耗时，日志按第1次及每100次节流。rkmpp是异步流水线，日志中的包是触发本次输出的包，不保证就是输出画面的原始源包。
+
+`collect_detailed_latency=false` 时中间统计（01 输入排队、02 总解码、D1-D5 细分）不采集，仅保留 ingress→解码输出链 `IngressToDecodedLatency()`；正式配置恒为 true，仅探针首尾模式使用。慢帧日志判断不受影响。
 
 首次收到`AV_PIX_FMT_DRM_PRIME`帧时，INFO日志输出`AVDRMFrameDescriptor`：对象fd/size/modifier、图层DRM格式（含 fourcc 字符解码，如 `0x3631564e(NV16)`，便于板上确认 mjpeg_rkmpp 输出格式）以及各平面的object index/offset/pitch。该日志只打印一次，用于确认当前MPP输出是否能安全通过RGA DMA-BUF接口直接读取，禁止在未知平面布局时假定NV12连续排列。
 
