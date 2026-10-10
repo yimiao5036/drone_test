@@ -52,6 +52,8 @@ Px4Link::StateOutput() -> MissionStateMachine
 - `SELF_CHECK`阶段等待PX4快照满足：连接在线、GPS fix有效、全局位置有效、Home有效。
   PX4 已到位（2026-10-10：装机体+GPS）：正常应能越过自检；仍停留则按
   心跳 → GPS fix → Home 顺序排查（见`docs/故障排查手册.md`），不要改条件绕过。
+  **室内提示**：室内可能无 GPS fix/Home，停留自检属预期、不是通信问题
+  （判据是「PX4 心跳已连接」是否出现）；分阶段验证见`docs/PX4实链验证清单.md`。
 - `READY`阶段等待有效地面站目标；目标有效且导航仍有效时，进入`GPS_APPROACH`影子状态。
 - `GPS_APPROACH`阶段只维护目标新鲜度和状态回传，不生成位置控制意图。目标短暂过期会置告警，后续策略再决定返航/等待。
 - 所有控制输出保持断开，`DroneApplication`仍不会绑定`Px4Setpoint`。
