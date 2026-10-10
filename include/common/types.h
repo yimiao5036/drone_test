@@ -373,10 +373,9 @@ struct TargetState {
 namespace topics {
 inline constexpr char kCameraStream[] = "camera_stream";      ///< EncodedFrame
 inline constexpr char kDecodedFrame[] = "decoded_frame";      ///< video::FrameHandle
-inline constexpr char kDecodedFrameLeft[] = "decoded_frame_left";    ///< video::FrameHandle（双目拆分左目）
-inline constexpr char kDecodedFrameRight[] = "decoded_frame_right";  ///< video::FrameHandle（双目拆分右目，仅统计；启用双目测距时接右目检测器）
-inline constexpr char kDetection[] = "detection";             ///< DetectionResult
-inline constexpr char kDetectionRight[] = "detection_right";  ///< DetectionResult（双目右目）
+inline constexpr char kDecodedFrameLeft[] = "decoded_frame_left";    ///< video::FrameHandle（双目拆分左目=SBS右半=物理左目=测距基准图）
+inline constexpr char kDecodedFrameRight[] = "decoded_frame_right";  ///< video::FrameHandle（双目拆分右目=SBS左半=物理右目=测距辅助图）
+inline constexpr char kDetection[] = "detection";             ///< DetectionResult（基准图检测框）
 inline constexpr char kStereoTargetDistance[] = "stereo_target_distance";  ///< StereoTargetDistance
 inline constexpr char kVisualTarget[] = "visual_target";      ///< VisualTargetObservation
 inline constexpr char kVisualTargetStatus[] = "visual_target_status";  ///< VisualTargetStatus

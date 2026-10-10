@@ -112,7 +112,6 @@ private:
     std::unique_ptr<video::VideoDecoder> decoder_;
     std::unique_ptr<video::StereoFrameSplitter> stereo_splitter_;
     std::unique_ptr<perception::YoloDetector> detector_;
-    std::unique_ptr<perception::YoloDetector> detector_right_;  ///< 右目检测（双目测距）
     std::unique_ptr<perception::StereoRanger> stereo_ranger_;   ///< 双目测距影子
     std::unique_ptr<perception::VisualTargetMonitor> visual_monitor_;
     std::unique_ptr<control::VisualTrackingShadow> visual_tracking_shadow_;

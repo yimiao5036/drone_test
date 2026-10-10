@@ -243,7 +243,6 @@ int main(int argc, char** argv) {
             // ingress→出口链，最大限度消除探针观察者效应。
             config.decoder.collect_detailed_latency = false;
             config.yolo.collect_detailed_latency = false;
-            config.yolo_right.collect_detailed_latency = false;
             config.compositor.collect_detailed_latency = false;
             config.video_sender.collect_detailed_latency = false;
             config.video_sender.encode.collect_detailed_latency = false;

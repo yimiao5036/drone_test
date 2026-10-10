@@ -1,17 +1,18 @@
 // =============================================================================
-// stereo_ranger.cpp —— 双目测距组件实现
+// stereo_ranger.cpp —— 双目测距组件实现（v2：稀疏 Census 路线）
 //
-// 配对：按 source_time_ms 分组为帧；左帧在挂起右帧中找 |Δt|≤pair_window
-// 的最近者配对；左帧超龄（now−t>pair_window）按空右帧处理（valid=false
-// 照常发布方位）。每个输出消息在发布时填 header.sequence（本地单调计数器）
-// 与 header.receive_time_ms。
+// 帧/批次配对：
+//   - 左右帧进环形缓冲（深度 frame_buffer_depth，持有 Topic 消息指针以占用
+//     拆分器内存池槽位，队满挤掉最旧），按 |Δt|≤pair_window 时间邻接配对；
+//   - 检测按 frame_sequence 成批：新序号首条到达或 settle 超时即闭合；
+//   - 闭合批次按 FIFO 处理，等帧上限 kBatchGiveUpMs；帧缺失/被挤出时该批次
+//     每个框仍发布一条 valid=false 消息（保证下游每目标有节拍）。
 //
-// 摘要（summary_log_interval 节流）：配对率/有效域内占比/|Δy| P95/测距
-// 耗时。|Δy| P95 连续 3 个摘要周期超 tau_y_px → WARN（不 remap 的代价
-// 兜底，提示评估升级 remap v1.1）。
+// 摘要（summary_log_interval 节流）：帧数/匹配帧/有效占比/丢帧/截断/耗时。
+// 事件日志节流：第 1 次与每满 100 次（丢帧 WARN、截断 WARN）。
 //
-// 线程模型：独立消费线程以 10ms 节拍阻塞等待左目消息驱动 Pump；Stop()
-// 置停止标志 → Reset 双订阅唤醒阻塞等待 → join → core.ResetFilter()。
+// 线程模型：独立消费线程以 10ms 节拍阻塞等待左目检测驱动 Pump；Stop()
+// 置停止标志 → Reset 三路订阅唤醒阻塞等待 → join → core.Reset()。
 // 热路径零日志；INFO=生命周期，WARN=降级，ERROR=逻辑缺陷（未接线启动）。
 // =============================================================================
 
@@ -19,7 +20,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <map>
+#include <cstddef>
+#include <deque>
 #include <optional>
 #include <thread>
 #include <utility>
@@ -36,135 +38,268 @@ std::int64_t SteadyNowMs() {
         .count();
 }
 
-/// 一帧的全部检测（按 source_time_ms 聚合）。
-struct FrameDetections {
-    std::uint64_t source_time_ms = 0;
-    std::uint64_t frame_sequence = 0;
-    std::vector<common::DetectionResult> detections;
-};
+/// 批次等待配对帧的放弃时限：超过即按无效发布，避免队首长期阻塞。
+constexpr std::int64_t kBatchGiveUpMs = 200;
+
+/// 事件日志节流：第 1 次与每满 100 次。
+bool ShouldLogThrottled(std::uint64_t count) {
+    return count == 1 || count % 100 == 0;
+}
 
 }  // namespace
 
 struct StereoRanger::Impl {
-    explicit Impl(StereoRangerConfig value) : config(std::move(value)), core(config) {}
+    Impl(StereoRangerConfig value, StereoRectifyMatrices value_matrices)
+        : config(std::move(value)),
+          matrices(value_matrices),
+          core(config, matrices) {}
 
     StereoRangerConfig config;
+    StereoRectifyMatrices matrices;
     StereoRangerCore core;
 
-    common::Topic<common::DetectionResult>* left_topic = nullptr;
-    common::Topic<common::DetectionResult>* right_topic = nullptr;
-    common::Topic<common::DetectionResult>::Subscription left_sub;
-    common::Topic<common::DetectionResult>::Subscription right_sub;
+    common::Topic<common::DetectionResult>* detection_topic = nullptr;
+    common::Topic<video::FrameHandle>* left_topic = nullptr;
+    common::Topic<video::FrameHandle>* right_topic = nullptr;
+    common::Topic<common::DetectionResult>::Subscription detection_sub;
+    common::Topic<video::FrameHandle>::Subscription left_sub;
+    common::Topic<video::FrameHandle>::Subscription right_sub;
     common::Topic<common::StereoTargetDistance> distance_output;
+
+    /// 帧条目：持有 Topic 消息指针（shared_ptr<const FrameHandle>），
+    /// 从而在缓冲期内占用拆分器内存池槽位；条目移除即归还槽位。
+    using FrameMessage = common::Topic<video::FrameHandle>::MessagePtr;
+    struct FrameEntry {
+        FrameMessage message;
+        std::uint64_t sequence = 0;
+        std::int64_t timestamp_ms = 0;
+    };
+    /// 检测批次：同一 frame_sequence 的全部左目检测。
+    struct Batch {
+        std::uint64_t sequence = 0;
+        std::int64_t deadline_ms = 0;  ///< 超时闭合时刻（steady ms）
+        std::vector<common::DetectionResult> boxes;
+    };
 
     std::atomic<bool> running{false};
     std::thread thread;
 
-    std::map<std::uint64_t, FrameDetections> pending_left;   // key=source_time_ms
-    std::map<std::uint64_t, FrameDetections> pending_right;
-
-    std::atomic<std::uint64_t> processed_pair_count{0};
+    std::atomic<std::uint64_t> batch_count{0};
+    std::atomic<std::uint64_t> published_count{0};
+    std::atomic<std::uint64_t> frame_miss_count{0};
     std::atomic<std::uint64_t> error_count{0};
 
     // 以下状态为消费线程独占，无需加锁。
-    std::uint64_t publish_sequence = 0;  // 来源内单调递增，跨重启不重置
-    double range_time_total_ms = 0.0;
-    double range_time_max_ms = 0.0;
-    std::uint64_t range_call_count = 0;
+    std::deque<FrameEntry> left_frames;
+    std::deque<FrameEntry> right_frames;
+    std::optional<Batch> open_batch;
+    std::deque<Batch> ready_batches;
+    std::uint64_t publish_sequence = 0;
+    double match_time_total_ms = 0.0;
+    double match_time_max_ms = 0.0;
+    std::uint64_t match_call_count = 0;
     std::int64_t last_summary_ms = 0;
-    int consecutive_dy_over = 0;
+    std::uint64_t clipped_log_count = 0;
 
-    /// 把一条检测并入对应帧分组。
-    static void AppendTo(std::map<std::uint64_t, FrameDetections>& pending,
-                         const common::DetectionResult& d) {
-        auto& frame = pending[d.header.source_time_ms];
-        frame.source_time_ms = d.header.source_time_ms;
-        frame.frame_sequence = d.frame_sequence;
-        frame.detections.push_back(d);
+    // ---- 帧缓冲 -------------------------------------------------------------
+
+    void PushFrame(std::deque<FrameEntry>& buffer, FrameMessage message) {
+        const video::VideoFrameInfo& info = message->Info();
+        FrameEntry entry;
+        entry.sequence = info.sequence;
+        entry.timestamp_ms = info.timestamp_ms;
+        entry.message = std::move(message);
+        buffer.push_back(std::move(entry));
+        while (buffer.size() > config.frame_buffer_depth) {
+            buffer.pop_front();  // 挤掉最旧：释放其内存池槽位
+        }
     }
 
-    /// 排空订阅队列并入挂起表。
-    void DrainInputs() {
+    void DrainFrames() {
         while (auto msg = left_sub.TryTake()) {
-            AppendTo(pending_left, **msg);
+            PushFrame(left_frames, std::move(*msg));
         }
         while (auto msg = right_sub.TryTake()) {
-            AppendTo(pending_right, **msg);
+            PushFrame(right_frames, std::move(*msg));
         }
     }
 
-    /// 挂起右帧中找 |Δt|≤pair_window 的最近帧；找到则取出返回。
-    std::optional<FrameDetections> TakeNearestRight(std::uint64_t left_time) {
+    using FrameIt = std::deque<FrameEntry>::iterator;
+
+    FrameIt FindLeftFrame(std::uint64_t sequence) {
+        for (auto it = left_frames.begin(); it != left_frames.end(); ++it) {
+            if (it->sequence == sequence) {
+                return it;
+            }
+        }
+        return left_frames.end();
+    }
+
+    /// 右帧中找 |Δt|≤pair_window 的最近帧。
+    FrameIt FindRightFrame(std::int64_t left_timestamp_ms) {
         const std::int64_t window = config.pair_window.count();
-        auto best = pending_right.end();
+        auto best = right_frames.end();
         std::int64_t best_dt = window + 1;
-        for (auto it = pending_right.begin(); it != pending_right.end(); ++it) {
-            const std::int64_t dt =
-                static_cast<std::int64_t>(it->first) -
-                static_cast<std::int64_t>(left_time);
+        for (auto it = right_frames.begin(); it != right_frames.end(); ++it) {
+            const std::int64_t dt = it->timestamp_ms - left_timestamp_ms;
             const std::int64_t abs_dt = dt < 0 ? -dt : dt;
             if (abs_dt <= window && abs_dt < best_dt) {
                 best_dt = abs_dt;
                 best = it;
             }
         }
-        if (best == pending_right.end()) {
-            return std::nullopt;
-        }
-        FrameDetections frame = std::move(best->second);
-        pending_right.erase(best);
-        return frame;
+        return best;
     }
 
-    void ProcessFrame(const FrameDetections& left,
-                      const std::vector<common::DetectionResult>& right) {
+    // ---- 检测批次 -----------------------------------------------------------
+
+    void AddDetection(const common::DetectionResult& detection) {
+        const std::int64_t now = SteadyNowMs();
+        if (!open_batch || open_batch->sequence != detection.frame_sequence) {
+            if (open_batch) {
+                ready_batches.push_back(std::move(*open_batch));  // 新序号 ⇒ 上批闭合
+                open_batch.reset();
+            }
+            open_batch = Batch{};
+            open_batch->sequence = detection.frame_sequence;
+        }
+        open_batch->deadline_ms = now + config.settle.count();
+        open_batch->boxes.push_back(detection);
+    }
+
+    /// 批次闭合（新序号已在 AddDetection 处理；此处只处理超时）。
+    void CloseTimedOutBatch(std::int64_t now) {
+        if (open_batch && now >= open_batch->deadline_ms) {
+            ready_batches.push_back(std::move(*open_batch));
+            open_batch.reset();
+        }
+    }
+
+    // ---- 发布 ---------------------------------------------------------------
+
+    void PublishMessages(const Batch& batch,
+                         const std::vector<StereoRangeResult>& results,
+                         std::int64_t source_time_ms) {
+        const std::uint64_t now =
+            static_cast<std::uint64_t>(SteadyNowMs());
+        for (std::size_t i = 0; i < batch.boxes.size(); ++i) {
+            const common::DetectionResult& box = batch.boxes[i];
+            const StereoRangeResult& range = results[i];
+            common::StereoTargetDistance msg;
+            msg.header.sequence = ++publish_sequence;
+            msg.header.source_time_ms = static_cast<std::uint64_t>(source_time_ms);
+            msg.header.receive_time_ms = now;
+            msg.frame_sequence = batch.sequence;
+            msg.class_id = box.class_id;
+            msg.track_id = 0;  // v2 单/少目标约定，多目标关联留后续
+            msg.confidence = box.confidence;
+            msg.bbox_x = box.bbox_x;
+            msg.bbox_y = box.bbox_y;
+            msg.bbox_w = box.bbox_w;
+            msg.bbox_h = box.bbox_h;
+            msg.center_pixel_x_mid = box.bbox_x + 0.5f * box.bbox_w;
+            if (range.available) {
+                msg.forward_distance_m = static_cast<float>(range.z_m);
+                msg.slant_range_m = static_cast<float>(range.euclid_m);
+                msg.disparity_px = static_cast<float>(range.disparity_px);
+                msg.center_pixel_x_mid = static_cast<float>(range.center_x_rect);
+                msg.valid = true;
+                if (range.clipped) {
+                    ++clipped_log_count;
+                    if (ShouldLogThrottled(clipped_log_count)) {
+                        SPDLOG_WARN(
+                            "双目测距视差顶到搜索上限(截断): d={:.1f}px "
+                            "上限={:.0f}px，距离可能更近（累计 {}）",
+                            range.disparity_px, config.disp_max_px,
+                            clipped_log_count);
+                    }
+                }
+            }
+            (void)distance_output.Emplace(std::move(msg));
+            ++published_count;
+        }
+    }
+
+    /// 帧缺失批次：每个框发布一条 valid=false（NaN 距离），保持节拍。
+    void PublishUnavailable(const Batch& batch, const char* reason) {
+        const std::vector<StereoRangeResult> empty(batch.boxes.size());
+        PublishMessages(batch, empty, 0);
+        const std::uint64_t count = frame_miss_count.fetch_add(1) + 1;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("双目测距批次未配对到帧({}): seq={} 框数={}（累计 {}）",
+                        reason, batch.sequence, batch.boxes.size(), count);
+        }
+    }
+
+    // ---- 主流程 -------------------------------------------------------------
+
+    void ProcessBatch(const Batch& batch, const FrameEntry& left,
+                      const FrameEntry& right) {
+        const video::VideoFrameInfo& left_info = left.message->Info();
+        const video::VideoFrameInfo& right_info = right.message->Info();
+        const GrayImageView ref{
+            reinterpret_cast<const std::uint8_t*>(left.message->Data()),
+            static_cast<int>(left_info.width), static_cast<int>(left_info.height),
+            static_cast<int>(left_info.hor_stride)};
+        const GrayImageView aux{
+            reinterpret_cast<const std::uint8_t*>(right.message->Data()),
+            static_cast<int>(right_info.width), static_cast<int>(right_info.height),
+            static_cast<int>(right_info.hor_stride)};
+
         const auto start = std::chrono::steady_clock::now();
-        auto results = core.Process(left.detections, right,
-                                    left.frame_sequence, left.source_time_ms);
+        const std::vector<StereoRangeResult> results =
+            core.Process(ref, aux, batch.boxes);
         const double elapsed_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start)
                 .count();
-        range_time_total_ms += elapsed_ms;
-        range_time_max_ms = std::max(range_time_max_ms, elapsed_ms);
-        ++range_call_count;
+        match_time_total_ms += elapsed_ms;
+        match_time_max_ms = std::max(match_time_max_ms, elapsed_ms);
+        ++match_call_count;
 
-        for (auto& msg : results) {
-            msg.header.sequence = ++publish_sequence;
-            msg.header.receive_time_ms =
-                static_cast<std::uint64_t>(SteadyNowMs());
-            (void)distance_output.Emplace(std::move(msg));
-        }
-        processed_pair_count.fetch_add(1);
+        PublishMessages(batch, results,
+                        static_cast<std::int64_t>(left_info.timestamp_ms));
+        batch_count.fetch_add(1);
     }
 
-    /// 配对 + 左帧超龄处理。
     void Pump() {
-        DrainInputs();
-        const std::int64_t now_ms = SteadyNowMs();
-        const std::int64_t window = config.pair_window.count();
-        while (!pending_left.empty()) {
-            const auto it = pending_left.begin();
-            const std::int64_t age =
-                now_ms - static_cast<std::int64_t>(it->first);
-            auto right = TakeNearestRight(it->first);
-            if (right.has_value()) {
-                FrameDetections left = std::move(it->second);
-                pending_left.erase(it);
-                ProcessFrame(left, right->detections);
-            } else if (age > window) {
-                FrameDetections left = std::move(it->second);
-                pending_left.erase(it);
-                ProcessFrame(left, {});  // 超龄未配对：valid=false 照常发布
-            } else {
-                break;  // 最早的左帧仍在窗内等右目，更新的帧不可能更急
+        DrainFrames();
+        const std::int64_t now = SteadyNowMs();
+        CloseTimedOutBatch(now);
+
+        while (!ready_batches.empty()) {
+            Batch& batch = ready_batches.front();
+            const FrameIt left = FindLeftFrame(batch.sequence);
+            if (left == left_frames.end()) {
+                // 左帧被挤出（缓冲最旧序号已超过）或等待超时 ⇒ 放弃该批次
+                const bool evicted =
+                    !left_frames.empty() && left_frames.front().sequence > batch.sequence;
+                if (evicted || now - batch.deadline_ms > kBatchGiveUpMs) {
+                    PublishUnavailable(batch, "左帧缺失/被挤出");
+                    ready_batches.pop_front();
+                    continue;
+                }
+                break;  // 等左帧
             }
-        }
-        // 右帧无配对需求（左目无检测帧不发布），超龄右帧直接丢弃
-        while (!pending_right.empty() &&
-               now_ms - static_cast<std::int64_t>(
-                            pending_right.begin()->first) > 4 * window) {
-            pending_right.erase(pending_right.begin());
+            const FrameIt right = FindRightFrame(left->timestamp_ms);
+            if (right == right_frames.end()) {
+                // 右帧不会再来：右缓冲最新帧已超过左帧时间 + 配对窗
+                const bool missing =
+                    !right_frames.empty() &&
+                    right_frames.back().timestamp_ms >
+                        left->timestamp_ms + config.pair_window.count();
+                if (missing || now - batch.deadline_ms > kBatchGiveUpMs) {
+                    PublishUnavailable(batch, "右帧缺失/被挤出");
+                    left_frames.erase(left);
+                    ready_batches.pop_front();
+                    continue;
+                }
+                break;  // 等右帧
+            }
+            ProcessBatch(batch, *left, *right);
+            left_frames.erase(left);
+            right_frames.erase(right);
+            ready_batches.pop_front();
         }
     }
 
@@ -173,51 +308,35 @@ struct StereoRanger::Impl {
             return;
         }
         last_summary_ms = now_ms;
-        const std::uint64_t processed = processed_pair_count.load();
-        const std::uint64_t matched = core.MatchedPairCount();
-        const std::uint64_t valid = core.ValidDistanceCount();
-        const double pair_rate =
-            processed > 0
-                ? 100.0 * static_cast<double>(matched) /
-                      static_cast<double>(processed)
-                : 0.0;
-        const double valid_rate =
-            matched > 0
-                ? 100.0 * static_cast<double>(valid) /
-                      static_cast<double>(matched)
-                : 0.0;
+        const std::uint64_t frames = core.ProcessedFrameCount();
+        const std::uint64_t matched = core.MatchedFrameCount();
+        const std::uint64_t available = core.AvailableCount();
+        const std::uint64_t published = published_count.load();
+        const std::uint64_t skipped = core.SkippedFrameCount();
+        const std::uint64_t clipped = core.ClippedCount();
+        const std::uint64_t misses = frame_miss_count.load();
+        const double valid_rate = published > 0
+                                      ? 100.0 * static_cast<double>(available) /
+                                            static_cast<double>(published)
+                                      : 0.0;
         const double avg_ms =
-            range_call_count > 0 ? range_time_total_ms / range_call_count : 0.0;
-        const double p95 = core.DeltaYP95Px();
-        SPDLOG_INFO("双目测距摘要: 左帧={} 匹配对={} 配对率={:.1f}% 有效={} "
-                    "有效域内占比={:.1f}% |Δy|P95={:.2f}px "
-                    "测距avg={:.2f}ms max={:.2f}ms",
-                    processed, matched, pair_rate, valid, valid_rate, p95,
-                    avg_ms, range_time_max_ms);
-        range_time_total_ms = 0.0;
-        range_time_max_ms = 0.0;
-        range_call_count = 0;
-        // 不 remap 的代价兜底：P95 持续超门限提示评估升级 remap（v1.1）
-        if (!std::isnan(p95) && p95 > config.tau_y_px) {
-            ++consecutive_dy_over;
-            if (consecutive_dy_over >= 3) {
-                SPDLOG_WARN("双目测距|Δy| P95={:.2f}px 连续{}个周期超门限"
-                            "tau_y={:.1f}px，未remap校正质量不足，"
-                            "需评估升级remap（v1.1）",
-                            p95, consecutive_dy_over, config.tau_y_px);
-            }
-        } else {
-            consecutive_dy_over = 0;
-        }
+            match_call_count > 0 ? match_time_total_ms / match_call_count : 0.0;
+        SPDLOG_INFO("双目测距摘要: 帧={} 匹配帧={} 批次={} 发布={} 有效测距={} "
+                    "有效占比={:.1f}% 跳过={} 帧未配={} 截断={} "
+                    "匹配avg={:.2f}ms max={:.2f}ms",
+                    frames, matched, batch_count.load(), published, available,
+                    valid_rate, skipped, misses, clipped, avg_ms,
+                    match_time_max_ms);
+        match_time_total_ms = 0.0;
+        match_time_max_ms = 0.0;
+        match_call_count = 0;
     }
 
     void Run() {
         while (running.load()) {
-            // 10ms 节拍：阻塞等待左目消息驱动 Pump，同时保证超龄帧及时发布。
-            // 取到的消息必须先并入分组，再由 Pump 内 DrainInputs 统一排空，
-            // 否则该条消息会丢失分组。
-            if (auto msg = left_sub.WaitTakeFor(std::chrono::milliseconds(10))) {
-                AppendTo(pending_left, **msg);
+            // 10ms 节拍：阻塞等待左目检测驱动；同时保证帧排空/批次超时闭合及时。
+            if (auto msg = detection_sub.WaitTakeFor(std::chrono::milliseconds(10))) {
+                AddDetection(**msg);
             }
             Pump();
             MaybeLogSummary(SteadyNowMs());
@@ -228,6 +347,7 @@ struct StereoRanger::Impl {
         if (!running.exchange(false)) {
             return;
         }
+        detection_sub.Reset();
         left_sub.Reset();
         right_sub.Reset();
         if (thread.joinable()) {
@@ -236,50 +356,56 @@ struct StereoRanger::Impl {
     }
 };
 
-StereoRanger::StereoRanger(StereoRangerConfig config)
-    : impl_(std::make_unique<Impl>(std::move(config))) {
-    impl_->config.Validate();
-    SPDLOG_INFO("双目测距创建: shadow=true control_output=false "
-                "pair_window={}ms 有效域=[{:.1f},{:.1f}]m",
-                impl_->config.pair_window.count(),
-                impl_->config.distance_min_m, impl_->config.distance_max_m);
+StereoRanger::StereoRanger(StereoRangerConfig config,
+                           StereoRectifyMatrices matrices)
+    : impl_(std::make_unique<Impl>(std::move(config), matrices)) {
+    SPDLOG_INFO("双目测距v2创建: shadow=true 基准图=SBS右半(物理左目) "
+                "fx_rect={:.2f}px 基线={:.3f}mm fxB={:.2f}m·px 视差=[{:.0f},{:.0f}]px",
+                impl_->matrices.fx_rect_px, impl_->matrices.baseline_m * 1000.0,
+                impl_->matrices.fxb_m_px, impl_->config.disp_min_px,
+                impl_->config.disp_max_px);
 }
 
-StereoRanger::~StereoRanger() {
-    Stop();
-}
+StereoRanger::~StereoRanger() { Stop(); }
 
 bool StereoRanger::Start() {
     if (impl_->running.load()) {
         return false;  // 幂等：状态不变，按接口约定返回 false
     }
-    if (impl_->left_topic == nullptr || impl_->right_topic == nullptr) {
-        ++impl_->error_count;
-        SPDLOG_ERROR("双目测距启动失败: 左右目输入未接线 left={} right={}",
+    if (impl_->detection_topic == nullptr || impl_->left_topic == nullptr ||
+        impl_->right_topic == nullptr) {
+        impl_->error_count.fetch_add(1);
+        SPDLOG_ERROR("双目测距启动失败: 输入未接线 detection={} left={} right={}",
+                     impl_->detection_topic != nullptr,
                      impl_->left_topic != nullptr,
                      impl_->right_topic != nullptr);
         return false;
     }
+    impl_->detection_sub = impl_->detection_topic->Subscribe(
+        impl_->config.input_queue_capacity,
+        common::Topic<common::DetectionResult>::OverflowPolicy::kDropOldest);
     impl_->left_sub = impl_->left_topic->Subscribe(
         impl_->config.input_queue_capacity,
-        common::Topic<common::DetectionResult>::OverflowPolicy::kDropOldest);
+        common::Topic<video::FrameHandle>::OverflowPolicy::kDropOldest);
     impl_->right_sub = impl_->right_topic->Subscribe(
         impl_->config.input_queue_capacity,
-        common::Topic<common::DetectionResult>::OverflowPolicy::kDropOldest);
-    impl_->pending_left.clear();
-    impl_->pending_right.clear();
-    impl_->range_time_total_ms = 0.0;
-    impl_->range_time_max_ms = 0.0;
-    impl_->range_call_count = 0;
+        common::Topic<video::FrameHandle>::OverflowPolicy::kDropOldest);
+    impl_->left_frames.clear();
+    impl_->right_frames.clear();
+    impl_->open_batch.reset();
+    impl_->ready_batches.clear();
+    impl_->match_time_total_ms = 0.0;
+    impl_->match_time_max_ms = 0.0;
+    impl_->match_call_count = 0;
+    impl_->clipped_log_count = 0;
     impl_->last_summary_ms = SteadyNowMs();
-    impl_->consecutive_dy_over = 0;
     impl_->running = true;
     impl_->thread = std::thread(&Impl::Run, impl_.get());
-    SPDLOG_INFO("双目测距启动: shadow=true pair_window={}ms 队列容量={} "
-                "有效域=[{:.1f},{:.1f}]m",
-                impl_->config.pair_window.count(),
-                impl_->config.input_queue_capacity,
-                impl_->config.distance_min_m, impl_->config.distance_max_m);
+    SPDLOG_INFO("双目测距启动: shadow=true 配对窗={}ms 批次闭合={}ms 帧缓冲={} "
+                "队列容量={}",
+                impl_->config.pair_window.count(), impl_->config.settle.count(),
+                impl_->config.frame_buffer_depth,
+                impl_->config.input_queue_capacity);
     return true;
 }
 
@@ -287,26 +413,26 @@ void StereoRanger::Stop() {
     const bool was_running = impl_->running.load();
     impl_->Stop();
     if (was_running) {
-        impl_->core.ResetFilter();
-        SPDLOG_INFO("双目测距停止: 累计左帧={} 匹配对={} 有效={} 错误={}",
-                    impl_->processed_pair_count.load(),
-                    impl_->core.MatchedPairCount(),
-                    impl_->core.ValidDistanceCount(),
-                    impl_->error_count.load());
+        impl_->core.Reset();
+        SPDLOG_INFO("双目测距停止: 批次={} 发布={} 有效={} 帧未配={} 截断={}",
+                    impl_->batch_count.load(), impl_->published_count.load(),
+                    impl_->core.AvailableCount(), impl_->frame_miss_count.load(),
+                    impl_->core.ClippedCount());
     }
 }
 
-bool StereoRanger::IsRunning() const {
-    return impl_->running.load();
+bool StereoRanger::IsRunning() const { return impl_->running.load(); }
+
+void StereoRanger::SetDetectionInput(
+    common::Topic<common::DetectionResult>& input) {
+    impl_->detection_topic = &input;
 }
 
-void StereoRanger::SetLeftInput(
-    common::Topic<common::DetectionResult>& input) {
+void StereoRanger::SetLeftFrameInput(common::Topic<video::FrameHandle>& input) {
     impl_->left_topic = &input;
 }
 
-void StereoRanger::SetRightInput(
-    common::Topic<common::DetectionResult>& input) {
+void StereoRanger::SetRightFrameInput(common::Topic<video::FrameHandle>& input) {
     impl_->right_topic = &input;
 }
 
@@ -314,24 +440,30 @@ common::Topic<common::StereoTargetDistance>& StereoRanger::DistanceOutput() {
     return impl_->distance_output;
 }
 
-std::uint64_t StereoRanger::ProcessedPairCount() const {
-    return impl_->processed_pair_count.load();
+std::uint64_t StereoRanger::ProcessedFrameCount() const {
+    return impl_->core.ProcessedFrameCount();
 }
-
-std::uint64_t StereoRanger::MatchedPairCount() const {
-    return impl_->core.MatchedPairCount();
+std::uint64_t StereoRanger::MatchedFrameCount() const {
+    return impl_->core.MatchedFrameCount();
 }
-
-std::uint64_t StereoRanger::ValidDistanceCount() const {
-    return impl_->core.ValidDistanceCount();
+std::uint64_t StereoRanger::AvailableCount() const {
+    return impl_->core.AvailableCount();
 }
-
+std::uint64_t StereoRanger::ClippedCount() const {
+    return impl_->core.ClippedCount();
+}
+std::uint64_t StereoRanger::SkippedFrameCount() const {
+    return impl_->core.SkippedFrameCount();
+}
+std::uint64_t StereoRanger::BatchCount() const {
+    return impl_->batch_count.load();
+}
+std::uint64_t StereoRanger::FrameMissCount() const {
+    return impl_->frame_miss_count.load();
+}
 std::uint64_t StereoRanger::ErrorCount() const {
     return impl_->error_count.load();
 }
-
-double StereoRanger::DeltaYP95Px() const {
-    return impl_->core.DeltaYP95Px();
-}
+double StereoRanger::LastMatchMs() const { return impl_->core.LastMatchMs(); }
 
 }  // namespace drone::perception
