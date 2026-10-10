@@ -67,7 +67,6 @@ struct AppConfig {
     video::VideoDecoderConfig decoder;
     video::StereoFrameSplitterConfig stereo_splitter;
     perception::YoloDetectorConfig yolo;
-    perception::YoloDetectorConfig yolo_right;     ///< 右目检测实例（默认继承 yolo）
     video::CompositorConfig compositor;
     video_transmission::VideoSenderConfig video_sender;
     communication::Px4LinkConfig px4;
@@ -76,7 +75,10 @@ struct AppConfig {
     perception::VisualTargetMonitorConfig visual_monitor;
     control::TrackingConfig visual_tracking;              ///< 视觉跟踪控制律（含标定内参）
     control::VisualTrackingShadowConfig visual_tracking_shadow;
-    perception::StereoRangerConfig stereo_ranger;  ///< 双目测距（默认值即标定实测）
+    perception::StereoRangerConfig stereo_ranger;  ///< 双目测距 v2（稀疏 Census，影子）
+    /// 预置校正矩阵：由 stereo_ranger.rectify_matrices_path 指向的 JSON 加载
+    /// （基准=SBS右半=物理左目；重标定后必须重跑 export_rectify.py）。
+    perception::StereoRectifyMatrices stereo_rectify;
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

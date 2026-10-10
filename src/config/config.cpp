@@ -127,6 +127,107 @@ int ReadOptionalPositiveInt(const json& object, const char* key,
     return static_cast<int>(value);
 }
 
+// 读取 3×3 / 3×4 矩阵字段；形状不符抛异常。
+void ReadMatrixField(const json& node, const char* field, double* out, int rows,
+                     int cols) {
+    if (!node.contains(field) || !node.at(field).is_array() ||
+        node.at(field).size() != static_cast<std::size_t>(rows)) {
+        throw std::invalid_argument(
+            std::string("校正矩阵缺少字段或形状不符: ") + field);
+    }
+    for (int r = 0; r < rows; ++r) {
+        const json& row = node.at(field).at(r);
+        if (!row.is_array() || row.size() != static_cast<std::size_t>(cols)) {
+            throw std::invalid_argument(
+                std::string("校正矩阵字段形状不符: ") + field);
+        }
+        for (int c = 0; c < cols; ++c) {
+            out[r * cols + c] = row.at(c).get<double>();
+        }
+    }
+}
+
+// 读取畸变系数向量；形状不符抛异常。
+void ReadCoeffsField(const json& node, const char* field, double* out,
+                     int count) {
+    if (!node.contains(field) || !node.at(field).is_array() ||
+        node.at(field).size() != static_cast<std::size_t>(count)) {
+        throw std::invalid_argument(
+            std::string("校正矩阵缺少字段或形状不符: ") + field);
+    }
+    for (int i = 0; i < count; ++i) {
+        out[i] = node.at(field).at(i).get<double>();
+    }
+}
+
+// 预置校正矩阵加载（stereo_ranger.rectify_matrices_path）。
+// 基准 = SBS 右半 = 物理左目 = 主工程左目 Topic；由
+// tools/camera_calibration/export_rectify.py 生成，重标定后必须重跑。
+// 字段缺失/非法、view 尺寸或焦距/基线非法、fx_rect/fxb 与 P 不自洽时抛异常。
+perception::StereoRectifyMatrices LoadStereoRectifyMatrices(
+    const std::string& path) {
+    json root;
+    try {
+        root = LoadJson(path);
+    } catch (const std::exception& error) {
+        throw std::invalid_argument("校正矩阵文件不可用: " + path + " (" +
+                                    error.what() + ")");
+    }
+    perception::StereoRectifyMatrices m;
+    try {
+        m.view_width = root.at("view_width").get<int>();
+        m.view_height = root.at("view_height").get<int>();
+        m.baseline_m = root.at("baseline_m").get<double>();
+        m.fx_rect_px = root.at("fx_rect_px").get<double>();
+        m.fxb_m_px = root.at("fxb_m_px").get<double>();
+        ReadMatrixField(root, "K_ref", m.k_ref, 3, 3);
+        ReadCoeffsField(root, "D_ref", m.d_ref, 5);
+        ReadMatrixField(root, "R_ref", m.r_ref, 3, 3);
+        ReadMatrixField(root, "P_ref", m.p_ref, 3, 4);
+        ReadMatrixField(root, "K_aux", m.k_aux, 3, 3);
+        ReadCoeffsField(root, "D_aux", m.d_aux, 5);
+        ReadMatrixField(root, "R_aux", m.r_aux, 3, 3);
+        ReadMatrixField(root, "P_aux", m.p_aux, 3, 4);
+    } catch (const std::exception& error) {
+        throw std::invalid_argument("校正矩阵字段缺失/非法: " + path + " (" +
+                                    error.what() + ")");
+    }
+    if (m.view_width <= 0 || m.view_height <= 0) {
+        throw std::invalid_argument("校正矩阵 view 尺寸非法: " + path);
+    }
+    if (!(m.k_ref[0] > 0.0) || !(m.k_aux[0] > 0.0) || !(m.p_ref[0] > 0.0) ||
+        !(m.baseline_m > 0.0)) {
+        throw std::invalid_argument("校正矩阵焦距/基线非法: " + path);
+    }
+    // 自洽校验：fxb 必须等于 fx_rect × baseline（防导出脚本与字段不一致）
+    const double expected = m.fx_rect_px * m.baseline_m;
+    if (std::abs(m.p_ref[0] - m.fx_rect_px) > 1e-6 * std::abs(m.fx_rect_px) ||
+        std::abs(m.fxb_m_px - expected) > 1e-6 * std::abs(expected)) {
+        throw std::invalid_argument(
+            "校正矩阵 fx_rect/fxb 与 P 不自洽（重跑 export_rectify.py）: " + path);
+    }
+    return m;
+}
+
+// 配置文件所在目录（用于解析与 config.json 同目录的伴随文件）。
+std::string ConfigDirectoryOf(const std::string& config_path) {
+    const std::size_t pos = config_path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    return pos == 0 ? config_path.substr(0, 1) : config_path.substr(0, pos);
+}
+
+// 伴随文件路径解析：绝对路径（以 / 开头）或空串原样返回，否则相对
+// config.json 所在目录拼接（生产部署中 config.json 在 <可执行文件>/config/）。
+std::string ResolveAdjacentPath(const std::string& config_directory,
+                                const std::string& value) {
+    if (value.empty() || value.front() == '/') {
+        return value;
+    }
+    return config_directory + "/" + value;
+}
+
 // 资源相对路径解析：绝对路径（以 / 开头）或空串原样返回，
 // 否则拼接在可执行文件目录后，避免依赖启动时的当前工作目录。
 std::string ResolveAssetPath(const std::string& value,
@@ -540,45 +641,57 @@ AppConfig LoadAppConfig(const std::string& path,
                                          config.visual_monitor.status_log_interval);
     config.visual_monitor.Validate();
 
-    // 双目测距（影子）：全部字段可选，默认值即 2026-09-23 标定实测。
+    // 双目测距 v2（稀疏 Census，影子）：全部字段可选，默认值即参考实现实测配置。
+    // rectify_matrices_path 按可执行文件目录解析（与模型路径同规则）；
+    // 矩阵文件由 tools/camera_calibration/export_rectify.py 生成，构造期加载并校验。
     const json stereo_ranger = root.value("stereo_ranger", json::object());
-    config.stereo_ranger.baseline_m = ReadOptionalPositiveDouble(
-        stereo_ranger, "baseline_m", config.stereo_ranger.baseline_m);
-    config.stereo_ranger.fx_left_px =
-        stereo_ranger.value("fx_left_px", config.stereo_ranger.fx_left_px);
-    config.stereo_ranger.fy_left_px =
-        stereo_ranger.value("fy_left_px", config.stereo_ranger.fy_left_px);
-    config.stereo_ranger.cx_left_px =
-        stereo_ranger.value("cx_left_px", config.stereo_ranger.cx_left_px);
-    config.stereo_ranger.cy_left_px =
-        stereo_ranger.value("cy_left_px", config.stereo_ranger.cy_left_px);
-    config.stereo_ranger.fx_right_px =
-        stereo_ranger.value("fx_right_px", config.stereo_ranger.fx_right_px);
-    config.stereo_ranger.fy_right_px =
-        stereo_ranger.value("fy_right_px", config.stereo_ranger.fy_right_px);
-    config.stereo_ranger.cx_right_px =
-        stereo_ranger.value("cx_right_px", config.stereo_ranger.cx_right_px);
-    config.stereo_ranger.cy_right_px =
-        stereo_ranger.value("cy_right_px", config.stereo_ranger.cy_right_px);
-    config.stereo_ranger.disparity_min_px = ReadOptionalPositiveDouble(
-        stereo_ranger, "disparity_min_px", config.stereo_ranger.disparity_min_px);
-    config.stereo_ranger.distance_min_m = ReadOptionalPositiveDouble(
-        stereo_ranger, "distance_min_m", config.stereo_ranger.distance_min_m);
-    config.stereo_ranger.distance_max_m = ReadOptionalPositiveDouble(
-        stereo_ranger, "distance_max_m", config.stereo_ranger.distance_max_m);
-    config.stereo_ranger.tau_y_px = ReadOptionalPositiveDouble(
-        stereo_ranger, "tau_y_px", config.stereo_ranger.tau_y_px);
-    config.stereo_ranger.tau_h_ratio = ReadOptionalPositiveDouble(
-        stereo_ranger, "tau_h_ratio", config.stereo_ranger.tau_h_ratio);
-    config.stereo_ranger.smooth_alpha = ReadOptionalPositiveDouble(
-        stereo_ranger, "smooth_alpha", config.stereo_ranger.smooth_alpha);
-    config.stereo_ranger.jump_reset_m = ReadOptionalPositiveDouble(
-        stereo_ranger, "jump_reset_m", config.stereo_ranger.jump_reset_m);
+    // 存原始值，待依赖链校验后再按 config.json 同目录解析（见文件后段）
+    config.stereo_ranger.rectify_matrices_path = stereo_ranger.value(
+        "rectify_matrices_path", config.stereo_ranger.rectify_matrices_path);
+    config.stereo_ranger.disp_min_px = ReadOptionalPositiveDouble(
+        stereo_ranger, "disp_min_px", config.stereo_ranger.disp_min_px);
+    config.stereo_ranger.disp_max_px = ReadOptionalPositiveDouble(
+        stereo_ranger, "disp_max_px", config.stereo_ranger.disp_max_px);
+    config.stereo_ranger.coarse_stride = ReadOptionalPositiveInt(
+        stereo_ranger, "coarse_stride", config.stereo_ranger.coarse_stride);
+    config.stereo_ranger.fine_halfwidth = ReadOptionalPositiveInt(
+        stereo_ranger, "fine_halfwidth", config.stereo_ranger.fine_halfwidth);
+    config.stereo_ranger.uniqueness_ratio = ReadOptionalPositiveDouble(
+        stereo_ranger, "uniqueness_ratio", config.stereo_ranger.uniqueness_ratio);
+    config.stereo_ranger.lr_tol_px =
+        stereo_ranger.value("lr_tol_px", config.stereo_ranger.lr_tol_px);
+    config.stereo_ranger.census_win = ReadOptionalPositiveInt(
+        stereo_ranger, "census_win", config.stereo_ranger.census_win);
+    config.stereo_ranger.max_points_per_target = ReadOptionalPositiveInt(
+        stereo_ranger, "max_points_per_target",
+        config.stereo_ranger.max_points_per_target);
+    config.stereo_ranger.grid_cells = ReadOptionalPositiveInt(
+        stereo_ranger, "grid_cells", config.stereo_ranger.grid_cells);
+    config.stereo_ranger.warmup_frames =
+        stereo_ranger.value("warmup_frames", config.stereo_ranger.warmup_frames);
+    config.stereo_ranger.black_frame_mean_threshold =
+        stereo_ranger.value("black_frame_mean_threshold",
+                            config.stereo_ranger.black_frame_mean_threshold);
+    config.stereo_ranger.bbox_erode_px =
+        stereo_ranger.value("bbox_erode_px", config.stereo_ranger.bbox_erode_px);
+    config.stereo_ranger.min_points = ReadOptionalPositiveInt(
+        stereo_ranger, "min_points", config.stereo_ranger.min_points);
+    config.stereo_ranger.near_pct =
+        stereo_ranger.value("near_pct", config.stereo_ranger.near_pct);
+    config.stereo_ranger.near_tol_px =
+        stereo_ranger.value("near_tol_px", config.stereo_ranger.near_tol_px);
+    config.stereo_ranger.smooth_alpha =
+        stereo_ranger.value("smooth_alpha", config.stereo_ranger.smooth_alpha);
     config.stereo_ranger.input_queue_capacity = ReadOptionalPositiveSize(
         stereo_ranger, "input_queue_capacity",
         config.stereo_ranger.input_queue_capacity);
+    config.stereo_ranger.frame_buffer_depth = ReadOptionalPositiveSize(
+        stereo_ranger, "frame_buffer_depth",
+        config.stereo_ranger.frame_buffer_depth);
     config.stereo_ranger.pair_window = ReadOptionalPositiveMilliseconds(
         stereo_ranger, "pair_window_ms", config.stereo_ranger.pair_window);
+    config.stereo_ranger.settle = ReadOptionalPositiveMilliseconds(
+        stereo_ranger, "settle_ms", config.stereo_ranger.settle);
     config.stereo_ranger.summary_log_interval = ReadOptionalPositiveMilliseconds(
         stereo_ranger, "summary_log_interval_ms",
         config.stereo_ranger.summary_log_interval);
@@ -755,6 +868,15 @@ AppConfig LoadAppConfig(const std::string& path,
             "enable_stereo_ranging=true时必须启用视频链路、camera_source=uvc、"
             "stereo_split=true且启用视觉跟踪影子");
     }
+    // 预置校正矩阵：仅启用双目测距时加载（禁用时不依赖该文件）；路径与
+    // config.json 同目录解析（生产部署即 <可执行文件>/config/）。缺失/不自洽
+    // 即启动失败，避免带病影子运行。
+    if (config.runtime.enable_stereo_ranging) {
+        config.stereo_ranger.rectify_matrices_path = ResolveAdjacentPath(
+            ConfigDirectoryOf(path), config.stereo_ranger.rectify_matrices_path);
+        config.stereo_rectify =
+            LoadStereoRectifyMatrices(config.stereo_ranger.rectify_matrices_path);
+    }
 
     config.camera.rtsp_url = video.value(
         "input_rtsp", std::string("rtsp://192.168.1.100:8554/live"));
@@ -792,36 +914,6 @@ AppConfig LoadAppConfig(const std::string& path,
         config.yolo.npu_core_mode != "all") {
         throw std::invalid_argument(
             "yolo.npu_core_mode仅支持auto/core0/core01/core012/all");
-    }
-
-    // 右目检测实例：默认继承 yolo 全部值，yolo_right 段仅覆盖差异字段
-    // （设计 §4：npu_core_mode 独立，绑核 vs all 板上实测定案）。
-    config.yolo_right = config.yolo;
-    const json yolo_right = root.value("yolo_right", json::object());
-    if (yolo_right.contains("model_path")) {
-        config.yolo_right.model_path = ResolveAssetPath(
-            yolo_right.value("model_path", std::string{}), executable_directory);
-    }
-    config.yolo_right.conf_threshold =
-        yolo_right.value("conf_threshold", config.yolo_right.conf_threshold);
-    config.yolo_right.nms_threshold =
-        yolo_right.value("nms_threshold", config.yolo_right.nms_threshold);
-    config.yolo_right.input_queue_capacity = static_cast<std::size_t>(
-        yolo_right.value("input_queue_capacity",
-                         config.yolo_right.input_queue_capacity));
-    config.yolo_right.npu_core_mode =
-        yolo_right.value("npu_core_mode", config.yolo_right.npu_core_mode);
-    config.yolo_right.collect_npu_internal_perf = yolo_right.value(
-        "collect_npu_internal_perf", config.yolo_right.collect_npu_internal_perf);
-    config.yolo_right.collect_npu_perf_detail = yolo_right.value(
-        "collect_npu_perf_detail", config.yolo_right.collect_npu_perf_detail);
-    if (config.yolo_right.npu_core_mode != "auto" &&
-        config.yolo_right.npu_core_mode != "core0" &&
-        config.yolo_right.npu_core_mode != "core01" &&
-        config.yolo_right.npu_core_mode != "core012" &&
-        config.yolo_right.npu_core_mode != "all") {
-        throw std::invalid_argument(
-            "yolo_right.npu_core_mode仅支持auto/core0/core01/core012/all");
     }
 
     config.compositor.pool_capacity = static_cast<std::size_t>(
