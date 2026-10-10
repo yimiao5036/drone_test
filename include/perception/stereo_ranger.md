@@ -1,192 +1,183 @@
-# stereo_ranger 实现文档
+# stereo_ranger 实现文档（v2：稀疏 Census 路线）
 
 > 对应实现：`include/perception/stereo_ranger_core.h`、`src/perception/stereo_ranger_core.cpp`、
 > `include/perception/stereo_ranger.h`、`src/perception/stereo_ranger.cpp`
-> 对应设计：`docs/superpowers/specs/2026-09-23-双目测距v1.0-design.md`（设计冻结 2026-09-23）
-> 更新：2026-09-24（v1.0 已实现，影子接入，待板上验证）
+> 对应设计：`docs/superpowers/specs/2026-10-10-双目测距v2-稀疏Census-design.md`（设计冻结 2026-10-10）
+> 参考实现（已验证）：`tools/camera_test_ok/{stereo_core.py, distance_app.py}`、`tools/camera_test_ok/C++移植指南.md`
+> 取代 v1.0（`2026-09-23-双目测距v1.0-design.md`）：**v1.0 两目内参互换，整链失效**，见「排查要点」。
 
 ## 功能职责
 
-- **StereoRangerCore**（纯算法）：输入一对已时间配准的左右目 `DetectionResult`
-  数组，完成 匹配（硬约束 + 代价贪心）→ 去主点视差 → `Z = B/D_norm` 三角测量
-  → 有效域判定 → Z 一阶低通滤波与跳变重置 → |Δy| 在线校验统计。不碰
-  Topic/线程/日志，线程不安全，由组件壳独占调用。
-- **GreedyStereoMatcher**（默认匹配器，`IStereoMatcher` 接口注入可替换）：
-  硬约束过滤后按代价升序贪心一一配对。
-- **StereoRanger**（组件壳）：双订阅左右目检测 Topic，按
-  `header.source_time_ms` 以 ±`pair_window_ms` 时间邻接配对左右帧，交 core
-  测距，每个左目目标发布一条 `StereoTargetDistance`（未匹配 valid=false 照常
-  发布方位）。独立消费线程，与 YoloDetector 相同的线程模型。
+- **StereoRangerCore**（纯算法）：输入一帧**基准灰度图 + 辅助灰度图 + 左目检测框**，
+  完成 校正（预置矩阵）→ 行带 remap → Shi-Tomasi 关键点 → Census 7×7 →
+  粗/精搜索 + 抛物线亚像素 + 唯一性 + 左右一致性 → bbox 近端簇聚合
+  （Z/X/Y/欧氏/IQR）→ EMA 平滑。不碰 Topic/线程/日志；线程不安全，由组件壳独占调用。
+- **StereoRanger**（组件壳）：订阅左目检测框与左右目原始帧，按 `frame_sequence` 把检测
+  成批、按时间窗把左右帧配对，交 core 测距，每个左目检测框发布一条 `StereoTargetDistance`。
 
-边界（v1.0）：
-- **影子链路组件**：发布 `kStereoTargetDistance`，唯一消费者是
-  `VisualTrackingShadow` 的距离通道（可选输入）；不产生飞行控制输出；
-  不注册健康源（本轮设计决定）。
-- **不做 remap 立体校正**：直接使用原始像素与标定内参；校正质量由 |Δy| 在线
-  残差统计兜底，持续超门限打 WARN 提示评估升级 remap（v1.1）。
-- **v1.0 单目标约定**：`track_id` 恒 0，多目标只做类别 + 最近邻滤波关联，
-  全量跟踪留 v1.1。
-- 右目无检测帧时 YOLO 不发布消息，走左帧超龄路径（按空右帧处理）。
-- 不做 NED 卡尔曼融合、不改控制律数学、方位通道不切换 x_mid（字段照发，
-  接入切换留后续）。
+### 目序（写死，勿动）
+
+| 角色 | 来源 | 物理身份 |
+|---|---|---|
+| 基准图（视差/YOLO/3D 坐标系） | `kDecodedFrameLeft`（SBS 右半幅） | **物理左目** |
+| 辅助图（只用于匹配） | `kDecodedFrameRight`（SBS 左半幅） | 物理右目 |
+
+标定文件（`config/camera_calibration_uvc_1280x720.json`）的 `left`/`right` 指 **SBS 半幅**、
+不是物理目；`T_m[0]=+0.0601>0`（cam1 在 cam2 的 +x 侧）⇒ SBS 左半是物理**右**目。
+校正以 cam2（SBS 右半）为基准：`R'=Rᵀ、T'=−RᵀT`，`stereoRectify(K_ref=K2, D2, K1, D1, …, R', T')`；
+视差 `d = u_ref − u_aux > 0`，`Z = fxB/d`，`fxB = fx_rect × |T| = 63.57 m·px`。
+主工程拆分器（`stereo_frame_splitter`）的左目输出已是 SBS 右半幅，语义天然一致。
+
+### 边界（v2）
+
+- **影子链路组件**：发布 `kStereoTargetDistance`，唯一消费者是 `VisualTrackingShadow`
+  的距离通道（可选输入）；不产生飞行控制输出；不注册健康源。
+- **只在基准图跑检测**：无右目检测实例（`yolo_right` 已删除，省约一半 NPU）。
+- 不做多目标跟踪（`track_id` 恒 0）、不做 NED 融合、不做饱和点剔除（仅截断告警）。
+- 校正矩阵**预置**（Python 一次性导出），C++ 不引入 OpenCV。
 
 ## 接口与数据流
 
 ```
-Topic<DetectionResult> kDetection（左目）       ─┐
-                                                 ├─► StereoRanger（消费线程）
-Topic<DetectionResult> kDetectionRight（右目）  ─┘        │
-        按 header.source_time_ms 分组为帧；               │
-        左帧在挂起右帧中找 |Δt|≤pair_window_ms 的最近者   ▼
-                                     Topic<StereoTargetDistance> kStereoTargetDistance
-                                                │
-                                                ▼
-                            VisualTrackingShadow::SetDistanceInput（可选）
-                            valid 且未超龄 → 距离 PID 接管（影子观察）；
-                            无效/未接线 → 回落 no_distance_action=kSlowApproach
+Topic<DetectionResult> kDetection（基准图检测框，原始左图坐标） ─┐
+Topic<FrameHandle> kDecodedFrameLeft （基准图=SBS右半,NV12）   ─┼─► StereoRanger（消费线程）
+Topic<FrameHandle> kDecodedFrameRight（辅助图=SBS左半,NV12）   ─┘        │
+  帧环形缓冲（按 sequence，深度 frame_buffer_depth）；                    │
+  检测按 frame_sequence 成批（新序号或 settle 超时闭合）；                 ▼
+  ≤pair_window 时间窗配对左右帧 → core.Process            Topic<StereoTargetDistance>
+                                                                        │
+                                                                        ▼
+                                    VisualTrackingShadow::SetDistanceInput（可选）
+                                    valid 且未超龄 → 距离 PID 接管（影子观察）；
+                                    无效/未接线 → 回落 no_distance_action=kSlowApproach
 ```
-
-配对语义（组件壳）：
-- 消费线程以 10ms 节拍阻塞等待左目消息驱动 Pump；右目消息只入挂起表。
-- 左帧超龄（now−t > pair_window）仍无右帧配对时，按空右帧调 core 并照常发布
-  （valid=false，方位字段取左目），保证下游每个左目目标都有节拍。
-- 超龄右帧（> 4×pair_window）直接丢弃；左右目无检测帧不发布消息。
-- 拆分器左右帧时间差实测 0~1ms，因此用 ±pair_window 邻接配对而非同帧相等。
 
 `StereoTargetDistance` 字段（`include/common/types.h`）：
 
-| 字段 | 含义 |
+| 字段 | v2 语义 |
 |---|---|
-| `header` | `sequence`/`receive_time_ms` 由组件发布时填写；`source_time_ms` 取左目帧 |
-| `frame_sequence` | 左目帧序号 |
-| `class_id` / `track_id` | 类别（0=无人机）；v1.0 track_id 恒 0 |
-| `forward_distance_m` | 前向距离 Z（米，滤波后）；valid=false 时 NaN |
-| `slant_range_m` | 斜距 R（米，参考值）；valid=false 时 NaN |
-| `disparity_px` | 归一化视差折算左目像素视差；valid=false 时 NaN |
-| `confidence` | 左右目置信度取小；未匹配时为左目置信度 |
-| `valid` | 匹配成功且在有效域内（视差≥门限且距离在域内） |
-| `center_pixel_x_mid` | 双目中心 x 中值；未匹配时为左目中心 x |
-| `bbox_x/y/w/h` | 左目检测框（像素），供交叉校验与调试 |
+| `frame_sequence` | 基准（左目）帧序号，取自检测批次的 `frame_sequence` |
+| `forward_distance_m` | 前向距离 Z（米，EMA 后）；不可用 NaN |
+| `slant_range_m` | 斜距（按平滑后 Z 重算）；不可用 NaN |
+| `disparity_px` | 近端簇中位视差（px，校正图坐标系）；不可用 NaN |
+| `confidence` | 左目检测置信度 |
+| `valid` | 聚合成功（近端簇点数 ≥ `min_points`） |
+| `center_pixel_x_mid` | 腐蚀后框中心 x（校正图）；不可用时取原始框中心 x |
+| `bbox_x/y/w/h` | 左目检测框（**原始左图坐标**，未腐蚀） |
+| `header.source_time_ms` | 基准帧的拆分完成时刻（帧元数据 `timestamp_ms`） |
+
+配置（`config.json` 的 `stereo_ranger` 段，默认值即参考实现实测）：
+
+`disp_min_px=8.0`（约 7.9m）、`disp_max_px=160.0`（约 0.40m）、`coarse_stride=2`、
+`fine_halfwidth=6`、`uniqueness_ratio=1.05`、`lr_tol_px=1.0`、`census_win=7`、
+`max_points_per_target=80`、`grid_cells=4`、`warmup_frames=15`、
+`black_frame_mean_threshold=2.0`、`bbox_erode_px=5`、`min_points=30`、`near_pct=90.0`、
+`near_tol_px=3.0`、`smooth_alpha=0.4`、`input_queue_capacity=2`、`frame_buffer_depth=4`、
+`pair_window_ms=20`、`settle_ms=50`、`summary_log_interval_ms=10000`。
+`StereoRangerConfig::Validate()` 对非法取值抛 `std::invalid_argument`。
+
+总开关 `runtime.enable_stereo_ranging`（默认 false；依赖链：enable_video +
+camera_source=uvc + stereo_split + enable_visual_tracking，config.cpp 校验）。
+启用时由 config 模块从 **`config/stereo_rectify_uvc_1280x720.json`**（与 config.json 同目录，
+`tools/camera_calibration/export_rectify.py` 生成）加载预置矩阵；缺失/不自洽即启动失败。
 
 Topic 一览：
 
 | Topic 常量 | 消息类型 | 生产者 | 消费者 |
 |---|---|---|---|
-| `kDetection` | `DetectionResult` | YoloDetector（左目） | FrameCompositor、StereoRanger |
-| `kDetectionRight` | `DetectionResult` | 右目 YoloDetector | StereoRanger |
+| `kDetection` | `DetectionResult` | YoloDetector（基准图） | FrameCompositor、StereoRanger |
+| `kDecodedFrameLeft/Right` | `video::FrameHandle` | StereoFrameSplitter | YoloDetector/叠加器/图传、StereoRanger |
 | `kStereoTargetDistance` | `StereoTargetDistance` | StereoRanger | VisualTrackingShadow（可选） |
 
-配置（`stereo_ranger` 段，默认值即 2026-09-23 标定实测
-`config/camera_calibration_uvc_1280x720.json`，由 config.cpp 解析覆盖）：
-`baseline_m=0.060085`、左目 `fx=1007.82/fy=1008.02/cx=620.73/cy=532.07`、
-右目 `fx=1006.59/fy=1006.07/cx=674.76/cy=526.70`、`disparity_min_px=3.0`、
-`distance_min_m=1.0`、`distance_max_m=11.0`、`tau_y_px=2.0`（⚠初值待板上回填）、
-`tau_h_ratio=0.25`、`smooth_alpha=0.3`、`jump_reset_m=5.0`、
-`pair_window_ms=20`、`summary_log_interval_ms=10000`。
-`StereoRangerConfig::Validate()` 对非法取值抛 `std::invalid_argument`。
-右目检测器由 `yolo_right` 段配置（缺省字段全部继承 `yolo`，仅
-`npu_core_mode` 独立）。总开关 `runtime.enable_stereo_ranging`（默认 false，
-依赖链：enable_video + camera_source=uvc + stereo_split + enable_visual_tracking，
-config.cpp 校验）。
+## 关键实现点（语义照抄参考实现，逐条可核对）
 
-## 关键实现点
-
-- **去主点视差（v1.0 最大的坑）**：两目主点 cx 实测差约 54px
-  （左 620.73 / 右 674.76），直接用框 x 坐标差算视差会在近距出现符号反转。
-  实现先做焦距归一化 `uL = (xL − cx_left)/fx_left`、
-  `uR = (xR − cx_right)/fx_right`（uL/uR 无量纲），取归一化视差
-  `D_norm = uL − uR`，三角测量 `Z = B / D_norm`（B = baseline_m）。
-  折算左目像素视差 `D_px = D_norm·fx_left`（消息 `disparity_px` 字段即此值），
-  等价写法 `Z = fx_left·B / D_px`，实测 `fx_left·B ≈ 1007.82 × 0.060085 ≈ 60.57`。
-  有专门的近距符号回归用例
-  （`NearDistanceSignRegression_PrincipalPointGap54px`）。
-- **贪心匹配**（设计 §3.2 原样）：硬约束——类别一致；|Δy|（去 cy）≤
-  `tau_y_px`；去主点视差对应距离在 `[distance_min_m, distance_max_m]`；
-  框高比 |hL−hR|/max ≤ `tau_h_ratio`。代价
-  `cost = |Δy|/tau_y + |Δh|/(tau_h·max)`，按 cost 升序逐一配对，cost<1
-  才接受，一一配对。目标数少，O(n²) 足够；匹配器接口注入，可替换匈牙利。
-- **有效域 ≤11m**：判据 `valid ⇔ 视差 ≥ disparity_min_px(3px) 且 Z ∈
-  [1, 11]m`。11m 上限来自误差模型 δZ ≈ Z²·δD/(F·B) 按实测 F·B=60.57、
-  δD=1px 取 δZ≤2m 的边界（思路文档 §5.3 已按实测重算）。
-- **滤波与跳变重置**：Z 一阶低通 `Z_f = α·Z + (1−α)·Z_prev`（α=0.3）；
-  |ΔZ| > `jump_reset_m`(5m) 直接重置不滤波，抑制单帧抖动又不拖慢真实跳变。
-  未匹配不清空滤波器；`ResetFilter()` 由组件 Stop 时调用。
-- **|Δy| 在线校验（不 remap 的代价兜底）**：core 对每对匹配维护 |Δy|（去 cy）
-  滑窗 P95（无样本 NaN）；组件摘要日志输出，连续 3 个摘要周期超 `tau_y_px`
-  打 WARN，提示未 remap 校正质量不足、评估升级 remap（v1.1）。
-- **线程模型与停机**：`Start()` 订阅双输入（队列容量 `input_queue_capacity` 默认 2，
-  丢最旧）并启动消费线程；`Stop()` 置停止标志 → Reset 双订阅唤醒阻塞等待 →
-  join → `core.ResetFilter()`。Start/Stop 幂等。热路径零日志。
-- **输出契约**：每个左目目标恰好一条输出；core 只填 `frame_sequence` 与
-  `header.source_time_ms`，`header.sequence`（本地单调计数器，跨重启不重置）
-  与 `receive_time_ms` 由组件发布时填写。
-- **装配**（`DroneApplication`）：`enable_stereo_ranging=true` 时创建右目
-  YoloDetector（订阅 `kDecodedFrameRight`）与 StereoRanger（左输入接左目
-  `DetectionOutput()`，右输入接右目 `DetectionOutput()`），`DistanceOutput()`
-  接 `VisualTrackingShadow::SetDistanceInput()`；右目检测器不接入健康上报
-  （本轮设计决定），右目链路降级经 StereoRanger 摘要的配对率/有效域占比
-  可观测；StereoRanger 不注册新健康源。
+- **校正映射表**：`P_ref⁻¹` 归一化 → `R_refᵀ` → 正向畸变模型 → `K_ref` 投影，
+  得到 rect→source 采样坐标（float32，init 时一次构建，约 14MB）。
+  `SourceToRectRef` 为解析逆映射（畸变逆解定点迭代 10 次），用于把检测框从原始坐标
+  映射到校正坐标（四角+四边中点包围盒，向外取整）。
+- **行带处理**：只在检测框联合区域 ±（采样余量 + Census 半径）的行带上做 remap、
+  Census 与提点（带内结果与全幅逐像素一致；Census 只依赖自身邻域），大幅省算力。
+- **Census**：以中心像素为阈值（`>=` 判据）的 7×7 邻域（跳过中心，48 位 → `uint64`），
+  越界按复制延拓。位序自定，但左右图与所有帧必须一致。
+- **代价引擎**：基准点窗口预提取一次；候选视差只做**列平移**（`x_R = x_L − d`），
+  行不变；越界**按行列分别裁剪**（线性索引裁剪会跨行回绕）。
+- **匹配主流程**：粗搜索（stride=2，候选不足 3 个时 9 点等分）→ 精搜索（±6，step=1）
+  → 抛物线亚像素（clip ±1）→ 唯一性（峰位 **±2 之外**的次优/最优 ≥ 1.05）
+  → 左右一致性（以右图点回搜 `x_L = x_R + d`，**加号**；容差 1.0px）。
+- **关键点**：Shi-Tomasi（blockSize=5、quality=0.01、minDistance=8、3×3 局部极大、
+  按质量降序 + minDistance 贪心抑制）+ **4×4 网格轮转**取点，每目标 ≤80。
+  与 OpenCV `goodFeaturesToTrack` 非逐位一致（见「测试方式」的隔离设计）。
+- **聚合（bbox 近端簇）**：框向内腐蚀 5px → 取框内有效匹配点（< `min_points` 判不可用）
+  → `near_pct=90` 分位 `d_near` → 聚 `d ≥ d_near − 3px` 的近端簇（簇内不足退回全体）
+  → 簇内**中位数** → `Z = fxB/d_med`；X/Y 用腐蚀后框中心与 `P_ref`；
+  IQR = p75−p25 作置信度。百分位为 numpy 语义（线性插值）。
+- **帧间平滑**：按 `(class_id, x1//40, y1//40)` 分桶 EMA（`smooth_alpha=0.4`）；
+  X/Y/欧氏距离按平滑后 Z 重算（`scale = Z_f/Z_raw`），保证自洽。
+- **截断告警**：`d_med ≥ disp_max − 2` 置截断标志（摘要计数 + 节流 WARN），
+  提示距离可能更近（量程近端 0.4m 顶格）。
+- **组件帧/批次**：帧缓冲持有 Topic 消息指针（占用拆分器内存池槽位，深度 4，
+  受池容量 8 约束）；批次闭合 = 新 `frame_sequence` 到达或 `settle_ms` 超时；
+  等帧上限 200ms，超限/被挤出时该批次每框发一条 valid=false（保持节拍）。
+- **线程模型与停机**：`Start()` 订阅三路输入（队列容量 2，丢最旧）并启动消费线程；
+  10ms 节拍阻塞等待左目检测驱动 Pump；`Stop()` 置停止标志 → Reset 三路订阅唤醒 →
+  join → `core.Reset()`。Start/Stop 幂等。
 
 ## 日志行为
 
 | 场景 | 等级 | 节流 |
 |------|------|------|
-| 创建（shadow=true、有效域）、启动、停止（累计计数） | INFO | 否 |
-| 摘要：左帧数/匹配对/配对率/有效数/有效域内占比/\|Δy\| P95/测距 avg/max | INFO | `summary_log_interval_ms`（默认 10s） |
-| \|Δy\| P95 连续 3 个摘要周期超 tau_y_px | WARN | 摘要节拍（提示评估升级 remap v1.1） |
-| 启动时左/右目输入未接线 | ERROR | 否（启动路径一次性，Start 返回 false） |
-| 逐帧配对/测距 | 不打日志 | — |
+| 创建（fx_rect/基线/fxB/视差区间）、启动、停止（累计计数） | INFO | 否 |
+| 摘要：帧数/匹配帧/批次/发布/有效测距/有效占比/跳过/帧未配/截断/耗时 | INFO | `summary_log_interval_ms` |
+| 批次未配对到帧（左/右帧缺失或被挤出） | WARN | 第 1 次 + 每满 100 次 |
+| 视差顶到搜索上限（截断） | WARN | 第 1 次 + 每满 100 次 |
+| 启动时三路输入未接线 | ERROR | 否（启动路径一次性，Start 返回 false） |
+| 逐帧匹配/聚合 | 不打日志 | — |
 
-口径说明：摘要中配对率/有效域占比为启动以来累计计数（`ProcessedPairCount()`/
-`MatchedPairCount()`/`ValidDistanceCount()` 单调累计），测距耗时 avg/max
-按摘要周期重置（每周期清零重新统计）。
-
-排查计数：`ProcessedPairCount()`（已处理左目帧数，含超龄未配对）、
-`MatchedPairCount()`、`ValidDistanceCount()`、`ErrorCount()`、
-`DeltaYP95Px()`。
+排查计数：`ProcessedFrameCount()`/`MatchedFrameCount()`/`AvailableCount()`/
+`ClippedCount()`/`SkippedFrameCount()`/`BatchCount()`/`FrameMissCount()`/
+`ErrorCount()`/`LastMatchMs()`。
 
 ## 测试方式
 
 - **开发机（WSL2 Ubuntu 24.04）**：
   ```bash
   cmake -S . -B build && cmake --build build -j$(nproc)
-  ./build/stereo_ranger_core_test   # 匹配器硬约束逐条拒绝/贪心一一配对、
-                                    # 去主点视差数值（含 cx 差 54px 符号回归）、
-                                    # 有效域边界（11m valid / 15m invalid / 视差门限）、
-                                    # 低通滤波与跳变重置、无匹配 valid=false、
-                                    # |Δy| P95 滑窗、配置校验、Mock 匹配器注入
-  ./build/stereo_ranger_test        # 组件：未接线拒绝启动、时间窗配对、
-                                    # 右目乱序先到仍配对、左帧超龄 valid=false、
-                                    # Stop 幂等与重启
-  ./build/visual_tracking_shadow_test --gtest_filter='*Distance*'
-                                    # 影子距离接通：valid 距离驱动距离 PID、
-                                    # 无效/超龄回落 kSlowApproach
-  ctest --test-dir build --output-on-failure   # 基线 333/333
+  ./build/stereo_ranger_core_test   # 映射表黄金采样点（对拍 OpenCV）、源↔校正往返、
+                                    # 黄金场景端到端对拍 Python 参考实现、
+                                    # 合成视差场复原/近端簇/截断/EMA、
+                                    # 预热与黑帧跳过、配置与矩阵校验
+  ./build/stereo_ranger_test        # 组件：接线校验、settle/新序号闭合、每框一条、
+                                    # 右帧缺失降级、Stop 幂等与重启
+  ctest --test-dir build --output-on-failure     # 基线 337/337
   ```
-  配置解析用例（缺段默认、非法值拒绝、依赖链校验）在 `config_test`。
-- **香橙派实机（待板上验证，留后续会话）**：静态标靶 3/5/8/11m 手持激光
-  测距仪对照、|Δy| P95 实测回填 `tau_y_px`、双推理并行帧率/时延回填
-  （思路文档 §9 预算表）、右目绑核 vs `all` 实测、摘要日志观察。
+  黄金数据（`tests/perception/data/`）由 `tests/perception/gen_stereo_golden.py`
+  用参考实现生成；Shi-Tomasi 与 OpenCV 的差异用「注入关键点」（`SetKeypointsOverride`）
+  在核心单测中隔离，端到端用例（组件测试）走真实提点。
+- **香橙派实机（板上验收，指南 §9）**：非周期纹理平面（书/海报）置 0.5/1.0/1.5/2.0m
+  卷尺对照（1m 内 ±2%、2m 处 ±5%，**禁用棋盘格/标定板**）；单调性；极线残差；
+  近端截断告警；连续 5 分钟 ≥30fps；摘要日志观察有效占比与 IQR。
+  **遗留必补**：`fxB` 绝对精度尚未与物理卷尺对齐（指南 §9.1）——若整体偏固定比例，
+  卡尺量镜头中心距并回填基线后重跑 `export_rectify.py`。
 
 ## 排查/修改要点
 
-- **无距离输出（kStereoTargetDistance 无消息）**：先确认
-  `enable_stereo_ranging=true` 且依赖链齐全（配置加载期会拒绝缺依赖的
-  启用）；再查右目检测器是否启动（订阅 `kDecodedFrameRight`，需
-  `camera_source=uvc` + `stereo_split=true`）；再看摘要日志配对率——左帧
-  全部超龄未配对说明右目无检测或 `pair_window_ms` 过窄（拆分器左右帧
-  时间差实测 0~1ms，默认 20ms 足够，异常时先查右目推理是否运行）。
-- **valid 恒 false**：配对率正常但有效域内占比低——查目标距离是否超出
-  有效域 [1, 11]m、视差是否低于 `disparity_min_px`(3px)，或标定内参与
-  当前相机档位不符（内参对应 1280×720 单目档）。
-- **近距距离符号/数值异常**：优先怀疑去主点视差被动过——两目 cx 差约
-  54px，任何直接用框 x 坐标差的改动都会在近距翻车；回归用例
-  `NearDistanceSignRegression_PrincipalPointGap54px` 必须保持通过。
-- **|Δy| P95 摘要持续超 tau_y_px（WARN）**：未 remap 的校正质量不足，
-  评估升级 remap（v1.1）；短期可对照标定文件确认内参未漂移。
-- **修改关联**：`StereoTargetDistance` 字段改动需同步
-  `docs/数据接口文档.md` 与 `include/common/types.h` 注释并重跑
-  `stereo_ranger_core_test` / `stereo_ranger_test` /
-  `visual_tracking_shadow_test`；标定更新（`tools/camera_calibration/`）
-  后必须同步 `config.json` 的 `stereo_ranger` 段与本文默认值；
+- **v1.0 失效根因（务必牢记）**：标定文件的 left/right 是 **SBS 半幅**语义，而拆分器
+  左目 Topic 是 **物理左目**（SBS 右半）。v1.0 把标定 `left` 内参（cx=620.73）用在左目
+  Topic（真实 cx=674.76）上 ⇒ 归一化视差恒多出 +0.107 ⇒ Z 恒 0.36~0.56m ⇒ valid 恒 false。
+  v2 用预置矩阵（以 cam2 为基准）从根上消除该配对歧义；**任何"按帧坐标直接套内参"的
+  改动都会重新引入该类错误**。
+- **valid 恒 false**：先看摘要「有效占比」。配对率正常但有效为 0 →
+  ① 目标超出量程（`disp_min/max` 决定 7.9m~0.4m）；② 纹理不足（弱纹理/纯色目标
+  关键点少）；③ 标定档位与当前分辨率不符（矩阵 `view_width/height` 必须 = 拆分后
+  每目尺寸）；④ 检查 `stereo_rectify_uvc_1280x720.json` 是否与当前相机标定同源。
+- **距离系统性偏差**：优先怀疑标定（fx/基线/主点）与实现所用矩阵不同源；
+  固定比例偏差 ⇒ 卡尺量基线并重跑导出脚本。
+- **帧未配（WARN）**：右帧缺失/被挤出 ⇒ 查拆分器是否丢帧（输出池满）、
+  左右目时间戳差是否超 `pair_window_ms`（实测 0~1ms）；帧缓冲深度过小
+  （< 检测推理时延/帧周期）也会导致批次拿不到帧。
+- **截断告警（WARN）**：目标进入量程下限（≈0.4m，`disp_max` 决定）；需要更近量程
+  时增大 `disp_max_px`（代价是搜索变慢）。
+- **修改关联**：`StereoTargetDistance` 字段改动需同步 `docs/数据接口文档.md`、
+  `include/common/types.h` 注释并重跑三件套测试；标定更新后必须重跑
+  `tools/camera_calibration/export_rectify.py` 并同步 `config.json` 的 `stereo_ranger` 段；
   控制律侧距离语义见 `include/control/tracking_control_law.md`。
