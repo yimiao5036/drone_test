@@ -682,6 +682,9 @@ AppConfig LoadAppConfig(const std::string& path,
         stereo_ranger.value("near_tol_px", config.stereo_ranger.near_tol_px);
     config.stereo_ranger.smooth_alpha =
         stereo_ranger.value("smooth_alpha", config.stereo_ranger.smooth_alpha);
+    // 诊断开关默认 false，不在生产热路径留诊断调用（同 yolo.collect_* 约定）
+    config.stereo_ranger.collect_detailed_latency = stereo_ranger.value(
+        "collect_detailed_latency", config.stereo_ranger.collect_detailed_latency);
     config.stereo_ranger.input_queue_capacity = ReadOptionalPositiveSize(
         stereo_ranger, "input_queue_capacity",
         config.stereo_ranger.input_queue_capacity);

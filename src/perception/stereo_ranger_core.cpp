@@ -841,6 +841,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     }
 
     // ---- 2. 联合包围盒 → 行带 ----
+    const bool collect = cfg.collect_detailed_latency;
     const auto t_remap0 = std::chrono::steady_clock::now();
     double ux0 = std::numeric_limits<double>::max();
     double uy0 = std::numeric_limits<double>::max();
@@ -923,9 +924,11 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         }
     }
     const double band_mean = mean_sum / (static_cast<double>(band_h) * crop_w);
-    impl_->stage_remap.Add(
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_remap0).count());
+    if (collect) {
+        impl_->stage_remap.Add(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_remap0).count());
+    }
     if (band_mean < cfg.black_frame_mean_threshold) {
         ++impl_->skipped_frames;
         return results;
@@ -992,9 +995,11 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     }
 
     const int n = static_cast<int>(keypoints.size());
-    impl_->stage_keypoints.Add(
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_kp0).count());
+    if (collect) {
+        impl_->stage_keypoints.Add(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_kp0).count());
+    }
     std::vector<double> disp(keypoints.size(), kNaN);
     std::vector<bool> point_valid(keypoints.size(), false);
 
@@ -1007,9 +1012,11 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
                                             crop_w, cfg.census_win, 0, band_h);
         impl_->census_aux = CensusTransform(impl_->band_aux.data(), crop_w, band_h,
                                             crop_w, cfg.census_win, 0, band_h);
-        impl_->stage_census.Add(
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t_census0).count());
+        if (collect) {
+            impl_->stage_census.Add(
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_census0).count());
+        }
 
         const int k = cfg.census_win * cfg.census_win;
         const int wr = cr;
@@ -1230,21 +1237,26 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
             point_valid[i] = std::isfinite(disp[i]) &&
                              ratio[i] >= cfg.uniqueness_ratio && lr_ok[i];
         }
-        impl_->last_points.resize(keypoints.size());
-        for (int i = 0; i < n; ++i) {
-            StereoRangerCore::PointDebug debug;
-            debug.x = keypoints[i].first;
-            debug.y = keypoints[i].second;
-            debug.disparity = static_cast<float>(disp[i]);
-            debug.uniqueness_ratio = static_cast<float>(ratio[i]);
-            debug.lr_ok = lr_ok[i];
-            debug.lr_best_back = static_cast<float>(lr_best_back[i]);
-            debug.valid = point_valid[i];
-            impl_->last_points[static_cast<std::size_t>(i)] = debug;
+        impl_->last_points.clear();
+        if (collect) {
+            impl_->last_points.resize(keypoints.size());
+            for (int i = 0; i < n; ++i) {
+                StereoRangerCore::PointDebug debug;
+                debug.x = keypoints[i].first;
+                debug.y = keypoints[i].second;
+                debug.disparity = static_cast<float>(disp[i]);
+                debug.uniqueness_ratio = static_cast<float>(ratio[i]);
+                debug.lr_ok = lr_ok[i];
+                debug.lr_best_back = static_cast<float>(lr_best_back[i]);
+                debug.valid = point_valid[i];
+                impl_->last_points[static_cast<std::size_t>(i)] = debug;
+            }
         }
         impl_->last_match_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_match0).count();
-        impl_->stage_match.Add(impl_->last_match_ms);
+        if (collect) {
+            impl_->stage_match.Add(impl_->last_match_ms);
+        }
     }
     ++impl_->matched_frames;
 
@@ -1353,8 +1365,10 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     const auto t_total1 = std::chrono::steady_clock::now();
     impl_->last_total_ms =
         std::chrono::duration<double, std::milli>(t_total1 - t_total0).count();
-    impl_->stage_aggregate.Add(std::chrono::duration<double, std::milli>(
-        t_total1 - t_agg0).count());
+    if (collect) {
+        impl_->stage_aggregate.Add(std::chrono::duration<double, std::milli>(
+            t_total1 - t_agg0).count());
+    }
     return results;
 }
 

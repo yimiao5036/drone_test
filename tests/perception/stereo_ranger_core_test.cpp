@@ -319,7 +319,9 @@ TEST(StereoRangerCoreTest, CensusEncodingMatchesSpecOnBothPaths) {
 TEST(StereoRangerCoreTest, MatchingWorksForKeypointsStraddlingEdgeEncoding) {
     const auto ref = MakeRefImage();
     const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
-    StereoRangerCore core(TestConfig(), IdentityMatrices());
+    StereoRangerConfig cfg = TestConfig();
+    cfg.collect_detailed_latency = true;  // 本用例要用逐点快照
+    StereoRangerCore core(cfg, IdentityMatrices());
     // 参考窗口落在 [W-7, W-2]：跨列 W-3（= kSynthW-3）的内列/边界列编码分界；
     // 目标窗口（左移 12px）完全落在内列——两条路径位序不一致时这些点必然失配。
     std::vector<std::pair<float, float>> keypoints;
@@ -353,6 +355,24 @@ TEST(StereoRangerCoreTest, MatchingWorksForKeypointsStraddlingEdgeEncoding) {
     EXPECT_GE(results[0].cluster_points, 30);
     const double fxb = IdentityMatrices().fxb_m_px;
     EXPECT_NEAR(results[0].z_m, fxb / 12.0, 0.02 * fxb / 12.0);
+}
+
+// ---------------------------------------------------------------------------
+// 诊断开关：默认关闭时不留逐点快照、阶段窗口为空（生产热路径零诊断），
+// 但测距功能不受影响
+// ---------------------------------------------------------------------------
+TEST(StereoRangerCoreTest, DetailedLatencyDisabledLeavesNoDiagnostics) {
+    const auto ref = MakeRefImage();
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
+    StereoRangerCore core(TestConfig(), IdentityMatrices());  // 默认 false
+    core.SetKeypointsOverride(GridKeypoints());
+    const auto results =
+        core.Process(ViewSynth(ref), ViewSynth(aux),
+                     {MakeBox(20, 20, kSynthW - 15, kSynthH - 5)});
+    EXPECT_TRUE(results[0].available) << "诊断关闭不应影响测距功能";
+    EXPECT_TRUE(core.LastPointDebugForTest().empty());
+    EXPECT_EQ(core.StageLatency().remap.window_count, 0u);
+    EXPECT_EQ(core.StageLatency().match.window_count, 0u);
 }
 
 // ---------------------------------------------------------------------------

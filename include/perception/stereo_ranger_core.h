@@ -80,6 +80,10 @@ struct StereoRangerConfig {
     double near_tol_px = 3.0;  ///< 近端簇容差（px）
     double smooth_alpha = 0.4; ///< EMA 系数 [0,1]；0=关闭
 
+    // ---- 诊断（默认关，不在生产热路径留诊断调用；同 yolo.collect_* 约定）----
+    bool collect_detailed_latency = false;  ///< 阶段耗时细分（remap/census/提点/匹配/聚合）
+                                            ///< 与逐关键点调试快照；基线/排查时置 true
+
     // ---- 组件壳（配对/缓冲/日志）----
     std::size_t input_queue_capacity = 2;    ///< 每路订阅队列容量（丢最旧）
     std::size_t frame_buffer_depth = 4;      ///< 帧环形缓冲深度（受拆分器池容量约束，≥2）

@@ -133,11 +133,19 @@ int main(int argc, char** argv) {
         box_y1 = std::atof(argv[5]);
     }
 
+    bool stats = true;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--no-stats") {
+            stats = false;  // A/B：关闭阶段与逐点诊断（= 生产默认），量诊断开销
+        }
+    }
+
     try {
         StereoRangerConfig cfg;
         cfg.disp_min_px = 8.0;
         cfg.disp_max_px = 160.0;
         cfg.warmup_frames = 0;
+        cfg.collect_detailed_latency = stats;  // 基准要看阶段耗时；--no-stats 做诊断开销 A/B
         const StereoRectifyMatrices matrices =
             LoadMatrices("config/stereo_rectify_uvc_1280x720.json");
         StereoRangerCore core(cfg, matrices);
@@ -155,7 +163,9 @@ int main(int argc, char** argv) {
 
         std::cout << "双目测距基准: 视差=[" << cfg.disp_min_px << ","
                   << cfg.disp_max_px << "]px 框=" << box.bbox_w << "x" << box.bbox_h
-                  << " 迭代=" << iterations << "（开发机 x86 数字，板上约为 1/2~1/4）\n";
+                  << " 迭代=" << iterations
+                  << " 诊断统计=" << (stats ? "开" : "关(--no-stats)")
+                  << "（开发机 x86 数字，板上约为 1/2~1/4）\n";
 
         // 预热（JIT/缓存/TLB 稳定）+ 计时
         for (int i = 0; i < 3; ++i) {
