@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/latency_statistics.h"
 #include "common/types.h"
 
 namespace drone::perception {
@@ -102,6 +103,16 @@ struct GrayImageView {
     }
 };
 
+/// 单帧各阶段耗时快照（毫秒，滚动窗口统计；摘要日志与开发机基准用）。
+/// 跳过帧（预热/黑帧）只记录已执行到的阶段，未执行的保持空窗口。
+struct StereoStageLatency {
+    common::LatencySummary remap;      ///< 行带 remap（双目）+ 黑帧检查
+    common::LatencySummary keypoints;  ///< 掩膜 + Shi-Tomasi + 网格取点
+    common::LatencySummary census;     ///< Census 变换（双目）
+    common::LatencySummary match;      ///< 粗/精搜索 + 亚像素 + 唯一性 + 左右一致性
+    common::LatencySummary aggregate;  ///< 逐框近端簇聚合 + EMA
+};
+
 /// 单框测距结果（校正图＝基准图像素坐标系；米制字段不可用时为 NaN）。
 struct StereoRangeResult {
     bool available = false;  ///< 近端簇点数 ≥ min_points（匹配与聚合成功）
@@ -154,6 +165,8 @@ public:
     std::uint64_t SkippedFrameCount() const;     ///< 黑帧+预热跳过帧数
     double LastMatchMs() const;                  ///< 最近一次匹配耗时（ms）
     double LastTotalMs() const;                  ///< 最近一次 Process 耗时（ms）
+    /// 各阶段耗时滚动窗口快照（每帧热路径 Add，摘要时 Snapshot 排序）。
+    StereoStageLatency StageLatency() const;
 
     /// 清空 EMA/统计状态（组件 Stop 时调用）。
     void Reset();

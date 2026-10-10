@@ -260,6 +260,38 @@ TEST(StereoRangerCoreTest, NearClusterPicksForeground) {
 }
 
 // ---------------------------------------------------------------------------
+// 列裁剪等价：同一场景、同一批关键点，窄框（裁剪生效）与全宽框结果必须完全一致
+// （裁剪只省算力，不改变任何被访问列与裁剪语义；用窄框直接压这条路径）
+// ---------------------------------------------------------------------------
+TEST(StereoRangerCoreTest, ColumnCropDoesNotChangeResults) {
+    const auto ref = MakeRefImage();
+    const auto aux = MakeAuxImage(std::vector<int>(kViewWidth, 12));
+    // 关键点全部落在窄框腐蚀后的区域内，两次聚合计数同一批点
+    std::vector<std::pair<float, float>> keypoints;
+    for (int gy = 0; gy < 6; ++gy) {
+        for (int gx = 0; gx < 8; ++gx) {
+            keypoints.emplace_back(212.0f + gx * 11.0f, 36.0f + gy * 33.0f);
+        }
+    }
+    const StereoRectifyMatrices matrices = IdentityMatrices();
+    StereoRangerCore narrow(TestConfig(), matrices);
+    StereoRangerCore wide(TestConfig(), matrices);
+    narrow.SetKeypointsOverride(keypoints);
+    wide.SetKeypointsOverride(keypoints);
+
+    const auto small =
+        narrow.Process(View(ref), View(aux), {MakeBox(200, 25, 300, 225)});
+    const auto full = wide.Process(View(ref), View(aux),
+                                   {MakeBox(0, 0, kViewWidth, kViewHeight)});
+    ASSERT_TRUE(small[0].available);
+    ASSERT_TRUE(full[0].available);
+    EXPECT_DOUBLE_EQ(small[0].z_m, full[0].z_m);
+    EXPECT_DOUBLE_EQ(small[0].disparity_px, full[0].disparity_px);
+    EXPECT_DOUBLE_EQ(small[0].iqr_px, full[0].iqr_px);
+    EXPECT_EQ(small[0].cluster_points, full[0].cluster_points);
+}
+
+// ---------------------------------------------------------------------------
 // 截断告警：视差顶到搜索上限
 // ---------------------------------------------------------------------------
 TEST(StereoRangerCoreTest, ClippedFlagAtSearchLimit) {

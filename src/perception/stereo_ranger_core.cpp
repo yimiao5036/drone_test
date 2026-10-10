@@ -391,48 +391,106 @@ std::vector<std::pair<float, float>> SpreadByGrid(
     return out;
 }
 
+/// 通用 Census 单像素（全列裁剪路径；win=7 的边界列与 win≠7 使用）。
+/// bit 序：按 (dy, dx) 行主序跳过中心，与常量展开路径严格一致。
+inline std::uint64_t CensusPixelClamped(const std::uint8_t* const* row_ptr,
+                                        int win, int r, int x, int width) {
+    const int center = row_ptr[r][x];
+    std::uint64_t code = 0;
+    int bit = 0;
+    for (int i = 0; i < win; ++i) {
+        const std::uint8_t* row = row_ptr[i];
+        for (int j = 0; j < win; ++j) {
+            if (i == r && j == r) {
+                continue;
+            }
+            const int nx = ClampInt(x + j - r, 0, width - 1);
+            code |= static_cast<std::uint64_t>(row[nx] >= center) << bit;
+            ++bit;
+        }
+    }
+    return code;
+}
+
+// win=7 内部列的 48 邻位常量展开（bit 序号为 (dy,dx) 行主序跳过中心的编号，
+// 位移与列偏移均为编译期常量；与 CensusPixelClamped 位序一致）。
+#define DRONE_CENSUS_BIT(row_idx, off, bit_index)                            \
+    code |= static_cast<std::uint64_t>(row_ptr[row_idx][x + (off)] >= center) \
+            << (bit_index)
+
 /// Census 变换（win×win 邻域，>= 判据，跳过中心；边界复制延拓）。
 /// 输出行对应全局 y ∈ [row0, row1)。
+/// 性能要点（2026-10-10 板上前 42ms→ 优化）：源行指针按输出行只算一次；
+/// 内部列 x ∈ [r, width−r) 无列裁剪分支（只比较、移位、或）；win=7 全展开。
 std::vector<std::uint64_t> CensusTransform(const std::uint8_t* img, int width,
                                            int img_height, int stride, int win,
                                            int row0, int row1) {
     const int r = win / 2;
     const int rows = row1 - row0;
     std::vector<std::uint64_t> out(static_cast<std::size_t>(rows) * width, 0);
+    const int x_lo = ClampInt(r, 0, width);
+    const int x_hi = ClampInt(width - r, x_lo, width);
     for (int y = row0; y < row1; ++y) {
-        std::uint64_t* dst = out.data() + static_cast<std::size_t>(y - row0) * width;
-        for (int x = 0; x < width; ++x) {
-            const int center = img[static_cast<std::size_t>(y) * stride + x];
-            std::uint64_t code = 0;
-            int bit = 0;
-            for (int dy = -r; dy <= r; ++dy) {
-                const int ny = ClampInt(y + dy, 0, img_height - 1);
-                const std::uint8_t* row =
-                    img + static_cast<std::size_t>(ny) * stride;
-                for (int dx = -r; dx <= r; ++dx) {
-                    if (dy == 0 && dx == 0) {
-                        continue;
-                    }
-                    const int nx = ClampInt(x + dx, 0, width - 1);
-                    if (row[nx] >= center) {
-                        code |= (std::uint64_t{1} << bit);
-                    }
-                    ++bit;
-                }
+        const std::uint8_t* row_ptr[7];
+        for (int i = 0; i < win; ++i) {
+            row_ptr[i] = img + static_cast<std::size_t>(
+                                   ClampInt(y + i - r, 0, img_height - 1)) * stride;
+        }
+        std::uint64_t* dst =
+            out.data() + static_cast<std::size_t>(y - row0) * width;
+        if (win == 7) {
+            for (int x = x_lo; x < x_hi; ++x) {
+                const int center = row_ptr[3][x];
+                std::uint64_t code = 0;
+                DRONE_CENSUS_BIT(0, -3, 0);  DRONE_CENSUS_BIT(0, -2, 1);
+                DRONE_CENSUS_BIT(0, -1, 2);  DRONE_CENSUS_BIT(0, 0, 3);
+                DRONE_CENSUS_BIT(0, 1, 4);   DRONE_CENSUS_BIT(0, 2, 5);
+                DRONE_CENSUS_BIT(0, 3, 6);
+                DRONE_CENSUS_BIT(1, -3, 7);  DRONE_CENSUS_BIT(1, -2, 8);
+                DRONE_CENSUS_BIT(1, -1, 9);  DRONE_CENSUS_BIT(1, 0, 10);
+                DRONE_CENSUS_BIT(1, 1, 11);  DRONE_CENSUS_BIT(1, 2, 12);
+                DRONE_CENSUS_BIT(1, 3, 13);
+                DRONE_CENSUS_BIT(2, -3, 14); DRONE_CENSUS_BIT(2, -2, 15);
+                DRONE_CENSUS_BIT(2, -1, 16); DRONE_CENSUS_BIT(2, 0, 17);
+                DRONE_CENSUS_BIT(2, 1, 18);  DRONE_CENSUS_BIT(2, 2, 19);
+                DRONE_CENSUS_BIT(2, 3, 20);
+                DRONE_CENSUS_BIT(3, -3, 21); DRONE_CENSUS_BIT(3, -2, 22);
+                DRONE_CENSUS_BIT(3, -1, 23);
+                DRONE_CENSUS_BIT(3, 1, 24);  DRONE_CENSUS_BIT(3, 2, 25);
+                DRONE_CENSUS_BIT(3, 3, 26);
+                DRONE_CENSUS_BIT(4, -3, 27); DRONE_CENSUS_BIT(4, -2, 28);
+                DRONE_CENSUS_BIT(4, -1, 29); DRONE_CENSUS_BIT(4, 0, 30);
+                DRONE_CENSUS_BIT(4, 1, 31);  DRONE_CENSUS_BIT(4, 2, 32);
+                DRONE_CENSUS_BIT(4, 3, 33);
+                DRONE_CENSUS_BIT(5, -3, 34); DRONE_CENSUS_BIT(5, -2, 35);
+                DRONE_CENSUS_BIT(5, -1, 36); DRONE_CENSUS_BIT(5, 0, 37);
+                DRONE_CENSUS_BIT(5, 1, 38);  DRONE_CENSUS_BIT(5, 2, 39);
+                DRONE_CENSUS_BIT(5, 3, 40);
+                DRONE_CENSUS_BIT(6, -3, 41); DRONE_CENSUS_BIT(6, -2, 42);
+                DRONE_CENSUS_BIT(6, -1, 43); DRONE_CENSUS_BIT(6, 0, 44);
+                DRONE_CENSUS_BIT(6, 1, 45);  DRONE_CENSUS_BIT(6, 2, 46);
+                DRONE_CENSUS_BIT(6, 3, 47);
+                dst[x] = code;
             }
-            dst[x] = code;
+            for (int x = 0; x < x_lo; ++x) {
+                dst[x] = CensusPixelClamped(row_ptr, 7, 3, x, width);
+            }
+            for (int x = x_hi; x < width; ++x) {
+                dst[x] = CensusPixelClamped(row_ptr, 7, 3, x, width);
+            }
+        } else {
+            for (int x = 0; x < width; ++x) {
+                dst[x] = CensusPixelClamped(row_ptr, win, r, x, width);
+            }
         }
     }
     return out;
 }
 
+#undef DRONE_CENSUS_BIT
+
 inline int Popcount64(std::uint64_t v) {
     return __builtin_popcountll(v);
-}
-
-/// 目标图列索引：先裁参考列，再平移视差后二次裁剪（对齐参考实现语义）。
-inline int ShiftedColumn(int ref_col, int disp, int width) {
-    return ClampInt(ClampInt(ref_col, 0, width - 1) - disp, 0, width - 1);
 }
 
 }  // namespace
@@ -511,6 +569,14 @@ struct StereoRangerCore::Impl {
     std::uint64_t skipped_frames = 0;
     double last_match_ms = 0.0;
     double last_total_ms = 0.0;
+
+    // 阶段耗时滚动窗口（每帧 Add 5 次：互斥+存值 ≈ 百纳秒级，远小于帧耗时；
+    // 摘要时才 Snapshot 复制排序，符合"热路径不分配"约定）。
+    common::LatencyStatistics stage_remap{512};
+    common::LatencyStatistics stage_keypoints{512};
+    common::LatencyStatistics stage_census{512};
+    common::LatencyStatistics stage_match{512};
+    common::LatencyStatistics stage_aggregate{512};
 };
 
 // ---- 构造 / 销毁 ------------------------------------------------------------
@@ -595,6 +661,16 @@ std::uint64_t StereoRangerCore::SkippedFrameCount() const {
 }
 double StereoRangerCore::LastMatchMs() const { return impl_->last_match_ms; }
 double StereoRangerCore::LastTotalMs() const { return impl_->last_total_ms; }
+
+StereoStageLatency StereoRangerCore::StageLatency() const {
+    StereoStageLatency stage;
+    stage.remap = impl_->stage_remap.Snapshot();
+    stage.keypoints = impl_->stage_keypoints.Snapshot();
+    stage.census = impl_->stage_census.Snapshot();
+    stage.match = impl_->stage_match.Snapshot();
+    stage.aggregate = impl_->stage_aggregate.Snapshot();
+    return stage;
+}
 
 void StereoRangerCore::Reset() {
     impl_->ema.clear();
@@ -688,6 +764,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     }
 
     // ---- 2. 联合包围盒 → 行带 ----
+    const auto t_remap0 = std::chrono::steady_clock::now();
     double ux0 = std::numeric_limits<double>::max();
     double uy0 = std::numeric_limits<double>::max();
     double ux1 = std::numeric_limits<double>::lowest();
@@ -718,9 +795,32 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         return results;
     }
 
-    // ---- 3. 行带 remap（基准/辅助，双线性）+ 黑帧检查 ----
-    impl_->band_ref.resize(static_cast<std::size_t>(band_h) * view_w);
-    impl_->band_aux.resize(static_cast<std::size_t>(band_h) * view_w);
+    // ---- 2.5 列裁剪（与全幅逐像素等价的推导）----
+    // 窗口与代价只访问以下列：参考窗口 = 关键点 ±wr（关键点必在框内）；
+    // 目标窗口 = 参考列 − ceil(disp_max)；census 邻域 = 上述列再 ±r。
+    // 取 [max(0, x0 − 2r − ceil(disp_max)), min(W, x1 + 2r)) 即覆盖全部访问，
+    // 且任一被访问列的 census 邻域要么真实落在带内、要么与全幅在同一画面边缘
+    // 处裁剪，故列裁剪不改变任何结果（仅省去带宽外的算力）。
+    const int max_shift = static_cast<int>(std::ceil(cfg.disp_max_px));
+    int box_x0 = view_w;
+    int box_x1 = 0;
+    for (const RectBox& rb : rect_boxes) {
+        if (!rb.valid) {
+            continue;
+        }
+        box_x0 = std::min(box_x0, static_cast<int>(std::lround(rb.x0)));
+        box_x1 = std::max(box_x1, static_cast<int>(std::lround(rb.x1)));
+    }
+    const int crop_x0 = ClampInt(box_x0 - 2 * cr - max_shift, 0, view_w - 1);
+    const int crop_x1 = ClampInt(box_x1 + 2 * cr, 0, view_w);
+    const int crop_w = crop_x1 - crop_x0;
+    if (crop_w <= 0) {
+        return results;
+    }
+
+    // ---- 3. 行带 remap（基准/辅助，双线性；列裁剪范围内）+ 黑帧检查 ----
+    impl_->band_ref.resize(static_cast<std::size_t>(band_h) * crop_w);
+    impl_->band_aux.resize(static_cast<std::size_t>(band_h) * crop_w);
     double mean_sum = 0.0;
     for (int ly = 0; ly < band_h; ++ly) {
         const int y = band_y0 + ly;
@@ -733,38 +833,42 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         const float* mya =
             impl_->map_aux_y.data() + static_cast<std::size_t>(y) * view_w;
         std::uint8_t* dr =
-            impl_->band_ref.data() + static_cast<std::size_t>(ly) * view_w;
+            impl_->band_ref.data() + static_cast<std::size_t>(ly) * crop_w;
         std::uint8_t* da =
-            impl_->band_aux.data() + static_cast<std::size_t>(ly) * view_w;
-        for (int x = 0; x < view_w; ++x) {
-            dr[x] = static_cast<std::uint8_t>(std::lround(SampleBilinearZero(
+            impl_->band_aux.data() + static_cast<std::size_t>(ly) * crop_w;
+        for (int x = crop_x0; x < crop_x1; ++x) {
+            const int lx = x - crop_x0;
+            dr[lx] = static_cast<std::uint8_t>(std::lround(SampleBilinearZero(
                 ref.data, ref.width, ref.height, ref.stride, mxr[x], myr[x])));
-            da[x] = static_cast<std::uint8_t>(std::lround(SampleBilinearZero(
+            da[lx] = static_cast<std::uint8_t>(std::lround(SampleBilinearZero(
                 aux.data, aux.width, aux.height, aux.stride, mxa[x], mya[x])));
-            mean_sum += dr[x];
+            mean_sum += dr[lx];
         }
     }
-    const double band_mean = mean_sum / (static_cast<double>(band_h) * view_w);
+    const double band_mean = mean_sum / (static_cast<double>(band_h) * crop_w);
+    impl_->stage_remap.Add(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_remap0).count());
     if (band_mean < cfg.black_frame_mean_threshold) {
         ++impl_->skipped_frames;
         return results;
     }
 
-    // ---- 4. 联合掩膜（行带局部坐标）----
-    impl_->band_mask.assign(static_cast<std::size_t>(band_h) * view_w, 0);
+    // ---- 4. 联合掩膜（带内局部坐标：行 −band_y0，列 −crop_x0）----
+    impl_->band_mask.assign(static_cast<std::size_t>(band_h) * crop_w, 0);
     for (const RectBox& rb : rect_boxes) {
         if (!rb.valid) {
             continue;
         }
-        const int x0 = ClampInt(static_cast<int>(std::lround(rb.x0)), 0, view_w);
-        const int x1 = ClampInt(static_cast<int>(std::lround(rb.x1)), 0, view_w);
+        const int x0 = ClampInt(static_cast<int>(std::lround(rb.x0)) - crop_x0, 0, crop_w);
+        const int x1 = ClampInt(static_cast<int>(std::lround(rb.x1)) - crop_x0, 0, crop_w);
         const int y0 =
             ClampInt(static_cast<int>(std::lround(rb.y0)) - band_y0, 0, band_h);
         const int y1 =
             ClampInt(static_cast<int>(std::lround(rb.y1)) - band_y0, 0, band_h);
         for (int ly = y0; ly < y1; ++ly) {
             std::uint8_t* row =
-                impl_->band_mask.data() + static_cast<std::size_t>(ly) * view_w;
+                impl_->band_mask.data() + static_cast<std::size_t>(ly) * crop_w;
             for (int x = x0; x < x1; ++x) {
                 row[x] = 1;
             }
@@ -772,7 +876,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     }
 
     // ---- 5. 关键点（注入优先；否则 Shi-Tomasi + 网格分散）----
-    const auto t_match0 = std::chrono::steady_clock::now();
+    const auto t_kp0 = std::chrono::steady_clock::now();
     std::vector<std::pair<float, float>> keypoints;  // 校正图全局坐标
     if (!impl_->keypoints_override.empty()) {
         keypoints = impl_->keypoints_override;
@@ -784,13 +888,14 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         const int max_corners =
             std::max(cfg.max_points_per_target * std::max(box_count, 1) * 4, 16);
         const auto local = DetectCornersShiTomasi(
-            impl_->band_ref.data(), impl_->band_mask.data(), view_w, band_h,
-            view_w, /*block_size=*/5, /*quality=*/0.01, /*min_distance=*/8,
+            impl_->band_ref.data(), impl_->band_mask.data(), crop_w, band_h,
+            crop_w, /*block_size=*/5, /*quality=*/0.01, /*min_distance=*/8,
             max_corners);
         std::vector<std::pair<float, float>> global;
         global.reserve(local.size());
         for (const auto& p : local) {
-            global.emplace_back(p.first, p.second + static_cast<float>(band_y0));
+            global.emplace_back(p.first + static_cast<float>(crop_x0),
+                                p.second + static_cast<float>(band_y0));
         }
         keypoints = SpreadByGrid(global,
                                  cfg.max_points_per_target * std::max(box_count, 1),
@@ -798,15 +903,24 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     }
 
     const int n = static_cast<int>(keypoints.size());
+    impl_->stage_keypoints.Add(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_kp0).count());
     std::vector<double> disp(keypoints.size(), kNaN);
     std::vector<bool> point_valid(keypoints.size(), false);
 
     if (n > 0) {
         // ---- 6. Census（直接在已校正行带上计算；行/列越界按复制延拓裁剪）----
-        impl_->census_ref = CensusTransform(impl_->band_ref.data(), view_w, band_h,
-                                            view_w, cfg.census_win, 0, band_h);
-        impl_->census_aux = CensusTransform(impl_->band_aux.data(), view_w, band_h,
-                                            view_w, cfg.census_win, 0, band_h);
+        // 列范围为裁剪区间 [crop_x0, crop_x1)：被访问列的邻域或真实在带内、
+        // 或与全幅在同一画面边缘处裁剪（见 §2.5 推导），结果与全幅一致。
+        const auto t_census0 = std::chrono::steady_clock::now();
+        impl_->census_ref = CensusTransform(impl_->band_ref.data(), crop_w, band_h,
+                                            crop_w, cfg.census_win, 0, band_h);
+        impl_->census_aux = CensusTransform(impl_->band_aux.data(), crop_w, band_h,
+                                            crop_w, cfg.census_win, 0, band_h);
+        impl_->stage_census.Add(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_census0).count());
 
         const int k = cfg.census_win * cfg.census_win;
         const int wr = cr;
@@ -814,26 +928,29 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         impl_->win_row.resize(static_cast<std::size_t>(n) * k);
         impl_->win_col.resize(static_cast<std::size_t>(n) * k);
         for (int i = 0; i < n; ++i) {
-            const int px = ClampInt(RintToInt(keypoints[i].first), 0, view_w - 1);
+            const int px = ClampInt(RintToInt(keypoints[i].first), crop_x0, crop_x1 - 1);
             const int py = ClampInt(RintToInt(keypoints[i].second) - band_y0, 0, band_h - 1);
             std::uint64_t* win =
                 impl_->ref_window.data() + static_cast<std::size_t>(i) * k;
-            int* rows = impl_->win_row.data() + static_cast<std::size_t>(i) * k;
+            int* bases = impl_->win_row.data() + static_cast<std::size_t>(i) * k;
             int* cols = impl_->win_col.data() + static_cast<std::size_t>(i) * k;
             int slot = 0;
             for (int oy = -wr; oy <= wr; ++oy) {
                 const int ny = ClampInt(py + oy, 0, band_h - 1);
+                // base = 行索引起点 − crop_x0，与该列的全局号相加即得带内索引
+                const int base = ny * crop_w - crop_x0;
                 for (int ox = -wr; ox <= wr; ++ox) {
-                    const int nx = ClampInt(px + ox, 0, view_w - 1);
-                    rows[slot] = ny;
+                    const int nx = ClampInt(px + ox, crop_x0, crop_x1 - 1);
+                    bases[slot] = base;
                     cols[slot] = nx;
-                    win[slot] = impl_->census_ref[static_cast<std::size_t>(ny) * view_w + nx];
+                    win[slot] = impl_->census_ref[base + nx];
                     ++slot;
                 }
             }
         }
 
-        // 目标图代价：列平移 di、行不变、二次裁剪（对齐参考实现）
+        // 目标图代价：列平移 di、行不变、二次裁剪（对齐参考实现；裁剪下界换成
+        // 列裁剪区间——由 §2.5 推导，被访问列恒在该区间内，故与全幅语义一致）
         auto target_costs = [&](const int* disps, int count,
                                 const std::uint64_t* target_census,
                                 std::vector<double>* out) {
@@ -843,15 +960,14 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
                 for (int i = 0; i < n; ++i) {
                     const std::uint64_t* win =
                         impl_->ref_window.data() + static_cast<std::size_t>(i) * k;
-                    const int* rows =
+                    const int* bases =
                         impl_->win_row.data() + static_cast<std::size_t>(i) * k;
                     const int* cols =
                         impl_->win_col.data() + static_cast<std::size_t>(i) * k;
                     int sum = 0;
                     for (int slot = 0; slot < k; ++slot) {
-                        const int nx = ShiftedColumn(cols[slot], di, view_w);
-                        const std::uint64_t t = target_census[
-                            static_cast<std::size_t>(rows[slot]) * view_w + nx];
+                        const int nx = ClampInt(cols[slot] - di, crop_x0, crop_x1 - 1);
+                        const std::uint64_t t = target_census[bases[slot] + nx];
                         sum += Popcount64(win[slot] ^ t);
                     }
                     (*out)[static_cast<std::size_t>(i) * count + c] =
@@ -861,6 +977,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         };
 
         // ---- 7. 粗搜索（stride）----
+        const auto t_match0 = std::chrono::steady_clock::now();
         const double d0 = cfg.disp_min_px;
         const double d1 = cfg.disp_max_px;
         std::vector<double> coarse;
@@ -965,23 +1082,23 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
             std::vector<int> back_col(static_cast<std::size_t>(n) * k);
             for (int i = 0; i < n; ++i) {
                 const int xr = ClampInt(
-                    RintToInt(keypoints[i].first) - RintToInt(disp[i]), 0,
-                    view_w - 1);
+                    RintToInt(keypoints[i].first) - RintToInt(disp[i]), crop_x0,
+                    crop_x1 - 1);
                 const int py = ClampInt(
                     RintToInt(keypoints[i].second) - band_y0, 0, band_h - 1);
                 std::uint64_t* win =
                     back_window.data() + static_cast<std::size_t>(i) * k;
-                int* rows = back_row.data() + static_cast<std::size_t>(i) * k;
+                int* bases = back_row.data() + static_cast<std::size_t>(i) * k;
                 int* cols = back_col.data() + static_cast<std::size_t>(i) * k;
                 int slot = 0;
                 for (int oy = -wr; oy <= wr; ++oy) {
                     const int ny = ClampInt(py + oy, 0, band_h - 1);
+                    const int base = ny * crop_w - crop_x0;
                     for (int ox = -wr; ox <= wr; ++ox) {
-                        const int nx = ClampInt(xr + ox, 0, view_w - 1);
-                        rows[slot] = ny;
+                        const int nx = ClampInt(xr + ox, crop_x0, crop_x1 - 1);
+                        bases[slot] = base;
                         cols[slot] = nx;
-                        win[slot] = impl_->census_aux[
-                            static_cast<std::size_t>(ny) * view_w + nx];
+                        win[slot] = impl_->census_aux[base + nx];
                         ++slot;
                     }
                 }
@@ -991,7 +1108,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
             for (int i = 0; i < n; ++i) {
                 const std::uint64_t* win =
                     back_window.data() + static_cast<std::size_t>(i) * k;
-                const int* rows =
+                const int* bases =
                     back_row.data() + static_cast<std::size_t>(i) * k;
                 const int* cols =
                     back_col.data() + static_cast<std::size_t>(i) * k;
@@ -1004,9 +1121,8 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
                     const int di = -RintToInt(cand);
                     int sum = 0;
                     for (int slot = 0; slot < k; ++slot) {
-                        const int nx = ShiftedColumn(cols[slot], di, view_w);
-                        const std::uint64_t t = impl_->census_ref[
-                            static_cast<std::size_t>(rows[slot]) * view_w + nx];
+                        const int nx = ClampInt(cols[slot] - di, crop_x0, crop_x1 - 1);
+                        const std::uint64_t t = impl_->census_ref[bases[slot] + nx];
                         sum += Popcount64(win[slot] ^ t);
                     }
                     if (static_cast<double>(sum) < best_cost) {
@@ -1023,13 +1139,14 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
             point_valid[i] = std::isfinite(disp[i]) &&
                              ratio[i] >= cfg.uniqueness_ratio && lr_ok[i];
         }
+        impl_->last_match_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_match0).count();
+        impl_->stage_match.Add(impl_->last_match_ms);
     }
-    const auto t_match1 = std::chrono::steady_clock::now();
-    impl_->last_match_ms =
-        std::chrono::duration<double, std::milli>(t_match1 - t_match0).count();
     ++impl_->matched_frames;
 
     // ---- 10. 逐框近端簇聚合 + EMA ----
+    const auto t_agg0 = std::chrono::steady_clock::now();
     const double fxb = mat.fxb_m_px;
     const double fx = mat.p_ref[0];
     const double fy = mat.p_ref[5];
@@ -1133,6 +1250,8 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
     const auto t_total1 = std::chrono::steady_clock::now();
     impl_->last_total_ms =
         std::chrono::duration<double, std::milli>(t_total1 - t_total0).count();
+    impl_->stage_aggregate.Add(std::chrono::duration<double, std::milli>(
+        t_total1 - t_agg0).count());
     return results;
 }
 

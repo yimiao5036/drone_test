@@ -238,6 +238,21 @@ else()
 endif()
 add_dependencies(video_latency_probe drone_runtime_assets)
 
+# 双目测距开发机性能基准（手动运行，不注册 ctest；见文件头说明）。
+# 合成图 + 预置校正矩阵，输出核心各阶段 avg/p95 耗时，用于定位热点与验证优化。
+add_executable(stereo_ranger_bench
+    tools/stereo_ranger_bench.cpp)
+target_link_libraries(stereo_ranger_bench PRIVATE
+    drone_common
+    drone_perception
+    spdlog::spdlog)
+if(MSVC)
+    target_compile_options(stereo_ranger_bench PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(stereo_ranger_bench PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_dependencies(stereo_ranger_bench drone_runtime_assets)
+
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE

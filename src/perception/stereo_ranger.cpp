@@ -338,7 +338,7 @@ struct StereoRanger::Impl {
         if (distance_sample_count > 0) {
             SPDLOG_INFO("双目测距摘要: 帧={} 匹配帧={} 批次={} 发布={} 有效测距={} "
                         "有效占比={:.1f}% 距离 min/avg/max={:.3f}/{:.3f}/{:.3f}m "
-                        "跳过={} 帧未配={} 截断={} 匹配avg={:.2f}ms max={:.2f}ms",
+                        "跳过={} 帧未配={} 截断={} 处理avg={:.2f}ms max={:.2f}ms",
                         frames, matched, batch_count.load(), published, available,
                         valid_rate, distance_min_m,
                         distance_sum_m / static_cast<double>(distance_sample_count),
@@ -347,10 +347,23 @@ struct StereoRanger::Impl {
         } else {
             SPDLOG_INFO("双目测距摘要: 帧={} 匹配帧={} 批次={} 发布={} 有效测距={} "
                         "有效占比={:.1f}% 跳过={} 帧未配={} 截断={} "
-                        "匹配avg={:.2f}ms max={:.2f}ms",
+                        "处理avg={:.2f}ms max={:.2f}ms",
                         frames, matched, batch_count.load(), published, available,
                         valid_rate, skipped, misses, clipped, avg_ms,
                         match_time_max_ms);
+        }
+        // 阶段耗时细分（滚动窗口 avg/p95，开发机基准与板上定位热点用）
+        const StereoStageLatency stage = core.StageLatency();
+        if (stage.remap.window_count > 0) {
+            SPDLOG_INFO(
+                "双目测距阶段耗时 avg/p95(ms,n={}): remap={:.1f}/{:.1f} "
+                "census={:.1f}/{:.1f} 提点={:.1f}/{:.1f} 匹配={:.1f}/{:.1f} "
+                "聚合={:.1f}/{:.1f}",
+                stage.remap.window_count, stage.remap.average_ms,
+                stage.remap.p95_ms, stage.census.average_ms, stage.census.p95_ms,
+                stage.keypoints.average_ms, stage.keypoints.p95_ms,
+                stage.match.average_ms, stage.match.p95_ms,
+                stage.aggregate.average_ms, stage.aggregate.p95_ms);
         }
         match_time_total_ms = 0.0;
         match_time_max_ms = 0.0;
