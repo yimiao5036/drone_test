@@ -584,6 +584,8 @@ if(BUILD_TESTING)
             tests/perception/stereo_ranger_core_test.cpp)
         target_link_libraries(stereo_ranger_core_test PRIVATE
             drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        target_compile_definitions(stereo_ranger_core_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         if(MSVC)
             target_compile_options(stereo_ranger_core_test PRIVATE /W4 /permissive-)
         else()
@@ -593,11 +595,13 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(stereo_ranger_core_test)
 
-        # 双目测距组件壳：双订阅时间窗配对 + 超龄处理 + 摘要日志
+        # 双目测距组件壳：帧/检测批次配对 + 发布语义 + 摘要日志
         add_executable(stereo_ranger_test
             tests/perception/stereo_ranger_test.cpp)
         target_link_libraries(stereo_ranger_test PRIVATE
-            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+            drone_common drone_video drone_perception spdlog::spdlog GTest::gtest_main)
+        target_compile_definitions(stereo_ranger_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         if(MSVC)
             target_compile_options(stereo_ranger_test PRIVATE /W4 /permissive-)
         else()

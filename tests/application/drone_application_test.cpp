@@ -18,6 +18,29 @@
 namespace drone::application {
 namespace {
 
+/// 自洽的最小校正矩阵（单位校正，1280×720）：装配测试不跑匹配，
+/// 只需通过 StereoRangerCore 构造期的矩阵校验。
+perception::StereoRectifyMatrices MakeTestMatrices() {
+    perception::StereoRectifyMatrices m;
+    m.view_width = 1280;
+    m.view_height = 720;
+    const double fx = 1000.0;
+    const double cx = 639.5;
+    const double cy = 359.5;
+    const double baseline = 0.06;
+    m.k_ref[0] = fx; m.k_ref[4] = fx; m.k_ref[2] = cx; m.k_ref[5] = cy; m.k_ref[8] = 1.0;
+    m.k_aux[0] = fx; m.k_aux[4] = fx; m.k_aux[2] = cx; m.k_aux[5] = cy; m.k_aux[8] = 1.0;
+    m.r_ref[0] = m.r_ref[4] = m.r_ref[8] = 1.0;
+    m.r_aux[0] = m.r_aux[4] = m.r_aux[8] = 1.0;
+    m.p_ref[0] = fx; m.p_ref[5] = fx; m.p_ref[2] = cx; m.p_ref[6] = cy; m.p_ref[10] = 1.0;
+    m.p_aux[0] = fx; m.p_aux[5] = fx; m.p_aux[2] = cx; m.p_aux[6] = cy; m.p_aux[10] = 1.0;
+    m.p_aux[3] = -fx * baseline;
+    m.baseline_m = baseline;
+    m.fx_rect_px = fx;
+    m.fxb_m_px = fx * baseline;
+    return m;
+}
+
 /// 探针式裁剪配置：仅视频链路 + 双目测距，无视觉监控/视觉跟踪/PX4/地面站。
 config::AppConfig MakeProbeLikeConfig() {
     config::AppConfig config;
@@ -31,6 +54,7 @@ config::AppConfig MakeProbeLikeConfig() {
     config.runtime.enable_control = false;
     config.video_source.camera_source = "uvc";
     config.video_source.stereo_split = true;
+    config.stereo_rectify = MakeTestMatrices();
     return config;
 }
 
