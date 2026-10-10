@@ -50,6 +50,8 @@ Px4Link::StateOutput() -> MissionStateMachine
 - 每个周期先抽干订阅队列，只保留最新不可变快照，再做状态判断，避免一次决策周期内读到不一致数据。
 - 启动后先发布`BOOT`，随后进入`SELF_CHECK`。
 - `SELF_CHECK`阶段等待PX4快照满足：连接在线、GPS fix有效、全局位置有效、Home有效。
+  PX4 已到位（2026-10-10：装机体+GPS）：正常应能越过自检；仍停留则按
+  心跳 → GPS fix → Home 顺序排查（见`docs/故障排查手册.md`），不要改条件绕过。
 - `READY`阶段等待有效地面站目标；目标有效且导航仍有效时，进入`GPS_APPROACH`影子状态。
 - `GPS_APPROACH`阶段只维护目标新鲜度和状态回传，不生成位置控制意图。目标短暂过期会置告警，后续策略再决定返航/等待。
 - 所有控制输出保持断开，`DroneApplication`仍不会绑定`Px4Setpoint`。
@@ -82,6 +84,6 @@ ctest --test-dir build --output-on-failure
 
 ## 排查/修改要点
 
-- 如果地面站目标ACK已成功但状态机不进入`GPS_APPROACH`，先检查PX4快照是否满足`connected/gps_fix/global_position_valid/home_valid`。
+- 如果地面站目标ACK已成功但状态机不进入`GPS_APPROACH`，先检查PX4快照是否满足`connected/gps_fix/global_position_valid/home_valid`（PX4 已到位后该组条件可实链成立，不再是"必然不满足"）。
 - 如果状态机没有状态回传，检查主程序是否启用了PX4和地面站链路，以及`GroundStationLink::TargetOutput()`是否已绑定到状态机。
 - 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和`enable_control`安全配置。

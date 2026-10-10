@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 运行在香橙派 RK3588（ARM64, Ubuntu）上的反无人机机载 C++17 控制系统：接收自研地面站 MAVLink 目标位置 → YOLOv26 RKNN 目标识别 → 轨迹预测 → 控制 PX4 跟踪/拦截。另见 `AGENTS.md`（完整开发规范，含强制规则）。
 
-**当前安全基线**：`config/config.json` 必须保持 `"enable_control": false`，正式程序不向 PX4 发送飞行控制。`MissionStateMachine`、`TargetEstimator`、`VisualTargetMonitor` 均为影子运行（跑真实算法但不产生控制输出）。现场无 PX4，只有香橙派、摄像头、图传/HM30 和地面站。
+**当前安全基线**：`config/config.json` 必须保持 `"enable_control": false`，正式程序不向 PX4 发送飞行控制。`MissionStateMachine`、`TargetEstimator`、`VisualTargetMonitor` 均为影子运行（跑真实算法但不产生控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home），依赖 PX4 的实链验证由此可开展；但安全基线不变——正式控制输出要等《主程序集成与数据链路实施计划》阶段 4 接入路径（`FlightController` 真实实现 + SITL/台架门禁）建成并验证后，才允许绑定 `Px4Setpoint`。
 
 ## 构建与测试（唯一构建环境：WSL2 Ubuntu 24.04）
 

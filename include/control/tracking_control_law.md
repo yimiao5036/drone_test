@@ -40,9 +40,9 @@ Topic<FlightStateSnapshot>─┘   （固定节拍 control.frequency_hz）
 
 - 状态映射：`VisualTargetStatus.state==kLocked` → tracked=true，其余 false；
   is_predicted 恒 false（主链路无预测）。
-- 虚拟姿态：现场无 PX4 时姿态缺失/超龄，`shadow.virtual_attitude_when_absent`
-  （默认 true）以零姿态继续计算仅供观察（首次进入 INFO 标注）；false 保持
-  真实语义（每拍降级保持）。
+- 虚拟姿态：姿态缺失/超龄（PX4 未连接或未上电；2026-10-10 起现场 PX4 已到位，
+  正常应走真实姿态）时，`shadow.virtual_attitude_when_absent`（默认 true）以零姿态
+  继续计算仅供观察（首次进入 INFO 标注）；false 保持真实语义（每拍降级保持）。
 - ControlIntent 映射：kVelocityHeading→target_x/y/z=NED 速度 + 速率式
   `yaw_rate_dps`（types.h 新增字段）/位置式 `yaw_deg`；kBrakeHover→kBrakeHover；
   kDegradedHold→kNone。reason_code 影子段（避开骨架 0-7）：
@@ -96,7 +96,7 @@ ctest --test-dir build -R 'ControlLaw|PixelToAngle|VisualTrackingShadow|Tracking
 
 | 现象 | 排查方向 |
 |------|----------|
-| 摘要一直是"降级保持" | 看 reason：姿态超龄（无 PX4 且虚拟姿态被关）/视觉超龄（monitor 没发布或视频链路没跑）；虚拟姿态开关在 `visual_tracking.shadow.virtual_attitude_when_absent` |
+| 摘要一直是"降级保持" | 看 reason：姿态超龄（PX4 未连接/未上电，且虚拟姿态被关）/视觉超龄（monitor 没发布或视频链路没跑）；虚拟姿态开关在 `visual_tracking.shadow.virtual_attitude_when_absent` |
 | 垂直角方向反了/量值不对 | 确认 camera 组 cy_px 是标定值 532.07 而非 360；主点假设错误的典型症状就是垂直方向固定偏约 9.7° |
 | 换了分辨率档位后角度错 | 内参只对 1280×720 有效，换档重新标定并更新 camera 组 |
 | kControlIntent 没人消费 | 影子阶段设计如此；观察靠摘要日志，后续接状态机时再接 FlightController |
