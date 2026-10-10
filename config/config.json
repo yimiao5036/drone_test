@@ -249,7 +249,7 @@
         }
     },
     "stereo_ranger": {
-        "_comment": "双目测距 v2（稀疏 Census，影子）：基准图=SBS右半=物理左目=左目Topic。校正矩阵与本文件同目录（stereo_rectify_uvc_1280x720.json，重标定后必须重跑 export_rectify.py）；以下参数默认即 Python 参考实现实测配置。collect_detailed_latency 为诊断开关：默认 false（生产热路径零诊断），跑基线/排查时才置 true 统计阶段耗时与逐点快照",
+        "_comment": "双目测距 v2（稀疏 Census，影子）：基准图=SBS右半=物理左目=左目Topic。校正矩阵与本文件同目录（stereo_rectify_uvc_1280x720.json，重标定后必须重跑 export_rectify.py）；以下参数默认即 Python 参考实现实测配置。collect_detailed_latency 为诊断开关：开发阶段置 true（记录阶段耗时/逐点快照，开销实测在噪声内），生产调优定型后改回 false",
         "rectify_matrices_path": "stereo_rectify_uvc_1280x720.json",
         "disp_min_px": 8.0,
         "disp_max_px": 160.0,
@@ -267,7 +267,7 @@
         "near_pct": 90.0,
         "near_tol_px": 3.0,
         "smooth_alpha": 0.4,
-        "collect_detailed_latency": false,
+        "collect_detailed_latency": true,
         "input_queue_capacity": 2,
         "frame_buffer_depth": 4,
         "pair_window_ms": 20,

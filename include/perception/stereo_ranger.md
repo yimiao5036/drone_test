@@ -72,8 +72,8 @@ Topic<FrameHandle> kDecodedFrameRight（辅助图=SBS左半,NV12）   ─┘    
 `fine_halfwidth=6`、`uniqueness_ratio=1.05`、`lr_tol_px=1.0`、`census_win=7`、
 `max_points_per_target=80`、`grid_cells=4`、`warmup_frames=15`、
 `black_frame_mean_threshold=2.0`、`bbox_erode_px=5`、`min_points=30`、`near_pct=90.0`、
-`near_tol_px=3.0`、`smooth_alpha=0.4`、`collect_detailed_latency=false`（诊断开关，
-见下）、`input_queue_capacity=2`、`frame_buffer_depth=4`、
+`near_tol_px=3.0`、`smooth_alpha=0.4`、`collect_detailed_latency=true`（诊断开关，开发
+阶段开、生产定型后置 false，见下）、`input_queue_capacity=2`、`frame_buffer_depth=4`、
 `pair_window_ms=20`、`settle_ms=50`、`summary_log_interval_ms=10000`。
 `StereoRangerConfig::Validate()` 对非法取值抛 `std::invalid_argument`。
 
@@ -100,12 +100,14 @@ Topic 一览：
   Census 与提点，行带内再按 `框 ± 2r ± ceil(disp_max)` 裁列（带内结果与全幅逐像素一致：
   四类被访问列——参考窗口/目标窗口/LR 回搜/回搜参考列——均在裁剪区间内或与全幅在
   同一画面边缘处裁剪；Census 只依赖自身邻域）；窄框 vs 全宽框等价性有专门单测压住。
-- **诊断开关 `collect_detailed_latency`（默认 false）**：关闭时热路径零诊断——不读阶段
-  计时、不调 `LatencyStatistics::Add`、不留逐点快照（`LastPointDebugForTest` 返回空）。
-  与 `yolo.collect_npu_internal_perf` / 视频链 `collect_detailed_latency` 同一约定：
-  **生产保持 false，跑基线/排查时才置 true**。开发机 A/B 实测（bench 开/关各 3 轮）
-  差异在 ±0.5ms 噪声内，即当前诊断本身开销量不出来；仍保留开关以遵守约定并防后续
-  加重诊断（对照 `tools/NPU性能分析探针使用方法.md` §6）。
+- **诊断开关 `collect_detailed_latency`（开发阶段默认 true）**：控制阶段耗时统计与逐点
+  调试快照；**关闭时热路径零诊断**——不读阶段计时、不调 `LatencyStatistics::Add`、
+  不留快照（`LastPointDebugForTest` 返回空），测距结果不变（有专门用例守住）。
+  与视频链 `collect_detailed_latency` 同一约定：开发阶段保持打开记录数据，**生产
+  调优定型后置 false**（对照 `tools/NPU性能分析探针使用方法.md` §6「不在热路径增加
+  诊断调用」）。开发机 A/B 实测（bench 开/关各 3 轮、每轮 60 帧）差异在 ±0.5ms 轮间
+  噪声内，即当前诊断开销量不出来。跑基准/看阶段占比见
+  `tools/双目测距性能基准使用方法.md`。
 - **热路径性能（2026-10-10 开发机基准 `stereo_ranger_bench`，400×380 框）**：
   107.2ms → **14.1ms/帧**（remap 3.6 | census 4.5 | 提点 4.7 | 匹配 1.6 | 聚合 0.004）。
   关键手段：Census 源行指针按输出行提升、内部列免裁剪分支、win=7 邻位常量展开；
@@ -145,7 +147,7 @@ Topic 一览：
 |------|------|------|
 | 创建（fx_rect/基线/fxB/视差区间）、启动、停止（累计计数） | INFO | 否 |
 | 摘要：帧数/匹配帧/批次/发布/有效测距/有效占比/距离 min/avg/max/跳过/帧未配/截断/处理耗时 | INFO | `summary_log_interval_ms` |
-| 阶段耗时细分：remap/census/提点/匹配/聚合 的 avg/p95（滚动窗口；**仅 `collect_detailed_latency=true` 时输出**） | INFO | `summary_log_interval_ms` |
+| 阶段耗时细分：remap/census/提点/匹配/聚合 的 avg/p95（滚动窗口；**仅 `collect_detailed_latency=true` 时输出**，判读见 `tools/双目测距性能基准使用方法.md`） | INFO | `summary_log_interval_ms` |
 | 批次未配对到帧（左/右帧缺失或被挤出） | WARN | 第 1 次 + 每满 100 次 |
 | 视差顶到搜索上限（截断） | WARN | 第 1 次 + 每满 100 次 |
 | 启动时三路输入未接线 | ERROR | 否（启动路径一次性，Start 返回 false） |

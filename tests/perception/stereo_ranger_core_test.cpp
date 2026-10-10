@@ -364,7 +364,9 @@ TEST(StereoRangerCoreTest, MatchingWorksForKeypointsStraddlingEdgeEncoding) {
 TEST(StereoRangerCoreTest, DetailedLatencyDisabledLeavesNoDiagnostics) {
     const auto ref = MakeRefImage();
     const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
-    StereoRangerCore core(TestConfig(), IdentityMatrices());  // 默认 false
+    StereoRangerConfig cfg = TestConfig();
+    cfg.collect_detailed_latency = false;  // 显式关闭，验证门控（不依赖默认值）
+    StereoRangerCore core(cfg, IdentityMatrices());
     core.SetKeypointsOverride(GridKeypoints());
     const auto results =
         core.Process(ViewSynth(ref), ViewSynth(aux),
