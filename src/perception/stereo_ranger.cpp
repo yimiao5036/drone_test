@@ -100,6 +100,11 @@ struct StereoRanger::Impl {
     std::uint64_t match_call_count = 0;
     std::int64_t last_summary_ms = 0;
     std::uint64_t clipped_log_count = 0;
+    // 摘要窗口内的有效距离统计（板上卷尺验收判读依据）
+    double distance_sum_m = 0.0;
+    double distance_min_m = 0.0;
+    double distance_max_m = 0.0;
+    std::uint64_t distance_sample_count = 0;
 
     // ---- 帧缓冲 -------------------------------------------------------------
 
@@ -204,6 +209,15 @@ struct StereoRanger::Impl {
                 msg.disparity_px = static_cast<float>(range.disparity_px);
                 msg.center_pixel_x_mid = static_cast<float>(range.center_x_rect);
                 msg.valid = true;
+                if (distance_sample_count == 0) {
+                    distance_min_m = range.z_m;
+                    distance_max_m = range.z_m;
+                } else {
+                    distance_min_m = std::min(distance_min_m, range.z_m);
+                    distance_max_m = std::max(distance_max_m, range.z_m);
+                }
+                distance_sum_m += range.z_m;
+                ++distance_sample_count;
                 if (range.clipped) {
                     ++clipped_log_count;
                     if (ShouldLogThrottled(clipped_log_count)) {
@@ -321,15 +335,28 @@ struct StereoRanger::Impl {
                                       : 0.0;
         const double avg_ms =
             match_call_count > 0 ? match_time_total_ms / match_call_count : 0.0;
-        SPDLOG_INFO("双目测距摘要: 帧={} 匹配帧={} 批次={} 发布={} 有效测距={} "
-                    "有效占比={:.1f}% 跳过={} 帧未配={} 截断={} "
-                    "匹配avg={:.2f}ms max={:.2f}ms",
-                    frames, matched, batch_count.load(), published, available,
-                    valid_rate, skipped, misses, clipped, avg_ms,
-                    match_time_max_ms);
+        if (distance_sample_count > 0) {
+            SPDLOG_INFO("双目测距摘要: 帧={} 匹配帧={} 批次={} 发布={} 有效测距={} "
+                        "有效占比={:.1f}% 距离 min/avg/max={:.3f}/{:.3f}/{:.3f}m "
+                        "跳过={} 帧未配={} 截断={} 匹配avg={:.2f}ms max={:.2f}ms",
+                        frames, matched, batch_count.load(), published, available,
+                        valid_rate, distance_min_m,
+                        distance_sum_m / static_cast<double>(distance_sample_count),
+                        distance_max_m, skipped, misses, clipped, avg_ms,
+                        match_time_max_ms);
+        } else {
+            SPDLOG_INFO("双目测距摘要: 帧={} 匹配帧={} 批次={} 发布={} 有效测距={} "
+                        "有效占比={:.1f}% 跳过={} 帧未配={} 截断={} "
+                        "匹配avg={:.2f}ms max={:.2f}ms",
+                        frames, matched, batch_count.load(), published, available,
+                        valid_rate, skipped, misses, clipped, avg_ms,
+                        match_time_max_ms);
+        }
         match_time_total_ms = 0.0;
         match_time_max_ms = 0.0;
         match_call_count = 0;
+        distance_sum_m = 0.0;
+        distance_sample_count = 0;
     }
 
     void Run() {
