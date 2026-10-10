@@ -95,8 +95,16 @@ Topic 一览：
   得到 rect→source 采样坐标（float32，init 时一次构建，约 14MB）。
   `SourceToRectRef` 为解析逆映射（畸变逆解定点迭代 10 次），用于把检测框从原始坐标
   映射到校正坐标（四角+四边中点包围盒，向外取整）。
-- **行带处理**：只在检测框联合区域 ±（采样余量 + Census 半径）的行带上做 remap、
-  Census 与提点（带内结果与全幅逐像素一致；Census 只依赖自身邻域），大幅省算力。
+- **行带 + 列裁剪**：只在检测框联合区域 ±（采样余量 + Census 半径）的行带上做 remap、
+  Census 与提点，行带内再按 `框 ± 2r ± ceil(disp_max)` 裁列（带内结果与全幅逐像素一致：
+  四类被访问列——参考窗口/目标窗口/LR 回搜/回搜参考列——均在裁剪区间内或与全幅在
+  同一画面边缘处裁剪；Census 只依赖自身邻域）；窄框 vs 全宽框等价性有专门单测压住。
+- **热路径性能（2026-10-10 开发机基准 `stereo_ranger_bench`，400×380 框）**：
+  107.2ms → **14.1ms/帧**（remap 3.6 | census 4.5 | 提点 4.7 | 匹配 1.6 | 聚合 0.004）。
+  关键手段：Census 源行指针按输出行提升、内部列免裁剪分支、win=7 邻位常量展开；
+  remap 四抽头在图内时走无分支快路径；Shi-Tomasi 临时缓冲跨帧复用、最小特征值/
+  候选只在掩膜包围盒 ±(block/2+1) 内计算（区域包含全部候选与掩膜像素，结果不变）。
+  板上数字约为开发机的 1/2~1/4，可用摘要的「双目测距阶段耗时」行对照。
 - **Census**：以中心像素为阈值（`>=` 判据）的 7×7 邻域（跳过中心，48 位 → `uint64`），
   越界按复制延拓。位序自定，但左右图与所有帧必须一致。
 - **代价引擎**：基准点窗口预提取一次；候选视差只做**列平移**（`x_R = x_L − d`），
@@ -127,7 +135,8 @@ Topic 一览：
 | 场景 | 等级 | 节流 |
 |------|------|------|
 | 创建（fx_rect/基线/fxB/视差区间）、启动、停止（累计计数） | INFO | 否 |
-| 摘要：帧数/匹配帧/批次/发布/有效测距/有效占比/距离 min/avg/max/跳过/帧未配/截断/耗时 | INFO | `summary_log_interval_ms` |
+| 摘要：帧数/匹配帧/批次/发布/有效测距/有效占比/距离 min/avg/max/跳过/帧未配/截断/处理耗时 | INFO | `summary_log_interval_ms` |
+| 阶段耗时细分：remap/census/提点/匹配/聚合 的 avg/p95（滚动窗口） | INFO | `summary_log_interval_ms` |
 | 批次未配对到帧（左/右帧缺失或被挤出） | WARN | 第 1 次 + 每满 100 次 |
 | 视差顶到搜索上限（截断） | WARN | 第 1 次 + 每满 100 次 |
 | 启动时三路输入未接线 | ERROR | 否（启动路径一次性，Start 返回 false） |
@@ -148,7 +157,8 @@ Topic 一览：
                                     # 预热与黑帧跳过、配置与矩阵校验
   ./build/stereo_ranger_test        # 组件：接线校验、settle/新序号闭合、每框一条、
                                     # 右帧缺失降级、Stop 幂等与重启
-  ctest --test-dir build --output-on-failure     # 基线 337/337
+  ctest --test-dir build --output-on-failure     # 基线 338/338
+  ./build/stereo_ranger_bench 30    # 性能基准（开发机，输出各阶段 avg/p95；手动运行）
   ```
   黄金数据（`tests/perception/data/`）由 `tests/perception/gen_stereo_golden.py`
   用参考实现生成；Shi-Tomasi 与 OpenCV 的差异用「注入关键点」（`SetKeypointsOverride`）

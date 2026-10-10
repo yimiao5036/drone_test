@@ -99,6 +99,30 @@ inline double SampleBilinearZero(const std::uint8_t* src, int width, int height,
     return value;
 }
 
+// remap 双线性快路径：四抽头全部在图内时无分支、无逐抽头越界判断
+// （行带 remap 的绝大多数像素走此路径）；否则退回通用零边界实现。
+// 两者数学等价，浮点末位可能有差（≤1 LSB，落回 uint8 前），与既有
+// "remap 与 OpenCV 定点实现差 ≤1 LSB" 的口径一致。
+inline double SampleBilinearFast(const std::uint8_t* src, int width, int height,
+                                 int stride, double sx, double sy) {
+    if (sx >= 0.0 && sx < static_cast<double>(width - 1) && sy >= 0.0 &&
+        sy < static_cast<double>(height - 1)) {
+        const int x0 = static_cast<int>(sx);
+        const int y0 = static_cast<int>(sy);
+        const double fx = sx - static_cast<double>(x0);
+        const double fy = sy - static_cast<double>(y0);
+        const std::uint8_t* row0 =
+            src + static_cast<std::size_t>(y0) * stride + x0;
+        const std::uint8_t* row1 = row0 + stride;
+        const double top = static_cast<double>(row0[0]) * (1.0 - fx) +
+                           static_cast<double>(row0[1]) * fx;
+        const double bottom = static_cast<double>(row1[0]) * (1.0 - fx) +
+                              static_cast<double>(row1[1]) * fx;
+        return top * (1.0 - fy) + bottom * fy;
+    }
+    return SampleBilinearZero(src, width, height, stride, sx, sy);
+}
+
 // 构建 rect→source 映射表（等价 cv2.initUndistortRectifyMap 的正向畸变模型）。
 void BuildRectToSourceMap(const double k[9], const double d[5], const double r[9],
                           const double p[12], int width, int height,
@@ -193,20 +217,21 @@ void SobelGradients(const std::uint8_t* img, int width, int height, int stride,
 }
 
 // 矩形和（积分图）：blockSize 窗口；越界部分按 0 贡献。
+// 缓冲区由调用方复用（assign 不缩容，跨帧不再反复分配 MB 级数组）。
 class BoxSumIntegral {
 public:
-    BoxSumIntegral(const std::vector<double>& src, int width, int height)
-        : width_(width),
-          height_(height),
-          integral_(static_cast<std::size_t>(width + 1) * (height + 1), 0.0) {
+    BoxSumIntegral(const std::vector<double>& src, int width, int height,
+                   std::vector<double>* scratch)
+        : width_(width), height_(height), integral_(scratch) {
+        integral_->assign(static_cast<std::size_t>(width + 1) * (height + 1),
+                          0.0);
+        std::vector<double>& integral = *integral_;
         for (int y = 0; y < height; ++y) {
             double row_sum = 0.0;
             for (int x = 0; x < width; ++x) {
                 row_sum += src[static_cast<std::size_t>(y) * width + x];
-                integral_[static_cast<std::size_t>(y + 1) * (width + 1) +
-                          (x + 1)] =
-                    integral_[static_cast<std::size_t>(y) * (width + 1) +
-                              (x + 1)] +
+                integral[static_cast<std::size_t>(y + 1) * (width + 1) + (x + 1)] =
+                    integral[static_cast<std::size_t>(y) * (width + 1) + (x + 1)] +
                     row_sum;
             }
         }
@@ -214,56 +239,87 @@ public:
 
     /// 以 (cx,cy) 为中心、半宽 half 的窗口和（越界部分按 0）。
     double Sum(int cx, int cy, int half) const {
+        const std::vector<double>& integral = *integral_;
         const int x0 = ClampInt(cx - half, 0, width_);
         const int x1 = ClampInt(cx + half + 1, 0, width_);
         const int y0 = ClampInt(cy - half, 0, height_);
         const int y1 = ClampInt(cy + half + 1, 0, height_);
         const std::size_t w = static_cast<std::size_t>(width_ + 1);
-        return integral_[static_cast<std::size_t>(y1) * w + x1] -
-               integral_[static_cast<std::size_t>(y0) * w + x1] -
-               integral_[static_cast<std::size_t>(y1) * w + x0] +
-               integral_[static_cast<std::size_t>(y0) * w + x0];
+        return integral[static_cast<std::size_t>(y1) * w + x1] -
+               integral[static_cast<std::size_t>(y0) * w + x1] -
+               integral[static_cast<std::size_t>(y1) * w + x0] +
+               integral[static_cast<std::size_t>(y0) * w + x0];
     }
 
 private:
     int width_;
     int height_;
-    std::vector<double> integral_;
+    std::vector<double>* integral_;
+};
+
+/// Shi-Tomasi 内部临时缓冲（组件复用；避免每帧重复分配 MB 级数组）。
+struct CornerScratch {
+    std::vector<double> gx;
+    std::vector<double> gy;
+    std::vector<double> ixx;
+    std::vector<double> iyy;
+    std::vector<double> ixy;
+    std::vector<double> eigen;
+    std::vector<double> integral_x;
+    std::vector<double> integral_y;
+    std::vector<double> integral_xy;
+    std::vector<std::uint8_t> suppressed;
 };
 
 /// Shi-Tomasi 角点（等价 goodFeaturesToTrack 语义：Sobel3×3 → blockSize5 矩阵和
 /// → 最小特征值 → 3×3 局部极大 → 质量降序 → minDistance 贪心抑制 → 掩膜过滤）。
 /// 返回行带局部坐标（按质量降序）。
+/// 性能要点（2026-10-10）：临时缓冲复用（scratch）；最小特征值/候选只在
+/// 掩膜包围盒 ±(half+1) 区域内计算——区域外不存在候选、区域包含全部掩膜
+/// 像素，故 max_eigen/阈值/候选集合与全带计算完全一致，仅省算力。
 std::vector<std::pair<float, float>> DetectCornersShiTomasi(
     const std::uint8_t* img, const std::uint8_t* mask, int width, int height,
     int stride, int block_size, double quality, int min_distance,
-    int max_corners) {
+    int max_corners, int region_x0, int region_x1, int region_y0, int region_y1,
+    CornerScratch* scratch) {
     std::vector<std::pair<float, float>> result;
     if (width < block_size + 2 || height < block_size + 2 || max_corners <= 0) {
         return result;
     }
-    std::vector<double> gx;
-    std::vector<double> gy;
-    SobelGradients(img, width, height, stride, &gx, &gy);
+    const int half = block_size / 2;
+    const int rx0 = ClampInt(region_x0, half, width);
+    const int rx1 = ClampInt(region_x1, rx0, width);
+    const int ry0 = ClampInt(region_y0, half, height);
+    const int ry1 = ClampInt(region_y1, ry0, height);
+    if (rx0 >= rx1 || ry0 >= ry1) {
+        return result;
+    }
+
+    SobelGradients(img, width, height, stride, &scratch->gx, &scratch->gy);
 
     const std::size_t count = static_cast<std::size_t>(width) * height;
-    std::vector<double> ixx(count, 0.0);
-    std::vector<double> iyy(count, 0.0);
-    std::vector<double> ixy(count, 0.0);
+    std::vector<double>& gx = scratch->gx;
+    std::vector<double>& gy = scratch->gy;
+    scratch->ixx.resize(count);
+    scratch->iyy.resize(count);
+    scratch->ixy.resize(count);
+    std::vector<double>& ixx = scratch->ixx;
+    std::vector<double>& iyy = scratch->iyy;
+    std::vector<double>& ixy = scratch->ixy;
     for (std::size_t i = 0; i < count; ++i) {
         ixx[i] = gx[i] * gx[i];
         iyy[i] = gy[i] * gy[i];
         ixy[i] = gx[i] * gy[i];
     }
-    const BoxSumIntegral sx(ixx, width, height);
-    const BoxSumIntegral sy(iyy, width, height);
-    const BoxSumIntegral sxy(ixy, width, height);
+    const BoxSumIntegral sx(ixx, width, height, &scratch->integral_x);
+    const BoxSumIntegral sy(iyy, width, height, &scratch->integral_y);
+    const BoxSumIntegral sxy(ixy, width, height, &scratch->integral_xy);
 
-    const int half = block_size / 2;
-    std::vector<double> eigen(count, 0.0);
+    scratch->eigen.assign(count, 0.0);
+    std::vector<double>& eigen = scratch->eigen;
     double max_eigen = 0.0;
-    for (int y = half; y + half < height; ++y) {
-        for (int x = half; x + half < width; ++x) {
+    for (int y = ry0; y < ry1; ++y) {
+        for (int x = rx0; x < rx1; ++x) {
             const std::size_t idx = static_cast<std::size_t>(y) * width + x;
             const double a = sx.Sum(x, y, half);
             const double c = sy.Sum(x, y, half);
@@ -290,8 +346,12 @@ std::vector<std::pair<float, float>> DetectCornersShiTomasi(
         int y;
     };
     std::vector<Candidate> candidates;
-    for (int y = half + 1; y + half + 1 < height; ++y) {
-        for (int x = half + 1; x + half + 1 < width; ++x) {
+    const int cx0 = std::max(rx0, half + 1);
+    const int cx1 = std::min(rx1, width - half - 1);
+    const int cy0 = std::max(ry0, half + 1);
+    const int cy1 = std::min(ry1, height - half - 1);
+    for (int y = cy0; y < cy1; ++y) {
+        for (int x = cx0; x < cx1; ++x) {
             const std::size_t idx = static_cast<std::size_t>(y) * width + x;
             if (mask != nullptr && mask[idx] == 0) {
                 continue;
@@ -327,7 +387,8 @@ std::vector<std::pair<float, float>> DetectCornersShiTomasi(
 
     // minDistance 贪心抑制（矩形半径）
     const int md = std::max(min_distance, 1);
-    std::vector<std::uint8_t> suppressed(count, 0);
+    scratch->suppressed.assign(count, 0);
+    std::vector<std::uint8_t>& suppressed = scratch->suppressed;
     for (const Candidate& c : candidates) {
         const std::size_t idx = static_cast<std::size_t>(c.y) * width + c.x;
         if (suppressed[idx] != 0) {
@@ -560,6 +621,9 @@ struct StereoRangerCore::Impl {
     std::vector<std::uint64_t> ref_window;  // N × win²
     std::vector<int> win_row;               // N × win²（census 行，带内局部）
     std::vector<int> win_col;               // N × win²（参考列，已裁剪）
+
+    // Shi-Tomasi 复用缓冲（避免每帧分配 MB 级数组）
+    CornerScratch corner_scratch;
 
     // 统计
     std::uint64_t processed_frames = 0;
@@ -838,9 +902,9 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
             impl_->band_aux.data() + static_cast<std::size_t>(ly) * crop_w;
         for (int x = crop_x0; x < crop_x1; ++x) {
             const int lx = x - crop_x0;
-            dr[lx] = static_cast<std::uint8_t>(std::lround(SampleBilinearZero(
+            dr[lx] = static_cast<std::uint8_t>(std::lround(SampleBilinearFast(
                 ref.data, ref.width, ref.height, ref.stride, mxr[x], myr[x])));
-            da[lx] = static_cast<std::uint8_t>(std::lround(SampleBilinearZero(
+            da[lx] = static_cast<std::uint8_t>(std::lround(SampleBilinearFast(
                 aux.data, aux.width, aux.height, aux.stride, mxa[x], mya[x])));
             mean_sum += dr[lx];
         }
@@ -856,6 +920,10 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
 
     // ---- 4. 联合掩膜（带内局部坐标：行 −band_y0，列 −crop_x0）----
     impl_->band_mask.assign(static_cast<std::size_t>(band_h) * crop_w, 0);
+    int mask_x0 = crop_w;
+    int mask_x1 = 0;
+    int mask_y0 = band_h;
+    int mask_y1 = 0;
     for (const RectBox& rb : rect_boxes) {
         if (!rb.valid) {
             continue;
@@ -866,6 +934,12 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
             ClampInt(static_cast<int>(std::lround(rb.y0)) - band_y0, 0, band_h);
         const int y1 =
             ClampInt(static_cast<int>(std::lround(rb.y1)) - band_y0, 0, band_h);
+        if (x0 < x1 && y0 < y1) {
+            mask_x0 = std::min(mask_x0, x0);
+            mask_x1 = std::max(mask_x1, x1);
+            mask_y0 = std::min(mask_y0, y0);
+            mask_y1 = std::max(mask_y1, y1);
+        }
         for (int ly = y0; ly < y1; ++ly) {
             std::uint8_t* row =
                 impl_->band_mask.data() + static_cast<std::size_t>(ly) * crop_w;
@@ -890,7 +964,9 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         const auto local = DetectCornersShiTomasi(
             impl_->band_ref.data(), impl_->band_mask.data(), crop_w, band_h,
             crop_w, /*block_size=*/5, /*quality=*/0.01, /*min_distance=*/8,
-            max_corners);
+            max_corners,
+            /*region=*/mask_x0, mask_x1, mask_y0, mask_y1,
+            &impl_->corner_scratch);
         std::vector<std::pair<float, float>> global;
         global.reserve(local.size());
         for (const auto& p : local) {
