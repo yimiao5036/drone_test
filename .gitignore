@@ -23,3 +23,4 @@ tools/camera_calibration/captures/
 __pycache__/
 *.pyc
 tools/camera_calibration/charuco_board.png
+tools/camera_test_ok
