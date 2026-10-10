@@ -625,6 +625,9 @@ struct StereoRangerCore::Impl {
     // Shi-Tomasi 复用缓冲（避免每帧分配 MB 级数组）
     CornerScratch corner_scratch;
 
+    // 测试接口用的逐点快照（生产路径只写入，供 LastPointDebugForTest 读取）
+    std::vector<StereoRangerCore::PointDebug> last_points;
+
     // 统计
     std::uint64_t processed_frames = 0;
     std::uint64_t matched_frames = 0;
@@ -683,6 +686,16 @@ StereoRangerCore::~StereoRangerCore() = default;
 void StereoRangerCore::SetKeypointsOverride(
     std::vector<std::pair<float, float>> rect_points) {
     impl_->keypoints_override = std::move(rect_points);
+}
+
+std::vector<std::uint64_t> StereoRangerCore::CensusEncodeForTest(
+    const std::uint8_t* data, int width, int height, int stride, int win) {
+    return CensusTransform(data, width, height, stride, win, 0, height);
+}
+
+std::vector<StereoRangerCore::PointDebug>
+StereoRangerCore::LastPointDebugForTest() const {
+    return impl_->last_points;
 }
 
 bool StereoRangerCore::RectToSourceRef(float u_rect, float v_rect, float* u_src,
@@ -1152,6 +1165,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
 
         // ---- 9. 左右一致性（回搜索 x_L = x_R + d）----
         std::vector<bool> lr_ok(keypoints.size(), true);
+        std::vector<double> lr_best_back(keypoints.size(), kNaN);
         if (cfg.lr_tol_px > 0.0) {
             std::vector<std::uint64_t> back_window(static_cast<std::size_t>(n) * k);
             std::vector<int> back_row(static_cast<std::size_t>(n) * k);
@@ -1206,6 +1220,7 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
                         best_back = cand;
                     }
                 }
+                lr_best_back[i] = best_back;
                 lr_ok[i] = std::isfinite(best_back) &&
                            std::abs(disp[i] - best_back) <= cfg.lr_tol_px;
             }
@@ -1214,6 +1229,18 @@ std::vector<StereoRangeResult> StereoRangerCore::Process(
         for (int i = 0; i < n; ++i) {
             point_valid[i] = std::isfinite(disp[i]) &&
                              ratio[i] >= cfg.uniqueness_ratio && lr_ok[i];
+        }
+        impl_->last_points.resize(keypoints.size());
+        for (int i = 0; i < n; ++i) {
+            StereoRangerCore::PointDebug debug;
+            debug.x = keypoints[i].first;
+            debug.y = keypoints[i].second;
+            debug.disparity = static_cast<float>(disp[i]);
+            debug.uniqueness_ratio = static_cast<float>(ratio[i]);
+            debug.lr_ok = lr_ok[i];
+            debug.lr_best_back = static_cast<float>(lr_best_back[i]);
+            debug.valid = point_valid[i];
+            impl_->last_points[static_cast<std::size_t>(i)] = debug;
         }
         impl_->last_match_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_match0).count();

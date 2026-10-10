@@ -13,6 +13,7 @@
 #include "perception/stereo_ranger_core.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -29,8 +30,12 @@
 namespace drone::perception {
 namespace {
 
+// 黄金数据（testdata）为 320×240 合成标定；合成视差场用例用 1280×240，
+// 以便构造"参考窗口跨内列/边界列编码路径"的边缘关键点（列 ≥ W−3）。
 using testdata::kViewHeight;
-using testdata::kViewWidth;
+using testdata::kViewWidth;   // 仅黄金数据用例使用
+constexpr int kSynthW = 1280;
+constexpr int kSynthH = 240;
 
 StereoRangerConfig TestConfig() {
     StereoRangerConfig cfg;
@@ -80,10 +85,10 @@ std::uint8_t TextureAt(int x, int y) {
 }
 
 std::vector<std::uint8_t> MakeRefImage() {
-    std::vector<std::uint8_t> img(static_cast<std::size_t>(kViewWidth) * kViewHeight);
-    for (int y = 0; y < kViewHeight; ++y) {
-        for (int x = 0; x < kViewWidth; ++x) {
-            img[static_cast<std::size_t>(y) * kViewWidth + x] = TextureAt(x, y);
+    std::vector<std::uint8_t> img(static_cast<std::size_t>(kSynthW) * kSynthH);
+    for (int y = 0; y < kSynthH; ++y) {
+        for (int x = 0; x < kSynthW; ++x) {
+            img[static_cast<std::size_t>(y) * kSynthW + x] = TextureAt(x, y);
         }
     }
     return img;
@@ -92,12 +97,12 @@ std::vector<std::uint8_t> MakeRefImage() {
 /// 目标图：aux(x,y) = ref(x + d(x), y)（列相关视差场，便于近端簇/截断用例）。
 std::vector<std::uint8_t> MakeAuxImage(const std::vector<int>& disp_for_col) {
     const std::vector<std::uint8_t> ref = MakeRefImage();
-    std::vector<std::uint8_t> aux(static_cast<std::size_t>(kViewWidth) * kViewHeight);
-    for (int y = 0; y < kViewHeight; ++y) {
-        for (int x = 0; x < kViewWidth; ++x) {
-            const int sx = std::min(kViewWidth - 1, x + disp_for_col[x]);
-            aux[static_cast<std::size_t>(y) * kViewWidth + x] =
-                ref[static_cast<std::size_t>(y) * kViewWidth + sx];
+    std::vector<std::uint8_t> aux(static_cast<std::size_t>(kSynthW) * kSynthH);
+    for (int y = 0; y < kSynthH; ++y) {
+        for (int x = 0; x < kSynthW; ++x) {
+            const int sx = std::min(kSynthW - 1, x + disp_for_col[x]);
+            aux[static_cast<std::size_t>(y) * kSynthW + x] =
+                ref[static_cast<std::size_t>(y) * kSynthW + sx];
         }
     }
     return aux;
@@ -107,10 +112,10 @@ std::vector<std::uint8_t> MakeAuxImage(const std::vector<int>& disp_for_col) {
 /// 恒等，合成"已校正"输入图可直接构造已知视差场（不经过真实校正几何）。
 StereoRectifyMatrices IdentityMatrices(double fx = 200.0, double baseline = 0.05) {
     StereoRectifyMatrices m;
-    m.view_width = kViewWidth;
-    m.view_height = kViewHeight;
-    const double cx = 0.5 * (kViewWidth - 1);
-    const double cy = 0.5 * (kViewHeight - 1);
+    m.view_width = kSynthW;
+    m.view_height = kSynthH;
+    const double cx = 0.5 * (kSynthW - 1);
+    const double cy = 0.5 * (kSynthH - 1);
     m.k_ref[0] = fx; m.k_ref[4] = fx; m.k_ref[2] = cx; m.k_ref[5] = cy; m.k_ref[8] = 1.0;
     m.k_aux[0] = fx; m.k_aux[4] = fx; m.k_aux[2] = cx; m.k_aux[5] = cy; m.k_aux[8] = 1.0;
     m.r_ref[0] = m.r_ref[4] = m.r_ref[8] = 1.0;
@@ -126,6 +131,11 @@ StereoRectifyMatrices IdentityMatrices(double fx = 200.0, double baseline = 0.05
 
 GrayImageView View(const std::vector<std::uint8_t>& img) {
     return GrayImageView{img.data(), kViewWidth, kViewHeight, kViewWidth};
+}
+
+/// 合成视差场用例的视图（1280×240）。
+GrayImageView ViewSynth(const std::vector<std::uint8_t>& img) {
+    return GrayImageView{img.data(), kSynthW, kSynthH, kSynthW};
 }
 
 /// 6×8 网格关键点（≥min_points=30），覆盖目标区域。
@@ -194,6 +204,7 @@ TEST(StereoRangerCoreTest, GoldenSceneMatchesReferenceAggregate) {
 
     const auto box = MakeBox(testdata::kBboxX0, testdata::kBboxY0,
                              testdata::kBboxX1, testdata::kBboxY1);
+    // 黄金数据为 320×240（testdata 尺寸），用 View 而非合成用例的 ViewSynth
     const auto results = core.Process(View(ref), View(aux), {box});
     ASSERT_EQ(results.size(), 1u);
     ASSERT_TRUE(results[0].available) << "黄金场景应可用（簇点数不足）";
@@ -215,12 +226,12 @@ TEST(StereoRangerCoreTest, GoldenSceneMatchesReferenceAggregate) {
 // ---------------------------------------------------------------------------
 TEST(StereoRangerCoreTest, RecoversConstantDisparity) {
     const auto ref = MakeRefImage();
-    const auto aux = MakeAuxImage(std::vector<int>(kViewWidth, 12));
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
     StereoRangerCore core(TestConfig(), IdentityMatrices());
     core.SetKeypointsOverride(GridKeypoints());
     const auto results =
-        core.Process(View(ref), View(aux),
-                     {MakeBox(20, 20, kViewWidth - 15, kViewHeight - 5)});
+        core.Process(ViewSynth(ref), ViewSynth(aux),
+                     {MakeBox(20, 20, kSynthW - 15, kSynthH - 5)});
     ASSERT_TRUE(results[0].available);
     EXPECT_NEAR(results[0].disparity_px, 12.0, 0.3);
     const double fxb = IdentityMatrices().fxb_m_px;
@@ -233,7 +244,7 @@ TEST(StereoRangerCoreTest, RecoversConstantDisparity) {
 // ---------------------------------------------------------------------------
 TEST(StereoRangerCoreTest, NearClusterPicksForeground) {
     const auto ref = MakeRefImage();
-    std::vector<int> disp_for_col(kViewWidth, 8);  // 远：d=8
+    std::vector<int> disp_for_col(kSynthW, 8);  // 远：d=8
     for (int x = 0; x < 150; ++x) {
         disp_for_col[x] = 16;  // 近：d=16（左半）
     }
@@ -252,11 +263,96 @@ TEST(StereoRangerCoreTest, NearClusterPicksForeground) {
         }
     }
     core.SetKeypointsOverride(keypoints);
-    const auto results = core.Process(View(ref), View(aux),
-                                      {MakeBox(20, 20, kViewWidth - 10, 220)});
+    const auto results = core.Process(ViewSynth(ref), ViewSynth(aux),
+                                      {MakeBox(20, 20, kSynthW - 10, 220)});
     ASSERT_TRUE(results[0].available);
     EXPECT_NEAR(results[0].disparity_px, 16.0, 0.5) << "近端簇应选前景 d=16";
     EXPECT_GE(results[0].cluster_points, 30);
+}
+
+// ---------------------------------------------------------------------------
+// Census 编码规格：内部列（常量展开）与边界列（通用裁剪）两条路径逐像素对拍
+// 规格实现——位序 win×win 行主序跳过中心、邻域 >= 中心、越界复制延拓
+// ---------------------------------------------------------------------------
+TEST(StereoRangerCoreTest, CensusEncodingMatchesSpecOnBothPaths) {
+    const int w = 16;
+    const int h = 12;
+    std::vector<std::uint8_t> img(static_cast<std::size_t>(w) * h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            img[static_cast<std::size_t>(y) * w + x] = TextureAt(x, y);
+        }
+    }
+    const auto codes =
+        StereoRangerCore::CensusEncodeForTest(img.data(), w, h, w, 7);
+    ASSERT_EQ(codes.size(), static_cast<std::size_t>(w) * h);
+    const int r = 3;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            // 独立的规格实现（不复用被测代码）
+            const int center = img[static_cast<std::size_t>(y) * w + x];
+            std::uint64_t expected = 0;
+            int bit = 0;
+            for (int dy = -r; dy <= r; ++dy) {
+                const int ny = std::clamp(y + dy, 0, h - 1);
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (dy == 0 && dx == 0) {
+                        continue;
+                    }
+                    const int nx = std::clamp(x + dx, 0, w - 1);
+                    if (img[static_cast<std::size_t>(ny) * w + nx] >= center) {
+                        expected |= (std::uint64_t{1} << bit);
+                    }
+                    ++bit;
+                }
+            }
+            EXPECT_EQ(codes[static_cast<std::size_t>(y) * w + x], expected)
+                << "像素 (" << x << "," << y << ")";
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 边缘关键点匹配：参考窗口跨"内列/边界列"两条编码路径（列 ≥ w−3 走通用路径），
+// 目标窗口落在内列——两条路径位序若不一致，这些点会匹配失败或视差错乱
+// ---------------------------------------------------------------------------
+TEST(StereoRangerCoreTest, MatchingWorksForKeypointsStraddlingEdgeEncoding) {
+    const auto ref = MakeRefImage();
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
+    StereoRangerCore core(TestConfig(), IdentityMatrices());
+    // 参考窗口落在 [W-7, W-2]：跨列 W-3（= kSynthW-3）的内列/边界列编码分界；
+    // 目标窗口（左移 12px）完全落在内列——两条路径位序不一致时这些点必然失配。
+    std::vector<std::pair<float, float>> keypoints;
+    for (int gy = 0; gy < 6; ++gy) {
+        for (int gx = 0; gx < 6; ++gx) {
+            keypoints.emplace_back(static_cast<float>(kSynthW - 21 + gx * 3),
+                                   40.0f + gy * 30.0f);
+        }
+    }
+    core.SetKeypointsOverride(keypoints);
+    const auto results = core.Process(
+        ViewSynth(ref), ViewSynth(aux),
+        {MakeBox(kSynthW - 40, 25, kSynthW, 215)});
+    // 逐点直查：跨越编码分界的关键点必须全部有效且视差正确
+    const auto points = core.LastPointDebugForTest();
+    ASSERT_EQ(points.size(), keypoints.size());
+    int valid = 0;
+    for (const auto& p : points) {
+        if (p.valid) {
+            ++valid;
+            EXPECT_NEAR(p.disparity, 12.0, 0.3)
+                << "边界编码关键点 @" << p.x << "," << p.y;
+        }
+    }
+    EXPECT_EQ(valid, static_cast<int>(keypoints.size()))
+        << "跨编码分界的关键点存在失配（两条编码路径位序可能不一致）";
+    ASSERT_TRUE(results[0].available)
+        << "cluster_points=" << results[0].cluster_points
+        << " d=" << results[0].disparity_px << " iqr=" << results[0].iqr_px;
+    EXPECT_NEAR(results[0].disparity_px, 12.0, 0.3);
+    EXPECT_GE(results[0].cluster_points, 30);
+    const double fxb = IdentityMatrices().fxb_m_px;
+    EXPECT_NEAR(results[0].z_m, fxb / 12.0, 0.02 * fxb / 12.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +361,7 @@ TEST(StereoRangerCoreTest, NearClusterPicksForeground) {
 // ---------------------------------------------------------------------------
 TEST(StereoRangerCoreTest, ColumnCropDoesNotChangeResults) {
     const auto ref = MakeRefImage();
-    const auto aux = MakeAuxImage(std::vector<int>(kViewWidth, 12));
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
     // 关键点全部落在窄框腐蚀后的区域内，两次聚合计数同一批点
     std::vector<std::pair<float, float>> keypoints;
     for (int gy = 0; gy < 6; ++gy) {
@@ -280,9 +376,9 @@ TEST(StereoRangerCoreTest, ColumnCropDoesNotChangeResults) {
     wide.SetKeypointsOverride(keypoints);
 
     const auto small =
-        narrow.Process(View(ref), View(aux), {MakeBox(200, 25, 300, 225)});
-    const auto full = wide.Process(View(ref), View(aux),
-                                   {MakeBox(0, 0, kViewWidth, kViewHeight)});
+        narrow.Process(ViewSynth(ref), ViewSynth(aux), {MakeBox(200, 25, 300, 225)});
+    const auto full = wide.Process(ViewSynth(ref), ViewSynth(aux),
+                                   {MakeBox(0, 0, kSynthW, kSynthH)});
     ASSERT_TRUE(small[0].available);
     ASSERT_TRUE(full[0].available);
     EXPECT_DOUBLE_EQ(small[0].z_m, full[0].z_m);
@@ -296,11 +392,11 @@ TEST(StereoRangerCoreTest, ColumnCropDoesNotChangeResults) {
 // ---------------------------------------------------------------------------
 TEST(StereoRangerCoreTest, ClippedFlagAtSearchLimit) {
     const auto ref = MakeRefImage();
-    const auto aux = MakeAuxImage(std::vector<int>(kViewWidth, 40));  // = disp_max
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 40));  // = disp_max
     StereoRangerCore core(TestConfig(), IdentityMatrices());
     core.SetKeypointsOverride(GridKeypoints());
     const auto results =
-        core.Process(View(ref), View(aux), {MakeBox(20, 20, 300, 230)});
+        core.Process(ViewSynth(ref), ViewSynth(aux), {MakeBox(20, 20, kSynthW - 15, 230)});
     ASSERT_TRUE(results[0].available);
     EXPECT_TRUE(results[0].clipped);
     EXPECT_EQ(core.ClippedCount(), 1u);
@@ -313,25 +409,25 @@ TEST(StereoRangerCoreTest, EmaSmoothingBetweenFrames) {
     StereoRangerConfig cfg = TestConfig();
     cfg.smooth_alpha = 0.4;
     const auto ref = MakeRefImage();
-    const auto aux_far = MakeAuxImage(std::vector<int>(kViewWidth, 8));
-    const auto aux_near = MakeAuxImage(std::vector<int>(kViewWidth, 16));
+    const auto aux_far = MakeAuxImage(std::vector<int>(kSynthW, 8));
+    const auto aux_near = MakeAuxImage(std::vector<int>(kSynthW, 16));
     StereoRangerCore core(cfg, IdentityMatrices());
     core.SetKeypointsOverride(GridKeypoints());
-    const auto box = MakeBox(20, 20, 300, 230);
+    const auto box = MakeBox(20, 20, kSynthW - 15, 230);
 
-    const auto first = core.Process(View(ref), View(aux_far), {box});
+    const auto first = core.Process(ViewSynth(ref), ViewSynth(aux_far), {box});
     ASSERT_TRUE(first[0].available);
     const double z_far = first[0].z_m;
     const double z_near = IdentityMatrices().fxb_m_px / 16.0;
     ASSERT_GT(z_far, z_near);
 
-    const auto second = core.Process(View(ref), View(aux_near), {box});
+    const auto second = core.Process(ViewSynth(ref), ViewSynth(aux_near), {box});
     ASSERT_TRUE(second[0].available);
     EXPECT_NEAR(second[0].z_m, 0.4 * z_near + 0.6 * z_far, 0.02)
         << "EMA 应介于两帧原始距离之间";
 
     core.Reset();  // 清空 EMA：重新起步应回到裸值
-    const auto third = core.Process(View(ref), View(aux_far), {box});
+    const auto third = core.Process(ViewSynth(ref), ViewSynth(aux_far), {box});
     ASSERT_TRUE(third[0].available);
     EXPECT_NEAR(third[0].z_m, z_far, 0.02);
 }
@@ -343,18 +439,18 @@ TEST(StereoRangerCoreTest, WarmupAndBlackFrameSkipped) {
     StereoRangerConfig cfg = TestConfig();
     cfg.warmup_frames = 2;
     const auto ref = MakeRefImage();
-    const auto aux = MakeAuxImage(std::vector<int>(kViewWidth, 12));
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
     StereoRangerCore core(cfg, IdentityMatrices());
-    const auto box = MakeBox(20, 20, 300, 230);
-    EXPECT_FALSE(core.Process(View(ref), View(aux), {box})[0].available);
-    EXPECT_FALSE(core.Process(View(ref), View(aux), {box})[0].available);
-    EXPECT_TRUE(core.Process(View(ref), View(aux), {box})[0].available);
+    const auto box = MakeBox(20, 20, kSynthW - 15, 230);
+    EXPECT_FALSE(core.Process(ViewSynth(ref), ViewSynth(aux), {box})[0].available);
+    EXPECT_FALSE(core.Process(ViewSynth(ref), ViewSynth(aux), {box})[0].available);
+    EXPECT_TRUE(core.Process(ViewSynth(ref), ViewSynth(aux), {box})[0].available);
     EXPECT_EQ(core.SkippedFrameCount(), 2u);
 
     // 黑帧（行带均值 < 阈值）跳过，不产生可用结果
     std::vector<std::uint8_t> black(
-        static_cast<std::size_t>(kViewWidth) * kViewHeight, 0);
-    EXPECT_FALSE(core.Process(View(black), View(black), {box})[0].available);
+        static_cast<std::size_t>(kSynthW) * kSynthH, 0);
+    EXPECT_FALSE(core.Process(ViewSynth(black), ViewSynth(black), {box})[0].available);
     EXPECT_EQ(core.SkippedFrameCount(), 3u);
 }
 
@@ -363,10 +459,11 @@ TEST(StereoRangerCoreTest, WarmupAndBlackFrameSkipped) {
 // ---------------------------------------------------------------------------
 TEST(StereoRangerCoreTest, RejectsMismatchedInputSize) {
     const auto ref = MakeRefImage();
-    const auto aux = MakeAuxImage(std::vector<int>(kViewWidth, 12));
+    const auto aux = MakeAuxImage(std::vector<int>(kSynthW, 12));
     StereoRangerCore core(TestConfig(), IdentityMatrices());
-    const GrayImageView bad{ref.data(), kViewWidth - 2, kViewHeight, kViewWidth - 2};
-    const auto results = core.Process(bad, View(aux), {MakeBox(20, 20, 300, 230)});
+    const GrayImageView bad{ref.data(), kSynthW - 2, kSynthH, kSynthW - 2};
+    const auto results =
+        core.Process(bad, ViewSynth(aux), {MakeBox(20, 20, kSynthW - 15, 230)});
     ASSERT_EQ(results.size(), 1u);
     EXPECT_FALSE(results[0].available);
     EXPECT_EQ(core.MatchedFrameCount(), 0u);

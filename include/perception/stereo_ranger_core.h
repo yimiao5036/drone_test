@@ -148,6 +148,26 @@ public:
     /// 注入关键点（校正图像素坐标），跳过 Shi-Tomasi；传空 vector 恢复默认检测。
     void SetKeypointsOverride(std::vector<std::pair<float, float>> rect_points);
 
+    /// 测试接口：对给定灰度图做 Census 编码（与内部实现同一函数，含内部列的
+    /// 常量展开路径与边界列的通用裁剪路径）。用于逐像素校验两条路径位序一致
+    /// （位序 = win×win 行主序跳过中心；邻域 >= 中心；越界按复制延拓）。
+    static std::vector<std::uint64_t> CensusEncodeForTest(const std::uint8_t* data,
+                                                          int width, int height,
+                                                          int stride, int win);
+
+    /// 测试接口：逐关键点结果（校正图坐标/视差/有效性）。最近一次 Process 的
+    /// 快照；跳过帧或无关键点返回空。用于定位个别关键点的匹配异常。
+    struct PointDebug {
+        float x = 0.0f;
+        float y = 0.0f;
+        float disparity = 0.0f;
+        float uniqueness_ratio = 0.0f;  ///< 峰位 ±2 外次优/最优
+        float lr_best_back = 0.0f;      ///< 回搜得到的最优候选视差
+        bool lr_ok = false;             ///< 左右一致性是否通过
+        bool valid = false;             ///< 有限 && 唯一性 && LR
+    };
+    std::vector<PointDebug> LastPointDebugForTest() const;
+
     // ---- 单点映射（黄金对拍/排查）----
     /// 校正图 → 源图采样坐标（映射表双线性查询）；越界返回 false。
     bool RectToSourceRef(float u_rect, float v_rect, float* u_src,
