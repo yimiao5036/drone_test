@@ -211,6 +211,8 @@ TEST(ConfigTest, DefaultsVideoSourceWhenFieldsMissing) {
     // 本用例刻意移除 uvc/stereo_split，会破坏双目测距依赖链（另有专门用例
     // 覆盖该拒绝），故先关掉测距，聚焦视频源默认值。
     value["runtime"]["enable_stereo_ranging"] = false;
+    // 视觉融合依赖测距，一并关闭（依赖链另有专门用例覆盖）
+    value["runtime"]["enable_visual_position_fusion"] = false;
     const auto path =
         WriteTemporaryConfig(value, "drone_config_video_source_default.json");
 
@@ -356,6 +358,8 @@ TEST(ConfigTest, AllowsMissingGroundStationSectionWhenDisabled) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_ground_station"] = false;
     value["runtime"]["enable_target_estimator"] = false;
+    // 视觉融合依赖目标估计器，一并关闭
+    value["runtime"]["enable_visual_position_fusion"] = false;
     value.erase("ground_station");
     value["video"]["output_rtsp"] = "rtsp://127.0.0.1:8554/drone_out";
     const auto path = WriteTemporaryConfig(value, "drone_config_ground_disabled.json");
@@ -491,6 +495,8 @@ TEST(ConfigTest, StereoRangerDefaultsWhenSectionAbsent) {
     json value = ReadSourceConfig();
     value.erase("stereo_ranger");
     value["runtime"].erase("enable_stereo_ranging");
+    // 视觉融合依赖测距，一并关闭
+    value["runtime"]["enable_visual_position_fusion"] = false;
     const auto path = WriteTemporaryConfig(value, "drone_config_stereo_default.json");
 
     const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
@@ -534,6 +540,70 @@ TEST(ConfigTest, StereoRangerRejectsMissingRectifyMatricesWhenEnabled) {
                  std::invalid_argument);
     CopyRectifyMatricesBeside(path);  // 恢复，避免影响其他用例
     std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, VisualFusionParsesAndCopiesFxb) {
+    // 生产配置已启用融合：fxb 由校正矩阵装配拷贝（单一真源，不进 JSON）
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(),
+                                                     std::string(TEST_SOURCE_DIR));
+    ASSERT_TRUE(config.runtime.enable_visual_position_fusion);
+    EXPECT_TRUE(config.target_estimator.visual.enabled);
+    EXPECT_NEAR(config.target_estimator.visual.fxb_m_px, 63.5665, 1e-3);
+    // 子组默认值（生产配置显式给出 mount 全 0 = 准直安装假设）
+    EXPECT_DOUBLE_EQ(config.target_estimator.visual.disparity_std_px, 0.5);
+    EXPECT_DOUBLE_EQ(config.target_estimator.visual.mount.yaw_deg, 0.0);
+}
+
+TEST(ConfigTest, VisualFusionRequiresEstimatorRangingAndPx4) {
+    // 依赖链：目标估计器 + 双目测距 + PX4，任一缺失都必须拒绝
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_target_estimator"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_no_estimator.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_no_stereo.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_px4"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_no_px4.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, VisualFusionRejectsInvalidValues) {
+    {
+        json value = ReadSourceConfig();
+        value["target_estimator"]["visual"]["disparity_std_px"] = 0.0;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_disp_std.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["target_estimator"]["visual"]["min_confidence"] = 1.5;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_conf_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
 }
 
 TEST(ConfigTest, StereoRangingRequiresUvcSplitAndVisualTracking) {

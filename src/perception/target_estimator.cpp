@@ -53,6 +53,32 @@ uint64_t SaturatingAdd(uint64_t left, uint64_t right) {
 
 }  // namespace
 
+void VisualFusionConfig::Validate() const {
+    if (queue_capacity == 0) {
+        throw std::invalid_argument("视觉融合订阅队列容量必须为正数");
+    }
+    if (max_observation_age_ms.count() <= 0 ||
+        flight_state_max_age_ms.count() <= 0) {
+        throw std::invalid_argument("视觉融合超龄门限必须为正数");
+    }
+    if (!IsPositiveFinite(disparity_std_px)) {
+        throw std::invalid_argument("视觉融合视差误差std必须为有限正数");
+    }
+    if (!std::isfinite(min_confidence) || min_confidence < 0.0 ||
+        min_confidence > 1.0) {
+        throw std::invalid_argument("视觉融合置信度下限必须在[0,1]");
+    }
+    if (!std::isfinite(mount.roll_deg) || !std::isfinite(mount.pitch_deg) ||
+        !std::isfinite(mount.yaw_deg) || !std::isfinite(mount.x_m) ||
+        !std::isfinite(mount.y_m) || !std::isfinite(mount.z_m)) {
+        throw std::invalid_argument("视觉融合安装外参必须为有限数");
+    }
+    if (enabled && !IsPositiveFinite(fxb_m_px)) {
+        throw std::invalid_argument(
+            "视觉融合启用时fxb_m_px必须为正（由双目校正矩阵装配填充）");
+    }
+}
+
 void TargetEstimatorConfig::Validate() const {
     if (ground_target_queue_capacity == 0 || flight_state_queue_capacity == 0) {
         throw std::invalid_argument("目标估计器订阅队列容量必须为正数");
@@ -68,6 +94,7 @@ void TargetEstimatorConfig::Validate() const {
         !IsPositiveFinite(minimum_measurement_std_m)) {
         throw std::invalid_argument("目标估计器噪声与精度参数必须为有限正数");
     }
+    visual.Validate();
 }
 
 struct TargetEstimator::Impl {
@@ -83,12 +110,15 @@ struct TargetEstimator::Impl {
     LinearTargetKalmanFilter filter;
     common::Topic<common::GroundStationTarget>* ground_topic = nullptr;
     common::Topic<common::FlightStateSnapshot>* flight_topic = nullptr;
+    common::Topic<common::StereoTargetDistance>* visual_topic = nullptr;
     common::Topic<common::GroundStationTarget>::Subscription ground_sub;
     common::Topic<common::FlightStateSnapshot>::Subscription flight_sub;
+    common::Topic<common::StereoTargetDistance>::Subscription visual_sub;
     common::Topic<common::TargetState> output;
     std::atomic<bool> running{false};
     std::thread thread;
     std::atomic<uint64_t> update_count{0};
+    std::atomic<uint64_t> visual_update_count{0};
     std::atomic<uint64_t> error_count{0};
     uint64_t waiting_home_count = 0;
     uint64_t output_sequence = 0;
@@ -105,6 +135,29 @@ struct TargetEstimator::Impl {
     mutable std::mutex last_state_mutex;
     common::TargetState last_state;
 
+    // ---- 视觉融合（第二阶段，仅 config.visual.enabled 时生效；消费线程独占）----
+    // 最新 PX4 快照（视觉转换的姿态/自身位置来源；Home 逻辑仍用 HandleFlightState）
+    common::FlightStateSnapshot latest_flight;
+    bool has_flight_snapshot = false;
+    uint64_t latest_flight_receive_ms = 0;
+    // 多框歧义防线（同一左目帧只接受第一条有效观测）
+    uint64_t visual_last_frame_sequence = 0; ///< 最近接受的左目帧序号
+    bool visual_frame_seen = false;
+    // 细分计数（拒绝计入 error_count 并节流 WARN；跳过类不计错误）
+    uint64_t visual_reject_nan = 0;
+    uint64_t visual_reject_time_zero = 0;
+    uint64_t visual_reject_future = 0;
+    uint64_t visual_reject_stale = 0;
+    uint64_t visual_reject_out_of_order = 0;
+    uint64_t visual_reject_ambiguous_frame = 0;
+    uint64_t visual_reject_low_confidence = 0;
+    uint64_t visual_reject_attitude = 0;
+    uint64_t visual_reject_local_position = 0;
+    uint64_t visual_reject_flight_stale = 0;
+    uint64_t visual_skipped_uninitialized = 0;
+    uint64_t visual_skipped_ground_expired = 0;
+    uint64_t ground_degraded_out_of_order = 0;  ///< 视觉推前状态后地面站原地降级更新
+
     void ResetFilterState() {
         filter.Reset();
         target_id = 0;
@@ -115,9 +168,17 @@ struct TargetEstimator::Impl {
         valid_until_ms = 0;
         original_valid_for_ms = 0;
         expired_state_published = false;
+        // 视觉记账一并清空（Home 变化/target_id 切换走同一入口）
+        visual_last_frame_sequence = 0;
+        visual_frame_seen = false;
     }
 
     void HandleFlightState(const common::FlightStateSnapshot& state) {
+        // 留存最新快照供视觉观测转换（姿态 + 自身局部位置）
+        latest_flight = state;
+        has_flight_snapshot = true;
+        latest_flight_receive_ms = state.header.receive_time_ms;
+
         if (!state.home_valid ||
             !IsValidLatitudeLongitude(state.home_lat_1e7, state.home_lon_1e7)) {
             return;
@@ -152,6 +213,142 @@ struct TargetEstimator::Impl {
         const uint64_t count = ++error_count;
         if (ShouldLogThrottled(count)) {
             SPDLOG_WARN("目标估计观测已拒绝: reason={} count={}", reason, count);
+        }
+    }
+
+    /// 视觉观测拒绝：细分计数 + 并入 error_count，节流 WARN（带细分次数）。
+    void VisualReject(uint64_t& counter, const char* reason) {
+        ++error_count;
+        const uint64_t count = ++counter;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("目标估计视觉观测已拒绝: reason={} count={}", reason,
+                        count);
+        }
+    }
+
+    // ---- 视觉观测处理（第二阶段）----
+    //
+    // 语义（docs/物理追踪思路.md §6.3/§6.4）：
+    //   - 视觉只细化、不初始化、不延展：滤波器须已被地面站目标初始化且
+    //     地面站有效期未过，否则跳过（不计错误，过期政策归状态机）；
+    //   - 同一左目帧只接受第一条有效观测（v2 单目标约定，多框歧义防线）；
+    //   - 视觉高频，早于滤波状态的观测直接丢弃（不走地面站的降级路径）。
+    void HandleVisualDistance(const common::StereoTargetDistance& msg,
+                              uint64_t now_ms) {
+        if (!msg.valid || !std::isfinite(msg.forward_distance_m) ||
+            !std::isfinite(msg.camera_x_m) || !std::isfinite(msg.camera_y_m)) {
+            VisualReject(visual_reject_nan, "视觉距离不可用或字段非有限");
+            return;
+        }
+        if (msg.header.source_time_ms == 0) {
+            VisualReject(visual_reject_time_zero, "视觉观测时刻为0");
+            return;
+        }
+        const uint64_t obs_time_ms = msg.header.source_time_ms;
+        if (obs_time_ms > now_ms) {
+            VisualReject(visual_reject_future, "视觉观测时刻在未来（钟域错乱）");
+            return;
+        }
+        if (now_ms - obs_time_ms >
+            static_cast<uint64_t>(config.visual.max_observation_age_ms.count())) {
+            VisualReject(visual_reject_stale, "视觉观测超龄");
+            return;
+        }
+        if (static_cast<double>(msg.confidence) < config.visual.min_confidence) {
+            VisualReject(visual_reject_low_confidence, "视觉观测置信度低于下限");
+            return;
+        }
+        if (visual_frame_seen && msg.frame_sequence == visual_last_frame_sequence) {
+            VisualReject(visual_reject_ambiguous_frame,
+                         "同一帧多框歧义，仅接受首条");
+            return;
+        }
+        if (!filter.IsInitialized()) {
+            ++visual_skipped_uninitialized;  // 地面站未给目标前视觉不造目标
+            return;
+        }
+        if (now_ms >= valid_until_ms) {
+            ++visual_skipped_ground_expired;  // 不延展有效期（状态机政策）
+            return;
+        }
+        if (obs_time_ms < state_time_ms) {
+            VisualReject(visual_reject_out_of_order, "视觉观测早于滤波状态");
+            return;
+        }
+        if (!has_flight_snapshot ||
+            now_ms - latest_flight_receive_ms >
+                static_cast<uint64_t>(
+                    config.visual.flight_state_max_age_ms.count())) {
+            VisualReject(visual_reject_flight_stale, "PX4快照缺失或超龄");
+            return;
+        }
+        if (!latest_flight.attitude_valid) {
+            VisualReject(visual_reject_attitude, "PX4姿态无效");
+            return;
+        }
+        if (!latest_flight.local_position_valid) {
+            VisualReject(visual_reject_local_position, "PX4局部位置无效");
+            return;
+        }
+
+        const LocalNedCoordinate self_position{
+            static_cast<double>(latest_flight.local_x_m),
+            static_cast<double>(latest_flight.local_y_m),
+            static_cast<double>(latest_flight.local_z_m)};
+        const auto ned = VisualCameraToLocalNed(
+            msg.camera_x_m, msg.camera_y_m,
+            static_cast<double>(msg.forward_distance_m), config.visual.mount,
+            static_cast<double>(latest_flight.roll_rad),
+            static_cast<double>(latest_flight.pitch_rad),
+            static_cast<double>(latest_flight.yaw_rad), self_position);
+        if (!ned.has_value()) {
+            VisualReject(visual_reject_nan, "视觉观测NED转换结果非有限");
+            return;
+        }
+
+        // σ 模型：z = fxb/d ⇒ σ_z = z²·σ_d/fxb；v1 水平/垂直共用 σ_z
+        //（大离轴角下不严格保守，见实现文档）。KF 内部另有最小 std 下限。
+        const double z_m = static_cast<double>(msg.forward_distance_m);
+        const double sigma_z =
+            z_m * z_m * config.visual.disparity_std_px / config.visual.fxb_m_px;
+        LinearTargetMeasurement measurement;
+        measurement.north_m = ned->north_m;
+        measurement.east_m = ned->east_m;
+        measurement.down_m = ned->down_m;
+        measurement.down_valid = true;
+        measurement.horizontal_position_std_m = sigma_z;
+        measurement.vertical_position_std_m = sigma_z;
+
+        const double dt_seconds =
+            static_cast<double>(obs_time_ms - state_time_ms) *
+            kMillisecondsToSeconds;
+        if (!(filter.Predict(dt_seconds) && filter.Update(measurement))) {
+            Reject("线性卡尔曼更新失败");
+            return;
+        }
+
+        visual_last_frame_sequence = msg.frame_sequence;
+        visual_frame_seen = true;
+        state_time_ms = obs_time_ms;
+        last_observed_ms = obs_time_ms;
+        // 注意：不触碰 valid_until_ms / original_valid_for_ms（不延展有效期）
+        const uint64_t count = ++visual_update_count;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO(
+                "目标估计已接受视觉观测: frame={} N={:.2f} E={:.2f} D={:.2f} "
+                "sigma={:.3f}m z={:.2f}m count={}",
+                msg.frame_sequence, ned->north_m, ned->east_m, ned->down_m,
+                sigma_z, z_m, count);
+        }
+    }
+
+    void DrainVisualDistances() {
+        if (!visual_sub.IsOpen()) {
+            return;
+        }
+        const uint64_t now_ms = SteadyNowMs();
+        while (auto message = visual_sub.TryTake()) {
+            HandleVisualDistance(**message, now_ms);
         }
     }
 
@@ -242,9 +439,23 @@ struct TargetEstimator::Impl {
         }
         const uint64_t observation_time_ms =
             target.header.receive_time_ms - target.transport_age_ms;
+        // 视觉融合开启后，视觉更新会把滤波状态时刻推前；此后到达的地面站观测
+        //（obs=receive−transport_age）必然“早于状态”，直接拒绝会让地面站链路
+        // 在有效期内饿死。降级：不回溯 Predict，在状态时刻原地 Update
+        //（误差上界≈目标速度×时间差）。开关关闭时保持原有拒绝行为。
+        bool ground_out_of_order_degraded = false;
         if (filter.IsInitialized() && observation_time_ms < state_time_ms) {
-            Reject("观测时间早于滤波状态");
-            return;
+            if (!config.visual.enabled) {
+                Reject("观测时间早于滤波状态");
+                return;
+            }
+            ground_out_of_order_degraded = true;
+            const uint64_t count = ++ground_degraded_out_of_order;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN(
+                    "地面站观测早于滤波状态（视觉已推前），原地降级更新: count={}",
+                    count);
+            }
         }
 
         LinearTargetMeasurement measurement;
@@ -266,8 +477,10 @@ struct TargetEstimator::Impl {
             accepted = filter.Initialize(measurement);
         } else {
             const double dt_seconds =
-                static_cast<double>(observation_time_ms - state_time_ms) *
-                kMillisecondsToSeconds;
+                ground_out_of_order_degraded
+                    ? 0.0  // 降级：原地更新，不回溯 Predict（也避免无符号回绕）
+                    : static_cast<double>(observation_time_ms - state_time_ms) *
+                          kMillisecondsToSeconds;
             accepted = filter.Predict(dt_seconds) && filter.Update(measurement);
         }
         if (!accepted) {
@@ -278,8 +491,10 @@ struct TargetEstimator::Impl {
         target_id = target.target_id;
         last_ground_boot_id = target.ground_station_boot_id;
         last_update_seq = target.update_seq;
-        state_time_ms = observation_time_ms;
-        last_observed_ms = observation_time_ms;
+        if (!ground_out_of_order_degraded) {
+            state_time_ms = observation_time_ms;  // 降级时不回退状态时刻
+        }
+        last_observed_ms = std::max(last_observed_ms, observation_time_ms);
         valid_until_ms = target_valid_until;
         original_valid_for_ms = target.header.valid_for_ms;
         expired_state_published = false;
@@ -365,9 +580,11 @@ struct TargetEstimator::Impl {
         uint64_t next_publish_ms = SteadyNowMs();
         while (running.load()) {
             DrainFlightStates();
+            DrainVisualDistances();
             const auto target = ground_sub.WaitTakeFor(
                 std::min(config.publish_interval, std::chrono::milliseconds(20)));
             DrainFlightStates();
+            DrainVisualDistances();
             if (target.has_value()) {
                 HandleGroundTarget(**target);
             }
@@ -387,6 +604,7 @@ struct TargetEstimator::Impl {
         }
         ground_sub.Reset();
         flight_sub.Reset();
+        visual_sub.Reset();
         if (thread.joinable()) {
             thread.join();
         }
@@ -413,6 +631,11 @@ bool TargetEstimator::Start() {
         SPDLOG_ERROR("目标估计器启动失败: 地面站目标或PX4状态输入未绑定");
         return false;
     }
+    if (impl_->config.visual.enabled && impl_->visual_topic == nullptr) {
+        ++impl_->error_count;
+        SPDLOG_ERROR("目标估计器启动失败: 视觉融合已启用但视觉距离输入未绑定");
+        return false;
+    }
     if (!impl_->ground_sub.IsOpen()) {
         impl_->ground_sub = impl_->ground_topic->Subscribe(
             impl_->config.ground_target_queue_capacity);
@@ -421,15 +644,24 @@ bool TargetEstimator::Start() {
         impl_->flight_sub = impl_->flight_topic->Subscribe(
             impl_->config.flight_state_queue_capacity);
     }
+    if (impl_->config.visual.enabled && !impl_->visual_sub.IsOpen()) {
+        impl_->visual_sub = impl_->visual_topic->Subscribe(
+            impl_->config.visual.queue_capacity,
+            common::Topic<common::StereoTargetDistance>::OverflowPolicy::
+                kDropOldest);
+    }
     impl_->ResetFilterState();
     impl_->home.reset();
+    impl_->has_flight_snapshot = false;
+    impl_->latest_flight_receive_ms = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->last_state_mutex);
         impl_->last_state = common::TargetState{};
     }
     impl_->running = true;
     impl_->thread = std::thread(&Impl::Run, impl_.get());
-    SPDLOG_INFO("目标估计器启动: shadow=true");
+    SPDLOG_INFO("目标估计器启动: shadow=true visual_fusion={}",
+                impl_->config.visual.enabled);
     return true;
 }
 
@@ -459,6 +691,15 @@ void TargetEstimator::SetFlightStateInput(
         impl_->config.flight_state_queue_capacity);
 }
 
+void TargetEstimator::SetVisualDistanceInput(
+    common::Topic<common::StereoTargetDistance>& visual) {
+    impl_->visual_topic = &visual;
+    impl_->visual_sub = visual.Subscribe(
+        impl_->config.visual.queue_capacity,
+        common::Topic<common::StereoTargetDistance>::OverflowPolicy::
+            kDropOldest);
+}
+
 common::Topic<common::TargetState>& TargetEstimator::EstimatedOutput() {
     return impl_->output;
 }
@@ -470,6 +711,10 @@ common::TargetState TargetEstimator::LastState() const {
 
 uint64_t TargetEstimator::UpdateCount() const {
     return impl_->update_count.load();
+}
+
+uint64_t TargetEstimator::VisualUpdateCount() const {
+    return impl_->visual_update_count.load();
 }
 
 uint64_t TargetEstimator::ErrorCount() const {
@@ -508,6 +753,9 @@ void TargetEstimatorStub::SetGroundTargetInput(
 void TargetEstimatorStub::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>&) {}
 
+void TargetEstimatorStub::SetVisualDistanceInput(
+    common::Topic<common::StereoTargetDistance>&) {}
+
 common::Topic<common::TargetState>& TargetEstimatorStub::EstimatedOutput() {
     return estimated_output_;
 }
@@ -517,6 +765,10 @@ common::TargetState TargetEstimatorStub::LastState() const {
 }
 
 uint64_t TargetEstimatorStub::UpdateCount() const {
+    return 0;
+}
+
+uint64_t TargetEstimatorStub::VisualUpdateCount() const {
     return 0;
 }
 

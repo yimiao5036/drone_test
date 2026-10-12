@@ -527,6 +527,8 @@ AppConfig LoadAppConfig(const std::string& path,
         runtime.value("enable_visual_tracking", false);
     config.runtime.enable_stereo_ranging =
         runtime.value("enable_stereo_ranging", false);
+    config.runtime.enable_visual_position_fusion =
+        runtime.value("enable_visual_position_fusion", false);
     config.runtime.enable_control = runtime.value("enable_control", false);
     if (!config.runtime.enable_video && !config.runtime.enable_px4 &&
         !config.runtime.enable_ground_station) {
@@ -542,6 +544,13 @@ AppConfig LoadAppConfig(const std::string& path,
         (!config.runtime.enable_ground_station || !config.runtime.enable_px4)) {
         throw std::invalid_argument(
             "enable_target_estimator=true时必须同时启用地面站和PX4链路");
+    }
+    if (config.runtime.enable_visual_position_fusion &&
+        (!config.runtime.enable_target_estimator ||
+         !config.runtime.enable_stereo_ranging || !config.runtime.enable_px4)) {
+        throw std::invalid_argument(
+            "enable_visual_position_fusion=true时必须同时启用目标估计器、"
+            "双目测距与PX4链路");
     }
     if (config.runtime.enable_visual_monitor && !config.runtime.enable_video) {
         throw std::invalid_argument(
@@ -610,6 +619,36 @@ AppConfig LoadAppConfig(const std::string& path,
         ReadOptionalPositiveDouble(target_estimator,
                                    "minimum_measurement_std_m",
                                    config.target_estimator.minimum_measurement_std_m);
+    // 视觉融合子组（runtime.enable_visual_position_fusion 开启后生效；
+    // enabled 与 fxb_m_px 在校正矩阵加载后装配填充并复核 Validate）。
+    // mount_* 默认全 0 = 准直安装假设（未标定），允许 0/负值故直接 value()。
+    const json visual_fusion =
+        target_estimator.value("visual", json::object());
+    auto& visual_cfg = config.target_estimator.visual;
+    visual_cfg.queue_capacity = ReadOptionalPositiveSize(
+        visual_fusion, "queue_capacity", visual_cfg.queue_capacity);
+    visual_cfg.max_observation_age_ms = ReadOptionalPositiveMilliseconds(
+        visual_fusion, "max_observation_age_ms",
+        visual_cfg.max_observation_age_ms);
+    visual_cfg.flight_state_max_age_ms = ReadOptionalPositiveMilliseconds(
+        visual_fusion, "flight_state_max_age_ms",
+        visual_cfg.flight_state_max_age_ms);
+    visual_cfg.disparity_std_px = ReadOptionalPositiveDouble(
+        visual_fusion, "disparity_std_px", visual_cfg.disparity_std_px);
+    visual_cfg.min_confidence = ReadOptionalNonNegativeDouble(
+        visual_fusion, "min_confidence", visual_cfg.min_confidence);
+    visual_cfg.mount.roll_deg =
+        visual_fusion.value("mount_roll_deg", visual_cfg.mount.roll_deg);
+    visual_cfg.mount.pitch_deg =
+        visual_fusion.value("mount_pitch_deg", visual_cfg.mount.pitch_deg);
+    visual_cfg.mount.yaw_deg =
+        visual_fusion.value("mount_yaw_deg", visual_cfg.mount.yaw_deg);
+    visual_cfg.mount.x_m =
+        visual_fusion.value("mount_x_m", visual_cfg.mount.x_m);
+    visual_cfg.mount.y_m =
+        visual_fusion.value("mount_y_m", visual_cfg.mount.y_m);
+    visual_cfg.mount.z_m =
+        visual_fusion.value("mount_z_m", visual_cfg.mount.z_m);
     config.target_estimator.Validate();
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。
@@ -879,6 +918,14 @@ AppConfig LoadAppConfig(const std::string& path,
             ConfigDirectoryOf(path), config.stereo_ranger.rectify_matrices_path);
         config.stereo_rectify =
             LoadStereoRectifyMatrices(config.stereo_ranger.rectify_matrices_path);
+    }
+    // 视觉融合装配：enabled 由 runtime 开关写入；fxb_m_px 从校正矩阵拷贝
+    //（深度系数单一真源，不进 JSON）；填充后复核 Validate（enabled 时要求
+    // fxb>0）。
+    if (config.runtime.enable_visual_position_fusion) {
+        config.target_estimator.visual.enabled = true;
+        config.target_estimator.visual.fxb_m_px = config.stereo_rectify.fxb_m_px;
+        config.target_estimator.Validate();
     }
 
     config.camera.rtsp_url = video.value(

@@ -140,6 +140,11 @@ struct StereoTargetDistance {
     float confidence = 0.f;         ///< 左右目置信度取小；未匹配时为左目置信度
     bool valid = false;             ///< 匹配成功且在有效域内（disparity≥最小视差且距离在域内）
     float center_pixel_x_mid = 0.f; ///< 双目中心x中值；未匹配时为左目中心x
+    // 目标在基准相机系（SBS 右半=物理左目校正域：x 右 / y 下 / z 前）的三维
+    // 位置（米，EMA 平滑后）；z 分量即 forward_distance_m。valid=false 时不可用。
+    // 供视觉观测 → 局部 NED 转换（TargetEstimator 视觉融合）使用。
+    float camera_x_m = std::numeric_limits<float>::quiet_NaN();
+    float camera_y_m = std::numeric_limits<float>::quiet_NaN();
     float bbox_x = 0.f;             ///< 左目框（像素）
     float bbox_y = 0.f;
     float bbox_w = 0.f;

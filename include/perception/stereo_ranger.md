@@ -30,8 +30,9 @@
 
 ### 边界（v2）
 
-- **影子链路组件**：发布 `kStereoTargetDistance`，唯一消费者是 `VisualTrackingShadow`
-  的距离通道（可选输入）；不产生飞行控制输出；不注册健康源。
+- **影子链路组件**：发布 `kStereoTargetDistance`，消费者为 `VisualTrackingShadow`
+  （距离通道，可选）与 `TargetEstimator`（视觉融合，需 `enable_visual_position_fusion`）；
+  不产生飞行控制输出；不注册健康源。
 - **只在基准图跑检测**：无右目检测实例（`yolo_right` 已删除，省约一半 NPU）。
 - 不做多目标跟踪（`track_id` 恒 0）、不做 NED 融合、不做饱和点剔除（仅截断告警）。
 - 校正矩阵**预置**（Python 一次性导出），C++ 不引入 OpenCV。
@@ -49,7 +50,9 @@ Topic<FrameHandle> kDecodedFrameRight（辅助图=SBS左半,NV12）   ─┘    
                                                                         ▼
                                     VisualTrackingShadow::SetDistanceInput（可选）
                                     valid 且未超龄 → 距离 PID 接管（影子观察）；
-                                    无效/未接线 → 回落 no_distance_action=kSlowApproach
+                                    无效/未接线 → 回落 no_distance_action=kSlowApproach；
+                                    TargetEstimator::SetVisualDistanceInput（可选，
+                                    视觉融合开关）→ 局部 NED 观测更新滤波器（影子）
 ```
 
 `StereoTargetDistance` 字段（`include/common/types.h`）：
@@ -63,6 +66,7 @@ Topic<FrameHandle> kDecodedFrameRight（辅助图=SBS左半,NV12）   ─┘    
 | `confidence` | 左目检测置信度 |
 | `valid` | 聚合成功（近端簇点数 ≥ `min_points`） |
 | `center_pixel_x_mid` | 腐蚀后框中心 x（校正图）；不可用时取原始框中心 x |
+| `camera_x_m` / `camera_y_m` | 目标在基准相机系（x 右 / y 下 / z 前）的横向/纵向位置（米，EMA 后）；z 即 `forward_distance_m`；valid=false 时 NaN。供 TargetEstimator 视觉融合（`visual_ned_converter`） |
 | `bbox_x/y/w/h` | 左目检测框（**原始左图坐标**，未腐蚀） |
 | `header.source_time_ms` | 基准帧的拆分完成时刻（帧元数据 `timestamp_ms`） |
 
@@ -88,7 +92,7 @@ Topic 一览：
 |---|---|---|---|
 | `kDetection` | `DetectionResult` | YoloDetector（基准图） | FrameCompositor、StereoRanger |
 | `kDecodedFrameLeft/Right` | `video::FrameHandle` | StereoFrameSplitter | YoloDetector/叠加器/图传、StereoRanger |
-| `kStereoTargetDistance` | `StereoTargetDistance` | StereoRanger | VisualTrackingShadow（可选） |
+| `kStereoTargetDistance` | `StereoTargetDistance` | StereoRanger | VisualTrackingShadow（可选）、TargetEstimator（视觉融合，可选） |
 
 ## 关键实现点（语义照抄参考实现，逐条可核对）
 
@@ -177,7 +181,7 @@ Topic 一览：
   ./build/stereo_ranger_test        # 组件：接线校验、settle/新序号闭合、每框一条、
                                     # 右帧缺失降级、Stop 幂等与重启、
                                     # 摘要静默抑制（静默不打印/活动恢复打印）
-  ctest --test-dir build --output-on-failure     # 基线 344/344
+  ctest --test-dir build --output-on-failure     # 基线 371/371
   ./build/stereo_ranger_bench 30    # 性能基准（开发机；输出各阶段 avg/p95，内部自动开诊断）
   ./build/stereo_ranger_bench 30 --no-stats   # 同上但关诊断（=生产默认），用于 A/B 诊断开销
   ```

@@ -209,6 +209,13 @@ void DroneApplication::BindTopics() {
         target_estimator_->SetGroundTargetInput(
             ground_station_link_->TargetOutput());
         target_estimator_->SetFlightStateInput(px4_link_->StateOutput());
+        // 视觉融合（影子）：双目距离 → 局部NED 观测接入同一滤波器；
+        // 开关关闭或未装配测距时不接线，估计器行为与第一阶段一致。
+        if (config_.runtime.enable_visual_position_fusion &&
+            stereo_ranger_ != nullptr) {
+            target_estimator_->SetVisualDistanceInput(
+                stereo_ranger_->DistanceOutput());
+        }
     }
 
     if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr &&

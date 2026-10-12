@@ -178,6 +178,11 @@ TEST(StereoRangerTest, PublishesValidDistancePerBoxAfterSettle) {
     EXPECT_NEAR((*msg)->forward_distance_m, kExpectedZ, 0.08);
     EXPECT_GT((*msg)->disparity_px, 10.0f);
     EXPECT_LT((*msg)->disparity_px, 16.0f);
+    // 相机系三维位置：z=forward_distance_m，x/y 有限且量级合理（黄金场景近距）
+    EXPECT_TRUE(std::isfinite((*msg)->camera_x_m));
+    EXPECT_TRUE(std::isfinite((*msg)->camera_y_m));
+    EXPECT_NEAR((*msg)->camera_x_m, 0.0f, (*msg)->forward_distance_m);
+    EXPECT_NEAR((*msg)->camera_y_m, 0.0f, (*msg)->forward_distance_m);
     EXPECT_EQ((*msg)->frame_sequence, left_seq);
     EXPECT_FLOAT_EQ((*msg)->bbox_x, 20.f);
     EXPECT_FLOAT_EQ((*msg)->bbox_w, static_cast<float>(kViewWidth - 35));
@@ -282,6 +287,8 @@ TEST(StereoRangerTest, MissingRightFramePublishesInvalid) {
     EXPECT_FALSE((*msg)->valid);
     EXPECT_TRUE(std::isnan((*msg)->forward_distance_m));
     EXPECT_TRUE(std::isnan((*msg)->disparity_px));
+    EXPECT_TRUE(std::isnan((*msg)->camera_x_m));  // 无效帧相机系坐标不可用
+    EXPECT_TRUE(std::isnan((*msg)->camera_y_m));
     EXPECT_EQ((*msg)->frame_sequence, left_seq);
     EXPECT_FLOAT_EQ((*msg)->bbox_x, 20.f);  // 方位字段照常发布
     f.ranger.Stop();

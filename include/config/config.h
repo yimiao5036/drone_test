@@ -36,6 +36,9 @@ struct RuntimeConfig {
     bool enable_visual_monitor = false;
     bool enable_visual_tracking = false;  ///< 视觉跟踪控制律影子（kControlIntent 无消费者）
     bool enable_stereo_ranging = false;  ///< 双目测距影子（依赖 uvc+stereo_split+视觉跟踪）
+    /// 双目视觉观测 → 局部 NED 融合进目标估计器（影子；依赖 target_estimator +
+    /// stereo_ranging + px4；不延展地面站有效期，docs/物理追踪思路.md §6.3）
+    bool enable_visual_position_fusion = false;
     bool enable_control = false;
 };
 

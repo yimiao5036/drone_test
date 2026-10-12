@@ -96,6 +96,7 @@ set(PERCEPTION_SOURCES
     src/perception/laser_range_finder.cpp
     src/perception/perception_fusion.cpp
     src/perception/geodetic_converter.cpp
+    src/perception/visual_ned_converter.cpp
     src/perception/linear_target_kalman_filter.cpp
     src/perception/target_estimator.cpp
     src/perception/stereo_ranger_core.cpp
@@ -625,6 +626,20 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stereo_ranger_test)
+
+        # 视觉观测 → 局部 NED 纯函数转换（轴置换/姿态 RPY/mount 外参）
+        add_executable(visual_ned_converter_test
+            tests/perception/visual_ned_converter_test.cpp)
+        target_link_libraries(visual_ned_converter_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(visual_ned_converter_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(visual_ned_converter_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(visual_ned_converter_test)
 
         # 叠加器测试：验证 NV12 帧 + 检测 → 标注帧（不依赖硬件）
         add_executable(frame_compositor_test tests/video/frame_compositor_test.cpp)

@@ -11,7 +11,8 @@
         "enable_visual_monitor": true,
         "enable_control": false,
         "enable_visual_tracking": true,
-        "enable_stereo_ranging": true
+        "enable_stereo_ranging": true,
+        "enable_visual_position_fusion": true
     },
     "health": {
         "cpu_sample_period_ms": 1000,
@@ -106,7 +107,20 @@
         "velocity_measurement_std_mps": 5.0,
         "default_horizontal_accuracy_m": 10.0,
         "default_vertical_accuracy_m": 15.0,
-        "minimum_measurement_std_m": 0.5
+        "minimum_measurement_std_m": 0.5,
+        "visual": {
+            "queue_capacity": 8,
+            "max_observation_age_ms": 200,
+            "flight_state_max_age_ms": 150,
+            "disparity_std_px": 0.5,
+            "min_confidence": 0.0,
+            "mount_roll_deg": 0.0,
+            "mount_pitch_deg": 0.0,
+            "mount_yaw_deg": 0.0,
+            "mount_x_m": 0.0,
+            "mount_y_m": 0.0,
+            "mount_z_m": 0.0
+        }
     },
     "visual_monitor": {
         "input_queue_capacity": 2,

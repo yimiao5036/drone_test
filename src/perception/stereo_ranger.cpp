@@ -217,6 +217,8 @@ struct StereoRanger::Impl {
                 msg.slant_range_m = static_cast<float>(range.euclid_m);
                 msg.disparity_px = static_cast<float>(range.disparity_px);
                 msg.center_pixel_x_mid = static_cast<float>(range.center_x_rect);
+                msg.camera_x_m = static_cast<float>(range.x_m);
+                msg.camera_y_m = static_cast<float>(range.y_m);
                 msg.valid = true;
                 if (distance_sample_count == 0) {
                     distance_min_m = range.z_m;
