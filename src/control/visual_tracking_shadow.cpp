@@ -7,7 +7,8 @@
 //      姿态缺失/超龄时按配置以零姿态兜底（虚拟姿态影子，日志标注）；
 //   ③ TrackingControlLaw::Update；
 //   ④ ControlOutput → ControlIntent 映射发布（见头文件 reason_code/模式约定）；
-//   ⑤ 节流摘要日志（默认 10s）。
+//   ⑤ 节流摘要日志（默认 10s）：离散状态变化立即打印一次，窗口到期时内容与
+//      上次完全相同则不打印（静默期不刷屏，故障排查手册 §19）。
 //
 // 日志纪律：启动/停止/虚拟姿态启用为生命周期 INFO；摘要节流；热路径零日志。
 // =============================================================================
@@ -205,12 +206,53 @@ struct VisualTrackingShadow::Impl {
         return intent;
     }
 
+    /// 摘要抑制指纹（故障排查手册 §19）：离散状态（模式/有效/coast/虚拟姿态/
+    /// 距离有效性）任一变化 ⇒ 立即打印一次；窗口到期时与上次打印指纹完全相同
+    /// （含速度/距离数值）⇒ 视为静默重复，跳过不打印。
+    struct SummaryFingerprint {
+        ControlMode mode = ControlMode::kBrakeHover;
+        bool valid = false;
+        bool coast = false;
+        bool virtual_attitude = false;
+        bool distance_valid = false;
+        double vx_mps = 0.0;
+        double vy_mps = 0.0;
+        double vz_mps = 0.0;
+        double yaw_rate_dps = 0.0;
+        double distance_m = 0.0;
+
+        bool operator==(const SummaryFingerprint& other) const {
+            return mode == other.mode && valid == other.valid &&
+                   coast == other.coast &&
+                   virtual_attitude == other.virtual_attitude &&
+                   distance_valid == other.distance_valid &&
+                   vx_mps == other.vx_mps && vy_mps == other.vy_mps &&
+                   vz_mps == other.vz_mps &&
+                   yaw_rate_dps == other.yaw_rate_dps &&
+                   distance_m == other.distance_m;
+        }
+        bool operator!=(const SummaryFingerprint& other) const {
+            return !(*this == other);
+        }
+
+        /// 离散状态子集（连续量不参与）：变化立即触发打印。
+        bool DiscreteChangedFrom(const SummaryFingerprint& last) const {
+            return mode != last.mode || valid != last.valid ||
+                   coast != last.coast ||
+                   virtual_attitude != last.virtual_attitude ||
+                   distance_valid != last.distance_valid;
+        }
+    };
+
     void Run() {
         const auto period = std::chrono::duration<double>(
             1.0 / tracking_config.control.frequency_hz);
         auto next_tick = std::chrono::steady_clock::now();
         std::int64_t last_summary_ms = 0;
         ControlOutput last_out;
+        // 摘要抑制状态：首拍必打印一次（确认组件活着，§19）
+        SummaryFingerprint last_summary;
+        bool has_summary = false;
 
         while (running.load()) {
             next_tick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -231,21 +273,52 @@ struct VisualTrackingShadow::Impl {
             (void)intent_output.Publish(std::move(intent));
             intent_count.fetch_add(1);
 
-            if (now_ms - last_summary_ms >= shadow_config.summary_log_interval.count()) {
-                last_summary_ms = now_ms;
-                char distance_buf[32];
-                if (has_distance && last_distance.valid) {
-                    std::snprintf(distance_buf, sizeof(distance_buf), "%.2fm(有效=1)",
-                                  static_cast<double>(last_distance.forward_distance_m));
-                } else {
-                    std::snprintf(distance_buf, sizeof(distance_buf), "--(有效=0)");
+            const bool distance_present = has_distance && last_distance.valid;
+            SummaryFingerprint summary_now;
+            summary_now.mode = last_out.mode;
+            summary_now.valid = last_out.valid;
+            summary_now.coast = last_out.coast_active;
+            summary_now.virtual_attitude = last_virtual_attitude.load();
+            summary_now.distance_valid = distance_present;
+            summary_now.vx_mps = last_out.vx_mps;
+            summary_now.vy_mps = last_out.vy_mps;
+            summary_now.vz_mps = last_out.vz_mps;
+            summary_now.yaw_rate_dps = last_out.yaw_rate_dps;
+            summary_now.distance_m =
+                distance_present
+                    ? static_cast<double>(last_distance.forward_distance_m)
+                    : 0.0;
+
+            const bool summary_due =
+                now_ms - last_summary_ms >=
+                shadow_config.summary_log_interval.count();
+            const bool discrete_changed =
+                !has_summary || summary_now.DiscreteChangedFrom(last_summary);
+            if (discrete_changed || summary_due) {
+                // 离散状态变化立即打印；窗口到期时内容与上次完全相同则跳过
+                //（静默期不再重复刷屏，故障排查手册 §19）。
+                if (discrete_changed || summary_now != last_summary) {
+                    char distance_buf[32];
+                    if (distance_present) {
+                        std::snprintf(distance_buf, sizeof(distance_buf),
+                                      "%.2fm(有效=1)",
+                                      static_cast<double>(
+                                          last_distance.forward_distance_m));
+                    } else {
+                        std::snprintf(distance_buf, sizeof(distance_buf),
+                                      "--(有效=0)");
+                    }
+                    SPDLOG_INFO(
+                        "视觉跟踪影子摘要: 模式={} 有效={} vx={:.2f} vy={:.2f} "
+                        "vz={:.2f} yaw_rate={:.1f}dps coast={} 虚拟姿态={} 距离={}",
+                        ModeName(last_out.mode), last_out.valid, last_out.vx_mps,
+                        last_out.vy_mps, last_out.vz_mps, last_out.yaw_rate_dps,
+                        last_out.coast_active, last_virtual_attitude.load(),
+                        distance_buf);
                 }
-                SPDLOG_INFO("视觉跟踪影子摘要: 模式={} 有效={} vx={:.2f} vy={:.2f} "
-                            "vz={:.2f} yaw_rate={:.1f}dps coast={} 虚拟姿态={} 距离={}",
-                            ModeName(last_out.mode), last_out.valid,
-                            last_out.vx_mps, last_out.vy_mps, last_out.vz_mps,
-                            last_out.yaw_rate_dps, last_out.coast_active,
-                            last_virtual_attitude.load(), distance_buf);
+                last_summary = summary_now;
+                has_summary = true;
+                last_summary_ms = now_ms;
             }
 
             std::this_thread::sleep_until(next_tick);

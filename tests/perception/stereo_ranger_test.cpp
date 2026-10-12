@@ -3,7 +3,7 @@
 //
 // 覆盖：三路输入接线校验、帧/检测批次配对（settle 闭合与新序号闭合）、
 //   每框一条发布、右帧缺失降级（valid=false）、字段映射（帧序号/框/置信度）、
-//   Stop 幂等与可重启。
+//   Stop 幂等与可重启、摘要静默抑制（静默窗口不打印，活动恢复照常打印）。
 //
 // 帧源用真实内存池（video::VideoFramePool）；输入图用黄金场景渲染图
 // （tests/perception/data/stereo_*.bin），端到端期望值与参考实现一致。
@@ -19,10 +19,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "../common/log_capture.h"
 #include "common/topic.h"
 #include "data/stereo_golden.h"
 #include "video/video_frame_pool.h"
@@ -35,6 +37,20 @@ using testdata::kViewHeight;
 using testdata::kViewWidth;
 
 constexpr double kExpectedZ = 0.988;  // 黄金场景（参考实现聚合值）
+
+/// 轮询等待条件成立（最长 timeout_ms）。
+template <typename F>
+bool WaitFor(F&& pred, int timeout_ms = 2000) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return pred();
+}
 
 StereoRangerConfig TestConfig() {
     StereoRangerConfig cfg;
@@ -92,8 +108,9 @@ struct Fixture {
     std::shared_ptr<video::VideoFramePool> right_pool;
     StereoRanger ranger;
 
-    Fixture()
-        : left_pool(std::make_shared<video::VideoFramePool>(6, FrameTemplate())),
+    explicit Fixture(StereoRangerConfig config = TestConfig())
+        : cfg(std::move(config)),
+          left_pool(std::make_shared<video::VideoFramePool>(6, FrameTemplate())),
           right_pool(std::make_shared<video::VideoFramePool>(6, FrameTemplate())),
           ranger(cfg, testdata::Matrices()) {
         ranger.SetDetectionInput(detection_topic);
@@ -297,6 +314,35 @@ TEST(StereoRangerTest, NotStartedDoesNotPublish) {
     (void)f.left_topic.Emplace(video::FrameHandle{});
     (void)f.detection_topic.Emplace(box);
     EXPECT_FALSE(out_sub.WaitTakeFor(50ms).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 摘要静默抑制（故障排查手册 §19）：静默窗口不重复打印，活动恢复照常打印
+// ---------------------------------------------------------------------------
+TEST(StereoRangerTest, SummarySuppressedDuringSilenceAndResumesWithActivity) {
+    drone::test::LogCapture capture;  // 须在组件启动前构造（见 log_capture.h）
+    StereoRangerConfig cfg = TestConfig();
+    cfg.summary_log_interval = 100ms;
+    Fixture f(std::move(cfg));
+    ASSERT_TRUE(f.ranger.Start());
+
+    // 静默 5 个窗口（不发布任何帧/检测）：只有启动后首个窗口打印一次
+    std::this_thread::sleep_for(550ms);
+    EXPECT_EQ(capture.Count("双目测距摘要"), 1);
+
+    // 恢复活动（帧 + 检测 → 批次处理）后，摘要照常出现
+    const auto ref = LoadBin("stereo_ref.bin");
+    const auto aux = LoadBin("stereo_aux.bin");
+    const std::uint64_t left_seq =
+        f.PublishFrame(f.left_pool, f.left_topic, ref, 1000);
+    (void)f.PublishFrame(f.right_pool, f.right_topic, aux, 1000);
+    common::DetectionResult box = MakeBox(20, 20, kViewWidth - 15, kViewHeight - 5);
+    box.frame_sequence = left_seq;
+    (void)f.detection_topic.Emplace(box);
+
+    EXPECT_TRUE(WaitFor([&capture] { return capture.Count("双目测距摘要") >= 2; }))
+        << "活动恢复后摘要未打印";
+    f.ranger.Stop();
 }
 
 }  // namespace

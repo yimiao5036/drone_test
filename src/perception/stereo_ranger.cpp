@@ -9,6 +9,8 @@
 //     每个框仍发布一条 valid=false 消息（保证下游每目标有节拍）。
 //
 // 摘要（summary_log_interval 节流）：帧数/匹配帧/有效占比/丢帧/截断/耗时。
+// 静默窗口（帧/发布/截断/帧未配四项均无增量）整段摘要跳过不打印；启动后首个
+// 窗口仍打印一次以确认组件活着（故障排查手册 §19）。
 // 事件日志节流：第 1 次与每满 100 次（丢帧 WARN、截断 WARN）。
 //
 // 线程模型：独立消费线程以 10ms 节拍阻塞等待左目检测驱动 Pump；Stop()
@@ -100,6 +102,13 @@ struct StereoRanger::Impl {
     std::uint64_t match_call_count = 0;
     std::int64_t last_summary_ms = 0;
     std::uint64_t clipped_log_count = 0;
+    // 摘要静默抑制（故障排查手册 §19）：以上次摘要时刻的累计计数为基准，
+    // 窗口内四项（帧/发布/截断/帧未配）均无增量 ⇒ 静默窗口，跳过打印。
+    std::uint64_t summary_base_frames = 0;
+    std::uint64_t summary_base_published = 0;
+    std::uint64_t summary_base_clipped = 0;
+    std::uint64_t summary_base_misses = 0;
+    bool first_summary_pending = true;  ///< 启动后首个窗口必打印一次（确认组件活着）
     // 摘要窗口内的有效距离统计（板上卷尺验收判读依据）
     double distance_sum_m = 0.0;
     double distance_min_m = 0.0;
@@ -329,6 +338,23 @@ struct StereoRanger::Impl {
         const std::uint64_t skipped = core.SkippedFrameCount();
         const std::uint64_t clipped = core.ClippedCount();
         const std::uint64_t misses = frame_miss_count.load();
+
+        // 静默窗口抑制（故障排查手册 §19）：窗口内无帧、无发布、无截断、无未配对
+        // ⇒ 摘要内容只是上一窗口的重复（无目标时全 0），跳过不打印；一旦有帧/发布/
+        // 截断/未配对，摘要照常出现。启动后首个窗口仍打印一次，确认组件活着。
+        const bool active = frames != summary_base_frames ||
+                            published != summary_base_published ||
+                            clipped != summary_base_clipped ||
+                            misses != summary_base_misses;
+        summary_base_frames = frames;
+        summary_base_published = published;
+        summary_base_clipped = clipped;
+        summary_base_misses = misses;
+        if (!active && !first_summary_pending) {
+            return;
+        }
+        first_summary_pending = false;
+
         const double valid_rate = published > 0
                                       ? 100.0 * static_cast<double>(available) /
                                             static_cast<double>(published)
@@ -439,6 +465,12 @@ bool StereoRanger::Start() {
     impl_->match_call_count = 0;
     impl_->clipped_log_count = 0;
     impl_->last_summary_ms = SteadyNowMs();
+    // 摘要静默抑制基准：以当前累计计数为起点，首个窗口必打印（§19）
+    impl_->summary_base_frames = impl_->core.ProcessedFrameCount();
+    impl_->summary_base_published = impl_->published_count.load();
+    impl_->summary_base_clipped = impl_->core.ClippedCount();
+    impl_->summary_base_misses = impl_->frame_miss_count.load();
+    impl_->first_summary_pending = true;
     impl_->running = true;
     impl_->thread = std::thread(&Impl::Run, impl_.get());
     SPDLOG_INFO("双目测距启动: shadow=true 配对窗={}ms 批次闭合={}ms 帧缓冲={} "

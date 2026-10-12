@@ -10,6 +10,7 @@
  * - 搜索：从未检测时保持 SEARCHING
  * - 观测超时：有观测后流中断判定 LOST（区别于“本帧无目标”）
  * - 多目标候选：按置信度最高者处理并计入错误计数
+ * - 摘要静默抑制：无目标期不打印摘要，LOCKED 后恢复（故障排查手册 §19）
  */
 #include <chrono>
 #include <cstdint>
@@ -20,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include "../common/log_capture.h"
 #include "common/topic.h"
 #include "common/types.h"
 #include "perception/visual_target_monitor.h"
@@ -307,6 +309,47 @@ TEST_F(VisualTargetMonitorTest, RestartResetsStabilityState) {
     EXPECT_EQ(monitor_->LastStatus().consecutive_detected_frames, 0);
     EXPECT_EQ(monitor_->LastStatus().consecutive_missed_frames, 0);
     EXPECT_FALSE(monitor_->LastStatus().valid);
+}
+
+// ---------------------------------------------------------------------------
+// 摘要静默抑制（故障排查手册 §19）：无目标期不重复刷屏；LOCKED 后即使本窗口
+// 无检测也照常打印（连续丢失增长是掉锁前兆，必须可观测）。
+// ---------------------------------------------------------------------------
+TEST(VisualTargetMonitorSummaryTest, SuppressedDuringSilenceResumesWhenLocked) {
+    drone::test::LogCapture capture;  // 须在组件启动前构造（见 log_capture.h）
+    VisualTargetMonitorConfig config = MakeConfig();
+    config.status_log_interval = std::chrono::milliseconds(100);
+    config.lock_frames = 1;    // 单帧检测即锁定
+    config.lost_frames = 100;  // 观察期内保持 LOCKED
+    VisualTargetMonitor monitor(config);
+    common::Topic<common::VisualTargetObservation> topic;
+    monitor.SetInput(topic);
+    ASSERT_TRUE(monitor.Start());
+
+    // 启动后首个窗口打印一次（确认组件活着），随后清空开始断言。
+    ASSERT_TRUE(WaitFor([&capture] { return capture.Count("视觉稳定性摘要") >= 1; }));
+    capture.Clear();
+
+    // 静默期（观测照常到达但全部 detected=false）≈4 个窗口：不再打印。
+    uint64_t sequence = 1;
+    for (int i = 0; i < 20; ++i) {
+        (void)topic.Publish(std::make_shared<const common::VisualTargetObservation>(
+            MakeObservation(sequence++, false)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(monitor.LastStatus().state, common::VisualTargetState::kSearching);
+    EXPECT_EQ(capture.Count("视觉稳定性摘要"), 0);
+
+    // 目标出现 → 锁定；此后即使窗口内无检测，摘要仍按窗口打印。
+    (void)topic.Publish(std::make_shared<const common::VisualTargetObservation>(
+        MakeObservation(sequence++, true)));
+    ASSERT_TRUE(WaitFor([&monitor] {
+        return monitor.LastStatus().state == common::VisualTargetState::kLocked;
+    }));
+    EXPECT_TRUE(WaitFor(
+        [&capture] { return capture.Count("视觉稳定性摘要") >= 2; }))
+        << "LOCKED 后摘要未恢复打印";
+    monitor.Stop();
 }
 
 }  // namespace

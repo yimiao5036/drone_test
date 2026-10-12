@@ -154,6 +154,12 @@ struct VisualTargetMonitor::Impl {
     // 累计检测率会被启动初期无目标时段拉低，不适合判断当前是否可靠。
     uint64_t window_observation_count = 0;
     uint64_t window_detected_count = 0;
+    // 摘要静默抑制（故障排查手册 §19）：窗口内无有效检测、状态停在
+    // SEARCHING/LOST、无状态转换、无新增错误 ⇒ 摘要跳过不打印；启动后首个
+    // 窗口仍打印一次（确认组件活着）。
+    uint64_t transitions_at_last_summary = 0;
+    uint64_t errors_at_last_summary = 0;
+    bool first_summary_done = false;
 
     mutable std::mutex last_status_mutex;
     common::VisualTargetStatus last_status;
@@ -177,6 +183,9 @@ struct VisualTargetMonitor::Impl {
         transitions_at_last_log = state_transition_count.load();
         window_observation_count = 0;
         window_detected_count = 0;
+        transitions_at_last_summary = state_transition_count.load();
+        errors_at_last_summary = error_count.load();
+        first_summary_done = false;
         consecutive_detected = 0;
         consecutive_missed = 0;
         smoothing_initialized = false;
@@ -344,36 +353,60 @@ struct VisualTargetMonitor::Impl {
 
         if (now_ms - last_status_log_ms >=
             static_cast<uint64_t>(config.status_log_interval.count())) {
-            const uint64_t observations = observation_count.load();
-            const uint64_t detected = detected_observation_count.load();
-            const double cumulative_rate =
-                observations == 0
-                    ? 0.0
-                    : 100.0 * static_cast<double>(detected) /
-                          static_cast<double>(observations);
-            const double window_rate =
-                window_observation_count == 0
-                    ? 0.0
-                    : 100.0 * static_cast<double>(window_detected_count) /
-                          static_cast<double>(window_observation_count);
-            const double speed_mean =
-                window_speed_samples == 0
-                    ? 0.0
-                    : window_speed_sum /
-                          static_cast<double>(window_speed_samples);
-            // 近期检测率是判断当前目标是否可跟踪的主指标；
-            // 累计检测率含启动初期无目标时段，只能作为整体参考。
-            SPDLOG_INFO(
-                "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px 画面速度=均{:.1f}/峰{:.1f}(n={}) {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
-                StateName(state), state == common::VisualTargetState::kLocked,
-                consecutive_detected, consecutive_missed, smoothed_confidence,
-                smoothed_cx, smoothed_cy, last_bbox_w, last_bbox_h, speed_mean,
-                window_speed_max, window_speed_samples,
-                last_seen_ms == 0
-                    ? "从未检测"
-                    : "上次检测=" + std::to_string(now_ms - last_seen_ms) + "ms前",
-                window_rate, window_detected_count, window_observation_count,
-                cumulative_rate, observations, state_transition_count.load());
+            const uint64_t transitions = state_transition_count.load();
+            const uint64_t errors = error_count.load();
+            // 静默窗口判定（故障排查手册 §19）：窗口内无有效检测、状态停在
+            // SEARCHING/LOST、无状态转换、无新增错误 ⇒ 摘要内容只是重复
+            // “仍然没有目标”，跳过不打印（状态转换另有独立的状态变化日志）。
+            // LOCKED 期间即使本窗口无检测也照常打印：连续丢失增长是掉锁前兆，
+            // 必须可观测；窗口内出现有效检测一律打印。
+            const bool quiet_window =
+                (state == common::VisualTargetState::kSearching ||
+                 state == common::VisualTargetState::kLost) &&
+                window_detected_count == 0 &&
+                transitions == transitions_at_last_summary &&
+                errors == errors_at_last_summary;
+            if (!first_summary_done || !quiet_window) {
+                const uint64_t observations = observation_count.load();
+                const uint64_t detected = detected_observation_count.load();
+                const double cumulative_rate =
+                    observations == 0
+                        ? 0.0
+                        : 100.0 * static_cast<double>(detected) /
+                              static_cast<double>(observations);
+                const double window_rate =
+                    window_observation_count == 0
+                        ? 0.0
+                        : 100.0 * static_cast<double>(window_detected_count) /
+                              static_cast<double>(window_observation_count);
+                const double speed_mean =
+                    window_speed_samples == 0
+                        ? 0.0
+                        : window_speed_sum /
+                              static_cast<double>(window_speed_samples);
+                // 近期检测率是判断当前目标是否可跟踪的主指标；
+                // 累计检测率含启动初期无目标时段，只能作为整体参考。
+                SPDLOG_INFO(
+                    "视觉稳定性摘要: state={} valid={} 连续检测={} 连续丢失={} 置信度={:.2f} 中心=({:.0f},{:.0f}) 框={:.0f}x{:.0f}px 画面速度=均{:.1f}/峰{:.1f}(n={}) {} 近期检测率={:.1f}%({}/{}) 累计检测率={:.1f}% 累计观测={} 累计转换={}",
+                    StateName(state),
+                    state == common::VisualTargetState::kLocked,
+                    consecutive_detected, consecutive_missed,
+                    smoothed_confidence, smoothed_cx, smoothed_cy, last_bbox_w,
+                    last_bbox_h, speed_mean, window_speed_max,
+                    window_speed_samples,
+                    last_seen_ms == 0
+                        ? "从未检测"
+                        : "上次检测=" + std::to_string(now_ms - last_seen_ms) +
+                              "ms前",
+                    window_rate, window_detected_count,
+                    window_observation_count, cumulative_rate, observations,
+                    transitions);
+                first_summary_done = true;
+            }
+            // 窗口基准无条件推进：跳过打印的窗口也要清零窗口计数，
+            // 保持“近期检测率”的窗口语义。
+            transitions_at_last_summary = transitions;
+            errors_at_last_summary = errors;
             last_status_log_ms = now_ms;
             window_observation_count = 0;
             window_detected_count = 0;

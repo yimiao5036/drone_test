@@ -394,7 +394,7 @@ if(BUILD_TESTING)
                 visual_tracking_shadow_test)
             add_executable(${control_test} tests/control/${control_test}.cpp)
             target_link_libraries(${control_test} PRIVATE
-                drone_common drone_control_core GTest::gtest_main)
+                drone_common drone_control_core spdlog::spdlog GTest::gtest_main)
             if(MSVC)
                 target_compile_options(${control_test} PRIVATE /W4 /permissive-)
             else()

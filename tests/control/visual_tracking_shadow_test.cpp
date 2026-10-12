@@ -3,7 +3,7 @@
 //
 // 覆盖：未接线启动失败、生命周期幂等、虚拟姿态开/关、仅 kLocked 输出正常
 // 控制、kLost → kBrakeHover 映射、视觉超龄 → kNone+降级码、
-// 速率式 yaw_rate_dps 进 ControlIntent。
+// 速率式 yaw_rate_dps 进 ControlIntent、摘要静默抑制（§19）。
 // =============================================================================
 
 #include <chrono>
@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "../common/log_capture.h"
 #include "control/visual_tracking_shadow.h"
 
 namespace {
@@ -305,6 +306,45 @@ TEST_F(VisualTrackingShadowTest, InvalidDistanceFallsBackToSlowApproach) {
     EXPECT_EQ(found->type, ControlIntentType::kVelocityHeading);
     EXPECT_EQ(found->reason_code, 100u);
     EXPECT_NEAR(found->target_x, 0.5, 0.1);
+}
+
+// ---------------------------------------------------------------------------
+// 摘要静默抑制（故障排查手册 §19）：窗口内容未变不打印；离散状态变化立即打印
+// ---------------------------------------------------------------------------
+TEST_F(VisualTrackingShadowTest, SummarySuppressedWhenContentUnchanged) {
+    drone::test::LogCapture capture;  // 须在组件启动前构造（见 log_capture.h）
+    auto shadow_cfg = MakeShadowConfig();
+    shadow_cfg.summary_log_interval = std::chrono::milliseconds(100);
+    BuildShadow(shadow_cfg);
+    ASSERT_TRUE(shadow_->Start());
+
+    // 首拍打印一次（确认组件活着），随后清空开始断言
+    ASSERT_TRUE(
+        WaitFor([&capture] { return capture.Count("视觉跟踪影子摘要") >= 1; }));
+    capture.Clear();
+
+    // 静默期（无输入，状态冻结为零速刹车）：内容不变的窗口不重复打印
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    EXPECT_EQ(capture.Count("视觉跟踪影子摘要"), 0);
+
+    // 目标出现（kLocked）→ 离散状态变化（模式/有效），立即打印一次
+    PublishStatus(status_topic_, VisualTargetState::kLocked);
+    EXPECT_TRUE(
+        WaitFor([&capture] { return capture.Count("视觉跟踪影子摘要") >= 1; }))
+        << "kLocked 后摘要未立即打印";
+
+    // 目标消失 → 回到零速刹车：等状态稳定后，静默期不再打印
+    for (int i = 0; i < 10; ++i) {
+        PublishStatus(status_topic_, VisualTargetState::kSearching);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    capture.Clear();
+    for (int i = 0; i < 14; ++i) {
+        PublishStatus(status_topic_, VisualTargetState::kSearching);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    EXPECT_EQ(capture.Count("视觉跟踪影子摘要"), 0);
+    shadow_->Stop();
 }
 
 }  // namespace
