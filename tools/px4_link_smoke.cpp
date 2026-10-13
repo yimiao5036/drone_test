@@ -63,6 +63,7 @@ struct Options {
     bool sitl_offboard_loss = false;
     bool sitl_stage4_controller = false;
     bool sitl_stage4_mission = false;
+    bool selftest = false;
 };
 
 void PrintUsage(const char* program) {
@@ -77,7 +78,8 @@ void PrintUsage(const char* program) {
               << "stage4-controller 装配真实 FlightController（意图脚本 → 限幅/门禁 → setpoint），\n"
               << "依次验收：零速漂移、速度阶跃斜率/稳态、停发刹车、Offboard 退出时延。\n"
               << "stage4-mission 装配状态机全链（G3）：注入地面站目标 + 模拟视觉观测走通\n"
-              << "S5→S6→S7→回退→停发链路，另含 G2 补验（围栏钳制、切非 Offboard 停发 <200ms）。\n";
+              << "S5→S6→S7→回退→停发链路，另含 G2 补验（围栏钳制、切非 Offboard 停发 <200ms）。\n"
+              << "--selftest 离线自检工具纯逻辑（G3 意图分类等），不需要 SITL/配置。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -125,6 +127,10 @@ Options ParseOptions(int argc, char** argv) {
         }
         if (argument == "--sitl-stage4-mission") {
             options.sitl_stage4_mission = true;
+            continue;
+        }
+        if (argument == "--selftest") {
+            options.selftest = true;
             continue;
         }
         if (argument == "--duration") {
@@ -1439,8 +1445,13 @@ constexpr uint32_t kMissionGroundBootId = 0x35430001U;  // 模拟地面站启动
 constexpr uint32_t kMissionValidityAltitude = 1U << 0U;
 constexpr uint32_t kMissionValidityHorizontal = 1U << 5U;
 constexpr uint32_t kMissionValidityVertical = 1U << 6U;
-/// 状态机意图 reason_code 低位段：地面站任务下发（S5/S6 位置引导，编码 7）。
-constexpr uint32_t kMissionReasonGroundStationTask = 7U;
+/// 状态机意图 reason_code 低位段（编码表见 docs/数据接口文档.md §3.5；
+/// 与 src/state_machine/mission_state_machine.cpp 的常量同源镜像，改动须同步）。
+constexpr uint32_t kMissionReasonGroundStationTask = 7U;    // S5/S6 位置引导（含冻结续发）
+constexpr uint32_t kMissionReasonVisualTracking = 100U;     // S7 视觉正常跟踪（速度航向）
+constexpr uint32_t kMissionReasonVisualBrake = 102U;        // S7 判丢零速刹车
+/// 低位段掩码（bit31 及以上为标志位段：状态机显式请求控制权）。
+constexpr uint32_t kMissionReasonLowMask = 0xFFU;
 /// MissionStatus 告警位（与 src/state_machine/mission_state_machine.cpp 定义同源；
 /// 该实现文件的常量在匿名命名空间不可外链，工具侧镜像位语义，改动须同步）。
 constexpr uint32_t kMissionWarningGroundTargetStaleBit = 1U << 1U;  // S5 目标过期
@@ -1482,6 +1493,65 @@ constexpr uint64_t kMissionExtraSendsAllowed = 2;  // 停发后容许的竞态�
 constexpr double kMissionSlewTolerance = 1.5;      // 输出连续性容差倍数
 constexpr double kMissionFenceToleranceM = 0.5;    // 围栏钳制实测容差
 constexpr uint64_t kMissionPollMs = 20;            // 主循环节拍（低于控制周期 50ms）
+
+/// G3 意图来源分类（纯逻辑，`--selftest` 离线断言；工具不在 ctest 内的断言曾连漏
+/// 两次——2026-10-14 终审要求抽成纯函数 + 离线自检防复发）。
+enum class MissionIntentClass : uint8_t {
+    kToolBootstrap = 0,      ///< 工具自身引导意图（reason 低字节 0）：不计入状态机轨迹
+    kPositionGuide = 1,      ///< 状态机位置引导/冻结续发（低字节 7；S5/S6 及 S7 过渡期）
+    kVisualServo = 2,        ///< 状态机 S7 视觉伺服速度意图（低字节 100）
+    kVisualBrake = 3,        ///< 状态机 S7 判丢零速刹车意图（低字节 102）
+    kStateMachineOther = 4,  ///< 状态机其它意图（其它低位码）：计入轨迹、不分类
+};
+
+/// 分类名（自检输出与日志用）。
+inline const char* MissionIntentClassName(MissionIntentClass value) {
+    switch (value) {
+        case MissionIntentClass::kToolBootstrap:
+            return "工具引导";
+        case MissionIntentClass::kPositionGuide:
+            return "位置引导(7)";
+        case MissionIntentClass::kVisualServo:
+            return "视觉伺服(100)";
+        case MissionIntentClass::kVisualBrake:
+            return "判丢刹车(102)";
+        case MissionIntentClass::kStateMachineOther:
+            return "其它低位码";
+    }
+    return "未知";
+}
+
+/// 意图来源分类（reason 低位段 + 意图类型双条件）。
+/// **纪律**：只排除**工具自身引导意图**（低字节 0，工具是接管前的意图生产者）；
+/// 不得改成"只认低字节 7"——状态机 S7 的伺服（100）/刹车（102）意图会被整体
+/// 丢弃，servo_intent_seen_ 永假、交接判据永不计算、脚本在交接段超时中止
+/// （2026-10-14 终审 Critical 的根因）。分类正确性由 `--selftest` 离线断言。
+inline MissionIntentClass ClassifyMissionIntent(uint32_t reason_code,
+                                               common::ControlIntentType type) {
+    const uint32_t low = reason_code & kMissionReasonLowMask;
+    if (low == 0U) {
+        return MissionIntentClass::kToolBootstrap;
+    }
+    if (low == kMissionReasonGroundStationTask &&
+        type == common::ControlIntentType::kPositionGuide) {
+        return MissionIntentClass::kPositionGuide;
+    }
+    if (low == kMissionReasonVisualTracking &&
+        type == common::ControlIntentType::kVelocityHeading) {
+        return MissionIntentClass::kVisualServo;
+    }
+    if (low == kMissionReasonVisualBrake &&
+        type == common::ControlIntentType::kBrakeHover) {
+        return MissionIntentClass::kVisualBrake;
+    }
+    return MissionIntentClass::kStateMachineOther;
+}
+
+/// 是否计入状态机意图轨迹（仅排除工具自身引导意图；未知低位码按状态机意图计入，
+/// 保证"漏分类"只影响细分判据、不影响"状态机是否在发意图"的总判据）。
+inline bool CountsAsStateMachineIntent(MissionIntentClass value) {
+    return value != MissionIntentClass::kToolBootstrap;
+}
 
 /// G3 脚本阶段。
 enum class MissionPhase : uint8_t {
@@ -1819,10 +1889,10 @@ private:
     /// （意图超龄的唯一直接后果）——等价于设计 §2.5"交接点不得出现意图超龄→刹车→
     /// 再起步"。S6 期间的冻结续发仅作诊断统计（是否观察到 S6 标签的冻结位置意图）。
     void NoteIntent(const drone::common::ControlIntent& intent) {
-        const bool from_state_machine =
-            (intent.reason_code & 0xFFU) == kMissionReasonGroundStationTask;
-        if (!from_state_machine) {
-            return;  // 工具引导意图不计入状态机轨迹
+        const MissionIntentClass intent_class =
+            ClassifyMissionIntent(intent.reason_code, intent.type);
+        if (!CountsAsStateMachineIntent(intent_class)) {
+            return;  // 工具引导意图不计入状态机轨迹（低字节 0）
         }
         sm_intent_seen_ = true;
         last_sm_intent_ms_ = intent.header.receive_time_ms;
@@ -1837,22 +1907,26 @@ private:
             }
             pre_servo_last_intent_ms_ = intent.header.receive_time_ms;
         }
-        if (intent.type == common::ControlIntentType::kPositionGuide) {
-            if (mission_state_ == common::MissionState::kGpsApproach) {
-                s5_last_position_intent_ms_ = intent.header.receive_time_ms;
-            } else if (mission_state_ == common::MissionState::kVisualHandover) {
-                s6_frozen_intent_seen_ = true;  // 诊断：S6 驻留期的冻结续发已观察到
-            }
-        }
-        if (intent.type == common::ControlIntentType::kVelocityHeading &&
-            intent.control_source == 1U) {
-            if (!servo_intent_seen_) {
-                servo_intent_seen_ = true;
-                first_servo_intent_ms_ = intent.header.receive_time_ms;
-            }
-        }
-        if (intent.type == common::ControlIntentType::kBrakeHover) {
-            brake_intent_seen_ = true;
+        switch (intent_class) {
+            case MissionIntentClass::kPositionGuide:
+                if (mission_state_ == common::MissionState::kGpsApproach) {
+                    s5_last_position_intent_ms_ = intent.header.receive_time_ms;
+                } else if (mission_state_ == common::MissionState::kVisualHandover) {
+                    s6_frozen_intent_seen_ = true;  // 诊断：S6 驻留期的冻结续发已观察到
+                }
+                break;
+            case MissionIntentClass::kVisualServo:
+                if (!servo_intent_seen_) {
+                    servo_intent_seen_ = true;
+                    first_servo_intent_ms_ = intent.header.receive_time_ms;
+                }
+                break;
+            case MissionIntentClass::kVisualBrake:
+                brake_intent_seen_ = true;
+                break;
+            case MissionIntentClass::kToolBootstrap:
+            case MissionIntentClass::kStateMachineOther:
+                break;  // 工具引导已被前置过滤；其它低位码只计入轨迹
         }
         if (backup_position_intent_pending_ &&
             intent.type == common::ControlIntentType::kPositionGuide) {
@@ -3046,6 +3120,63 @@ private:
     float max_east_m_ = 0.f;
 };
 
+/// 工具离线自检（`--selftest`）：不需要 SITL、配置或硬件，验证 G3 意图分类等
+/// 纯逻辑。工具自身不在 GoogleTest 覆盖范围内，而这类断言已连漏两次
+/// （2026-10-14 终审 Critical：S7 意图被原因码过滤误丢）——故抽成纯函数并纳入
+/// ctest（`px4_link_smoke_selftest`）。
+int RunToolSelfTest() {
+    struct Case {
+        const char* name;
+        uint32_t reason_code;
+        drone::common::ControlIntentType type;
+        MissionIntentClass expected;
+        bool expected_counted;
+    };
+    const Case cases[] = {
+        {"工具引导零速意图(位31,低字节0,速度航向)",
+         drone::common::kControlIntentReasonRequestControl,
+         drone::common::ControlIntentType::kVelocityHeading,
+         MissionIntentClass::kToolBootstrap, false},
+        {"工具起飞位置意图(位31,低字节0,位置引导)",
+         drone::common::kControlIntentReasonRequestControl,
+         drone::common::ControlIntentType::kPositionGuide,
+         MissionIntentClass::kToolBootstrap, false},
+        {"S5/S6 位置引导(位31|7)", 0x80000007U,
+         drone::common::ControlIntentType::kPositionGuide,
+         MissionIntentClass::kPositionGuide, true},
+        {"S7 视觉伺服(位31|100)", 0x80000064U,
+         drone::common::ControlIntentType::kVelocityHeading,
+         MissionIntentClass::kVisualServo, true},
+        {"S7 判丢刹车(位31|102)", 0x80000066U,
+         drone::common::ControlIntentType::kBrakeHover,
+         MissionIntentClass::kVisualBrake, true},
+        {"状态机其它低位码(位31|9)", 0x80000009U,
+         drone::common::ControlIntentType::kVelocityHeading,
+         MissionIntentClass::kStateMachineOther, true},
+        {"低位码100但类型不符(位置引导)", 0x80000064U,
+         drone::common::ControlIntentType::kPositionGuide,
+         MissionIntentClass::kStateMachineOther, true},
+        {"低位码7但类型不符(速度航向)", 0x80000007U,
+         drone::common::ControlIntentType::kVelocityHeading,
+         MissionIntentClass::kStateMachineOther, true},
+    };
+    std::cout << "tools/px4_link_smoke 离线自检（G3 意图分类）" << std::endl;
+    bool passed = true;
+    for (const auto& item : cases) {
+        const MissionIntentClass actual =
+            ClassifyMissionIntent(item.reason_code, item.type);
+        const bool counted = CountsAsStateMachineIntent(actual);
+        const bool ok = actual == item.expected && counted == item.expected_counted;
+        std::cout << (ok ? "[PASS] " : "[FAIL] ") << item.name << " → 分类="
+                  << MissionIntentClassName(actual) << " 计入轨迹=" << YesNo(counted)
+                  << std::endl;
+        passed = passed && ok;
+    }
+    std::cout << (passed ? "结果: 工具离线自检通过" : "结果: 工具离线自检未通过")
+              << std::endl;
+    return passed ? 0 : 1;
+}
+
 /// stage4-mission 入口：装配状态机全链（G3）并运行脚本。
 int RunStage4Mission(drone::communication::Px4Link& link, const std::string& config_path,
                      const Options& options) {
@@ -3155,6 +3286,9 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
 int main(int argc, char** argv) {
     try {
         const Options options = ParseOptions(argc, argv);
+        if (options.selftest) {
+            return RunToolSelfTest();  // 离线自检：不读配置、不触硬件
+        }
         const std::string config_path = ResolveConfigPath(options.config_path);
         const json root = LoadJson(config_path);
         const Px4LinkConfig config = LoadPx4Config(root);

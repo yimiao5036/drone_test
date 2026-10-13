@@ -68,7 +68,14 @@ struct MissionStateMachineConfig {
     /// 捕网执行器配置（actuator 配置节同源注入，阶段四 Task 10）：进入拦截
     /// 执行态（S10）触发、离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）
     /// 复位；未注入命令接口（enable_control=false 装配语义）时本功能物理缺席。
+    /// 构造期对其实施 `Validate()` 兜底（程序化构造的 channel 越界会索引固定
+    /// 7 元素参数数组，属 UB；参照 FlightController 构造期 period 防御先例）。
     config::ActuatorConfig actuator;
+    /// 测试钩子开关（默认关闭）：只有显式置位后 `ForceStateForTest` 才生效。
+    /// **生产装配（`DroneApplication`）必须保持默认 false** —— 该入口可强推到
+    /// 拦截状态（S9/S10），在 `enable_control=true` 装配下会经命令窄接口发出
+    /// 捕网触发命令（动作不可逆）。单测与 SITL 验收工具显式开启。
+    bool test_hooks_enabled = false;
 };
 
 /// 任务状态机部件抽象接口。
@@ -162,12 +169,17 @@ public:
     uint64_t TransitionCount() const override;
     uint64_t ErrorCount() const override;
 
-    // ---- 测试入口（生产装配不得调用） ----
-    /// 强制提交一次状态迁移（单测入口；Start 后调用，由决策线程消费进入/
-    /// 离开动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
+    // ---- 测试入口（生产装配不可达） ----
+    /// 强制提交一次状态迁移（单测/SITL 验收入口；Start 后调用，由决策线程消费
+    /// 进入/离开动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
     /// EvaluateNetActuator），用于验证当前尚无生产入口的状态——拦截序列
     /// S9/S10/S11（入口判据=授权策略/射程门限，属后续任务，本任务不发明）。
-    void TestForceState(common::MissionState state);
+    ///
+    /// **风险与门控**：强推到 S9/S10 会让状态机在 `enable_control=true` 装配下
+    /// 经命令窄接口发出**捕网触发命令（动作不可逆）**。因此本函数要求构造配置
+    /// `MissionStateMachineConfig::test_hooks_enabled=true`；默认 false（生产装配
+    /// 语义：`DroneApplication` 不置位）时**直接拒绝并记 ERROR，不产生任何迁移**。
+    void ForceStateForTest(common::MissionState state);
 
 private:
     class Impl;

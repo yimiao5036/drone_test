@@ -300,6 +300,11 @@ add_custom_command(TARGET px4_link_smoke POST_BUILD
 
 include(CTest)
 if(BUILD_TESTING)
+    # 工具离线自检（G3 意图分类等纯逻辑；不依赖 SITL/配置/硬件）：px4_link_smoke
+    # 自身不在 GoogleTest 覆盖内，而这类断言曾连漏两次（2026-10-14 终审 Critical
+    # = S7 伺服/刹车意图被原因码过滤误丢），故抽成纯函数并纳入 ctest 回归。
+    add_test(NAME px4_link_smoke_selftest COMMAND px4_link_smoke --selftest)
+
     find_package(GTest QUIET)
     if(GTest_FOUND)
         add_executable(topic_test tests/common/topic_test.cpp)

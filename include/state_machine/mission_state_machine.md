@@ -41,7 +41,7 @@ norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min
 
 `output_pwm_min_us/max_us`为配置项（必须与所接通道的 `PWM_AUX_MINn/MAXn` 一致，装机后按实配核对）；行程必须落在该区间内（`ActuatorConfig::Validate` fail-fast，否则归一化超出 -1..1 不可表达）。默认行程 1100/1900µs 在默认区间下换算为 **-0.8 / +0.8**。换算公式的单测见`ConfigTest.ActuatorNormalizePwmMapsOutputRangeToMinusOneToOne`；实际行程方向/到位由 **G4 拆桨台架**核对。
 
-**拦截序列入口边界（T10 交付范围外，防误读）**：S9/S10 的**进入判据**（锁定质量、相对状态/射程、执行机构就绪、`IInterceptionAuthorizationPolicy` 授权）未在阶段四冻结，本任务**不发明**——状态机现有迁移逻辑只覆盖到 S7，拦截序列当前**无生产入口**（`DroneApplication`不驱动、整机不可达），捕网触发路径因此处于"已接通、待入口"状态。补充入口判据属后续任务；在此之前仅 `TestForceState` 测试入口可达（见测试方式）。
+**拦截序列入口边界（T10 交付范围外，防误读）**：S9/S10 的**进入判据**（锁定质量、相对状态/射程、执行机构就绪、`IInterceptionAuthorizationPolicy` 授权）未在阶段四冻结，本任务**不发明**——状态机现有迁移逻辑只覆盖到 S7，拦截序列当前**无生产入口**（`DroneApplication`不驱动、整机不可达），捕网触发路径因此处于"已接通、待入口"状态。补充入口判据属后续任务；在此之前仅 `ForceStateForTest` 测试入口可达（需显式开启测试钩子，见下与测试方式）。
 
 阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
 
@@ -91,7 +91,7 @@ public:
     Topic<MissionStatus>& StatusOutput() override;
 
     // ---- 测试入口（生产装配不得调用） ----
-    void TestForceState(common::MissionState state);  // 强制迁移（驱动无生产入口的拦截序列）
+    void ForceStateForTest(common::MissionState state);  // 强制迁移（需 test_hooks_enabled=true）
 };
 ```
 
@@ -245,9 +245,17 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 边界：状态驻留 <1 决策周期（100ms）的极端迁移可能被跳过——生产语义下
     S10 驻留由拦截结果决定（远长于决策周期），不构成风险。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
-- `TestForceState`为测试入口（生产装配不得调用）：与生产路径共用`TransitionTo`
+- `ForceStateForTest`为测试入口（**运行期门控**）：与生产路径共用`TransitionTo`
   统一迁移挂点，用于驱动当前无生产入口的拦截序列（S9/S10/S11），验证进入/离开
-  动作语义；生产代码不调用。
+  动作语义。**门控**：`MissionStateMachineConfig::test_hooks_enabled` 默认 false
+  （生产装配语义，`DroneApplication` 不置位），此时调用**直接拒绝并记 ERROR、不产生
+  任何迁移**——强推到 S9/S10 会在 `enable_control=true` 装配下经命令窄接口发出
+  **不可逆的捕网触发命令**，而拦截序列当前无生产入口，该入口是唯一误触路径；
+  单测与 SITL 验收工具显式置 true。
+- 构造期对 `actuator` 配置执行 `Validate()` 兜底（`SendNetActuatorStroke` 以
+  `params[net_channel-1]` 索引固定 7 元素参数数组：程序化构造的 channel 越界即 UB、
+  channel=7 静默无效）；配置加载期已校验，此处对程序化构造 fail-fast，先例见
+  FlightController 构造期 period 防御。
 - 控制输出是否接 PX4 仍由`DroneApplication`的`enable_control`门禁决定（绑定
   `Px4Setpoint`+注入快照源+注入命令接口只在 true 分支）；诊断接口注入与
   `enable_control` 无关（只读诊断，影子期即可用）。
@@ -334,8 +342,9 @@ ctest --test-dir build --output-on-failure
     `MissionStatus` 告警位 bit3 置位且状态保持 S7；恢复新鲜姿态、首条视觉意图
     发出后 bit3 在同一 S7 驻留内清除（标注"报告状态与实际输出背离"的两态）。
 - 捕网执行器（Task 10，`FakeCommandSender` 假件按调用顺序记录 SendCommand
-  （命令/参数/入队结果）并可脚本化入队失败；用例经 `TestForceState` 驱动拦截
-  序列——与生产路径共用 TransitionTo/决策线程挂点）：
+  （命令/参数/入队结果）并可脚本化入队失败；用例经 `ForceStateForTest`（配置
+  置 `test_hooks_enabled=true`）驱动拦截序列——与生产路径共用 TransitionTo/
+  决策线程挂点）：
   - `InterceptExecutingFiresNetActuator`：进入 S10 → 恰好一条 187 命令
     （p3=归一化触发行程 −0.8、其余参数位 NaN、p7=0），停留多拍不重复；
     离开（S10→S11）→ 复位行程（+0.8）且只发一次；再次进入 → 新一次触发；
@@ -349,7 +358,10 @@ ctest --test-dir build --output-on-failure
     （逐条断言命令参数与入队结果，钉住"先复位、后触发"在异常重试下的次序）；
   - `LeavingInterceptSequenceSendsResetStroke`：S9 不触发；S9→返航离开 →
     发复位行程（不依赖是否触发过）；
-  - `NoCommandSenderNeverFires`：未注入命令接口 → 即使进入拦截态也零调用。
+  - `NoCommandSenderNeverFires`：未注入命令接口 → 即使进入拦截态也零调用；
+  - `ForceStateForTestRejectedWithoutTestHooks`：`test_hooks_enabled=false`（生产
+    装配默认）时强制迁移被拒绝并记 ERROR、状态不变、已注入的命令接口零调用
+    （防"生产路径误触发射网"）。
   - 负对照（一次性注入 3 处破坏：未用参数位填 0、入队失败也置位、离开不发复位）
     → 恰好对应 3 个用例失败，恢复后全绿；评审修复另作 2 处次序负对照——触发
     判据前移到复位挂起检查之前 → `NetActuatorTriggerWaitsForResetEnqueued`

@@ -278,10 +278,17 @@ public:
           tracking_config_(config.tracking),
           tracking_law_(config.tracking),
           actuator_config_(config.actuator),
+          test_hooks_enabled_(config.test_hooks_enabled),
           azimuth_converter_(config.tracking.camera.fx_px,
                              config.tracking.camera.cx_px),
           elevation_converter_(config.tracking.camera.fy_px,
                                config.tracking.camera.cy_px) {
+        // 执行器配置构造期兜底校验（Task 10 评审遗留）：`SendNetActuatorStroke`
+        // 以 `params[net_channel-1]` 索引固定 7 元素数组，程序化构造的越界
+        // channel（如 8）即 UB、channel=7 会静默无效。配置加载期
+        // （`LoadAppConfig`）已校验，此处对程序化构造 fail-fast，先例见
+        // FlightController 构造期 period 防御。
+        config.actuator.Validate();
         // 视场半角由内参推（主点非画面中心，见 control/tracking_config.h）：
         // 水平取 (W−cx) 侧、垂直取 (H−cy) 侧，构造期固化。
         const double width = static_cast<double>(config.tracking.camera.image_width);
@@ -454,8 +461,16 @@ public:
     common::Topic<common::MissionStatus>& StatusOutput() { return status_output_; }
 
     /// 测试入口：强制提交一次状态迁移（与生产路径共用 TransitionTo 统一挂点；
-    /// 进入/离开动作由决策线程在 Evaluate 末段评估）。生产装配不得调用。
-    void TestForceState(common::MissionState state) {
+    /// 进入/离开动作由决策线程在 Evaluate 末段评估）。
+    /// 门控：`test_hooks_enabled=false`（默认，生产装配语义）时拒绝并记 ERROR——
+    /// 强推到拦截状态会在 enable_control=true 装配下发出不可逆的捕网触发命令。
+    void ForceStateForTest(common::MissionState state) {
+        if (!test_hooks_enabled_) {
+            RecordError(
+                "未启用测试钩子（MissionStateMachineConfig::test_hooks_enabled=false）："
+                "拒绝强制状态迁移");
+            return;
+        }
         TransitionTo(state, "测试入口强制迁移");
     }
 
@@ -1142,7 +1157,7 @@ private:
     /// 触发/复位同为控制输出，仅经 enable_control 门禁注入的窄接口可达。
     /// 注：本函数按"状态驻留"而非"迁移边沿"判定——生产路径同一决策拍内完成
     /// 迁移与评估（Evaluate 末段调用），S10 驻留远长于决策周期，不存在漏触发；
-    /// 无生产入口的拦截序列经 TestForceState 驱动时同样满足该时序约束。
+    /// 无生产入口的拦截序列经 ForceStateForTest 驱动时同样满足该时序约束。
     void EvaluateNetActuator() {
         if (command_sender_ == nullptr) {
             return;  // 物理缺席：不产生任何命令
@@ -1370,6 +1385,8 @@ private:
     uint64_t hot_backup_starved_count_ = 0;
     /// 捕网执行器配置（构造注入，actuator 配置节同源；装机确认前为默认值）。
     const config::ActuatorConfig actuator_config_;
+    /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
+    const bool test_hooks_enabled_;
     /// 捕网触发命令已入队（防重复触发；离开拦截序列清除，再进入可重新触发）。
     bool net_fired_ = false;
     /// 处于拦截序列（S9/S10）——离开时的复位行程检测基准（决策线程独占）。
@@ -1424,8 +1441,8 @@ uint64_t MissionStateMachine::TransitionCount() const {
     return impl_->TransitionCount();
 }
 uint64_t MissionStateMachine::ErrorCount() const { return impl_->ErrorCount(); }
-void MissionStateMachine::TestForceState(common::MissionState state) {
-    impl_->TestForceState(state);
+void MissionStateMachine::ForceStateForTest(common::MissionState state) {
+    impl_->ForceStateForTest(state);
 }
 
 MissionStateMachineStub::MissionStateMachineStub() {

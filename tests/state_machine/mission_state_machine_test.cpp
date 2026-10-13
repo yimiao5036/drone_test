@@ -1189,7 +1189,7 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
 // 未注入命令接口（enable_control=false 装配语义）→ 零调用（物理缺席）。
 //
 // 拦截序列（S9/S10/S11）当前尚无生产入口——入口判据（授权策略/射程门限）
-// 属后续任务，本任务不发明；用例经 TestForceState 测试入口驱动状态迁移，
+// 属后续任务，本任务不发明；用例经 ForceStateForTest 测试入口驱动状态迁移，
 // 与生产路径共用同一 TransitionTo/决策线程挂点，触发/复位语义等同生产。
 // ---------------------------------------------------------------------------
 
@@ -1264,10 +1264,12 @@ private:
     uint64_t fail_calls_remaining_ = 0;
 };
 
-/// 捕网执行器用例配置：通道 3（验证通道号落在 p3 而非 p1），行程取默认值。
+/// 捕网执行器用例配置：通道 3（验证通道号落在 p3 而非 p1），行程取默认值；
+/// 显式开启测试钩子（拦截序列无生产入口，用例经 `ForceStateForTest` 驱动）。
 state_machine::MissionStateMachineConfig MakeNetActuatorTestConfig() {
     state_machine::MissionStateMachineConfig config;
     config.actuator.net_channel = 3;
+    config.test_hooks_enabled = true;
     return config;
 }
 
@@ -1311,7 +1313,7 @@ TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
 
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
     EXPECT_EQ(sender.LastCommand(), 187U);  // MAV_CMD_DO_SET_ACTUATOR
     {
@@ -1331,7 +1333,7 @@ TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
     EXPECT_EQ(machine.CurrentState(), common::MissionState::kInterceptExecuting);
 
     // 离开拦截序列（S10→S11 POST_INTERCEPT）：发复位行程（待命行程），只发一次
-    machine.TestForceState(common::MissionState::kPostIntercept);
+    machine.ForceStateForTest(common::MissionState::kPostIntercept);
     ASSERT_TRUE(WaitForCallCount(sender, 2)) << "离开拦截序列应发复位行程";
     EXPECT_EQ(sender.LastCommand(), 187U);
     EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
@@ -1339,7 +1341,7 @@ TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
     EXPECT_EQ(sender.CallCount(), 2U);
 
     // 再次进入 S10：新一次拦截触发（net_fired_ 已随离开清除）
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     ASSERT_TRUE(WaitForCallCount(sender, 3));
     EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetFireNormalized);
 
@@ -1360,7 +1362,7 @@ TEST(MissionStateMachineTest, NetActuatorFiringRetriesWhenEnqueueFails) {
     ASSERT_TRUE(WaitForSelfCheck(machine));
 
     sender.FailNextCalls(2);  // 前两次入队失败
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     ASSERT_TRUE(WaitForCallCount(sender, 3)) << "入队失败应下拍重试直至成功";
     {
         const auto params = sender.LastParams();
@@ -1388,11 +1390,11 @@ TEST(MissionStateMachineTest, NetActuatorResetRetriesWhenEnqueueFails) {
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
 
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
 
     sender.FailNextCalls(2);  // 复位前两次入队失败
-    machine.TestForceState(common::MissionState::kPostIntercept);
+    machine.ForceStateForTest(common::MissionState::kPostIntercept);
     ASSERT_TRUE(WaitForCallCount(sender, 4)) << "复位入队失败应下拍重试直至成功";
 
     // 成功入队后不再补发（含不补发触发）
@@ -1429,16 +1431,16 @@ TEST(MissionStateMachineTest, NetActuatorTriggerWaitsForResetEnqueued) {
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
 
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
 
     sender.FailNextCalls(3);  // 复位连续三次入队失败
-    machine.TestForceState(common::MissionState::kPostIntercept);
+    machine.ForceStateForTest(common::MissionState::kPostIntercept);
     // 等复位首拍落地，确保决策线程已消费"离开拦截序列"（复位挂起中）
     ASSERT_TRUE(WaitForCallCount(sender, 2)) << "离开拦截序列应发复位行程";
 
     // 复位仍挂起（未成功入队）时重进 S10：不得抢发触发
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     ASSERT_TRUE(WaitForCallCount(sender, 6)) << "复位重试成功后应恢复触发";
     std::this_thread::sleep_for(400ms);
     ASSERT_EQ(sender.CallCount(), 6U);
@@ -1476,12 +1478,12 @@ TEST(MissionStateMachineTest, LeavingInterceptSequenceSendsResetStroke) {
     ASSERT_TRUE(WaitForSelfCheck(machine));
 
     // S9（INTERCEPT_READY）不触发：只在 S10 执行态触发
-    machine.TestForceState(common::MissionState::kInterceptReady);
+    machine.ForceStateForTest(common::MissionState::kInterceptReady);
     std::this_thread::sleep_for(300ms);
     EXPECT_EQ(sender.CallCount(), 0U);
 
     // 返航离开拦截序列 → 复位行程
-    machine.TestForceState(common::MissionState::kReturnHome);
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
     ASSERT_TRUE(WaitForCallCount(sender, 1));
     EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
     std::this_thread::sleep_for(300ms);
@@ -1502,14 +1504,43 @@ TEST(MissionStateMachineTest, NoCommandSenderNeverFires) {
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
 
-    machine.TestForceState(common::MissionState::kInterceptReady);
+    machine.ForceStateForTest(common::MissionState::kInterceptReady);
     std::this_thread::sleep_for(150ms);
-    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
     std::this_thread::sleep_for(300ms);
-    machine.TestForceState(common::MissionState::kPostIntercept);
+    machine.ForceStateForTest(common::MissionState::kPostIntercept);
     std::this_thread::sleep_for(300ms);
 
     EXPECT_EQ(sender.CallCount(), 0U);
+
+    machine.Stop();
+}
+
+// 测试入口门控（2026-10-14 终审）：`ForceStateForTest` 在
+// `MissionStateMachineConfig::test_hooks_enabled=false`（默认＝生产装配语义，
+// DroneApplication 不置位）时必须拒绝并记 ERROR——强推到 S10 会在
+// enable_control=true 装配下经命令窄接口发出**不可逆的捕网触发命令**，
+// 生产路径不得可达；而拦截序列当前无生产入口，该入口是唯一的误触路径。
+TEST(MissionStateMachineTest, ForceStateForTestRejectedWithoutTestHooks) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;  // 已注入命令接口：验证"拒绝发生在任何命令之前"
+    auto config = MakeNetActuatorTestConfig();
+    config.test_hooks_enabled = false;  // 生产装配默认值
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    const uint64_t errors_before = machine.ErrorCount();
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    std::this_thread::sleep_for(300ms);  // 留出决策线程消费（若放行会触发捕网）
+
+    EXPECT_GT(machine.ErrorCount(), errors_before);  // 拒绝并记 ERROR
+    EXPECT_NE(machine.CurrentState(), common::MissionState::kInterceptExecuting);
+    EXPECT_EQ(sender.CallCount(), 0U);  // 任何命令都不得发出
 
     machine.Stop();
 }

@@ -66,6 +66,7 @@ echo "退出码=$?"
 | `--sitl-offboard-loss` | 仅 UDP，起飞 1m 后停止 setpoint、验证 PX4 退出 Offboard，再 AUTO.LAND 回收；最短 25 秒 |
 | `--sitl-stage4-controller` | 仅 UDP，装配真实 `FlightController` + 意图脚本（G2 执行层门禁）；最短 60 秒 |
 | `--sitl-stage4-mission` | 仅 UDP，装配状态机全链 + 注入模拟数据（G3 全链门禁，含 G2 补验两项）；最短 60 秒 |
+| `--selftest` | 离线自检工具纯逻辑（G3 意图分类等），不读配置、不触 SITL/硬件；已纳入 `ctest`（`px4_link_smoke_selftest`） |
 | `--help` | 显示帮助 |
 
 ### 2.1 stage4 执行层门禁脚本（`--sitl-stage4-controller`）
@@ -145,7 +146,13 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
   与"仅 S5→S7 过渡耗时偏长"（间隔仍小于有效期）；
 - 交接缝所引用的 `intent_timeout` 与状态机意图有效期**同源**（`controller.intent_timeout`
   经 `LoadAppConfig` 注入，报告打印实测值），`valid_for_ms` 一致的 500ms 常量仅用于
-  工具自身引导意图（工具是接管前的意图生产者）。
+  工具自身引导意图（工具是接管前的意图生产者）；
+- **意图分类纪律（2026-10-14 终审 Critical 防复发）**：工具按 reason 低位段 +
+  意图类型分类状态机意图（`ClassifyMissionIntent` 纯函数）——位置引导 7（S5/S6 与
+  S7 过渡）、视觉伺服 100、判丢刹车 102；**只排除工具自身引导意图（低字节 0）**。
+  不得写成"只认低字节 7"（那会把 S7 伺服/刹车意图整体丢弃，`servo_intent_seen_`
+  永假、交接判据永不计算、脚本在交接段超时中止）。该分类由 `--selftest` 离线断言
+  （8 条用例，含 servo/brake 通过过滤与工具引导被排除），并已纳入 `ctest`。
 
 脚本序列与验收断言（报告逐条 PASS/FAIL，实测值一并打印）：
 
