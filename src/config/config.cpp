@@ -484,8 +484,8 @@ void FlightControllerConfig::Validate() const {
         throw std::invalid_argument("controller.intent_timeout_ms 必须为正");
     if (coast_timeout.count() <= intent_timeout.count())
         throw std::invalid_argument("controller.coast_timeout_ms 必须大于 intent_timeout_ms");
-    if (slew_transition.count() < 0)
-        throw std::invalid_argument("controller.slew_transition_ms 不得为负");
+    if (slew_transition.count() <= 0)
+        throw std::invalid_argument("controller.slew_transition_ms 必须为正");
 }
 
 void HandoverConfig::Validate() const {
@@ -678,7 +678,8 @@ AppConfig LoadAppConfig(const std::string& path,
     // FlightController 参数（controller 节，阶段四控制接入）：全部字段可选，
     // 缺席回退默认值；Validate 做范围与跨字段校验（如 coast_timeout > intent_timeout）。
     // max_jerk_mps3 允许 0（不启用 jerk 限制，v1 预留），故直接 value() 后由
-    // Validate 拦负值；slew_transition 允许 0（无斜坡）。
+    // Validate 拦负值；slew_transition 语义统一为 >0（与加载路径
+    // ReadOptionalPositiveMilliseconds 一致）。
     const json controller = root.value("controller", json::object());
     config.controller.period = ReadOptionalPositiveMilliseconds(
         controller, "period_ms", config.controller.period);

@@ -51,6 +51,7 @@ public:
 
     // ---- 输入 ----
     /// 绑定控制意图输入主题（IMissionStateMachine::IntentOutput()）。
+    /// 须在 Start() 前调用（Start 后周期线程即开始消费订阅）。
     virtual void SetInput(common::Topic<common::ControlIntent>& intent) = 0;
 
     // ---- 输出 ----
@@ -91,16 +92,20 @@ private:
     common::Topic<common::Px4Setpoint> setpoint_output_;
 };
 
-/// 控制权状态（spec §4；Task 5 接入授权/降级转移，本任务恒为 kIdle）。
+/// 控制权状态（spec §4；Task 5 接入授权/降级转移，本任务恒为 kIdle，
+/// 单测可经 TestForceAuthority 强制）。
 enum class ControlAuthority : uint8_t { kIdle, kActive, kCoast };
 
 /// 正式飞行控制器（spec §3 执行层）：固定周期消费 ControlIntent，
-/// 门禁链（有限性/超龄/控制权）+ 限幅 + 无扰衔接后发布 Px4Setpoint。
+/// 门禁链（有限性/超龄/控制权）+ 限幅流水线 + 无扰衔接后发布 Px4Setpoint。
 ///
-/// 骨架边界（本任务）：
+/// 当前边界：
 /// - 固定周期线程、意图队列排干（只留最新）、入口门禁（有限性/超龄拒绝计数）、
 ///   IDLE 门禁（默认 kIdle，不发布任何 setpoint）已实现；
-/// - 限幅（Task 4）、控制权三态与 PX4 门禁（Task 5）后续接入；
+/// - 限幅流水线（Task 4）：速度幅值等比钳制 → SlewRateLimiter 加速度限幅；
+///   来源/类型变化时斜坡起点=上一周期实际输出（无扰衔接）；时钟回退冻结输出；
+///   未定义 control_source 按安全语义降级（仅刹停类意图生效）；
+/// - 控制权三态与 PX4 门禁（Task 5）后续接入；
 ///   SetPx4LinkSource 接口已预留，本任务仅存指针不做判定。
 class FlightController final : public IFlightController {
 public:
@@ -128,8 +133,18 @@ public:
     ControlAuthority Authority() const;
     /// 门禁拒绝（非有限/超龄）意图累计计数。
     uint64_t RejectedIntentCount() const;
+    /// 速度幅值限幅触发累计计数（每次钳制生效 +1，供 G2 验收核对）。
+    uint64_t ClampedCount() const;
     /// 注入 PX4 链路只读快照源（Task 5 门禁启用；本任务仅保存指针）。
     void SetPx4LinkSource(const communication::IPx4Link* link);
+
+    // ---- 测试入口（生产装配不得调用） ----
+    /// 强制设置控制权状态（Task 5 授权链接入前的单测入口；
+    /// 用公开诊断方法替代 #ifdef 测试钩，不破坏封装）。
+    void TestForceAuthority(ControlAuthority authority);
+    /// 以指定时间戳同步执行一拍控制周期（须在未 Start 状态调用，
+    /// 与周期线程互斥；用于时钟回退等时序用例的确定性驱动）。
+    void TestTick(uint64_t now_ms);
 
 private:
     class Impl;
