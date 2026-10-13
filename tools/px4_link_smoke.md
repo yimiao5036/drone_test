@@ -93,32 +93,71 @@ echo "退出码=$?"
 
 ## 3. 当前配置
 
+机载身份（`onboard_system_id`/`onboard_component_id`）自 2026-09-02 多机区分配置改造起
+与正式主程序一致，位于 **`px4` 节**（历史顶层 `mavlink` 节已废弃，照抄旧样例会被工具以
+JSON 异常拒绝）。下面是与 `config/px4_sitl.json` 一致的**完整可运行样例**（可直接照抄为
+SITL 配置文件）：
+
 ```json
-"mavlink": {
-    "onboard_system_id": 1,
-    "onboard_component_id": 191
-},
-"px4": {
-    "firmware_version": "1.17.0",
-    "target_system_id": 1,
-    "target_component_id": 1,
-    "mavlink_version": 2,
-    "command_ack_timeout_ms": 1000,
-    "command_queue_capacity": 16,
-    "one_shot_message_requests": [148, 242],
-    "message_interval_requests": [
-        {"message_id": 30, "interval_us": 100000},
-        {"message_id": 32, "interval_us": 100000}
-    ],
-    "serial": {
-        "device": "/dev/ttyS1",
-        "baud_rate": 115200,
-        "data_bits": 8,
-        "stop_bits": 1,
-        "parity": "N"
+{
+    "log": {
+        "dir": "logs/",
+        "level": "info"
+    },
+    "px4": {
+        "transport": "udp",
+        "onboard_system_id": 1,
+        "onboard_component_id": 191,
+        "firmware_version": "1.17.0",
+        "target_system_id": 1,
+        "target_component_id": 1,
+        "mavlink_version": 2,
+        "heartbeat_send_interval_ms": 1000,
+        "heartbeat_timeout_ms": 3000,
+        "telemetry_timeout_ms": 2000,
+        "state_publish_interval_ms": 100,
+        "command_ack_timeout_ms": 1000,
+        "setpoint_send_interval_ms": 50,
+        "setpoint_timeout_ms": 500,
+        "setpoint_queue_capacity": 4,
+        "command_queue_capacity": 16,
+        "one_shot_message_requests": [148, 242],
+        "message_interval_requests": [
+            {"message_id": 1, "interval_us": 1000000},
+            {"message_id": 24, "interval_us": 200000},
+            {"message_id": 30, "interval_us": 100000},
+            {"message_id": 32, "interval_us": 100000},
+            {"message_id": 33, "interval_us": 200000},
+            {"message_id": 65, "interval_us": 200000},
+            {"message_id": 147, "interval_us": 1000000},
+            {"message_id": 245, "interval_us": 500000}
+        ],
+        "serial": {
+            "device": "/dev/ttyS1",
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "stop_bits": 1,
+            "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "udp": {
+            "bind_address": "127.0.0.1",
+            "bind_port": 14540,
+            "remote_address": "127.0.0.1",
+            "remote_port": 14580,
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "reconnect_interval_ms": 1000
     }
 }
 ```
+
+上板串口（`config/config.json`）的 `px4` 节结构完全相同，区别只有：`transport` 为
+`"serial"`（用 `serial` 子节，`udp` 子节仅为完整性保留），且文件额外包含
+`runtime`/`controller`/`ground_station` 等正式主程序配置节——本工具只读 `log`、`px4`
+与 stage4 用到的 `controller` 节，其余节忽略。
 
 波特率必须与 PX4 对应 MAVLink 实例一致。若实机不是 115200，只修改 JSON 后重新运行，不改代码。
 

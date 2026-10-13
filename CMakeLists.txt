@@ -399,7 +399,8 @@ if(BUILD_TESTING)
                 tracking_config_test
                 tracking_control_law_test
                 visual_tracking_shadow_test
-                flight_controller_test)
+                flight_controller_test
+                flight_controller_link_contract_test)
             add_executable(${control_test} tests/control/${control_test}.cpp)
             target_link_libraries(${control_test} PRIVATE
                 drone_common drone_control_core spdlog::spdlog GTest::gtest_main)
@@ -411,6 +412,9 @@ if(BUILD_TESTING)
             include(GoogleTest)
             gtest_discover_tests(${control_test})
         endforeach()
+        # 跨模块契约用例需要真实 Px4Link（PTY 伪终端对端），额外链接通信模块。
+        target_link_libraries(flight_controller_link_contract_test PRIVATE
+            drone_communication)
 
         # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
         add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)

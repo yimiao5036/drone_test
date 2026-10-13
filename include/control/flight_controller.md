@@ -163,10 +163,12 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
      `dt=period` 推进，单步变化 ≤ `max_accel_mps2·period`；`dt<=0`
      （时钟回退/首拍）时限幅器冻结输出保持上一值——既有语义，不改。
      时钟回退检测：`now_ms <= last_output_ms_` 时本拍 `dt=0`。
-- **坐标系标注（G2 实跑发现补入）**：所有发布路径（速度/位置/刹车/停发）在
-  `Publish()` 统一写入 `header.frame_id = 3`（局部 NED，编码见
-  `include/common/types.h`）——`Px4Link::IsSetpointStructurallyValid` 强制核验
-  该值，缺失会使控制器全部设定值被静默拒绝（零发送）。
+- **坐标系标注（stage4 门禁实现期代码核对发现并补入）**：所有发布路径
+  （速度/位置/刹车/停发）在 `Publish()` 统一写入 `header.frame_id = 3`
+  （局部 NED，编码见 `include/common/types.h`）——`Px4Link::IsSetpointStructurallyValid`
+  强制核验该值，缺失会使控制器全部设定值被静默拒绝（零发送）。
+  跨模块回归网：`tests/control/flight_controller_link_contract_test.cpp`
+  （PTY 真实链路契约用例，见下「测试方式」）。
 - **类型映射**：`kVelocityHeading`→`SetpointType::kVelocity`（限幅流水线）；
   `kPositionGuide`→`kPosition`（**透传位置目标不做 slew**——位置阶跃由 PX4
   内部轨迹规划平滑，本控制器只管速度式连续性；速度上限写入由 Px4Link 侧
