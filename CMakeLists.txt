@@ -392,7 +392,8 @@ if(BUILD_TESTING)
                 frame_transform_test
                 tracking_config_test
                 tracking_control_law_test
-                visual_tracking_shadow_test)
+                visual_tracking_shadow_test
+                flight_controller_test)
             add_executable(${control_test} tests/control/${control_test}.cpp)
             target_link_libraries(${control_test} PRIVATE
                 drone_common drone_control_core spdlog::spdlog GTest::gtest_main)
