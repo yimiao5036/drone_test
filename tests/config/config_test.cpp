@@ -686,6 +686,38 @@ TEST(ConfigTest, VisualTrackingStaleFieldsAreParsed) {
     std::filesystem::remove(path);
 }
 
+TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
+    // 生产配置尚未声明 controller/handover 节：两节缺席时必须回退默认值
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
+    EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
+    EXPECT_EQ(config.handover.lock_frames, 10u);
+    EXPECT_EQ(config.handover.exit_lost_frames, 30u);
+}
+
+TEST(ConfigTest, RejectsHandoverExitNotGreaterThanEnter) {
+    // 迟滞关系强制：lock_frames=20、exit_lost_frames=10 → 拒绝
+    json value = ReadSourceConfig();
+    value["handover"]["lock_frames"] = 20;
+    value["handover"]["exit_lost_frames"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_handover_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveControllerLimits) {
+    // max_speed_mps=0 → 拒绝
+    json value = ReadSourceConfig();
+    value["controller"]["max_speed_mps"] = 0.0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_controller_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_video"] = false;

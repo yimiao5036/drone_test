@@ -60,6 +60,33 @@ struct VideoSourceConfig {
     bool stereo_split = false;           ///< uvc 时是否装配 StereoFrameSplitter 左右拆分
 };
 
+/// FlightController 配置（controller 配置节，阶段四控制接入）。
+/// 全部字段可选，缺席回退默认值；Validate 做范围与跨字段校验，
+/// 非法值在配置加载期 fail-fast（抛 std::invalid_argument，消息带字段名）。
+struct FlightControllerConfig {
+    std::chrono::milliseconds period{50};        // 控制周期
+    double max_speed_mps = 2.0;                  // 速度幅值上限
+    double max_accel_mps2 = 2.0;                 // 加速度上限（slew）
+    double max_jerk_mps3 = 0.0;                  // jerk 上限；0=不启用（v1 预留）
+    double max_altitude_m = 30.0;                // 围栏：相对 Home 最大高度
+    double max_radius_m = 100.0;                 // 围栏：相对 Home 最大水平半径
+    std::chrono::milliseconds intent_timeout{300};   // 意图超龄阈值
+    std::chrono::milliseconds coast_timeout{1000};   // COAST 最长保持
+    std::chrono::milliseconds slew_transition{500};  // 无扰衔接斜坡时长
+    void Validate() const;
+};
+
+/// 交接缝配置（handover 配置节，阶段四控制接入）。
+/// 视觉锁定↔卡尔曼跟踪的状态切换迟滞：exit_lost_frames 必须大于 lock_frames。
+struct HandoverConfig {
+    uint32_t lock_frames = 10;          // S5→S6：LOCKED 连续帧数
+    double fow_margin_deg = 5.0;        // 视线角视场余量
+    double innovation_gate_m = 3.0;     // 视觉观测与卡尔曼预测创新门限（米）
+    std::chrono::milliseconds timeout{3000};  // S6 驻留超时
+    uint32_t exit_lost_frames = 30;     // S7 退出：LOST 连续帧数（必须 > lock_frames）
+    void Validate() const;
+};
+
 struct AppConfig {
     LogConfig log;
     RuntimeConfig runtime;
@@ -82,6 +109,8 @@ struct AppConfig {
     /// 预置校正矩阵：由 stereo_ranger.rectify_matrices_path 指向的 JSON 加载
     /// （基准=SBS右半=物理左目；重标定后必须重跑 export_rectify.py）。
     perception::StereoRectifyMatrices stereo_rectify;
+    FlightControllerConfig controller;  ///< FlightController 参数（阶段四控制接入）
+    HandoverConfig handover;            ///< 交接缝迟滞参数（阶段四控制接入）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

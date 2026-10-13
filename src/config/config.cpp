@@ -473,6 +473,30 @@ communication::Px4LinkConfig ParsePx4Config(const json& root) {
 
 }  // namespace
 
+void FlightControllerConfig::Validate() const {
+    if (period.count() <= 0) throw std::invalid_argument("controller.period_ms 必须为正");
+    if (max_speed_mps <= 0.0) throw std::invalid_argument("controller.max_speed_mps 必须为正");
+    if (max_accel_mps2 <= 0.0) throw std::invalid_argument("controller.max_accel_mps2 必须为正");
+    if (max_jerk_mps3 < 0.0) throw std::invalid_argument("controller.max_jerk_mps3 不得为负");
+    if (max_altitude_m <= 0.0 || max_radius_m <= 0.0)
+        throw std::invalid_argument("controller 围栏参数必须为正");
+    if (intent_timeout.count() <= 0)
+        throw std::invalid_argument("controller.intent_timeout_ms 必须为正");
+    if (coast_timeout.count() <= intent_timeout.count())
+        throw std::invalid_argument("controller.coast_timeout_ms 必须大于 intent_timeout_ms");
+    if (slew_transition.count() < 0)
+        throw std::invalid_argument("controller.slew_transition_ms 不得为负");
+}
+
+void HandoverConfig::Validate() const {
+    if (lock_frames == 0) throw std::invalid_argument("handover.lock_frames 必须为正");
+    if (exit_lost_frames <= lock_frames)
+        throw std::invalid_argument("handover.exit_lost_frames 必须大于 lock_frames（迟滞）");
+    if (fow_margin_deg <= 0.0) throw std::invalid_argument("handover.fow_margin_deg 必须为正");
+    if (innovation_gate_m <= 0.0) throw std::invalid_argument("handover.innovation_gate_m 必须为正");
+    if (timeout.count() <= 0) throw std::invalid_argument("handover.timeout_ms 必须为正");
+}
+
 // 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
 // config/config.json，最后回退当前目录的 ./config/config.json；都失败则抛错。
 // 这样从部署目录直接运行也能稳定加载配置，不依赖启动时的工作目录。
@@ -650,6 +674,45 @@ AppConfig LoadAppConfig(const std::string& path,
     visual_cfg.mount.z_m =
         visual_fusion.value("mount_z_m", visual_cfg.mount.z_m);
     config.target_estimator.Validate();
+
+    // FlightController 参数（controller 节，阶段四控制接入）：全部字段可选，
+    // 缺席回退默认值；Validate 做范围与跨字段校验（如 coast_timeout > intent_timeout）。
+    // max_jerk_mps3 允许 0（不启用 jerk 限制，v1 预留），故直接 value() 后由
+    // Validate 拦负值；slew_transition 允许 0（无斜坡）。
+    const json controller = root.value("controller", json::object());
+    config.controller.period = ReadOptionalPositiveMilliseconds(
+        controller, "period_ms", config.controller.period);
+    config.controller.max_speed_mps = ReadOptionalPositiveDouble(
+        controller, "max_speed_mps", config.controller.max_speed_mps);
+    config.controller.max_accel_mps2 = ReadOptionalPositiveDouble(
+        controller, "max_accel_mps2", config.controller.max_accel_mps2);
+    config.controller.max_jerk_mps3 =
+        controller.value("max_jerk_mps3", config.controller.max_jerk_mps3);
+    config.controller.max_altitude_m = ReadOptionalPositiveDouble(
+        controller, "max_altitude_m", config.controller.max_altitude_m);
+    config.controller.max_radius_m = ReadOptionalPositiveDouble(
+        controller, "max_radius_m", config.controller.max_radius_m);
+    config.controller.intent_timeout = ReadOptionalPositiveMilliseconds(
+        controller, "intent_timeout_ms", config.controller.intent_timeout);
+    config.controller.coast_timeout = ReadOptionalPositiveMilliseconds(
+        controller, "coast_timeout_ms", config.controller.coast_timeout);
+    config.controller.slew_transition = ReadOptionalPositiveMilliseconds(
+        controller, "slew_transition_ms", config.controller.slew_transition);
+    config.controller.Validate();
+
+    // 交接缝迟滞参数（handover 节，阶段四控制接入）：exit_lost_frames 必须
+    // 大于 lock_frames，避免 S6/S7 边界抖动。
+    const json handover = root.value("handover", json::object());
+    config.handover.lock_frames = handover.value("lock_frames", config.handover.lock_frames);
+    config.handover.fow_margin_deg = ReadOptionalPositiveDouble(
+        handover, "fow_margin_deg", config.handover.fow_margin_deg);
+    config.handover.innovation_gate_m = ReadOptionalPositiveDouble(
+        handover, "innovation_gate_m", config.handover.innovation_gate_m);
+    config.handover.timeout = ReadOptionalPositiveMilliseconds(
+        handover, "timeout_ms", config.handover.timeout);
+    config.handover.exit_lost_frames =
+        handover.value("exit_lost_frames", config.handover.exit_lost_frames);
+    config.handover.Validate();
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。
     const json visual_monitor = root.value("visual_monitor", json::object());
