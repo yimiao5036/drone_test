@@ -253,6 +253,8 @@ TEST_F(FlightControllerPipelineTest, SpeedMagnitudeClamped) {
     EXPECT_NEAR(last->y, 1.6, 1e-3);
     EXPECT_NEAR(last->z, 0.0, 1e-6);
     EXPECT_GT(controller_.ClampedCount(), 0u);  // 限幅触发计数（供 G2 验收核对）
+    // 坐标系契约：输出必须标注局部 NED(frame_id=3)，否则 Px4Link 结构校验拒发
+    EXPECT_EQ(last->header.frame_id, 3);
 }
 
 TEST_F(FlightControllerPipelineTest, AccelerationSlewLimitsStepResponse) {
@@ -381,6 +383,8 @@ TEST_F(FlightControllerPipelineTest, PositionGuidePassthrough) {
     EXPECT_TRUE(out->use_yaw);
     EXPECT_FLOAT_EQ(out->yaw_deg, 30.f);
     EXPECT_EQ(controller_.ClampedCount(), 0u);
+    // 坐标系契约：位置式输出同样标注局部 NED(frame_id=3)
+    EXPECT_EQ(out->header.frame_id, 3);
 }
 
 TEST_F(FlightControllerPipelineTest, PositionToVelocitySlewStartsFromZero) {

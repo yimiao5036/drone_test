@@ -575,6 +575,11 @@ private:
         setpoint.header.receive_time_ms = now_ms;
         setpoint.header.valid_for_ms =
             static_cast<uint64_t>(config_.period.count()) * 2;
+        // 坐标系契约：本控制器输出的位置/速度设定值统一为局部 NED
+        // （frame_id=3，编码见 include/common/types.h）。Px4Link 的
+        // IsSetpointStructurallyValid 强制核验该值——缺失会使全部设定值被
+        // 静默拒绝（G2 实跑发现：控制器 → Px4Link 全链零发送）。
+        setpoint.header.frame_id = 3;
         (void)setpoint_output_.Publish(
             std::make_shared<const common::Px4Setpoint>(std::move(setpoint)));
         ++setpoint_count_;
