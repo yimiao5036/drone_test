@@ -47,8 +47,9 @@ common::Topic<Px4Setpoint> ──► IPx4Link（PX4 通信线程）
 - `Authority()` / `RejectedIntentCount()` / `ClampedCount()` /
   `SetpointCount()` / `ErrorCount()`：诊断计数，原子量，供测试与门禁使用。
   - `RejectedIntentCount()` 语义：入口门禁拒绝（非有限/到达即超龄）按到达
-    计数；**授权后持有期超龄在转入 COAST 那一拍 +1**（Task 5 起超龄即转
-    COAST，不再逐拍增长）；位置式意图无 Home 基准拒绝按到达计数。
+    计——上游每拍重发同一条违例意图时表现为按拍增长；**授权后持有期
+    超龄在转入 COAST 那一拍 +1**（Task 5 起超龄即转 COAST，不再逐拍
+    增长）；位置式意图无 Home 基准拒绝按拍计，直至意图超龄转 COAST。
   - `ClampedCount()` 为限幅触发累计计数（速度幅值等比钳制 + 位置式围栏
     钳制，每次钳制生效 +1，供 G2 验收核对）。
 - `SetPx4LinkSource(const communication::IPx4Link*)`：注入 PX4 只读快照源
@@ -78,14 +79,16 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
 表示状态机显式请求控制权；低位段沿用 `docs/数据接口文档.md` §3.5 枚举
 （0~7 规划语义、100+ 视觉跟踪影子段）。锁存规则：跟随**最新通过入口门禁**
 的意图刷新（被拒绝的意图不刷新）；进入 IDLE 时清零——回 ACTIVE 必须重新
-满足授权链（含显式请求）。状态机侧置位在 Task 7 落地。
+满足授权链（含显式请求）。锁存本身**不随时间过期**：IDLE→ACTIVE 另要求
+持有新鲜（未超龄）请求位意图，陈旧锁存不得事后激活授权（评审 fix round 2）。
+状态机侧置位在 Task 7 落地。
 
 三态迁移表（每次迁移打 WARN 级状态变化日志，含原因串）：
 
 | 当前态 | 条件 | 下一态 | 动作 |
 |---|---|---|---|
-| IDLE | 授权链全通 | ACTIVE | 无（随后走正常发布路径） |
-| IDLE | 授权链不通 | IDLE | 停发（不发布任何 setpoint） |
+| IDLE | 授权链全通且持有新鲜请求位意图 | ACTIVE | 无（随后走正常发布路径） |
+| IDLE | 授权链不通或请求意图已超龄 | IDLE | 停发（不发布任何 setpoint） |
 | ACTIVE | 授权链断开（心跳断/非 Offboard/未 armed/请求撤销） | IDLE | 发布 `valid=false` 停发 |
 | ACTIVE | 无意图或持有期超龄 | COAST | 记录 `coast_since`，发布零速刹车 |
 | COAST | 授权链断开 | IDLE | 发布 `valid=false` 停发 |
@@ -219,6 +222,9 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
   - `CoastBrakesThenIdles`：ACTIVE 中意图断粮 → 超龄转 COAST 零速刹车；
     COAST 中意图恢复回 ACTIVE；再次断粮转 COAST 后 coast_timeout 耗尽
     → IDLE + `valid=false` 停发；
+  - `StaleRequestDoesNotActivateAuthority`：请求位意图到达后长期 IDLE
+    （无新意图），授权链事后就绪时陈旧请求不得激活 ACTIVE（评审
+    fix round 2 回归）；补新鲜请求位意图后才转 ACTIVE；
   - `FenceClampsPositionIntent`：位置意图超 `max_radius_m`/`max_altitude_m`
     → 钳制到边界 + `ClampedCount` 计数；`home_valid=false` → 位置式意图
     拒绝输出并计 `RejectedIntentCount`。

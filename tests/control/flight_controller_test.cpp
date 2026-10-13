@@ -585,6 +585,36 @@ TEST_F(FlightControllerAuthorityTest, CoastBrakesThenIdles) {
     EXPECT_FALSE(stop->valid);
 }
 
+TEST_F(FlightControllerAuthorityTest, StaleRequestDoesNotActivateAuthority) {
+    // 评审修复（fix round 2）：请求位意图到达后长期 IDLE（无新意图），
+    // 授权链链路/模式条件事后就绪时，陈旧请求不得激活 ACTIVE——IDLE→ACTIVE
+    // 须同时持有新鲜请求位意图
+    px4_link_.SetState(MakePositionModeSnapshot());  // 非 Offboard：保持 IDLE
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();  // t0：请求位意图被排干（锁存=true），门禁不通 → IDLE
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+
+    // 长期 IDLE：推进远超 intent_timeout(100ms)，锁存意图陈旧
+    for (int i = 0; i < 10; ++i) {  // t0+20 .. t0+200
+        Tick();
+        EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    }
+
+    // Offboard 就绪：链路/模式条件满足，但请求位意图已超龄 → 不得转 ACTIVE
+    px4_link_.SetState(MakeOffboardSnapshot());
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    EXPECT_FALSE(TakeOutput().has_value());
+
+    // 对照：补一条新鲜请求位意图 → 授权链全通，转 ACTIVE
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_TRUE(out->valid);
+}
+
 TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
     // 位置意图超过 max_radius_m / max_altitude_m（相对 Home）→ 钳制到边界 +
     // 节流 WARN（ClampedCount 计数）

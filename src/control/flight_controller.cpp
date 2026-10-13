@@ -244,7 +244,9 @@ private:
         const bool gate = AuthorityGateOpen();
         switch (authority_.load(std::memory_order_acquire)) {
             case ControlAuthority::kIdle:
-                if (!gate) {
+                // IDLE→ACTIVE 须授权链全通且持有新鲜请求位意图：请求锁存
+                // 不随时间过期，陈旧请求不得事后激活授权（评审 fix round 2）。
+                if (!gate || !FreshIntentAvailable(now_ms)) {
                     return;  // IDLE 停发：不发布任何 setpoint
                 }
                 TransitionTo(ControlAuthority::kActive, "授权链全通");
