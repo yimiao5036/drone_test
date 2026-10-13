@@ -130,6 +130,10 @@ public:
             mavlink_.Reset();  // 清半包/序号，避免重连后残留污染
 
             state_ = common::FlightStateSnapshot{};
+            {
+                std::lock_guard<std::mutex> state_lock(state_mutex_);
+                latest_state_snapshot_ = common::FlightStateSnapshot{};
+            }
             state_sequence_ = 0;
             last_heartbeat_time_ms_ = 0;
             ResetTelemetryTimes();
@@ -249,6 +253,12 @@ public:
             return 0;
         }
         return message_receive_counts_[message_id].load(std::memory_order_relaxed);
+    }
+
+    // 最近发布快照的只读拷贝；未发布过时返回默认快照（connected=false）。
+    common::FlightStateSnapshot LatestState() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return latest_state_snapshot_;
     }
 
 private:
@@ -583,6 +593,9 @@ private:
         state_.flight_sub_mode = static_cast<uint8_t>((heartbeat.custom_mode >> 24U) & 0xFFU);
         state_.system_status = heartbeat.system_status;
 
+        // 先发布快照再置连接原子标志：保证观察到 IsConnected()==true 的线程
+        // 经 LatestState() 必能读到 connected=true 的快照（happens-before）。
+        PublishState(now_ms);
         if (!connected_.exchange(true, std::memory_order_acq_rel)) {
             SPDLOG_INFO("PX4 心跳已连接: source={}/{} mode={}/{} armed={}",
                         message.sysid, message.compid, state_.flight_mode,
@@ -592,7 +605,6 @@ private:
                 QueueTelemetryRequests();
             }
         }
-        PublishState(now_ms);
     }
 
     // 落地状态：仅当非 UNDEFINED 才算有效。
@@ -973,7 +985,9 @@ private:
     void PublishState(uint64_t now_ms) {
         RefreshTelemetryValidity(now_ms);
         common::FlightStateSnapshot snapshot = state_;
-        snapshot.connected = connected_.load(std::memory_order_acquire);
+        // connected 取自 state_：各发布点 state_.connected 与 connected_ 原子标志一致，
+        // 且心跳处理先发布再置标志，保证 LatestState() 与 IsConnected() 观察顺序一致。
+        snapshot.connected = state_.connected;
         snapshot.header.sequence = ++state_sequence_;
         snapshot.header.source_time_ms = 0;
         snapshot.header.receive_time_ms = now_ms;
@@ -983,6 +997,11 @@ private:
         snapshot.header.health = snapshot.connected ? 1 : 3;
         snapshot.header.frame_id =
             (snapshot.local_position_valid || snapshot.global_position_valid) ? 3 : 0;
+        {
+            // 供 LatestState() 只读门禁查询：锁粒度为一次结构拷贝。
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            latest_state_snapshot_ = snapshot;
+        }
         (void)state_output_.Publish(
             std::make_shared<const common::FlightStateSnapshot>(std::move(snapshot)));
     }
@@ -1000,6 +1019,8 @@ private:
     SetpointSubscription setpoint_subscription_;
     common::Topic<common::FlightStateSnapshot> state_output_;
     common::FlightStateSnapshot state_;
+    mutable std::mutex state_mutex_;
+    common::FlightStateSnapshot latest_state_snapshot_;
     uint64_t state_sequence_ = 0;
     uint64_t last_heartbeat_time_ms_ = 0;
     uint64_t last_landed_time_ms_ = 0;
@@ -1054,6 +1075,9 @@ uint64_t Px4Link::ReceiveCount() const { return impl_->ReceiveCount(); }
 uint64_t Px4Link::AckMatchCount() const { return impl_->AckMatchCount(); }
 uint64_t Px4Link::AckTimeoutCount() const { return impl_->AckTimeoutCount(); }
 uint64_t Px4Link::ErrorCount() const { return impl_->ErrorCount(); }
+common::FlightStateSnapshot Px4Link::LatestState() const {
+    return impl_->LatestState();
+}
 uint64_t Px4Link::MessageReceiveCount(uint32_t message_id) const {
     return impl_->MessageReceiveCount(message_id);
 }
@@ -1107,5 +1131,9 @@ uint64_t Px4LinkStub::ReceiveCount() const { return receive_count_; }
 uint64_t Px4LinkStub::AckMatchCount() const { return ack_match_count_; }
 uint64_t Px4LinkStub::AckTimeoutCount() const { return ack_timeout_count_; }
 uint64_t Px4LinkStub::ErrorCount() const { return error_count_; }
+
+common::FlightStateSnapshot Px4LinkStub::LatestState() const {
+    return common::FlightStateSnapshot{};
+}
 
 }  // namespace drone::communication

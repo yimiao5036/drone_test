@@ -31,11 +31,28 @@
 
 namespace drone::communication {
 
-/// PX4 通信部件抽象接口。
-class IPx4Link {
+/// 窄命令发送接口：仅暴露 SendCommand 与 ACK 计数，供状态机在
+/// enable_control=true 时注入（装配期物理隔离；false 时不注入）。
+class IPx4CommandSender {
 public:
-    virtual ~IPx4Link() = default;
+    virtual ~IPx4CommandSender() = default;
 
+    /// 发送 MAVLink 命令（解锁/起飞/返航等）。
+    /// @param mavlink_command MAV_CMD 常量值（实现期用 mavlink 库常量，骨架期传数值）。
+    /// @param params 命令参数 param1~param7。
+    /// @return 是否成功入队发送。
+    virtual bool SendCommand(uint16_t mavlink_command, float param1, float param2,
+                             float param3, float param4, float param5,
+                             float param6, float param7) = 0;
+    /// ACK 匹配成功次数。
+    virtual uint64_t AckMatchCount() const = 0;
+    /// ACK 超时次数。
+    virtual uint64_t AckTimeoutCount() const = 0;
+};
+
+/// PX4 通信部件抽象接口。
+class IPx4Link : public IPx4CommandSender {
+public:
     // ---- 生命周期 ----
     /// 启动通信（打开串口、启动收发线程）。返回是否成功启动。
     virtual bool Start() = 0;
@@ -54,24 +71,15 @@ public:
     /// 飞行状态快照输出主题：common::FlightStateSnapshot。
     virtual common::Topic<common::FlightStateSnapshot>& StateOutput() = 0;
 
-    // ---- 命令 ----
-    /// 发送 MAVLink 命令（解锁/起飞/返航等）。
-    /// @param mavlink_command MAV_CMD 常量值（实现期用 mavlink 库常量，骨架期传数值）。
-    /// @param params 命令参数 param1~param7。
-    /// @return 是否成功入队发送。
-    virtual bool SendCommand(uint16_t mavlink_command, float param1, float param2,
-                             float param3, float param4, float param5,
-                             float param6, float param7) = 0;
+    /// 最近发布的飞行状态快照拷贝（只读门禁用；未发布过时返回默认快照，
+    /// connected=false）。线程安全。
+    virtual common::FlightStateSnapshot LatestState() const = 0;
 
     // ---- 状态查询 ----
     /// 累计发送设定值帧数。
     virtual uint64_t SetpointSendCount() const = 0;
     /// 累计接收消息数。
     virtual uint64_t ReceiveCount() const = 0;
-    /// ACK 匹配成功次数。
-    virtual uint64_t AckMatchCount() const = 0;
-    /// ACK 超时次数。
-    virtual uint64_t AckTimeoutCount() const = 0;
     /// 累计错误次数。
     virtual uint64_t ErrorCount() const = 0;
 };
@@ -130,6 +138,8 @@ public:
                      float param3, float param4, float param5,
                      float param6, float param7) override;
 
+    common::FlightStateSnapshot LatestState() const override;
+
     uint64_t SetpointSendCount() const override;
     uint64_t ReceiveCount() const override;
     uint64_t AckMatchCount() const override;
@@ -165,6 +175,8 @@ public:
     bool SendCommand(uint16_t mavlink_command, float param1, float param2,
                      float param3, float param4, float param5,
                      float param6, float param7) override;
+
+    common::FlightStateSnapshot LatestState() const override;
 
     uint64_t SetpointSendCount() const override;
     uint64_t ReceiveCount() const override;

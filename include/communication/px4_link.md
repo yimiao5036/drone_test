@@ -61,8 +61,27 @@ public:
     bool IsConnected() const;
     void SetInput(Topic<Px4Setpoint>& setpoint);
     Topic<FlightStateSnapshot>& StateOutput();
+    FlightStateSnapshot LatestState() const;  // 最近发布快照的只读拷贝
 };
 ```
+
+窄命令接口与只读快照（阶段四控制接入）：
+
+```cpp
+class IPx4CommandSender {          // IPx4Link 的父接口
+    virtual bool SendCommand(uint16_t mavlink_command, float p1, ..., float p7) = 0;
+    virtual uint64_t AckMatchCount() const = 0;
+    virtual uint64_t AckTimeoutCount() const = 0;
+};
+```
+
+- `IPx4CommandSender` 仅暴露命令发送与 ACK 计数，供状态机在 `enable_control=true` 时
+  注入（装配期物理隔离；`false` 时不注入，命令通道在装配层缺席）。
+- `IPx4Link::LatestState()` 返回最近一次发布快照的拷贝，供 FlightController 控制权
+  门禁做只读判断——门禁不订阅 `kFlightState` Topic，避免控制环路经 Topic 回环。
+  未发布过快照时返回默认值（`connected=false`）。线程安全（互斥锁保护一次结构拷贝），
+  且保证观察到 `IsConnected()==true` 的线程经 `LatestState()` 必读到
+  `connected=true` 的快照（心跳处理先发布快照再置连接原子标志）。
 
 当前接收数据流：
 
@@ -244,6 +263,7 @@ bits 24..31 → flight_sub_mode（sub mode）
 - `COMMAND_LONG` 参数编码、最终 ACK 匹配和快照更新；
 - ACK 超时计数后继续队列；
 - 首次心跳后按顺序发送单次消息请求和消息频率请求；
+- `LatestState()` 未发布时返回默认快照，连接后反映已发布快照（connected/armed）；
 - 本地 NED 位置设定值、type mask 和 yaw 角转换；
 - 本地 NED 速度设定值、type mask 和 yaw rate 转换；
 - 过期设定值停止重发；

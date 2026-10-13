@@ -786,6 +786,22 @@ TEST(Px4LinkTest, RejectsUnsupportedOrAmbiguousSetpoint) {
     link.Stop();
 }
 
+TEST(Px4LinkTest, LatestStateReflectsPublishedSnapshot) {
+    PseudoTerminal terminal;
+    Px4Link link(MakeConfig(terminal.SlaveName()));
+    ASSERT_TRUE(link.Start());
+    EXPECT_FALSE(link.LatestState().connected);  // 未连接时默认快照
+
+    MavlinkHandler encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        encoder, 1, MAV_COMP_ID_AUTOPILOT1, true, 6, 0)));
+    ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 500ms));
+    const auto snapshot = link.LatestState();
+    EXPECT_TRUE(snapshot.connected);
+    EXPECT_TRUE(snapshot.armed);
+    link.Stop();
+}
+
 TEST(Px4LinkTest, QueuesSafeTelemetryRequestsAfterFirstHeartbeat) {
     PseudoTerminal terminal;
     auto config = MakeConfig(terminal.SlaveName());
