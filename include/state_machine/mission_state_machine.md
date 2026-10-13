@@ -317,19 +317,27 @@ ctest --test-dir build --output-on-failure
   - `S7ServoNotStartedFallsBackAfterTimeout`：S7 中控制律持续降级（不提供姿态 →
     姿态超龄）时伺服永不启动——冻结位置续发在 `timeout_ms` 内持续滚动（无速度/
     刹车意图），超时收口回退 S5，日志 reason="S7伺服未启动超时"。
-- 捕网执行器（Task 10，`FakeCommandSender` 假件记录 SendCommand 调用并可脚本化
-  入队失败；用例经 `TestForceState` 驱动拦截序列——与生产路径共用 TransitionTo/
-  决策线程挂点）：
+- 捕网执行器（Task 10，`FakeCommandSender` 假件按调用顺序记录 SendCommand
+  （命令/参数/入队结果）并可脚本化入队失败；用例经 `TestForceState` 驱动拦截
+  序列——与生产路径共用 TransitionTo/决策线程挂点）：
   - `InterceptExecutingFiresNetActuator`：进入 S10 → 恰好一条 187 命令
     （p3=归一化触发行程 −0.8、其余参数位 NaN、p7=0），停留多拍不重复；
     离开（S10→S11）→ 复位行程（+0.8）且只发一次；再次进入 → 新一次触发；
   - `NetActuatorFiringRetriesWhenEnqueueFails`：前两次入队失败 → 下拍重试直至
     成功（成功入队后不再补发，重试内容一致）；
+  - `NetActuatorResetRetriesWhenEnqueueFails`：复位前两次入队失败 → 下拍重试
+    直至成功（按调用顺序断言：重试期间只反复位行程、不混入触发；成功入队后
+    不再补发）；
+  - `NetActuatorTriggerWaitsForResetEnqueued`：复位连续三次入队失败（挂起重试）
+    期间重进 S10 → 复位未成功入队前不发触发，触发排在复位成功入队之后
+    （逐条断言命令参数与入队结果，钉住"先复位、后触发"在异常重试下的次序）；
   - `LeavingInterceptSequenceSendsResetStroke`：S9 不触发；S9→返航离开 →
     发复位行程（不依赖是否触发过）；
   - `NoCommandSenderNeverFires`：未注入命令接口 → 即使进入拦截态也零调用。
   - 负对照（一次性注入 3 处破坏：未用参数位填 0、入队失败也置位、离开不发复位）
-    → 恰好对应 3 个用例失败，恢复后全绿。
+    → 恰好对应 3 个用例失败，恢复后全绿；评审修复另作 2 处次序负对照——触发
+    判据前移到复位挂起检查之前 → `NetActuatorTriggerWaitsForResetEnqueued`
+    失败；复位入队失败即清除挂起（不重试）→ 两个复位用例失败。
 
 ## 排查/修改要点
 

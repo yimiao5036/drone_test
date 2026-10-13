@@ -1161,9 +1161,17 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
 constexpr float kNetFireNormalized = -0.8F;
 constexpr float kNetIdleNormalized = 0.8F;
 
-/// 命令窄接口假件：记录 SendCommand 调用并可脚本化前 N 次入队失败。
+/// 命令窄接口假件：记录 SendCommand 调用（顺序/参数/入队结果）并可脚本化
+/// 前 N 次入队失败。
 class FakeCommandSender final : public communication::IPx4CommandSender {
 public:
+    /// 单条命令调用记录：供触发/复位次序与各次入队结果断言。
+    struct CallRecord {
+        uint16_t command = 0;
+        std::array<float, 7> params{};
+        bool queued = false;  // SendCommand 返回值（false=链路未就绪/队列满）
+    };
+
     bool SendCommand(uint16_t mavlink_command, float param1, float param2,
                      float param3, float param4, float param5, float param6,
                      float param7) override {
@@ -1171,11 +1179,13 @@ public:
         ++call_count_;
         last_command_ = mavlink_command;
         last_params_ = {param1, param2, param3, param4, param5, param6, param7};
+        bool queued = true;
         if (fail_calls_remaining_ > 0) {
             --fail_calls_remaining_;
-            return false;
+            queued = false;
         }
-        return true;
+        history_.push_back({mavlink_command, last_params_, queued});
+        return queued;
     }
 
     uint64_t AckMatchCount() const override { return 0; }
@@ -1196,6 +1206,12 @@ public:
         return last_params_;
     }
 
+    /// 全部调用记录（按时间顺序的拷贝）。
+    std::vector<CallRecord> History() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return history_;
+    }
+
     /// 令接下来 count 次 SendCommand 返回失败（模拟 PX4 未连接/队列满）。
     void FailNextCalls(uint64_t count) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1207,6 +1223,7 @@ private:
     uint64_t call_count_ = 0;
     uint16_t last_command_ = 0;
     std::array<float, 7> last_params_{};
+    std::vector<CallRecord> history_;
     uint64_t fail_calls_remaining_ = 0;
 };
 
@@ -1316,6 +1333,94 @@ TEST(MissionStateMachineTest, NetActuatorFiringRetriesWhenEnqueueFails) {
     // 成功入队后不再补发
     std::this_thread::sleep_for(400ms);
     EXPECT_EQ(sender.CallCount(), 3U);
+
+    machine.Stop();
+}
+
+// 复位入队失败同样下拍重试：复位是安全动作（机构归位到待命行程），链路瞬时
+// 不可用（PX4 未连接/命令队列满）不得让其静默丢失——重试至成功，且重试期间
+// 只反复位行程、不得混入触发命令。
+TEST(MissionStateMachineTest, NetActuatorResetRetriesWhenEnqueueFails) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
+
+    sender.FailNextCalls(2);  // 复位前两次入队失败
+    machine.TestForceState(common::MissionState::kPostIntercept);
+    ASSERT_TRUE(WaitForCallCount(sender, 4)) << "复位入队失败应下拍重试直至成功";
+
+    // 成功入队后不再补发（含不补发触发）
+    std::this_thread::sleep_for(400ms);
+    ASSERT_EQ(sender.CallCount(), 4U);
+    const auto history = sender.History();
+    ASSERT_EQ(history.size(), 4U);
+    // 次序：1=触发成功；2/3=复位失败（重试内容一致）；4=复位成功
+    EXPECT_EQ(history[0].command, 187U);
+    EXPECT_FLOAT_EQ(history[0].params[2], kNetFireNormalized);
+    EXPECT_TRUE(history[0].queued);
+    for (std::size_t index = 1; index < history.size(); ++index) {
+        EXPECT_EQ(history[index].command, 187U);
+        EXPECT_FLOAT_EQ(history[index].params[2], kNetIdleNormalized)
+            << "复位重试期间不得混入触发行程 index=" << index;
+        EXPECT_EQ(history[index].queued, index == 3U)
+            << "入队结果序列不符（前两次复位应失败、第三次成功）index=" << index;
+    }
+
+    machine.Stop();
+}
+
+// 复位未入队前不发触发：离开拦截序列后复位尚在重试（未成功入队）期间重进
+// S10，触发命令必须等复位成功入队后才发——"先复位、后触发"的次序在异常重试
+// 下仍保持，机构不会带着上一次拦截的残留行程直接触发。
+TEST(MissionStateMachineTest, NetActuatorTriggerWaitsForResetEnqueued) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
+
+    sender.FailNextCalls(3);  // 复位连续三次入队失败
+    machine.TestForceState(common::MissionState::kPostIntercept);
+    // 等复位首拍落地，确保决策线程已消费"离开拦截序列"（复位挂起中）
+    ASSERT_TRUE(WaitForCallCount(sender, 2)) << "离开拦截序列应发复位行程";
+
+    // 复位仍挂起（未成功入队）时重进 S10：不得抢发触发
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 6)) << "复位重试成功后应恢复触发";
+    std::this_thread::sleep_for(400ms);
+    ASSERT_EQ(sender.CallCount(), 6U);
+
+    const auto history = sender.History();
+    ASSERT_EQ(history.size(), 6U);
+    // 期望次序：1=触发成功；2~4=复位重试全失败；5=复位成功；6=新触发
+    EXPECT_FLOAT_EQ(history[0].params[2], kNetFireNormalized);
+    EXPECT_TRUE(history[0].queued);
+    for (std::size_t index = 1; index <= 3; ++index) {
+        EXPECT_FLOAT_EQ(history[index].params[2], kNetIdleNormalized)
+            << "复位未入队前不得发触发 index=" << index;
+        EXPECT_FALSE(history[index].queued);
+    }
+    EXPECT_FLOAT_EQ(history[4].params[2], kNetIdleNormalized);
+    EXPECT_TRUE(history[4].queued) << "第 5 条应为复位成功入队";
+    // 触发排在复位成功之后
+    EXPECT_FLOAT_EQ(history[5].params[2], kNetFireNormalized);
+    EXPECT_TRUE(history[5].queued);
 
     machine.Stop();
 }
