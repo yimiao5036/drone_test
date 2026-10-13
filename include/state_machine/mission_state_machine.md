@@ -31,10 +31,22 @@
 
 **与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
 
+阶段四新增（Task 10）：**捕网执行器命令（`MAV_CMD_DO_SET_ACTUATOR`）**——注入命令窄接口`IPx4CommandSender`后，状态机在进入 **S10（INTERCEPT_EXECUTING）** 时发一次捕网触发命令（`net_fired_`防重复；入队失败不置位、下拍重试），离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）时发**复位行程**并清除触发标志（机构归位到待命行程；复位入队失败同样下拍重试，且复位未入队前不发触发）。命令参数按配置换算：`actuator`节的 PWM 微秒行程经 PX4 输出映射区间归一到 **-1..1**（换算式见下），只有本通道对应的参数位填值、**其余参数位 NaN**（MAVLink 规范语义"忽略"；不得填 0——0 为中位行程，会误动其他执行器组），`p7=0`（执行器组序号，PX4 仅处理组 0）。
+
+**MAVLink/PX4 语义核对（2026-10-13，实现前查证）**：`MAV_CMD_DO_SET_ACTUATOR=187` 的官方参数语义是 **p1..p6 = Actuator Set 1..6 的归一化值（-1..1，NaN=忽略）**、**p7 = 执行器组序号**——执行器"通道号"是**参数位**而非参数值。PX4 把 Actuator Set N 映射到配置了输出功能「Peripheral via Actuator Set N」的输出（`FunctionActuatorSet`，仅组 0、最多 6 组），并把 -1..1 线性映射到该输出的 PWM 区间（`PWM_AUX_MINn/MAXn`，默认 1000/2000µs）。因此实现**不把毫秒/微秒直填参数**，而是：
+
+```text
+norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min_us) − 1
+```
+
+`output_pwm_min_us/max_us`为配置项（必须与所接通道的 `PWM_AUX_MINn/MAXn` 一致，装机后按实配核对）；行程必须落在该区间内（`ActuatorConfig::Validate` fail-fast，否则归一化超出 -1..1 不可表达）。默认行程 1100/1900µs 在默认区间下换算为 **-0.8 / +0.8**。换算公式的单测见`ConfigTest.ActuatorNormalizePwmMapsOutputRangeToMinusOneToOne`；实际行程方向/到位由 **G4 拆桨台架**核对。
+
+**拦截序列入口边界（T10 交付范围外，防误读）**：S9/S10 的**进入判据**（锁定质量、相对状态/射程、执行机构就绪、`IInterceptionAuthorizationPolicy` 授权）未在阶段四冻结，本任务**不发明**——状态机现有迁移逻辑只覆盖到 S7，拦截序列当前**无生产入口**（`DroneApplication`不驱动、整机不可达），捕网触发路径因此处于"已接通、待入口"状态。补充入口判据属后续任务；在此之前仅 `TestForceState` 测试入口可达（见测试方式）。
+
 本阶段仍不做以下事情：
 
-- 不发送PX4命令、模式切换、解锁、起飞、降落或setpoint（`SetCommandSender`注入的命令接口当前仅持有，供后续 ARM/执行机构任务使用）。
-- 不直接调用拦截设备。
+- 不发送模式切换、解锁、起飞、降落或setpoint（`SetCommandSender`注入的命令接口当前唯一消费点是捕网执行器触发/复位，Task 10；ARM/模式切换命令仍待后续任务）。
+- 不实现拦截序列（S9/S10/S11）的进入判据与授权策略（上段），不直接调用拦截设备接口。
 - 不把地面站目标透传为PX4航点。
 - 不实现设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量（依赖
   控制侧反馈与尚未冻结的阈值配置），S6→S7 仍用"条件持续 + 视觉链推进 +
@@ -55,6 +67,7 @@ struct MissionStateMachineConfig {
                                                       // vertical/distance 供 S7 伺服控制律）
     std::chrono::milliseconds visual_stale{200};      // 视觉状态超龄（visual_tracking.control.visual_stale_ms 同源）
     std::chrono::milliseconds distance_stale{500};    // 测距超龄（distance_stale_ms 同源）
+    config::ActuatorConfig actuator;                  // 捕网执行器（actuator 配置节同源，Task 10）
 };
 
 class MissionStateMachine final : public IMissionStateMachine {
@@ -70,6 +83,9 @@ public:
     void SetEstimationDiagnostics(const perception::ITargetEstimator* estimator) override;
     Topic<ControlIntent>& IntentOutput() override;
     Topic<MissionStatus>& StatusOutput() override;
+
+    // ---- 测试入口（生产装配不得调用） ----
+    void TestForceState(common::MissionState state);  // 强制迁移（驱动无生产入口的拦截序列）
 };
 ```
 
@@ -87,12 +103,14 @@ StereoRanger::DistanceOutput() ──────┘
 TargetEstimator（ITargetEstimator）─► SetEstimationDiagnostics(...)（装配估计器即注入，只读诊断）
 MissionStateMachine::IntentOutput() ─► FlightController::SetInput(...)
 MissionStateMachine::StatusOutput() ─► GroundStationLink::SetMissionStatusInput(...)
-Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=true 装配分支）
+Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=true 装配分支；
+                             当前唯一消费点=捕网执行器触发/复位，Task 10）
 ```
 
 配置注入：`intent_valid_for`由`DroneApplication`从`config_.controller.intent_timeout`
 同源传入，保证意图`valid_until_ms`与控制器意图超龄门禁一致；`handover`、
-`tracking`（`visual_tracking`整节）与两个超龄阈值分别从`config_.handover`、
+`tracking`（`visual_tracking`整节）、`actuator`（`actuator`整节，Task 10）
+与两个超龄阈值分别从`config_.handover`、
 `config_.visual_tracking`、`config_.visual_tracking.control.{visual_stale_ms,
 distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.control.*`
 （生产与状态机侧两阈值同源注入，测试可分别收紧）。
@@ -100,8 +118,10 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 `HandoverConfig::Validate`强制，状态机构造不重复校验（与 FlightController 同约定）。
 
 **接线现状（T12 前）**：`DroneApplication`尚未实际调用`SetEstimationInputs`
-（整机因此停在 S5 影子行为，不影响既有链路）——三者一组绑定与命令接口注入按
-实施计划归 T12 G3 全链接线；`SetEstimationDiagnostics`已在装配估计器时注入。
+（整机因此停在 S5 影子行为，不影响既有链路）——三者一组绑定按实施计划归
+T12 G3 全链接线；`SetEstimationDiagnostics`已在装配估计器时注入；
+`SetCommandSender`已在`enable_control=true`装配门禁分支注入（T6），
+消费点=捕网执行器触发/复位（T10，enable_control=false 时零调用）。
 
 ## 关键实现点
 
@@ -190,7 +210,31 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     退出路径 ④ 收口回 S5，不得无限续期）；发出后停发（`StopPositionIntent`）。
     交接段收口（含冻结清空、控制律`Reset`、热备份状态清零）统一在
     `ResetHandoverHysteresis`内完成。
+- **捕网执行器（Task 10）**（`EvaluateNetActuator` / `SendNetActuatorStroke`）：
+  - 判定按"状态驻留"而非"迁移边沿"：决策线程每拍末段评估（`Evaluate` 内迁移后
+    立即调用，进入 S10 当拍触发、离开拦截序列当拍复位，无额外延迟）；
+    拦截序列={S9, S10}，离开=任一其他状态（回退/返航/POST_INTERCEPT）。
+  - 触发语义：S10 内 `net_fired_` 未置位才发；`SendCommand` 成功（入队）才置位，
+    失败（PX4 未连接/命令队列满）节流 WARN 并下拍重试——触发命令不得因一次
+    入队失败而丢失。S9 只标记序列开始，不触发（设计：S10 才调用执行机构）。
+  - 复位语义：离开拦截序列置 `net_reset_pending_` 并当拍尝试发复位行程；
+    入队成功才清除，失败下拍重试；**复位未入队前不发触发**（先复位、后触发
+    的次序在异常重试下仍保持）。`net_fired_` 随离开清除——再次进入 S10 是新
+    一次拦截（"防重复"仅限同一拦截段；设计 V1「一次上电一次拦截」由后续入口
+    判据承担，本层不越权裁决）。
+  - 参数组装：只有本通道参数位填归一化值，**其余位 NaN**（规范"忽略"；
+    0=中位行程会误动其他执行器组），p7=0。命令号 187 以常量携带
+    （`kMavCmdDoSetActuator`，状态机不引 MAVLink 头）。
+  - 门禁：`command_sender_==nullptr`（enable_control=false 装配语义）→ 零调用，
+    本功能物理缺席；触发/复位同为控制输出，不另开旁路。
+  - 进程退出不补发复位行程（`Stop()` 不触发机构动作）：机构实际位置由
+    G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
+  - 边界：状态驻留 <1 决策周期（100ms）的极端迁移可能被跳过——生产语义下
+    S10 驻留由拦截结果决定（远长于决策周期），不构成风险。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
+- `TestForceState`为测试入口（生产装配不得调用）：与生产路径共用`TransitionTo`
+  统一迁移挂点，用于驱动当前无生产入口的拦截序列（S9/S10/S11），验证进入/离开
+  动作语义；生产代码不调用。
 - 控制输出是否接 PX4 仍由`DroneApplication`的`enable_control`门禁决定（绑定
   `Px4Setpoint`+注入快照源+注入命令接口只在 true 分支）；诊断接口注入与
   `enable_control` 无关（只读诊断，影子期即可用）。
@@ -204,7 +248,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   S7 视觉伺服意图启动（带首拍 vx/vy/vz/yaw_rate 摘要）；PX4 命令接口与估计器
   诊断接口注入；首次/节流接收地面站目标。
 - WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
-  S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）。
+  S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）；
+  **捕网执行器触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
+  捕网命令入队失败（节流，下拍重试）。
 - ERROR：订阅或线程启动异常；运行中重绑输入/注入接口；估计输入部分绑定；
   估计输入已绑定但未注入估计器诊断（交接不评估）。
 - 高频周期（100ms 决策、10Hz 意图重发、S7 逐拍伺服计算）不打印日志；
@@ -271,6 +317,19 @@ ctest --test-dir build --output-on-failure
   - `S7ServoNotStartedFallsBackAfterTimeout`：S7 中控制律持续降级（不提供姿态 →
     姿态超龄）时伺服永不启动——冻结位置续发在 `timeout_ms` 内持续滚动（无速度/
     刹车意图），超时收口回退 S5，日志 reason="S7伺服未启动超时"。
+- 捕网执行器（Task 10，`FakeCommandSender` 假件记录 SendCommand 调用并可脚本化
+  入队失败；用例经 `TestForceState` 驱动拦截序列——与生产路径共用 TransitionTo/
+  决策线程挂点）：
+  - `InterceptExecutingFiresNetActuator`：进入 S10 → 恰好一条 187 命令
+    （p3=归一化触发行程 −0.8、其余参数位 NaN、p7=0），停留多拍不重复；
+    离开（S10→S11）→ 复位行程（+0.8）且只发一次；再次进入 → 新一次触发；
+  - `NetActuatorFiringRetriesWhenEnqueueFails`：前两次入队失败 → 下拍重试直至
+    成功（成功入队后不再补发，重试内容一致）；
+  - `LeavingInterceptSequenceSendsResetStroke`：S9 不触发；S9→返航离开 →
+    发复位行程（不依赖是否触发过）；
+  - `NoCommandSenderNeverFires`：未注入命令接口 → 即使进入拦截态也零调用。
+  - 负对照（一次性注入 3 处破坏：未用参数位填 0、入队失败也置位、离开不发复位）
+    → 恰好对应 3 个用例失败，恢复后全绿。
 
 ## 排查/修改要点
 
@@ -318,4 +377,20 @@ ctest --test-dir build --output-on-failure
   进入判据是否失效（撤销回 S5 的分支，属预期收口而非冻结失效）。
 - 整机实测停在 S5、从不进 S6：**T12 前属预期**——`DroneApplication`尚未调用
   `SetEstimationInputs`（三输入未绑定，状态机保持影子）。勿据此判缺陷。
+- 捕网不触发（日志无「捕网执行器触发命令已入队」）：先确认是否**根本不满足触发条件**——
+  ① 整机当前**无拦截序列入口**（S9/S10 进入判据属后续任务，`DroneApplication`
+  不驱动），状态达不到 S10，属本任务交付边界而非缺陷；② `SetCommandSender`
+  未注入（只有 `enable_control=true` 装配分支注入）→ 本功能物理缺席（零调用）；
+  ③ 已注入但仍无日志 → 查「入队失败（下拍重试）」节流 WARN（PX4 未连接/命令
+  队列满）；三者都在调试时用状态转移日志确认当前是否真的到过 S10。
+- 捕网触发了但机构不动/行程反向：① 核对 PX4 侧该输出通道是否已分配「Peripheral
+  via Actuator Set N」（N 与 `actuator.net_channel` 对应）且已解锁/预解锁
+  （PX4 默认在 disarmed 下不驱动执行器，台架用 pre-arm 状态测）；② 核对
+  `actuator.output_pwm_min_us/max_us` 与该通道 `PWM_AUX_MINn/MAXn` 是否一致
+  （不一致则归一化值对应的实际 PWM 偏移）；③ 行程方向以 **G4 台架**为准
+  （本层只保证换算与命令语义正确，方向属装机接线问题）；日志中的
+  `pwm/norm` 摘要即换算式输入输出，可反算核对。
+- 离开拦截序列后机构停在触发位：查「复位行程命令入队失败（下拍重试）」节流
+  WARN——入队失败会持续重试直至成功；若从未出现复位日志，确认离开时是否
+  真的到过 S9/S10（`net_sequence_active_` 只在对序列内状态驻留过之后才置位）。
 - 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和`enable_control`安全配置。

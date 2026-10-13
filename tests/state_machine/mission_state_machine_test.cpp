@@ -1,13 +1,16 @@
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "communication/px4_link.h"
 #include "config/config.h"
 #include "perception/target_estimator.h"
 #include "state_machine/mission_state_machine.h"
@@ -1040,7 +1043,7 @@ TEST(MissionStateMachineTest, S7ServoNotStartedFallsBackAfterTimeout) {
 
 // S7 热备份核对（设计 §2.4）：每秒核对卡尔曼状态年龄（TargetState 接收时刻 +
 // 自报有效期窗），断粮 → 节流 WARN「热备份断粮」+ MissionStatus 告警位 bit2，
-// 不退出 S7（停 S7 由三条收口路径决定，热备份告警只提示"假备份"风险）。
+// 不退出 S7（停 S7 由四条收口路径决定，热备份告警只提示"假备份"风险）。
 TEST(MissionStateMachineTest, HotBackupKalmanStarvedWarnsInS7) {
     drone::test::LogCapture logs;  // 必须在组件启动前挂载（见 log_capture.h 约束）
     VisualServoFixture f;
@@ -1135,6 +1138,238 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
                       first_velocity->header.receive_time_ms);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 阶段四 Task 10：捕网执行器命令（MAV_CMD_DO_SET_ACTUATOR=187）
+//
+// 状态机在进入 S10 INTERCEPT_EXECUTING 时经命令窄接口 IPx4CommandSender 发
+// 一次触发命令（net_fired_ 防重复；入队失败不置位、下拍重试）；离开拦截序列
+// （S9/S10 → 回退/返航/POST_INTERCEPT）时发复位行程并清除触发标志。
+// 通道号/行程来自 actuator 配置节；PWM 微秒按 PX4 输出映射区间换算为
+// MAV_CMD_DO_SET_ACTUATOR 的归一化参数（-1..1），未用参数位 NaN（规范语义
+// 为"忽略"，0 会误动其他执行器组）；p7=执行器组序号（PX4 仅处理 0）。
+// 未注入命令接口（enable_control=false 装配语义）→ 零调用（物理缺席）。
+//
+// 拦截序列（S9/S10/S11）当前尚无生产入口——入口判据（授权策略/射程门限）
+// 属后续任务，本任务不发明；用例经 TestForceState 测试入口驱动状态迁移，
+// 与生产路径共用同一 TransitionTo/决策线程挂点，触发/复位语义等同生产。
+// ---------------------------------------------------------------------------
+
+/// 触发行程 1100µs、复位行程 1900µs、输出映射区间 1000..2000µs 的归一化期望值：
+/// norm = 2·(pwm − 1000)/1000 − 1。
+constexpr float kNetFireNormalized = -0.8F;
+constexpr float kNetIdleNormalized = 0.8F;
+
+/// 命令窄接口假件：记录 SendCommand 调用并可脚本化前 N 次入队失败。
+class FakeCommandSender final : public communication::IPx4CommandSender {
+public:
+    bool SendCommand(uint16_t mavlink_command, float param1, float param2,
+                     float param3, float param4, float param5, float param6,
+                     float param7) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++call_count_;
+        last_command_ = mavlink_command;
+        last_params_ = {param1, param2, param3, param4, param5, param6, param7};
+        if (fail_calls_remaining_ > 0) {
+            --fail_calls_remaining_;
+            return false;
+        }
+        return true;
+    }
+
+    uint64_t AckMatchCount() const override { return 0; }
+    uint64_t AckTimeoutCount() const override { return 0; }
+
+    uint64_t CallCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return call_count_;
+    }
+
+    uint16_t LastCommand() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_command_;
+    }
+
+    std::array<float, 7> LastParams() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_params_;
+    }
+
+    /// 令接下来 count 次 SendCommand 返回失败（模拟 PX4 未连接/队列满）。
+    void FailNextCalls(uint64_t count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fail_calls_remaining_ = count;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    uint64_t call_count_ = 0;
+    uint16_t last_command_ = 0;
+    std::array<float, 7> last_params_{};
+    uint64_t fail_calls_remaining_ = 0;
+};
+
+/// 捕网执行器用例配置：通道 3（验证通道号落在 p3 而非 p1），行程取默认值。
+state_machine::MissionStateMachineConfig MakeNetActuatorTestConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.actuator.net_channel = 3;
+    return config;
+}
+
+/// 等待发送器累计调用数达到期望值（决策周期 100ms，留足余量）。
+bool WaitForCallCount(const FakeCommandSender& sender, uint64_t expected,
+                      std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (sender.CallCount() >= expected) {
+            return true;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return sender.CallCount() >= expected;
+}
+
+/// 等待状态机完成启动首个迁移（BOOT→SELF_CHECK）再强制状态；否则工作线程
+/// 的初始迁移会把测试入口强制写入的状态覆盖掉。
+bool WaitForSelfCheck(const state_machine::MissionStateMachine& machine,
+                      std::chrono::milliseconds timeout = 1000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (machine.CurrentState() == common::MissionState::kSelfCheck) {
+            return true;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    return machine.CurrentState() == common::MissionState::kSelfCheck;
+}
+
+// 进入 S10 → 恰好一次触发命令；停留不重复；离开拦截序列 → 复位行程；
+// 再次进入 → 新一次触发（触发标志随离开清除，防重复仅限同一拦截段）。
+TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
+    EXPECT_EQ(sender.LastCommand(), 187U);  // MAV_CMD_DO_SET_ACTUATOR
+    {
+        const auto params = sender.LastParams();
+        EXPECT_FLOAT_EQ(params[2], kNetFireNormalized);  // p3=通道 3（触发行程）
+        EXPECT_TRUE(std::isnan(params[0]));              // p1 未用 → NaN（忽略）
+        EXPECT_TRUE(std::isnan(params[1]));
+        EXPECT_TRUE(std::isnan(params[3]));
+        EXPECT_TRUE(std::isnan(params[4]));
+        EXPECT_TRUE(std::isnan(params[5]));
+        EXPECT_FLOAT_EQ(params[6], 0.0F);                // p7=执行器组序号 0
+    }
+
+    // 停留 S10 多拍：不重复触发
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(sender.CallCount(), 1U);
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kInterceptExecuting);
+
+    // 离开拦截序列（S10→S11 POST_INTERCEPT）：发复位行程（待命行程），只发一次
+    machine.TestForceState(common::MissionState::kPostIntercept);
+    ASSERT_TRUE(WaitForCallCount(sender, 2)) << "离开拦截序列应发复位行程";
+    EXPECT_EQ(sender.LastCommand(), 187U);
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(sender.CallCount(), 2U);
+
+    // 再次进入 S10：新一次拦截触发（net_fired_ 已随离开清除）
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 3));
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetFireNormalized);
+
+    machine.Stop();
+}
+
+// 入队失败不置位、下拍重试：PX4 未连接/命令队列满（SendCommand 返回 false）
+// 时触发命令不得丢失，也不得因"已尝试"而停产。
+TEST(MissionStateMachineTest, NetActuatorFiringRetriesWhenEnqueueFails) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    sender.FailNextCalls(2);  // 前两次入队失败
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 3)) << "入队失败应下拍重试直至成功";
+    {
+        const auto params = sender.LastParams();
+        EXPECT_FLOAT_EQ(params[2], kNetFireNormalized);  // 重试用同一条命令
+        EXPECT_FLOAT_EQ(params[6], 0.0F);
+    }
+    // 成功入队后不再补发
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(sender.CallCount(), 3U);
+
+    machine.Stop();
+}
+
+// 离开拦截序列发复位行程不依赖是否触发过：S9 进入后未进 S10（如授权拒绝
+// 返航/条件失效回退）即离开，同样发复位行程让机构归位到待命行程。
+TEST(MissionStateMachineTest, LeavingInterceptSequenceSendsResetStroke) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // S9（INTERCEPT_READY）不触发：只在 S10 执行态触发
+    machine.TestForceState(common::MissionState::kInterceptReady);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(sender.CallCount(), 0U);
+
+    // 返航离开拦截序列 → 复位行程
+    machine.TestForceState(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(sender.CallCount(), 1U);
+
+    machine.Stop();
+}
+
+// 未注入命令接口（enable_control=false 装配语义）：即使进入拦截态也零调用，
+// 本功能物理缺席（命令发不出去）。
+TEST(MissionStateMachineTest, NoCommandSenderNeverFires) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;  // 不注入
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    machine.TestForceState(common::MissionState::kInterceptReady);
+    std::this_thread::sleep_for(150ms);
+    machine.TestForceState(common::MissionState::kInterceptExecuting);
+    std::this_thread::sleep_for(300ms);
+    machine.TestForceState(common::MissionState::kPostIntercept);
+    std::this_thread::sleep_for(300ms);
+
+    EXPECT_EQ(sender.CallCount(), 0U);
+
+    machine.Stop();
 }
 
 }  // namespace

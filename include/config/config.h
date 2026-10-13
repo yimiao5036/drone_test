@@ -76,6 +76,26 @@ struct FlightControllerConfig {
     void Validate() const;
 };
 
+/// 捕网执行器配置（actuator 配置节，阶段四控制接入 Task 10）。
+/// 捕网机构为 PWM 行程型执行器，经 PX4 执行器通道驱动
+/// （MAV_CMD_DO_SET_ACTUATOR=187，命令窄接口 IPx4CommandSender）。
+/// 通道号/接线/行程参数待装机确认后冻结（G4 拆桨台架验证行程与方向）。
+/// 行程以 PWM 微秒填写；下发前按 PX4 输出映射区间归一到 [-1, 1]
+/// （PX4 把该区间线性映射回 PWM 输出，换算式见 NormalizePwm）。
+struct ActuatorConfig {
+    int32_t net_channel = 1;       ///< 捕网执行器通道号（1..6，对应 PX4 Actuator Set N）
+    double net_fire_pwm = 1100.0;  ///< 触发行程 PWM（微秒；待装机确认后冻结）
+    double net_idle_pwm = 1900.0;  ///< 复位/待命行程 PWM（微秒；待装机确认后冻结）
+    /// PX4 输出映射区间（微秒）：必须与该通道 PWM_AUX_MINn/PWM_AUX_MAXn
+    /// （PX4 默认 1000/2000）一致——归一化换算依赖该区间，装机后按实配核对。
+    double output_pwm_min_us = 1000.0;
+    double output_pwm_max_us = 2000.0;
+    /// PWM 行程（微秒）→ MAV_CMD_DO_SET_ACTUATOR 归一化参数（-1..1）：
+    /// norm = 2·(pwm − min)/(max − min) − 1。调用前须通过 Validate。
+    double NormalizePwm(double pwm_us) const;
+    void Validate() const;
+};
+
 /// 交接缝配置（handover 配置节，阶段四控制接入）。
 /// 视觉锁定↔卡尔曼跟踪的状态切换迟滞：exit_lost_frames 必须大于 lock_frames。
 struct HandoverConfig {
@@ -114,6 +134,7 @@ struct AppConfig {
     perception::StereoRectifyMatrices stereo_rectify;
     FlightControllerConfig controller;  ///< FlightController 参数（阶段四控制接入）
     HandoverConfig handover;            ///< 交接缝迟滞参数（阶段四控制接入）
+    ActuatorConfig actuator;            ///< 捕网执行器（阶段四控制接入 Task 10）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

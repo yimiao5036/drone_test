@@ -499,6 +499,35 @@ void HandoverConfig::Validate() const {
         throw std::invalid_argument("handover.distance_lost_ms 必须为正");
 }
 
+double ActuatorConfig::NormalizePwm(double pwm_us) const {
+    return 2.0 * (pwm_us - output_pwm_min_us) /
+               (output_pwm_max_us - output_pwm_min_us) -
+           1.0;
+}
+
+void ActuatorConfig::Validate() const {
+    if (net_channel < 1 || net_channel > 6)
+        throw std::invalid_argument("actuator.net_channel 必须在 1~6（执行器组）之间");
+    if (!std::isfinite(net_fire_pwm) || net_fire_pwm <= 0.0)
+        throw std::invalid_argument("actuator.net_fire_pwm 必须为有限正数");
+    if (!std::isfinite(net_idle_pwm) || net_idle_pwm <= 0.0)
+        throw std::invalid_argument("actuator.net_idle_pwm 必须为有限正数");
+    if (!std::isfinite(output_pwm_min_us) || !std::isfinite(output_pwm_max_us) ||
+        output_pwm_max_us <= output_pwm_min_us)
+        throw std::invalid_argument(
+            "actuator 输出映射区间必须满足 output_pwm_max_us > output_pwm_min_us（有限值）");
+    if (net_fire_pwm < output_pwm_min_us || net_fire_pwm > output_pwm_max_us)
+        throw std::invalid_argument(
+            "actuator.net_fire_pwm 必须落在输出映射区间 [output_pwm_min_us, "
+            "output_pwm_max_us] 内（否则无法表达为 -1..1 执行器值）");
+    if (net_idle_pwm < output_pwm_min_us || net_idle_pwm > output_pwm_max_us)
+        throw std::invalid_argument(
+            "actuator.net_idle_pwm 必须落在输出映射区间 [output_pwm_min_us, "
+            "output_pwm_max_us] 内（否则无法表达为 -1..1 执行器值）");
+    if (net_fire_pwm == net_idle_pwm)
+        throw std::invalid_argument("actuator.net_fire_pwm 与 net_idle_pwm 不得相同");
+}
+
 // 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
 // config/config.json，最后回退当前目录的 ./config/config.json；都失败则抛错。
 // 这样从部署目录直接运行也能稳定加载配置，不依赖启动时的工作目录。
@@ -724,6 +753,23 @@ AppConfig LoadAppConfig(const std::string& path,
     config.handover.distance_lost_ms = ReadOptionalPositiveMilliseconds(
         handover, "distance_lost_ms", config.handover.distance_lost_ms);
     config.handover.Validate();
+
+    // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：通道号/行程/输出
+    // 映射区间全部可选，缺席回退默认值；通道号仅 1..6（MAV_CMD_DO_SET_ACTUATOR
+    // 的执行器组），行程必须落在输出映射区间内（否则无法表达为 -1..1）。
+    // 装机确认（G4 台架）前不要显式改配：参数错误直接转化为行程/方向错误。
+    const json actuator = root.value("actuator", json::object());
+    config.actuator.net_channel =
+        actuator.value("net_channel", config.actuator.net_channel);
+    config.actuator.net_fire_pwm = ReadOptionalPositiveDouble(
+        actuator, "net_fire_pwm", config.actuator.net_fire_pwm);
+    config.actuator.net_idle_pwm = ReadOptionalPositiveDouble(
+        actuator, "net_idle_pwm", config.actuator.net_idle_pwm);
+    config.actuator.output_pwm_min_us = ReadOptionalPositiveDouble(
+        actuator, "output_pwm_min_us", config.actuator.output_pwm_min_us);
+    config.actuator.output_pwm_max_us = ReadOptionalPositiveDouble(
+        actuator, "output_pwm_max_us", config.actuator.output_pwm_max_us);
+    config.actuator.Validate();
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。
     const json visual_monitor = root.value("visual_monitor", json::object());

@@ -1,6 +1,6 @@
 /**
  * @file mission_state_machine.cpp
- * @brief MissionStateMachine 安全影子实现（阶段四：位置意图 + 交接判据 + S7 视觉伺服）
+ * @brief MissionStateMachine 安全影子实现（阶段四：位置意图 + 交接判据 + S7 视觉伺服 + 捕网执行器）
  *
  * 默认只接入地面站目标与飞行状态，发布 MissionStatus 供链路验证；
  * 经 SetEstimationInputs 绑定估计/视觉/测距输入后，GPS_APPROACH 状态发布
@@ -12,12 +12,17 @@
  * 发布 control_source=1 的速度意图（输出已是局部 NED），短期 LOST 按控制律
  * 判丢语义映射为零速刹车意图。是否真正输出由 FlightController 授权链与
  * enable_control 装配门禁决定。
+ * 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）经
+ * MAV_CMD_DO_SET_ACTUATOR 发一次捕网触发命令、离开拦截序列发复位行程
+ * （actuator 配置节，PWM 微秒 → -1..1 归一化）。
  */
 #include "state_machine/mission_state_machine.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -78,6 +83,11 @@ constexpr uint32_t kReasonVisualBrake = 102;
 constexpr uint8_t kFrameLocalNed = 3;
 /// 热备份年龄核对周期（设计 §2.4「S7 期间每秒核对」）。
 constexpr uint64_t kHotBackupCheckIntervalMs = 1000;
+/// MAV_CMD_DO_SET_ACTUATOR（MAVLink common.xml #187，Task 10 捕网触发）。
+/// 参数语义（third_party/c_library_v2 common.xml）：p1..p6 = Actuator Set 1..6
+/// 归一化值（-1..1，NaN=忽略不改动）；p7 = 执行器组序号（PX4 仅处理 0）。
+/// 状态机不引 MAVLink 头，命令号以常量携带（与 px4_link 的数值约定一致）。
+constexpr uint16_t kMavCmdDoSetActuator = 187;
 /// 弧度 → 度换算（视线角与视场半角比较统一用度，与配置项单位一致）。
 constexpr double kRadToDeg = 57.29577951308232;
 /// 交接状态迁移原因（状态转移日志用，中文可读）。
@@ -261,6 +271,7 @@ public:
           distance_stale_ms_(config.distance_stale.count()),
           tracking_config_(config.tracking),
           tracking_law_(config.tracking),
+          actuator_config_(config.actuator),
           azimuth_converter_(config.tracking.camera.fx_px,
                              config.tracking.camera.cx_px),
           elevation_converter_(config.tracking.camera.fy_px,
@@ -351,6 +362,11 @@ public:
         // 重启后同一锁定帧不得沿用上一轮的计数。
         ResetHandoverHysteresis();
         last_counted_locked_frame_.reset();
+        // 捕网执行器标志复位：重启后不得沿用上一轮触发记忆（机构实际位置
+        // 由 G4 台架/人工确认，见实现文档"排查/修改要点"）。
+        net_fired_ = false;
+        net_sequence_active_ = false;
+        net_reset_pending_ = false;
         PublishStatus(now_ms);
 
         running_.store(true, std::memory_order_release);
@@ -430,6 +446,12 @@ public:
 
     common::Topic<common::ControlIntent>& IntentOutput() { return intent_output_; }
     common::Topic<common::MissionStatus>& StatusOutput() { return status_output_; }
+
+    /// 测试入口：强制提交一次状态迁移（与生产路径共用 TransitionTo 统一挂点；
+    /// 进入/离开动作由决策线程在 Evaluate 末段评估）。生产装配不得调用。
+    void TestForceState(common::MissionState state) {
+        TransitionTo(state, "测试入口强制迁移");
+    }
 
     common::MissionState CurrentState() const {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -524,6 +546,9 @@ private:
         EvaluateVisualServoIntent(now_ms);
         // 热备份核对（Task 9）：S7 期间每秒核对卡尔曼状态年龄，断粮置告警位。
         warnings |= EvaluateHotBackup(now_ms);
+        // 捕网执行器联动（Task 10）：本拍迁移后立即评估（进入 S10 当拍触发、
+        // 离开拦截序列当拍复位；入队失败下拍重试，误差 <1 决策周期）。
+        EvaluateNetActuator();
 
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
@@ -1087,6 +1112,78 @@ private:
         return hot_backup_starved_ ? kWarningHotBackupStarved : 0;
     }
 
+    // ---- 捕网执行器（Task 10：MAV_CMD_DO_SET_ACTUATOR 命令窄接口） ----
+
+    /// 捕网执行器联动（决策线程每拍，本函数内状态仅决策线程访问）。语义：
+    /// - 进入 S10（INTERCEPT_EXECUTING）：发一次触发命令；net_fired_ 防重复，
+    ///   入队失败不置位、下拍重试（PX4 未连接/命令队列满时自动补发）；
+    /// - 离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）：发复位行程并清
+    ///   触发标志（机构归位到待命行程）；复位入队失败同样下拍重试，且复位
+    ///   未入队前不发触发（先复位、后触发的次序不变）。
+    /// S9（INTERCEPT_READY）只标记序列开始，不触发（设计：S10 才调用执行机构）。
+    /// 未注入命令接口（enable_control=false 装配语义）→ 零调用（物理缺席）；
+    /// 触发/复位同为控制输出，仅经 enable_control 门禁注入的窄接口可达。
+    /// 注：本函数按"状态驻留"而非"迁移边沿"判定——生产路径同一决策拍内完成
+    /// 迁移与评估（Evaluate 末段调用），S10 驻留远长于决策周期，不存在漏触发；
+    /// 无生产入口的拦截序列经 TestForceState 驱动时同样满足该时序约束。
+    void EvaluateNetActuator() {
+        if (command_sender_ == nullptr) {
+            return;  // 物理缺席：不产生任何命令
+        }
+        const auto state = CurrentState();
+        const bool in_intercept_sequence =
+            state == common::MissionState::kInterceptReady ||
+            state == common::MissionState::kInterceptExecuting;
+        if (net_sequence_active_ && !in_intercept_sequence) {
+            // 离开拦截序列（回退/返航/POST_INTERCEPT）
+            net_sequence_active_ = false;
+            net_fired_ = false;
+            net_reset_pending_ = true;
+        }
+        if (in_intercept_sequence) {
+            net_sequence_active_ = true;
+        }
+        if (net_reset_pending_) {
+            // 复位行程：入队成功才清除，失败下拍重试
+            net_reset_pending_ =
+                !SendNetActuatorStroke(actuator_config_.net_idle_pwm, "复位行程");
+            return;
+        }
+        if (state == common::MissionState::kInterceptExecuting && !net_fired_) {
+            net_fired_ =
+                SendNetActuatorStroke(actuator_config_.net_fire_pwm, "触发");
+        }
+    }
+
+    /// 发送一条捕网行程命令（触发/复位共用）。参数按 MAV_CMD_DO_SET_ACTUATOR
+    /// 规范组装：仅本通道对应的参数位填归一化值（PWM 微秒按输出映射区间换算
+    /// 为 -1..1），其余参数位 NaN（规范语义"忽略"，不得填 0——0 为中位行程，
+    /// 会误动其他执行器组）；p7=执行器组序号固定 0（PX4 仅处理组 0）。
+    /// @return 是否成功入队（false=链路未就绪/队列满，由调用方决定重试）。
+    bool SendNetActuatorStroke(double pwm_us, const char* action) {
+        const int32_t channel = actuator_config_.net_channel;
+        const double normalized = actuator_config_.NormalizePwm(pwm_us);
+        std::array<float, 7> params;
+        params.fill(std::numeric_limits<float>::quiet_NaN());
+        params[static_cast<std::size_t>(channel - 1)] =
+            static_cast<float>(normalized);
+        params[6] = 0.0F;
+        const bool queued = command_sender_->SendCommand(
+            kMavCmdDoSetActuator, params[0], params[1], params[2], params[3],
+            params[4], params[5], params[6]);
+        if (queued) {
+            SPDLOG_WARN("捕网执行器{}命令已入队: channel={} pwm={:.0f}us norm={:.2f}",
+                        action, channel, pwm_us, normalized);
+            return true;
+        }
+        const uint64_t count = ++net_command_fail_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("捕网执行器{}命令入队失败（下拍重试）: channel={} count={}",
+                        action, channel, count);
+        }
+        return false;
+    }
+
     /// GPS位置引导的最低导航前置条件。后续接入控制前还需增加模式/高度/电池等门禁。
     // GPS 引导最低门禁：连接、3D fix、全局位置和 Home 必须同时有效。
     bool HasNavigationForGps() const {
@@ -1175,7 +1272,8 @@ private:
     common::Topic<common::TargetState>* estimated_topic_ = nullptr;
     common::Topic<common::VisualTargetStatus>* visual_status_topic_ = nullptr;
     common::Topic<common::StereoTargetDistance>* distance_topic_ = nullptr;
-    /// PX4 命令窄接口（仅 enable_control=true 装配期注入；当前仅持有备用）。
+    /// PX4 命令窄接口（仅 enable_control=true 装配期注入）。当前消费点：
+    /// 捕网执行器触发/复位（Task 10，EvaluateNetActuator）；未注入时零调用。
     communication::IPx4CommandSender* command_sender_ = nullptr;
     /// 估计器诊断接口（只读；交接创新门限的数据来源，Start 前注入）。
     const perception::ITargetEstimator* estimator_diagnostics_ = nullptr;
@@ -1250,6 +1348,16 @@ private:
     uint64_t hot_backup_check_ms_ = 0;
     bool hot_backup_starved_ = false;
     uint64_t hot_backup_starved_count_ = 0;
+    /// 捕网执行器配置（构造注入，actuator 配置节同源；装机确认前为默认值）。
+    const config::ActuatorConfig actuator_config_;
+    /// 捕网触发命令已入队（防重复触发；离开拦截序列清除，再进入可重新触发）。
+    bool net_fired_ = false;
+    /// 处于拦截序列（S9/S10）——离开时的复位行程检测基准（决策线程独占）。
+    bool net_sequence_active_ = false;
+    /// 复位行程待入队（离开拦截序列置位；入队成功清除，失败下拍重试）。
+    bool net_reset_pending_ = false;
+    /// 捕网命令入队失败累计计数（节流日志用）。
+    uint64_t net_command_fail_count_ = 0;
     uint64_t intent_sequence_ = 0;
     uint64_t last_intent_publish_ms_ = 0;
     uint64_t intent_stale_count_ = 0;
@@ -1296,6 +1404,9 @@ uint64_t MissionStateMachine::TransitionCount() const {
     return impl_->TransitionCount();
 }
 uint64_t MissionStateMachine::ErrorCount() const { return impl_->ErrorCount(); }
+void MissionStateMachine::TestForceState(common::MissionState state) {
+    impl_->TestForceState(state);
+}
 
 MissionStateMachineStub::MissionStateMachineStub() {
     SPDLOG_INFO("任务状态机部件骨架创建");

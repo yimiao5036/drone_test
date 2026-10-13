@@ -122,7 +122,9 @@ void DroneApplication::BuildComponents() {
     // 意图有效期与 FlightController 的 controller.intent_timeout 同源注入，
     // 保证状态机 valid_until_ms 与控制器超龄门禁一致；交接判据阈值来自
     // handover 节；visual_tracking 整节注入（相机内参供视线角换算，
-    // 控制律参数/阈值供 S7 视觉伺服），不在此写死。
+    // 控制律参数/阈值供 S7 视觉伺服），不在此写死；actuator 节（捕网执行器，
+    // Task 10）同源注入——是否发得出命令由命令接口注入门禁决定
+    // （enable_control=true 才注入，见下方 BindTopics 门禁分支）。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
         state_machine::MissionStateMachineConfig state_machine_config;
         state_machine_config.intent_valid_for = config_.controller.intent_timeout;
@@ -132,6 +134,7 @@ void DroneApplication::BuildComponents() {
             config_.visual_tracking.control.visual_stale_ms);
         state_machine_config.distance_stale = std::chrono::milliseconds(
             config_.visual_tracking.control.distance_stale_ms);
+        state_machine_config.actuator = config_.actuator;
         mission_state_machine_ =
             std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
     }

@@ -65,6 +65,10 @@ struct MissionStateMachineConfig {
     std::chrono::milliseconds visual_stale{200};
     /// 双目测距超龄阈值（visual_tracking.control.distance_stale_ms 同源）。
     std::chrono::milliseconds distance_stale{500};
+    /// 捕网执行器配置（actuator 配置节同源注入，阶段四 Task 10）：进入拦截
+    /// 执行态（S10）触发、离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）
+    /// 复位；未注入命令接口（enable_control=false 装配语义）时本功能物理缺席。
+    config::ActuatorConfig actuator;
 };
 
 /// 任务状态机部件抽象接口。
@@ -125,6 +129,9 @@ public:
 /// 协作者（TrackingControlLaw）发布 control_source=1 的速度航向意图
 /// （输出已是局部 NED）。是否真正输出控制由 FlightController 授权链与
 /// enable_control 装配门禁决定。
+/// 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）发一次
+/// 捕网触发命令（MAV_CMD_DO_SET_ACTUATOR），离开拦截序列（S9/S10）发复位
+/// 行程；拦截序列入口判据（授权策略/射程门限）属后续任务，本类不发明。
 class MissionStateMachine final : public IMissionStateMachine {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});
@@ -154,6 +161,13 @@ public:
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
     uint64_t ErrorCount() const override;
+
+    // ---- 测试入口（生产装配不得调用） ----
+    /// 强制提交一次状态迁移（单测入口；Start 后调用，由决策线程消费进入/
+    /// 离开动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
+    /// EvaluateNetActuator），用于验证当前尚无生产入口的状态——拦截序列
+    /// S9/S10/S11（入口判据=授权策略/射程门限，属后续任务，本任务不发明）。
+    void TestForceState(common::MissionState state);
 
 private:
     class Impl;

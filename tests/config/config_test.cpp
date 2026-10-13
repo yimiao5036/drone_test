@@ -762,6 +762,83 @@ TEST(ConfigTest, RejectsNonPositiveControllerLimits) {
     std::filesystem::remove(path);
 }
 
+// 捕网执行器（actuator 节，阶段四 Task 10）：生产配置尚未声明该节，缺席时
+// 回退默认值（通道 1、触发 1100µs、复位 1900µs、PX4 输出映射区间 1000..2000µs）。
+TEST(ConfigTest, ActuatorSectionDefaultsParse) {
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_EQ(config.actuator.net_channel, 1);
+    EXPECT_DOUBLE_EQ(config.actuator.net_fire_pwm, 1100.0);
+    EXPECT_DOUBLE_EQ(config.actuator.net_idle_pwm, 1900.0);
+    EXPECT_DOUBLE_EQ(config.actuator.output_pwm_min_us, 1000.0);
+    EXPECT_DOUBLE_EQ(config.actuator.output_pwm_max_us, 2000.0);
+}
+
+TEST(ConfigTest, ParsesActuatorSection) {
+    json value = ReadSourceConfig();
+    value["actuator"]["net_channel"] = 5;
+    value["actuator"]["net_fire_pwm"] = 1200.0;
+    value["actuator"]["net_idle_pwm"] = 1800.0;
+    value["actuator"]["output_pwm_min_us"] = 1100.0;
+    value["actuator"]["output_pwm_max_us"] = 1900.0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_actuator.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.actuator.net_channel, 5);
+    EXPECT_DOUBLE_EQ(config.actuator.net_fire_pwm, 1200.0);
+    EXPECT_DOUBLE_EQ(config.actuator.net_idle_pwm, 1800.0);
+    EXPECT_DOUBLE_EQ(config.actuator.output_pwm_min_us, 1100.0);
+    EXPECT_DOUBLE_EQ(config.actuator.output_pwm_max_us, 1900.0);
+    std::filesystem::remove(path);
+}
+
+// 归一化换算：PX4 把执行器值 -1..1 线性映射到输出通道的 PWM 区间，
+// 下发前按同一区间反向换算（norm = 2·(pwm − min)/(max − min) − 1）。
+TEST(ConfigTest, ActuatorNormalizePwmMapsOutputRangeToMinusOneToOne) {
+    drone::config::ActuatorConfig actuator;  // 默认区间 1000..2000µs
+    EXPECT_DOUBLE_EQ(actuator.NormalizePwm(1000.0), -1.0);
+    EXPECT_DOUBLE_EQ(actuator.NormalizePwm(1500.0), 0.0);
+    EXPECT_DOUBLE_EQ(actuator.NormalizePwm(2000.0), 1.0);
+    EXPECT_DOUBLE_EQ(actuator.NormalizePwm(1100.0), -0.8);
+    EXPECT_DOUBLE_EQ(actuator.NormalizePwm(1900.0), 0.8);
+}
+
+TEST(ConfigTest, RejectsActuatorChannelOutOfRange) {
+    // MAV_CMD_DO_SET_ACTUATOR 仅 6 个执行器组：net_channel=7 → 拒绝
+    json value = ReadSourceConfig();
+    value["actuator"]["net_channel"] = 7;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_channel_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsActuatorStrokeOutsideOutputRange) {
+    // 行程必须落在输出映射区间内（否则归一化超出 -1..1，PX4 侧不可表达）
+    json value = ReadSourceConfig();
+    value["actuator"]["net_fire_pwm"] = 900.0;  // 区间 1000..2000 之外
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_stroke_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsActuatorOutputRangeInverted) {
+    // min >= max → 拒绝（换算分母非法）
+    json value = ReadSourceConfig();
+    value["actuator"]["output_pwm_min_us"] = 2000.0;
+    value["actuator"]["output_pwm_max_us"] = 2000.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_range_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_video"] = false;
