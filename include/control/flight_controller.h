@@ -9,10 +9,10 @@
  * - 本接口为纯虚抽象，控制算法（位置/速度/姿态设定值生成）在实现期接入。
  * - FlightControllerStub 为骨架占位实现：生命周期可运行，业务方法
  *   记录"未实现"节流日志并返回默认值。
- * - FlightController 为正式实现（阶段四控制接入 Task 3 骨架）：固定周期
- *   线程消费意图 + 门禁链（有限性/超龄/控制权）；控制权默认 IDLE 不发布
- *   设定值，限幅（Task 4）与控制权三态（Task 5）后续接入。实现文档见
- *   同目录 flight_controller.md。
+ * - FlightController 为正式实现（阶段四控制接入 Task 3~5）：固定周期
+ *   线程消费意图 + 门禁链（有限性/超龄/控制权）；限幅流水线（Task 4）
+ *   与控制权三态/Offboard 周期核验/Home 相对围栏（Task 5）已接入。
+ *   实现文档见同目录 flight_controller.md。
  *
  * 数据流：
  *   common::Topic<ControlIntent>（状态机）──► IFlightController ──► common::Topic<Px4Setpoint> ──► IPx4Link
@@ -92,21 +92,27 @@ private:
     common::Topic<common::Px4Setpoint> setpoint_output_;
 };
 
-/// 控制权状态（spec §4；Task 5 接入授权/降级转移，本任务恒为 kIdle，
-/// 单测可经 TestForceAuthority 强制）。
+/// 控制权状态（spec §4；Task 5 已接入授权/降级转移）：
+/// IDLE 无控制权停发；ACTIVE Offboard 控制中；COAST 意图短期超龄刹车保持。
+/// 迁移全部由授权链周期核验驱动，迁移时打 WARN 级状态变化日志。
 enum class ControlAuthority : uint8_t { kIdle, kActive, kCoast };
 
 /// 正式飞行控制器（spec §3 执行层）：固定周期消费 ControlIntent，
 /// 门禁链（有限性/超龄/控制权）+ 限幅流水线 + 无扰衔接后发布 Px4Setpoint。
 ///
 /// 当前边界：
-/// - 固定周期线程、意图队列排干（只留最新）、入口门禁（有限性/超龄拒绝计数）、
-///   IDLE 门禁（默认 kIdle，不发布任何 setpoint）已实现；
+/// - 固定周期线程、意图队列排干（只留最新）、入口门禁（有限性/超龄拒绝计数）；
 /// - 限幅流水线（Task 4）：速度幅值等比钳制 → SlewRateLimiter 加速度限幅；
 ///   来源/类型变化时斜坡起点=上一周期实际输出（无扰衔接）；时钟回退冻结输出；
 ///   未定义 control_source 按安全语义降级（仅刹停类意图生效）；
-/// - 控制权三态与 PX4 门禁（Task 5）后续接入；
-///   SetPx4LinkSource 接口已预留，本任务仅存指针不做判定。
+/// - 控制权三态与 PX4 门禁（Task 5）：每拍经 SetPx4LinkSource 注入的快照核验
+///   connected+armed+Offboard(6/0)，并要求最新意图携带状态机显式请求位
+///   （reason_code bit31，见 common::kControlIntentReasonRequestControl）；
+///   未注入快照源时授权链恒不通过（影子运行，保持 IDLE 停发）；
+///   ACTIVE/COAST 中门禁失效立即发布 valid=false 停发并转 IDLE；
+///   意图超龄转 COAST 刹车保持，coast_timeout 超时转 IDLE 停发；
+/// - Home 相对围栏（Task 5）：位置式意图水平模长超 max_radius_m 等比钳制、
+///   相对高度超 max_altitude_m 钳制；home_valid=false 时位置式意图拒绝。
 class FlightController final : public IFlightController {
 public:
     /// 配置在 LoadAppConfig 加载期已 Validate() 校验（fail-fast）；
@@ -131,19 +137,24 @@ public:
     // ---- 诊断（测试与门禁用） ----
     /// 当前控制权状态。
     ControlAuthority Authority() const;
-    /// 门禁拒绝（非有限/超龄）意图累计计数。
+    /// 门禁拒绝意图累计计数（入口门禁：非有限/到达即超龄，按到达计；
+    /// 授权后路径：持有期超龄——Task 5 起超龄即转 COAST，拒绝计数在转入
+    /// 那一拍 +1，不再逐拍增长；位置式意图无 Home 基准拒绝，按到达计）。
     uint64_t RejectedIntentCount() const;
-    /// 速度幅值限幅触发累计计数（每次钳制生效 +1，供 G2 验收核对）。
+    /// 限幅触发累计计数（速度幅值等比钳制 + 位置式围栏钳制，
+    /// 每次钳制生效 +1，供 G2 验收核对）。
     uint64_t ClampedCount() const;
-    /// 注入 PX4 链路只读快照源（Task 5 门禁启用；本任务仅保存指针）。
+    /// 注入 PX4 链路只读快照源（控制权门禁与 Home 围栏数据源）；
+    /// 未注入时授权链恒不通过，控制器保持 IDLE 影子运行。
     void SetPx4LinkSource(const communication::IPx4Link* link);
 
     // ---- 测试入口（生产装配不得调用） ----
-    /// 强制设置控制权状态（Task 5 授权链接入前的单测入口；
-    /// 用公开诊断方法替代 #ifdef 测试钩，不破坏封装）。
+    /// 强制设置控制权状态（单测入口）。注意授权链每拍重估：门禁不通时
+    /// 下一拍即撤到 IDLE——维持 ACTIVE 须同时满足快照门禁与意图请求位。
     void TestForceAuthority(ControlAuthority authority);
     /// 以指定时间戳同步执行一拍控制周期（须在未 Start 状态调用，
-    /// 与周期线程互斥；用于时钟回退等时序用例的确定性驱动）。
+    /// 与周期线程互斥；Start 后调用被忽略并节流 WARN——运行时守卫，
+    /// 防止与周期线程并发访问 Tick 内部无锁状态）。
     void TestTick(uint64_t now_ms);
 
 private:

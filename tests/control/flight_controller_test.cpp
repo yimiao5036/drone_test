@@ -15,6 +15,7 @@
 
 #include "common/topic.h"
 #include "common/types.h"
+#include "communication/px4_link.h"
 #include "config/config.h"
 
 namespace drone::control {
@@ -59,6 +60,55 @@ common::ControlIntent MakeVelocityIntent(double vx, double vy, double vz) {
     intent.target_z = static_cast<float>(vz);
     intent.valid_until_ms = MonotonicMs() + 5000;
     return intent;
+}
+
+/// 只读门禁 Mock：LatestState() 返回注入快照，其余接口为占位空实现
+/// （替代 PTY，直接驱动控制权门禁的判定输入）。
+class MockPx4Link final : public drone::communication::IPx4Link {
+public:
+    bool Start() override { return true; }
+    void Stop() override {}
+    bool IsRunning() const override { return true; }
+    bool IsConnected() const override { return state_.connected; }
+    void SetInput(common::Topic<common::Px4Setpoint>& /*setpoint*/) override {}
+    common::Topic<common::FlightStateSnapshot>& StateOutput() override {
+        return state_output_;
+    }
+    common::FlightStateSnapshot LatestState() const override { return state_; }
+    bool SendCommand(uint16_t /*command*/, float /*p1*/, float /*p2*/, float /*p3*/,
+                     float /*p4*/, float /*p5*/, float /*p6*/, float /*p7*/) override {
+        return false;
+    }
+    uint64_t SetpointSendCount() const override { return 0; }
+    uint64_t ReceiveCount() const override { return 0; }
+    uint64_t AckMatchCount() const override { return 0; }
+    uint64_t AckTimeoutCount() const override { return 0; }
+    uint64_t ErrorCount() const override { return 0; }
+
+    void SetState(const common::FlightStateSnapshot& state) { state_ = state; }
+
+private:
+    common::FlightStateSnapshot state_{};
+    common::Topic<common::FlightStateSnapshot> state_output_;
+};
+
+/// PX4 1.17.0 模式编码（与 px4_link 解码侧一致）：Offboard = flight_mode 6 /
+/// sub_mode 0；Position = 3/0；AUTO.LOITER = 4/3。
+common::FlightStateSnapshot MakeOffboardSnapshot() {
+    common::FlightStateSnapshot state;
+    state.connected = true;
+    state.armed = true;
+    state.flight_mode = 6;
+    state.flight_sub_mode = 0;
+    state.home_valid = true;
+    state.local_position_valid = true;
+    return state;
+}
+
+common::FlightStateSnapshot MakePositionModeSnapshot() {
+    auto state = MakeOffboardSnapshot();
+    state.flight_mode = 3;
+    return state;
 }
 
 }  // namespace
@@ -128,14 +178,21 @@ class FlightControllerPipelineTest : public ::testing::Test {
 protected:
     FlightControllerPipelineTest() : controller_(MakePipelineConfig()) {
         controller_.SetInput(intents_);
+        // 控制权门禁（Task 5）：注入 Offboard+armed 快照使授权链可通，
+        // 意图经 PublishIntent 携带状态机显式请求位。
+        px4_link_.SetState(MakeOffboardSnapshot());
+        controller_.SetPx4LinkSource(&px4_link_);
         output_ = controller_.SetpointOutput().Subscribe(kOutputCapacity);
-        // 测试友好授权入口：控制权三态归 Task 5，此处强制 ACTIVE 放行发布路径
+        // 测试友好授权入口：强制 ACTIVE 放行发布路径（授权链每拍重估，
+        // 快照需保持 Offboard+armed 才能维持 ACTIVE）
         controller_.TestForceAuthority(ControlAuthority::kActive);
     }
 
-    /// 发布一条意图（receive_time 为 0，由控制器在排干时补当前合成时刻）。
+    /// 发布一条意图（receive_time 为 0，由控制器在排干时补当前合成时刻；
+    /// 携带控制权显式请求位，模拟状态机正式请求）。
     void PublishIntent(common::ControlIntent intent) {
         intent.valid_until_ms = now_ms_ + kValidForMs;
+        intent.reason_code |= common::kControlIntentReasonRequestControl;
         (void)intents_.Publish(
             std::make_shared<const common::ControlIntent>(intent));
     }
@@ -164,6 +221,7 @@ protected:
 
     uint64_t now_ms_ = kStartMs;
     common::Topic<common::ControlIntent> intents_;
+    MockPx4Link px4_link_;
     FlightController controller_;
     common::Topic<common::Px4Setpoint>::Subscription output_;
 };
@@ -344,6 +402,224 @@ TEST_F(FlightControllerPipelineTest, PositionToVelocitySlewStartsFromZero) {
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->type, common::SetpointType::kVelocity);
     EXPECT_NEAR(first->x, kMaxStep, 1e-5);  // 从 0 起步推进一拍，而非位置值 10
+}
+
+// =============================================================================
+// 控制权三态用例（Task 5）：MockPx4Link 注入快照 + 合成时间轴 TestTick 驱动。
+// 配置：period=20ms、intent_timeout=100ms、coast_timeout=400ms
+// （MakeControllerConfig），围栏 max_radius_m=100、max_altitude_m=30（默认）。
+// =============================================================================
+
+class FlightControllerAuthorityTest : public ::testing::Test {
+protected:
+    FlightControllerAuthorityTest() : controller_(MakeControllerConfig()) {
+        controller_.SetInput(intents_);
+        controller_.SetPx4LinkSource(&px4_link_);
+        output_ = controller_.SetpointOutput().Subscribe(kOutputCapacity);
+    }
+
+    /// 发布一条带控制权显式请求位的意图（receive_time 由控制器补合成时刻）。
+    void PublishIntent(common::ControlIntent intent) {
+        intent.valid_until_ms = now_ms_ + kValidForMs;
+        intent.reason_code |= common::kControlIntentReasonRequestControl;
+        (void)intents_.Publish(
+            std::make_shared<const common::ControlIntent>(intent));
+    }
+
+    /// 以当前合成时刻同步执行一拍，随后推进一个控制周期。
+    void Tick() {
+        controller_.TestTick(now_ms_);
+        now_ms_ += kPeriodMs;
+    }
+
+    /// 取下一条输出（无输出返回 nullopt）。
+    std::optional<common::Px4Setpoint> TakeOutput() {
+        auto message = output_.TryTake();
+        if (!message.has_value()) {
+            return std::nullopt;
+        }
+        return **message;
+    }
+
+    /// 排干输出队列。
+    void DrainOutputs() {
+        while (TakeOutput().has_value()) {
+        }
+    }
+
+    static constexpr uint64_t kStartMs = 1000000;
+    static constexpr uint64_t kPeriodMs = 20;
+    static constexpr uint64_t kValidForMs = 60000;
+    static constexpr std::size_t kOutputCapacity = 512;
+
+    uint64_t now_ms_ = kStartMs;
+    common::Topic<common::ControlIntent> intents_;
+    MockPx4Link px4_link_;
+    FlightController controller_;
+    common::Topic<common::Px4Setpoint>::Subscription output_;
+};
+
+TEST_F(FlightControllerAuthorityTest, ActiveOnlyInOffboardAndArmed) {
+    // 未 armed：授权链不通，保持 IDLE 不输出（即使意图带显式请求位）
+    auto disarmed = MakeOffboardSnapshot();
+    disarmed.armed = false;
+    px4_link_.SetState(disarmed);
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    EXPECT_FALSE(TakeOutput().has_value());
+
+    // 快照 flight_mode=6/0(Offboard) 且 armed → 授权链通，转 ACTIVE 产生输出
+    px4_link_.SetState(MakeOffboardSnapshot());
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_TRUE(out->valid);
+    EXPECT_EQ(out->type, common::SetpointType::kVelocity);
+
+    // 模式变为 4/3(AUTO/LOITER) → 下一周期立即停发（valid=false）并转 IDLE
+    auto loiter = MakeOffboardSnapshot();
+    loiter.flight_mode = 4;
+    loiter.flight_sub_mode = 3;
+    px4_link_.SetState(loiter);
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    auto stop = TakeOutput();
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->valid);
+}
+
+TEST_F(FlightControllerAuthorityTest, ModeFlapDoesNotChatterAuthority) {
+    // Review Focus #4：Offboard↔Position 快速抖动 → 每次离开都转 IDLE，
+    // 回 ACTIVE 必须重新满足授权链（含状态机显式请求标志）
+    px4_link_.SetState(MakeOffboardSnapshot());
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
+
+    // 抖到 Position：立即停发转 IDLE（显式请求标志同时清零）
+    px4_link_.SetState(MakePositionModeSnapshot());
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    DrainOutputs();
+
+    // 抖回 Offboard 但无新意图：授权链缺"状态机显式请求"，保持 IDLE 不恢复
+    px4_link_.SetState(MakeOffboardSnapshot());
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    EXPECT_FALSE(TakeOutput().has_value());
+
+    // 状态机重新显式请求（新意图带请求位）→ 授权链重新全通回 ACTIVE
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_TRUE(out->valid);
+
+    // 再次抖离 → 再次立即停发转 IDLE（离开即撤，无迟滞不抖动）
+    px4_link_.SetState(MakePositionModeSnapshot());
+    Tick();
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    auto stop = TakeOutput();
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->valid);
+}
+
+TEST_F(FlightControllerAuthorityTest, CoastBrakesThenIdles) {
+    // ACTIVE 中意图超龄：先发零速刹车（COAST），coast_timeout 后停发转 IDLE
+    px4_link_.SetState(MakeOffboardSnapshot());
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();  // t0：转 ACTIVE，正常输出
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    DrainOutputs();
+
+    // 停止发意图：receive_time=t0，intent_timeout=100ms → 年龄 <=100ms 的
+    // 5 拍保持 ACTIVE，第 6 拍（t0+120，年龄 120ms）持有期超龄转 COAST
+    for (int i = 0; i < 5; ++i) {
+        Tick();
+        ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
+        DrainOutputs();
+    }
+    Tick();  // t0+120：超龄 → COAST + 零速刹车
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kCoast);
+    auto brake = TakeOutput();
+    ASSERT_TRUE(brake.has_value());
+    EXPECT_TRUE(brake->valid);
+    EXPECT_EQ(brake->type, common::SetpointType::kVelocity);
+    EXPECT_FLOAT_EQ(brake->x, 0.f);
+    EXPECT_FLOAT_EQ(brake->y, 0.f);
+    EXPECT_FLOAT_EQ(brake->z, 0.f);
+
+    // COAST 期间意图恢复 → 回 ACTIVE（恢复路径）
+    PublishIntent(MakeVelocityIntent(1.0, 0.0, 0.0));
+    Tick();  // t0+140：新意图 receive=t0+140
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    auto resumed = TakeOutput();
+    ASSERT_TRUE(resumed.has_value());
+    EXPECT_TRUE(resumed->valid);
+
+    // 再次断粮：年龄 20..100ms 的 5 拍保持 ACTIVE，第 6 拍（t0+260）转 COAST
+    for (int i = 0; i < 6; ++i) {
+        Tick();
+    }
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kCoast);
+    DrainOutputs();
+
+    // coast_timeout=400ms：20 拍内（now-coast_since=20..400ms）保持 COAST
+    // 刹车输出，第 21 拍（420ms > 400ms）超时转 IDLE 并停发
+    for (int i = 0; i < 20; ++i) {
+        Tick();
+        ASSERT_EQ(controller_.Authority(), ControlAuthority::kCoast)
+            << "COAST 第 " << i << " 拍";
+        auto coast_out = TakeOutput();
+        ASSERT_TRUE(coast_out.has_value());
+        EXPECT_TRUE(coast_out->valid);
+        EXPECT_FLOAT_EQ(coast_out->x, 0.f);
+    }
+    Tick();  // 超时 → IDLE + valid=false 停发
+    EXPECT_EQ(controller_.Authority(), ControlAuthority::kIdle);
+    auto stop = TakeOutput();
+    ASSERT_TRUE(stop.has_value());
+    EXPECT_FALSE(stop->valid);
+}
+
+TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
+    // 位置意图超过 max_radius_m / max_altitude_m（相对 Home）→ 钳制到边界 +
+    // 节流 WARN（ClampedCount 计数）
+    px4_link_.SetState(MakeOffboardSnapshot());
+    common::ControlIntent intent;
+    intent.type = common::ControlIntentType::kPositionGuide;
+    intent.control_source = 0;
+    intent.target_x = 150.f;  // 水平半径 150m > max_radius_m=100
+    intent.target_y = 0.f;
+    intent.target_z = -50.f;  // 相对高度 50m（NED z 向下为负）> max_altitude_m=30
+    PublishIntent(intent);
+    Tick();
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_TRUE(out->valid);
+    EXPECT_EQ(out->type, common::SetpointType::kPosition);
+    EXPECT_NEAR(out->x, 100.f, 1e-3);  // 水平等比钳制到半径边界
+    EXPECT_NEAR(out->y, 0.f, 1e-6);
+    EXPECT_FLOAT_EQ(out->z, -30.f);  // 高度钳制到上限
+    EXPECT_EQ(controller_.ClampedCount(), 2u);  // 水平+高度各钳制一次
+
+    // home_valid=false：无基准不可围栏 → 位置式意图拒绝输出并计数
+    auto no_home = MakeOffboardSnapshot();
+    no_home.home_valid = false;
+    px4_link_.SetState(no_home);
+    common::ControlIntent no_home_intent;
+    no_home_intent.type = common::ControlIntentType::kPositionGuide;
+    no_home_intent.control_source = 0;
+    no_home_intent.target_x = 10.f;
+    no_home_intent.target_z = -5.f;
+    PublishIntent(no_home_intent);
+    Tick();
+    EXPECT_FALSE(TakeOutput().has_value());
+    EXPECT_GT(controller_.RejectedIntentCount(), 0u);
 }
 
 }  // namespace drone::control

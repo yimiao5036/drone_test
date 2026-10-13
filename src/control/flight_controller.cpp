@@ -5,11 +5,13 @@
  * 骨架期仅保证生命周期可运行与装配验证；业务逻辑（控制意图 → PX4
  * 设定值转换、控制算法）在实现期接入。
  *
- * FlightController（阶段四控制接入 Task 3/4）：固定周期线程消费
+ * FlightController（阶段四控制接入 Task 3~5）：固定周期线程消费
  * ControlIntent，门禁链（有限性/超龄/控制权）通过后经限幅流水线
  * （速度幅值钳制 → slew 加速度限幅）与无扰衔接发布 Px4Setpoint。
- * 控制权默认 kIdle（不发布任何 setpoint，单测可经 TestForceAuthority
- * 强制）；控制权三态与 PX4 门禁（Task 5）后续接入。
+ * 控制权三态（Task 5）：每拍核验 PX4 快照（connected+armed+Offboard 6/0）
+ * 与状态机显式请求位（reason_code bit31）；失效立即停发（valid=false）
+ * 转 IDLE；意图超龄转 COAST 刹车保持，coast_timeout 超时转 IDLE 停发；
+ * 位置式意图经 Home 相对围栏钳制。
  */
 #include "control/flight_controller.h"
 
@@ -36,6 +38,24 @@ using Clock = std::chrono::steady_clock;
 /// 已定义控制来源上限（common::ControlIntent::control_source 注释：
 /// 0=位置 1=视觉 2=安全 3=遥控器 4=PX4 保护）；超出按安全语义降级。
 constexpr uint8_t kMaxDefinedControlSource = 4;
+
+/// PX4 1.17.0 模式编码：Offboard = custom main mode 6 / sub mode 0。
+/// 与 px4_link.cpp 心跳解码侧编码一致，控制权门禁每拍核验。
+constexpr uint8_t kPx4MainModeOffboard = 6;
+constexpr uint8_t kPx4SubModeOffboard = 0;
+
+/// 控制权状态名（日志用）。
+const char* AuthorityName(ControlAuthority authority) {
+    switch (authority) {
+        case ControlAuthority::kIdle:
+            return "IDLE";
+        case ControlAuthority::kActive:
+            return "ACTIVE";
+        case ControlAuthority::kCoast:
+            return "COAST";
+    }
+    return "UNKNOWN";
+}
 
 /// 返回当前进程单调时钟毫秒，用于超龄判定与输出时间戳。
 uint64_t MonotonicMs() {
@@ -171,18 +191,30 @@ public:
     }
 
     void SetPx4LinkSource(const communication::IPx4Link* link) {
-        // Task 5 接入 PX4 快照门禁；本任务仅保存只读源指针。
+        // 控制权门禁与 Home 围栏的只读快照源；只允许装配期（Start 前）注入。
         px4_link_ = link;
     }
 
-    /// 测试入口：强制控制权状态（Task 5 授权链接入前的单测放行手段）。
+    /// 测试入口：强制控制权状态。授权链每拍重估，门禁不通时下一拍即撤到
+    /// IDLE——单测维持 ACTIVE 须配合 MockPx4Link 快照与意图请求位。
     void TestForceAuthority(ControlAuthority authority) {
         authority_.store(authority, std::memory_order_release);
     }
 
-    /// 测试入口：以指定时间戳同步执行一拍。须在未 Start 状态调用，
-    /// 否则与周期线程并发访问 Tick 内部状态（无锁）。
-    void TestTick(uint64_t now_ms) { Tick(now_ms); }
+    /// 测试入口：以指定时间戳同步执行一拍。须在未 Start 状态调用；
+    /// 运行时守卫：Start 后调用与周期线程并发访问 Tick 内部无锁状态，
+    /// 直接忽略并节流 WARN。
+    void TestTick(uint64_t now_ms) {
+        if (running_.load(std::memory_order_acquire)) {
+            const uint64_t count = ++error_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("飞行控制器 TestTick 在运行状态被调用，已忽略（须先 Stop） 累计={}",
+                            count);
+            }
+            return;
+        }
+        Tick(now_ms);
+    }
 
 private:
     /// 意图订阅队列容量：周期消费，4 条足够吸收突发，溢出丢旧保新。
@@ -204,25 +236,116 @@ private:
     }
 
     void Tick(uint64_t now_ms) {
-        // 1) 排干意图队列，只留最新（入口门禁在排干时执行，拒绝即计数）
+        // 1) 排干意图队列，只留最新（入口门禁在排干时执行，拒绝即计数；
+        //    最新通过门禁的意图同步刷新"状态机显式请求"锁存）
         DrainIntents(now_ms);
-        // 2) 门禁链：IDLE 直接返回（本任务默认 IDLE，Task 5 才接入授权）
-        if (authority_.load(std::memory_order_acquire) == ControlAuthority::kIdle) {
-            return;
+        // 2) 控制权门禁：PX4 快照（connected+armed+Offboard 6/0）+
+        //    状态机显式请求位，每拍核验（非一次性）
+        const bool gate = AuthorityGateOpen();
+        switch (authority_.load(std::memory_order_acquire)) {
+            case ControlAuthority::kIdle:
+                if (!gate) {
+                    return;  // IDLE 停发：不发布任何 setpoint
+                }
+                TransitionTo(ControlAuthority::kActive, "授权链全通");
+                break;
+            case ControlAuthority::kActive:
+                if (!gate) {
+                    // 控制权失效（心跳断/非 Offboard/未 armed/请求撤销）：
+                    // 立即停发并转 IDLE——离开即撤，不做迟滞（模式抖动不抖动）
+                    TransitionTo(ControlAuthority::kIdle, "授权链断开");
+                    PublishInvalidStop(now_ms);
+                    return;
+                }
+                break;
+            case ControlAuthority::kCoast:
+                if (!gate) {
+                    TransitionTo(ControlAuthority::kIdle, "COAST 中授权链断开");
+                    PublishInvalidStop(now_ms);
+                    return;
+                }
+                if (static_cast<int64_t>(now_ms) -
+                        static_cast<int64_t>(coast_since_ms_) >
+                    config_.coast_timeout.count()) {
+                    TransitionTo(ControlAuthority::kIdle, "COAST 超时");
+                    PublishInvalidStop(now_ms);
+                    return;
+                }
+                if (!FreshIntentAvailable(now_ms)) {
+                    PublishBrake(now_ms);  // COAST 刹车保持
+                    return;
+                }
+                TransitionTo(ControlAuthority::kActive, "意图恢复");
+                break;
         }
+        // ACTIVE 路径：意图缺失或持有期超龄 → 转 COAST 刹车保持
         if (!latest_intent_.has_value()) {
+            EnterCoast(now_ms, "无意图");
+            PublishBrake(now_ms);
             return;
         }
-        // ① 持有期再超龄（意图在消费间隔内过期）→ 拒绝并刹停降级
-        if (now_ms >= latest_intent_->valid_until_ms ||
-            StalenessChecker::IsStale(
-                static_cast<int64_t>(latest_intent_->header.receive_time_ms),
-                static_cast<int64_t>(now_ms), config_.intent_timeout.count())) {
+        // ① 持有期再超龄（意图在消费间隔内过期）→ 拒绝并转 COAST 刹车。
+        //    转入 COAST 后走 kCoast 分支不再经过此处，拒绝计数仅本拍 +1。
+        if (IntentStale(*latest_intent_, now_ms)) {
             RejectIntent("意图持有期超龄");
-            PublishBrake(now_ms);  // EnterCoastOrIdle 由 Task 5 完整实现
+            EnterCoast(now_ms, "意图持有期超龄");
+            PublishBrake(now_ms);
             return;
         }
         PublishFromIntent(*latest_intent_, now_ms);
+    }
+
+    /// 授权链（本控制器侧部分）：快照源已注入 + PX4 connected+armed+
+    /// Offboard(6/0) + 状态机显式请求位。门禁判据只取 LatestState() 快照的
+    /// connected 字段（断开方向有滞后窗口：链路侧先清原子标志后发布快照，
+    /// 不得与 IsConnected() 交叉推理）。
+    bool AuthorityGateOpen() const {
+        if (px4_link_ == nullptr) {
+            return false;  // 未注入（影子模式/未装配）：永不授权
+        }
+        const auto state = px4_link_->LatestState();
+        const bool offboard = state.connected && state.armed &&
+                              state.flight_mode == kPx4MainModeOffboard &&
+                              state.flight_sub_mode == kPx4SubModeOffboard;
+        return offboard && state_machine_requested_;
+    }
+
+    /// 控制权迁移：WARN 级状态变化日志；进入 IDLE 时清零"状态机显式请求"
+    /// 锁存——回 ACTIVE 必须重新满足授权链（含显式请求），防模式抖动抖动。
+    void TransitionTo(ControlAuthority next, const char* reason) {
+        const ControlAuthority previous =
+            authority_.load(std::memory_order_acquire);
+        if (previous == next) {
+            return;
+        }
+        authority_.store(next, std::memory_order_release);
+        if (next == ControlAuthority::kIdle) {
+            state_machine_requested_ = false;
+        }
+        SPDLOG_WARN("飞行控制器控制权迁移: {} -> {} ({})", AuthorityName(previous),
+                    AuthorityName(next), reason);
+    }
+
+    /// 意图超龄判定（valid_until 截止 + receive_time 年龄超 intent_timeout）。
+    bool IntentStale(const common::ControlIntent& intent, uint64_t now_ms) const {
+        return now_ms >= intent.valid_until_ms ||
+               StalenessChecker::IsStale(
+                   static_cast<int64_t>(intent.header.receive_time_ms),
+                   static_cast<int64_t>(now_ms), config_.intent_timeout.count());
+    }
+
+    /// COAST 恢复判据：存在未超龄意图。
+    bool FreshIntentAvailable(uint64_t now_ms) const {
+        return latest_intent_.has_value() && !IntentStale(*latest_intent_, now_ms);
+    }
+
+    /// 进入 COAST：记录刹车保持起点（重复进入不刷新计时——超时以首次进入为准）。
+    void EnterCoast(uint64_t now_ms, const char* reason) {
+        if (authority_.load(std::memory_order_acquire) !=
+            ControlAuthority::kCoast) {
+            coast_since_ms_ = now_ms;
+        }
+        TransitionTo(ControlAuthority::kCoast, reason);
     }
 
     /// 排干意图队列，只保留通过入口门禁的最新一条。
@@ -247,6 +370,12 @@ private:
                 RejectIntent("意图超龄");
                 continue;
             }
+            // 状态机显式请求锁存：跟随最新通过入口门禁的意图（约定：
+            // reason_code bit31，见 common::kControlIntentReasonRequestControl；
+            // 被拒绝的意图不刷新锁存）。
+            state_machine_requested_ =
+                (intent.reason_code & common::kControlIntentReasonRequestControl) !=
+                0;
             latest_intent_ = std::move(intent);
         }
     }
@@ -273,6 +402,20 @@ private:
         vy_slew_.Reset(0.0);
         vz_slew_.Reset(0.0);
         last_output_ = setpoint;  // 零速也是速度式输出，供无扰衔接起点判定
+        Publish(std::move(setpoint), now_ms);
+    }
+
+    /// 发布停发设定值：valid=false（Px4Link 收到后立即停止向 PX4 发送）。
+    /// 用于控制权失效/COAST 超时转 IDLE。衔接状态归零：恢复授权后
+    /// 速度式输出从 0 斜坡起步（last_output_ 非速度式 → 从 0 起步路径）。
+    void PublishInvalidStop(uint64_t now_ms) {
+        common::Px4Setpoint setpoint;
+        setpoint.type = common::SetpointType::kNone;
+        setpoint.valid = false;
+        vx_slew_.Reset(0.0);
+        vy_slew_.Reset(0.0);
+        vz_slew_.Reset(0.0);
+        last_output_ = setpoint;
         Publish(std::move(setpoint), now_ms);
     }
 
@@ -370,12 +513,49 @@ private:
     /// 位置式（S5 远端引导）：透传位置目标，不做 slew——位置阶跃由 PX4
     /// 内部轨迹规划平滑，本控制器只管速度式连续性；速度上限写入由 Px4Link
     /// 侧 type mask 语义保证。完整联调测试归 Task 7。
+    ///
+    /// Home 相对围栏（Task 5）：意图目标为局部 NED，项目坐标约定局部 NED
+    /// 原点即 PX4 Home（docs/数据接口文档.md、include/perception/目标估计器.md），
+    /// 故目标值本身即 Home 相对量；`home_valid=false` 时该约定无基准，
+    /// 位置式意图拒绝输出（无基准不可围栏）。
     void PublishPosition(const common::ControlIntent& intent, uint64_t now_ms) {
+        const auto state = px4_link_ != nullptr
+                               ? px4_link_->LatestState()
+                               : common::FlightStateSnapshot{};
+        if (!state.home_valid) {
+            RejectIntent("位置意图无 Home 基准(home_valid=false)，拒绝");
+            return;
+        }
+        double target_x = intent.target_x;
+        double target_y = intent.target_y;
+        double target_z = intent.target_z;
+        // 水平半径：模长超 max_radius_m 等比钳制（方向不变）
+        const double radius = std::hypot(target_x, target_y);
+        if (radius > config_.max_radius_m) {
+            const double scale = config_.max_radius_m / radius;
+            target_x *= scale;
+            target_y *= scale;
+            const uint64_t count = ++clamped_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("飞行控制器围栏水平半径钳制: r={:.2f} > max={:.2f} 累计={}",
+                            radius, config_.max_radius_m, count);
+            }
+        }
+        // 高度：NED z 向下为正，相对 Home 高度 = -z；超 max_altitude_m 钳制
+        const double altitude_m = -target_z;
+        if (altitude_m > config_.max_altitude_m) {
+            target_z = -config_.max_altitude_m;
+            const uint64_t count = ++clamped_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("飞行控制器围栏高度钳制: h={:.2f} > max={:.2f} 累计={}",
+                            altitude_m, config_.max_altitude_m, count);
+            }
+        }
         common::Px4Setpoint setpoint;
         setpoint.type = common::SetpointType::kPosition;
-        setpoint.x = intent.target_x;
-        setpoint.y = intent.target_y;
-        setpoint.z = intent.target_z;
+        setpoint.x = static_cast<float>(target_x);
+        setpoint.y = static_cast<float>(target_y);
+        setpoint.z = static_cast<float>(target_z);
         // 航向通道透传（互斥约束同速度式，沿用 Px4Link 现有校验）。
         setpoint.use_yaw = intent.yaw_deg != 0.f;
         setpoint.yaw_deg = intent.yaw_deg;
@@ -404,11 +584,13 @@ private:
     std::thread worker_;
     common::Topic<common::ControlIntent>::Subscription intent_subscription_;
     common::Topic<common::Px4Setpoint> setpoint_output_;
-    const communication::IPx4Link* px4_link_ = nullptr;  // 只读门禁源（Task 5 启用）
+    const communication::IPx4Link* px4_link_ = nullptr;  // 只读门禁源（快照/围栏）
 
     // 以下仅周期线程访问（诊断接口经原子量暴露）。
     std::optional<common::ControlIntent> latest_intent_;
     uint64_t setpoint_sequence_ = 0;
+    bool state_machine_requested_ = false;  ///< 状态机显式请求锁存（reason_code bit31）
+    uint64_t coast_since_ms_ = 0;           ///< 本次 COAST 进入时刻
     std::atomic<ControlAuthority> authority_{ControlAuthority::kIdle};
     std::atomic<uint64_t> setpoint_count_{0};
     std::atomic<uint64_t> rejected_intent_count_{0};
@@ -428,7 +610,7 @@ private:
 
 FlightController::FlightController(const config::FlightControllerConfig& config)
     : impl_(std::make_unique<Impl>(config)) {
-    SPDLOG_INFO("飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线已接入）");
+    SPDLOG_INFO("飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线+控制权三态+Home 围栏已接入）");
 }
 
 FlightController::~FlightController() = default;

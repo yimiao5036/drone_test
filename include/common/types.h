@@ -313,6 +313,13 @@ struct ControlIntent {
     uint64_t valid_until_ms = 0; ///< 有效期截止（单调时钟）
 };
 
+/// ControlIntent::reason_code 高位标志（低位段沿用 docs/数据接口文档.md §3.5
+/// 枚举：0~7 规划语义、100+ 视觉跟踪影子段，高位为标志位段）：
+/// bit31 = 状态机显式请求控制权。FlightController 授权链必要条件之一——
+/// 仅当最新通过入口门禁的意图携带该位时才允许 IDLE→ACTIVE；进入 IDLE 时
+/// 锁存清零，回 ACTIVE 必须重新显式请求。状态机侧置位在阶段四 Task 7 落地。
+constexpr uint32_t kControlIntentReasonRequestControl = 1u << 31;
+
 /// PX4 设定值类型（飞行控制器 → PX4 通信）。
 enum class SetpointType : uint8_t {
     kNone = 0,
