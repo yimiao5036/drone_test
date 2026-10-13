@@ -278,7 +278,8 @@ void DroneApplication::BindTopics() {
         px4_link_ != nullptr) {
         flight_controller_->SetPx4LinkSource(px4_link_.get());
         px4_link_->SetInput(flight_controller_->SetpointOutput());
-        // 阶段四 Task 7：注入 PX4 命令窄接口（仅 enable_control=true 分支可达）。
+        // 阶段四装配门禁分支（Task 6）内注入 PX4 命令窄接口（调用启用归 Task 7，
+        // 仅 enable_control=true 可达；false 时命令接口物理缺席）。
         mission_state_machine_->SetCommandSender(px4_link_.get());
         control_assembly_.px4_snapshot_source_injected = true;
         control_assembly_.setpoint_bound_to_px4 = true;

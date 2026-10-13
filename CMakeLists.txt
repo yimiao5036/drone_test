@@ -276,11 +276,15 @@ endif()
 add_executable(px4_link_smoke
     tools/px4_link_smoke.cpp
     src/common/logger.cpp)
-# drone_control_core：stage4 装配真实 FlightController（G2 执行层门禁）。
+# drone_control_core：stage4 装配真实 FlightController（G2 执行层门禁）；
+# drone_state_machine/drone_perception：stage4-mission 装配状态机全链（G3，
+# 含真实 TargetEstimator 视觉融合与 GeodeticToLocalNed 装配回验）。
 target_link_libraries(px4_link_smoke PRIVATE
     drone_common
     drone_communication
     drone_control_core
+    drone_state_machine
+    drone_perception
     spdlog::spdlog)
 if(MSVC)
     target_compile_options(px4_link_smoke PRIVATE /W4 /permissive-)

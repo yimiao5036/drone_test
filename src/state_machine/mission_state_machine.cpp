@@ -66,6 +66,11 @@ constexpr uint32_t kWarningGroundTargetStale = 1U << 1U;
 /// 告警位：VISUAL_TRACKING 期间热备份断粮（卡尔曼状态年龄超窗，设计 §2.4）。
 /// 只提示"假备份"风险，不触发退出（退出由 S7 四条收口路径决定）。
 constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
+/// 告警位：VISUAL_TRACKING 期间本拍未发出视觉伺服意图——伺服尚未启动
+/// （S6/S7 过渡期仍在续发冻结位置意图）或控制律降级停发（姿态/视觉超龄，
+/// 控制器意图超时门禁接手刹停）。标注"S7 报告状态与实际控制输出背离"，
+/// 供地面站/Web 观测（T9 评审裁决 I2，阶段四 Task 12 落地）。
+constexpr uint32_t kWarningServoSuspended = 1U << 3U;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。
 constexpr uint64_t kIntentRepublishIntervalMs = 100;
@@ -544,6 +549,14 @@ private:
         EvaluateHandover(now_ms);
         EvaluatePositionIntent(now_ms);
         EvaluateVisualServoIntent(now_ms);
+        // 告警位：S7 报告状态与实际控制输出背离标注（T9 评审裁决 I2）——本拍
+        // 未发出视觉伺服意图：伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图）
+        // 或控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停）。
+        // 状态按当拍（迁移后）判定；离开 S7 即不置位。
+        if (CurrentState() == common::MissionState::kVisualTracking &&
+            !servo_intent_active_) {
+            warnings |= kWarningServoSuspended;
+        }
         // 热备份核对（Task 9）：S7 期间每秒核对卡尔曼状态年龄，断粮置告警位。
         warnings |= EvaluateHotBackup(now_ms);
         // 捕网执行器联动（Task 10）：本拍迁移后立即评估（进入 S10 当拍触发、
@@ -687,6 +700,7 @@ private:
         }
         frozen_handover_target_.reset();
         s7_servo_started_ = false;
+        servo_intent_active_ = false;  // 交接段收口：背离告警位随段结束清空
         hot_backup_check_ms_ = 0;
         hot_backup_starved_ = false;
         tracking_law_.Reset();
@@ -974,6 +988,7 @@ private:
         if (CurrentState() != common::MissionState::kVisualTracking) {
             return;  // 离开 S7 的收口在 EvaluateHandover 内完成（含标志复位）
         }
+        servo_intent_active_ = false;  // 本拍默认停发（S7 背离告警位按拍评估）
         const auto intent = BuildVisualIntent(now_ms);
         if (!intent.has_value()) {
             // 控制律降级保持（output.valid=false，姿态/视觉超龄）：不发布意图。
@@ -997,6 +1012,7 @@ private:
                 static_cast<double>(intent->target_z),
                 static_cast<double>(intent->yaw_rate_dps));
         }
+        servo_intent_active_ = true;
         (void)intent_output_.Publish(
             std::make_shared<const common::ControlIntent>(*intent));
     }
@@ -1341,6 +1357,9 @@ private:
     std::optional<common::TargetState> frozen_handover_target_;
     /// S7 段内是否已发出首条视觉意图（冻结续发的收口条件）。
     bool s7_servo_started_ = false;
+    /// S7 本拍是否实际发出视觉伺服意图（背离告警位 kWarningServoSuspended
+    /// 的判定依据；EvaluateVisualServoIntent 每拍置位，离开 S7 不再更新）。
+    bool servo_intent_active_ = false;
     /// 视觉伺服降级停发计数（节流日志）与最近降级原因。
     uint64_t servo_degraded_count_ = 0;
     control::DegradedReason last_degraded_reason_ = control::DegradedReason::kNone;

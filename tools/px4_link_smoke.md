@@ -1,13 +1,17 @@
 # PX4 串口冒烟与 SITL 分级控制测试（px4_link_smoke）
 
 > 对应实现：`tools/px4_link_smoke.cpp`
-> 使用模块：`SerialPort`、`MavlinkHandler`、`Px4Link`、`FlightStateSnapshot`
+> 使用模块：`SerialPort`、`MavlinkHandler`、`Px4Link`、`FlightStateSnapshot`、
+> `FlightController`（stage4/stage4-mission）、`MissionStateMachine` +
+> `TargetEstimator`（stage4-mission）
 
 ## 1. 功能职责
 
 该程序用于分级验证真实 Pixhawk/PX4 串口基础链路和 PX4 SITL UDP 控制链路；stage 0~3D
 不依赖视频、YOLO、图传、状态机和控制器，stage4（`--sitl-stage4-controller`）装配真实
-`FlightController` 验证执行层全链（G2 门禁），仍不依赖视频/状态机。
+`FlightController` 验证执行层全链（G2 门禁），stage4-mission
+（`--sitl-stage4-mission`）装配状态机全链验证 S5→S6→S7→回退→停发（G3 门禁，
+另补验 G2 表列的围栏钳制与切模式停发），两者均不依赖视频/相机链路。
 
 测试内容：
 
@@ -19,10 +23,15 @@
 - 到期或 Ctrl+C 后停止并输出 PASS/WARN/FAIL 验收报告；
 - 根据基础链路结果返回进程退出码；
 - stage4：装配 `ControlIntent → FlightController → Px4Setpoint → Px4Link` 全链，
-  按脚本化意图序列验收零速漂移、速度阶跃、停发刹车与 Offboard 退出时延。
+  按脚本化意图序列验收零速漂移、速度阶跃、停发刹车与 Offboard 退出时延；
+- stage4-mission：装配 `MissionStateMachine → FlightController → Px4Link` 全链并注入
+  地面站目标/模拟视觉观测/模拟测距，验收迁移序列（S5→S6→S7→回退→停发）、交接处
+  输出连续与卡尔曼备份接管，另含围栏钳制与切非 Offboard 停发时延补验。
 
 安全边界：不带 SITL 阶段参数时，程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、
-降落或 Offboard 控制；主动内容仅为 HEARTBEAT 和遥测请求。所有控制阶段参数强制要求
+降落或 Offboard 控制；主动内容仅为 HEARTBEAT 和遥测请求。stage4-mission 会在 SITL 中
+真实起飞（相对 1m）、水平引导至注入目标点并在该点降落上锁（全程 armed 包线内），
+不得在真实飞机上运行。所有控制阶段参数强制要求
 `transport=udp` 且互斥，串口配置会在启动前拒绝。`--sitl-takeoff-land` 固定相对起飞 1m，
 不可通过命令行扩大，确认 landed 前禁止 DISARM。stage4 的意图/边界同样固定，不可经命令行放大。
 
@@ -56,6 +65,7 @@ echo "退出码=$?"
 | `--sitl-horizontal-motion` | 仅 UDP，起飞 1m 后北向 0.5m/s×2 秒、零速度制动、返回起点、降落上锁；最短 30 秒 |
 | `--sitl-offboard-loss` | 仅 UDP，起飞 1m 后停止 setpoint、验证 PX4 退出 Offboard，再 AUTO.LAND 回收；最短 25 秒 |
 | `--sitl-stage4-controller` | 仅 UDP，装配真实 `FlightController` + 意图脚本（G2 执行层门禁）；最短 60 秒 |
+| `--sitl-stage4-mission` | 仅 UDP，装配状态机全链 + 注入模拟数据（G3 全链门禁，含 G2 补验两项）；最短 60 秒 |
 | `--help` | 显示帮助 |
 
 ### 2.1 stage4 执行层门禁脚本（`--sitl-stage4-controller`）
@@ -90,6 +100,71 @@ echo "退出码=$?"
 非预期的 Offboard 退出（非步骤 5）计入失败。
 
 退出码沿用第 5 节；无 SITL 时在 10 秒连接超时后中止脚本并报告 FAIL（退出码 3），不得误报 PASS。
+
+### 2.2 stage4-mission 全链门禁脚本（`--sitl-stage4-mission`，G3）
+
+装配与数据流：工具装配 **正式 `MissionStateMachine`**（唯一意图生产者）+
+`FlightController` + `Px4Link`，并扮演**地面站/视觉监视器/双目测距**三路生产者注入
+模拟数据（生产装配同构，仅上游换为注入）：
+
+```text
+注入地面站目标(10Hz, WGS-84) → TargetEstimator(真实卡尔曼 + 视觉融合) → TargetState ─┐
+注入 VisualTargetStatus(20Hz, 像素) ──────────────────────────────────────────────┼→ MissionStateMachine
+注入 StereoTargetDistance(20Hz, 相机系坐标) ─────────────────────────────────────┘   （S5 位置引导 /
+Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/估计器输入）            交接判据/S7 伺服/
+                                                                                     热备份核对）
+  → ControlIntent → FlightController（门禁/限幅/无扰衔接）→ Px4Setpoint → Px4Link → PX4
+```
+
+配置与几何注入约定（2026-10-13 落地）：
+
+- 配置经 `LoadAppConfig` **同源加载**（`controller`/`handover`/`visual_tracking`/
+  `target_estimator`/`actuator` 整节；缺席节用默认值），`fxb_m_px` 从双目校正矩阵
+  同源读取；启动打印状态机阈值与注入几何；
+- **装配期注入几何自检**（开跑前 fail-fast）：相机系反变换
+  （`NedToCameraFrame` ↔ `perception::VisualCameraToLocalNed`）与地理反解
+  （`OffsetToGeodetic` ↔ `perception::GeodeticToLocalNed`）必须互逆（阈值
+  1e-6m / 0.01m），否则拒绝开跑——注入观测与卡尔曼航迹必须落在同一点，否则
+  创新门限会误拒交接；
+- 注入目标/观测的几何：探针目标北向 150m（> `controller.max_radius_m`）、主目标
+  北向 40m、目标高度 +1m（与悬停同高）；视觉像素与测距由"目标 NED − 自身 NED"
+  经真实姿态/安装外参反变换生成（俯仰/偏航变化下仍一致）；
+- 注入目标高度基准 = Home（`alt_reference=1`，WGS-84 反解与 `GeodeticToLocalNed`
+  同式，发布前正向回验 ≤0.05m）；目标有效期 2s、10Hz 刷新；
+- 注入测距**不模拟** `StereoRanger` 最小视差有效域（z_max≈12.7m）：G3 验状态机
+  判据与迁移序列，测距有效域/精度归实拍与独立测试工程；
+- 短期/持续 LOST 期间**测距保持有效**（模拟"测距仍跟踪、跟踪器判丢"），使 S7
+  退出由 LOST 迟滞路径唯一决定（测距失效路径由单测覆盖）。
+
+脚本序列与验收断言（报告逐条 PASS/FAIL，实测值一并打印）：
+
+| 段 | 内容 | 验收断言 |
+|---|---|---|
+| 0 | 引导零速度流 → Offboard(6/0) → ARM → 工具引导意图接管 | 同 stage4 引导段；控制器接管后链路发送持续增长 |
+| 1 | **[G2 补验]** 命令 AUTO.LOITER（切非 Offboard） | 首个非 Offboard 快照 → 控制器转 IDLE 实测 ≤200ms；停发后设定值额外发送 ≤2 条 |
+| 2 | 引导流重入 Offboard 并重新接管 | Offboard ACK accepted + 真实 6/0 + 控制器回 ACTIVE |
+| 3 | 工具位置引导意图起飞至相对 1m、稳定悬停 | 高度误差 ≤0.15m、水平漂移 ≤0.30m、垂速 ≤0.30m/s |
+| 4 | **[G2 补验]** 注入围栏外目标（150m） | `ClampedCount` 增长 ≥1 且控制器输出位置设定值水平模长 ≤ `max_radius_m`+0.5m |
+| 5 | 换注入近距目标（40m）→ 状态机接管意图流 | 出现 `reason` 低位=7 的位置引导意图（工具停止注入）；状态=S5 |
+| 6 | 注入 SEARCHING→LOCKED 帧 + 测距 | 迁移序列 S5→S6→S7；S6 冻结位置意图续发最大间隔 < `intent_timeout`；出现 `control_source=1` 速度意图 |
+| 7 | 短期 LOST（10 帧 < `exit_lost_frames`） | 状态保持 S7；出现零速刹车意图（reason 低位 102） |
+| 8 | 持续 LOST（达 `exit_lost_frames`）→ 回退 | 状态回 S5；位置引导意图恢复（卡尔曼备份接管）；控制权全程不中断（ACTIVE） |
+| 9 | 交接/回退全程输出连续性 | 速度式设定值隐含加速度 ≤ `max_accel_mps2`×1.5（含位置式→速度式段首"从 0 起步"核验） |
+| 10 | 停止注入目标（过期） | 告警位 bit1 置位 + 意图停发（> `intent_timeout` 无新意图）→ COAST 零速刹车 → IDLE → PX4 ≤1.3s 退出 Offboard；停发后额外发送 ≤2 条 |
+| 11 | AUTO.LAND → landed → 主动 DISARM | 同 stage4 收尾（未落地禁止空中 DISARM） |
+
+硬包线（armed 期间越界即安全回收 AUTO.LAND）：相对高度 0.50~1.30m（下限只对升空后
+生效）、北向 ≤ 主目标北向+6m、东西 ≤2m、水平半径 ≤ `max_radius_m`+0.5m；连接/位置/
+姿态失效同样触发回收；非预期退出 Offboard（非步骤 1/10）计失败。
+
+退出码沿用第 5 节；无 SITL 时在 10 秒连接超时后中止脚本并报告 FAIL（退出码 3），
+不得误报 PASS（无数据判定项不得空过：连续性要求速度样本非空、控制器异常计数要求
+已 armed）。
+
+**SITL 实跑属线下执行项**（本机无 PX4 SITL 环境）：任务内已完成 = 编译零警告 +
+参数门禁自测（互斥/时长/串口拒绝）+ 无 SITL 负对照（退出码 3、21 条 FAIL、0 条 PASS）
++ 注入几何自检（相机系互逆 0m、地理反解 1.7e-10m）。实跑判据见
+`docs/PX4实链验证清单.md` §7。
 
 ## 3. 当前配置
 
@@ -155,9 +230,12 @@ SITL 配置文件）：
 ```
 
 上板串口（`config/config.json`）的 `px4` 节结构完全相同，区别只有：`transport` 为
-`"serial"`（用 `serial` 子节，`udp` 子节仅为完整性保留），且文件额外包含
-`runtime`/`controller`/`ground_station` 等正式主程序配置节——本工具只读 `log`、`px4`
-与 stage4 用到的 `controller` 节，其余节忽略。
+`"serial"`（用 `serial` 子节，`udp` 子节仅为完整性保留）。工具只读 `log`、`px4` 节，
+以及 stage4 / stage4-mission 用到的控制相关配置节（`controller`/`handover`/
+`visual_tracking`/`target_estimator`/`actuator` 等）——**这些节在 `config/config.json`
+与 `config/px4_sitl.json` 中均可缺席**（缺席时用 `config/config.h` 默认值，stage4 缺省
+阈值即默认值），其余节忽略。stage4-mission 需要 `config/` 目录同级的双目校正矩阵
+（读 `fxb_m_px`，路径取 `stereo_ranger.rectify_matrices_path`）。
 
 波特率必须与 PX4 对应 MAVLink 实例一致。若实机不是 115200，只修改 JSON 后重新运行，不改代码。
 
@@ -240,7 +318,10 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 - `Px4Link` 仅记录生命周期、连接变化、版本首次上报和节流错误；命令拒绝/失败使用 WARN；
 - SITL 飞行阶段仅打印状态变化、阶段切换、安全回收和最终验收，不逐设定值打印；
 - stage4 期间控制器的控制权迁移（IDLE/ACTIVE/COAST 及原因串）由 `FlightController`
-  自身 WARN 日志记录，工具侧只打印阶段切换与实测值。
+  自身 WARN 日志记录，工具侧只打印阶段切换与实测值；
+- stage4-mission 每秒打印一行任务摘要（状态机状态/告警位/注入目标/视觉注入状态/
+  卡尔曼估计/控制权），阶段切换与验收证据打印实测值；状态机/估计器/控制器的业务
+  日志按各自模块纪律记录，工具不逐条转发。
 
 ## 7. 排查要点
 
@@ -266,6 +347,13 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | stage4 起飞阶段超时 | 位置引导意图被拒（`home_valid=false` → 无 Home 基准）或 `local_position` 无效；报告打印控制器 rejected 计数 |
 | stage4 刹车/退出时延超标 | 对照 `controller.coast_timeout_ms` 与 PX4 `COM_OF_LOSS_T`；报告分别打印 COAST→过零与 IDLE→退出实测值 |
 | stage4 无 SITL 时 | 10 秒连接超时后中止并 FAIL（退出码 3）；若退出码 1，先看参数互斥/时长/transport 门禁提示 |
+| stage4-mission 退出码 1 且报"注入几何自检失败" | 反变换/正变换不互逆（代码级缺陷）：查 `NedToCameraFrame`/`OffsetToGeodetic` 与 `visual_ned_converter.cpp`/`geodetic_converter.cpp` 是否同步改动 |
+| stage4-mission 卡在"交接段超时" | 按状态机排查要点四项逐项查（`include/state_machine/mission_state_machine.md`"停在 S5 不进 S6"）；工具侧另看：注入目标是否新鲜（Home 有效）、测距注入是否在跑、姿态/位置遥测是否有效、估计器诊断是否注入（本工具已注入真实估计器） |
+| stage4-mission 卡在"S5 位置引导段超时" | 状态机未出位置意图：查估计是否有效（地面站目标是否被注入、Home 是否有效）、`TargetState.valid`、`reason` 低位=7 的意图是否出现（工具据此停止注入引导意图） |
+| stage4-mission 卡在"围栏探针段超时" | 探针目标 150m 是否 > `controller.max_radius_m`（默认 100m；若配置把围栏放宽到 ≥150m 则无钳制可验）；控制器拒发位置意图（`home_valid=false`）时同样无钳制 |
+| stage4-mission 卡在"切非 Offboard 停发补验" | AUTO.LOITER 是否被 ACK accepted、真实模式是否离开 6/0（快照 `flight_mode/flight_sub_mode`）、控制器是否仍 ACTIVE（授权链快照门禁） |
+| stage4-mission 模式停发时延超标（>200ms） | 测量起点是**工具首个非 Offboard 快照**，终点是控制器转 IDLE；超标多为控制周期/快照发布周期设置过大（`controller.period_ms`、`px4.state_publish_interval_ms`），非状态机问题 |
+| stage4-mission"目标过期链"超时 | 过期判据依赖注入目标有效期（工具 2s）；看状态机告警位 bit1、控制器 COAST（意图超龄）与 IDLE（`coast_timeout`）、PX4 `COM_OF_LOSS_T` 是否与配置自洽 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

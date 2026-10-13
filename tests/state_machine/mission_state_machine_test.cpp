@@ -860,8 +860,10 @@ state_machine::MissionStateMachineConfig MakeServoTestConfig() {
 /// 控制律内部超龄阈值（视觉 200ms/姿态 300ms/测距 500ms，跟踪配置默认值）
 /// 要求用例按期刷新三路输入，否则控制律降级保持、停止发布意图。
 struct VisualServoFixture : HandoverFixture {
-    explicit VisualServoFixture(double yaw_rad = 0.0)
-        : HandoverFixture(MakeServoTestConfig()), yaw_rad_(yaw_rad) {
+    explicit VisualServoFixture(
+        double yaw_rad = 0.0,
+        const state_machine::MissionStateMachineConfig& custom = MakeServoTestConfig())
+        : HandoverFixture(custom), yaw_rad_(yaw_rad) {
         intent_subscription = machine->IntentOutput().Subscribe(64);
     }
 
@@ -1039,6 +1041,41 @@ TEST(MissionStateMachineTest, S7ServoNotStartedFallsBackAfterTimeout) {
                              common::MissionState::kGpsApproach)
                     .has_value());
     EXPECT_EQ(logs.Count("S7伺服未启动超时"), 1);
+}
+
+// S7 报告状态与实际控制输出背离的可观测位（T9 评审裁决 I2，Task 12）：
+// S7 期间本拍未发出视觉伺服意图——伺服尚未启动（仍在续发冻结位置意图）
+// 或控制律降级停发（姿态/视觉超龄）——MissionStatus 告警位 bit3 置位；
+// 伺服意图正常发出即清除（同一 S7 驻留内）。
+TEST(MissionStateMachineTest, ServoSuspendedBitTracksVisualServoOutput) {
+    auto config = MakeServoTestConfig();
+    config.handover.timeout = 8000ms;  // 放宽 S7 伺服未启动超时，专测告警位
+    VisualServoFixture f(/*yaw_rad=*/0.0, config);
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();  // 飞行快照无姿态 → 控制律姿态超龄降级、伺服未启动
+    constexpr uint32_t kWarningServoSuspended = 1U << 3U;  // 见 mission_state_machine.md
+
+    // 伺服未启动：S7 无视觉意图输出（冻结位置意图在续发）→ 背离位置位
+    const auto suspended =
+        WaitForWarningBit(f.status_subscription, kWarningServoSuspended, 3000ms);
+    ASSERT_TRUE(suspended.has_value());
+    EXPECT_EQ(suspended->state, common::MissionState::kVisualTracking);
+
+    // 姿态恢复新鲜 + 持续伺服输入 → 首条视觉意图发出 → 位清除（仍在 S7）
+    bool cleared = false;
+    uint64_t frame = 400;  // 避开交接驱动帧 1..4 与既有用例帧段
+    const auto deadline = std::chrono::steady_clock::now() + 3000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        f.PublishServoInputs(++frame);
+        auto message = f.status_subscription.WaitTakeFor(100ms);
+        if (message && (*message)->state == common::MissionState::kVisualTracking &&
+            ((*message)->active_warning_bits & kWarningServoSuspended) == 0U) {
+            cleared = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(cleared);
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
 }
 
 // S7 热备份核对（设计 §2.4）：每秒核对卡尔曼状态年龄（TargetState 接收时刻 +

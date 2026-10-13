@@ -43,6 +43,10 @@ norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min
 
 **拦截序列入口边界（T10 交付范围外，防误读）**：S9/S10 的**进入判据**（锁定质量、相对状态/射程、执行机构就绪、`IInterceptionAuthorizationPolicy` 授权）未在阶段四冻结，本任务**不发明**——状态机现有迁移逻辑只覆盖到 S7，拦截序列当前**无生产入口**（`DroneApplication`不驱动、整机不可达），捕网触发路径因此处于"已接通、待入口"状态。补充入口判据属后续任务；在此之前仅 `TestForceState` 测试入口可达（见测试方式）。
 
+阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
+
+**G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、S6 冻结续发无缺口、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
+
 本阶段仍不做以下事情：
 
 - 不发送模式切换、解锁、起飞、降落或setpoint（`SetCommandSender`注入的命令接口当前唯一消费点是捕网执行器触发/复位，Task 10；ARM/模式切换命令仍待后续任务）。
@@ -50,7 +54,9 @@ norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min
 - 不把地面站目标透传为PX4航点。
 - 不实现设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量（依赖
   控制侧反馈与尚未冻结的阈值配置），S6→S7 仍用"条件持续 + 视觉链推进 +
-  驻留超时"作最小验证，留 T12 全链补齐。
+  驻留超时"作最小验证。**T12 处置（2026-10-13）**：G3 全链验收以"迁移序列与
+  设计 §2 判据一致 + 交接处输出连续（速度设定值无越限跳变）"作为等价验收面，
+  三项量化条件待控制律整定（设计 §7）后在 G3 实跑/回放中冻结，阈值不落代码。
 - S7 无姿态超龄退出路径（边界声明）：姿态超龄由控制律降级停发 → FlightController
   授权链收口（姿态异常同时意味着 PX4 数据链异常，由控制器门禁裁决）。
 
@@ -117,9 +123,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 `handover` 的关系校验（`exit_lost_frames > lock_frames` 等）由配置加载期
 `HandoverConfig::Validate`强制，状态机构造不重复校验（与 FlightController 同约定）。
 
-**接线现状（T12 前）**：`DroneApplication`尚未实际调用`SetEstimationInputs`
-（整机因此停在 S5 影子行为，不影响既有链路）——三者一组绑定按实施计划归
-T12 G3 全链接线；`SetEstimationDiagnostics`已在装配估计器时注入；
+**接线现状（T12 裁决后）**：`DroneApplication`**仍未**调用`SetEstimationInputs`
+（整机因此停在 S5 影子行为，不影响既有链路）——T12 G3 全链验收改走独立装配工具
+（`tools/px4_link_smoke --sitl-stage4-mission`，三输入一组绑定 + 真实估计器诊断），
+生产接线与 `enable_control` 打开一并做（避免控制未启时改变整机行为）；
+`SetEstimationDiagnostics`已在装配估计器时注入；
 `SetCommandSender`已在`enable_control=true`装配门禁分支注入（T6），
 消费点=捕网执行器触发/复位（T10，enable_control=false 时零调用）。
 
@@ -200,6 +208,11 @@ T12 G3 全链接线；`SetEstimationDiagnostics`已在装配估计器时注入�
     WARN（reason 区分姿态超龄/视觉超龄/持续无距离退出）。**不补发零速**：
     控制律已明确"禁止正常控制"，补发会与其矛盾；刹停收口交 FlightController
     意图超时门禁（`intent_timeout` 后 COAST 刹车）。
+  - **S7 伺服停发告警位（Task 12）**：`servo_intent_active_` 由
+    `EvaluateVisualServoIntent` 每拍置位（仅实际发布视觉意图时为 true；离开
+    S7 不更新，交接段收口清零）；`Evaluate` 末段按"当拍状态==S7 且未发出意图"
+    置 `kWarningServoSuspended`（bit3）。该位只做**观测标注**，不改变任何迁移
+    或输出判定（S7 去留仍由四条收口路径决定）。
   - **热备份核对**：S7 内每秒（进入后立即核对一次）检查`HasFreshEstimate`
     ——即`TargetState`年龄是否超出其自报有效期窗`valid_for_ms`（生产者声明的
     "数据允许使用的最长时间"）；断粮 WARN 节流（第 1 次与每满 100 次）+
@@ -316,7 +329,10 @@ ctest --test-dir build --output-on-failure
     意图发出后不再出现位置意图；
   - `S7ServoNotStartedFallsBackAfterTimeout`：S7 中控制律持续降级（不提供姿态 →
     姿态超龄）时伺服永不启动——冻结位置续发在 `timeout_ms` 内持续滚动（无速度/
-    刹车意图），超时收口回退 S5，日志 reason="S7伺服未启动超时"。
+    刹车意图），超时收口回退 S5，日志 reason="S7伺服未启动超时"；
+  - `ServoSuspendedBitTracksVisualServoOutput`：S7 中伺服未启动（控制律降级）→
+    `MissionStatus` 告警位 bit3 置位且状态保持 S7；恢复新鲜姿态、首条视觉意图
+    发出后 bit3 在同一 S7 驻留内清除（标注"报告状态与实际输出背离"的两态）。
 - 捕网执行器（Task 10，`FakeCommandSender` 假件按调用顺序记录 SendCommand
   （命令/参数/入队结果）并可脚本化入队失败；用例经 `TestForceState` 驱动拦截
   序列——与生产路径共用 TransitionTo/决策线程挂点）：
@@ -383,8 +399,14 @@ ctest --test-dir build --output-on-failure
   "交接冻结位置意图续发"日志与滚动续期的位置意图（2000ms 超时档位下
   `timeout_ms` 需大于冻结续发失效时间）；若位置意图在 S6 中途停止，查
   进入判据是否失效（撤销回 S5 的分支，属预期收口而非冻结失效）。
-- 整机实测停在 S5、从不进 S6：**T12 前属预期**——`DroneApplication`尚未调用
-  `SetEstimationInputs`（三输入未绑定，状态机保持影子）。勿据此判缺陷。
+- 整机实测停在 S5、从不进 S6：**属预期（T12 裁决后仍成立）**——`DroneApplication`
+  尚未调用 `SetEstimationInputs`（三输入未绑定，状态机保持影子）。G3 全链验收走
+  独立装配工具 `tools/px4_link_smoke --sitl-stage4-mission`（见 `tools/px4_link_smoke.md`）；
+  生产接线与 `enable_control` 打开一并做。勿据此判缺陷。
+- 地面站看到"状态=S7 但飞机不动/无控制输出"：查 `MissionStatus.active_warning_bits`
+  bit3（S7 伺服停发中）——置位说明伺服尚未启动或控制律降级停发，实际输出要么是
+  冻结位置意图、要么无意图（控制器意图超时刹停）；服务器侧诊断先用该位区分
+  "状态机在跟踪"与"实际控制输出在跟"，再查 WARN"视觉伺服停发意图"的降级原因。
 - 捕网不触发（日志无「捕网执行器触发命令已入队」）：先确认是否**根本不满足触发条件**——
   ① 整机当前**无拦截序列入口**（S9/S10 进入判据属后续任务，`DroneApplication`
   不驱动），状态达不到 S10，属本任务交付边界而非缺陷；② `SetCommandSender`

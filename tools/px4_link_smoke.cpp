@@ -24,11 +24,15 @@
 #include "communication/px4_link.h"
 #include "config/config.h"
 #include "control/flight_controller.h"
+#include "perception/geodetic_converter.h"
+#include "perception/target_estimator.h"
+#include "state_machine/mission_state_machine.h"
 
 namespace {
 
 using json = nlohmann::json;
 using drone::communication::Px4LinkConfig;
+namespace common = drone::common;  // stage4-mission（G3 全链）段使用
 
 std::atomic<bool> g_stop{false};
 
@@ -58,6 +62,7 @@ struct Options {
     bool sitl_horizontal_motion = false;
     bool sitl_offboard_loss = false;
     bool sitl_stage4_controller = false;
+    bool sitl_stage4_mission = false;
 };
 
 void PrintUsage(const char* program) {
@@ -65,11 +70,14 @@ void PrintUsage(const char* program) {
               << " [--config <config.json>] [--duration <秒>]\n"
               << "       [--sitl-zero-velocity | --sitl-offboard-disarmed | --sitl-arm-zero-velocity\n"
               << "        | --sitl-takeoff-land | --sitl-horizontal-motion\n"
-              << "        | --sitl-offboard-loss | --sitl-stage4-controller]\n"
+              << "        | --sitl-offboard-loss | --sitl-stage4-controller\n"
+              << "        | --sitl-stage4-mission]\n"
               << "SITL 参数仅允许 UDP；offboard-loss 起飞 1m 后主动停止 setpoint，\n"
               << "验证 PX4 退出 Offboard，再统一 AUTO.LAND 回收。\n"
               << "stage4-controller 装配真实 FlightController（意图脚本 → 限幅/门禁 → setpoint），\n"
-              << "依次验收：零速漂移、速度阶跃斜率/稳态、停发刹车、Offboard 退出时延。\n";
+              << "依次验收：零速漂移、速度阶跃斜率/稳态、停发刹车、Offboard 退出时延。\n"
+              << "stage4-mission 装配状态机全链（G3）：注入地面站目标 + 模拟视觉观测走通\n"
+              << "S5→S6→S7→回退→停发链路，另含 G2 补验（围栏钳制、切非 Offboard 停发 <200ms）。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -115,6 +123,10 @@ Options ParseOptions(int argc, char** argv) {
             options.sitl_stage4_controller = true;
             continue;
         }
+        if (argument == "--sitl-stage4-mission") {
+            options.sitl_stage4_mission = true;
+            continue;
+        }
         if (argument == "--duration") {
             if (++index >= argc) {
                 throw std::invalid_argument("--duration 缺少秒数");
@@ -134,7 +146,8 @@ Options ParseOptions(int argc, char** argv) {
                                  static_cast<int>(options.sitl_takeoff_land) +
                                  static_cast<int>(options.sitl_horizontal_motion) +
                                  static_cast<int>(options.sitl_offboard_loss) +
-                                 static_cast<int>(options.sitl_stage4_controller);
+                                 static_cast<int>(options.sitl_stage4_controller) +
+                                 static_cast<int>(options.sitl_stage4_mission);
     if (sitl_stage_count > 1) {
         throw std::invalid_argument("多个 SITL 阶段参数不能同时使用");
     }
@@ -152,6 +165,9 @@ Options ParseOptions(int argc, char** argv) {
     }
     if (options.sitl_stage4_controller && options.duration < std::chrono::seconds(60)) {
         throw std::invalid_argument("控制器执行层门禁测试时长不能少于 60 秒");
+    }
+    if (options.sitl_stage4_mission && options.duration < std::chrono::seconds(60)) {
+        throw std::invalid_argument("全链（状态机）门禁测试时长不能少于 60 秒");
     }
     return options;
 }
@@ -309,8 +325,9 @@ double ReadOptionalPositiveDouble(const json& object, const char* key,
 }
 
 /// 读取 controller 配置节（字段名与默认值同源 `config/config.h`）。
-/// 本工具不链接 drone_config（避免为 smoke 拖入视频/感知依赖），
-/// 故只做 stage4 断言依赖的跨字段校验，其余由 FlightController 自身保证。
+/// stage4（G2）保持轻量自读：只做断言依赖的跨字段校验，其余由 FlightController
+/// 自身保证；stage4-mission（G3）需要 controller/handover/visual_tracking 等整节，
+/// 改由 drone_config 的 LoadAppConfig 同源加载（见 RunStage4Mission）。
 drone::config::FlightControllerConfig LoadControllerConfig(const json& root) {
     drone::config::FlightControllerConfig config;
     const json controller = root.value("controller", json::object());
@@ -338,6 +355,27 @@ drone::config::FlightControllerConfig LoadControllerConfig(const json& root) {
 std::string ResolveLogDirectory(const json& root) {
     const json log = root.value("log", json::object());
     return log.value("dir", std::string("logs/"));
+}
+
+/// 读取双目校正矩阵的深度系数 fxb_m_px（与 config.cpp 同源文件、同字段；
+/// stage4-mission 注入模拟测距需要 fxb 通过 TargetEstimatorConfig::Validate）。
+/// 路径按"与 config.json 同目录"解析（与 config.cpp 的 ResolveAdjacentPath 同规则）。
+double LoadRectifyFxb(const std::string& config_path, const std::string& relative_path) {
+    std::string path = relative_path;
+    const bool absolute = !path.empty() && (path.front() == '/' || path.front() == '\\');
+    if (!absolute) {
+        std::string directory = config_path;
+        const auto separator = directory.find_last_of("/\\");
+        directory = separator == std::string::npos ? std::string(".")
+                                                   : directory.substr(0, separator);
+        path = directory + "/" + relative_path;
+    }
+    const json root = LoadJson(path);
+    const double fxb = root.at("fxb_m_px").get<double>();
+    if (!std::isfinite(fxb) || fxb <= 0.0) {
+        throw std::invalid_argument("校正矩阵 fxb_m_px 必须为有限正数: " + path);
+    }
+    return fxb;
 }
 
 struct ObservedState {
@@ -1355,6 +1393,1713 @@ int RunStage4(drone::communication::Px4Link& link, const json& root,
     return run.Evaluate(connected_at_end) ? 0 : 3;
 }
 
+// ---------------------------------------------------------------------------
+// stage4-mission（G3 全链）：状态机转正——注入地面站目标 + 模拟视觉观测驱动
+// S5→S6→S7→回退→停发全流程；另含 G2 表列但 stage4 未覆盖的两项补验
+// （围栏钳制、切非 Offboard 立即停发 <200ms）。
+//
+// 与 stage4 的边界差异：stage4 由工具扮演状态机直接发布脚本意图；本段装配正式
+// MissionStateMachine（唯一意图生产者），工具只扮演地面站/视觉监视器/双目测距
+// 三路生产者并注入模拟数据，验收"迁移序列与设计 §2 判据一致、交接处输出连续、
+// 回退后卡尔曼备份接管有效"。
+//
+// 数据流（与 DroneApplication 正式装配同构，上游换为注入）：
+//   注入地面站目标（10Hz，WGS-84）→ TargetEstimator（真实卡尔曼 + 视觉融合）
+//     → TargetState ──────────────────────┐
+//   注入模拟视觉观测（VisualTargetStatus）├─► MissionStateMachine ──► ControlIntent
+//   注入模拟测距（StereoTargetDistance）──┤   （S5 位置引导 / 交接判据 /
+//   Px4Link 真实遥测 → FlightStateSnapshot┘    S7 视觉伺服 / 热备份核对）
+//     → FlightController（门禁/限幅/无扰衔接）→ Px4Setpoint → Px4Link → PX4
+//
+// 脚本序列：
+//   0) 引导零速度流 → Offboard → ARM → 工具引导意图接管（stage3A/stage4 同纪律）
+//   1) [G2 补验] 飞行中切非 Offboard(AUTO.LOITER) → 控制器停发 <200ms；
+//      随后引导流重入 Offboard 重新接管
+//   2) 工具位置引导意图起飞至相对 1m 并稳定悬停（此时未注入地面站目标，
+//      状态机停在 READY 静默，意图流唯一生产者仍是工具）
+//   3) [G2 补验] 注入围栏外目标（150m > controller.max_radius_m）→ 位置设定值
+//      被钳制在围栏内（ClampedCount 增长 + 实测设定值水平模长 ≤ 围栏）
+//   4) 换注入近距目标（40m）→ S5（GPS_APPROACH）位置引导；随后注入
+//      SEARCHING → LOCKED 帧序列 + 测距 → S6（冻结位置意图续发）→ S7（视觉伺服）
+//   5) 短期 LOST（10 帧 < exit_lost_frames）→ 保持 S7 + 判丢零速刹车意图
+//   6) 持续 LOST（达 exit_lost_frames）→ 回退 S5；卡尔曼备份接管
+//      （位置意图恢复、控制权不中断）
+//   7) 停止注入目标 → 过期 → 位置意图停发 → COAST 刹车 → IDLE → PX4 退出
+//      Offboard（返航语义：本阶段 RETURN_HOME 无生产入口，停发后由工具按
+//      台架纪律 AUTO.LAND 回收）
+//   8) AUTO.LAND → landed → 主动 DISARM
+// ---------------------------------------------------------------------------
+
+/// G3 固定边界（不可经命令行放宽）。
+constexpr uint8_t kMissionFrameLocalNed = 3;       // 局部 NED（types.h 文件头约定）
+constexpr double kMissionDegToRad = 3.14159265358979323846 / 180.0;
+constexpr uint32_t kMissionGroundBootId = 0x35430001U;  // 模拟地面站启动标识
+/// 注入目标 validity_flags（与 docs/数据接口文档.md §3.4 同源：bit0 高度、
+/// bit5 水平精度、bit6 垂直精度）。
+constexpr uint32_t kMissionValidityAltitude = 1U << 0U;
+constexpr uint32_t kMissionValidityHorizontal = 1U << 5U;
+constexpr uint32_t kMissionValidityVertical = 1U << 6U;
+/// 状态机意图 reason_code 低位段：地面站任务下发（S5/S6 位置引导，编码 7）。
+constexpr uint32_t kMissionReasonGroundStationTask = 7U;
+/// MissionStatus 告警位（与 src/state_machine/mission_state_machine.cpp 定义同源；
+/// 该实现文件的常量在匿名命名空间不可外链，工具侧镜像位语义，改动须同步）。
+constexpr uint32_t kMissionWarningGroundTargetStaleBit = 1U << 1U;  // S5 目标过期
+constexpr float kMissionTakeoffHeightM = 1.0f;     // 相对起飞高度（与 stage4 同）
+constexpr float kMissionHoverZErrorM = 0.15f;      // 悬停窗口：高度误差
+constexpr float kMissionHoverDriftM = 0.30f;       // 悬停窗口：水平漂移
+constexpr float kMissionHoverVzMps = 0.30f;        // 悬停窗口：垂速
+constexpr float kMissionMaxHeightM = 1.30f;        // armed 期间硬性高度上限
+constexpr float kMissionMinHeightM = 0.50f;        // armed 期间硬性高度下限
+constexpr float kMissionMaxEastM = 2.0f;           // 全段东西向硬边界
+constexpr float kMissionNorthMarginM = 6.0f;       // 主目标北向包线余量
+constexpr double kMissionTargetNorthM = 40.0;      // 主目标北向距离（Home 相对）
+constexpr double kMissionFenceProbeNorthM = 150.0; // 围栏探针目标（须 > max_radius）
+constexpr double kMissionTargetUpM = 1.0;          // 目标高度（相对 Home，与悬停同高）
+constexpr uint64_t kMissionIntentValidMs = 500;    // 工具引导意图有效期
+constexpr uint64_t kMissionIntentPeriodMs = 100;   // 工具引导意图周期（10Hz）
+constexpr uint64_t kMissionGuidePeriodMs = 100;    // 引导 setpoint 流周期（10Hz）
+constexpr uint64_t kMissionGuideMinSends = 20;     // 引导流最小条数（stage3A 纪律）
+constexpr uint64_t kMissionGuideMinMs = 2000;      // 引导流最短时长（stage3A 纪律）
+constexpr uint64_t kMissionConnectTimeoutMs = 10000;   // 未连接快速失败（负对照）
+constexpr uint64_t kMissionBootstrapTimeoutMs = 20000; // 引导/Offboard/ARM/接管上限
+constexpr uint64_t kMissionTakeoffTimeoutMs = 15000;   // 起飞/悬停上限
+constexpr uint64_t kMissionHoverStableMs = 2000;       // 悬停稳定判据时长
+constexpr uint64_t kMissionProbeTimeoutMs = 15000;     // 围栏/交接/回退各段上限
+constexpr uint64_t kMissionTargetPeriodMs = 100;   // 地面站目标注入周期（10Hz）
+constexpr uint64_t kMissionTargetValidMs = 2000;   // 注入目标有效期
+constexpr uint32_t kMissionTargetIdProbe = 1;      // 围栏探针目标 ID
+constexpr uint32_t kMissionTargetIdMain = 2;       // 主目标 ID（换 ID 触发卡尔曼重初始化）
+constexpr uint64_t kMissionVisionPeriodMs = 50;    // 视觉/测距注入周期（20Hz）
+constexpr uint64_t kMissionVisualSearchMs = 500;   // SEARCHING 帧注入时长（锁定前）
+constexpr uint64_t kMissionShortLostFrames = 10;   // 短期 LOST 注入帧数（< exit_lost_frames）
+constexpr uint64_t kMissionModeStopLimitMs = 200;  // 切非 Offboard 停发上限（设计 §4）
+constexpr uint64_t kMissionModeStopSettleMs = 300; // 停发后再观察时长（发送冻结核验）
+constexpr uint64_t kMissionStopTimeoutMs = 15000;  // 停发→Offboard 退出上限
+constexpr uint64_t kMissionOffboardExitLimitMs = 1300;  // IDLE→PX4 退出 Offboard 上限
+constexpr uint64_t kMissionExpiryTimeoutMs = 8000; // 目标过期→停发链上限
+constexpr uint64_t kMissionLandTimeoutMs = 30000;  // AUTO.LAND→landed 上限
+constexpr uint64_t kMissionExtraSendsAllowed = 2;  // 停发后容许的竞态额外发送
+constexpr double kMissionSlewTolerance = 1.5;      // 输出连续性容差倍数
+constexpr double kMissionFenceToleranceM = 0.5;    // 围栏钳制实测容差
+constexpr uint64_t kMissionPollMs = 20;            // 主循环节拍（低于控制周期 50ms）
+
+/// G3 脚本阶段。
+enum class MissionPhase : uint8_t {
+    kBootstrap,      ///< 连接 → 引导流 → Offboard → ARM → 工具引导意图接管
+    kModeStopProbe,  ///< [G2 补验] 切非 Offboard → 控制器停发时延/发送冻结
+    kRebootstrap,    ///< 引导流重入 Offboard 并重新接管
+    kTakeoff,        ///< 工具位置引导意图：相对起飞 1m 稳定悬停
+    kFenceProbe,     ///< [G2 补验] 注入围栏外目标 → 位置意图被钳制
+    kApproach,       ///< 注入近距目标 → S5 位置引导（状态机接管意图流）
+    kVisualInject,   ///< 注入 SEARCHING→LOCKED + 测距 → S6 → S7
+    kShortLost,      ///< 短期 LOST → 保持 S7 + 零速刹车意图
+    kSustainedLost,  ///< 持续 LOST → 回退 S5 + 卡尔曼备份接管
+    kTargetExpiry,   ///< 停止注入目标 → 过期 → COAST → IDLE → 退出 Offboard
+    kLand,           ///< AUTO.LAND → landed
+    kDone,
+};
+
+/// G3 脚本运行体（见本节文件头注释）。
+class Stage4MissionRun {
+public:
+    Stage4MissionRun(
+        drone::communication::Px4Link& link,
+        drone::control::FlightController& controller,
+        drone::state_machine::MissionStateMachine& machine,
+        drone::common::Topic<drone::common::GroundStationTarget>& ground_target_topic,
+        drone::common::Topic<drone::common::VisualTargetStatus>& visual_topic,
+        drone::common::Topic<drone::common::StereoTargetDistance>& distance_topic,
+        drone::common::Topic<drone::common::TargetState>& estimated_topic,
+        const drone::config::AppConfig& app_config, double fxb_m_px,
+        std::chrono::seconds duration,
+        drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription
+            subscription)
+        : link_(link),
+          controller_(controller),
+          machine_(machine),
+          ground_target_topic_(ground_target_topic),
+          visual_topic_(visual_topic),
+          distance_topic_(distance_topic),
+          estimated_topic_(estimated_topic),
+          controller_config_(app_config.controller),
+          handover_(app_config.handover),
+          camera_(app_config.visual_tracking.camera),
+          mount_(app_config.target_estimator.visual.mount),
+          fxb_m_px_(fxb_m_px),
+          duration_ms_(static_cast<uint64_t>(duration.count()) * 1000),
+          subscription_(std::move(subscription)) {
+        status_subscription_ = machine_.StatusOutput().Subscribe(64);
+        intent_subscription_ = machine_.IntentOutput().Subscribe(64);
+        setpoint_subscription_ = controller_.SetpointOutput().Subscribe(64);
+        estimated_subscription_ = estimated_topic_.Subscribe(16);
+    }
+
+    /// 执行脚本主循环（返回到期/中断/完成后仍可能 armed，收尾见 FinishFlight）。
+    void Execute() {
+        const uint64_t started_ms = MonotonicMs();
+        uint64_t next_summary_ms = started_ms;
+        while (!g_stop.load(std::memory_order_acquire) &&
+               MonotonicMs() - started_ms < duration_ms_) {
+            if (auto message =
+                    subscription_.WaitTakeFor(std::chrono::milliseconds(kMissionPollMs))) {
+                latest_ = **message;
+                have_snapshot_ = true;
+                UpdateObserved(latest_, &observed_);
+                PrintStateChange();
+                // 起飞起点锁定：首次 armed 且位置有效时（与 stage3/stage4 同语义）。
+                if (latest_.armed && !takeoff_target_ready_ &&
+                    latest_.local_position_valid) {
+                    takeoff_target_ready_ = true;
+                    start_x_ = latest_.local_x_m;
+                    start_y_ = latest_.local_y_m;
+                    start_z_ = latest_.local_z_m;
+                    takeoff_target_z_ = start_z_ - kMissionTakeoffHeightM;
+                    std::cout << "[SITL] 起飞目标已锁定: N=" << start_x_
+                              << " E=" << start_y_ << " D=" << takeoff_target_z_
+                              << std::endl;
+                }
+            }
+            const uint64_t now_ms = MonotonicMs();
+            DrainOutputs();
+            PublishBootstrapIntent(now_ms);
+            AdvancePhase(now_ms, now_ms - started_ms);
+            if (have_snapshot_) {
+                CheckFlightEnvelope();
+                CheckAuthorityContinuity();
+            }
+            if (now_ms >= next_summary_ms) {
+                PrintSummary(latest_, std::chrono::duration_cast<std::chrono::seconds>(
+                                           std::chrono::milliseconds(now_ms - started_ms)));
+                PrintMissionSummary();
+                next_summary_ms = now_ms + 1000;
+            }
+            if (aborted_ || safety_violation_ || phase_ == MissionPhase::kDone) {
+                break;
+            }
+        }
+        FinishFlight();
+    }
+
+    /// 装配期注入几何自检（开跑前调用）：反变换与正变换必须互逆——像素/测距
+    /// （NedToCameraFrame ↔ perception::VisualCameraToLocalNed）与地理坐标
+    /// （OffsetToGeodetic ↔ perception::GeodeticToLocalNed）。任一处不互逆即
+    /// 拒绝开跑：否则估计器视觉融合会与注入目标偏离、创新门限误拒交接。
+    bool VerifyInjectionGeometry() const {
+        constexpr double kRoll = 0.02;
+        constexpr double kPitch = -0.015;
+        constexpr double kYaw = 0.25;
+        const drone::perception::LocalNedCoordinate self{5.0, -2.0, -1.0};
+        const double north_m = 40.0 - self.north_m;
+        const double east_m = 0.0 - self.east_m;
+        const double down_m = -1.0 - self.down_m;
+        double cam_x = 0.0;
+        double cam_y = 0.0;
+        double cam_z = 0.0;
+        NedToCameraFrame(north_m, east_m, down_m, kRoll, kPitch, kYaw, &cam_x, &cam_y,
+                        &cam_z);
+        const auto back = drone::perception::VisualCameraToLocalNed(
+            cam_x, cam_y, cam_z, mount_, kRoll, kPitch, kYaw, self);
+        const auto offset = [](const drone::perception::LocalNedCoordinate& a, double n,
+                               double e, double d) {
+            return std::sqrt((a.north_m - n) * (a.north_m - n) +
+                             (a.east_m - e) * (a.east_m - e) +
+                             (a.down_m - d) * (a.down_m - d));
+        };
+        const double camera_error = back.has_value()
+            ? offset(*back, self.north_m + north_m, self.east_m + east_m,
+                     self.down_m + down_m)
+            : std::numeric_limits<double>::infinity();
+        constexpr double kRefLat = 47.397742;
+        constexpr double kRefLon = 8.545594;
+        constexpr double kRefAlt = 488.0;
+        double lat = 0.0;
+        double lon = 0.0;
+        double alt = 0.0;
+        const bool solved = OffsetToGeodetic(kRefLat, kRefLon, kRefAlt, north_m, east_m,
+                                            down_m, &lat, &lon, &alt);
+        const auto geo = solved ? drone::perception::GeodeticToLocalNed(
+                                      {kRefLat, kRefLon, kRefAlt}, {lat, lon, alt})
+                                : std::nullopt;
+        const double geodetic_error = geo.has_value()
+            ? std::sqrt((geo->north_m - north_m) * (geo->north_m - north_m) +
+                        (geo->east_m - east_m) * (geo->east_m - east_m) +
+                        (geo->down_m - down_m) * (geo->down_m - down_m))
+            : std::numeric_limits<double>::infinity();
+        std::cout << "  注入几何自检: 相机系互逆偏差 " << camera_error
+                  << " m，地理反解互逆偏差 " << geodetic_error << " m" << std::endl;
+        return camera_error < 1e-6 && geodetic_error < 0.01;
+    }
+
+    /// 打印 G3 验收报告并返回总判定。
+    bool Evaluate(bool connected_at_end) const {
+        const double slew_limit =
+            controller_config_.max_accel_mps2 * kMissionSlewTolerance;
+        const double max_slew = MaxObservedSlewMps2();
+        const uint64_t sends_after_mode_stop =
+            mode_stop_seen_ ? sends_after_mode_stop_ : 0;
+        const uint64_t sends_after_idle =
+            idle_seen_ && link_.SetpointSendCount() >= sends_at_idle_
+                ? link_.SetpointSendCount() - sends_at_idle_
+                : 0;
+        const bool mode_stop_ok = mode_stop_seen_ && mode_change_seen_ &&
+                                  mode_stop_ms_ >= mode_change_ms_ &&
+                                  mode_stop_ms_ - mode_change_ms_ <=
+                                      kMissionModeStopLimitMs &&
+                                  sends_after_mode_stop <= kMissionExtraSendsAllowed;
+        const bool takeover_ok = handover_done_ && takeover_stream_ok_;
+        const bool rebootstrap_ok = rebootstrap_takeover_seen_;
+        const bool takeoff_ok = takeoff_target_ready_ && takeoff_started_ &&
+                                hover_complete_ && !safety_violation_;
+        const bool fence_ok = fence_clamp_seen_ && max_position_norm_m_ > 0.0 &&
+                              max_position_norm_m_ <=
+                                  controller_config_.max_radius_m + kMissionFenceToleranceM;
+        const bool sm_takeover_ok = sm_intent_seen_;
+        const bool migration_ok = SequenceContains({common::MissionState::kGpsApproach,
+                                                    common::MissionState::kVisualHandover,
+                                                    common::MissionState::kVisualTracking,
+                                                    common::MissionState::kGpsApproach});
+        const bool frozen_ok = s6_frozen_gap_ok_;
+        const bool servo_ok = servo_intent_seen_;
+        const bool short_lost_ok = short_lost_kept_s7_ && brake_intent_seen_;
+        const bool fallback_ok = fallback_seen_ && backup_position_intent_seen_ &&
+                                 authority_uninterrupted_;
+        const bool continuity_ok = velocity_sample_count_ > 0 && max_slew <= slew_limit;
+        const bool expiry_ok = expiry_warning_seen_ && expiry_intent_stop_seen_ &&
+                               coast_seen_ && idle_seen_ && offboard_exit_seen_ &&
+                               offboard_exit_ms_ - idle_ms_ <= kMissionOffboardExitLimitMs &&
+                               sends_after_idle <= kMissionExtraSendsAllowed;
+        const bool land_ok = land_command_queued_ && land_ack_received_ &&
+                             land_ack_accepted_ && landed_after_flight_;
+        const bool disarm_ok = !unexpected_disarm_before_command_ &&
+                               disarm_command_queued_ && disarm_ack_received_ &&
+                               disarm_ack_accepted_ && disarmed_confirmed_;
+
+        std::cout << "\n========== stage4-mission 全链门禁报告（G3：状态机 → "
+                     "FlightController → Px4Link → PX4）=========="
+                  << std::endl;
+        PrintCheck("PX4 HEARTBEAT", observed_.heartbeat, true);
+        PrintCheck("测试结束时心跳仍连接", connected_at_end, true);
+        PrintCheck("引导零速度流已注入(≥20 条)", guide_injected_ >= kMissionGuideMinSends,
+                   true);
+        PrintCheck("控制器已接管设定值流(第一轮授权链全通)", takeover_ok, true);
+        PrintCheck("切非 Offboard 停发时延 ≤200ms",
+                   mode_stop_ok, true);
+        PrintCheck("切回 Offboard 重新接管(第二轮授权链全通)", rebootstrap_ok, true);
+        PrintCheck("相对起飞 1m 稳定悬停完成", takeoff_ok, true);
+        PrintCheck("围栏钳制: 位置设定值未超 max_radius",
+                   fence_ok, true);
+        PrintCheck("状态机接管意图流(S5 位置引导 reason=7)",
+                   sm_takeover_ok, true);
+        PrintCheck("迁移序列 S5→S6→S7→(LOST 回退)S5", migration_ok, true);
+        PrintCheck("S6 冻结位置意图续发无缺口(< intent_timeout)",
+                   frozen_ok, true);
+        PrintCheck("S7 视觉伺服意图启动(control_source=1)", servo_ok, true);
+        PrintCheck("短期 LOST 保持 S7 且输出零速刹车意图", short_lost_ok, true);
+        PrintCheck("持续 LOST 回退 S5 且卡尔曼备份接管(位置意图恢复)",
+                   fallback_ok, true);
+        PrintCheck("交接/回退全程速度设定值连续(≤max_accel×1.5)",
+                   continuity_ok, true);
+        PrintCheck("目标过期: 告警位/停发/COAST/IDLE/退出 Offboard 链完整",
+                   expiry_ok, true);
+        PrintCheck("AUTO.LAND 请求/ACK accepted/PX4 已确认 landed", land_ok, true);
+        PrintCheck("主动 DISARM 前未被自动上锁",
+                   armed_reached_ && !unexpected_disarm_before_command_, true);
+        PrintCheck("DISARM ACK accepted 且已确认 disarmed", disarm_ok, true);
+        PrintCheck("飞行未触发高度/漂移安全回收",
+                   armed_reached_ && !safety_violation_, true);
+        PrintCheck("控制器无异常计数(未支持意图/未知来源)",
+                   armed_reached_ && controller_.ErrorCount() == 0, true);
+        PrintMessageCheck("LOCAL_POSITION_NED",
+                          link_.MessageReceiveCount(MAVLINK_MSG_ID_LOCAL_POSITION_NED),
+                          observed_.local_position);
+        PrintMessageCheck("ATTITUDE", link_.MessageReceiveCount(MAVLINK_MSG_ID_ATTITUDE),
+                          observed_.attitude);
+        std::cout << "状态迁移序列: " << StateSequenceText() << std::endl;
+        std::cout << "实测值: 切非Offboard→控制器停发 "
+                  << (mode_stop_seen_ && mode_change_seen_
+                          ? mode_stop_ms_ - mode_change_ms_
+                          : 0)
+                  << " ms（上限 " << kMissionModeStopLimitMs << "，停发后额外发送 "
+                  << sends_after_mode_stop << " 条），围栏探针最大设定值水平模长 "
+                  << max_position_norm_m_ << " m（围栏 " << controller_config_.max_radius_m
+                  << " m），速度设定值最大隐含加速度 " << max_slew << " m/s²（上限 "
+                  << slew_limit << "），S5→S6 冻结续发最大间隔 "
+                  << s6_position_intent_max_gap_ms_ << " ms（意图有效期 "
+                  << kMissionIntentValidMs << " ms）" << std::endl;
+        std::cout << "实测时延: 过期→COAST "
+                  << (coast_seen_ && expiry_stop_ms_ ? coast_ms_ - expiry_stop_ms_ : 0)
+                  << " ms，COAST→IDLE "
+                  << (coast_seen_ && idle_seen_ ? idle_ms_ - coast_ms_ : 0)
+                  << " ms，IDLE→退出 Offboard "
+                  << (idle_seen_ && offboard_exit_seen_ ? offboard_exit_ms_ - idle_ms_ : 0)
+                  << " ms（上限 " << kMissionOffboardExitLimitMs << "），退出模式 "
+                  << static_cast<int>(offboard_exit_mode_) << '/'
+                  << static_cast<int>(offboard_exit_sub_mode_) << "，停发后额外发送 "
+                  << sends_after_idle << " 条" << std::endl;
+        std::cout << "包线: 最大相对高度 " << max_ascent_m_ << " m，最大北向 "
+                  << max_north_m_ << " m，最大东西 " << max_east_m_ << " m，控制权最终态 "
+                  << AuthorityText(controller_.Authority()) << std::endl;
+        std::cout << "状态机诊断: 迁移 " << machine_.TransitionCount() << " 次，错误 "
+                  << machine_.ErrorCount() << " 次（估计器错误计数见日志）"
+                  << std::endl;
+        std::cout << "控制器诊断: setpoint=" << controller_.SetpointCount()
+                  << " rejected=" << controller_.RejectedIntentCount()
+                  << " clamped=" << controller_.ClampedCount()
+                  << " error=" << controller_.ErrorCount() << std::endl;
+        if (!abort_reason_.empty()) {
+            std::cout << "[信息] 脚本中断原因: " << abort_reason_ << std::endl;
+        }
+        const bool passed = observed_.heartbeat && connected_at_end &&
+                            link_.ErrorCount() == 0 &&
+                            guide_injected_ >= kMissionGuideMinSends && takeover_ok &&
+                            mode_stop_ok && rebootstrap_ok && takeoff_ok && fence_ok &&
+                            sm_takeover_ok && migration_ok && frozen_ok && servo_ok &&
+                            short_lost_ok && fallback_ok && continuity_ok && expiry_ok &&
+                            land_ok && disarm_ok && !safety_violation_ &&
+                            controller_.ErrorCount() == 0;
+        std::cout << (passed ? "结果: stage4-mission 全链门禁通过"
+                             : "结果: stage4-mission 全链门禁未通过")
+                  << std::endl;
+        return passed;
+    }
+
+private:
+    // ---- 订阅抽取（状态/意图/设定值） ----
+
+    /// 抽干状态机状态、意图、控制器设定值与估计目标四个订阅，保留验收轨迹。
+    void DrainOutputs() {
+        while (auto message = status_subscription_.TryTake()) {
+            const auto& status = **message;
+            warning_bits_seen_ |= status.active_warning_bits;
+            if (status.active_warning_bits & kMissionWarningGroundTargetStaleBit) {
+                expiry_warning_seen_ = true;
+            }
+            if (state_sequence_.empty() || state_sequence_.back() != status.state) {
+                state_sequence_.push_back(status.state);
+            }
+            mission_state_ = status.state;
+            mission_warning_bits_ = status.active_warning_bits;
+        }
+        while (auto message = intent_subscription_.TryTake()) {
+            intents_.push_back(**message);
+            NoteIntent(**message);
+        }
+        while (auto message = setpoint_subscription_.TryTake()) {
+            setpoints_.push_back(**message);
+            if ((*message)->valid &&
+                (*message)->type == drone::common::SetpointType::kVelocity) {
+                ++velocity_sample_count_;
+            }
+            if ((*message)->valid &&
+                (*message)->type == drone::common::SetpointType::kPosition) {
+                max_position_norm_m_ =
+                    std::max(max_position_norm_m_,
+                             std::hypot(static_cast<double>((*message)->x),
+                                        static_cast<double>((*message)->y)));
+            }
+        }
+        while (auto message = estimated_subscription_.TryTake()) {
+            latest_estimate_ = **message;
+            has_estimate_ = true;
+        }
+    }
+
+    /// 意图轨迹记录（交接验收：S6 冻结续发缺口、S7 伺服启动、回退后位置意图恢复）。
+    void NoteIntent(const drone::common::ControlIntent& intent) {
+        const bool from_state_machine =
+            (intent.reason_code & 0xFFU) == kMissionReasonGroundStationTask;
+        if (!from_state_machine) {
+            return;  // 工具引导意图不计入状态机轨迹
+        }
+        sm_intent_seen_ = true;
+        last_sm_intent_ms_ = intent.header.receive_time_ms;
+        if (mission_state_ == common::MissionState::kVisualHandover &&
+            intent.type == common::ControlIntentType::kPositionGuide) {
+            if (s6_last_position_intent_ms_ != 0) {
+                s6_position_intent_max_gap_ms_ =
+                    std::max(s6_position_intent_max_gap_ms_,
+                             intent.header.receive_time_ms - s6_last_position_intent_ms_);
+            }
+            s6_last_position_intent_ms_ = intent.header.receive_time_ms;
+        }
+        if (intent.type == common::ControlIntentType::kVelocityHeading &&
+            intent.control_source == 1U) {
+            servo_intent_seen_ = true;
+        }
+        if (intent.type == common::ControlIntentType::kBrakeHover) {
+            brake_intent_seen_ = true;
+        }
+        if (backup_position_intent_pending_ &&
+            intent.type == common::ControlIntentType::kPositionGuide) {
+            backup_position_intent_seen_ = true;
+        }
+    }
+
+    // ---- 注入：工具引导意图 / 引导 setpoint 流 ----
+
+    /// 工具引导意图（bootstrap/rebootstrap/模式探针/起飞段）：接管前工具是意图
+    /// 唯一生产者（此时未注入地面站目标，状态机停在 READY 静默）；状态机意图
+    /// 上线后停止注入（bootstrap_intent_active_=false）。
+    void PublishBootstrapIntent(uint64_t now_ms) {
+        if (!bootstrap_intent_active_ || now_ms < next_bootstrap_intent_ms_) {
+            return;
+        }
+        drone::common::ControlIntent intent;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = kMissionIntentValidMs;
+        intent.header.frame_id = kMissionFrameLocalNed;
+        intent.reason_code = drone::common::kControlIntentReasonRequestControl;
+        intent.valid_until_ms = now_ms + kMissionIntentValidMs;
+        if (phase_ == MissionPhase::kTakeoff && takeoff_target_ready_) {
+            intent.type = drone::common::ControlIntentType::kPositionGuide;
+            intent.control_source = 0;  // 位置链（对应 S5 远端引导）
+            intent.target_x = start_x_;
+            intent.target_y = start_y_;
+            intent.target_z = takeoff_target_z_;
+        } else {
+            intent.type = drone::common::ControlIntentType::kVelocityHeading;
+            intent.control_source = 1;  // 零速度保持
+        }
+        (void)intent_topic().Emplace(intent);
+        next_bootstrap_intent_ms_ = now_ms + kMissionIntentPeriodMs;
+    }
+
+    /// 引导零速度流注入（接管前的 setpoint 流来源，见 stage4 类注释）。
+    void InjectGuideSetpoint() {
+        drone::common::Px4Setpoint setpoint;
+        setpoint.header.receive_time_ms = MonotonicMs();
+        setpoint.header.valid_for_ms = 300;
+        setpoint.header.frame_id = kMissionFrameLocalNed;
+        setpoint.type = drone::common::SetpointType::kVelocity;
+        setpoint.valid = true;
+        (void)controller_.SetpointOutput().Emplace(setpoint);
+        ++guide_injected_;
+    }
+
+    // ---- 注入：地面站目标（WGS-84） ----
+
+    /// 注入地面站目标：Home 相对 NED 位置反解 WGS-84 后按 10Hz 发布。
+    /// 反解与 perception::GeodeticToLocalNed 同一局部切平面公式（正向回验，
+    /// 偏差 >0.05m 判装配错误并中止）。
+    void PublishGroundTarget(double north_m, uint32_t target_id, uint64_t now_ms) {
+        if (!target_enabled_ || now_ms < next_target_publish_ms_ || !have_snapshot_ ||
+            !latest_.home_valid) {
+            return;
+        }
+        const double ref_lat = static_cast<double>(latest_.home_lat_1e7) * 1e-7;
+        const double ref_lon = static_cast<double>(latest_.home_lon_1e7) * 1e-7;
+        const double ref_alt = static_cast<double>(latest_.home_altitude_mm) * 1e-3;
+        double lat = 0.0;
+        double lon = 0.0;
+        double alt = 0.0;
+        if (!OffsetToGeodetic(ref_lat, ref_lon, ref_alt, north_m, 0.0,
+                              -kMissionTargetUpM, &lat, &lon, &alt)) {
+            Abort("注入目标反解失败（Home 基准非法）");
+            return;
+        }
+        // 正向回验：同一公式必须还原（防装配式笔误导致注入点漂移）。
+        const auto verify = drone::perception::GeodeticToLocalNed(
+            {ref_lat, ref_lon, ref_alt}, {lat, lon, alt});
+        if (!verify.has_value() ||
+            std::fabs(verify->north_m - north_m) > 0.05 ||
+            std::fabs(verify->down_m + kMissionTargetUpM) > 0.05) {
+            Abort("注入目标反解回验偏差超限（>0.05m）");
+            return;
+        }
+
+        drone::common::GroundStationTarget target;
+        target.header.receive_time_ms = now_ms;
+        target.header.valid_for_ms = kMissionTargetValidMs;
+        target.header.frame_id = 1;  // 1=WGS84 经纬度（与 GroundStationLink 同约定）
+        target.ground_station_boot_id = kMissionGroundBootId;
+        target.update_seq = ++target_update_seq_;
+        target.target_id = target_id;
+        target.latitude_1e7 = static_cast<int32_t>(std::llround(lat * 1e7));
+        target.longitude_1e7 = static_cast<int32_t>(std::llround(lon * 1e7));
+        target.altitude_mm = static_cast<int32_t>(std::llround(alt * 1e3));
+        target.alt_reference = 1;  // 1=MSL（估计器要求；Home 高度同基准）
+        target.protocol_version = 1;
+        target.transport_age_ms = 0;
+        target.validity_flags = kMissionValidityAltitude | kMissionValidityHorizontal |
+                                kMissionValidityVertical;
+        target.horizontal_accuracy_m = 2.0f;
+        target.vertical_accuracy_m = 3.0f;
+        target.heading_deg = std::numeric_limits<float>::quiet_NaN();
+        (void)ground_target_topic_.Emplace(target);
+        next_target_publish_ms_ = now_ms + kMissionTargetPeriodMs;
+    }
+
+    // ---- 注入：模拟视觉观测 + 测距 ----
+
+    /// 注入一帧模拟视觉观测 + 对应测距：相机系坐标由（目标 NED − 自身 NED）
+    /// 经 姿态/安装外参 反变换得到，与 VisualCameraToLocalNed 正变换严格互逆，
+    /// 保证估计器视觉融合的横向位置与地面站目标一致（创新 ≈ 0，滤除几何分歧）。
+    /// distance_valid 独立于视觉状态：模拟"测距仍跟踪但跟踪器判丢"，
+    /// 使 S7 退出由 LOST 迟滞路径唯一决定（测距失效路径由单测覆盖）。
+    /// @return 本拍是否实际注入了一帧（按 20Hz 节流；调用方计数用）。
+    bool PublishSimulatedVision(common::VisualTargetState state, uint64_t now_ms) {
+        if (!vision_enabled_ || now_ms < next_vision_publish_ms_ || !have_snapshot_ ||
+            !latest_.attitude_valid || !latest_.local_position_valid) {
+            return false;
+        }
+        const double target_north = target_north_m_;
+        const double target_east = 0.0;
+        const double target_down = -kMissionTargetUpM;
+        const double north_m =
+            target_north - static_cast<double>(latest_.local_x_m);
+        const double east_m = target_east - static_cast<double>(latest_.local_y_m);
+        const double down_m = target_down - static_cast<double>(latest_.local_z_m);
+        double cam_x = 0.0;
+        double cam_y = 0.0;
+        double cam_z = 0.0;
+        NedToCameraFrame(north_m, east_m, down_m,
+                         static_cast<double>(latest_.roll_rad),
+                         static_cast<double>(latest_.pitch_rad),
+                         static_cast<double>(latest_.yaw_rad), &cam_x, &cam_y, &cam_z);
+        if (cam_z <= 0.1) {
+            Abort("注入视觉几何非法（目标不在相机前向）");
+            return false;
+        }
+        // 像素：与 control::PixelToAngle（angle = atan((pixel − c) / f)）互逆，
+        // 使状态机视线角/视场余量判据对注入几何成立。
+        const double azimuth_rad = std::atan2(cam_x, cam_z);
+        const double elevation_rad = std::atan2(cam_y, cam_z);
+        const float pixel_x = static_cast<float>(
+            camera_.cx_px + camera_.fx_px * std::tan(azimuth_rad));
+        const float pixel_y = static_cast<float>(
+            camera_.cy_px + camera_.fy_px * std::tan(elevation_rad));
+        const bool locked = state == common::VisualTargetState::kLocked;
+        const uint64_t frame_sequence = ++vision_frame_sequence_;
+
+        drone::common::VisualTargetStatus visual;
+        visual.header.receive_time_ms = now_ms;
+        visual.state = state;
+        visual.frame_sequence = frame_sequence;
+        visual.last_seen_ms = locked ? now_ms : visual_last_seen_ms_;
+        visual.consecutive_detected_frames = locked ? visual_locked_streak_ : 0;
+        visual.consecutive_missed_frames = locked ? 0 : visual_lost_streak_;
+        visual.confidence = locked ? 0.90f : 0.0f;
+        visual.center_pixel_x = pixel_x;
+        visual.center_pixel_y = pixel_y;
+        visual.frame_width = static_cast<uint32_t>(camera_.image_width);
+        visual.frame_height = static_cast<uint32_t>(camera_.image_height);
+        visual.valid = locked;
+        (void)visual_topic_.Emplace(visual);
+        if (locked) {
+            ++visual_locked_streak_;
+            visual_lost_streak_ = 0;
+            visual_last_seen_ms_ = now_ms;
+        } else {
+            ++visual_lost_streak_;
+            visual_locked_streak_ = 0;
+        }
+
+        drone::common::StereoTargetDistance distance;
+        distance.header.receive_time_ms = now_ms;
+        distance.header.source_time_ms = now_ms;  // 估计器按 source_time 排序/超龄
+        distance.frame_sequence = frame_sequence;
+        distance.class_id = 0;
+        distance.track_id = 0;
+        distance.forward_distance_m = static_cast<float>(cam_z);
+        distance.slant_range_m =
+            static_cast<float>(std::sqrt(cam_x * cam_x + cam_y * cam_y + cam_z * cam_z));
+        distance.disparity_px = static_cast<float>(fxb_m_px_ / cam_z);
+        distance.confidence = 0.90f;
+        distance.valid = distance_valid_;
+        distance.center_pixel_x_mid = pixel_x;
+        distance.camera_x_m = static_cast<float>(cam_x);
+        distance.camera_y_m = static_cast<float>(cam_y);
+        (void)distance_topic_.Emplace(distance);
+        next_vision_publish_ms_ = now_ms + kMissionVisionPeriodMs;
+        return true;
+    }
+
+    /// 目标 NED 差值 → 基准相机系（右/下/前）坐标：VisualCameraToLocalNed
+    /// 正变换的逐级逆（姿态 R^T → 安装外参逆 → 固定轴置换逆）。
+    void NedToCameraFrame(double north_m, double east_m, double down_m, double roll_rad,
+                          double pitch_rad, double yaw_rad, double* cam_x, double* cam_y,
+                          double* cam_z) const {
+        double r_body[9];
+        RotationRpy(roll_rad, pitch_rad, yaw_rad, r_body);
+        double bx = 0.0;
+        double by = 0.0;
+        double bz = 0.0;
+        ApplyTranspose(r_body, north_m, east_m, down_m, &bx, &by, &bz);
+        // 安装外参：正变换为 b' = R_mount·b + t ⇒ b = R_mount^T·(b' − t)
+        double r_mount[9];
+        RotationRpy(mount_.roll_deg * kMissionDegToRad, mount_.pitch_deg * kMissionDegToRad,
+                    mount_.yaw_deg * kMissionDegToRad, r_mount);
+        double mx = 0.0;
+        double my = 0.0;
+        double mz = 0.0;
+        ApplyTranspose(r_mount, bx - mount_.x_m, by - mount_.y_m, bz - mount_.z_m, &mx, &my,
+                       &mz);
+        // 固定轴置换逆：body = (cam_z, cam_x, cam_y) ⇒ cam = (body_y, body_z, body_x)
+        *cam_x = my;
+        *cam_y = mz;
+        *cam_z = mx;
+    }
+
+    /// 航空 RPY（ZYX）旋转矩阵（行主序，弧度；与 visual_ned_converter.cpp 同式）。
+    static void RotationRpy(double roll, double pitch, double yaw, double out[9]) {
+        const double cr = std::cos(roll);
+        const double sr = std::sin(roll);
+        const double cp = std::cos(pitch);
+        const double sp = std::sin(pitch);
+        const double cy = std::cos(yaw);
+        const double sy = std::sin(yaw);
+        out[0] = cy * cp;
+        out[1] = cy * sp * sr - sy * cr;
+        out[2] = cy * sp * cr + sy * sr;
+        out[3] = sy * cp;
+        out[4] = sy * sp * sr + cy * cr;
+        out[5] = sy * sp * cr - cy * sr;
+        out[6] = -sp;
+        out[7] = cp * sr;
+        out[8] = cp * cr;
+    }
+
+    /// R^T · v（转置左乘）。
+    static void ApplyTranspose(const double m[9], double x, double y, double z, double* out_x,
+                               double* out_y, double* out_z) {
+        *out_x = m[0] * x + m[3] * y + m[6] * z;
+        *out_y = m[1] * x + m[4] * y + m[7] * z;
+        *out_z = m[2] * x + m[5] * y + m[8] * z;
+    }
+
+    /// Home（WGS-84 参考点）按 NED 偏移反解目标 WGS-84（GeodeticToLocalNed 同式反演）。
+    static bool OffsetToGeodetic(double ref_lat_deg, double ref_lon_deg, double ref_alt_m,
+                                 double north_m, double east_m, double down_m,
+                                 double* lat_deg, double* lon_deg, double* alt_m) {
+        constexpr double kWgs84SemiMajorAxisM = 6378137.0;
+        constexpr double kWgs84Flattening = 1.0 / 298.257223563;
+        constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+        const double lat_rad = ref_lat_deg * kDegToRad;
+        const double e2 = kWgs84Flattening * (2.0 - kWgs84Flattening);
+        const double sin_lat = std::sin(lat_rad);
+        const double denom = std::sqrt(1.0 - e2 * sin_lat * sin_lat);
+        const double prime_vertical_radius_m = kWgs84SemiMajorAxisM / denom;
+        const double meridian_radius_m =
+            kWgs84SemiMajorAxisM * (1.0 - e2) / (denom * denom * denom);
+        const double delta_lat_rad = north_m / (meridian_radius_m + ref_alt_m);
+        const double delta_lon_rad =
+            east_m / ((prime_vertical_radius_m + ref_alt_m) * std::cos(lat_rad));
+        *lat_deg = ref_lat_deg + delta_lat_rad / kDegToRad;
+        *lon_deg = ref_lon_deg + delta_lon_rad / kDegToRad;
+        *alt_m = ref_alt_m - down_m;
+        return std::isfinite(*lat_deg) && std::isfinite(*lon_deg) &&
+               std::isfinite(*alt_m);
+    }
+
+    // ---- 命令发送 ----
+
+    bool SendOffboardRequest() {
+        constexpr uint8_t kPx4MainModeOffboard = 6;
+        const bool queued = link_.SendCommand(
+            MAV_CMD_DO_SET_MODE, static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            static_cast<float>(kPx4MainModeOffboard), 0.f, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            offboard_request_time_ms_ = MonotonicMs();
+        }
+        return queued;
+    }
+
+    bool SendArmDisarm(bool arm) {
+        const bool queued = link_.SendCommand(MAV_CMD_COMPONENT_ARM_DISARM, arm ? 1.f : 0.f,
+                                              0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            if (arm) {
+                arm_request_time_ms_ = MonotonicMs();
+            } else {
+                disarm_request_time_ms_ = MonotonicMs();
+            }
+        }
+        return queued;
+    }
+
+    bool SendAutoLand() {
+        constexpr uint8_t kPx4MainModeAuto = 4;
+        constexpr uint8_t kPx4SubModeAutoLand = 6;
+        const bool queued = link_.SendCommand(
+            MAV_CMD_DO_SET_MODE, static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            static_cast<float>(kPx4MainModeAuto), static_cast<float>(kPx4SubModeAutoLand),
+            0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            land_request_time_ms_ = MonotonicMs();
+        }
+        return queued;
+    }
+
+    /// AUTO.LOITER（主模式 4 子模式 3）：G2 补验用"切非 Offboard"目标模式。
+    /// 选 LOITER 而非 POSCTL：无遥控器输入时 LOITER 以 GPS 原地保持，安全可回收。
+    bool SendAutoLoiter() {
+        constexpr uint8_t kPx4MainModeAuto = 4;
+        constexpr uint8_t kPx4SubModeAutoLoiter = 3;
+        const bool queued = link_.SendCommand(
+            MAV_CMD_DO_SET_MODE, static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            static_cast<float>(kPx4MainModeAuto), static_cast<float>(kPx4SubModeAutoLoiter),
+            0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            mode_probe_request_ms_ = MonotonicMs();
+        }
+        return queued;
+    }
+
+    /// 脚本中断：记录原因并按安全回收处理（FinishFlight 统一 AUTO.LAND）。
+    void Abort(const std::string& reason) {
+        if (aborted_) {
+            return;
+        }
+        aborted_ = true;
+        abort_reason_ = reason;
+        std::cout << "[SITL][中断] " << reason << std::endl;
+    }
+
+    // ---- 阶段推进 ----
+
+    void AdvancePhase(uint64_t now_ms, uint64_t elapsed_ms) {
+        switch (phase_) {
+            case MissionPhase::kBootstrap:
+            case MissionPhase::kRebootstrap:
+                AdvanceBootstrap(now_ms, elapsed_ms);
+                return;
+            case MissionPhase::kModeStopProbe:
+                AdvanceModeStopProbe(now_ms);
+                return;
+            case MissionPhase::kTakeoff:
+                AdvanceTakeoff(now_ms);
+                return;
+            case MissionPhase::kFenceProbe:
+                AdvanceFenceProbe(now_ms);
+                return;
+            case MissionPhase::kApproach:
+                AdvanceApproach(now_ms);
+                return;
+            case MissionPhase::kVisualInject:
+                AdvanceVisualInject(now_ms);
+                return;
+            case MissionPhase::kShortLost:
+                AdvanceShortLost(now_ms);
+                return;
+            case MissionPhase::kSustainedLost:
+                AdvanceSustainedLost(now_ms);
+                return;
+            case MissionPhase::kTargetExpiry:
+                AdvanceTargetExpiry(now_ms);
+                return;
+            case MissionPhase::kLand:
+                AdvanceLand(now_ms);
+                return;
+            case MissionPhase::kDone:
+                return;
+        }
+    }
+
+    /// 引导/接管段（两轮共用）：第一轮连接 + ARM；第二轮跳过 ARM（已 armed），
+    /// 由引导流 + Offboard 命令重新接管。
+    void AdvanceBootstrap(uint64_t now_ms, uint64_t elapsed_ms) {
+        const bool rebootstrap = phase_ == MissionPhase::kRebootstrap;
+        if (!link_.IsConnected()) {
+            if (elapsed_ms >= kMissionConnectTimeoutMs) {
+                Abort("连接超时：未收到 PX4 心跳（SITL 未启动或 UDP 配置不符）");
+            }
+            return;
+        }
+        if (bootstrap_start_ms_ == 0) {
+            bootstrap_start_ms_ = now_ms;
+        }
+        if (!guide_started_) {
+            guide_started_ = true;
+            guide_start_ms_ = now_ms;
+            guide_round_start_count_ = guide_injected_;
+            next_guide_publish_ms_ = now_ms;
+            std::cout << "[SITL] 引导阶段开始"
+                      << (rebootstrap ? "（重入 Offboard）" : "") << "：注入零速度引导流"
+                      << std::endl;
+        }
+        if (!rebootstrap && !handover_done_ && now_ms >= next_guide_publish_ms_) {
+            InjectGuideSetpoint();
+            next_guide_publish_ms_ = now_ms + kMissionGuidePeriodMs;
+        }
+        if (rebootstrap && !handover_done_ && now_ms >= next_guide_publish_ms_) {
+            InjectGuideSetpoint();
+            next_guide_publish_ms_ = now_ms + kMissionGuidePeriodMs;
+        }
+        // stage3A 纪律：引导流满足"≥2 秒且 ≥20 条"后才请求 Offboard（按轮计数）
+        if (!offboard_command_queued_ &&
+            guide_injected_ - guide_round_start_count_ >= kMissionGuideMinSends &&
+            now_ms - guide_start_ms_ >= kMissionGuideMinMs) {
+            offboard_command_queued_ = SendOffboardRequest();
+            std::cout << "[SITL] Offboard 模式请求"
+                      << (offboard_command_queued_ ? "已入队" : "入队失败") << std::endl;
+        }
+        if (have_snapshot_) {
+            if (offboard_command_queued_ && !offboard_ack_received_ &&
+                latest_.last_ack_time_ms >= offboard_request_time_ms_ &&
+                latest_.last_ack_command == MAV_CMD_DO_SET_MODE) {
+                offboard_ack_received_ = true;
+                offboard_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+            }
+            offboard_mode_reached_ =
+                offboard_mode_reached_ ||
+                (offboard_command_queued_ && latest_.flight_mode == 6 &&
+                 latest_.flight_sub_mode == 0);
+            if (latest_.flight_mode == 6 && latest_.flight_sub_mode == 0) {
+                out_of_offboard_ = false;  // 已回到 Offboard（模式探针段收场）
+            }
+            if (arm_command_queued_ && !arm_ack_received_ &&
+                latest_.last_ack_time_ms >= arm_request_time_ms_ &&
+                latest_.last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+                arm_ack_received_ = true;
+                arm_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+            }
+            // stage3A 前置条件：Offboard ACK accepted + 真实 6/0 + landed +
+            // 位置/姿态有效，才允许 ARM（第二轮已 armed，本块自动跳过）
+            if (!arm_command_queued_ && offboard_ack_accepted_ && offboard_mode_reached_ &&
+                latest_.connected && !latest_.armed && latest_.landed_state_valid &&
+                latest_.landed && latest_.local_position_valid && latest_.attitude_valid) {
+                arm_command_queued_ = SendArmDisarm(true);
+                std::cout << "[SITL] ARM 请求" << (arm_command_queued_ ? "已入队" : "入队失败")
+                          << std::endl;
+            }
+            if (latest_.armed) {
+                armed_reached_ = true;
+            }
+        }
+        if (armed_reached_) {
+            if (!handover_done_ &&
+                controller_.Authority() == drone::control::ControlAuthority::kActive) {
+                handover_done_ = true;
+                handover_ms_ = now_ms;
+                send_count_at_handover_ = link_.SetpointSendCount();
+                std::cout << "[SITL] 控制器已接管设定值流（授权链全通：armed+Offboard+"
+                             "请求位）"
+                          << (rebootstrap ? "（第二轮）" : "") << std::endl;
+            }
+            if (handover_done_ && !takeover_stream_ok_ &&
+                link_.SetpointSendCount() > send_count_at_handover_) {
+                takeover_stream_ok_ = true;  // 停注后链路发送仍在增长=控制器在供流
+            }
+            if (takeover_stream_ok_ && now_ms - handover_ms_ >= 500) {
+                if (!rebootstrap) {
+                    std::cout << "[SITL] 第一轮接管完成，进入切非 Offboard 停发补验段"
+                              << std::endl;
+                    phase_ = MissionPhase::kModeStopProbe;
+                    probe_start_ms_ = now_ms;
+                    return;
+                }
+                rebootstrap_takeover_seen_ = true;
+                std::cout << "[SITL] 第二轮接管完成，进入工具位置引导起飞段" << std::endl;
+                phase_ = MissionPhase::kTakeoff;
+                takeoff_start_ms_ = now_ms;
+                takeoff_started_ = true;
+                return;
+            }
+        }
+        const uint64_t segment_start_ms =
+            rebootstrap ? rebootstrap_start_ms_ : bootstrap_start_ms_;
+        if (segment_start_ms != 0 &&
+            now_ms - segment_start_ms >= kMissionBootstrapTimeoutMs) {
+            Abort(rebootstrap
+                      ? "重入 Offboard 接管超时（检查引导流/模式 ACK/授权链快照）"
+                      : "引导/Offboard/ARM/接管阶段超时（检查 ACK、模式与授权链）");
+        }
+    }
+
+    /// [G2 补验] 切非 Offboard：飞行/意图活跃中命令 AUTO.LOITER，核验控制器
+    /// 在首个非 Offboard 快照后 ≤200ms（设计 §4）停止发布，并核验发送冻结。
+    void AdvanceModeStopProbe(uint64_t now_ms) {
+        if (!mode_probe_command_queued_) {
+            mode_probe_command_queued_ = SendAutoLoiter();
+            std::cout << "[SITL] 切非 Offboard(AUTO.LOITER) 请求"
+                      << (mode_probe_command_queued_ ? "已入队" : "入队失败") << std::endl;
+        }
+        if (mode_probe_command_queued_ && !mode_change_seen_ && have_snapshot_ &&
+            latest_.flight_mode != 6 && !out_of_offboard_) {
+            mode_change_seen_ = true;
+            mode_change_ms_ = now_ms;
+            out_of_offboard_ = true;
+            sends_at_mode_change_ = link_.SetpointSendCount();
+        }
+        if (mode_change_seen_ && !mode_stop_seen_ &&
+            controller_.Authority() != drone::control::ControlAuthority::kActive) {
+            mode_stop_seen_ = true;
+            mode_stop_ms_ = now_ms;
+        }
+        if (mode_stop_seen_) {
+            // 停发后观察一小段，核验设定值发送冻结（残留队列竞态允许 ≤2 条）
+            if (now_ms - mode_stop_ms_ < kMissionModeStopSettleMs) {
+                return;
+            }
+            sends_after_mode_stop_ = link_.SetpointSendCount() > sends_at_mode_change_
+                ? link_.SetpointSendCount() - sends_at_mode_change_
+                : 0;
+            std::cout << "[SITL] 控制器已停发：首见非 Offboard→停发 "
+                      << mode_stop_ms_ - mode_change_ms_ << " ms（上限 "
+                      << kMissionModeStopLimitMs << "ms），停发后额外发送 "
+                      << sends_after_mode_stop_ << " 条" << std::endl;
+            // 复位引导/接管标志，进入第二轮（重入 Offboard）
+            guide_started_ = false;
+            offboard_command_queued_ = false;
+            offboard_ack_received_ = false;
+            offboard_ack_accepted_ = false;
+            offboard_mode_reached_ = false;
+            handover_done_ = false;
+            takeover_stream_ok_ = false;
+            phase_ = MissionPhase::kRebootstrap;
+            rebootstrap_start_ms_ = now_ms;
+            return;
+        }
+        if (now_ms - probe_start_ms_ >= kMissionProbeTimeoutMs) {
+            Abort("切非 Offboard 后控制器未在限时内停发");
+        }
+    }
+
+    /// 工具位置引导意图起飞至相对 1m 并稳定悬停（与 stage4 起飞段同窗口）。
+    void AdvanceTakeoff(uint64_t now_ms) {
+        if (!takeoff_target_ready_ || !latest_.local_position_valid) {
+            if (now_ms - takeoff_start_ms_ >= kMissionTakeoffTimeoutMs) {
+                Abort("起飞超时：位置基准缺失或位置遥测无效");
+            }
+            return;
+        }
+        const float ascent_m = start_z_ - latest_.local_z_m;
+        const float dx = latest_.local_x_m - start_x_;
+        const float dy = latest_.local_y_m - start_y_;
+        const float drift_m = std::sqrt(dx * dx + dy * dy);
+        if (ascent_m > kMissionMaxHeightM ||
+            drift_m > kMissionHoverDriftM + kMissionFenceToleranceM) {
+            Abort("起飞段高度/漂移超包线");
+            return;
+        }
+        const bool inside_window =
+            std::fabs(latest_.local_z_m - takeoff_target_z_) <= kMissionHoverZErrorM &&
+            drift_m <= kMissionHoverDriftM && std::fabs(latest_.vz_mps) <= kMissionHoverVzMps;
+        if (inside_window) {
+            if (hover_stable_since_ms_ == 0) {
+                hover_stable_since_ms_ = now_ms;
+            }
+            hover_complete_ = now_ms - hover_stable_since_ms_ >= kMissionHoverStableMs;
+        } else {
+            hover_stable_since_ms_ = 0;
+        }
+        if (hover_complete_) {
+            std::cout << "[SITL] 悬停稳定完成，注入围栏外目标（北向 "
+                      << kMissionFenceProbeNorthM << "m > max_radius "
+                      << controller_config_.max_radius_m << "m）" << std::endl;
+            target_north_m_ = kMissionFenceProbeNorthM;
+            fence_probe_clamped_at_ = controller_.ClampedCount();
+            phase_ = MissionPhase::kFenceProbe;
+            phase_start_ms_ = now_ms;
+            return;
+        }
+        if (now_ms - takeoff_start_ms_ >= kMissionTakeoffTimeoutMs) {
+            Abort("起飞/悬停超时（检查 home_valid 与位置意图是否被控制拒绝）");
+        }
+    }
+
+    /// 注入围栏外目标：位置引导意图指向 150m，控制器应钳制到 max_radius。
+    /// 验收证据：ClampedCount 增长 + 实测位置设定值水平模长 ≤ 围栏（+容差）。
+    void AdvanceFenceProbe(uint64_t now_ms) {
+        PublishGroundTarget(kMissionFenceProbeNorthM, kMissionTargetIdProbe, now_ms);
+        if (mission_state_ == common::MissionState::kGpsApproach && sm_intent_seen_ &&
+            !bootstrap_intent_active_stopped_) {
+            bootstrap_intent_active_ = false;  // 状态机意图已上线：工具停止注入意图
+            bootstrap_intent_active_stopped_ = true;
+            std::cout << "[SITL] 状态机已接管意图流（S5 位置引导），工具停止注入引导意图"
+                      << std::endl;
+        }
+        if (mission_state_ == common::MissionState::kGpsApproach &&
+            controller_.ClampedCount() > fence_probe_clamped_at_) {
+            fence_clamp_seen_ = true;
+        }
+        if (fence_clamp_seen_ && sm_intent_seen_ &&
+            now_ms - phase_start_ms_ >= 2000) {
+            std::cout << "[SITL] 围栏钳制证据成立：ClampedCount +"
+                      << controller_.ClampedCount() - fence_probe_clamped_at_
+                      << "，最大位置设定值水平模长 " << max_position_norm_m_ << " m（围栏 "
+                      << controller_config_.max_radius_m << " m）；换注入近距目标（北向 "
+                      << kMissionTargetNorthM << "m）" << std::endl;
+            target_north_m_ = kMissionTargetNorthM;
+            phase_ = MissionPhase::kApproach;
+            phase_start_ms_ = now_ms;
+            return;
+        }
+        if (now_ms - phase_start_ms_ >= kMissionProbeTimeoutMs) {
+            Abort("围栏探针段超时：未观测到状态机位置意图或围栏钳制");
+        }
+    }
+
+    /// 注入近距目标：S5 位置引导（状态机唯一意图生产者）。
+    void AdvanceApproach(uint64_t now_ms) {
+        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        if (mission_state_ == common::MissionState::kGpsApproach && sm_intent_seen_ &&
+            now_ms - phase_start_ms_ >= 2000) {
+            std::cout << "[SITL] S5 位置引导稳定，开始注入模拟视觉观测"
+                         "（SEARCHING → LOCKED）"
+                      << std::endl;
+            vision_enabled_ = true;
+            vision_search_until_ms_ = now_ms + kMissionVisualSearchMs;
+            phase_ = MissionPhase::kVisualInject;
+            phase_start_ms_ = now_ms;
+            return;
+        }
+        if (now_ms - phase_start_ms_ >= kMissionProbeTimeoutMs) {
+            Abort("S5 位置引导段超时：状态机未发布位置引导意图");
+        }
+    }
+
+    /// 注入 SEARCHING → LOCKED 帧序列：S5→S6（冻结位置意图续发）→ S7（视觉伺服）。
+    void AdvanceVisualInject(uint64_t now_ms) {
+        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        if (now_ms < vision_search_until_ms_) {
+            PublishSimulatedVision(common::VisualTargetState::kSearching, now_ms);
+            return;
+        }
+        if (vision_lock_started_ms_ == 0) {
+            vision_lock_started_ms_ = now_ms;
+            std::cout << "[SITL] 注入 LOCKED 帧序列（lock_frames=" << handover_.lock_frames
+                      << "，exit_lost_frames=" << handover_.exit_lost_frames
+                      << "，创新门限 " << handover_.innovation_gate_m << "m）" << std::endl;
+        }
+        PublishSimulatedVision(common::VisualTargetState::kLocked, now_ms);
+        if (mission_state_ == common::MissionState::kVisualTracking && servo_intent_seen_) {
+            // S6 冻结续发缺口判据在视觉伺服接管时刻定格（设计 §2.5 无扰衔接）。
+            s6_frozen_gap_ok_ = s6_position_intent_max_gap_ms_ > 0 &&
+                                s6_position_intent_max_gap_ms_ < kMissionIntentValidMs;
+            std::cout << "[SITL] S6→S7 完成（S6 冻结续发最大间隔 "
+                      << s6_position_intent_max_gap_ms_ << " ms），视觉伺服意图已启动，"
+                      << "进入短期 LOST 注入段" << std::endl;
+            short_lost_frames_ = 0;
+            phase_ = MissionPhase::kShortLost;
+            phase_start_ms_ = now_ms;
+            return;
+        }
+        if (now_ms - phase_start_ms_ >= kMissionProbeTimeoutMs) {
+            Abort("交接段超时：未进入 S7 或伺服意图未启动（查创新/测距/姿态与门限）");
+        }
+    }
+
+    /// 短期 LOST（< exit_lost_frames）：保持 S7，输出判丢零速刹车意图。
+    void AdvanceShortLost(uint64_t now_ms) {
+        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        if (short_lost_frames_ < kMissionShortLostFrames) {
+            if (PublishSimulatedVision(common::VisualTargetState::kLost, now_ms)) {
+                ++short_lost_frames_;
+            }
+            return;
+        }
+        short_lost_kept_s7_ = mission_state_ == common::MissionState::kVisualTracking;
+        std::cout << "[SITL] 短期 LOST " << kMissionShortLostFrames << " 帧注入完成：状态="
+                  << static_cast<int>(mission_state_) << "（期望 S7 保持），刹车意图="
+                  << YesNo(brake_intent_seen_) << std::endl;
+        sustained_lost_frames_ = 0;
+        phase_ = MissionPhase::kSustainedLost;
+        phase_start_ms_ = now_ms;
+    }
+
+    /// 持续 LOST（达 exit_lost_frames）：回退 S5，卡尔曼备份接管位置引导。
+    void AdvanceSustainedLost(uint64_t now_ms) {
+        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        if (mission_state_ == common::MissionState::kVisualTracking) {
+            if (sustained_lost_frames_ <= handover_.exit_lost_frames + 5) {
+                if (PublishSimulatedVision(common::VisualTargetState::kLost, now_ms)) {
+                    ++sustained_lost_frames_;
+                }
+            }
+            return;
+        }
+        // 已回退（S5）：确认卡尔曼备份位置意图恢复（估计仍新鲜）
+        if (mission_state_ == common::MissionState::kGpsApproach) {
+            if (!fallback_seen_) {
+                fallback_seen_ = true;
+                backup_position_intent_pending_ = true;
+                std::cout << "[SITL] 持续 LOST 回退 S5（控制权不中断），等待卡尔曼备份接管"
+                          << std::endl;
+            }
+            if (backup_position_intent_seen_ || now_ms - phase_start_ms_ >= 3000) {
+                vision_enabled_ = false;  // 视觉链随目标一起收场
+                std::cout << "[SITL] 卡尔曼备份位置意图恢复："
+                          << YesNo(backup_position_intent_seen_) << "；停止注入目标（过期）"
+                          << std::endl;
+                target_enabled_ = false;
+                expiry_stop_ms_ = now_ms;
+                expect_offboard_exit_ = true;  // 停发链的 Offboard 退出属预期
+                phase_ = MissionPhase::kTargetExpiry;
+                phase_start_ms_ = now_ms;
+            }
+            return;
+        }
+        if (now_ms - phase_start_ms_ >= kMissionProbeTimeoutMs) {
+            Abort("持续 LOST 段超时：状态机未回退 S5");
+        }
+    }
+
+    /// 目标过期：位置意图停发 → COAST 刹车 → IDLE → PX4 退出 Offboard。
+    void AdvanceTargetExpiry(uint64_t now_ms) {
+        if (!coast_seen_ &&
+            controller_.Authority() == drone::control::ControlAuthority::kCoast) {
+            coast_seen_ = true;
+            coast_ms_ = now_ms;
+            std::cout << "[SITL] 目标过期后意图停发，控制器进入 COAST 零速刹车" << std::endl;
+        }
+        if (!idle_seen_ &&
+            controller_.Authority() == drone::control::ControlAuthority::kIdle) {
+            idle_seen_ = true;
+            idle_ms_ = now_ms;
+            sends_at_idle_ = link_.SetpointSendCount();
+            std::cout << "[SITL] 控制器转 IDLE 停发（COAST 超时），等待 PX4 退出 Offboard"
+                      << std::endl;
+        }
+        // 意图停发：距最后一条状态机意图超过意图有效期（valid_for_ms）仍无新意图。
+        expiry_intent_stop_seen_ =
+            expiry_intent_stop_seen_ ||
+            (last_sm_intent_ms_ != 0 && now_ms - last_sm_intent_ms_ > kMissionIntentValidMs);
+        if (idle_seen_ && !offboard_exit_seen_ && have_snapshot_ &&
+            latest_.flight_mode != 6) {
+            offboard_exit_seen_ = true;
+            offboard_exit_ms_ = now_ms;
+            offboard_exit_mode_ = latest_.flight_mode;
+            offboard_exit_sub_mode_ = latest_.flight_sub_mode;
+            std::cout << "[SITL] PX4 已退出 Offboard: mode="
+                      << static_cast<int>(offboard_exit_mode_) << '/'
+                      << static_cast<int>(offboard_exit_sub_mode_) << "（IDLE 后 "
+                      << offboard_exit_ms_ - idle_ms_ << " ms）" << std::endl;
+            land_command_queued_ = SendAutoLand();
+            std::cout << "[SITL] AUTO.LAND 模式请求"
+                      << (land_command_queued_ ? "已入队" : "入队失败") << std::endl;
+            phase_ = MissionPhase::kLand;
+            return;
+        }
+        if (now_ms - phase_start_ms_ >= kMissionExpiryTimeoutMs) {
+            Abort("目标过期停发链未在限时内完成（COAST/IDLE/退出 Offboard）");
+        }
+    }
+
+    void AdvanceLand(uint64_t now_ms) {
+        if (have_snapshot_ && land_command_queued_ && !land_ack_received_ &&
+            latest_.last_ack_time_ms >= land_request_time_ms_ &&
+            latest_.last_ack_command == MAV_CMD_DO_SET_MODE) {
+            land_ack_received_ = true;
+            land_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+        }
+        if (have_snapshot_ && land_ack_accepted_ && latest_.landed_state_valid &&
+            latest_.landed) {
+            landed_after_flight_ = true;
+            std::cout << "[SITL] PX4 已确认降落，准备主动 DISARM" << std::endl;
+            phase_ = MissionPhase::kDone;
+            return;
+        }
+        if (now_ms - land_request_time_ms_ >= kMissionLandTimeoutMs) {
+            Abort("AUTO.LAND 后未确认 landed");
+        }
+    }
+
+    // ---- 观测与安全 ----
+
+    void PrintStateChange() {
+        if (latest_.connected == last_connected_ && latest_.armed == last_armed_ &&
+            latest_.flight_mode == last_mode_ &&
+            latest_.flight_sub_mode == last_sub_mode_) {
+            return;
+        }
+        std::cout << "[状态变化] connected=" << YesNo(latest_.connected)
+                  << " armed=" << YesNo(latest_.armed)
+                  << " mode=" << static_cast<int>(latest_.flight_mode) << '/'
+                  << static_cast<int>(latest_.flight_sub_mode) << std::endl;
+        last_connected_ = latest_.connected;
+        last_armed_ = latest_.armed;
+        last_mode_ = latest_.flight_mode;
+        last_sub_mode_ = latest_.flight_sub_mode;
+    }
+
+    /// 每秒打印任务摘要（状态机状态 + 告警位 + 估计目标 + 注入状态）。
+    void PrintMissionSummary() const {
+        std::cout << "  状态机: state=" << static_cast<int>(mission_state_)
+                  << " warnings=0x" << std::hex << mission_warning_bits_ << std::dec
+                  << " 注入目标北向=" << target_north_m_
+                  << " 视觉=" << (vision_enabled_ ? "注入中" : "停") << " 卡尔曼="
+                  << (has_estimate_ ? (latest_estimate_.valid ? "有效" : "失效")
+                                    : "未初始化");
+        if (has_estimate_) {
+            std::cout << " 估计(N/E/D)=(" << latest_estimate_.pos_x_m << ","
+                      << latest_estimate_.pos_y_m << "," << latest_estimate_.pos_z_m
+                      << ")";
+        }
+        std::cout << " 控制权=" << AuthorityText(controller_.Authority()) << std::endl;
+    }
+
+    /// 飞行安全包线：armed 期间连接/位置/姿态异常或越界立即 AUTO.LAND 回收。
+    void CheckFlightEnvelope() {
+        if (armed_reached_ && !latest_.armed && !disarm_command_queued_) {
+            unexpected_disarm_before_command_ = true;
+        }
+        if (!latest_.armed || land_command_queued_ || safety_violation_) {
+            return;
+        }
+        if (!latest_.connected || !latest_.local_position_valid ||
+            !latest_.attitude_valid) {
+            safety_violation_ = true;
+            std::cout << "[SITL][安全回收] 连接、位置或姿态失效" << std::endl;
+            return;
+        }
+        // 非预期退出 Offboard（模式探针段主动切出、目标过期停发链属预期，其余异常）
+        if (!out_of_offboard_ && !expect_offboard_exit_ && latest_.flight_mode != 6) {
+            safety_violation_ = true;
+            std::cout << "[SITL][安全回收] 非预期退出 Offboard（mode="
+                      << static_cast<int>(latest_.flight_mode) << "）" << std::endl;
+            return;
+        }
+        if (!takeoff_target_ready_) {
+            return;
+        }
+        const float ascent_m = start_z_ - latest_.local_z_m;
+        const float north_m = latest_.local_x_m - start_x_;
+        const float east_m = std::fabs(latest_.local_y_m - start_y_);
+        max_ascent_m_ = std::max(max_ascent_m_, ascent_m);
+        max_north_m_ = std::max(max_north_m_, north_m);
+        max_east_m_ = std::max(max_east_m_, east_m);
+        const double radius = std::hypot(static_cast<double>(latest_.local_x_m),
+                                         static_cast<double>(latest_.local_y_m));
+        // 高度下限只对升空后（起飞完成后的引导/交接/停发段）生效：起飞前
+        // 机体在地面（相对高度 0），不得按"低于下限"误判安全回收。
+        const bool airborne = phase_ == MissionPhase::kFenceProbe ||
+                              phase_ == MissionPhase::kApproach ||
+                              phase_ == MissionPhase::kVisualInject ||
+                              phase_ == MissionPhase::kShortLost ||
+                              phase_ == MissionPhase::kSustainedLost ||
+                              phase_ == MissionPhase::kTargetExpiry;
+        const bool height_out =
+            ascent_m > kMissionMaxHeightM || (airborne && ascent_m < kMissionMinHeightM);
+        const bool horizontal_out =
+            north_m > kMissionNorthMarginM + static_cast<float>(kMissionTargetNorthM) ||
+            east_m > kMissionMaxEastM ||
+            radius > controller_config_.max_radius_m + kMissionFenceToleranceM;
+        if (height_out || horizontal_out) {
+            safety_violation_ = true;
+            std::cout << "[SITL][安全回收] 高度/水平位移超包线: 相对高度 " << ascent_m
+                      << " m，北向 " << north_m << " m，东西 " << east_m
+                      << " m，半径 " << radius << " m" << std::endl;
+        }
+    }
+
+    /// 交接/回退段（S5 位置引导→S7 伺服→回退 S5）控制权必须连续保持 ACTIVE。
+    void CheckAuthorityContinuity() {
+        if (phase_ == MissionPhase::kFenceProbe || phase_ == MissionPhase::kApproach ||
+            phase_ == MissionPhase::kVisualInject ||
+            phase_ == MissionPhase::kShortLost || phase_ == MissionPhase::kSustainedLost) {
+            if (controller_.Authority() != drone::control::ControlAuthority::kActive) {
+                authority_uninterrupted_ = false;
+            }
+        }
+    }
+
+    /// 交接/回退全程速度式设定值的最大隐含加速度（输出连续性验收；段首按
+    /// "位置式→速度式从 0 起步"守卫核验，见 FlightController 无扰衔接）。
+    double MaxObservedSlewMps2() const {
+        double max_slew = 0.0;
+        bool have_prev_velocity = false;
+        uint64_t prev_velocity_ms = 0;
+        float prev_vx = 0.f;
+        float prev_vy = 0.f;
+        float prev_vz = 0.f;
+        uint64_t last_sample_ms = 0;
+        for (const auto& setpoint : setpoints_) {
+            if (setpoint.header.receive_time_ms == 0) {
+                continue;
+            }
+            if (!setpoint.valid ||
+                setpoint.type != drone::common::SetpointType::kVelocity) {
+                have_prev_velocity = false;
+                last_sample_ms = setpoint.header.receive_time_ms;
+                continue;
+            }
+            const uint64_t sample_ms = setpoint.header.receive_time_ms;
+            if (have_prev_velocity && sample_ms > prev_velocity_ms) {
+                const double dt = static_cast<double>(sample_ms - prev_velocity_ms) / 1000.0;
+                const double dv = std::sqrt(Squared(setpoint.x - prev_vx) +
+                                            Squared(setpoint.y - prev_vy) +
+                                            Squared(setpoint.z - prev_vz));
+                max_slew = std::max(max_slew, dv / dt);
+            } else if (!have_prev_velocity && sample_ms > last_sample_ms) {
+                const double dt = static_cast<double>(sample_ms - last_sample_ms) / 1000.0;
+                const double dv = std::sqrt(Squared(setpoint.x) + Squared(setpoint.y) +
+                                            Squared(setpoint.z));
+                max_slew = std::max(max_slew, dv / dt);
+            }
+            have_prev_velocity = true;
+            prev_velocity_ms = sample_ms;
+            prev_vx = setpoint.x;
+            prev_vy = setpoint.y;
+            prev_vz = setpoint.z;
+            last_sample_ms = sample_ms;
+        }
+        return max_slew;
+    }
+
+    static double Squared(float value) {
+        return static_cast<double>(value) * static_cast<double>(value);
+    }
+
+    /// 状态序列包含给定子序列（按出现顺序）。
+    bool SequenceContains(const std::vector<common::MissionState>& expected) const {
+        std::size_t index = 0;
+        for (const auto state : state_sequence_) {
+            if (index < expected.size() && state == expected[index]) {
+                ++index;
+            }
+        }
+        return index == expected.size();
+    }
+
+    std::string StateSequenceText() const {
+        std::string text;
+        for (const auto state : state_sequence_) {
+            if (!text.empty()) {
+                text += " → ";
+            }
+            text += std::to_string(static_cast<int>(state));
+        }
+        return text.empty() ? "（无）" : text;
+    }
+
+    static const char* AuthorityText(drone::control::ControlAuthority authority) {
+        switch (authority) {
+            case drone::control::ControlAuthority::kIdle:
+                return "IDLE";
+            case drone::control::ControlAuthority::kActive:
+                return "ACTIVE";
+            case drone::control::ControlAuthority::kCoast:
+                return "COAST";
+        }
+        return "未知";
+    }
+
+    /// 收尾：未落地先强制 AUTO.LAND 回收（禁止空中 DISARM），确认 landed 后主动 DISARM。
+    void FinishFlight() {
+        const bool armed_now = armed_reached_ || latest_.armed;
+        if (armed_now && !landed_after_flight_) {
+            if (!land_command_queued_) {
+                land_command_queued_ = SendAutoLand();
+                std::cout << "[SITL] 异常回收 AUTO.LAND 请求"
+                          << (land_command_queued_ ? "已入队" : "入队失败") << std::endl;
+            }
+            const uint64_t deadline = MonotonicMs() + kMissionLandTimeoutMs;
+            while (MonotonicMs() < deadline) {
+                if (auto message =
+                        subscription_.WaitTakeFor(std::chrono::milliseconds(100))) {
+                    latest_ = **message;
+                    UpdateObserved(latest_, &observed_);
+                    if (land_command_queued_ && !land_ack_received_ &&
+                        latest_.last_ack_time_ms >= land_request_time_ms_ &&
+                        latest_.last_ack_command == MAV_CMD_DO_SET_MODE) {
+                        land_ack_received_ = true;
+                        land_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+                    }
+                    if (latest_.landed_state_valid && latest_.landed) {
+                        landed_after_flight_ = true;
+                        break;
+                    }
+                }
+            }
+            std::cout << "[SITL] 回收结果: landed=" << YesNo(landed_after_flight_)
+                      << std::endl;
+        }
+        if (armed_now && landed_after_flight_) {
+            while (subscription_.TryTake()) {
+                // 清除排队旧快照，避免用解锁前 armed=false 误判上锁完成。
+            }
+            disarm_command_queued_ = SendArmDisarm(false);
+            std::cout << "[SITL] DISARM 请求"
+                      << (disarm_command_queued_ ? "已入队" : "入队失败") << std::endl;
+            const uint64_t deadline = MonotonicMs() + 5000;
+            while (MonotonicMs() < deadline) {
+                if (auto message =
+                        subscription_.WaitTakeFor(std::chrono::milliseconds(100))) {
+                    latest_ = **message;
+                    UpdateObserved(latest_, &observed_);
+                    if (disarm_command_queued_ &&
+                        latest_.last_ack_time_ms >= disarm_request_time_ms_ &&
+                        latest_.last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+                        disarm_ack_received_ = true;
+                        disarm_ack_accepted_ =
+                            latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+                    }
+                    if (disarm_ack_accepted_ && !latest_.armed) {
+                        disarmed_confirmed_ = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    drone::common::Topic<drone::common::ControlIntent>& intent_topic() {
+        return machine_.IntentOutput();
+    }
+
+    // ---- 依赖 ----
+    drone::communication::Px4Link& link_;
+    drone::control::FlightController& controller_;
+    drone::state_machine::MissionStateMachine& machine_;
+    drone::common::Topic<drone::common::GroundStationTarget>& ground_target_topic_;
+    drone::common::Topic<drone::common::VisualTargetStatus>& visual_topic_;
+    drone::common::Topic<drone::common::StereoTargetDistance>& distance_topic_;
+    drone::common::Topic<drone::common::TargetState>& estimated_topic_;
+    const drone::config::FlightControllerConfig& controller_config_;
+    const drone::config::HandoverConfig& handover_;
+    const drone::control::TrackingCameraGroupConfig& camera_;
+    const drone::perception::VisualMountExtrinsics& mount_;
+    const double fxb_m_px_ = 0.0;  // 校正矩阵同源深度系数（装配入口注入）
+    uint64_t duration_ms_ = 0;
+    drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription subscription_;
+    drone::common::Topic<drone::common::MissionStatus>::Subscription status_subscription_;
+    drone::common::Topic<drone::common::ControlIntent>::Subscription intent_subscription_;
+    drone::common::Topic<drone::common::Px4Setpoint>::Subscription setpoint_subscription_;
+    drone::common::Topic<drone::common::TargetState>::Subscription estimated_subscription_;
+
+    // ---- 观测 ----
+    drone::common::FlightStateSnapshot latest_;
+    bool have_snapshot_ = false;
+    ObservedState observed_;
+    bool last_connected_ = false;
+    bool last_armed_ = false;
+    uint8_t last_mode_ = 0;
+    uint8_t last_sub_mode_ = 0;
+    std::vector<drone::common::ControlIntent> intents_;
+    std::vector<drone::common::Px4Setpoint> setpoints_;
+    std::vector<common::MissionState> state_sequence_;
+    common::MissionState mission_state_ = common::MissionState::kBoot;
+    uint32_t mission_warning_bits_ = 0;
+    uint32_t warning_bits_seen_ = 0;
+
+    // ---- 脚本推进 ----
+    MissionPhase phase_ = MissionPhase::kBootstrap;
+    bool aborted_ = false;
+    std::string abort_reason_;
+    uint64_t phase_start_ms_ = 0;
+    uint64_t probe_start_ms_ = 0;
+    bool bootstrap_intent_active_ = true;
+    bool bootstrap_intent_active_stopped_ = false;
+    uint64_t next_bootstrap_intent_ms_ = 0;
+    uint64_t next_guide_publish_ms_ = 0;
+    bool guide_started_ = false;
+    uint64_t guide_start_ms_ = 0;
+    uint64_t guide_injected_ = 0;
+    uint64_t next_target_publish_ms_ = 0;
+    uint32_t target_update_seq_ = 0;
+    bool target_enabled_ = true;
+    bool vision_enabled_ = false;
+    bool distance_valid_ = true;
+    uint64_t next_vision_publish_ms_ = 0;
+    uint64_t vision_frame_sequence_ = 0;
+    uint64_t visual_locked_streak_ = 0;
+    uint64_t visual_lost_streak_ = 0;
+    uint64_t visual_last_seen_ms_ = 0;
+    uint64_t vision_search_until_ms_ = 0;
+    uint64_t vision_lock_started_ms_ = 0;
+    double target_north_m_ = 0.0;
+    bool has_estimate_ = false;
+    drone::common::TargetState latest_estimate_;
+
+    // 引导/Offboard/ARM/接管
+    bool offboard_command_queued_ = false;
+    bool offboard_ack_received_ = false;
+    bool offboard_ack_accepted_ = false;
+    bool offboard_mode_reached_ = false;
+    uint64_t offboard_request_time_ms_ = 0;
+    bool arm_command_queued_ = false;
+    bool arm_ack_received_ = false;
+    bool arm_ack_accepted_ = false;
+    bool armed_reached_ = false;
+    uint64_t arm_request_time_ms_ = 0;
+    bool handover_done_ = false;
+    bool takeover_stream_ok_ = false;
+    uint64_t handover_ms_ = 0;
+    uint64_t send_count_at_handover_ = 0;
+    bool rebootstrap_takeover_seen_ = false;
+    uint64_t bootstrap_start_ms_ = 0;
+    uint64_t rebootstrap_start_ms_ = 0;
+    uint64_t guide_round_start_count_ = 0;
+    bool expect_offboard_exit_ = false;
+
+    // 模式停发补验
+    bool mode_probe_command_queued_ = false;
+    uint64_t mode_probe_request_ms_ = 0;
+    bool mode_change_seen_ = false;
+    uint64_t mode_change_ms_ = 0;
+    bool mode_stop_seen_ = false;
+    uint64_t mode_stop_ms_ = 0;
+    uint64_t sends_at_mode_change_ = 0;
+    uint64_t sends_after_mode_stop_ = 0;
+    bool out_of_offboard_ = false;
+
+    // 起飞/悬停
+    bool takeoff_target_ready_ = false;
+    float start_x_ = 0.f;
+    float start_y_ = 0.f;
+    float start_z_ = 0.f;
+    float takeoff_target_z_ = 0.f;
+    bool takeoff_started_ = false;
+    uint64_t takeoff_start_ms_ = 0;
+    bool hover_complete_ = false;
+    uint64_t hover_stable_since_ms_ = 0;
+
+    // 围栏/交接/回退
+    uint64_t fence_probe_clamped_at_ = 0;
+    bool fence_clamp_seen_ = false;
+    double max_position_norm_m_ = 0.0;  // 位置设定值水平模长峰值（围栏钳制验收）
+    uint64_t velocity_sample_count_ = 0;  // 速度式设定值样本数（连续性判据非空前提）
+    bool sm_intent_seen_ = false;
+    bool servo_intent_seen_ = false;
+    bool brake_intent_seen_ = false;
+    uint64_t s6_last_position_intent_ms_ = 0;
+    uint64_t s6_position_intent_max_gap_ms_ = 0;
+    bool s6_frozen_gap_ok_ = false;
+    uint64_t short_lost_frames_ = 0;
+    bool short_lost_kept_s7_ = false;
+    uint64_t sustained_lost_frames_ = 0;
+    bool fallback_seen_ = false;
+    bool backup_position_intent_pending_ = false;
+    bool backup_position_intent_seen_ = false;
+    bool authority_uninterrupted_ = true;
+
+    // 过期/停发/降落
+    uint64_t expiry_stop_ms_ = 0;
+    uint64_t last_sm_intent_ms_ = 0;  // 最近一条状态机意图时刻（停发判定）
+    bool expiry_warning_seen_ = false;
+    bool expiry_intent_stop_seen_ = false;
+    bool coast_seen_ = false;
+    uint64_t coast_ms_ = 0;
+    bool idle_seen_ = false;
+    uint64_t idle_ms_ = 0;
+    uint64_t sends_at_idle_ = 0;
+    bool offboard_exit_seen_ = false;
+    uint64_t offboard_exit_ms_ = 0;
+    uint8_t offboard_exit_mode_ = 0;
+    uint8_t offboard_exit_sub_mode_ = 0;
+    bool land_command_queued_ = false;
+    bool land_ack_received_ = false;
+    bool land_ack_accepted_ = false;
+    uint64_t land_request_time_ms_ = 0;
+    bool landed_after_flight_ = false;
+    bool disarm_command_queued_ = false;
+    bool disarm_ack_received_ = false;
+    bool disarm_ack_accepted_ = false;
+    bool disarmed_confirmed_ = false;
+    uint64_t disarm_request_time_ms_ = 0;
+    bool unexpected_disarm_before_command_ = false;
+
+    // 安全/包线
+    bool safety_violation_ = false;
+    float max_ascent_m_ = 0.f;
+    float max_north_m_ = 0.f;
+    float max_east_m_ = 0.f;
+};
+
+/// stage4-mission 入口：装配状态机全链（G3）并运行脚本。
+int RunStage4Mission(drone::communication::Px4Link& link, const std::string& config_path,
+                     const Options& options) {
+    // 全量配置：controller/handover/visual_tracking/target_estimator 等整节同源，
+    // 与正式装配一致（config 缺节时用默认值，与 LoadAppConfig 行为一致）。
+    const drone::config::AppConfig app =
+        drone::config::LoadAppConfig(config_path, ExecDir());
+
+    // 视觉融合：正式装配置位依赖 runtime 开关（工具注入模拟测距，不经相机链路，
+    // 故等价补齐）；fxb 深度系数仍从校正矩阵同源文件读取（单一真源）。
+    drone::perception::TargetEstimatorConfig estimator_config = app.target_estimator;
+    const double fxb_m_px =
+        LoadRectifyFxb(config_path, app.stereo_ranger.rectify_matrices_path);
+    estimator_config.visual.enabled = true;
+    estimator_config.visual.fxb_m_px = fxb_m_px;
+    estimator_config.Validate();
+
+    drone::common::Topic<drone::common::GroundStationTarget> ground_target_topic;
+    drone::common::Topic<drone::common::HealthStatus> health_topic;  // 状态机未消费内容
+    drone::common::Topic<drone::common::VisualTargetStatus> visual_topic;
+    drone::common::Topic<drone::common::StereoTargetDistance> distance_topic;
+
+    drone::perception::TargetEstimator estimator(estimator_config);
+    estimator.SetGroundTargetInput(ground_target_topic);
+    estimator.SetFlightStateInput(link.StateOutput());
+    estimator.SetVisualDistanceInput(distance_topic);
+
+    drone::state_machine::MissionStateMachineConfig mission_config;
+    mission_config.intent_valid_for = app.controller.intent_timeout;
+    mission_config.handover = app.handover;
+    mission_config.tracking = app.visual_tracking;
+    mission_config.visual_stale = std::chrono::milliseconds(
+        app.visual_tracking.control.visual_stale_ms);
+    mission_config.distance_stale = std::chrono::milliseconds(
+        app.visual_tracking.control.distance_stale_ms);
+    mission_config.actuator = app.actuator;
+    drone::state_machine::MissionStateMachine machine(mission_config);
+
+    drone::control::FlightController controller(app.controller);
+    controller.SetInput(machine.IntentOutput());
+    controller.SetPx4LinkSource(&link);
+    link.SetInput(controller.SetpointOutput());
+
+    machine.SetInputs(ground_target_topic, link.StateOutput(), health_topic);
+    machine.SetEstimationInputs(estimator.EstimatedOutput(), visual_topic, distance_topic);
+    machine.SetEstimationDiagnostics(&estimator);
+
+    std::cout << "  状态机: lock_frames=" << app.handover.lock_frames
+              << " exit_lost_frames=" << app.handover.exit_lost_frames
+              << " handover_timeout=" << app.handover.timeout.count()
+              << "ms innovation_gate=" << app.handover.innovation_gate_m
+              << "m fow_margin=" << app.handover.fow_margin_deg << "deg"
+              << " intent_valid=" << app.controller.intent_timeout.count() << "ms"
+              << std::endl;
+    std::cout << "  注入几何: 探针目标北向 " << kMissionFenceProbeNorthM
+              << "m（> max_radius " << app.controller.max_radius_m
+              << "m），主目标北向 " << kMissionTargetNorthM << "m，目标高度 +"
+              << kMissionTargetUpM << "m；相机 " << app.visual_tracking.camera.image_width
+              << "x" << app.visual_tracking.camera.image_height << " fx="
+              << app.visual_tracking.camera.fx_px << std::endl;
+
+    auto subscription = link.StateOutput().Subscribe(128);
+    Stage4MissionRun run(link, controller, machine, ground_target_topic, visual_topic,
+                         distance_topic, estimator.EstimatedOutput(), app, fxb_m_px,
+                         options.duration, std::move(subscription));
+    // 装配期自检先于任何 Start（fail-fast，不进入运行态）：注入几何反变换必须
+    // 与估计器正变换互逆，否则注入观测与卡尔曼航迹偏离、创新门限误拒交接。
+    if (!run.VerifyInjectionGeometry()) {
+        std::cerr << "[FAIL] 注入几何自检失败（反变换与正变换不互逆），拒绝开跑"
+                  << std::endl;
+        return 1;
+    }
+    if (!link.Start()) {
+        std::cerr << "[FAIL] PX4 链路启动失败，请检查 UDP 端口占用与配置" << std::endl;
+        return 2;
+    }
+    if (!estimator.Start()) {
+        std::cerr << "[FAIL] 目标估计器启动失败" << std::endl;
+        link.Stop();
+        return 2;
+    }
+    if (!machine.Start()) {
+        std::cerr << "[FAIL] 任务状态机启动失败" << std::endl;
+        estimator.Stop();
+        link.Stop();
+        return 2;
+    }
+    if (!controller.Start()) {
+        std::cerr << "[FAIL] 飞行控制器启动失败" << std::endl;
+        machine.Stop();
+        estimator.Stop();
+        link.Stop();
+        return 2;
+    }
+    run.Execute();
+    const bool connected_at_end = link.IsConnected();
+    controller.Stop();
+    machine.Stop();
+    estimator.Stop();
+    link.Stop();
+    return run.Evaluate(connected_at_end) ? 0 : 3;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1372,7 +3117,8 @@ int main(int argc, char** argv) {
             options.sitl_offboard_disarmed || sitl_arm_test;
         const bool sitl_setpoint_test =
             options.sitl_zero_velocity || sitl_offboard_test;
-        if ((sitl_setpoint_test || options.sitl_stage4_controller) &&
+        if ((sitl_setpoint_test || options.sitl_stage4_controller ||
+             options.sitl_stage4_mission) &&
             config.transport != "udp") {
             throw std::invalid_argument("SITL 设定值参数只允许 transport=udp，禁止在真实串口运行");
         }
@@ -1397,7 +3143,10 @@ int main(int argc, char** argv) {
                   << "  firmware: " << config.firmware_version << '\n'
                   << "  duration: " << options.duration.count() << " 秒\n"
                   << "  安全边界: "
-                  << (options.sitl_stage4_controller
+                  << (options.sitl_stage4_mission
+                          ? "SITL UDP 装配状态机全链（G3）：注入地面站目标 + 模拟视觉"
+                            "观测，走通 S5/S6/S7/回退/停发；含围栏钳制与模式停发补验"
+                          : (options.sitl_stage4_controller
                           ? "SITL UDP 装配真实 FlightController，意图脚本驱动全链；"
                             "零速漂移/阶跃斜率/停发刹车/Offboard 退出时延验收"
                           : (options.sitl_offboard_loss
@@ -1412,7 +3161,7 @@ int main(int argc, char** argv) {
                                  ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
                                  : (options.sitl_zero_velocity
                                         ? "SITL UDP 零速度流，不切模式、不解锁"
-                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")))))))
+                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令"))))))))
                   << '\n'
                   << std::endl;
 
@@ -1421,6 +3170,10 @@ int main(int argc, char** argv) {
             // stage4 独立装配（意图主题 + FlightController + Px4Link）与独立报告，
             // 与 stage 0~3D 的直发 setpoint 路径完全分离。
             return RunStage4(link, root, options);
+        }
+        if (options.sitl_stage4_mission) {
+            // stage4-mission（G3）独立装配：状态机全链 + 注入上游，独立报告。
+            return RunStage4Mission(link, config_path, options);
         }
         drone::common::Topic<drone::common::Px4Setpoint> setpoint_topic;
         if (sitl_setpoint_test) {
