@@ -84,6 +84,9 @@ struct HandoverConfig {
     double innovation_gate_m = 3.0;     // 视觉观测与卡尔曼预测创新门限（米）
     std::chrono::milliseconds timeout{3000};  // S6 驻留超时
     uint32_t exit_lost_frames = 30;     // S7 退出：LOST 连续帧数（必须 > lock_frames）
+    /// S7 退出：双目测距失效（invalid 或超龄）连续达该时长即回退——覆盖
+    /// "测距丢失但视觉仍锁定"的收口（no_distance_action 不触发 kExit 的档位）
+    std::chrono::milliseconds distance_lost_ms{3000};
     void Validate() const;
 };
 

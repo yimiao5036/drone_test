@@ -70,6 +70,10 @@ constexpr const char* kReasonHandoverTimeout =
     "S6驻留超时（首条视觉指令未生效），回GPS_APPROACH";
 constexpr const char* kReasonVisualTrackingExit =
     "视觉连续丢失达退出迟滞门限，回退GPS_APPROACH";
+constexpr const char* kReasonVisionStreamLost =
+    "视觉状态断流超龄（监视器/链路中断），退出VISUAL_TRACKING回GPS_APPROACH";
+constexpr const char* kReasonDistanceLostExit =
+    "双目测距失效达距离丢失门限，退出VISUAL_TRACKING回GPS_APPROACH";
 
 /// 交接进入判据输入（阶段四 Task 8；纯数据，供判定函数与 Task 9 复用）。
 struct HandoverInputs {
@@ -519,6 +523,7 @@ private:
         consecutive_lost_frames_ = 0;
         s6_lock_baseline_ = 0;
         s6_entered_ms_ = 0;
+        distance_lost_since_ms_.reset();
     }
 
     /// 交接判据总入口（S5→S6→S7 推进与 S7 退出迟滞）。
@@ -535,7 +540,7 @@ private:
                 EvaluateVisualHandover(now_ms);
                 break;
             case common::MissionState::kVisualTracking:
-                EvaluateVisualTrackingExit();
+                EvaluateVisualTrackingExit(now_ms);
                 break;
             default:
                 break;
@@ -587,16 +592,78 @@ private:
         }
     }
 
-    /// S7 退出迟滞：LOST 连续帧数达 handover.exit_lost_frames 才回退 S5
-    /// （进入门限 lock_frames 与退出门限 exit_lost_frames 不同，防两状态抖动）；
-    /// 未达门限保持 S7，短时丢失的图像空间 coast 由 Task 9 的视觉伺服承担。
-    /// 注：设计 §2.3 的"距离失效超时"退出路径无对应配置项，归 Task 9/后续任务。
-    void EvaluateVisualTrackingExit() {
-        if (consecutive_lost_frames_ < handover_.exit_lost_frames) {
+    /// S7 退出（三条独立路径，任一成立即回退 S5）：
+    /// ① 视觉状态断流：最近一条 VisualTargetStatus 的接收年龄超过 S6 进入判据
+    ///    所用的同一视觉新鲜度阈值（监视器线程死亡/链路中断时无 LOST 消息可计数、
+    ///    帧序冻结，按超龄直接收口）；
+    /// ② 测距失效连续计时达 handover.distance_lost_ms（valid=false 或超龄；
+    ///    恢复有效即清零）——覆盖"测距丢失但视觉仍锁定"的收口；
+    /// ③ 视觉 LOST 连续帧数达 handover.exit_lost_frames（进入 lock_frames 与
+    ///    退出 exit_lost_frames 门限不同防抖动）。
+    /// 未达门限保持 S7，短时丢失的图像空间 coast 由 Task 9 的视觉伺服承担
+    /// （监视器按 publish_interval≈100ms 发布，健康流不会触及 200ms 超龄阈值）。
+    void EvaluateVisualTrackingExit(uint64_t now_ms) {
+        if (VisualStatusStale(now_ms)) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach, kReasonVisionStreamLost);
             return;
         }
-        ResetHandoverHysteresis();
-        TransitionTo(common::MissionState::kGpsApproach, kReasonVisualTrackingExit);
+        UpdateDistanceLostTimer(now_ms);
+        if (distance_lost_since_ms_.has_value() &&
+            now_ms - *distance_lost_since_ms_ >=
+                static_cast<uint64_t>(handover_.distance_lost_ms.count())) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach,
+                         kReasonDistanceLostExit);
+            return;
+        }
+        if (consecutive_lost_frames_ >= handover_.exit_lost_frames) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach,
+                         kReasonVisualTrackingExit);
+        }
+    }
+
+    /// 测距失效计时（S7 专用）：invalid 或超龄即累计起始时刻，恢复有效清零。
+    void UpdateDistanceLostTimer(uint64_t now_ms) {
+        if (DistanceLost(now_ms)) {
+            if (!distance_lost_since_ms_.has_value()) {
+                distance_lost_since_ms_ = now_ms;
+            }
+            return;
+        }
+        distance_lost_since_ms_.reset();
+    }
+
+    /// 测距是否失效：无测距快照、valid=false 或接收超龄（阈值与进入判据同源）。
+    bool DistanceLost(uint64_t now_ms) const {
+        if (!latest_distance_) {
+            return true;
+        }
+        if (!latest_distance_->valid) {
+            return true;
+        }
+        return !DistanceFresh(now_ms);
+    }
+
+    /// 测距接收是否新鲜（存在且未超龄；valid 单独判定，供进入判据两字段使用）。
+    bool DistanceFresh(uint64_t now_ms) const {
+        if (!latest_distance_) {
+            return false;
+        }
+        return !control::StalenessChecker::IsStale(
+            static_cast<int64_t>(latest_distance_->header.receive_time_ms),
+            static_cast<int64_t>(now_ms), distance_stale_ms_);
+    }
+
+    /// 视觉状态是否断流：无状态消息或接收超龄（阈值与进入判据同源）。
+    bool VisualStatusStale(uint64_t now_ms) const {
+        if (!latest_visual_status_) {
+            return true;
+        }
+        return control::StalenessChecker::IsStale(
+            static_cast<int64_t>(latest_visual_status_->header.receive_time_ms),
+            static_cast<int64_t>(now_ms), visual_stale_ms_);
     }
 
     /// 进入判据整体核验：视觉状态新鲜 + 卡尔曼估计存活 + 四项判据（纯函数）。
@@ -604,12 +671,7 @@ private:
     /// receive_time + 注入的超龄阈值判定；估计新鲜是创新门限的前提
     /// （卡尔曼必须存活，预测才有意义）。
     bool HandoverEntrySatisfied(uint64_t now_ms) const {
-        if (!latest_visual_status_) {
-            return false;
-        }
-        if (control::StalenessChecker::IsStale(
-                static_cast<int64_t>(latest_visual_status_->header.receive_time_ms),
-                static_cast<int64_t>(now_ms), visual_stale_ms_)) {
+        if (VisualStatusStale(now_ms)) {
             return false;
         }
         if (!HasFreshEstimate(now_ms)) {
@@ -637,9 +699,7 @@ private:
         }
         if (latest_distance_) {
             in.distance_valid = latest_distance_->valid;
-            in.distance_fresh = !control::StalenessChecker::IsStale(
-                static_cast<int64_t>(latest_distance_->header.receive_time_ms),
-                static_cast<int64_t>(now_ms), distance_stale_ms_);
+            in.distance_fresh = DistanceFresh(now_ms);
         }
         if (estimator_diagnostics_ != nullptr) {
             in.innovation_distance_m =
@@ -847,6 +907,8 @@ private:
     std::optional<uint64_t> last_counted_locked_frame_;  ///< 去重：最近计数的锁定帧序号
     uint64_t s6_lock_baseline_ = 0;  ///< S6 进入时的锁定计数（S6→S7 需再推进）
     uint64_t s6_entered_ms_ = 0;     ///< S6 进入时刻（驻留超时基准）
+    /// S7 测距失效计时起始时刻（nullopt=测距未失效；恢复有效即清零）
+    std::optional<uint64_t> distance_lost_since_ms_;
     bool estimation_inputs_active_ = false;  ///< 估计/视觉/测距输入组已成功订阅
     bool position_intent_active_ = false;    ///< S5 位置引导意图发布中
     uint64_t intent_sequence_ = 0;

@@ -724,6 +724,19 @@ TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
     EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
     EXPECT_EQ(config.handover.lock_frames, 10u);
     EXPECT_EQ(config.handover.exit_lost_frames, 30u);
+    EXPECT_EQ(config.handover.distance_lost_ms, std::chrono::milliseconds(3000));
+}
+
+TEST(ConfigTest, RejectsNonPositiveHandoverDistanceLost) {
+    // S7 测距失效退出计时门限必须为正：0 → 拒绝（否则进 S7 立即超时退出）
+    json value = ReadSourceConfig();
+    value["handover"]["distance_lost_ms"] = 0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_handover_distance_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
 }
 
 TEST(ConfigTest, RejectsHandoverExitNotGreaterThanEnter) {

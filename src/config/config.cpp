@@ -495,6 +495,8 @@ void HandoverConfig::Validate() const {
     if (fow_margin_deg <= 0.0) throw std::invalid_argument("handover.fow_margin_deg 必须为正");
     if (innovation_gate_m <= 0.0) throw std::invalid_argument("handover.innovation_gate_m 必须为正");
     if (timeout.count() <= 0) throw std::invalid_argument("handover.timeout_ms 必须为正");
+    if (distance_lost_ms.count() <= 0)
+        throw std::invalid_argument("handover.distance_lost_ms 必须为正");
 }
 
 // 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
@@ -719,6 +721,8 @@ AppConfig LoadAppConfig(const std::string& path,
         handover, "timeout_ms", config.handover.timeout);
     config.handover.exit_lost_frames =
         handover.value("exit_lost_frames", config.handover.exit_lost_frames);
+    config.handover.distance_lost_ms = ReadOptionalPositiveMilliseconds(
+        handover, "distance_lost_ms", config.handover.distance_lost_ms);
     config.handover.Validate();
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。

@@ -181,7 +181,7 @@ Topic 一览：
   ./build/stereo_ranger_test        # 组件：接线校验、settle/新序号闭合、每框一条、
                                     # 右帧缺失降级、Stop 幂等与重启、
                                     # 摘要静默抑制（静默不打印/活动恢复打印）
-  ctest --test-dir build --output-on-failure     # 基线 409/409
+  ctest --test-dir build --output-on-failure     # 基线 412/412
   ./build/stereo_ranger_bench 30    # 性能基准（开发机；输出各阶段 avg/p95，内部自动开诊断）
   ./build/stereo_ranger_bench 30 --no-stats   # 同上但关诊断（=生产默认），用于 A/B 诊断开销
   ```
