@@ -69,7 +69,8 @@ constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
 /// 告警位：VISUAL_TRACKING 期间本拍未发出视觉伺服意图——伺服尚未启动
 /// （S6/S7 过渡期仍在续发冻结位置意图）或控制律降级停发（姿态/视觉超龄，
 /// 控制器意图超时门禁接手刹停）。标注"S7 报告状态与实际控制输出背离"，
-/// 供地面站/Web 观测（T9 评审裁决 I2，阶段四 Task 12 落地）。
+/// 供地面站观测（65013 全量下发；Web UI 渲染待补。T9 评审裁决 I2，
+/// 阶段四 Task 12 落地）。
 constexpr uint32_t kWarningServoSuspended = 1U << 3U;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。

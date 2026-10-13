@@ -1455,7 +1455,7 @@ constexpr float kMissionNorthMarginM = 6.0f;       // 主目标北向包线余�
 constexpr double kMissionTargetNorthM = 40.0;      // 主目标北向距离（Home 相对）
 constexpr double kMissionFenceProbeNorthM = 150.0; // 围栏探针目标（须 > max_radius）
 constexpr double kMissionTargetUpM = 1.0;          // 目标高度（相对 Home，与悬停同高）
-constexpr uint64_t kMissionIntentValidMs = 500;    // 工具引导意图有效期
+constexpr uint64_t kMissionToolIntentValidMs = 500;  // 工具引导意图有效期（工具自用）
 constexpr uint64_t kMissionIntentPeriodMs = 100;   // 工具引导意图周期（10Hz）
 constexpr uint64_t kMissionGuidePeriodMs = 100;    // 引导 setpoint 流周期（10Hz）
 constexpr uint64_t kMissionGuideMinSends = 20;     // 引导流最小条数（stage3A 纪律）
@@ -1511,7 +1511,7 @@ public:
         drone::common::Topic<drone::common::StereoTargetDistance>& distance_topic,
         drone::common::Topic<drone::common::TargetState>& estimated_topic,
         const drone::config::AppConfig& app_config, double fxb_m_px,
-        std::chrono::seconds duration,
+        uint64_t intent_valid_ms, std::chrono::seconds duration,
         drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription
             subscription)
         : link_(link),
@@ -1526,6 +1526,7 @@ public:
           camera_(app_config.visual_tracking.camera),
           mount_(app_config.target_estimator.visual.mount),
           fxb_m_px_(fxb_m_px),
+          intent_valid_ms_(intent_valid_ms),
           duration_ms_(static_cast<uint64_t>(duration.count()) * 1000),
           subscription_(std::move(subscription)) {
         status_subscription_ = machine_.StatusOutput().Subscribe(64);
@@ -1658,7 +1659,7 @@ public:
                                                     common::MissionState::kVisualHandover,
                                                     common::MissionState::kVisualTracking,
                                                     common::MissionState::kGpsApproach});
-        const bool frozen_ok = s6_frozen_gap_ok_;
+        const bool seam_ok = handover_seam_ok_;
         const bool servo_ok = servo_intent_seen_;
         const bool short_lost_ok = short_lost_kept_s7_ && brake_intent_seen_;
         const bool fallback_ok = fallback_seen_ && backup_position_intent_seen_ &&
@@ -1691,8 +1692,9 @@ public:
         PrintCheck("状态机接管意图流(S5 位置引导 reason=7)",
                    sm_takeover_ok, true);
         PrintCheck("迁移序列 S5→S6→S7→(LOST 回退)S5", migration_ok, true);
-        PrintCheck("S6 冻结位置意图续发无缺口(< intent_timeout)",
-                   frozen_ok, true);
+        PrintCheck("交接缝意图无超龄(末条S5位置意图→首条S7速度意图 < intent_timeout"
+                   " 且未跌入 COAST)",
+                   seam_ok, true);
         PrintCheck("S7 视觉伺服意图启动(control_source=1)", servo_ok, true);
         PrintCheck("短期 LOST 保持 S7 且输出零速刹车意图", short_lost_ok, true);
         PrintCheck("持续 LOST 回退 S5 且卡尔曼备份接管(位置意图恢复)",
@@ -1723,9 +1725,12 @@ public:
                   << sends_after_mode_stop << " 条），围栏探针最大设定值水平模长 "
                   << max_position_norm_m_ << " m（围栏 " << controller_config_.max_radius_m
                   << " m），速度设定值最大隐含加速度 " << max_slew << " m/s²（上限 "
-                  << slew_limit << "），S5→S6 冻结续发最大间隔 "
-                  << s6_position_intent_max_gap_ms_ << " ms（意图有效期 "
-                  << kMissionIntentValidMs << " ms）" << std::endl;
+                  << slew_limit << "），交接缝（末条S5位置→首条S7速度） "
+                  << handover_seam_gap_ms_ << " ms（意图有效期 " << intent_valid_ms_
+                  << " ms，窗口内 COAST=" << YesNo(coast_during_seam_)
+                  << "，伺服接管前意图最大间隔 " << pre_servo_max_intent_gap_ms_
+                  << " ms，S6 冻结续发观察=" << YesNo(s6_frozen_intent_seen_) << "）"
+                  << std::endl;
         std::cout << "实测时延: 过期→COAST "
                   << (coast_seen_ && expiry_stop_ms_ ? coast_ms_ - expiry_stop_ms_ : 0)
                   << " ms，COAST→IDLE "
@@ -1753,7 +1758,7 @@ public:
                             link_.ErrorCount() == 0 &&
                             guide_injected_ >= kMissionGuideMinSends && takeover_ok &&
                             mode_stop_ok && rebootstrap_ok && takeoff_ok && fence_ok &&
-                            sm_takeover_ok && migration_ok && frozen_ok && servo_ok &&
+                            sm_takeover_ok && migration_ok && seam_ok && servo_ok &&
                             short_lost_ok && fallback_ok && continuity_ok && expiry_ok &&
                             land_ok && disarm_ok && !safety_violation_ &&
                             controller_.ErrorCount() == 0;
@@ -1804,7 +1809,15 @@ private:
         }
     }
 
-    /// 意图轨迹记录（交接验收：S6 冻结续发缺口、S7 伺服启动、回退后位置意图恢复）。
+    /// 意图轨迹记录（交接验收：交接缝意图无超龄、S7 伺服启动、回退后位置意图恢复）。
+    ///
+    /// 交接缝判据口径（T12 评审修复，Critical）：**不按 S6 驻留期取样**——lock_frames
+    /// 门限 + 20Hz 注入使 S6 只驻留 1 决策拍（S6→S7 只需再推进 1 个新 LOCKED 帧），
+    /// S6 标签样本恒 ≤1 条、间隔恒 0，按间隔断言会把行为正确的系统判 FAIL。改为
+    /// 跨缝测量：末条 **S5 位置意图** → 首条 **S7 视觉速度意图** 的间隔必须小于状态机
+    /// 意图有效期（`controller.intent_timeout`），且该窗口内控制器不得跌入 COAST
+    /// （意图超龄的唯一直接后果）——等价于设计 §2.5"交接点不得出现意图超龄→刹车→
+    /// 再起步"。S6 期间的冻结续发仅作诊断统计（是否观察到 S6 标签的冻结位置意图）。
     void NoteIntent(const drone::common::ControlIntent& intent) {
         const bool from_state_machine =
             (intent.reason_code & 0xFFU) == kMissionReasonGroundStationTask;
@@ -1813,18 +1826,30 @@ private:
         }
         sm_intent_seen_ = true;
         last_sm_intent_ms_ = intent.header.receive_time_ms;
-        if (mission_state_ == common::MissionState::kVisualHandover &&
-            intent.type == common::ControlIntentType::kPositionGuide) {
-            if (s6_last_position_intent_ms_ != 0) {
-                s6_position_intent_max_gap_ms_ =
-                    std::max(s6_position_intent_max_gap_ms_,
-                             intent.header.receive_time_ms - s6_last_position_intent_ms_);
+        if (!servo_intent_seen_) {
+            // 诊断（不断言）：伺服接管前（S5 引导 + 交接缝）相邻意图的最大间隔——
+            // 交接缝判据 FAIL 时据此区分"意图链真断档"（间隔 ≥ 有效期内含 S6/S7
+            // 冻结续发缺口）与"仅 S5→S7 过渡耗时偏长"（间隔仍 < 有效期）。
+            if (pre_servo_last_intent_ms_ != 0) {
+                pre_servo_max_intent_gap_ms_ =
+                    std::max(pre_servo_max_intent_gap_ms_,
+                             intent.header.receive_time_ms - pre_servo_last_intent_ms_);
             }
-            s6_last_position_intent_ms_ = intent.header.receive_time_ms;
+            pre_servo_last_intent_ms_ = intent.header.receive_time_ms;
+        }
+        if (intent.type == common::ControlIntentType::kPositionGuide) {
+            if (mission_state_ == common::MissionState::kGpsApproach) {
+                s5_last_position_intent_ms_ = intent.header.receive_time_ms;
+            } else if (mission_state_ == common::MissionState::kVisualHandover) {
+                s6_frozen_intent_seen_ = true;  // 诊断：S6 驻留期的冻结续发已观察到
+            }
         }
         if (intent.type == common::ControlIntentType::kVelocityHeading &&
             intent.control_source == 1U) {
-            servo_intent_seen_ = true;
+            if (!servo_intent_seen_) {
+                servo_intent_seen_ = true;
+                first_servo_intent_ms_ = intent.header.receive_time_ms;
+            }
         }
         if (intent.type == common::ControlIntentType::kBrakeHover) {
             brake_intent_seen_ = true;
@@ -1846,10 +1871,10 @@ private:
         }
         drone::common::ControlIntent intent;
         intent.header.receive_time_ms = now_ms;
-        intent.header.valid_for_ms = kMissionIntentValidMs;
+        intent.header.valid_for_ms = kMissionToolIntentValidMs;
         intent.header.frame_id = kMissionFrameLocalNed;
         intent.reason_code = drone::common::kControlIntentReasonRequestControl;
-        intent.valid_until_ms = now_ms + kMissionIntentValidMs;
+        intent.valid_until_ms = now_ms + kMissionToolIntentValidMs;
         if (phase_ == MissionPhase::kTakeoff && takeoff_target_ready_) {
             intent.type = drone::common::ControlIntentType::kPositionGuide;
             intent.control_source = 0;  // 位置链（对应 S5 远端引导）
@@ -2464,11 +2489,21 @@ private:
         }
         PublishSimulatedVision(common::VisualTargetState::kLocked, now_ms);
         if (mission_state_ == common::MissionState::kVisualTracking && servo_intent_seen_) {
-            // S6 冻结续发缺口判据在视觉伺服接管时刻定格（设计 §2.5 无扰衔接）。
-            s6_frozen_gap_ok_ = s6_position_intent_max_gap_ms_ > 0 &&
-                                s6_position_intent_max_gap_ms_ < kMissionIntentValidMs;
-            std::cout << "[SITL] S6→S7 完成（S6 冻结续发最大间隔 "
-                      << s6_position_intent_max_gap_ms_ << " ms），视觉伺服意图已启动，"
+            // 交接缝判据在视觉伺服接管时刻定格（设计 §2.5 无扰衔接）：
+            // 末条 S5 位置意图 → 首条 S7 速度意图 < 意图有效期，且窗口内未跌入 COAST。
+            if (first_servo_intent_ms_ != 0 && s5_last_position_intent_ms_ != 0 &&
+                first_servo_intent_ms_ >= s5_last_position_intent_ms_) {
+                handover_seam_gap_ms_ =
+                    first_servo_intent_ms_ - s5_last_position_intent_ms_;
+            }
+            handover_seam_ok_ = handover_seam_gap_ms_ > 0 &&
+                                handover_seam_gap_ms_ < intent_valid_ms_ &&
+                                !coast_during_seam_;
+            std::cout << "[SITL] S6→S7 完成：交接缝间隔 " << handover_seam_gap_ms_
+                      << " ms（上限 " << intent_valid_ms_ << " ms，窗口内 COAST="
+                      << YesNo(coast_during_seam_) << "；伺服接管前意图最大间隔 "
+                      << pre_servo_max_intent_gap_ms_ << " ms；S6 冻结续发意图观察="
+                      << YesNo(s6_frozen_intent_seen_) << "），视觉伺服意图已启动，"
                       << "进入短期 LOST 注入段" << std::endl;
             short_lost_frames_ = 0;
             phase_ = MissionPhase::kShortLost;
@@ -2554,7 +2589,7 @@ private:
         // 意图停发：距最后一条状态机意图超过意图有效期（valid_for_ms）仍无新意图。
         expiry_intent_stop_seen_ =
             expiry_intent_stop_seen_ ||
-            (last_sm_intent_ms_ != 0 && now_ms - last_sm_intent_ms_ > kMissionIntentValidMs);
+            (last_sm_intent_ms_ != 0 && now_ms - last_sm_intent_ms_ > intent_valid_ms_);
         if (idle_seen_ && !offboard_exit_seen_ && have_snapshot_ &&
             latest_.flight_mode != 6) {
             offboard_exit_seen_ = true;
@@ -2684,12 +2719,20 @@ private:
     }
 
     /// 交接/回退段（S5 位置引导→S7 伺服→回退 S5）控制权必须连续保持 ACTIVE。
+    /// 另单独记录**交接缝窗口内**（伺服启动前的引导/交接段）是否跌入 COAST——
+    /// 该窗口内 COAST 只可能由意图超龄触发，是"交接点意图断档"的直接证据。
     void CheckAuthorityContinuity() {
         if (phase_ == MissionPhase::kFenceProbe || phase_ == MissionPhase::kApproach ||
             phase_ == MissionPhase::kVisualInject ||
             phase_ == MissionPhase::kShortLost || phase_ == MissionPhase::kSustainedLost) {
             if (controller_.Authority() != drone::control::ControlAuthority::kActive) {
                 authority_uninterrupted_ = false;
+            }
+            if (!servo_intent_seen_ &&
+                (phase_ == MissionPhase::kApproach ||
+                 phase_ == MissionPhase::kVisualInject) &&
+                controller_.Authority() == drone::control::ControlAuthority::kCoast) {
+                coast_during_seam_ = true;
             }
         }
     }
@@ -2851,6 +2894,7 @@ private:
     const drone::control::TrackingCameraGroupConfig& camera_;
     const drone::perception::VisualMountExtrinsics& mount_;
     const double fxb_m_px_ = 0.0;  // 校正矩阵同源深度系数（装配入口注入）
+    uint64_t intent_valid_ms_ = 0;  // 状态机意图有效期（= controller.intent_timeout）
     uint64_t duration_ms_ = 0;
     drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription subscription_;
     drone::common::Topic<drone::common::MissionStatus>::Subscription status_subscription_;
@@ -2953,9 +2997,14 @@ private:
     bool sm_intent_seen_ = false;
     bool servo_intent_seen_ = false;
     bool brake_intent_seen_ = false;
-    uint64_t s6_last_position_intent_ms_ = 0;
-    uint64_t s6_position_intent_max_gap_ms_ = 0;
-    bool s6_frozen_gap_ok_ = false;
+    uint64_t s5_last_position_intent_ms_ = 0;  ///< 末条 S5 位置引导意图时刻
+    uint64_t first_servo_intent_ms_ = 0;       ///< 首条 S7 视觉速度意图时刻
+    uint64_t handover_seam_gap_ms_ = 0;        ///< 交接缝间隔（上述两者之差）
+    bool handover_seam_ok_ = false;            ///< 交接缝判据（含窗口内 COAST 核验）
+    bool coast_during_seam_ = false;           ///< 交接缝窗口内是否跌入 COAST
+    bool s6_frozen_intent_seen_ = false;       ///< 诊断：观察到 S6 标签的冻结续发意图
+    uint64_t pre_servo_last_intent_ms_ = 0;    ///< 诊断：伺服接管前最近一条意图时刻
+    uint64_t pre_servo_max_intent_gap_ms_ = 0; ///< 诊断：伺服接管前意图最大间隔
     uint64_t short_lost_frames_ = 0;
     bool short_lost_kept_s7_ = false;
     uint64_t sustained_lost_frames_ = 0;
@@ -3061,6 +3110,7 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
     auto subscription = link.StateOutput().Subscribe(128);
     Stage4MissionRun run(link, controller, machine, ground_target_topic, visual_topic,
                          distance_topic, estimator.EstimatedOutput(), app, fxb_m_px,
+                         static_cast<uint64_t>(app.controller.intent_timeout.count()),
                          options.duration, std::move(subscription));
     // 装配期自检先于任何 Start（fail-fast，不进入运行态）：注入几何反变换必须
     // 与估计器正变换互逆，否则注入观测与卡尔曼航迹偏离、创新门限误拒交接。
