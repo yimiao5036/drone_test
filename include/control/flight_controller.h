@@ -104,7 +104,8 @@ enum class ControlAuthority : uint8_t { kIdle, kActive, kCoast };
 ///   SetPx4LinkSource 接口已预留，本任务仅存指针不做判定。
 class FlightController final : public IFlightController {
 public:
-    /// 配置在 LoadAppConfig 加载期已 Validate() 校验（fail-fast）。
+    /// 配置在 LoadAppConfig 加载期已 Validate() 校验（fail-fast）；
+    /// 构造函数另做本地防御：period<=0 直接抛 std::invalid_argument。
     explicit FlightController(const config::FlightControllerConfig& config);
     ~FlightController() override;
 

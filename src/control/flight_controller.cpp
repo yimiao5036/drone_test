@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -112,7 +113,12 @@ class FlightController::Impl {
 public:
     explicit Impl(const config::FlightControllerConfig& config) : config_(config) {
         // 配置在 LoadAppConfig 加载期已 Validate() 校验（fail-fast）；
-        // 此处不再重复校验，避免 drone_control_core → drone_config 的链接依赖反转。
+        // 此处不调用 drone::config::Validate()（避免 drone_control_core →
+        // drone_config 链接依赖反转），但对周期做本地防御：period<=0 会让
+        // Run() 的 sleep_until 立即返回、周期线程退化为忙等空转。
+        if (config_.period.count() <= 0) {
+            throw std::invalid_argument("controller.period_ms 必须为正");
+        }
     }
 
     ~Impl() { Stop(); }

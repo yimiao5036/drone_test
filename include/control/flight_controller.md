@@ -58,9 +58,11 @@ common::Topic<Px4Setpoint> ──► IPx4Link（PX4 通信线程）
 - **线程安全**：`latest_intent_`/`setpoint_sequence_` 仅周期线程访问；
   诊断计数与控制权状态为原子量，跨线程只读。
 - **生命周期**：`Start()`/`Stop()` 幂等（`compare_exchange`/`exchange`）；
-  构造不重复校验配置（加载期 `LoadAppConfig` 已 `Validate()` fail-fast，
-  避免 drone_control_core → drone_config 链接依赖反转）；析构 RAII 自动
-  Stop 并 join 线程。
+  构造不调用 `drone::config::Validate()`（加载期 `LoadAppConfig` 已校验，
+  且避免 drone_control_core → drone_config 链接依赖反转），但对
+  `period<=0` 做本地防御——构造期抛 `std::invalid_argument`
+  （否则周期线程 `sleep_until` 立即返回、退化为忙等空转）；析构 RAII
+  自动 Stop 并 join 线程。
 
 ## 日志行为
 

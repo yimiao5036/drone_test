@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -58,6 +59,14 @@ common::ControlIntent MakeVelocityIntent(double vx, double vy, double vz) {
 }
 
 }  // namespace
+
+TEST(FlightControllerTest, ConstructorRejectsNonPositivePeriod) {
+    // 本地防御：period<=0 会让周期线程 sleep_until 立即返回、退化为忙等空转，
+    // 构造期 fail-fast 抛 std::invalid_argument（不依赖 drone_config 的 Validate）。
+    auto config = MakeControllerConfig();
+    config.period = 0ms;
+    EXPECT_THROW(FlightController controller(config), std::invalid_argument);
+}
 
 TEST(FlightControllerTest, IdlePublishesNothingWithoutAuthority) {
     // 未获授权（默认 IDLE）：即使有意图也不发布任何 setpoint
