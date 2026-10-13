@@ -236,6 +236,11 @@ struct FlightStateSnapshot {
     bool gps_state_valid = false;
     bool gps_fix = false;
     uint8_t gps_fix_type = 0;     ///< MAVLink GPS_FIX_TYPE
+    uint8_t gps_satellites_visible = 0;  ///< 可见卫星数（gps_satellites_valid=true 时有效）
+    bool gps_satellites_valid = false;
+    float gps_eph_m = 0.f;        ///< 水平定位精度（米，gps_accuracy_valid=true 时有效）
+    float gps_epv_m = 0.f;        ///< 垂直定位精度（米，同上）
+    bool gps_accuracy_valid = false;
     bool global_position_valid = false;
     int32_t latitude_1e7 = 0;     ///< 全局位置 WGS-84 ×1e7
     int32_t longitude_1e7 = 0;

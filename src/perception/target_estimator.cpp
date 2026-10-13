@@ -7,9 +7,11 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
+#include <spdlog/fmt/fmt.h>
 #include <spdlog/spdlog.h>
 
 #include "perception/geodetic_converter.h"
@@ -200,11 +202,23 @@ struct TargetEstimator::Impl {
         home = candidate;
         if (changed) {
             ResetFilterState();
+            // 附带 GPS 上下文，用于定位 Home 漂移根因（如边缘收星）
             SPDLOG_WARN("PX4 Home变化，目标估计器已重置局部NED滤波状态: "
-                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m)",
+                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) "
+                        "gps_fix={} 卫星={} eph={} epv={}",
                         previous.latitude_deg, previous.longitude_deg,
                         previous.altitude_m, candidate.latitude_deg,
-                        candidate.longitude_deg, candidate.altitude_m);
+                        candidate.longitude_deg, candidate.altitude_m,
+                        state.gps_fix_type,
+                        state.gps_satellites_valid
+                            ? std::to_string(state.gps_satellites_visible)
+                            : std::string("--"),
+                        state.gps_accuracy_valid
+                            ? fmt::format("{:.2f}m", state.gps_eph_m)
+                            : std::string("--"),
+                        state.gps_accuracy_valid
+                            ? fmt::format("{:.2f}m", state.gps_epv_m)
+                            : std::string("--"));
         }
     }
 

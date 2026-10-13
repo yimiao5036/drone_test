@@ -58,7 +58,7 @@ Px4Link::StateOutput()
 | 姿态 | `ATTITUDE` | 100ms |
 | 局部NED位置和速度 | `LOCAL_POSITION_NED` | 200ms |
 | 经纬度、高度和速度 | `GLOBAL_POSITION_INT` | 200ms |
-| GPS fix | `GPS_RAW_INT` | 500ms |
+| GPS fix、卫星数、水平/垂直精度（eph/epv） | `GPS_RAW_INT` | 500ms |
 | landed状态 | `EXTENDED_SYS_STATE` | 500ms |
 | 总电压、电流和剩余电量 | `SYS_STATUS` | 1000ms |
 | 电池电流和剩余电量 | `BATTERY_STATUS` | 1000ms |

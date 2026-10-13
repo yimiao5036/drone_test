@@ -324,6 +324,9 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
 
     mavlink_gps_raw_int_t gps{};
     gps.fix_type = GPS_FIX_TYPE_3D_FIX;
+    gps.satellites_visible = 17;
+    gps.eph = 125;   // 1.25m
+    gps.epv = 250;   // 2.50m
     AppendEncoded(encoder, &bytes, [&](mavlink_status_t* status, mavlink_message_t* message) {
         return mavlink_msg_gps_raw_int_encode_status(
             1, MAV_COMP_ID_AUTOPILOT1, status, message, &gps);
@@ -432,6 +435,11 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
     EXPECT_TRUE(snapshot.gps_state_valid);
     EXPECT_TRUE(snapshot.gps_fix);
     EXPECT_EQ(snapshot.gps_fix_type, GPS_FIX_TYPE_3D_FIX);
+    EXPECT_TRUE(snapshot.gps_satellites_valid);
+    EXPECT_EQ(snapshot.gps_satellites_visible, 17);
+    EXPECT_TRUE(snapshot.gps_accuracy_valid);
+    EXPECT_FLOAT_EQ(snapshot.gps_eph_m, 1.25f);
+    EXPECT_FLOAT_EQ(snapshot.gps_epv_m, 2.5f);
     EXPECT_EQ(snapshot.latitude_1e7, global.lat);
     EXPECT_EQ(snapshot.longitude_1e7, global.lon);
     EXPECT_EQ(snapshot.altitude_mm, global.alt);
@@ -505,6 +513,43 @@ TEST(Px4LinkTest, TelemetryValidityExpiresWithoutDisconnectingHeartbeat) {
     }
     EXPECT_TRUE(found_expired);
     EXPECT_TRUE(link.IsConnected());
+    link.Stop();
+}
+
+TEST(Px4LinkTest, GpsUnknownSatellitesAndAccuracyStayInvalid) {
+    PseudoTerminal terminal;
+    Px4Link link(MakeConfig(terminal.SlaveName()));
+    auto subscription = link.StateOutput().Subscribe(32);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler encoder;
+    std::vector<uint8_t> bytes = EncodePx4Heartbeat(
+        encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
+    mavlink_gps_raw_int_t gps{};
+    gps.fix_type = GPS_FIX_TYPE_3D_FIX;
+    gps.satellites_visible = UINT8_MAX;   // MAVLink 约定：255=未知
+    gps.eph = UINT16_MAX;                 // UINT16_MAX=未知
+    gps.epv = UINT16_MAX;
+    AppendEncoded(encoder, &bytes, [&](mavlink_status_t* status, mavlink_message_t* message) {
+        return mavlink_msg_gps_raw_int_encode_status(
+            1, MAV_COMP_ID_AUTOPILOT1, status, message, &gps);
+    });
+    ASSERT_TRUE(terminal.Write(bytes));
+
+    common::FlightStateSnapshot snapshot;
+    ASSERT_TRUE(WaitUntil([&] {
+        while (auto message = subscription.TryTake()) {
+            if ((*message)->gps_state_valid) {
+                snapshot = **message;
+                return true;
+            }
+        }
+        return false;
+    }, 500ms));
+
+    EXPECT_TRUE(snapshot.gps_fix);
+    EXPECT_FALSE(snapshot.gps_satellites_valid);
+    EXPECT_FALSE(snapshot.gps_accuracy_valid);
     link.Stop();
 }
 

@@ -1380,6 +1380,7 @@ private:
     }
 
     // GPS_RAW_INT：仅在 GPS 状态有效时发送；无全局位置时经纬高填 0，靠 fix_type 表达。
+    // 卫星数/eph/epv 透传真实值，未知时按 MAVLink 约定填 UINT8_MAX/UINT16_MAX。
     bool SendGps(const common::FlightStateSnapshot& state) {
         if (!state.gps_state_valid) {
             return false;
@@ -1387,13 +1388,23 @@ private:
         const int32_t latitude = state.global_position_valid ? state.latitude_1e7 : 0;
         const int32_t longitude = state.global_position_valid ? state.longitude_1e7 : 0;
         const int32_t altitude = state.global_position_valid ? state.altitude_mm : 0;
-        return EncodeAndWrite([this, &state, latitude, longitude, altitude](
+        const uint16_t eph_cm = state.gps_accuracy_valid
+            ? static_cast<uint16_t>(state.gps_eph_m * 100.f)
+            : std::numeric_limits<uint16_t>::max();
+        const uint16_t epv_cm = state.gps_accuracy_valid
+            ? static_cast<uint16_t>(state.gps_epv_m * 100.f)
+            : std::numeric_limits<uint16_t>::max();
+        const uint8_t satellites = state.gps_satellites_valid
+            ? state.gps_satellites_visible
+            : std::numeric_limits<uint8_t>::max();
+        return EncodeAndWrite([this, &state, latitude, longitude, altitude, eph_cm,
+                               epv_cm, satellites](
                                   mavlink_status_t* status,
                                   mavlink_message_t* message) {
             return mavlink_msg_gps_raw_int_pack_status(
                 config_.aircraft_system_id, config_.aircraft_component_id, status,
                 message, 0, state.gps_fix_type, latitude, longitude, altitude,
-                UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT8_MAX, 0,
+                eph_cm, epv_cm, UINT16_MAX, UINT16_MAX, satellites, 0,
                 0, 0, 0, 0, 0);
         });
     }

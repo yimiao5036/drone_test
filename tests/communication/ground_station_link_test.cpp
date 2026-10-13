@@ -404,6 +404,11 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
     snapshot.gps_state_valid = true;
     snapshot.gps_fix = true;
     snapshot.gps_fix_type = GPS_FIX_TYPE_3D_FIX;
+    snapshot.gps_satellites_valid = true;
+    snapshot.gps_satellites_visible = 17;
+    snapshot.gps_accuracy_valid = true;
+    snapshot.gps_eph_m = 1.25f;
+    snapshot.gps_epv_m = 2.5f;
     snapshot.global_position_valid = true;
     snapshot.latitude_1e7 = 231234567;
     snapshot.longitude_1e7 = 1131234567;
@@ -449,6 +454,48 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
     EXPECT_EQ(system_status.current_battery, 340);
     EXPECT_EQ(system_status.battery_remaining, 76);
     EXPECT_GT(link.SendCount(), 0u);
+
+    mavlink_message_t gps_message{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            return message.msgid == MAVLINK_MSG_ID_GPS_RAW_INT;
+        }, 500ms, &gps_message));
+    mavlink_gps_raw_int_t gps{};
+    mavlink_msg_gps_raw_int_decode(&gps_message, &gps);
+    EXPECT_EQ(gps.fix_type, GPS_FIX_TYPE_3D_FIX);
+    EXPECT_EQ(gps.satellites_visible, 17);
+    EXPECT_EQ(gps.eph, 125);
+    EXPECT_EQ(gps.epv, 250);
+
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, GpsDownlinkKeepsUnknownSatellitesAndAccuracyInvalid) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    common::FlightStateSnapshot snapshot;
+    snapshot.connected = true;
+    snapshot.gps_state_valid = true;
+    snapshot.gps_fix = true;
+    snapshot.gps_fix_type = GPS_FIX_TYPE_3D_FIX;
+    // 卫星数/精度未知：保持 valid 标志为假
+    ASSERT_TRUE(flight_state.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(snapshot)).accepted);
+
+    mavlink_message_t gps_message{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            return message.msgid == MAVLINK_MSG_ID_GPS_RAW_INT;
+        }, 500ms, &gps_message));
+    mavlink_gps_raw_int_t gps{};
+    mavlink_msg_gps_raw_int_decode(&gps_message, &gps);
+    EXPECT_EQ(gps.satellites_visible, UINT8_MAX);
+    EXPECT_EQ(gps.eph, UINT16_MAX);
+    EXPECT_EQ(gps.epv, UINT16_MAX);
 
     link.Stop();
 }

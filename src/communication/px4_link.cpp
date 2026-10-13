@@ -651,6 +651,20 @@ private:
         state_.gps_state_valid = true;
         state_.gps_fix_type = gps.fix_type;
         state_.gps_fix = gps.fix_type >= GPS_FIX_TYPE_3D_FIX;
+        // MAVLink 约定：satellites_visible=255、eph/epv=UINT16_MAX 表示未知，
+        // 不伪装成有效数值；eph/epv 单位 cm，换算为米。
+        state_.gps_satellites_valid =
+            gps.satellites_visible != std::numeric_limits<uint8_t>::max();
+        if (state_.gps_satellites_valid) {
+            state_.gps_satellites_visible = gps.satellites_visible;
+        }
+        state_.gps_accuracy_valid =
+            gps.eph != std::numeric_limits<uint16_t>::max() &&
+            gps.epv != std::numeric_limits<uint16_t>::max();
+        if (state_.gps_accuracy_valid) {
+            state_.gps_eph_m = static_cast<float>(gps.eph) / 100.f;
+            state_.gps_epv_m = static_cast<float>(gps.epv) / 100.f;
+        }
         last_gps_time_ms_ = now_ms;
     }
 
@@ -876,6 +890,10 @@ private:
         state_.gps_state_valid = IsTelemetryFresh(last_gps_time_ms_, now_ms);
         state_.gps_fix = state_.gps_state_valid &&
                          state_.gps_fix_type >= GPS_FIX_TYPE_3D_FIX;
+        if (!state_.gps_state_valid) {
+            state_.gps_satellites_valid = false;
+            state_.gps_accuracy_valid = false;
+        }
         state_.battery_valid = IsTelemetryFresh(last_battery_time_ms_, now_ms);
         if (!state_.battery_valid) {
             state_.battery_current_valid = false;
@@ -894,6 +912,8 @@ private:
         state_.attitude_valid = false;
         state_.gps_state_valid = false;
         state_.gps_fix = false;
+        state_.gps_satellites_valid = false;
+        state_.gps_accuracy_valid = false;
         state_.battery_valid = false;
         state_.battery_current_valid = false;
         state_.battery_remaining_valid = false;

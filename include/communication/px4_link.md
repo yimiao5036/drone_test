@@ -144,7 +144,11 @@ bits 24..31 → flight_sub_mode（sub mode）
 
 - 心跳：`connected/armed/base_mode/custom_mode/flight_mode/flight_sub_mode/system_status`；
 - 落地：`landed`，仅 `landed_state_valid=true` 时可用；
-- 导航：GPS fix、全局位置、局部 NED 位置和 NED 速度；
+- 导航：GPS fix、卫星数（`gps_satellites_visible`）、水平/垂直定位精度
+  （`gps_eph_m/gps_epv_m`，eph/epv 由 cm 换算为米；MAVLink 约定的未知值
+  `satellites_visible=255`、`eph/epv=UINT16_MAX` 不伪装成数值，对应
+  `gps_satellites_valid/gps_accuracy_valid` 标志为假）、全局位置、局部 NED 位置和
+  NED 速度；
 - 姿态：roll/pitch/yaw；
 - 动力电池：电压、电流、剩余量及各自有效标志；
 - Home：经纬度与 MSL 高度；
