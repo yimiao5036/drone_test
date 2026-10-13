@@ -201,7 +201,9 @@ bits 24..31 → flight_sub_mode（sub mode）
 
 - `MAV_CMD_REQUEST_MESSAGE`：请求 `AUTOPILOT_VERSION` 和 `HOME_POSITION`；
 - `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
-  `EXTENDED_SYS_STATE` 的配置频率。
+  `EXTENDED_SYS_STATE` 的配置频率（当前生产配置：姿态/局部位置 25Hz、GPS 10Hz、
+  全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；
+  115200 波特率下链路占用约 45%）。
 
 这些内部命令只改变本 MAVLink 链路的消息输出，不执行解锁、模式切换或飞行控制。
 

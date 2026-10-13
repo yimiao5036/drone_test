@@ -52,15 +52,15 @@
             },
             {
                 "message_id": 24,
-                "interval_us": 200000
+                "interval_us": 100000
             },
             {
                 "message_id": 30,
-                "interval_us": 100000
+                "interval_us": 40000
             },
             {
                 "message_id": 32,
-                "interval_us": 100000
+                "interval_us": 40000
             },
             {
                 "message_id": 33,
@@ -167,11 +167,11 @@
             "attitude": 100,
             "local_position": 200,
             "global_position": 200,
-            "gps": 500,
+            "gps": 200,
             "extended_state": 500,
             "system_status": 1000,
             "battery": 1000,
-            "home": 5000
+            "home": 1000
         },
         "serial": {
             "device": "/dev/ttyS6",

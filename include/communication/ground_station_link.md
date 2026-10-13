@@ -50,19 +50,19 @@ Px4Link::StateOutput()
 
 当前实现已按`docs/多机身份与功能寻址设计.md`拆分地面站链路身份：`aircraft_system_id`表示同类型编号，`aircraft_component_id`表示功能类别，捕网类使用25、火箭类使用26；PX4链路继续保持独立的1/191→1/1。生产配置当前为捕网-01，下行MAVLink帧头应显示`system=1/component=25`。地面站来源固定为`255/190`，只有该来源且类型为`MAV_TYPE_GCS`的心跳会刷新在线状态。
 
-当前下行消息：
+当前下行消息（周期列为当前生产配置值，均可经 `ground_station.send_interval_ms` 调整）：
 
-| 内容 | MAVLink消息 | 默认周期 |
+| 内容 | MAVLink消息 | 生产周期 |
 |---|---|---:|
 | 在线、armed、PX4模式和系统状态 | `HEARTBEAT` | 1000ms |
 | 姿态 | `ATTITUDE` | 100ms |
 | 局部NED位置和速度 | `LOCAL_POSITION_NED` | 200ms |
 | 经纬度、高度和速度 | `GLOBAL_POSITION_INT` | 200ms |
-| GPS fix、卫星数、水平/垂直精度（eph/epv） | `GPS_RAW_INT` | 500ms |
+| GPS fix、卫星数、水平/垂直精度（eph/epv） | `GPS_RAW_INT` | 200ms |
 | landed状态 | `EXTENDED_SYS_STATE` | 500ms |
 | 总电压、电流和剩余电量 | `SYS_STATUS` | 1000ms |
 | 电池电流和剩余电量 | `BATTERY_STATUS` | 1000ms |
-| Home点 | `HOME_POSITION` | 5000ms |
+| Home点 | `HOME_POSITION` | 1000ms |
 | 健康状态 | `V2_EXTENSION(65012)` | 1000ms，状态变化立即发送 |
 | 任务状态 | `V2_EXTENSION(65013)` | 500ms，状态变化立即发送 |
 | 单调时钟同步 | `TIMESYNC` | 获取期200ms，稳定后1000ms |
