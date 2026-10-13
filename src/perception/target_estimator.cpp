@@ -196,10 +196,15 @@ struct TargetEstimator::Impl {
             (home->latitude_deg != candidate.latitude_deg ||
              home->longitude_deg != candidate.longitude_deg ||
              home->altitude_m != candidate.altitude_m);
+        const GeodeticCoordinate previous = home.value_or(candidate);
         home = candidate;
         if (changed) {
             ResetFilterState();
-            SPDLOG_WARN("PX4 Home变化，目标估计器已重置局部NED滤波状态");
+            SPDLOG_WARN("PX4 Home变化，目标估计器已重置局部NED滤波状态: "
+                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m)",
+                        previous.latitude_deg, previous.longitude_deg,
+                        previous.altitude_m, candidate.latitude_deg,
+                        candidate.longitude_deg, candidate.altitude_m);
         }
     }
 
