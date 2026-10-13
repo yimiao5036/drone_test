@@ -863,11 +863,16 @@ struct VisualServoFixture : HandoverFixture {
     }
 
     /// 发布一轮伺服输入：新鲜姿态 + 指定视觉状态 + 测距 15m（射程 10m 之外）。
+    /// with_attitude=false 时不发布飞行快照（最新快照保持无姿态）——用于构造
+    /// "控制律姿态超龄持续降级、伺服永不启动"的场景。
     void PublishServoInputs(
         uint64_t frame,
-        common::VisualTargetState visual_state = common::VisualTargetState::kLocked) {
-        (void)flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
-            MakeFlightWithAttitude(yaw_rad_)));
+        common::VisualTargetState visual_state = common::VisualTargetState::kLocked,
+        bool with_attitude = true) {
+        if (with_attitude) {
+            (void)flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                MakeFlightWithAttitude(yaw_rad_)));
+        }
         (void)visual.Publish(std::make_shared<const common::VisualTargetStatus>(
             MakeVisualStatus(visual_state, frame)));
         (void)distance.Publish(std::make_shared<const common::StereoTargetDistance>(
@@ -994,6 +999,43 @@ TEST(MissionStateMachineTest, VisualLostBrakesThenExitsToGpsApproach) {
         LastIntentOfType(after_exit, common::ControlIntentType::kPositionGuide);
     ASSERT_NE(position, nullptr);
     EXPECT_EQ(position->control_source, 0U);
+}
+
+// S7 伺服永不启动（控制律持续降级，如姿态超龄）时，冻结位置续发不得无限
+// 续期：S6 有 handover.timeout_ms 封顶，S7 需等价封顶——驻留超时仍未见
+// 首条有效视觉意图 → 收口回退 S5（复用既有退出机制，中文 reason 区分路径）。
+TEST(MissionStateMachineTest, S7ServoNotStartedFallsBackAfterTimeout) {
+    drone::test::LogCapture logs;  // 必须在组件启动前挂载（见 log_capture.h 约束）
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();  // 飞行快照无姿态 → 控制律姿态超龄降级
+    f.DrainIntents();
+    logs.Clear();
+
+    // S7 驻留：按期刷新视觉/测距（不提供姿态），冻结位置续发持续滚动续期
+    std::vector<common::ControlIntent> intents;
+    uint64_t frame = 300;
+    for (int round = 0; round < 14; ++round) {
+        f.PublishServoInputs(++frame, common::VisualTargetState::kLocked,
+                             /*with_attitude=*/false);
+        auto batch = CollectIntents(f.intent_subscription, 200ms);
+        intents.insert(intents.end(), batch.begin(), batch.end());
+        if (f.machine->CurrentState() != common::MissionState::kVisualTracking) {
+            break;
+        }
+    }
+    // 回退前伺服从未启动：无速度/刹车意图；冻结位置续发在生效
+    EXPECT_EQ(LastIntentOfType(intents, common::ControlIntentType::kVelocityHeading),
+              nullptr);
+    EXPECT_EQ(LastIntentOfType(intents, common::ControlIntentType::kBrakeHover),
+              nullptr);
+    EXPECT_NE(LastIntentOfType(intents, common::ControlIntentType::kPositionGuide),
+              nullptr);
+    // 超时收口回 S5（reason 中文可查，区别于 S6 超时与其它三条 S7 退出路径）
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+    EXPECT_EQ(logs.Count("S7伺服未启动超时"), 1);
 }
 
 // S7 热备份核对（设计 §2.4）：每秒核对卡尔曼状态年龄（TargetState 接收时刻 +

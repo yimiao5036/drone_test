@@ -59,7 +59,7 @@ constexpr uint32_t kWarningNavigationUnavailable = 1U << 0U;
 /// 告警位：已经进入GPS_APPROACH影子状态，但最新目标超过剩余有效期。
 constexpr uint32_t kWarningGroundTargetStale = 1U << 1U;
 /// 告警位：VISUAL_TRACKING 期间热备份断粮（卡尔曼状态年龄超窗，设计 §2.4）。
-/// 只提示"假备份"风险，不触发退出（退出由 S7 三条收口路径决定）。
+/// 只提示"假备份"风险，不触发退出（退出由 S7 四条收口路径决定）。
 constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。
@@ -95,6 +95,8 @@ constexpr const char* kReasonVisionStreamLost =
     "视觉状态断流超龄（监视器/链路中断），退出VISUAL_TRACKING回GPS_APPROACH";
 constexpr const char* kReasonDistanceLostExit =
     "双目测距失效达距离丢失门限，退出VISUAL_TRACKING回GPS_APPROACH";
+constexpr const char* kReasonServoNotStartedTimeout =
+    "S7伺服未启动超时（首条视觉伺服意图未生效），回GPS_APPROACH";
 
 /// 交接进入判据输入（阶段四 Task 8；纯数据，供判定函数与 Task 9 复用）。
 struct HandoverInputs {
@@ -653,6 +655,7 @@ private:
         consecutive_lost_frames_ = 0;
         s6_lock_baseline_ = 0;
         s6_entered_ms_ = 0;
+        s7_entered_ms_ = 0;
         distance_lost_since_ms_.reset();
         if (frozen_handover_target_.has_value()) {
             SPDLOG_INFO("交接段收口: 停止冻结位置续发/视觉伺服意图");
@@ -720,6 +723,7 @@ private:
         }
         if (consecutive_lock_frames_ > s6_lock_baseline_) {
             consecutive_lost_frames_ = 0;
+            s7_entered_ms_ = now_ms;  // S7 伺服未启动超时计时基准（见退出路径④）
             TransitionTo(common::MissionState::kVisualTracking,
                          kReasonHandoverVerified);
             return;
@@ -732,14 +736,17 @@ private:
         }
     }
 
-    /// S7 退出（三条独立路径，任一成立即回退 S5）：
+    /// S7 退出（四条独立路径，任一成立即回退 S5）：
     /// ① 视觉状态断流：最近一条 VisualTargetStatus 的接收年龄超过 S6 进入判据
     ///    所用的同一视觉新鲜度阈值（监视器线程死亡/链路中断时无 LOST 消息可计数、
     ///    帧序冻结，按超龄直接收口）；
     /// ② 测距失效连续计时达 handover.distance_lost_ms（valid=false 或超龄；
     ///    恢复有效即清零）——覆盖"测距丢失但视觉仍锁定"的收口；
     /// ③ 视觉 LOST 连续帧数达 handover.exit_lost_frames（进入 lock_frames 与
-    ///    退出 exit_lost_frames 门限不同防抖动）。
+    ///    退出 exit_lost_frames 门限不同防抖动）；
+    /// ④ 伺服未启动超时：S7 驻留超 handover.timeout_ms 仍未见首条有效视觉意图
+    ///    （控制律持续降级，如姿态超龄）——冻结位置续发不得无限续期（S6 有
+    ///    超时封顶，S7 需等价封顶），收口回 S5 重新走交接判据。
     /// 未达门限保持 S7，短时丢失的图像空间 coast 由 Task 9 的视觉伺服承担
     /// （监视器按 publish_interval≈100ms 发布，健康流不会触及 200ms 超龄阈值）。
     void EvaluateVisualTrackingExit(uint64_t now_ms) {
@@ -761,6 +768,17 @@ private:
             ResetHandoverHysteresis();
             TransitionTo(common::MissionState::kGpsApproach,
                          kReasonVisualTrackingExit);
+            return;
+        }
+        // 防御：s7_entered_ms_ 由 S6→S7 迁移当拍赋值，正常路径进入 S7 必有值
+        //（未赋值时不评估，避免误判 0 为"已驻留超时"当拍即退）。
+        if (!s7_servo_started_ && s7_entered_ms_ != 0 &&
+            now_ms - s7_entered_ms_ >= handover_timeout_ms_) {
+            // 超时回退同样复位计数：重新进入 S6 需要新的连续锁定证据，
+            // 不得因陈旧计数在下一拍立即回跳。
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach,
+                         kReasonServoNotStartedTimeout);
         }
     }
 
@@ -922,7 +940,7 @@ private:
 
     /// S7 视觉伺服意图发布入口。仅在估计输入已绑定且处于 S7 时工作；
     /// 意图逐拍发布（决策周期 10Hz；控制律按实际时钟差推算 dt，配置频率
-    /// 仅作首拍兜底）。S7 去留由 EvaluateVisualTrackingExit 三条路径决定，
+    /// 仅作首拍兜底）。S7 去留由 EvaluateVisualTrackingExit 四条路径决定，
     /// 本函数不迁移状态。
     void EvaluateVisualServoIntent(uint64_t now_ms) {
         if (!estimation_inputs_active_) {
@@ -1045,7 +1063,7 @@ private:
     /// `valid_for_ms`——生产者声明的"数据允许使用的最长时间"，与 S5 意图门禁
     /// `HasFreshEstimate` 同一口径；无快照、valid=false 亦视为断粮）。
     /// 进入 S7 后立即核对一次，此后每秒一次；断粮 → 节流 WARN + 返回告警位
-    /// （不退出 S7：S7 去留由三条收口路径决定，热备份告警只提示"假备份"风险）。
+    /// （不退出 S7：S7 去留由四条收口路径决定，热备份告警只提示"假备份"风险）。
     uint32_t EvaluateHotBackup(uint64_t now_ms) {
         if (CurrentState() != common::MissionState::kVisualTracking) {
             hot_backup_starved_ = false;
@@ -1213,6 +1231,7 @@ private:
     std::optional<uint64_t> last_counted_locked_frame_;  ///< 去重：最近计数的锁定帧序号
     uint64_t s6_lock_baseline_ = 0;  ///< S6 进入时的锁定计数（S6→S7 需再推进）
     uint64_t s6_entered_ms_ = 0;     ///< S6 进入时刻（驻留超时基准）
+    uint64_t s7_entered_ms_ = 0;     ///< S7 进入时刻（伺服未启动超时基准）
     /// S7 测距失效计时起始时刻（nullopt=测距未失效；恢复有效即清零）
     std::optional<uint64_t> distance_lost_since_ms_;
     bool estimation_inputs_active_ = false;  ///< 估计/视觉/测距输入组已成功订阅

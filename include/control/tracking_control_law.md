@@ -107,5 +107,5 @@ ctest --test-dir build -R 'ControlLaw|PixelToAngle|VisualTrackingShadow|Tracking
 | 摘要一直是"降级保持" | 看 reason：姿态超龄（PX4 未连接/未上电，且虚拟姿态被关）/视觉超龄（monitor 没发布或视频链路没跑）；虚拟姿态开关在 `visual_tracking.shadow.virtual_attitude_when_absent` |
 | 垂直角方向反了/量值不对 | 确认 camera 组 cy_px 是标定值 532.07 而非 360；主点假设错误的典型症状就是垂直方向固定偏约 9.7° |
 | 换了分辨率档位后角度错 | 内参只对 1280×720 有效，换档重新标定并更新 camera 组 |
-| kControlIntent 没人消费 | 影子阶段设计如此；观察靠摘要日志，后续接状态机时再接 FlightController |
+| 影子 kControlIntent 没人消费 | 影子主题无消费者（2026-10-13 阶段四 Task 9 起正式路径 = 状态机 S7 `MissionStateMachine::IntentOutput` → `FlightController`）；影子保留供观察，靠摘要日志核对行为 |
 | 增益/PID 整定 | heading.gain、vertical.vz_gain、distance.kp/ki/kd 均为占位初值，整定后改 config.json，不动代码 |

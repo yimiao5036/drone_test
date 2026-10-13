@@ -13,7 +13,7 @@
 | S5→S6 | 视觉 `LOCKED` 连续帧 ≥ `lock_frames` + 双目距离有效且未超龄 + 视线角距视场边缘 ≥ `fow_margin_deg` + 视觉观测与卡尔曼预测创新 ≤ `innovation_gate_m`（四项同时满足） |
 | S6→S7 | 进入判据持续满足 **且** 视觉链再推进一条新的 `LOCKED` 帧（交接期不断流） |
 | S6→S5 | 进入判据任一失效（撤销交接）；或驻留超 `timeout_ms`（首条视觉指令未生效，防卡死） |
-| S7→S5 | 三条独立路径任一成立：① 视觉状态消息断流超视觉新鲜度阈值（`visual_stale`）；② 测距失效（invalid 或超龄）连续达 `distance_lost_ms`；③ 视觉 `LOST` 连续帧 ≥ `exit_lost_frames`（进入/退出门限不同构成迟滞，防状态抖动） |
+| S7→S5 | 四条独立路径任一成立：① 视觉状态消息断流超视觉新鲜度阈值（`visual_stale`）；② 测距失效（invalid 或超龄）连续达 `distance_lost_ms`；③ 视觉 `LOST` 连续帧 ≥ `exit_lost_frames`（进入/退出门限不同构成迟滞，防状态抖动）；④ 伺服未启动超时——S7 驻留超 `timeout_ms` 仍未见首条有效视觉意图（控制律持续降级，如姿态超龄），防冻结位置续发无限续期 |
 
 **未注入估计器诊断时交接判据不评估**（保持 S5，启动记 ERROR）：无法核验"视觉锁定与卡尔曼航迹是否同一目标"就不允许切进视觉末段。
 
@@ -27,7 +27,7 @@
 
 **S6 冻结最后位置目标（评审裁决 (a)，Task 9 落地）**：S5→S6 当拍冻结进入时刻的`TargetState`坐标；S6 驻留期逐拍续发该位置意图（`valid_until`由状态机每拍滚动续期），直到首条视觉速度意图被发出再停（S7 首拍若伺服降级停发，冻结续发继续顶住，不留意图缺口）。此策略对应用户设计 §2.1「进入 S6 后冻结最后位置目标」与 §2.5「位置式→速度式无扰斜坡过渡」——若交接期停发位置意图，控制器在`intent_timeout`(300ms)后 COAST 刹车，真实系统会在交接点先刹停再起步。
 
-**热备份核对（设计 §2.4）**：S7 期间每秒核对卡尔曼状态年龄——`TargetState.header.receive_time_ms`年龄是否超出其自报有效期窗（`valid_for_ms`，与 S5 意图门禁`HasFreshEstimate`同一口径；无快照/`valid=false`亦视为断粮）。断粮 → 节流 WARN「S7 热备份断粮」+ `MissionStatus.active_warning_bits` bit2 置位，**不退出 S7**（S7 去留由三条收口路径决定，热备份告警只提示"假备份"风险）。
+**热备份核对（设计 §2.4）**：S7 期间每秒核对卡尔曼状态年龄——`TargetState.header.receive_time_ms`年龄是否超出其自报有效期窗（`valid_for_ms`，与 S5 意图门禁`HasFreshEstimate`同一口径；无快照/`valid=false`亦视为断粮）。断粮 → 节流 WARN「S7 热备份断粮」+ `MissionStatus.active_warning_bits` bit2 置位，**不退出 S7**（S7 去留由四条收口路径决定，热备份告警只提示"假备份"风险）。
 
 **与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
 
@@ -146,14 +146,20 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     （`HasFreshEstimate`）是创新门限的前提（卡尔曼必须存活）。
   - 创新值取自`ITargetEstimator::LastVisualInnovationM()`（最近一次接受的视觉观测
     与卡尔曼预测的水平距离）；该接口未注入或返回 NaN 时不放行交接。
-  - **S7 退出收口三条路径**（缺一都会让 S7 在异常下永不退出）：
+  - **S7 退出收口四条路径**（缺一都会让 S7 在异常下永不退出或意图挂死）：
     ① 视觉状态断流——监视器线程死亡/链路中断时无 `LOST` 消息可计数、帧序冻结，
     按「最近一条 `VisualTargetStatus` 的接收年龄 > `visual_stale`」直接退出
     （与 S6 进入判据同一新鲜度阈值、同一`StalenessChecker`判定，见`VisualStatusStale`）；
     ② 测距失效计时——`valid=false` 或超龄即累计，连续达 `distance_lost_ms` 退出，
     中途恢复有效立刻清零（`distance_lost_since_ms_`），覆盖"测距丢失但视觉仍
     锁定、控制律 `no_distance_action` 不触发退出"的场景；
-    ③ 视觉 `LOST` 连续帧达 `exit_lost_frames`。
+    ③ 视觉 `LOST` 连续帧达 `exit_lost_frames`；
+    ④ **伺服未启动超时**——S7 驻留超 `timeout_ms`（自进入 S7 起计）仍未见首条
+    有效视觉意图：控制律持续降级（可持续情形为姿态超龄）时伺服永不启动，
+    冻结位置续发不得无限续期（S6 有 `timeout_ms` 封顶，S7 需等价封顶），
+    收口回 S5 重新走交接判据（reason 中文区分"伺服未启动超时"）。
+    一旦首条视觉意图（速度或刹车）已发出，本条不再评估（伺服启动后的降级
+    停发由其余三条路径与控制器门禁收口）。
     S7 期间不评估进入条件；健康监视器按 `publish_interval`（100ms）发布，
     200ms 超龄阈值留 2 倍余量，短时丢帧不触发 ①，图像空间 coast 由 Task 9
     的视觉伺服承担（阈值以内的短时缺口按判丢刹车形态落地，见下）。
@@ -179,9 +185,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     "数据允许使用的最长时间"）；断粮 WARN 节流（第 1 次与每满 100 次）+
     `MissionStatus`告警位 bit2，**不退出 S7**。告警位随离开 S7 清除。
   - 冻结位置续发：S5→S6 当拍`FreezeHandoverTarget()`（取进入时刻`TargetState`），
-    S6 逐拍`PublishPositionIntent`滚动续期；S7 首拍伺服未发出意图前继续顶住；
-    发出后停发（`StopPositionIntent`）。交接段收口（含冻结清空、控制律`Reset`、
-    热备份状态清零）统一在`ResetHandoverHysteresis`内完成。
+    S6 逐拍`PublishPositionIntent`滚动续期；S7 首拍伺服未发出意图前继续顶住
+    （**以 `timeout_ms` 封顶**：自进入 S7 起计，超时未见首条有效视觉意图 →
+    退出路径 ④ 收口回 S5，不得无限续期）；发出后停发（`StopPositionIntent`）。
+    交接段收口（含冻结清空、控制律`Reset`、热备份状态清零）统一在
+    `ResetHandoverHysteresis`内完成。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
 - 控制输出是否接 PX4 仍由`DroneApplication`的`enable_control`门禁决定（绑定
   `Px4Setpoint`+注入快照源+注入命令接口只在 true 分支）；诊断接口注入与
@@ -190,8 +198,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 ## 日志行为
 
 - INFO：状态机创建、启动、停止、销毁；状态转移（含交接进入/验证通过/撤销/超时/
-  视觉断流退出/测距失效退出/退出迟滞回退，一一对应中文 reason，便于事后区分
-  是哪条退出路径生效）；位置引导意图启动/停止（含"交接冻结最后位置目标"、
+  视觉断流退出/测距失效退出/退出迟滞回退/伺服未启动超时，一一对应中文 reason，
+  便于事后区分是哪条退出路径生效）；位置引导意图启动/停止（含"交接冻结最后位置目标"、
   "交接冻结位置意图续发"、"位置引导意图停止: 视觉伺服接续"、交接段收口）；
   S7 视觉伺服意图启动（带首拍 vx/vy/vz/yaw_rate 摘要）；PX4 命令接口与估计器
   诊断接口注入；首次/节流接收地面站目标。
@@ -259,7 +267,10 @@ ctest --test-dir build --output-on-failure
     节流 WARN「热备份断粮」，状态保持 S7；
   - `HandoverPublishesFrozenPositionUntilServoStarts`：S6 驻留期估计更新后冻结
     续发仍指向进入时刻值（12.5,−3,−8），`valid_until`逐拍滚动；S7 首条视觉速度
-    意图发出后不再出现位置意图。
+    意图发出后不再出现位置意图；
+  - `S7ServoNotStartedFallsBackAfterTimeout`：S7 中控制律持续降级（不提供姿态 →
+    姿态超龄）时伺服永不启动——冻结位置续发在 `timeout_ms` 内持续滚动（无速度/
+    刹车意图），超时收口回退 S5，日志 reason="S7伺服未启动超时"。
 
 ## 排查/修改要点
 
@@ -274,22 +285,26 @@ ctest --test-dir build --output-on-failure
   创新值是否为 NaN 或超 `innovation_gate_m`（视觉首次观测前为 NaN，属预期）。
 - S6 很快回 S5：确认视觉链在交接期是否继续产生新的 `LOCKED` 帧（无新帧会走
   `timeout_ms` 超时）；若日志是"进入判据失效"则按上一行四项排查。
-- 停在 S7 不退出：按三条退出路径逐项查——① 视觉状态消息是否仍在到达
+- 停在 S7 不退出：按四条退出路径逐项查——① 视觉状态消息是否仍在到达
   （断流超 `visual_stale` 会立即退出，日志 reason="视觉状态断流超龄"）；
   ② 测距是否 `valid=true` 且未超龄（失效连续达 `distance_lost_ms` 会退出，
   reason="双目测距失效达距离丢失门限"）；③ `LOST` 连续帧数是否未达
-  `exit_lost_frames`（进入门限约 1s、退出门限约 3s 属设计迟滞——这是唯一
-  "应当停在 S7"的情形）。
+  `exit_lost_frames`（进入门限约 1s、退出门限约 3s 属设计迟滞）；
+  ④ 伺服是否已启动（首条视觉意图发出前驻留超 `timeout_ms` 会按
+  reason="S7伺服未启动超时"退出——若停在 S7 且日志无该 reason，
+  说明伺服已启动过，属③的"应当停在 S7"情形）。
 - S7 提前退出（非预期）：先看状态转移日志的 reason——"断流超龄"说明监视器/
   链路停止发布状态（查监视器线程与上游 YOLO 观测）；"测距失效"说明双目匹配
-  连续失效或测距线程停发（查测距组件与视差有效域）；二者都可能在视觉仍
-  LOCKED 时发生，属安全收口而非缺陷。
+  连续失效或测距线程停发（查测距组件与视差有效域）；"伺服未启动超时"说明
+  首条视觉意图在 `timeout_ms` 内始终发不出（先按下一行"没有速度意图"查降级
+  原因，多为姿态超龄）；前两条可能在视觉仍 LOCKED 时发生，属安全收口而非缺陷。
 - S7 没有速度意图（WARN"视觉伺服停发意图: 控制律降级"）：按 reason 查——
   ①"姿态超龄"：`FlightStateSnapshot.attitude_valid`为 false 或接收时间超
   `attitude_stale_ms`（查 PX4 姿态流是否在发布、时间戳是否新鲜）；
   ②"视觉超龄"：`VisualTargetStatus`接收时间超`visual_stale_ms`；
   ③"持续无距离退出"：测距失效超`no_distance_exit_grace_ms`（该档位下可见）。
-  三者均属控制律安全降级（不发布意图 → 控制器意图超时刹车），不是状态机缺陷。
+  三者均属控制律安全降级（不发布意图 → 控制器意图超时刹车），不是状态机缺陷；
+  若持续超 `timeout_ms` 未恢复，S7 会按退出路径 ④ 收口回 S5。
 - S7 收到`kBrakeHover`零速意图而非速度意图：短期视觉 LOST 的判丢刹车
   （reason=102）——主链路无预测坐标，coast 以刹车形态落地；LOST 连续帧未达
   `exit_lost_frames`前属预期，达门限即退出 S7。
