@@ -59,6 +59,38 @@ common::GroundStationTarget MakeFreshGroundTarget() {
     return target;
 }
 
+// 局部 NED 坐标系编码（frame_id=3，见 types.h 文件头约定）。
+constexpr uint8_t kFrameLocalNed = 3;
+
+/// 有效目标估计快照（TargetEstimator 影子输出语义：valid=true 且剩余有效期充足）。
+common::TargetState MakeValidEstimatedTarget() {
+    common::TargetState state;
+    state.header.sequence = 1;
+    state.header.source_time_ms = TestMonotonicMs();
+    state.header.receive_time_ms = TestMonotonicMs();
+    state.header.valid_for_ms = 1000;
+    state.header.source_id = 0;
+    state.header.health = 1;
+    state.header.frame_id = kFrameLocalNed;
+    state.target_id = 7;
+    state.pos_x_m = 12.5f;
+    state.pos_y_m = -3.0f;
+    state.pos_z_m = -8.0f;
+    state.valid = true;
+    return state;
+}
+
+/// 估计失效快照（valid=false，例如地面站目标过期后 TargetEstimator 发布的过期态）。
+common::TargetState MakeInvalidEstimatedTarget() {
+    common::TargetState state = MakeValidEstimatedTarget();
+    state.header.sequence = 2;
+    state.header.receive_time_ms = TestMonotonicMs();
+    state.header.valid_for_ms = 0;
+    state.header.health = 2;
+    state.valid = false;
+    return state;
+}
+
 std::optional<common::MissionStatus> WaitForState(
     common::Topic<common::MissionStatus>::Subscription& subscription,
     common::MissionState expected,
@@ -160,6 +192,131 @@ TEST(MissionStateMachineTest, TargetWithoutNavigationDoesNotLeaveSelfCheck) {
     EXPECT_FALSE(WaitForState(status_subscription, common::MissionState::kGpsApproach, 300ms)
                      .has_value());
     EXPECT_EQ(machine.CurrentState(), common::MissionState::kSelfCheck);
+
+    machine.Stop();
+}
+
+/// 等待一条控制意图；超时返回 nullopt。
+std::optional<common::ControlIntent> WaitForIntent(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 驱动状态机进入 GPS_APPROACH（导航就绪 + 新鲜地面站目标）。
+void DriveToGpsApproach(
+    common::Topic<common::FlightStateSnapshot>& flight_topic,
+    common::Topic<common::GroundStationTarget>& ground_target_topic,
+    common::Topic<common::MissionStatus>::Subscription& status_subscription) {
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(MakeNavigationReadyFlight()));
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReady).has_value());
+    (void)ground_target_topic.Publish(
+        std::make_shared<const common::GroundStationTarget>(MakeFreshGroundTarget()));
+    ASSERT_TRUE(
+        WaitForState(status_subscription, common::MissionState::kGpsApproach).has_value());
+}
+
+// 阶段四 Task 7：绑定估计/视觉/测距输入后，S5 发布位置引导意图——指向估计目标、
+// control_source=0（位置链）、reason_code 带 bit31 控制权请求位、有效期来自配置。
+TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeValidEstimatedTarget()));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
+    EXPECT_EQ(intent->control_source, 0U);
+    EXPECT_FLOAT_EQ(intent->target_x, 12.5f);
+    EXPECT_FLOAT_EQ(intent->target_y, -3.0f);
+    EXPECT_FLOAT_EQ(intent->target_z, -8.0f);
+    EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
+    EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(intent->header.valid_for_ms, 300U);
+    EXPECT_EQ(intent->valid_until_ms,
+              intent->header.receive_time_ms + intent->header.valid_for_ms);
+
+    machine.Stop();
+}
+
+// 意图有效期必须来自注入的配置（与 controller.intent_timeout 对齐），不写死字面量。
+TEST(MissionStateMachineTest, IntentValidityComesFromConfig) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachineConfig config;
+    config.intent_valid_for = 450ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeValidEstimatedTarget()));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_EQ(intent->header.valid_for_ms, 450U);
+    EXPECT_EQ(intent->valid_until_ms, intent->header.receive_time_ms + 450U);
+
+    machine.Stop();
+}
+
+// 估计失效（TargetState.valid=false，如地面站目标过期）后停止发布位置引导意图；
+// 超龄收口由 FlightController 意图超时门禁接管。
+TEST(MissionStateMachineTest, IntentStopsWhenEstimateInvalid) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeValidEstimatedTarget()));
+    ASSERT_TRUE(WaitForIntent(intent_subscription).has_value());
+
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeInvalidEstimatedTarget()));
+    // 等待至少两个决策周期，确保状态机已观测到失效估计并停发。
+    std::this_thread::sleep_for(250ms);
+    while (intent_subscription.TryTake().has_value()) {
+    }
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(300ms).has_value());
 
     machine.Stop();
 }

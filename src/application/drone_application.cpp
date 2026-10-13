@@ -119,8 +119,13 @@ void DroneApplication::BuildComponents() {
     RegisterHealthSources();
 
     // 影子状态机只在PX4状态源与地面站目标源同时存在时创建。
+    // 意图有效期与 FlightController 的 controller.intent_timeout 同源注入，
+    // 保证状态机 valid_until_ms 与控制器超龄门禁一致。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
-        mission_state_machine_ = std::make_unique<state_machine::MissionStateMachine>();
+        state_machine::MissionStateMachineConfig state_machine_config;
+        state_machine_config.intent_valid_for = config_.controller.intent_timeout;
+        mission_state_machine_ =
+            std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
     }
 
     // 飞行控制器（阶段四正式实现）：状态机装配即创建，与 enable_control 无关——
@@ -256,7 +261,8 @@ void DroneApplication::BindTopics() {
         px4_link_ != nullptr) {
         flight_controller_->SetPx4LinkSource(px4_link_.get());
         px4_link_->SetInput(flight_controller_->SetpointOutput());
-        // Task 7 启用：mission_state_machine_->SetCommandSender(px4_link_.get());
+        // 阶段四 Task 7：注入 PX4 命令窄接口（仅 enable_control=true 分支可达）。
+        mission_state_machine_->SetCommandSender(px4_link_.get());
         control_assembly_.px4_snapshot_source_injected = true;
         control_assembly_.setpoint_bound_to_px4 = true;
         SPDLOG_WARN("正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint");

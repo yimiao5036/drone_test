@@ -1,14 +1,17 @@
 /**
  * @file mission_state_machine.cpp
- * @brief MissionStateMachine 安全影子实现
+ * @brief MissionStateMachine 安全影子实现（阶段四起支持 S5 位置引导意图）
  *
- * 当前阶段只接入地面站目标与飞行状态，发布 MissionStatus 供链路验证；
- * 不发布真实 ControlIntent，不连接 PX4 控制输出。
+ * 默认只接入地面站目标与飞行状态，发布 MissionStatus 供链路验证；
+ * 经 SetEstimationInputs 绑定估计/视觉/测距输入后，GPS_APPROACH 状态发布
+ * kPositionGuide 控制意图（带 bit31 控制权请求位），是否真正输出由
+ * FlightController 授权链与 enable_control 装配门禁决定。
  */
 #include "state_machine/mission_state_machine.h"
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -19,11 +22,14 @@
 
 #include <spdlog/spdlog.h>
 
+#include "communication/px4_link.h"
+
 namespace drone::state_machine {
 namespace {
 
-// 当前实现是安全影子状态机：只消费目标/飞行/健康快照并发布 MissionStatus，
+// 当前实现默认是安全影子状态机：只消费目标/飞行/健康快照并发布 MissionStatus，
 // 不生成真实 ControlIntent，也不连接 PX4 控制输出。所有决策运行在独立线程中。
+// 绑定估计/视觉/测距输入后，S5 开始发布位置引导意图（见 PublishGpsApproachIntent）。
 
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
@@ -38,6 +44,12 @@ constexpr uint64_t kStatusValidForMs = 1000;
 constexpr uint32_t kWarningNavigationUnavailable = 1U << 0U;
 /// 告警位：已经进入GPS_APPROACH影子状态，但最新目标超过剩余有效期。
 constexpr uint32_t kWarningGroundTargetStale = 1U << 1U;
+/// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
+/// 内容无变化时按该间隔重发，内容变化立即发。
+constexpr uint64_t kIntentRepublishIntervalMs = 100;
+/// 位置引导意图低位原因码：地面站任务下发（docs/数据接口文档.md §3.5 编码 7），
+/// 与 bit31 控制权请求位正交叠加。
+constexpr uint32_t kReasonGroundStationTask = 7;
 
 /// 返回当前进程单调时钟毫秒，用于内部Topic时间戳和新鲜度判断。
 uint64_t MonotonicMs() {
@@ -50,6 +62,12 @@ uint64_t MonotonicMs() {
 /// 异常/诊断日志节流规则：第1次与每满100次打印一次，避免周期线程刷屏。
 bool ShouldLogThrottled(uint64_t count) {
     return count == 1 || count % 100 == 0;
+}
+
+/// 浮点内容比较：NaN 与 NaN 视为相等（高度无效时 pos_z_m 恒为 NaN，
+/// 不得因此被当成"内容变化"每拍立即重发）。
+bool FloatContentEqual(float a, float b) {
+    return a == b || (std::isnan(a) && std::isnan(b));
 }
 
 /// 任务状态枚举转中文可读名称，供状态转移日志定位。
@@ -105,7 +123,12 @@ uint8_t TaskPhase(common::MissionState state) {
 /// MissionStateMachine的实际状态与线程实现，隐藏在PIMPL中保持头文件稳定。
 class MissionStateMachine::Impl final {
 public:
-    Impl() { SPDLOG_INFO("任务状态机创建: shadow=true control_output=false"); }
+    explicit Impl(const MissionStateMachineConfig& config)
+        : intent_valid_for_ms_(
+              static_cast<uint64_t>(config.intent_valid_for.count())) {
+        SPDLOG_INFO("任务状态机创建: shadow=true control_output=false intent_valid_for_ms={}",
+                    intent_valid_for_ms_);
+    }
 
     ~Impl() {
         Stop();
@@ -123,10 +146,28 @@ public:
             return false;
         }
 
+        // 估计/视觉/测距三个输入是一组：部分绑定视为装配错误，按未绑定处理
+        // （保持影子行为），避免 S5 意图只依据部分观测链。
+        const bool any_estimation_bound = estimated_topic_ != nullptr ||
+                                          visual_status_topic_ != nullptr ||
+                                          distance_topic_ != nullptr;
+        const bool all_estimation_bound = estimated_topic_ != nullptr &&
+                                          visual_status_topic_ != nullptr &&
+                                          distance_topic_ != nullptr;
+        if (any_estimation_bound && !all_estimation_bound) {
+            RecordError("估计/视觉/测距输入必须三者同时绑定；本次按未绑定处理（保持影子）");
+        }
+
         try {
             ground_target_subscription_ = ground_target_topic_->Subscribe(4);
             flight_subscription_ = flight_topic_->Subscribe(2);
             health_subscription_ = health_topic_->Subscribe(2);
+            if (all_estimation_bound) {
+                estimated_subscription_ = estimated_topic_->Subscribe(2);
+                visual_status_subscription_ = visual_status_topic_->Subscribe(2);
+                distance_subscription_ = distance_topic_->Subscribe(2);
+                estimation_inputs_active_ = true;
+            }
         } catch (const std::exception& error) {
             RecordError(std::string("任务状态机订阅输入失败: ") + error.what());
             return false;
@@ -156,6 +197,9 @@ public:
         ground_target_subscription_.Reset();
         flight_subscription_.Reset();
         health_subscription_.Reset();
+        estimated_subscription_.Reset();
+        visual_status_subscription_.Reset();
+        distance_subscription_.Reset();
         if (worker_.joinable()) {
             worker_.join();
         }
@@ -175,6 +219,31 @@ public:
         ground_target_topic_ = &ground_target;
         flight_topic_ = &flight;
         health_topic_ = &health;
+    }
+
+    /// 绑定估计/视觉/测距输入（三者一组）。必须在Start前调用；未绑定时
+    /// GPS_APPROACH 不出控制意图，保持影子行为。
+    void SetEstimationInputs(common::Topic<common::TargetState>& estimated,
+                             common::Topic<common::VisualTargetStatus>& visual_status,
+                             common::Topic<common::StereoTargetDistance>& distance) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定估计输入Topic");
+            return;
+        }
+        estimated_topic_ = &estimated;
+        visual_status_topic_ = &visual_status;
+        distance_topic_ = &distance;
+    }
+
+    /// 注入 PX4 命令窄接口。仅 enable_control=true 装配期调用；当前阶段只持有，
+    /// 供后续 ARM/执行机构命令使用，不参与意图发布判定。
+    void SetCommandSender(communication::IPx4CommandSender* sender) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许注入 PX4 命令接口");
+            return;
+        }
+        command_sender_ = sender;
+        SPDLOG_INFO("任务状态机 PX4 命令接口已注入: sender={}", static_cast<const void*>(sender));
     }
 
     common::Topic<common::ControlIntent>& IntentOutput() { return intent_output_; }
@@ -228,6 +297,15 @@ private:
         while (auto message = health_subscription_.TryTake()) {
             latest_health_ = **message;
         }
+        while (auto message = estimated_subscription_.TryTake()) {
+            latest_estimated_ = **message;
+        }
+        while (auto message = visual_status_subscription_.TryTake()) {
+            latest_visual_status_ = **message;
+        }
+        while (auto message = distance_subscription_.TryTake()) {
+            latest_distance_ = **message;
+        }
     }
 
     /// 根据当前状态、飞行快照和目标新鲜度推进影子状态，并周期发布MissionStatus。
@@ -256,10 +334,101 @@ private:
             }
         }
 
+        EvaluateGpsApproachIntent(now_ms);
+
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
             PublishStatus(now_ms);
         }
+    }
+
+    /// GPS_APPROACH 位置引导意图（阶段四）。仅在估计输入已绑定且处于 S5 时工作：
+    /// 估计新鲜有效→发布/重发 kPositionGuide 意图；估计失效→停发，
+    /// 超龄收口由 FlightController 意图超时门禁（controller.intent_timeout）接管。
+    void EvaluateGpsApproachIntent(uint64_t now_ms) {
+        if (!estimation_inputs_active_) {
+            return;
+        }
+        if (CurrentState() != common::MissionState::kGpsApproach) {
+            if (position_intent_active_) {
+                position_intent_active_ = false;
+                last_intent_target_.reset();
+                SPDLOG_INFO("GPS_APPROACH 位置引导意图停止: 离开GPS_APPROACH状态");
+            }
+            return;
+        }
+        if (HasFreshEstimate(now_ms)) {
+            PublishGpsApproachIntent(*latest_estimated_, now_ms);
+        } else if (position_intent_active_) {
+            // 估计失效或超龄：停止正常意图。FlightController 在意图超时后自行收口，
+            // 这里不再补发安全类意图（刹停语义归后续状态迁移任务）。
+            position_intent_active_ = false;
+            last_intent_target_.reset();
+            const uint64_t count = ++intent_stale_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("GPS_APPROACH 位置引导意图停止: 估计无效或超龄 count={}", count);
+            }
+        }
+    }
+
+    /// 估计目标是否新鲜有效（valid 标志 + 剩余有效期，与 TargetEstimator 输出语义一致）。
+    bool HasFreshEstimate(uint64_t now_ms) const {
+        if (!latest_estimated_) {
+            return false;
+        }
+        const auto& target = *latest_estimated_;
+        if (!target.valid) {
+            return false;
+        }
+        if (target.header.receive_time_ms == 0 || target.header.valid_for_ms == 0) {
+            return false;
+        }
+        return now_ms <= target.header.receive_time_ms + target.header.valid_for_ms;
+    }
+
+    /// 发布 S5 位置引导意图。节流纪律：内容无变化按 10Hz 上限重发
+    /// （意图是周期语义，FlightController 50ms 周期消费）；内容变化立即发。
+    void PublishGpsApproachIntent(const common::TargetState& target, uint64_t now_ms) {
+        const bool content_changed = !last_intent_target_.has_value() ||
+            !FloatContentEqual(last_intent_target_->pos_x_m, target.pos_x_m) ||
+            !FloatContentEqual(last_intent_target_->pos_y_m, target.pos_y_m) ||
+            !FloatContentEqual(last_intent_target_->pos_z_m, target.pos_z_m) ||
+            last_intent_target_->valid != target.valid;
+        if (!content_changed &&
+            now_ms - last_intent_publish_ms_ < kIntentRepublishIntervalMs) {
+            return;
+        }
+        if (!position_intent_active_) {
+            SPDLOG_INFO("GPS_APPROACH 位置引导意图启动: target_id={} pos=({:.2f},{:.2f},{:.2f})",
+                        target.target_id, static_cast<double>(target.pos_x_m),
+                        static_cast<double>(target.pos_y_m),
+                        static_cast<double>(target.pos_z_m));
+        }
+        common::ControlIntent intent;
+        intent.header.sequence = ++intent_sequence_;
+        intent.header.source_time_ms = now_ms;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = intent_valid_for_ms_;
+        intent.header.source_id = 1;
+        intent.header.health = 1;
+        intent.header.frame_id = target.header.frame_id;
+        intent.type = common::ControlIntentType::kPositionGuide;
+        intent.control_source = 0;  // 位置链
+        intent.target_x = target.pos_x_m;
+        intent.target_y = target.pos_y_m;
+        // 高度无效时 pos_z_m 为 NaN（合法语义）：原样透传，
+        // 由 FlightController 有限性门禁拒绝，状态机侧不得改成 0。
+        intent.target_z = target.pos_z_m;
+        // bit31 显式请求控制权（FlightController 授权链必要条件）+
+        // 低位 7=地面站任务下发。
+        intent.reason_code =
+            common::kControlIntentReasonRequestControl | kReasonGroundStationTask;
+        intent.valid_until_ms = now_ms + intent_valid_for_ms_;
+        (void)intent_output_.Publish(
+            std::make_shared<const common::ControlIntent>(intent));
+        last_intent_publish_ms_ = now_ms;
+        last_intent_target_ = target;
+        position_intent_active_ = true;
     }
 
     /// GPS位置引导的最低导航前置条件。后续接入控制前还需增加模式/高度/电池等门禁。
@@ -347,14 +516,25 @@ private:
     common::Topic<common::GroundStationTarget>* ground_target_topic_ = nullptr;
     common::Topic<common::FlightStateSnapshot>* flight_topic_ = nullptr;
     common::Topic<common::HealthStatus>* health_topic_ = nullptr;
+    common::Topic<common::TargetState>* estimated_topic_ = nullptr;
+    common::Topic<common::VisualTargetStatus>* visual_status_topic_ = nullptr;
+    common::Topic<common::StereoTargetDistance>* distance_topic_ = nullptr;
+    /// PX4 命令窄接口（仅 enable_control=true 装配期注入；当前仅持有备用）。
+    communication::IPx4CommandSender* command_sender_ = nullptr;
 
     common::Topic<common::GroundStationTarget>::Subscription ground_target_subscription_;
     common::Topic<common::FlightStateSnapshot>::Subscription flight_subscription_;
     common::Topic<common::HealthStatus>::Subscription health_subscription_;
+    common::Topic<common::TargetState>::Subscription estimated_subscription_;
+    common::Topic<common::VisualTargetStatus>::Subscription visual_status_subscription_;
+    common::Topic<common::StereoTargetDistance>::Subscription distance_subscription_;
 
     std::optional<common::GroundStationTarget> latest_ground_target_;
     std::optional<common::FlightStateSnapshot> latest_flight_;
     std::optional<common::HealthStatus> latest_health_;
+    std::optional<common::TargetState> latest_estimated_;
+    std::optional<common::VisualTargetStatus> latest_visual_status_;
+    std::optional<common::StereoTargetDistance> latest_distance_;
 
     std::atomic<bool> running_{false};
     std::thread worker_;
@@ -369,11 +549,21 @@ private:
     uint64_t target_receive_count_ = 0;
     uint64_t target_stale_count_ = 0;
 
+    /// 控制意图有效期（构造注入，与 controller.intent_timeout 对齐）。
+    const uint64_t intent_valid_for_ms_;
+    bool estimation_inputs_active_ = false;  ///< 估计/视觉/测距输入组已成功订阅
+    bool position_intent_active_ = false;    ///< S5 位置引导意图发布中
+    uint64_t intent_sequence_ = 0;
+    uint64_t last_intent_publish_ms_ = 0;
+    uint64_t intent_stale_count_ = 0;
+    std::optional<common::TargetState> last_intent_target_;  ///< 上次发布意图对应的目标内容
+
     common::Topic<common::ControlIntent> intent_output_;
     common::Topic<common::MissionStatus> status_output_;
 };
 
-MissionStateMachine::MissionStateMachine() : impl_(std::make_unique<Impl>()) {}
+MissionStateMachine::MissionStateMachine(MissionStateMachineConfig config)
+    : impl_(std::make_unique<Impl>(config)) {}
 MissionStateMachine::~MissionStateMachine() = default;
 bool MissionStateMachine::Start() { return impl_->Start(); }
 void MissionStateMachine::Stop() { impl_->Stop(); }
@@ -382,6 +572,15 @@ void MissionStateMachine::SetInputs(common::Topic<common::GroundStationTarget>& 
                                     common::Topic<common::FlightStateSnapshot>& flight,
                                     common::Topic<common::HealthStatus>& health) {
     impl_->SetInputs(ground_target, flight, health);
+}
+void MissionStateMachine::SetEstimationInputs(
+    common::Topic<common::TargetState>& estimated,
+    common::Topic<common::VisualTargetStatus>& visual_status,
+    common::Topic<common::StereoTargetDistance>& distance) {
+    impl_->SetEstimationInputs(estimated, visual_status, distance);
+}
+void MissionStateMachine::SetCommandSender(communication::IPx4CommandSender* sender) {
+    impl_->SetCommandSender(sender);
 }
 common::Topic<common::ControlIntent>& MissionStateMachine::IntentOutput() {
     return impl_->IntentOutput();
@@ -427,6 +626,18 @@ void MissionStateMachineStub::SetInputs(
     common::Topic<common::GroundStationTarget>& /*ground_target*/,
     common::Topic<common::FlightStateSnapshot>& /*flight*/,
     common::Topic<common::HealthStatus>& /*health*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetEstimationInputs(
+    common::Topic<common::TargetState>& /*estimated*/,
+    common::Topic<common::VisualTargetStatus>& /*visual_status*/,
+    common::Topic<common::StereoTargetDistance>& /*distance*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetCommandSender(
+    communication::IPx4CommandSender* /*sender*/) {
     // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
 }
 
