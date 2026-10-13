@@ -5,7 +5,9 @@
 
 ## 1. 功能职责
 
-该程序用于分级验证真实 Pixhawk/PX4 串口基础链路和 PX4 SITL UDP 控制链路，不依赖视频、YOLO、图传、状态机和控制器。
+该程序用于分级验证真实 Pixhawk/PX4 串口基础链路和 PX4 SITL UDP 控制链路；stage 0~3D
+不依赖视频、YOLO、图传、状态机和控制器，stage4（`--sitl-stage4-controller`）装配真实
+`FlightController` 验证执行层全链（G2 门禁），仍不依赖视频/状态机。
 
 测试内容：
 
@@ -15,12 +17,14 @@
 - 接收 PX4 HEARTBEAT 和已配置输出的遥测；
 - 每秒打印一次状态摘要，连接/armed/模式变化时立即打印；
 - 到期或 Ctrl+C 后停止并输出 PASS/WARN/FAIL 验收报告；
-- 根据基础链路结果返回进程退出码。
+- 根据基础链路结果返回进程退出码；
+- stage4：装配 `ControlIntent → FlightController → Px4Setpoint → Px4Link` 全链，
+  按脚本化意图序列验收零速漂移、速度阶跃、停发刹车与 Offboard 退出时延。
 
 安全边界：不带 SITL 阶段参数时，程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、
 降落或 Offboard 控制；主动内容仅为 HEARTBEAT 和遥测请求。所有控制阶段参数强制要求
 `transport=udp` 且互斥，串口配置会在启动前拒绝。`--sitl-takeoff-land` 固定相对起飞 1m，
-不可通过命令行扩大，确认 landed 前禁止 DISARM。
+不可通过命令行扩大，确认 landed 前禁止 DISARM。stage4 的意图/边界同样固定，不可经命令行放大。
 
 ## 2. 构建与运行
 
@@ -51,7 +55,41 @@ echo "退出码=$?"
 | `--sitl-takeoff-land` | 仅 UDP，相对起飞 1m、稳定悬停 3 秒、AUTO.LAND、确认 landed 后主动 DISARM |
 | `--sitl-horizontal-motion` | 仅 UDP，起飞 1m 后北向 0.5m/s×2 秒、零速度制动、返回起点、降落上锁；最短 30 秒 |
 | `--sitl-offboard-loss` | 仅 UDP，起飞 1m 后停止 setpoint、验证 PX4 退出 Offboard，再 AUTO.LAND 回收；最短 25 秒 |
+| `--sitl-stage4-controller` | 仅 UDP，装配真实 `FlightController` + 意图脚本（G2 执行层门禁）；最短 60 秒 |
 | `--help` | 显示帮助 |
+
+### 2.1 stage4 执行层门禁脚本（`--sitl-stage4-controller`）
+
+装配与数据流：工具创建 `Topic<ControlIntent>`、真实 `FlightController`（配置节
+`controller`，字段与默认值同源 `config/config.h`）并接线
+`ControlIntent → FlightController → Px4Setpoint → Px4Link`。工具扮演“状态机 + 地面站”
+角色发布脚本化意图（每 100ms 一条，带 `reason_code` bit31 控制权请求位、
+`valid_until_ms = now+500ms`），控制器授权链要求 `connected + armed + Offboard(6/0)`。
+
+**进入 Offboard 的引导流**：PX4 要求进入 Offboard 前已存在 setpoint 流（stage3A 纪律），
+而控制器授权链要求 armed + Offboard 才发布——先有鸡还是先有蛋。工具因此在接管前直接向
+控制器输出主题注入零速度引导流（控制器 IDLE 期间不发布，无冲突），满足“≥2 秒且 ≥20 条”
+后请求 Offboard；ARM 确认 armed、控制器授权链全通转 ACTIVE 后停止注入，由控制器供流
+（停注后 `SetpointSendCount` 继续增长即证明接管成功）。该引导顺序说明进入 Offboard 的
+生产接管次序仍待后续任务（状态机侧的 ARM/模式命令）落地。
+
+脚本序列与验收断言（报告逐条 PASS/FAIL，实测值一并打印）：
+
+| 段 | 内容 | 验收断言 |
+|---|---|---|
+| 0 | 引导零速度流 → Offboard(6/0) → ARM | Offboard/ARM 的 ACK accepted + 真实模式/armed；控制器接管后链路发送持续增长 |
+| 1 | 位置引导意图（`control_source=0`）起飞至相对 1m 并稳定悬停 3 秒 | 高度误差 ≤0.15m、水平漂移 ≤0.30m、垂速 ≤0.30m/s；该段位置意图零拒绝（含 Home 基准） |
+| 2 | 零速度意图保持 3 秒（`control_source=1`） | 最大水平漂移 < 0.10m |
+| 3 | 北向 2m/s 阶跃意图保持 2.5 秒 | 速度爬升斜率 ≤ max_accel_mps2×1.2（300ms 窗口差分）；稳态速度 = min(2, max_speed_mps) ±0.25m/s |
+| 4 | 停止发布意图（超龄注入） | 控制器转 COAST 零速刹车；速度过零（≤0.10m/s）时间 < coast_timeout |
+| 5 | 持续停发 | 控制器转 IDLE 停发（`valid=false`），PX4 在 1.3s 内退出 Offboard；停发后额外发送 ≤2 条 |
+| 6 | AUTO.LAND → landed → 主动 DISARM | ACK accepted + 真实 landed/armed 状态；未落地禁止 DISARM |
+
+硬包线（armed 期间越界即安全回收 AUTO.LAND）：相对高度 ≤1.30m；阶跃前水平漂移 ≤0.50m；
+阶跃/停发段北向 ≤6.0m、东西 ≤1.0m、高度 ≥0.50m；连接/位置/姿态失效同样触发回收。
+非预期的 Offboard 退出（非步骤 5）计入失败。
+
+退出码沿用第 5 节；无 SITL 时在 10 秒连接超时后中止脚本并报告 FAIL（退出码 3），不得误报 PASS。
 
 ## 3. 当前配置
 
@@ -161,7 +199,9 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 - 文件日志：沿用 `config.log` 配置和工程异步日志；
 - 不逐条打印高频姿态/位置消息；
 - `Px4Link` 仅记录生命周期、连接变化、版本首次上报和节流错误；命令拒绝/失败使用 WARN；
-- SITL 飞行阶段仅打印状态变化、阶段切换、安全回收和最终验收，不逐设定值打印。
+- SITL 飞行阶段仅打印状态变化、阶段切换、安全回收和最终验收，不逐设定值打印；
+- stage4 期间控制器的控制权迁移（IDLE/ACTIVE/COAST 及原因串）由 `FlightController`
+  自身 WARN 日志记录，工具侧只打印阶段切换与实测值。
 
 ## 7. 排查要点
 
@@ -182,6 +222,11 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | 水平运动位移验收失败 | 制动完成时北向位移必须在 0.70~1.30m；速度命令结束瞬间位移仅用于观察加速响应 |
 | 停止 setpoint 后仍为 6/0 | 检查 `COM_OF_LOSS_T` 和实际 setpoint 发送计数；本工具最长等待 10 秒 |
 | Offboard loss 保护模式与预期不同 | 对照运行前记录的 `COM_OBL_RC_ACT` 和 RC 是否存在，不在工具内猜测或改参数 |
+| stage4 引导阶段超时 | 引导流是否 ≥2 秒且 ≥20 条、Offboard ACK 是否 accepted、PX4 是否真实 6/0；查日志中控制器迁移原因串 |
+| stage4“控制器未接管设定值流” | 控制器授权链未全通：查 `controller.reason_code` bit31 是否置位、快照是否 armed+6/0（工具每拍带请求位） |
+| stage4 起飞阶段超时 | 位置引导意图被拒（`home_valid=false` → 无 Home 基准）或 `local_position` 无效；报告打印控制器 rejected 计数 |
+| stage4 刹车/退出时延超标 | 对照 `controller.coast_timeout_ms` 与 PX4 `COM_OF_LOSS_T`；报告分别打印 COAST→过零与 IDLE→退出实测值 |
+| stage4 无 SITL 时 | 10 秒连接超时后中止并 FAIL（退出码 3）；若退出码 1，先看参数互斥/时长/transport 门禁提示 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

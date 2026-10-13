@@ -474,6 +474,76 @@ PX4 1.17.0 源码确认：`COM_OBL_RC_ACT=0`定义为Position mode，custom 4/5�
 
 任何阶段未通过都不得进入真实 Pixhawk 控制测试。
 
+## 12. 第 4 阶段：FlightController 执行层门禁（G2）
+
+第 3D 通过后执行（`--config config/px4_sitl.json` 必须使用 UDP 配置）：
+
+```bash
+./build/px4_link_smoke \
+  --config config/px4_sitl.json \
+  --duration 90 \
+  --sitl-stage4-controller
+```
+
+与第 0~3D 的区别：工具不再直接发布 `Px4Setpoint`，而是装配真实 `FlightController`
+（`controller` 配置节，字段/默认值与 `config/config.h` 同源，本工具只解析不链接
+drone_config），把脚本化 `ControlIntent`（每 100ms，带 `reason_code` bit31 控制权
+请求位）交给控制器门禁链与限幅流水线，再经 `Px4Link` 下发；验收只取 PX4 遥测与
+控制器公开诊断计数器。
+
+固定流程：
+
+1. 连接建立后注入零速度引导流（≥2 秒且 ≥20 条，见下）→ 请求 `DO_SET_MODE` 6/0 →
+   本轮 ACK accepted 且真实 6/0 → 在 landed + 位置/姿态有效条件下 ARM；
+2. 确认 armed 后控制器授权链全通转 ACTIVE，工具停止引导流并确认控制器接管供流；
+3. 位置引导意图起飞至相对起飞 1m（起点锁定同 3B，不使用固定原点），稳定悬停 3 秒；
+4. 零速度意图保持 3 秒，最大水平漂移 < 0.10m；
+5. 北向 2m/s 阶跃意图：爬升斜率 ≤ `max_accel_mps2`×1.2（300ms 窗口），
+   稳态速度 = min(2, `max_speed_mps`) ±0.25m/s；
+6. 停止发布意图（超龄注入）→ 控制器转 COAST 零速刹车，速度过零时间 < `coast_timeout_ms`；
+7. 持续停发 → 控制器转 IDLE 停发（`valid=false`）→ PX4 在 1.3s 内退出 Offboard
+   （实测基准：第 3D 段 `COM_OF_LOSS_T=1.0` 下 1270ms，含 commander/上报/采样延迟）；
+8. 立即请求 AUTO.LAND 4/6 → 确认 landed → 主动 DISARM。
+
+进入 Offboard 的次序说明（引导流）：PX4 要求进入 Offboard 前已有 setpoint 流（第 3A
+纪律），而控制器授权链要求 armed + Offboard(6/0) 才发布，二者构成死锁。工具在接管前
+直接向控制器输出主题注入零速度引导流（控制器 IDLE 不发布，无冲突），控制器 ACTIVE
+接管后即停注（停注后 `SetpointSendCount` 继续增长证明控制器供流）。生产侧“谁负责
+ARM/进入 Offboard”仍未接线（状态机命令接口当前仅捕网执行器），属后续任务；
+本阶段实跑时顺带记录 PX4 是否接受“无预流直接切 Offboard”，作为生产接管次序的输入。
+
+硬门禁：仅 UDP、与其他阶段参数互斥、最短 60 秒；相对高度 ≤1.30m；阶跃前水平漂移
+≤0.50m；阶跃/停发段北向 ≤6.0m、东西 ≤1.0m、高度 ≥0.50m；连接/位置/姿态失效或
+非预期退出 Offboard 一律触发 AUTO.LAND 回收；未确认 landed 禁止 DISARM；不使用
+force arm。无 SITL 环境时，10 秒连接超时即中止脚本并 FAIL（退出码 3）——负对照。
+
+验收报告必须全部 PASS：
+
+```text
+引导零速度流已注入(≥20 条)
+Offboard 模式请求/ACK accepted/PX4 已进入 Offboard(6/0)
+ARM 请求/ACK accepted/PX4 已确认 armed
+控制器已接管设定值流(授权链全通)
+相对起飞目标已建立 / 达到相对 1m 高度 / 目标高度稳定悬停 3 秒
+位置引导意图未被控制拒绝(含 Home 基准)
+零速意图 3 秒最大漂移 < 0.10m
+阶跃爬升斜率受限(≤max_accel×1.2) / 阶跃稳态速度=min(2, max_speed)
+停发后 COAST 零速刹车已触发 / 速度过零时间 < coast_timeout
+控制器已转 IDLE 停发 / PX4 已在 1.3s 内退出 Offboard
+停发后设定值发送已停止(≤2 条)
+AUTO.LAND 请求/ACK accepted/PX4 已确认 landed
+主动 DISARM 前未被自动上锁 / DISARM ACK accepted 且已确认 disarmed
+飞行未触发高度/漂移安全回收 / 控制器无异常计数
+实测时延: COAST→速度过零 ... ms，IDLE→PX4 退出 Offboard ... ms，退出模式 main/sub
+控制器诊断: setpoint=... rejected=... clamped=... error=... 引导注入=... 条
+```
+
+### 12.1 第 4 阶段实跑状态（2026-10-13）
+
+**待线下执行**：本阶段实现期无 PX4 SITL 环境，线上只完成编译、参数互斥/门禁负对照
+（无 SITL 时 10 秒连接超时 → FAIL、退出码 3；串口配置在启动前被拒）。SITL 实跑通过后
+把实测值（漂移、斜率、稳态速度、两级时延、包线）回填本小节与 `docs/开发进度.md`。
+
 ## 8. 常见问题
 
 | 现象 | 排查 |
@@ -484,3 +554,6 @@ PX4 1.17.0 源码确认：`COM_OBL_RC_ACT=0`定义为Position mode，custom 4/5�
 | Offboard 请求被拒绝 | 设定值预发送不足、local position 无效、模式命令 ACK 非 accepted |
 | PX4 没有 target | remote_port 错误、type mask/消息未到，抓取 `mavlink status` |
 | 程序拒绝启动 | 安全保护检测到 `--sitl-zero-velocity` 配合了非 UDP 配置 |
+| stage4 引导阶段超时 | 引导流未达 ≥2 秒/≥20 条、Offboard ACK 非 accepted、未真实 6/0；查控制器 WARN 迁移日志 |
+| stage4 起飞阶段超时 | 位置引导意图被拒（Home 基准缺失）或位置遥测无效；报告打印 rejected 计数 |
+| stage4 停发后未退出 Offboard | 对照 `controller.coast_timeout_ms` 与 PX4 `COM_OF_LOSS_T`；报告打印 IDLE→退出实测时延 |
