@@ -716,6 +716,8 @@ TEST(TargetEstimatorFusionTest, HomeChangeResetsVisualBookkeeping) {
     ASSERT_TRUE(f.flight.Publish(
         std::make_shared<const common::FlightStateSnapshot>(moved)).accepted);
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // 滤波器重置同时清空视觉创新诊断值（不得残留上一原点的创新）
+    EXPECT_TRUE(std::isnan(f.estimator.LastVisualInnovationM()));
     const uint64_t errors_before = f.estimator.ErrorCount();
     f.PublishVisual(MakeVisual(2, 10.0F));
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -774,6 +776,35 @@ TEST(TargetEstimatorFusionTest, MountYawRotatesVisualObservation) {
     // 东向偏移显著为正且与北向同量级（45° 旋转生效）
     EXPECT_GT(state.pos_y_m, 2.0F);
     EXPECT_NEAR(state.pos_x_m, state.pos_y_m, 2.0F);
+}
+
+TEST(TargetEstimatorFusionTest, InnovationDiagnosticsReflectsObservationOffset) {
+    // 交接创新门限（阶段四 Task 8）的数据来源：最近一次接受的视觉观测与
+    // 卡尔曼预测的水平距离，须在观测-预测差距大时显著、收敛后显著减小；
+    // 无任何视觉更新时为 NaN（表示无值，不被门限误当作"一致"）。
+    FusionFixture f;
+    ASSERT_TRUE(f.estimator.Start());
+    f.InitByGroundTarget();  // 原点初始化：预测在 NED 原点
+    ASSERT_TRUE(f.WaitGroundUpdates(1));
+    EXPECT_TRUE(std::isnan(f.estimator.LastVisualInnovationM()));
+
+    // 视觉观测在前方 10m（cam z=10 → NED north=10）：创新≈10m
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    f.PublishFlight();
+    f.PublishVisual(MakeVisual(1, 10.0F));
+    ASSERT_TRUE(f.WaitVisualUpdates(1));
+    const double first = f.estimator.LastVisualInnovationM();
+    EXPECT_NEAR(first, 10.0, 0.5);
+
+    // 同位置第二条观测（滤波器已被第一条拉近）：创新显著减小但不为负/NaN
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    f.PublishFlight();
+    f.PublishVisual(MakeVisual(2, 10.0F));
+    ASSERT_TRUE(f.WaitVisualUpdates(2));
+    const double second = f.estimator.LastVisualInnovationM();
+    f.estimator.Stop();
+    EXPECT_GT(second, 0.0);
+    EXPECT_LT(second, first);
 }
 
 TEST(TargetEstimatorFusionTest, FarObservationPullsWeakerThanNear) {

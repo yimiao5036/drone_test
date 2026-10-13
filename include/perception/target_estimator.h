@@ -75,6 +75,13 @@ public:
     virtual uint64_t VisualUpdateCount() const = 0;
     /// 累计拒绝的非法、过期或乱序观测数。
     virtual uint64_t ErrorCount() const = 0;
+
+    /// 最近一次接受的视觉观测与卡尔曼预测的水平创新距离（米，诊断接口）。
+    /// 语义：观测历元处的预测位置到观测位置的 N/E 水平距离（更新前差异），
+    /// 供交接判据的"创新一致性"门限消费（阶段四 Task 8，防错锁伪目标）。
+    /// 无有效视觉更新（从未接受、滤波器重置/重新初始化后）返回 NaN——
+    /// 调用方必须把 NaN 当作"无值"而不是"一致"。
+    virtual double LastVisualInnovationM() const = 0;
 };
 
 /// 正式单目标线性卡尔曼估计器。仅发布影子TargetState，不产生ControlIntent/Px4Setpoint。
@@ -103,6 +110,7 @@ public:
     uint64_t UpdateCount() const override;
     uint64_t VisualUpdateCount() const override;
     uint64_t ErrorCount() const override;
+    double LastVisualInnovationM() const override;
 
 private:
     struct Impl;
@@ -135,6 +143,7 @@ public:
     uint64_t UpdateCount() const override;
     uint64_t VisualUpdateCount() const override;
     uint64_t ErrorCount() const override;
+    double LastVisualInnovationM() const override;
 
 private:
     bool running_ = false;

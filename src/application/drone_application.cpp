@@ -120,10 +120,17 @@ void DroneApplication::BuildComponents() {
 
     // 影子状态机只在PX4状态源与地面站目标源同时存在时创建。
     // 意图有效期与 FlightController 的 controller.intent_timeout 同源注入，
-    // 保证状态机 valid_until_ms 与控制器超龄门禁一致。
+    // 保证状态机 valid_until_ms 与控制器超龄门禁一致；交接判据阈值来自
+    // handover 节与 visual_tracking（相机内参/超龄阈值），不在此写死。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
         state_machine::MissionStateMachineConfig state_machine_config;
         state_machine_config.intent_valid_for = config_.controller.intent_timeout;
+        state_machine_config.handover = config_.handover;
+        state_machine_config.camera = config_.visual_tracking.camera;
+        state_machine_config.visual_stale = std::chrono::milliseconds(
+            config_.visual_tracking.control.visual_stale_ms);
+        state_machine_config.distance_stale = std::chrono::milliseconds(
+            config_.visual_tracking.control.distance_stale_ms);
         mission_state_machine_ =
             std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
     }
@@ -243,6 +250,12 @@ void DroneApplication::BindTopics() {
                                           health_manager_->Output());
         ground_station_link_->SetMissionStatusInput(
             mission_state_machine_->StatusOutput());
+    }
+
+    // 交接判据的创新门限读取估计器最近一次视觉创新（只读诊断接口）。
+    // 未装配估计器时不注入：交接判据不评估（保持 GPS_APPROACH 影子行为）。
+    if (mission_state_machine_ != nullptr && target_estimator_ != nullptr) {
+        mission_state_machine_->SetEstimationDiagnostics(target_estimator_.get());
     }
 
     // 飞行控制器接线（阶段四装配门禁）。意图输入纪律：只接

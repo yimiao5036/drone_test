@@ -122,6 +122,11 @@ struct TargetEstimator::Impl {
     std::atomic<uint64_t> update_count{0};
     std::atomic<uint64_t> visual_update_count{0};
     std::atomic<uint64_t> error_count{0};
+    /// 最近一次接受的视觉观测与预测的水平创新距离（诊断；NaN=无有效值）。
+    /// 消费线程写、任意线程读（交接判据），原子量避免额外锁：
+    /// 这是一个"最新值"诊断，不要求与滤波状态严格同步。
+    std::atomic<double> visual_innovation_m{
+        std::numeric_limits<double>::quiet_NaN()};
     uint64_t waiting_home_count = 0;
     uint64_t output_sequence = 0;
 
@@ -173,6 +178,9 @@ struct TargetEstimator::Impl {
         // 视觉记账一并清空（Home 变化/target_id 切换走同一入口）
         visual_last_frame_sequence = 0;
         visual_frame_seen = false;
+        // 创新诊断一并清空：跨原点/跨目标的创新值没有意义（防陈旧值通过门限）
+        visual_innovation_m.store(std::numeric_limits<double>::quiet_NaN(),
+                                  std::memory_order_relaxed);
     }
 
     void HandleFlightState(const common::FlightStateSnapshot& state) {
@@ -341,10 +349,22 @@ struct TargetEstimator::Impl {
         const double dt_seconds =
             static_cast<double>(obs_time_ms - state_time_ms) *
             kMillisecondsToSeconds;
-        if (!(filter.Predict(dt_seconds) && filter.Update(measurement))) {
+        if (!filter.Predict(dt_seconds)) {
+            Reject("线性卡尔曼预测失败");
+            return;
+        }
+        // 创新（更新前）：观测历元处预测位置到观测位置的水平距离。
+        // 交接判据的创新门限依赖该值判断"视觉锁定与卡尔曼航迹是否同一目标"，
+        // 必须在 Update 之前取预测态（更新后差异会被滤波修正吃掉）。
+        const auto predicted = filter.State();
+        const double innovation_m =
+            std::hypot(ned->north_m - predicted.north_m,
+                       ned->east_m - predicted.east_m);
+        if (!filter.Update(measurement)) {
             Reject("线性卡尔曼更新失败");
             return;
         }
+        visual_innovation_m.store(innovation_m, std::memory_order_relaxed);
 
         visual_last_frame_sequence = msg.frame_sequence;
         visual_frame_seen = true;
@@ -355,9 +375,9 @@ struct TargetEstimator::Impl {
         if (ShouldLogThrottled(count)) {
             SPDLOG_INFO(
                 "目标估计已接受视觉观测: frame={} N={:.2f} E={:.2f} D={:.2f} "
-                "sigma={:.3f}m z={:.2f}m count={}",
+                "sigma={:.3f}m z={:.2f}m 创新={:.2f}m count={}",
                 msg.frame_sequence, ned->north_m, ned->east_m, ned->down_m,
-                sigma_z, z_m, count);
+                sigma_z, z_m, innovation_m, count);
         }
     }
 
@@ -740,6 +760,10 @@ uint64_t TargetEstimator::ErrorCount() const {
     return impl_->error_count.load();
 }
 
+double TargetEstimator::LastVisualInnovationM() const {
+    return impl_->visual_innovation_m.load(std::memory_order_relaxed);
+}
+
 TargetEstimatorStub::TargetEstimatorStub() {
     SPDLOG_INFO("目标估计部件骨架创建");
 }
@@ -793,6 +817,10 @@ uint64_t TargetEstimatorStub::VisualUpdateCount() const {
 
 uint64_t TargetEstimatorStub::ErrorCount() const {
     return 0;
+}
+
+double TargetEstimatorStub::LastVisualInnovationM() const {
+    return std::numeric_limits<double>::quiet_NaN();  // 骨架实现不产生视觉创新
 }
 
 }  // namespace drone::perception

@@ -1,10 +1,14 @@
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
 
 #include <gtest/gtest.h>
 
+#include "config/config.h"
+#include "perception/target_estimator.h"
 #include "state_machine/mission_state_machine.h"
 
 namespace {
@@ -319,6 +323,335 @@ TEST(MissionStateMachineTest, IntentStopsWhenEstimateInvalid) {
     EXPECT_FALSE(intent_subscription.WaitTakeFor(300ms).has_value());
 
     machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// 阶段四 Task 8：交接判据（S5→S6→S7 进入/退出迟滞）
+//
+// 进入（S5→S6）需同时满足：视觉 LOCKED 连续帧达 handover.lock_frames、
+// 双目距离有效且未超龄、视线角距视场边缘有余量（handover.fow_margin_deg）、
+// 视觉观测与卡尔曼预测创新在门限内（handover.innovation_gate_m）。
+// S6 驻留超时（handover.timeout_ms）回 S5；S7 退出需 LOST 连续帧达
+// handover.exit_lost_frames（进入/退出门限不同构成迟滞）。
+// 本层计数与 VisualTargetMonitor 内部 lock_frames 判据相互独立。
+// ---------------------------------------------------------------------------
+
+/// 视觉稳定性状态快照。默认中心 (640, 532) 位于标定内参下视场余量内：
+/// 标定主点 cy=532.07 偏离画面中心，画面中心 (640, 360) 反而贴近视场边缘。
+common::VisualTargetStatus MakeVisualStatus(common::VisualTargetState state,
+                                            uint64_t frame_sequence,
+                                            float center_x = 640.0F,
+                                            float center_y = 532.0F) {
+    common::VisualTargetStatus status;
+    status.header.sequence = frame_sequence;
+    status.header.source_time_ms = TestMonotonicMs();
+    status.header.receive_time_ms = TestMonotonicMs();
+    status.header.source_id = 0;
+    status.header.health = 1;
+    status.state = state;
+    status.frame_sequence = frame_sequence;
+    status.last_seen_ms = TestMonotonicMs();
+    status.consecutive_detected_frames = static_cast<int>(frame_sequence);
+    status.confidence = 0.9F;
+    status.center_pixel_x = center_x;
+    status.center_pixel_y = center_y;
+    status.frame_width = 1280;
+    status.frame_height = 720;
+    status.valid = state == common::VisualTargetState::kLocked;
+    return status;
+}
+
+/// 有效双目测距快照（StereoTargetDistance 头不含 valid_for_ms，
+/// 新鲜度由状态机按注入的超龄阈值判定）。
+common::StereoTargetDistance MakeFreshDistance(uint64_t frame_sequence) {
+    common::StereoTargetDistance msg;
+    msg.header.sequence = frame_sequence;
+    msg.header.source_time_ms = TestMonotonicMs();
+    msg.header.receive_time_ms = TestMonotonicMs();
+    msg.frame_sequence = frame_sequence;
+    msg.valid = true;
+    msg.confidence = 0.9F;
+    msg.forward_distance_m = 10.0F;
+    msg.camera_x_m = 0.0F;
+    msg.camera_y_m = 0.0F;
+    return msg;
+}
+
+/// 交接测试用估计快照：有效期足够长，覆盖用例全程。
+common::TargetState MakeHandoverEstimate() {
+    common::TargetState state = MakeValidEstimatedTarget();
+    state.header.valid_for_ms = 5000;
+    state.header.receive_time_ms = TestMonotonicMs();
+    return state;
+}
+
+/// 估计器诊断假件：只提供交接创新门限所需的值（其余接口占位）。
+/// 用假件而不是真估计器，使创新值可精确注入，状态机测试不依赖感知内部时序。
+class FakeEstimator final : public perception::ITargetEstimator {
+public:
+    bool Start() override { return true; }
+    void Stop() override {}
+    bool IsRunning() const override { return true; }
+    void SetGroundTargetInput(
+        common::Topic<common::GroundStationTarget>& /*ground*/) override {}
+    void SetFlightStateInput(
+        common::Topic<common::FlightStateSnapshot>& /*flight*/) override {}
+    void SetVisualDistanceInput(
+        common::Topic<common::StereoTargetDistance>& /*visual*/) override {}
+    common::Topic<common::TargetState>& EstimatedOutput() override {
+        return output_;
+    }
+    common::TargetState LastState() const override { return {}; }
+    uint64_t UpdateCount() const override { return 0; }
+    uint64_t VisualUpdateCount() const override { return 0; }
+    uint64_t ErrorCount() const override { return 0; }
+    double LastVisualInnovationM() const override { return innovation_m_; }
+
+    void SetInnovation(double value) { innovation_m_ = value; }
+
+private:
+    common::Topic<common::TargetState> output_;
+    double innovation_m_ = std::numeric_limits<double>::quiet_NaN();
+};
+
+/// 交接判据测试夹具：状态机 + 四路输入 + 假估计器诊断。
+/// 交接阈值取小值（lock=3、exit=6、超时 2s）压缩用例时长；
+/// 视觉/测距超龄阈值放宽，避免用例时序被调度抖动影响
+/// （超龄门禁本身有专门用例覆盖）。
+struct HandoverFixture {
+    explicit HandoverFixture(bool inject_diagnostics = true,
+                             std::chrono::milliseconds handover_timeout = 2000ms) {
+        config.visual_stale = 5000ms;
+        config.distance_stale = 5000ms;
+        config.handover.lock_frames = 3;
+        config.handover.exit_lost_frames = 6;
+        config.handover.fow_margin_deg = 5.0;
+        config.handover.innovation_gate_m = 3.0;
+        config.handover.timeout = handover_timeout;
+        estimator.SetInnovation(0.5);  // 默认创新在门限内
+        machine = std::make_unique<state_machine::MissionStateMachine>(config);
+        machine->SetInputs(ground, flight, health);
+        machine->SetEstimationInputs(estimated, visual, distance);
+        if (inject_diagnostics) {
+            machine->SetEstimationDiagnostics(&estimator);
+        }
+        status_subscription = machine->StatusOutput().Subscribe(64);
+        started = machine->Start();
+    }
+
+    ~HandoverFixture() { machine->Stop(); }
+
+    /// 驱动到 S5（导航就绪 → 新鲜地面站目标 → 估计/测距有效）。
+    void DriveToGpsApproach() {
+        (void)flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight()));
+        ASSERT_TRUE(
+            WaitForState(status_subscription, common::MissionState::kReady).has_value());
+        (void)ground.Publish(std::make_shared<const common::GroundStationTarget>(
+            MakeFreshGroundTarget()));
+        ASSERT_TRUE(WaitForState(status_subscription,
+                                 common::MissionState::kGpsApproach)
+                        .has_value());
+        PublishEstimateAndDistance();
+    }
+
+    void PublishEstimateAndDistance() {
+        (void)estimated.Publish(
+            std::make_shared<const common::TargetState>(MakeHandoverEstimate()));
+        (void)distance.Publish(std::make_shared<const common::StereoTargetDistance>(
+            MakeFreshDistance(++distance_sequence)));
+    }
+
+    /// 发布一条视觉状态并等待决策周期消费（决策周期 100ms，留余量）。
+    void PublishVisual(const common::VisualTargetStatus& status) {
+        (void)visual.Publish(
+            std::make_shared<const common::VisualTargetStatus>(status));
+        std::this_thread::sleep_for(120ms);
+    }
+
+    state_machine::MissionStateMachineConfig config;
+    common::Topic<common::GroundStationTarget> ground;
+    common::Topic<common::FlightStateSnapshot> flight;
+    common::Topic<common::HealthStatus> health;
+    common::Topic<common::TargetState> estimated;
+    common::Topic<common::VisualTargetStatus> visual;
+    common::Topic<common::StereoTargetDistance> distance;
+    common::Topic<common::MissionStatus>::Subscription status_subscription;
+    FakeEstimator estimator;
+    std::unique_ptr<state_machine::MissionStateMachine> machine;
+    bool started = false;
+    uint64_t distance_sequence = 0;
+};
+
+// LOCKED 断续不累计：N-1 条连续 LOCKED 被中断后不进入 S6；再补齐连续 N 条才进 S6。
+TEST(MissionStateMachineTest, HandoverRequiresConsecutiveLockFrames) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    // LOCKED(1) LOCKED(2) LOST(3) LOCKED(4) LOCKED(5)：任一刻连续锁定 < 3
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 1));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 2));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 3));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 4));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 5));
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+
+    // 第 3 条连续 LOCKED（断续累计是第 5 条，必须不生效）→ 进入 S6
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 6));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+}
+
+// 创新门限：无有效创新（NaN）或观测-预测水平距离超门限均不放行交接（防错锁伪目标）。
+TEST(MissionStateMachineTest, HandoverRejectsInnovationBeyondGate) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    f.estimator.SetInnovation(std::numeric_limits<double>::quiet_NaN());
+    for (uint64_t frame = 1; frame <= 4; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    // 连续锁定帧数已超门限，但创新无值 → 不放行
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+
+    f.estimator.SetInnovation(5.0);  // 超 innovation_gate_m=3.0
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 5));
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+
+    f.estimator.SetInnovation(0.5);  // 回到门限内 → 连续锁定条件已满足，进入 S6
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+}
+
+// 视场余量：目标视线角距视场边缘不足 fow_margin_deg 时不进入 S6。
+TEST(MissionStateMachineTest, HandoverRejectsTargetNearFovEdge) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    // 像素 x=1240 → 视线方位角约 31.6°，标定内参下视场半角约 33.2°，
+    // 余量不足 5° → 不放行
+    for (uint64_t frame = 1; frame <= 4; ++frame) {
+        f.PublishVisual(
+            MakeVisualStatus(common::VisualTargetState::kLocked, frame, 1240.0F));
+    }
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+
+    // 目标回到画面中部（余量充足）→ 进入 S6
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 5));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+}
+
+// S6 驻留超时：进入 S6 后视觉链未再推进新帧（首条视觉指令未生效）→ 回 S5。
+TEST(MissionStateMachineTest, HandoverTimeoutReturnsToGpsApproach) {
+    // 超时 300ms 先于视觉/测距超龄（5s）发生，确保走超时路径而非超龄撤销路径
+    HandoverFixture f(/*inject_diagnostics=*/true, /*handover_timeout=*/300ms);
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    // 驻留期：进入条件仍有效（输入未超龄），仅因超时回 S5
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach, 1500ms)
+                    .has_value());
+    // 超时回退后不因旧锁定帧立刻回跳 S6
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 400ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+}
+
+// S7 退出迟滞：LOST 连续帧超过进入门限但未达 exit_lost_frames 保持 S7；
+// 达到 exit_lost_frames 才回退（进入/退出门限不同防止两状态抖动）。
+TEST(MissionStateMachineTest, ExitRequiresMoreLostFramesThanEntry) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    // S6 内视觉链继续推进一条新的 LOCKED 帧 → 交接验证通过进入 S7
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 4));
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualTracking)
+                    .has_value());
+
+    // LOST 4 条（> lock_frames=3 但 < exit_lost_frames=6）→ 保持 S7
+    for (uint64_t frame = 5; frame <= 8; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, frame));
+    }
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kGpsApproach, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+
+    // 补足 6 条连续 LOST → 回退 S5
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 9));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 10));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+}
+
+// S6 撤销：驻留期进入条件失效（视觉丢失）→ 立即撤销回 S5。
+TEST(MissionStateMachineTest, HandoverAbortsWhenLockLostInHandover) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 4));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+}
+
+// 未注入估计器诊断接口时不放行交接：创新门限无法核验，保守保持 S5（并记 ERROR）。
+TEST(MissionStateMachineTest, HandoverRequiresEstimatorDiagnostics) {
+    HandoverFixture f(/*inject_diagnostics=*/false);
+    ASSERT_TRUE(f.started);
+    EXPECT_GT(f.machine->ErrorCount(), 0U);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 5; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
 }
 
 }  // namespace

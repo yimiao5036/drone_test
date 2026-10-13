@@ -151,7 +151,9 @@ add_library(drone_state_machine STATIC
 target_include_directories(drone_state_machine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_state_machine PUBLIC cxx_std_17)
-target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog)
+# control 模块：交接判据复用 PixelToAngle 视线角换算（Task 9 起还复用
+# TrackingControlLaw）。静态库依赖经 LINK_ONLY 传播给最终可执行文件。
+target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog drone_control_core)
 
 # ---- control 模块（飞行控制接口+视觉跟踪控制律；库名加 _core 避免与可执行 drone_control 冲突） ----
 add_library(drone_control_core STATIC

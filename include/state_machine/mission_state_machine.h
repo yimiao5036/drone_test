@@ -9,7 +9,9 @@
  * 当前正式实现处于安全影子阶段：只验证 GroundStationTarget 能进入任务链路并
  * 发布 MissionStatus，不连接 PX4 控制输出。阶段四起可通过 SetEstimationInputs
  * 绑定估计/视觉/测距输入：绑定后 S5（GPS_APPROACH）发布 kPositionGuide
- * 控制意图（reason_code 带 bit31 控制权请求位）；未绑定时保持原影子行为。
+ * 控制意图（reason_code 带 bit31 控制权请求位）；绑定估计器诊断接口后，
+ * 交接判据（S5→S6→S7 进入/退出迟滞，handover 配置节）开始工作；未绑定时
+ * 保持原影子行为（停在 S5）。
  *
  * 数据流：
  *   common::Topic<GroundStationTarget> ─┐
@@ -17,7 +19,8 @@
  *   common::Topic<HealthStatus> ────────┤
  *   common::Topic<TargetState> ─────────┼──► IMissionStateMachine ──┬─► common::Topic<ControlIntent>
  *   common::Topic<VisualTargetStatus> ──┤   （后三者经              └─► common::Topic<MissionStatus>
- *   common::Topic<StereoTargetDistance> ┘      SetEstimationInputs）
+ *   common::Topic<StereoTargetDistance> ┘      SetEstimationInputs；
+ *   估计器诊断（LastVisualInnovationM）经 SetEstimationDiagnostics）
  * 可替换边界：不依赖具体设备。
  */
 #pragma once
@@ -28,9 +31,15 @@
 
 #include "common/topic.h"
 #include "common/types.h"
+#include "config/config.h"
+#include "control/tracking_config.h"
 
 namespace drone::communication {
 class IPx4CommandSender;
+}
+
+namespace drone::perception {
+class ITargetEstimator;
 }
 
 namespace drone::state_machine {
@@ -40,6 +49,17 @@ struct MissionStateMachineConfig {
     /// 控制意图有效期（valid_for_ms 与 valid_until_ms 基准）。必须与
     /// FlightController 的 controller.intent_timeout 对齐，由装配层从同一来源传入。
     std::chrono::milliseconds intent_valid_for{300};
+    /// 交接缝迟滞参数（handover 配置节同源注入）。关系校验（exit > lock 等）
+    /// 由配置加载期 `HandoverConfig::Validate` 强制；本结构不重复校验。
+    config::HandoverConfig handover;
+    /// 标定内参（visual_tracking.camera 同源注入）：视线角与视场半角换算基准。
+    /// 分辨率与内参绑定，换档位必须重新标定（见 control/tracking_config.h）。
+    control::TrackingCameraGroupConfig camera;
+    /// 视觉稳定性状态超龄阈值（visual_tracking.control.visual_stale_ms 同源）。
+    /// VisualTargetStatus 头不设置 valid_for_ms，新鲜度按 receive_time + 该阈值判定。
+    std::chrono::milliseconds visual_stale{200};
+    /// 双目测距超龄阈值（visual_tracking.control.distance_stale_ms 同源）。
+    std::chrono::milliseconds distance_stale{500};
 };
 
 /// 任务状态机部件抽象接口。
@@ -68,6 +88,12 @@ public:
         common::Topic<common::StereoTargetDistance>& distance) = 0;
     /// 注入 PX4 命令窄接口（仅 enable_control=true 装配期调用）。
     virtual void SetCommandSender(communication::IPx4CommandSender* sender) = 0;
+    /// 注入目标估计器诊断接口：交接判据的创新门限读取
+    /// `ITargetEstimator::LastVisualInnovationM()`（最近一次视觉观测与卡尔曼预测的
+    /// 水平距离）。必须在 Start 前调用；未注入时交接判据不评估（保持 S5 影子行为，
+    /// 创新门限无法核验时不放行交接）。
+    virtual void SetEstimationDiagnostics(
+        const perception::ITargetEstimator* estimator) = 0;
 
     // ---- 输出 ----
     /// 控制意图输出主题：common::ControlIntent（供 IFlightController 消费）。
@@ -87,8 +113,10 @@ public:
 /// 正式任务状态机实现。
 ///
 /// 默认保持安全影子语义；调用 SetEstimationInputs 绑定估计/视觉/测距输入后，
-/// S5（GPS_APPROACH）开始发布 kPositionGuide 控制意图（带 bit31 控制权请求位），
-/// 是否真正输出由 FlightController 授权链与 enable_control 装配门禁决定。
+/// S5（GPS_APPROACH）开始发布 kPositionGuide 控制意图（带 bit31 控制权请求位）；
+/// 再经 SetEstimationDiagnostics 注入估计器诊断后，交接判据
+/// （handover 配置节：LOCKED 连续帧/测距/视场余量/创新门限 + S6 超时 + S7 退出迟滞）
+/// 生效。是否真正输出控制由 FlightController 授权链与 enable_control 装配门禁决定。
 class MissionStateMachine final : public IMissionStateMachine {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});
@@ -109,6 +137,8 @@ public:
         common::Topic<common::VisualTargetStatus>& visual_status,
         common::Topic<common::StereoTargetDistance>& distance) override;
     void SetCommandSender(communication::IPx4CommandSender* sender) override;
+    void SetEstimationDiagnostics(
+        const perception::ITargetEstimator* estimator) override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
@@ -143,6 +173,8 @@ public:
         common::Topic<common::VisualTargetStatus>& visual_status,
         common::Topic<common::StereoTargetDistance>& distance) override;
     void SetCommandSender(communication::IPx4CommandSender* sender) override;
+    void SetEstimationDiagnostics(
+        const perception::ITargetEstimator* estimator) override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
