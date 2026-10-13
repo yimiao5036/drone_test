@@ -279,10 +279,41 @@ TEST(ConfigTest, ParsesUvcStereoConfiguration) {
     std::filesystem::remove(path);
 }
 
-TEST(ConfigTest, RejectsControlBeforeFormalAssemblyIsEnabled) {
+// 阶段四装配门禁：enable_control=true 在依赖链（PX4+地面站）齐备且
+// controller 配置 Validate 通过时允许加载（正式绑定仍是装配期行为，
+// 仓库生产 config.json 永远保持 false）。
+TEST(ConfigTest, AllowsControlWhenAssemblyPreconditionsMet) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_control"] = true;
-    const auto path = WriteTemporaryConfig(value, "drone_config_control_rejected.json");
+    const auto path = WriteTemporaryConfig(value, "drone_config_control_allowed.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.runtime.enable_control);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsControlWithoutGroundStation) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_control"] = true;
+    value["runtime"]["enable_ground_station"] = false;
+    // 摘掉依赖地面站的链路，确保拒绝原因只剩 enable_control 门禁本身。
+    value["runtime"]["enable_target_estimator"] = false;
+    value["runtime"]["enable_visual_position_fusion"] = false;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_control_without_ground.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsControlWithInvalidControllerConfig) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_control"] = true;
+    // coast_timeout 必须大于 intent_timeout（默认 300ms），违反则 Validate 拒绝。
+    value["controller"]["coast_timeout_ms"] = 100;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_control_invalid_controller.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

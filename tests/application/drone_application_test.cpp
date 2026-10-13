@@ -12,6 +12,7 @@
  */
 #include <gtest/gtest.h>
 
+#include "../common/log_capture.h"
 #include "application/drone_application.h"
 #include "config/config.h"
 
@@ -74,6 +75,53 @@ TEST(DroneApplicationTest, StereoRangingWithVisualTrackingConstructs) {
     EXPECT_NO_THROW({
         DroneApplication application(std::move(config));
     });
+}
+
+/// 控制面装配配置：PX4+地面站开启（状态机与飞行控制器因此装配），视频链路
+/// 关闭；只验证构造装配接线，不启动线程、不触碰硬件。
+config::AppConfig MakeControlAssemblyConfig(bool enable_control) {
+    config::AppConfig config;
+    config.runtime.enable_video = false;
+    config.runtime.enable_px4 = true;
+    config.runtime.enable_ground_station = true;
+    config.runtime.enable_target_estimator = false;
+    config.runtime.enable_visual_monitor = false;
+    config.runtime.enable_visual_tracking = false;
+    config.runtime.enable_stereo_ranging = false;
+    config.runtime.enable_control = enable_control;
+    return config;
+}
+
+// 阶段四装配门禁：enable_control=false 时飞行控制器影子运行——已创建并接入
+// 状态机意图（授权链因未注入 PX4 快照源恒不通过），但不绑定 Px4Setpoint、
+// 不注入命令接口，且无「正式控制输出已启用」WARN。
+TEST(DroneApplicationTest, EnableControlFalseDoesNotBindSetpoint) {
+    test::LogCapture capture;
+    DroneApplication application(MakeControlAssemblyConfig(false));
+    const auto snapshot = application.ControlAssembly();
+    EXPECT_TRUE(snapshot.flight_controller_created);
+    EXPECT_TRUE(snapshot.intent_input_bound);
+    EXPECT_FALSE(snapshot.px4_snapshot_source_injected);
+    EXPECT_FALSE(snapshot.setpoint_bound_to_px4);
+    EXPECT_EQ(capture.Count("正式控制输出已启用"), 0);
+}
+
+// enable_control=true：完成 PX4 快照源注入与 Px4Setpoint 绑定
+// （状态机命令接口注入由 Task 7 落地，此处仅占位纪律）。
+TEST(DroneApplicationTest, EnableControlTrueBindsSetpointAndCommandSender) {
+    DroneApplication application(MakeControlAssemblyConfig(true));
+    const auto snapshot = application.ControlAssembly();
+    EXPECT_TRUE(snapshot.flight_controller_created);
+    EXPECT_TRUE(snapshot.intent_input_bound);
+    EXPECT_TRUE(snapshot.px4_snapshot_source_injected);
+    EXPECT_TRUE(snapshot.setpoint_bound_to_px4);
+}
+
+// enable_control=true：装配期打 WARN「正式控制输出已启用」（运行时显性标记）。
+TEST(DroneApplicationTest, EnableControlTrueLogsWarnAtStart) {
+    test::LogCapture capture;
+    DroneApplication application(MakeControlAssemblyConfig(true));
+    EXPECT_GE(capture.Count("正式控制输出已启用"), 1);
 }
 
 }  // namespace

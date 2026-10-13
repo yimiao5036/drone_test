@@ -10,6 +10,7 @@
 
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
+#include "control/flight_controller.h"
 #include "control/visual_tracking_shadow.h"
 #include "perception/detection_backend.h"
 #include "perception/stereo_ranger.h"
@@ -31,7 +32,9 @@ namespace drone::application {
 //
 // 负责根据 AppConfig 创建组件、在启动前完成 Topic 接线，并按数据依赖顺序
 // 启动/停止各模块。main.cpp 不承载业务装配逻辑，只负责配置、日志、信号和等待。
-// 当前正式程序仍处于安全阶段：不绑定 Px4Setpoint，不发送飞行控制命令。
+// 安全基线：enable_control=false 时 FlightController 影子运行（不绑定
+// Px4Setpoint、不注入 PX4 快照源与命令接口）；只有 enable_control=true 才在
+// BindTopics 门禁分支完成控制输出接线（见函数内注释）。
 // ============================================================================
 
 DroneApplication::DroneApplication(config::AppConfig config)
@@ -115,9 +118,19 @@ void DroneApplication::BuildComponents() {
         config_.health.startup_grace_period);
     RegisterHealthSources();
 
-    // 影子状态机只在PX4状态源与地面站目标源同时存在时创建；本阶段不创建控制器。
+    // 影子状态机只在PX4状态源与地面站目标源同时存在时创建。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
         mission_state_machine_ = std::make_unique<state_machine::MissionStateMachine>();
+    }
+
+    // 飞行控制器（阶段四正式实现）：状态机装配即创建，与 enable_control 无关——
+    // enable_control=false 时影子运行：周期线程跑真实门禁链与限幅流水线，
+    // 但不注入 PX4 快照源（SetPx4LinkSource），授权链恒不通过、保持 IDLE 停发，
+    // SetpointOutput 无消费者；enable_control=true 的绑定见 BindTopics 门禁分支。
+    if (mission_state_machine_ != nullptr) {
+        flight_controller_ =
+            std::make_unique<control::FlightController>(config_.controller);
+        control_assembly_.flight_controller_created = true;
     }
 }
 
@@ -227,8 +240,27 @@ void DroneApplication::BindTopics() {
             mission_state_machine_->StatusOutput());
     }
 
-    // 当前正式主程序不绑定Px4Setpoint输入，也不发送控制命令。
-    // 后续只有在状态机、控制器和真实拆桨台架门禁全部完成后才允许连接控制Topic。
+    // 飞行控制器接线（阶段四装配门禁）。意图输入纪律：只接
+    // MissionStateMachine::IntentOutput()——VisualTrackingShadow 的影子意图不带
+    // 授权请求位（common::kControlIntentReasonRequestControl，reason_code bit31），
+    // 若接入控制器会每拍清锁存压死授权门禁，故影子输出永不接 FlightController。
+    if (flight_controller_ != nullptr && mission_state_machine_ != nullptr) {
+        flight_controller_->SetInput(mission_state_machine_->IntentOutput());
+        control_assembly_.intent_input_bound = true;
+    }
+
+    // enable_control 门禁：只有显式打开才把控制输出接到 PX4 链路并注入授权
+    // 数据源；false 时保持物理隔离——不绑定 Px4Setpoint、不注入快照源、
+    // 不注入命令接口，控制器留在 IDLE 影子运行。
+    if (config_.runtime.enable_control && flight_controller_ != nullptr &&
+        px4_link_ != nullptr) {
+        flight_controller_->SetPx4LinkSource(px4_link_.get());
+        px4_link_->SetInput(flight_controller_->SetpointOutput());
+        // Task 7 启用：mission_state_machine_->SetCommandSender(px4_link_.get());
+        control_assembly_.px4_snapshot_source_injected = true;
+        control_assembly_.setpoint_bound_to_px4 = true;
+        SPDLOG_WARN("正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint");
+    }
 }
 
 // 启动独立模块。单个模块失败时记录降级并继续尝试其他模块；只要有一个模块
@@ -325,6 +357,17 @@ bool DroneApplication::Start() {
         if (!target_estimator_->Start()) {
             degraded = true;
             SPDLOG_ERROR("主程序目标估计器启动失败，TargetState影子输出不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 飞行控制器是状态机意图的消费者，必须先于状态机启动；影子/正式语义由
+    // 装配期 enable_control 门禁决定（见 BindTopics），失败不阻断其他链路。
+    if (flight_controller_ != nullptr) {
+        if (!flight_controller_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序飞行控制器启动失败，控制链路不可用");
         } else {
             any_started = true;
         }
@@ -524,7 +567,10 @@ void DroneApplication::Stop() {
         health_manager_->Stop();
     }
 
-    // 健康生产者停止后再停止其消费者。
+    // 健康生产者停止后再停止其消费者；状态机意图的消费者（飞行控制器）先停。
+    if (flight_controller_ != nullptr) {
+        flight_controller_->Stop();
+    }
     if (mission_state_machine_ != nullptr) {
         mission_state_machine_->Stop();
     }

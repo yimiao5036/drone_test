@@ -16,6 +16,7 @@ class GroundStationLink;
 class Px4Link;
 }
 namespace drone::control {
+class FlightController;
 class VisualTrackingShadow;
 }
 namespace drone::perception {
@@ -97,6 +98,19 @@ public:
     bool IsRunning() const;
     VideoPipelineLatencySnapshot VideoLatencySnapshot() const;
 
+    /// 控制面装配诊断快照（阶段四装配门禁断言与排查用）。
+    /// enable_control=false：控制器已创建并接入状态机意图（影子运行，
+    /// 授权链因未注入 PX4 快照源恒不通过），但不绑定 Px4Setpoint、不注入命令接口；
+    /// enable_control=true：四个字段全 true。
+    struct ControlAssemblySnapshot {
+        bool flight_controller_created = false;    ///< 真实 FlightController 已创建
+        bool intent_input_bound = false;           ///< 意图输入已接 MissionStateMachine::IntentOutput()
+        bool px4_snapshot_source_injected = false; ///< SetPx4LinkSource 已注入（仅 enable_control=true）
+        bool setpoint_bound_to_px4 = false;        ///< Px4Link::SetInput 已绑定（仅 enable_control=true）
+    };
+    /// 装配完成后（构造返回后）的控制面接线快照。
+    ControlAssemblySnapshot ControlAssembly() const { return control_assembly_; }
+
 private:
     void BuildComponents();
     void BindTopics();
@@ -121,7 +135,10 @@ private:
     std::unique_ptr<communication::GroundStationLink> ground_station_link_;
     std::unique_ptr<perception::TargetEstimator> target_estimator_;
     std::unique_ptr<state_machine::MissionStateMachine> mission_state_machine_;
+    std::unique_ptr<control::FlightController> flight_controller_;  ///< 阶段四正式实现，影子/正式由 enable_control 门禁
     std::unique_ptr<health::HealthManager> health_manager_;
+
+    ControlAssemblySnapshot control_assembly_;
 
     std::atomic<bool> health_report_running_{false};
     std::thread health_report_thread_;
