@@ -24,6 +24,11 @@
 - **Home 相对围栏已接入（Task 5）**：位置式意图水平模长超 `max_radius_m`
   等比钳制、相对高度超 `max_altitude_m` 钳制；`home_valid=false` 时
   位置式意图拒绝（无基准不可围栏）。
+- **坐标边界（Task 9 明确）**：`kVelocityHeading` 意图的速度三分量约定为
+  **局部 NED（北/东/地）**——机体系→NED 旋转由意图生产方在输出端完成
+  （S7 视觉伺服在 `TrackingControlLaw` 内部按快照航向角旋转，状态机意图以
+  `frame_id=3` 标注），`FlightController` 只做限幅/无扰衔接/门禁，
+  **不做任何二次旋转**；位置式意图同理为局部 NED（原点=PX4 Home）。
 - `FlightControllerStub` 骨架占位保留不动，供骨架冒烟测试使用。
 
 ## 接口与数据流

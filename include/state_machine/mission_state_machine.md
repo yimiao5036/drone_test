@@ -17,19 +17,30 @@
 
 **未注入估计器诊断时交接判据不评估**（保持 S5，启动记 ERROR）：无法核验"视觉锁定与卡尔曼航迹是否同一目标"就不允许切进视觉末段。
 
+阶段四新增（Task 9）：**S7（VISUAL_TRACKING）视觉伺服意图迁入状态机**——内部伺服协作者复用`TrackingControlLaw`（配置为`MissionStateMachineConfig.tracking`，即`visual_tracking`节整节注入），逐拍组装控制快照（视觉稳定性状态 + 双目测距 + `FlightStateSnapshot`姿态）计算并发布`control_source=1`的速度航向意图（NED 速度，`reason_code`带 bit31 控制权请求位）。输出→意图映射约定：
+
+| 控制律输出 | 映射意图 |
+|---|---|
+| `kVelocityHeading`（valid=true） | `kVelocityHeading`：NED 速度分量 + 航向通道（速率式填`yaw_rate_dps`/位置式填`yaw_deg`），reason 低位 100 正常跟踪 |
+| `kBrakeHover`（视觉短期 LOST 判丢刹车，valid=true） | `kBrakeHover`零速安全意图（速度分量全零），reason 低位 102；**主链路无预测坐标**（`is_predicted`恒 false，101 Coast 低码不可达）——图像空间 coast 在本链路以判丢刹车形态落地 |
+| `kDegradedHold`（valid=false：姿态/视觉超龄） | **不发布意图**（安全语义：控制律已明确"禁止正常控制"，补发零速与其矛盾）；超龄收口交 FlightController 意图超时门禁（`intent_timeout`）刹停 |
+
+**S6 冻结最后位置目标（评审裁决 (a)，Task 9 落地）**：S5→S6 当拍冻结进入时刻的`TargetState`坐标；S6 驻留期逐拍续发该位置意图（`valid_until`由状态机每拍滚动续期），直到首条视觉速度意图被发出再停（S7 首拍若伺服降级停发，冻结续发继续顶住，不留意图缺口）。此策略对应用户设计 §2.1「进入 S6 后冻结最后位置目标」与 §2.5「位置式→速度式无扰斜坡过渡」——若交接期停发位置意图，控制器在`intent_timeout`(300ms)后 COAST 刹车，真实系统会在交接点先刹停再起步。
+
+**热备份核对（设计 §2.4）**：S7 期间每秒核对卡尔曼状态年龄——`TargetState.header.receive_time_ms`年龄是否超出其自报有效期窗（`valid_for_ms`，与 S5 意图门禁`HasFreshEstimate`同一口径；无快照/`valid=false`亦视为断粮）。断粮 → 节流 WARN「S7 热备份断粮」+ `MissionStatus.active_warning_bits` bit2 置位，**不退出 S7**（S7 去留由三条收口路径决定，热备份告警只提示"假备份"风险）。
+
+**与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
+
 本阶段仍不做以下事情：
 
 - 不发送PX4命令、模式切换、解锁、起飞、降落或setpoint（`SetCommandSender`注入的命令接口当前仅持有，供后续 ARM/执行机构任务使用）。
 - 不直接调用拦截设备。
 - 不把地面站目标透传为PX4航点。
-- S6/S7 期间不发布控制意图（视觉伺服意图由 Task 9 落地；当前位置意图只在 S5 发布）；
-  设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"验证量依赖控制侧反馈与
-  尚未冻结的阈值，本任务以"条件持续 + 视觉链推进 + 驻留超时"替代最小验证，
-  留待 Task 9/T12 补齐。
-- 设计 §2.1「进入 S6 后冻结最后位置目标」的**发布策略**（S6/S7 期间是否继续发布
-  冻结的位置意图、直至首条视觉指令被接收）由 **Task 9 显式决定**：本任务既不冻结
-  也不发布（位置引导意图随离开 S5 即停发，不引入未消费状态，见 .cpp 注释）；
-  Task 9 若决定发布，需同时定义冻结意图与首条视觉意图的切换时序。
+- 不实现设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量（依赖
+  控制侧反馈与尚未冻结的阈值配置），S6→S7 仍用"条件持续 + 视觉链推进 +
+  驻留超时"作最小验证，留 T12 全链补齐。
+- S7 无姿态超龄退出路径（边界声明）：姿态超龄由控制律降级停发 → FlightController
+  授权链收口（姿态异常同时意味着 PX4 数据链异常，由控制器门禁裁决）。
 
 完整自动任务链仍以`docs/状态机设计.md`为准；当前跳过`ARMING/TAKEOFF`只用于无控制输出的地面站目标接入验证，后续接入控制门禁后需要恢复完整状态推进。
 
@@ -39,7 +50,9 @@
 struct MissionStateMachineConfig {
     std::chrono::milliseconds intent_valid_for{300};  // 意图有效期，与 controller.intent_timeout 同源
     config::HandoverConfig handover;                  // 交接迟滞参数（handover 配置节同源）
-    control::TrackingCameraGroupConfig camera;        // 标定内参（visual_tracking.camera 同源）
+    control::TrackingConfig tracking;                 // 视觉跟踪控制律整节（visual_tracking 同源：
+                                                      // camera 供视线角/视场换算，control/heading/
+                                                      // vertical/distance 供 S7 伺服控制律）
     std::chrono::milliseconds visual_stale{200};      // 视觉状态超龄（visual_tracking.control.visual_stale_ms 同源）
     std::chrono::milliseconds distance_stale{500};    // 测距超龄（distance_stale_ms 同源）
 };
@@ -78,11 +91,17 @@ Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=
 ```
 
 配置注入：`intent_valid_for`由`DroneApplication`从`config_.controller.intent_timeout`
-同源传入，保证意图`valid_until_ms`与控制器意图超龄门禁一致；`handover`、`camera`
-与两个超龄阈值分别从`config_.handover`、`config_.visual_tracking.camera`、
-`config_.visual_tracking.control.{visual_stale_ms, distance_stale_ms}`同源传入。
+同源传入，保证意图`valid_until_ms`与控制器意图超龄门禁一致；`handover`、
+`tracking`（`visual_tracking`整节）与两个超龄阈值分别从`config_.handover`、
+`config_.visual_tracking`、`config_.visual_tracking.control.{visual_stale_ms,
+distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.control.*`
+（生产与状态机侧两阈值同源注入，测试可分别收紧）。
 `handover` 的关系校验（`exit_lost_frames > lock_frames` 等）由配置加载期
 `HandoverConfig::Validate`强制，状态机构造不重复校验（与 FlightController 同约定）。
+
+**接线现状（T12 前）**：`DroneApplication`尚未实际调用`SetEstimationInputs`
+（整机因此停在 S5 影子行为，不影响既有链路）——三者一组绑定与命令接口注入按
+实施计划归 T12 G3 全链接线；`SetEstimationDiagnostics`已在装配估计器时注入。
 
 ## 关键实现点
 
@@ -136,8 +155,33 @@ Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=
     锁定、控制律 `no_distance_action` 不触发退出"的场景；
     ③ 视觉 `LOST` 连续帧达 `exit_lost_frames`。
     S7 期间不评估进入条件；健康监视器按 `publish_interval`（100ms）发布，
-    200ms 超龄阈值留 2 倍余量，短时丢帧不触发 ①，图像空间 coast 仍归 Task 9
-    的视觉伺服（覆盖阈值以内的短时缺口）。
+    200ms 超龄阈值留 2 倍余量，短时丢帧不触发 ①，图像空间 coast 由 Task 9
+    的视觉伺服承担（阈值以内的短时缺口按判丢刹车形态落地，见下）。
+- **视觉伺服（Task 9）**（`EvaluatePositionIntent` / `EvaluateVisualServoIntent` /
+  `BuildVisualIntent` / `EvaluateHotBackup`）：
+  - 调用节拍：跟随状态机决策周期（100ms/10Hz）；控制律按实际时钟差推算`dt`
+    （`tracking.control.frequency_hz`仅作首拍兜底），限幅在真实时间上推进；
+    热路径零日志（意图切换/降级才打）。控制律单线程约定由决策线程独占满足。
+  - 快照组装：视觉`LOCKED`→`tracked=true`（其余状态 false）；`is_predicted`恒
+    false（主链路无预测坐标）；距离仅在`valid=true`且接收时间有效时透传
+    （超龄判定在控制律内，阈值取`tracking.control.distance_stale_ms`）；
+    姿态取`FlightStateSnapshot`真实值（**正式路径不做虚拟姿态兜底**——影子
+    部件的`virtual_attitude_when_absent`属观察开关，不进入正式装配）。
+  - 意图坐标系：速度分量已是**局部 NED**（机体系→NED 旋转在`TrackingControlLaw`
+    内完成），意图`frame_id=3`标注；FlightController 不做二次旋转
+    （边界见`include/control/flight_controller.md`）。
+  - 降级停发语义：`output.valid=false`（姿态/视觉超龄）→ 不发布意图 + 节流
+    WARN（reason 区分姿态超龄/视觉超龄/持续无距离退出）。**不补发零速**：
+    控制律已明确"禁止正常控制"，补发会与其矛盾；刹停收口交 FlightController
+    意图超时门禁（`intent_timeout` 后 COAST 刹车）。
+  - **热备份核对**：S7 内每秒（进入后立即核对一次）检查`HasFreshEstimate`
+    ——即`TargetState`年龄是否超出其自报有效期窗`valid_for_ms`（生产者声明的
+    "数据允许使用的最长时间"）；断粮 WARN 节流（第 1 次与每满 100 次）+
+    `MissionStatus`告警位 bit2，**不退出 S7**。告警位随离开 S7 清除。
+  - 冻结位置续发：S5→S6 当拍`FreezeHandoverTarget()`（取进入时刻`TargetState`），
+    S6 逐拍`PublishPositionIntent`滚动续期；S7 首拍伺服未发出意图前继续顶住；
+    发出后停发（`StopPositionIntent`）。交接段收口（含冻结清空、控制律`Reset`、
+    热备份状态清零）统一在`ResetHandoverHysteresis`内完成。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
 - 控制输出是否接 PX4 仍由`DroneApplication`的`enable_control`门禁决定（绑定
   `Px4Setpoint`+注入快照源+注入命令接口只在 true 分支）；诊断接口注入与
@@ -147,13 +191,17 @@ Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=
 
 - INFO：状态机创建、启动、停止、销毁；状态转移（含交接进入/验证通过/撤销/超时/
   视觉断流退出/测距失效退出/退出迟滞回退，一一对应中文 reason，便于事后区分
-  是哪条退出路径生效）；位置引导意图启动/停止；
-  PX4 命令接口与估计器诊断接口注入；首次/节流接收地面站目标。
-- WARN：启动前未绑定输入；目标过期；估计失效导致意图停止（节流）；导航状态丢失。
+  是哪条退出路径生效）；位置引导意图启动/停止（含"交接冻结最后位置目标"、
+  "交接冻结位置意图续发"、"位置引导意图停止: 视觉伺服接续"、交接段收口）；
+  S7 视觉伺服意图启动（带首拍 vx/vy/vz/yaw_rate 摘要）；PX4 命令接口与估计器
+  诊断接口注入；首次/节流接收地面站目标。
+- WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
+  S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）。
 - ERROR：订阅或线程启动异常；运行中重绑输入/注入接口；估计输入部分绑定；
   估计输入已绑定但未注入估计器诊断（交接不评估）。
-- 高频周期（100ms 决策、10Hz 意图重发）不打印日志；交接判据每周期静默评估，
-  只在状态迁移时打日志；重复异常使用第1次和每100次节流。
+- 高频周期（100ms 决策、10Hz 意图重发、S7 逐拍伺服计算）不打印日志；
+  交接判据与伺服计算每周期静默评估，只在状态迁移、意图来源切换与降级时打日志；
+  重复异常使用第1次和每100次节流。
 
 ## 测试方式
 
@@ -196,6 +244,22 @@ ctest --test-dir build --output-on-failure
     未达 `visual_stale` 阈值不退出，超龄后按断流回退 S5；
   - `HandoverAbortsWhenLockLostInHandover`：S6 中视觉丢失 → 立即撤销回 S5；
   - `HandoverRequiresEstimatorDiagnostics`：未注入诊断接口时不放行交接并记 ERROR。
+- 视觉伺服（Task 9，`VisualServoFixture` + `MakeServoTestConfig`：在交接测试配置上
+  注入非零距离环比例增益 kp=0.1——占位默认 kp=0 会让前向速度恒为零；用例按期
+  刷新视觉/测距/姿态三路输入满足控制律内部超龄阈值）：
+  - `VisualTrackingPublishesVelocityIntent`：S7 发布`control_source=1`速度航向
+    意图（bit31、frame_id=3、有效期来自配置），速度分量对拍控制律期望值
+    （vx=kp·Δd=0.5m/s、vz=vz_gain·α≈−0.0004m/s、yaw_rate=gain·β≈1.095°/s）；
+  - `VisualTrackingIntentIsLocalNed`：姿态 yaw=90°时机体前向 0.5m/s 映射为
+    NED 东向 0.5/北向 0（机体系→NED 旋转已在意图内完成）；
+  - `VisualLostBrakesThenExitsToGpsApproach`：S7 中 LOST 4 条（< exit_lost_frames=6）
+    保持 S7且意图转零速`kBrakeHover`（reason=102）；补足 6 条回退 S5 后位置引导
+    链接管（重新出现`kPositionGuide`）；
+  - `HotBackupKalmanStarvedWarnsInS7`：S7 中估计断粮 → 告警位 bit2 置位 +
+    节流 WARN「热备份断粮」，状态保持 S7；
+  - `HandoverPublishesFrozenPositionUntilServoStarts`：S6 驻留期估计更新后冻结
+    续发仍指向进入时刻值（12.5,−3,−8），`valid_until`逐拍滚动；S7 首条视觉速度
+    意图发出后不再出现位置意图。
 
 ## 排查/修改要点
 
@@ -220,4 +284,23 @@ ctest --test-dir build --output-on-failure
   链路停止发布状态（查监视器线程与上游 YOLO 观测）；"测距失效"说明双目匹配
   连续失效或测距线程停发（查测距组件与视差有效域）；二者都可能在视觉仍
   LOCKED 时发生，属安全收口而非缺陷。
+- S7 没有速度意图（WARN"视觉伺服停发意图: 控制律降级"）：按 reason 查——
+  ①"姿态超龄"：`FlightStateSnapshot.attitude_valid`为 false 或接收时间超
+  `attitude_stale_ms`（查 PX4 姿态流是否在发布、时间戳是否新鲜）；
+  ②"视觉超龄"：`VisualTargetStatus`接收时间超`visual_stale_ms`；
+  ③"持续无距离退出"：测距失效超`no_distance_exit_grace_ms`（该档位下可见）。
+  三者均属控制律安全降级（不发布意图 → 控制器意图超时刹车），不是状态机缺陷。
+- S7 收到`kBrakeHover`零速意图而非速度意图：短期视觉 LOST 的判丢刹车
+  （reason=102）——主链路无预测坐标，coast 以刹车形态落地；LOST 连续帧未达
+  `exit_lost_frames`前属预期，达门限即退出 S7。
+- WARN"热备份断粮"：S7 期间卡尔曼状态年龄超出其自报有效期窗（估计断粮/
+  `valid=false`/从未收到）。**不退出 S7**——查地面站目标是否过期、估计器线程
+  与视觉融合是否仍在更新；该告警提示"假备份"风险（回退后 S5 位置链将无
+  新鲜估计可用）。
+- 交接点出现"先刹停再起步"（速度意图前有零速段）：确认 S6 驻留期是否有
+  "交接冻结位置意图续发"日志与滚动续期的位置意图（2000ms 超时档位下
+  `timeout_ms` 需大于冻结续发失效时间）；若位置意图在 S6 中途停止，查
+  进入判据是否失效（撤销回 S5 的分支，属预期收口而非冻结失效）。
+- 整机实测停在 S5、从不进 S6：**T12 前属预期**——`DroneApplication`尚未调用
+  `SetEstimationInputs`（三输入未绑定，状态机保持影子）。勿据此判缺陷。
 - 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和`enable_control`安全配置。

@@ -11,7 +11,10 @@
  * 绑定估计/视觉/测距输入：绑定后 S5（GPS_APPROACH）发布 kPositionGuide
  * 控制意图（reason_code 带 bit31 控制权请求位）；绑定估计器诊断接口后，
  * 交接判据（S5→S6→S7 进入/退出迟滞，handover 配置节）开始工作；未绑定时
- * 保持原影子行为（停在 S5）。
+ * 保持原影子行为（停在 S5）。S6 驻留期续发进入时刻冻结的最后位置目标，
+ * S7（VISUAL_TRACKING）由内部视觉伺服协作者（复用 TrackingControlLaw）
+ * 发布 control_source=1 的视觉意图；视觉状态断流/测距失效/连续丢失等退出
+ * 迟滞之外另有热备份年龄核对（节流 WARN，不退出 S7）。
  *
  * 数据流：
  *   common::Topic<GroundStationTarget> ─┐
@@ -52,9 +55,11 @@ struct MissionStateMachineConfig {
     /// 交接缝迟滞参数（handover 配置节同源注入）。关系校验（exit > lock 等）
     /// 由配置加载期 `HandoverConfig::Validate` 强制；本结构不重复校验。
     config::HandoverConfig handover;
-    /// 标定内参（visual_tracking.camera 同源注入）：视线角与视场半角换算基准。
+    /// 视觉跟踪控制律全量配置（visual_tracking 节整节同源注入）：
+    /// `tracking.camera` 供视线角与视场半角换算（S6 进入判据）、
+    /// S7 视觉伺服协作者构造 TrackingControlLaw（阈值与增益同源）。
     /// 分辨率与内参绑定，换档位必须重新标定（见 control/tracking_config.h）。
-    control::TrackingCameraGroupConfig camera;
+    control::TrackingConfig tracking;
     /// 视觉稳定性状态超龄阈值（visual_tracking.control.visual_stale_ms 同源）。
     /// VisualTargetStatus 头不设置 valid_for_ms，新鲜度按 receive_time + 该阈值判定。
     std::chrono::milliseconds visual_stale{200};
@@ -116,7 +121,10 @@ public:
 /// S5（GPS_APPROACH）开始发布 kPositionGuide 控制意图（带 bit31 控制权请求位）；
 /// 再经 SetEstimationDiagnostics 注入估计器诊断后，交接判据
 /// （handover 配置节：LOCKED 连续帧/测距/视场余量/创新门限 + S6 超时 + S7 退出迟滞）
-/// 生效。是否真正输出控制由 FlightController 授权链与 enable_control 装配门禁决定。
+/// 生效。S6 驻留期续发冻结的最后位置目标（设计 §2.1），S7 由内部视觉伺服
+/// 协作者（TrackingControlLaw）发布 control_source=1 的速度航向意图
+/// （输出已是局部 NED）。是否真正输出控制由 FlightController 授权链与
+/// enable_control 装配门禁决定。
 class MissionStateMachine final : public IMissionStateMachine {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});

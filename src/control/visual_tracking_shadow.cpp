@@ -1,6 +1,11 @@
 // =============================================================================
 // visual_tracking_shadow.cpp —— 视觉跟踪控制律影子适配层实现
 //
+// 说明（阶段四 Task 9 起）：控制律的正规调用点已迁入 MissionStateMachine
+// 的 S7 视觉伺服（复用同一 TrackingControlLaw，输出接 FlightController）；
+// 本影子的 kControlIntent 输出无消费者（与状态机意图是两个独立 Topic），
+// 保留供观察，不参与控制链路，见头文件「与状态机并存」注释。
+//
 // 节拍循环（固定周期，§7.1）：
 //   ① 排空两个输入订阅队列取最新（容量 1 + 丢最旧，只需最新状态）；
 //   ② 组装 ControlSnapshot：kLocked → tracked=true 并取平滑中心；

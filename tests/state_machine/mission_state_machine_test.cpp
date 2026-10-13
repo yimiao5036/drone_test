@@ -4,12 +4,15 @@
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "config/config.h"
 #include "perception/target_estimator.h"
 #include "state_machine/mission_state_machine.h"
+
+#include "../common/log_capture.h"
 
 namespace {
 
@@ -364,7 +367,8 @@ common::VisualTargetStatus MakeVisualStatus(common::VisualTargetState state,
 /// 双目测距快照（StereoTargetDistance 头不含 valid_for_ms，
 /// 新鲜度由状态机按注入的超龄阈值判定）。valid=false 时距离字段为 NaN。
 common::StereoTargetDistance MakeFreshDistance(uint64_t frame_sequence,
-                                               bool valid = true) {
+                                               bool valid = true,
+                                               float forward_m = 10.0F) {
     common::StereoTargetDistance msg;
     msg.header.sequence = frame_sequence;
     msg.header.source_time_ms = TestMonotonicMs();
@@ -373,7 +377,7 @@ common::StereoTargetDistance MakeFreshDistance(uint64_t frame_sequence,
     msg.valid = valid;
     msg.confidence = 0.9F;
     if (valid) {
-        msg.forward_distance_m = 10.0F;
+        msg.forward_distance_m = forward_m;
         msg.camera_x_m = 0.0F;
         msg.camera_y_m = 0.0F;
     }
@@ -733,6 +737,362 @@ TEST(MissionStateMachineTest, ExitWhenVisualStreamStalls) {
                              common::MissionState::kGpsApproach, 1500ms)
                     .has_value());
     EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+}
+
+// ---------------------------------------------------------------------------
+// 阶段四 Task 9：S7 视觉伺服意图（TrackingControlLaw 迁入状态机）+ coast +
+// 热备份核对
+//
+// S7（VISUAL_TRACKING）期间状态机是唯一的视觉意图生产者：以 VisualTargetStatus
+// （LOCKED→tracked）、StereoTargetDistance 与 FlightStateSnapshot 姿态组装
+// ControlSnapshot，驱动 TrackingControlLaw（含机体系→NED 旋转），把输出映射为
+// control_source=1 的 ControlIntent（带 bit31 控制权请求位）。
+// 主链路无预测坐标（is_predicted 恒 false）：短期 LOST 按控制律判丢语义映射为
+// 零速刹车意图（kBrakeHover）；控制律降级保持（姿态/视觉超龄）时不发布意图
+// （安全语义：超龄收口交 FlightController 意图超时门禁刹停）。
+// S6 驻留期由状态机续发进入时刻冻结的最后位置目标（valid_until 逐拍滚动，
+// 设计 §2.1/§2.5 无扰衔接：避免交接点意图超龄刹车再起步），首条视觉速度
+// 意图发出即停。
+// ---------------------------------------------------------------------------
+
+constexpr double kPi = 3.14159265358979323846;
+
+/// 默认跟踪配置（visual_tracking 节默认值）下的伺服期望输出基准：
+///   航向 β = atan((px − cx)/fx)，速率式 yaw_rate = gain·β（gain 默认 1.0）
+///   垂直 α = atan((py − cy)/fy)，vz = vz_gain·α（vz_gain 默认 0.1）
+///   距离 Δd = 15 − d_exp，vx = kp·Δd（kp 用例注入 0.1，占位默认 0 无法验证映射）
+constexpr double kDefaultFx = 1007.82;
+constexpr double kDefaultFy = 1008.02;
+constexpr double kDefaultCx = 620.73;
+constexpr double kDefaultCy = 532.07;
+constexpr double kDefaultVzGain = 0.1;
+constexpr double kServoDistanceKp = 0.1;
+constexpr double kDefaultDExpM = 10.0;
+constexpr double kServoDistanceM = 15.0;
+constexpr double kServoVisualX = 640.0;
+constexpr double kServoVisualY = 532.0;
+
+/// 期望航向角速度（度/秒）：β 由标定内参算出，约 1.0955°/s。
+double ServoExpectedBetaDeg() {
+    return std::atan((kServoVisualX - kDefaultCx) / kDefaultFx) * 180.0 / kPi;
+}
+
+/// 期望垂直速度（米/秒）：α≈−0.004°（像素 y=532 略高于主点 cy=532.07）。
+double ServoExpectedVz() {
+    const double alpha_deg =
+        std::atan((kServoVisualY - kDefaultCy) / kDefaultFy) * 180.0 / kPi;
+    return kDefaultVzGain * alpha_deg;
+}
+
+/// 期望前向速度（米/秒）：Δd=15−10=5m、kp=0.1 → 0.5m/s（加速度限幅收敛后）。
+double ServoExpectedVx() {
+    return kServoDistanceKp * (kServoDistanceM - kDefaultDExpM);
+}
+
+/// 导航就绪 + 新鲜姿态的飞行快照（S7 伺服要求姿态在控制律超龄阈值内，
+/// 用例需按期重发刷新接收时间）。
+common::FlightStateSnapshot MakeFlightWithAttitude(double yaw_rad) {
+    common::FlightStateSnapshot flight = MakeNavigationReadyFlight();
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.attitude_valid = true;
+    flight.roll_rad = 0.0F;
+    flight.pitch_rad = 0.0F;
+    flight.yaw_rad = static_cast<float>(yaw_rad);
+    return flight;
+}
+
+/// 收集一段时间内的全部意图（按发布顺序）。
+std::vector<common::ControlIntent> CollectIntents(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    std::chrono::milliseconds duration) {
+    std::vector<common::ControlIntent> intents;
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message) {
+            intents.push_back(**message);
+        }
+    }
+    return intents;
+}
+
+/// 返回序列中最后一条指定类型的意图；不存在返回 nullptr。
+const common::ControlIntent* LastIntentOfType(
+    const std::vector<common::ControlIntent>& intents,
+    common::ControlIntentType type) {
+    const common::ControlIntent* found = nullptr;
+    for (const auto& intent : intents) {
+        if (intent.type == type) {
+            found = &intent;
+        }
+    }
+    return found;
+}
+
+/// 等待一条带指定告警位的任务状态（超时返回 nullopt）。
+std::optional<common::MissionStatus> WaitForWarningBit(
+    common::Topic<common::MissionStatus>::Subscription& subscription,
+    uint32_t mask,
+    std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message && ((*message)->active_warning_bits & mask) != 0U) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 视觉伺服用例配置：交接阈值同 HandoverFixture（取小值压缩用例时长）；
+/// 距离环比例增益取非零——占位默认 kp=0 会让前向速度恒为零，无法验证
+/// "距离通道输出 → 意图映射"。
+state_machine::MissionStateMachineConfig MakeServoTestConfig() {
+    auto config = MakeHandoverTestConfig();
+    config.tracking.distance.kp = kServoDistanceKp;
+    return config;
+}
+
+/// 视觉伺服测试夹具：交接驱动复用 HandoverFixture，附加 S7 输入泵与意图订阅。
+/// 控制律内部超龄阈值（视觉 200ms/姿态 300ms/测距 500ms，跟踪配置默认值）
+/// 要求用例按期刷新三路输入，否则控制律降级保持、停止发布意图。
+struct VisualServoFixture : HandoverFixture {
+    explicit VisualServoFixture(double yaw_rad = 0.0)
+        : HandoverFixture(MakeServoTestConfig()), yaw_rad_(yaw_rad) {
+        intent_subscription = machine->IntentOutput().Subscribe(64);
+    }
+
+    /// 发布一轮伺服输入：新鲜姿态 + 指定视觉状态 + 测距 15m（射程 10m 之外）。
+    void PublishServoInputs(
+        uint64_t frame,
+        common::VisualTargetState visual_state = common::VisualTargetState::kLocked) {
+        (void)flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
+            MakeFlightWithAttitude(yaw_rad_)));
+        (void)visual.Publish(std::make_shared<const common::VisualTargetStatus>(
+            MakeVisualStatus(visual_state, frame)));
+        (void)distance.Publish(std::make_shared<const common::StereoTargetDistance>(
+            MakeFreshDistance(frame, /*valid=*/true, /*forward_m=*/kServoDistanceM)));
+    }
+
+    /// 按期泵输入并收集期间的意图（每轮约 120ms）。
+    std::vector<common::ControlIntent> PumpAndCollect(int rounds) {
+        std::vector<common::ControlIntent> intents;
+        for (int round = 0; round < rounds; ++round) {
+            PublishServoInputs(++frame_);
+            auto batch = CollectIntents(intent_subscription, 120ms);
+            intents.insert(intents.end(), batch.begin(), batch.end());
+        }
+        return intents;
+    }
+
+    /// 清空意图队列（跳过交接驱动期已发出的意图）。
+    void DrainIntents() {
+        while (intent_subscription.TryTake().has_value()) {
+        }
+    }
+
+    double yaw_rad_ = 0.0;
+    uint64_t frame_ = 100;  ///< 帧序号：避开交接驱动帧 1..4 的迟滞去重记忆
+    common::Topic<common::ControlIntent>::Subscription intent_subscription;
+};
+
+// S7：视觉 LOCKED + 测距有效 + 姿态新鲜 → 发布 control_source=1 的速度航向意图，
+// 速度分量与 TrackingControlLaw 输出一致（注入已知几何，对拍控制律单测期望值）。
+TEST(MissionStateMachineTest, VisualTrackingPublishesVelocityIntent) {
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    f.DrainIntents();
+
+    const auto intents = f.PumpAndCollect(/*rounds=*/10);
+    const common::ControlIntent* last = LastIntentOfType(
+        intents, common::ControlIntentType::kVelocityHeading);
+    ASSERT_NE(last, nullptr);
+
+    EXPECT_EQ(last->control_source, 1U);  // 1=视觉
+    EXPECT_NE(last->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(last->reason_code & 0xFFU, 100U);  // 视觉跟踪：正常跟踪
+    EXPECT_EQ(last->header.frame_id, kFrameLocalNed);
+    EXPECT_EQ(last->header.valid_for_ms, 300U);
+    EXPECT_EQ(last->valid_until_ms, last->header.receive_time_ms + 300U);
+
+    // 距离通道：Δd = 15−10 = 5m、kp=0.1 → 前向 0.5m/s（加速度限幅收敛后）
+    EXPECT_NEAR(last->target_x, ServoExpectedVx(), 1e-3);
+    // 姿态 yaw=0：机体系侧向恒 0，NED 东向 0
+    EXPECT_NEAR(last->target_y, 0.0, 1e-6);
+    // 垂直通道：α 由标定内参算出
+    EXPECT_NEAR(last->target_z, ServoExpectedVz(), 1e-6);
+    // 航向通道（速率式）：增益×视线角
+    EXPECT_NEAR(last->yaw_rate_dps, ServoExpectedBetaDeg(), 1e-3);
+    EXPECT_FLOAT_EQ(last->yaw_deg, 0.0F);  // 速率式不使用 yaw_deg
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+}
+
+// 意图速度已是局部 NED：姿态 yaw=90°（机头朝东）时，机体前向速度映射为 NED
+// 东向速度、北向≈0 —— 状态机内完成机体系→NED 旋转，FlightController 不做
+// 二次旋转（控制边界见 flight_controller.md）。
+TEST(MissionStateMachineTest, VisualTrackingIntentIsLocalNed) {
+    VisualServoFixture f(kPi / 2.0);
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    f.DrainIntents();
+
+    const auto intents = f.PumpAndCollect(/*rounds=*/10);
+    const common::ControlIntent* last = LastIntentOfType(
+        intents, common::ControlIntentType::kVelocityHeading);
+    ASSERT_NE(last, nullptr);
+
+    EXPECT_NEAR(last->target_x, 0.0, 1e-6);                // 北向≈0
+    EXPECT_NEAR(last->target_y, ServoExpectedVx(), 1e-3);  // 东向=机体前向
+    EXPECT_NEAR(last->target_z, ServoExpectedVz(), 1e-6);
+    // 速率式航向通道与自机航向无关：仍为增益×视线角
+    EXPECT_NEAR(last->yaw_rate_dps, ServoExpectedBetaDeg(), 1e-3);
+}
+
+// S7 视觉短期 LOST：主链路无预测坐标（is_predicted 恒 false），控制律按判丢
+// 语义输出零速刹车（valid=true）→ 意图映射为零速 kBrakeHover 安全意图
+//（图像空间 coast 在本链路的退化形态，见实现文档）；LOST 连续帧达
+// exit_lost_frames 才退出 S7 回退 S5，回退后位置引导链接管。
+TEST(MissionStateMachineTest, VisualLostBrakesThenExitsToGpsApproach) {
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    f.DrainIntents();
+
+    // 先确认伺服已启动（S7 期收到过速度意图）
+    const auto servo = f.PumpAndCollect(/*rounds=*/4);
+    ASSERT_NE(LastIntentOfType(servo, common::ControlIntentType::kVelocityHeading),
+              nullptr);
+
+    // LOST 4 条（> lock_frames=3、< exit_lost_frames=6）：保持 S7，意图转零速刹车
+    std::vector<common::ControlIntent> lost_intents;
+    for (uint64_t frame = 200; frame <= 203; ++frame) {
+        f.PublishServoInputs(frame, common::VisualTargetState::kLost);
+        auto batch = CollectIntents(f.intent_subscription, 120ms);
+        lost_intents.insert(lost_intents.end(), batch.begin(), batch.end());
+    }
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+    const common::ControlIntent* brake =
+        LastIntentOfType(lost_intents, common::ControlIntentType::kBrakeHover);
+    ASSERT_NE(brake, nullptr);
+    EXPECT_EQ(brake->control_source, 1U);
+    EXPECT_NE(brake->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(brake->reason_code & 0xFFU, 102U);  // 判丢零速刹车
+    EXPECT_FLOAT_EQ(brake->target_x, 0.0F);
+    EXPECT_FLOAT_EQ(brake->target_y, 0.0F);
+    EXPECT_FLOAT_EQ(brake->target_z, 0.0F);
+
+    // 补足 6 条连续 LOST → 退出 S7 回退 S5
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 204));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 205));
+    ASSERT_TRUE(
+        WaitForState(f.status_subscription, common::MissionState::kGpsApproach)
+            .has_value());
+    // 回退后位置引导链接管（估计仍新鲜）
+    const auto after_exit = CollectIntents(f.intent_subscription, 400ms);
+    const common::ControlIntent* position =
+        LastIntentOfType(after_exit, common::ControlIntentType::kPositionGuide);
+    ASSERT_NE(position, nullptr);
+    EXPECT_EQ(position->control_source, 0U);
+}
+
+// S7 热备份核对（设计 §2.4）：每秒核对卡尔曼状态年龄（TargetState 接收时刻 +
+// 自报有效期窗），断粮 → 节流 WARN「热备份断粮」+ MissionStatus 告警位 bit2，
+// 不退出 S7（停 S7 由三条收口路径决定，热备份告警只提示"假备份"风险）。
+TEST(MissionStateMachineTest, HotBackupKalmanStarvedWarnsInS7) {
+    drone::test::LogCapture logs;  // 必须在组件启动前挂载（见 log_capture.h 约束）
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    logs.Clear();
+
+    // 卡尔曼断粮：估计失效快照（valid=false、有效期为 0）
+    (void)f.estimated.Publish(
+        std::make_shared<const common::TargetState>(MakeInvalidEstimatedTarget()));
+
+    // 核对周期 1s：等待告警位置位（MissionStatus 500ms 周期回传）
+    constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;  // 见 mission_state_machine.md
+    const auto starved =
+        WaitForWarningBit(f.status_subscription, kWarningHotBackupStarved, 3000ms);
+    ASSERT_TRUE(starved.has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+    EXPECT_GE(logs.Count("热备份断粮"), 1);
+}
+
+// 设计 §2.1「进入 S6 后冻结最后位置目标」+ §2.5 无扰衔接（评审裁决 (a)）：
+// S6 驻留期由状态机逐拍续发进入时刻冻结的位置意图（valid_until 滚动续期），
+// 避免意图超龄 → 控制器 COAST 刹车 → 再起步的"交接点先刹停"；冻结坐标取
+// 进入时刻的 TargetState（此后估计更新不影响冻结值）；首条视觉速度意图
+// 发出（S7）后冻结续发停止。
+TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    f.DrainIntents();
+
+    // S6 驻留期估计更新为新位置（仍新鲜有效）——冻结续发必须仍指向进入时刻的值
+    common::TargetState updated = MakeHandoverEstimate();
+    updated.header.sequence += 1;
+    updated.pos_x_m = 99.0F;
+    updated.pos_y_m = 98.0F;
+    updated.pos_z_m = -7.0F;
+    (void)f.estimated.Publish(std::make_shared<const common::TargetState>(updated));
+
+    std::vector<common::ControlIntent> frozen;
+    for (int round = 0; round < 3; ++round) {
+        // 重复同一锁定帧：不推进锁定计数（停留 S6），只刷新状态新鲜度
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 3));
+        auto batch = CollectIntents(f.intent_subscription, 120ms);
+        frozen.insert(frozen.end(), batch.begin(), batch.end());
+    }
+    ASSERT_EQ(f.machine->CurrentState(), common::MissionState::kVisualHandover);
+    ASSERT_GE(frozen.size(), 2U);
+    for (const auto& intent : frozen) {
+        EXPECT_EQ(intent.type, common::ControlIntentType::kPositionGuide);
+        EXPECT_EQ(intent.control_source, 0U);
+        EXPECT_FLOAT_EQ(intent.target_x, 12.5F);  // 冻结值（非更新后的 99）
+        EXPECT_FLOAT_EQ(intent.target_y, -3.0F);
+        EXPECT_FLOAT_EQ(intent.target_z, -8.0F);
+        // 滚动续期：valid_until 按 300ms 窗逐拍推进
+        EXPECT_EQ(intent.valid_until_ms, intent.header.receive_time_ms + 300U);
+    }
+    // 续期确实发生：至少两条意图的截止时刻不同（逐拍滚动，非一次性发布）
+    bool renewed = false;
+    for (size_t index = 1; index < frozen.size(); ++index) {
+        if (frozen[index].valid_until_ms != frozen.front().valid_until_ms) {
+            renewed = true;
+        }
+    }
+    EXPECT_TRUE(renewed);
+
+    // 视觉链推进一条新 LOCKED 帧（附姿态/测距输入）→ S7 首条视觉速度意图发出
+    f.PublishServoInputs(4);
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualTracking)
+                    .has_value());
+    const auto servo = f.PumpAndCollect(/*rounds=*/4);
+    const common::ControlIntent* first_velocity = nullptr;
+    for (const auto& intent : servo) {
+        if (intent.type == common::ControlIntentType::kVelocityHeading) {
+            first_velocity = &intent;
+            break;
+        }
+    }
+    ASSERT_NE(first_velocity, nullptr);
+    // 冻结续发停止：位置意图不得出现在首条视觉速度意图之后
+    //（迁移当拍允许同拍续发一条，控制器保留最新=视觉意图）
+    for (const auto& intent : servo) {
+        if (intent.type == common::ControlIntentType::kPositionGuide) {
+            EXPECT_LE(intent.header.receive_time_ms,
+                      first_velocity->header.receive_time_ms);
+        }
+    }
 }
 
 }  // namespace

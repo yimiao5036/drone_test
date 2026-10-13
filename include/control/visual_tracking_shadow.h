@@ -11,6 +11,13 @@
 //   ControlIntent 发布到 kControlIntent。纯影子运行：kControlIntent 当前无
 //   消费者，enable_control=false 基线不动，不产生任何真实控制输出。
 //
+// 与状态机并存（2026-10-13 阶段四 Task 9 起）：
+//   控制律调用点已迁入 MissionStateMachine（S7 视觉伺服，control_source=1
+//   带 bit31 控制权请求位），**本影子**的输出主题与状态机 IntentOutput()
+//   是两个独立 Topic，影子输出未接 FlightController（装配层只接状态机意图），
+//   因此不存在双意图生产者竞争；本部件保留供现场观察控制律行为，退役时机
+//   随视觉伺服正式化验收（阶段四 G3/G4）确定。
+//
 // 边界：
 //   - 双目测距（可选输入 kStereoTargetDistance）：最新一条 valid 且
 //     receive_time_ms>0 → distance_valid=true 并填 target_distance_m；

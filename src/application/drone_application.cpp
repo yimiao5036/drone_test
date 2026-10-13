@@ -121,12 +121,13 @@ void DroneApplication::BuildComponents() {
     // 影子状态机只在PX4状态源与地面站目标源同时存在时创建。
     // 意图有效期与 FlightController 的 controller.intent_timeout 同源注入，
     // 保证状态机 valid_until_ms 与控制器超龄门禁一致；交接判据阈值来自
-    // handover 节与 visual_tracking（相机内参/超龄阈值），不在此写死。
+    // handover 节；visual_tracking 整节注入（相机内参供视线角换算，
+    // 控制律参数/阈值供 S7 视觉伺服），不在此写死。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
         state_machine::MissionStateMachineConfig state_machine_config;
         state_machine_config.intent_valid_for = config_.controller.intent_timeout;
         state_machine_config.handover = config_.handover;
-        state_machine_config.camera = config_.visual_tracking.camera;
+        state_machine_config.tracking = config_.visual_tracking;
         state_machine_config.visual_stale = std::chrono::milliseconds(
             config_.visual_tracking.control.visual_stale_ms);
         state_machine_config.distance_stale = std::chrono::milliseconds(

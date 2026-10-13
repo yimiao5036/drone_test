@@ -1,14 +1,17 @@
 /**
  * @file mission_state_machine.cpp
- * @brief MissionStateMachine 安全影子实现（阶段四：S5 位置意图 + 交接判据）
+ * @brief MissionStateMachine 安全影子实现（阶段四：位置意图 + 交接判据 + S7 视觉伺服）
  *
  * 默认只接入地面站目标与飞行状态，发布 MissionStatus 供链路验证；
  * 经 SetEstimationInputs 绑定估计/视觉/测距输入后，GPS_APPROACH 状态发布
  * kPositionGuide 控制意图（带 bit31 控制权请求位）；再经
  * SetEstimationDiagnostics 注入估计器诊断后，交接判据（handover 配置节）生效：
  * S5→S6（LOCKED 连续帧/测距有效/视场余量/创新门限）→ S7 验证、S6 超时回 S5、
- * S7 退出迟滞。是否真正输出由 FlightController 授权链与 enable_control
- * 装配门禁决定。
+ * S7 退出迟滞。S6 驻留期续发进入时刻冻结的最后位置目标（防意图超龄 →
+ * 控制器刹车 → 再起步）；S7 由内部视觉伺服协作者（复用 TrackingControlLaw）
+ * 发布 control_source=1 的速度意图（输出已是局部 NED），短期 LOST 按控制律
+ * 判丢语义映射为零速刹车意图。是否真正输出由 FlightController 授权链与
+ * enable_control 装配门禁决定。
  */
 #include "state_machine/mission_state_machine.h"
 
@@ -29,6 +32,8 @@
 #include "communication/px4_link.h"
 #include "control/line_of_sight.h"
 #include "control/staleness_checker.h"
+#include "control/tracking_control_law.h"
+#include "control/tracking_types.h"
 #include "perception/target_estimator.h"
 
 namespace drone::state_machine {
@@ -36,7 +41,9 @@ namespace {
 
 // 当前实现默认是安全影子状态机：只消费目标/飞行/健康快照并发布 MissionStatus，
 // 不生成真实 ControlIntent，也不连接 PX4 控制输出。所有决策运行在独立线程中。
-// 绑定估计/视觉/测距输入后，S5 开始发布位置引导意图（见 PublishGpsApproachIntent）。
+// 绑定估计/视觉/测距输入后，S5 开始发布位置引导意图（EvaluatePositionIntent），
+// S6 续发冻结位置目标，S7 由伺服协作者发布速度意图
+// （EvaluateVisualServoIntent → BuildVisualIntent）。
 
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
@@ -51,12 +58,26 @@ constexpr uint64_t kStatusValidForMs = 1000;
 constexpr uint32_t kWarningNavigationUnavailable = 1U << 0U;
 /// 告警位：已经进入GPS_APPROACH影子状态，但最新目标超过剩余有效期。
 constexpr uint32_t kWarningGroundTargetStale = 1U << 1U;
+/// 告警位：VISUAL_TRACKING 期间热备份断粮（卡尔曼状态年龄超窗，设计 §2.4）。
+/// 只提示"假备份"风险，不触发退出（退出由 S7 三条收口路径决定）。
+constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。
 constexpr uint64_t kIntentRepublishIntervalMs = 100;
 /// 位置引导意图低位原因码：地面站任务下发（docs/数据接口文档.md §3.5 编码 7），
 /// 与 bit31 控制权请求位正交叠加。
 constexpr uint32_t kReasonGroundStationTask = 7;
+/// 视觉伺服意图低位原因码（复用 100 段视觉跟踪语义，docs/数据接口文档.md §3.5
+/// 编码 100/102）：100=正常跟踪，102=判丢零速刹车。主链路无预测坐标
+/// （is_predicted 恒 false），101（Coast 预测跟踪）在本链路不可达；短时丢失
+/// 按控制律判丢语义映射为 102。
+constexpr uint32_t kReasonVisualTracking = 100;
+constexpr uint32_t kReasonVisualBrake = 102;
+/// 局部 NED 坐标系编码（types.h 文件头约定：3=局部NED）。
+/// 视觉伺服输出（机体系→NED 旋转在控制律内完成）按该坐标系标注。
+constexpr uint8_t kFrameLocalNed = 3;
+/// 热备份年龄核对周期（设计 §2.4「S7 期间每秒核对」）。
+constexpr uint64_t kHotBackupCheckIntervalMs = 1000;
 /// 弧度 → 度换算（视线角与视场半角比较统一用度，与配置项单位一致）。
 constexpr double kRadToDeg = 57.29577951308232;
 /// 交接状态迁移原因（状态转移日志用，中文可读）。
@@ -186,6 +207,44 @@ uint8_t TaskPhase(common::MissionState state) {
     return static_cast<uint8_t>(state);
 }
 
+/// 控制律降级原因中文名（仅降级停发日志用）。
+const char* DegradedReasonName(control::DegradedReason reason) {
+    switch (reason) {
+        case control::DegradedReason::kNone:
+            return "无";
+        case control::DegradedReason::kAttitudeStale:
+            return "姿态超龄";
+        case control::DegradedReason::kVisionStale:
+            return "视觉超龄";
+        case control::DegradedReason::kNoDistanceExit:
+            return "持续无距离退出";
+    }
+    return "未知";
+}
+
+/// 控制意图类型中文名（仅意图切换日志用）。
+const char* IntentTypeName(common::ControlIntentType type) {
+    switch (type) {
+        case common::ControlIntentType::kNone:
+            return "无";
+        case common::ControlIntentType::kPositionGuide:
+            return "位置引导";
+        case common::ControlIntentType::kVelocityHeading:
+            return "速度航向";
+        case common::ControlIntentType::kBrakeHover:
+            return "零速刹车";
+        case common::ControlIntentType::kTakeoff:
+            return "起飞";
+        case common::ControlIntentType::kLand:
+            return "降落";
+        case common::ControlIntentType::kRtl:
+            return "返航";
+        case common::ControlIntentType::kManualOverride:
+            return "人工接管";
+    }
+    return "未知";
+}
+
 }  // namespace
 
 /// MissionStateMachine的实际状态与线程实现，隐藏在PIMPL中保持头文件稳定。
@@ -198,27 +257,34 @@ public:
           handover_timeout_ms_(static_cast<uint64_t>(config.handover.timeout.count())),
           visual_stale_ms_(config.visual_stale.count()),
           distance_stale_ms_(config.distance_stale.count()),
-          azimuth_converter_(config.camera.fx_px, config.camera.cx_px),
-          elevation_converter_(config.camera.fy_px, config.camera.cy_px) {
+          tracking_config_(config.tracking),
+          tracking_law_(config.tracking),
+          azimuth_converter_(config.tracking.camera.fx_px,
+                             config.tracking.camera.cx_px),
+          elevation_converter_(config.tracking.camera.fy_px,
+                               config.tracking.camera.cy_px) {
         // 视场半角由内参推（主点非画面中心，见 control/tracking_config.h）：
         // 水平取 (W−cx) 侧、垂直取 (H−cy) 侧，构造期固化。
-        const double width = static_cast<double>(config.camera.image_width);
-        const double height = static_cast<double>(config.camera.image_height);
+        const double width = static_cast<double>(config.tracking.camera.image_width);
+        const double height =
+            static_cast<double>(config.tracking.camera.image_height);
         fow_half_azimuth_deg_ =
-            std::atan((width - config.camera.cx_px) / config.camera.fx_px) *
+            std::atan((width - config.tracking.camera.cx_px) /
+                      config.tracking.camera.fx_px) *
             kRadToDeg;
         fow_half_elevation_deg_ =
-            std::atan((height - config.camera.cy_px) / config.camera.fy_px) *
+            std::atan((height - config.tracking.camera.cy_px) /
+                      config.tracking.camera.fy_px) *
             kRadToDeg;
         SPDLOG_INFO(
             "任务状态机创建: shadow=true control_output=false intent_valid_for_ms={} "
             "handover(lock_frames={} exit_lost_frames={} timeout_ms={} "
             "fow_margin_deg={:.1f} innovation_gate_m={:.1f}) "
-            "fov_half(az={:.2f}deg el={:.2f}deg)",
+            "fov_half(az={:.2f}deg el={:.2f}deg) servo=TrackingControlLaw({:.1f}Hz)",
             intent_valid_for_ms_, handover_.lock_frames, handover_.exit_lost_frames,
             handover_timeout_ms_, handover_.fow_margin_deg,
             handover_.innovation_gate_m, fow_half_azimuth_deg_,
-            fow_half_elevation_deg_);
+            fow_half_elevation_deg_, tracking_config_.control.frequency_hz);
     }
 
     ~Impl() {
@@ -449,10 +515,13 @@ private:
             }
         }
 
-        // 交接评估先于位置意图发布：S5→S6 迁移当拍即离开 S5 分支，
-        // EvaluateGpsApproachIntent 随即停发位置引导意图。
+        // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
+        // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
         EvaluateHandover(now_ms);
-        EvaluateGpsApproachIntent(now_ms);
+        EvaluatePositionIntent(now_ms);
+        EvaluateVisualServoIntent(now_ms);
+        // 热备份核对（Task 9）：S7 期间每秒核对卡尔曼状态年龄，断粮置告警位。
+        warnings |= EvaluateHotBackup(now_ms);
 
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
@@ -460,33 +529,92 @@ private:
         }
     }
 
-    /// GPS_APPROACH 位置引导意图（阶段四）。仅在估计输入已绑定且处于 S5 时工作：
-    /// 估计新鲜有效→发布/重发 kPositionGuide 意图；估计失效→停发，
-    /// 超龄收口由 FlightController 意图超时门禁（controller.intent_timeout）接管。
-    void EvaluateGpsApproachIntent(uint64_t now_ms) {
+    /// 位置类意图发布总入口（阶段四 Task 7/9）：
+    /// - S5（GPS_APPROACH）：估计新鲜 → 发布/重发 kPositionGuide 意图；估计失效
+    ///   → 停发，超龄收口由 FlightController 意图超时门禁（intent_timeout）接管；
+    /// - S6（VISUAL_HANDOVER）：逐拍续发进入时刻冻结的最后位置目标
+    ///   （valid_until 滚动续期，设计 §2.1 冻结 + §2.5 无扰衔接：避免交接期意图
+    ///   超龄 → 控制器 COAST 刹车 → 再起步的"交接点先刹停"）；
+    /// - S7：首条视觉速度意图发出前仍续发冻结意图（伺服首拍降级时不留意图
+    ///   缺口），发出后停发（视觉链接管）。
+    void EvaluatePositionIntent(uint64_t now_ms) {
         if (!estimation_inputs_active_) {
             return;
         }
-        if (CurrentState() != common::MissionState::kGpsApproach) {
-            if (position_intent_active_) {
-                position_intent_active_ = false;
-                last_intent_target_.reset();
-                SPDLOG_INFO("GPS_APPROACH 位置引导意图停止: 离开GPS_APPROACH状态");
-            }
+        switch (CurrentState()) {
+            case common::MissionState::kGpsApproach:
+                EvaluateEstimateGuidedIntent(now_ms);
+                return;
+            case common::MissionState::kVisualHandover:
+                PublishFrozenHandoverIntent(now_ms);
+                return;
+            case common::MissionState::kVisualTracking:
+                if (!s7_servo_started_ && frozen_handover_target_.has_value()) {
+                    PublishFrozenHandoverIntent(now_ms);
+                    return;
+                }
+                StopPositionIntent("视觉伺服接续");
+                return;
+            default:
+                StopPositionIntent("离开位置引导段");
+                return;
+        }
+    }
+
+    /// S5 估计引导意图：估计新鲜有效 → 发布/重发（内容变化立即发，内容不变
+    /// 按 10Hz 上限续期）；估计失效或超龄 → 停发（不补发安全类意图，
+    /// 刹停语义归 FlightController 意图超时门禁）。
+    void EvaluateEstimateGuidedIntent(uint64_t now_ms) {
+        if (HasFreshEstimate(now_ms)) {
+            PublishEstimateGuidedIntent(*latest_estimated_, now_ms);
             return;
         }
-        if (HasFreshEstimate(now_ms)) {
-            PublishGpsApproachIntent(*latest_estimated_, now_ms);
-        } else if (position_intent_active_) {
-            // 估计失效或超龄：停止正常意图。FlightController 在意图超时后自行收口，
-            // 这里不再补发安全类意图（刹停语义归后续状态迁移任务）。
-            position_intent_active_ = false;
+        if (position_intent_source_ != PositionIntentSource::kNone) {
+            position_intent_source_ = PositionIntentSource::kNone;
             last_intent_target_.reset();
             const uint64_t count = ++intent_stale_count_;
             if (ShouldLogThrottled(count)) {
-                SPDLOG_WARN("GPS_APPROACH 位置引导意图停止: 估计无效或超龄 count={}", count);
+                SPDLOG_WARN("GPS_APPROACH 位置引导意图停止: 估计无效或超龄 count={}",
+                            count);
             }
         }
+    }
+
+    /// 冻结最后位置目标（S5→S6 进入时调用，设计 §2.1）：取进入时刻的估计
+    /// 目标坐标（此刻的 TargetState 值），交接期不再随估计更新改变。
+    void FreezeHandoverTarget() {
+        frozen_handover_target_ = latest_estimated_;
+        SPDLOG_INFO("交接冻结最后位置目标: pos=({:.2f},{:.2f},{:.2f}) frame_id={}",
+                    static_cast<double>(frozen_handover_target_->pos_x_m),
+                    static_cast<double>(frozen_handover_target_->pos_y_m),
+                    static_cast<double>(frozen_handover_target_->pos_z_m),
+                    frozen_handover_target_->header.frame_id);
+    }
+
+    /// S6/S7 过渡期冻结位置意图续发：valid_until 逐拍滚动（不做内容节流，
+    /// 续期必须发生在每拍），内容固定为进入时刻的冻结目标。
+    void PublishFrozenHandoverIntent(uint64_t now_ms) {
+        if (!frozen_handover_target_.has_value()) {
+            return;  // 防御：未冻结（不应发生，进入 S6 必有估计快照）
+        }
+        if (position_intent_source_ != PositionIntentSource::kFrozen) {
+            position_intent_source_ = PositionIntentSource::kFrozen;
+            last_intent_target_.reset();  // 内容节流记忆失效（来源已切换）
+            SPDLOG_INFO("交接冻结位置意图续发: 滚动续期直至视觉伺服接续");
+        }
+        const auto& frozen = *frozen_handover_target_;
+        PublishPositionIntent(frozen.pos_x_m, frozen.pos_y_m, frozen.pos_z_m,
+                              frozen.header.frame_id, now_ms);
+    }
+
+    /// 停止位置类意图发布（离开位置引导段/交接段）；幂等。
+    void StopPositionIntent(const char* reason) {
+        if (position_intent_source_ == PositionIntentSource::kNone) {
+            return;
+        }
+        position_intent_source_ = PositionIntentSource::kNone;
+        last_intent_target_.reset();
+        SPDLOG_INFO("位置引导意图停止: {}", reason);
     }
 
     /// 交接层独立迟滞计数（与 VisualTargetMonitor 内部 lock_frames 判据是两套
@@ -517,13 +645,23 @@ private:
     }
 
     /// 复位交接迟滞计数（不清去重记忆：回退后重发的旧锁定帧不得立即重新起算，
-    /// 重新进入 S6 必须依赖新的锁定帧）。
+    /// 重新进入 S6 必须依赖新的锁定帧）。同时作为**交接段收口**：冻结目标、
+    /// 视觉伺服标志、控制律历史与热备份核对状态随段结束清空（S6/S7 回退与
+    /// Start 均经此函数；S6→S7 不调用，段内继续）。
     void ResetHandoverHysteresis() {
         consecutive_lock_frames_ = 0;
         consecutive_lost_frames_ = 0;
         s6_lock_baseline_ = 0;
         s6_entered_ms_ = 0;
         distance_lost_since_ms_.reset();
+        if (frozen_handover_target_.has_value()) {
+            SPDLOG_INFO("交接段收口: 停止冻结位置续发/视觉伺服意图");
+        }
+        frozen_handover_target_.reset();
+        s7_servo_started_ = false;
+        hot_backup_check_ms_ = 0;
+        hot_backup_starved_ = false;
+        tracking_law_.Reset();
     }
 
     /// 交接判据总入口（S5→S6→S7 推进与 S7 退出迟滞）。
@@ -548,9 +686,10 @@ private:
     }
 
     /// S5→S6：进入条件全部满足且 LOCKED 连续帧数达 handover.lock_frames。
-    /// 进入后位置引导意图随离开 S5 停发（EvaluateGpsApproachIntent 分支收口）；
-    /// 设计 §2.1 的"冻结最后位置目标"没有当前消费者（回退/无扰衔接参考），
-    /// 归 Task 9 的回退路径实现，本任务不引入未消费状态。
+    /// 进入当拍冻结最后位置目标（设计 §2.1，取进入时刻的 TargetState 值），
+    /// 此后 S6 驻留期由 EvaluatePositionIntent 逐拍续发该冻结位置意图
+    /// （valid_until 滚动），直到首条视觉速度意图发出（S7，Task 9）——
+    /// 避免位置意图在交接期超龄 → 控制器刹车 → 再起步（设计 §2.5）。
     void TryEnterVisualHandover(uint64_t now_ms) {
         if (consecutive_lock_frames_ < handover_.lock_frames) {
             return;
@@ -561,6 +700,7 @@ private:
         s6_lock_baseline_ = consecutive_lock_frames_;
         s6_entered_ms_ = now_ms;
         consecutive_lost_frames_ = 0;
+        FreezeHandoverTarget();
         TransitionTo(common::MissionState::kVisualHandover, kReasonEnterHandover);
     }
 
@@ -723,24 +863,38 @@ private:
         return now_ms <= target.header.receive_time_ms + target.header.valid_for_ms;
     }
 
-    /// 发布 S5 位置引导意图。节流纪律：内容无变化按 10Hz 上限重发
+    /// 发布 S5 估计引导位置意图。节流纪律：内容无变化按 10Hz 上限重发
     /// （意图是周期语义，FlightController 50ms 周期消费）；内容变化立即发。
-    void PublishGpsApproachIntent(const common::TargetState& target, uint64_t now_ms) {
+    void PublishEstimateGuidedIntent(const common::TargetState& target,
+                                     uint64_t now_ms) {
         const bool content_changed = !last_intent_target_.has_value() ||
             !FloatContentEqual(last_intent_target_->pos_x_m, target.pos_x_m) ||
             !FloatContentEqual(last_intent_target_->pos_y_m, target.pos_y_m) ||
             !FloatContentEqual(last_intent_target_->pos_z_m, target.pos_z_m) ||
             last_intent_target_->valid != target.valid;
-        if (!content_changed &&
+        if (position_intent_source_ == PositionIntentSource::kEstimate &&
+            !content_changed &&
             now_ms - last_intent_publish_ms_ < kIntentRepublishIntervalMs) {
             return;
         }
-        if (!position_intent_active_) {
-            SPDLOG_INFO("GPS_APPROACH 位置引导意图启动: target_id={} pos=({:.2f},{:.2f},{:.2f})",
-                        target.target_id, static_cast<double>(target.pos_x_m),
-                        static_cast<double>(target.pos_y_m),
-                        static_cast<double>(target.pos_z_m));
+        if (position_intent_source_ != PositionIntentSource::kEstimate) {
+            SPDLOG_INFO(
+                "GPS_APPROACH 位置引导意图启动: target_id={} pos=({:.2f},{:.2f},{:.2f})",
+                target.target_id, static_cast<double>(target.pos_x_m),
+                static_cast<double>(target.pos_y_m),
+                static_cast<double>(target.pos_z_m));
+            position_intent_source_ = PositionIntentSource::kEstimate;
         }
+        PublishPositionIntent(target.pos_x_m, target.pos_y_m, target.pos_z_m,
+                              target.header.frame_id, now_ms);
+        last_intent_target_ = target;
+    }
+
+    /// 组装并发布位置引导意图（S5 估计引导与 S6 冻结续发共用）。
+    /// 高度无效时 pos_z 为 NaN（合法语义）：原样透传，由 FlightController
+    /// 有限性门禁拒绝，状态机侧不得改成 0。
+    void PublishPositionIntent(float x, float y, float z, uint8_t frame_id,
+                               uint64_t now_ms) {
         common::ControlIntent intent;
         intent.header.sequence = ++intent_sequence_;
         intent.header.source_time_ms = now_ms;
@@ -748,14 +902,12 @@ private:
         intent.header.valid_for_ms = intent_valid_for_ms_;
         intent.header.source_id = 1;
         intent.header.health = 1;
-        intent.header.frame_id = target.header.frame_id;
+        intent.header.frame_id = frame_id;
         intent.type = common::ControlIntentType::kPositionGuide;
         intent.control_source = 0;  // 位置链
-        intent.target_x = target.pos_x_m;
-        intent.target_y = target.pos_y_m;
-        // 高度无效时 pos_z_m 为 NaN（合法语义）：原样透传，
-        // 由 FlightController 有限性门禁拒绝，状态机侧不得改成 0。
-        intent.target_z = target.pos_z_m;
+        intent.target_x = x;
+        intent.target_y = y;
+        intent.target_z = z;
         // bit31 显式请求控制权（FlightController 授权链必要条件）+
         // 低位 7=地面站任务下发。
         intent.reason_code =
@@ -764,8 +916,157 @@ private:
         (void)intent_output_.Publish(
             std::make_shared<const common::ControlIntent>(intent));
         last_intent_publish_ms_ = now_ms;
-        last_intent_target_ = target;
-        position_intent_active_ = true;
+    }
+
+    // ---- S7 视觉伺服（Task 9：TrackingControlLaw 迁入状态机） ----
+
+    /// S7 视觉伺服意图发布入口。仅在估计输入已绑定且处于 S7 时工作；
+    /// 意图逐拍发布（决策周期 10Hz；控制律按实际时钟差推算 dt，配置频率
+    /// 仅作首拍兜底）。S7 去留由 EvaluateVisualTrackingExit 三条路径决定，
+    /// 本函数不迁移状态。
+    void EvaluateVisualServoIntent(uint64_t now_ms) {
+        if (!estimation_inputs_active_) {
+            return;
+        }
+        if (CurrentState() != common::MissionState::kVisualTracking) {
+            return;  // 离开 S7 的收口在 EvaluateHandover 内完成（含标志复位）
+        }
+        const auto intent = BuildVisualIntent(now_ms);
+        if (!intent.has_value()) {
+            // 控制律降级保持（output.valid=false，姿态/视觉超龄）：不发布意图。
+            // 安全语义——控制律已明确"禁止正常控制"，补发零速会与其矛盾；
+            // 收口交 FlightController 意图超时门禁（intent_timeout）刹停。
+            const uint64_t count = ++servo_degraded_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("S7 视觉伺服停发意图: 控制律降级（{}）count={}",
+                            DegradedReasonName(last_degraded_reason_), count);
+            }
+            return;
+        }
+        if (!s7_servo_started_) {
+            s7_servo_started_ = true;
+            SPDLOG_INFO(
+                "S7 视觉伺服意图启动: type={} vx={:.2f} vy={:.2f} vz={:.2f} "
+                "yaw_rate={:.1f}dps",
+                IntentTypeName(intent->type),
+                static_cast<double>(intent->target_x),
+                static_cast<double>(intent->target_y),
+                static_cast<double>(intent->target_z),
+                static_cast<double>(intent->yaw_rate_dps));
+        }
+        (void)intent_output_.Publish(
+            std::make_shared<const common::ControlIntent>(*intent));
+    }
+
+    /// 组装控制快照并计算 S7 视觉伺服意图（本任务核心）：
+    /// ① 快照：视觉（`LOCKED`→tracked；主链路无预测坐标 → is_predicted 恒
+    ///    false）、双目距离（valid 且接收时间有效才透传，超龄判定在控制律内）、
+    ///    真实姿态（正式路径不做虚拟姿态兜底——姿态缺失按控制律原语义降级）；
+    /// ② TrackingControlLaw::Update（机体系增益/限幅 + 机体系→NED 旋转）；
+    /// ③ 输出映射：kVelocityHeading 填 NED 速度与航向通道；kBrakeHover 为零速
+    ///    安全意图（判丢刹车，§6.4）；二者均 control_source=1、带 bit31 控制权
+    ///    请求位（刹车保持控制权比停发更安全）；降级保持返回 nullopt。
+    std::optional<common::ControlIntent> BuildVisualIntent(uint64_t now_ms) {
+        control::ControlSnapshot snapshot;
+        if (latest_visual_status_.has_value() &&
+            latest_visual_status_->header.receive_time_ms > 0) {
+            snapshot.track.tracked =
+                latest_visual_status_->state == common::VisualTargetState::kLocked;
+            snapshot.track.is_predicted = false;  // 主链路无预测坐标
+            snapshot.track.center_x =
+                static_cast<double>(latest_visual_status_->center_pixel_x);
+            snapshot.track.center_y =
+                static_cast<double>(latest_visual_status_->center_pixel_y);
+            snapshot.track_time_ms = static_cast<int64_t>(
+                latest_visual_status_->header.receive_time_ms);
+        }
+        if (latest_distance_.has_value() && latest_distance_->valid &&
+            latest_distance_->header.receive_time_ms > 0) {
+            snapshot.target_distance_m =
+                static_cast<double>(latest_distance_->forward_distance_m);
+            snapshot.distance_valid = true;
+            snapshot.distance_time_ms = static_cast<int64_t>(
+                latest_distance_->header.receive_time_ms);
+        }
+        if (latest_flight_.has_value()) {
+            snapshot.attitude_present = latest_flight_->attitude_valid &&
+                latest_flight_->header.receive_time_ms > 0;
+            snapshot.attitude_time_ms = static_cast<int64_t>(
+                latest_flight_->header.receive_time_ms);
+            snapshot.roll_rad = static_cast<double>(latest_flight_->roll_rad);
+            snapshot.pitch_rad = static_cast<double>(latest_flight_->pitch_rad);
+            snapshot.yaw_rad = static_cast<double>(latest_flight_->yaw_rad);
+        }
+
+        const auto output =
+            tracking_law_.Update(snapshot, static_cast<int64_t>(now_ms));
+        last_degraded_reason_ = output.degraded_reason;
+        if (!output.valid) {
+            return std::nullopt;
+        }
+
+        common::ControlIntent intent;
+        intent.header.sequence = ++intent_sequence_;
+        intent.header.source_time_ms = now_ms;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = intent_valid_for_ms_;
+        intent.header.source_id = 1;
+        intent.header.health = 1;
+        // 速度输出已是局部 NED（机体系→NED 旋转在控制律内完成），
+        // FlightController 不再做二次旋转。
+        intent.header.frame_id = kFrameLocalNed;
+        intent.control_source = 1;  // 1=视觉
+        intent.valid_until_ms = now_ms + intent_valid_for_ms_;
+        switch (output.mode) {
+            case control::ControlMode::kVelocityHeading:
+                intent.type = common::ControlIntentType::kVelocityHeading;
+                intent.target_x = static_cast<float>(output.vx_mps);
+                intent.target_y = static_cast<float>(output.vy_mps);
+                intent.target_z = static_cast<float>(output.vz_mps);
+                intent.yaw_deg = static_cast<float>(output.yaw_deg);
+                intent.yaw_rate_dps = static_cast<float>(output.yaw_rate_dps);
+                intent.reason_code = common::kControlIntentReasonRequestControl |
+                                     kReasonVisualTracking;
+                return intent;
+            case control::ControlMode::kBrakeHover:
+                // 判丢零速刹车（§6.4）：速度分量保持零（ControlIntent 默认值）
+                intent.type = common::ControlIntentType::kBrakeHover;
+                intent.reason_code = common::kControlIntentReasonRequestControl |
+                                     kReasonVisualBrake;
+                return intent;
+            case control::ControlMode::kDegradedHold:
+                break;  // valid=true 时不应出现；防御：不发布
+        }
+        return std::nullopt;
+    }
+
+    /// 热备份核对（设计 §2.4）：S7 期间每秒核对卡尔曼状态年龄
+    /// （`TargetState.header.receive_time_ms` 年龄是否超出其自报有效期窗
+    /// `valid_for_ms`——生产者声明的"数据允许使用的最长时间"，与 S5 意图门禁
+    /// `HasFreshEstimate` 同一口径；无快照、valid=false 亦视为断粮）。
+    /// 进入 S7 后立即核对一次，此后每秒一次；断粮 → 节流 WARN + 返回告警位
+    /// （不退出 S7：S7 去留由三条收口路径决定，热备份告警只提示"假备份"风险）。
+    uint32_t EvaluateHotBackup(uint64_t now_ms) {
+        if (CurrentState() != common::MissionState::kVisualTracking) {
+            hot_backup_starved_ = false;
+            return 0;
+        }
+        if (hot_backup_check_ms_ != 0 &&
+            now_ms - hot_backup_check_ms_ < kHotBackupCheckIntervalMs) {
+            return hot_backup_starved_ ? kWarningHotBackupStarved : 0;
+        }
+        hot_backup_check_ms_ = now_ms;
+        hot_backup_starved_ = !HasFreshEstimate(now_ms);
+        if (hot_backup_starved_) {
+            const uint64_t count = ++hot_backup_starved_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN(
+                    "S7 热备份断粮: 卡尔曼状态年龄超窗（估计无效/超龄/未收到），"
+                    "不退出 S7 count={}",
+                    count);
+            }
+        }
+        return hot_backup_starved_ ? kWarningHotBackupStarved : 0;
     }
 
     /// GPS位置引导的最低导航前置条件。后续接入控制前还需增加模式/高度/电池等门禁。
@@ -895,6 +1196,11 @@ private:
     const uint64_t handover_timeout_ms_;
     const int64_t visual_stale_ms_;
     const int64_t distance_stale_ms_;
+    /// 视觉跟踪控制律配置拷贝与主控律（Task 9；仅决策线程访问，遵循控制律
+    /// 单线程约定。控制律内部超龄阈值取 tracking.control.*，生产与状态机侧
+    /// visual_stale/distance_stale 同源注入）。
+    const control::TrackingConfig tracking_config_;
+    control::TrackingControlLaw tracking_law_;
     /// 标定内参换算器与视场半角（构造期固化；热路径零分配）。
     control::PixelToAngle azimuth_converter_;
     control::PixelToAngle elevation_converter_;
@@ -910,7 +1216,21 @@ private:
     /// S7 测距失效计时起始时刻（nullopt=测距未失效；恢复有效即清零）
     std::optional<uint64_t> distance_lost_since_ms_;
     bool estimation_inputs_active_ = false;  ///< 估计/视觉/测距输入组已成功订阅
-    bool position_intent_active_ = false;    ///< S5 位置引导意图发布中
+    /// 位置类意图来源（Task 9 起含 S6 冻结续发与 S7 首拍过渡续发）：
+    /// kNone=未发布，kEstimate=S5 估计引导，kFrozen=S6/S7 冻结续发。
+    enum class PositionIntentSource { kNone, kEstimate, kFrozen };
+    PositionIntentSource position_intent_source_ = PositionIntentSource::kNone;
+    /// S5→S6 冻结的最后位置目标（进入时刻的估计快照；交接段结束清空）。
+    std::optional<common::TargetState> frozen_handover_target_;
+    /// S7 段内是否已发出首条视觉意图（冻结续发的收口条件）。
+    bool s7_servo_started_ = false;
+    /// 视觉伺服降级停发计数（节流日志）与最近降级原因。
+    uint64_t servo_degraded_count_ = 0;
+    control::DegradedReason last_degraded_reason_ = control::DegradedReason::kNone;
+    /// 热备份核对（Task 9）：上次核对时刻、断粮状态与断粮计数（节流日志）。
+    uint64_t hot_backup_check_ms_ = 0;
+    bool hot_backup_starved_ = false;
+    uint64_t hot_backup_starved_count_ = 0;
     uint64_t intent_sequence_ = 0;
     uint64_t last_intent_publish_ms_ = 0;
     uint64_t intent_stale_count_ = 0;
