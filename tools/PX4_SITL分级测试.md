@@ -501,8 +501,9 @@ drone_config），把脚本化 `ControlIntent`（每 100ms，带 `reason_code` b
 5. 北向 2m/s 阶跃意图：爬升斜率 ≤ `max_accel_mps2`×1.2（300ms 窗口），
    稳态速度 = min(2, `max_speed_mps`) ±0.25m/s；
 6. 停止发布意图（超龄注入）→ 控制器转 COAST 零速刹车，速度过零时间 < `coast_timeout_ms`；
-7. 持续停发 → 控制器转 IDLE 停发（`valid=false`）→ PX4 在 1.3s 内退出 Offboard
-   （实测基准：第 3D 段 `COM_OF_LOSS_T=1.0` 下 1270ms，含 commander/上报/采样延迟）；
+7. 持续停发 → 控制器转 IDLE 停发（`valid=false`）→ PX4 在 2.2s 内退出 Offboard
+   （COM_OF_LOSS_T 1.0s + HEARTBEAT 1Hz 相位 ≤1s + 余量；2026-10-14 前为 1.3s，
+   实测该测法受心跳相位支配随机失败，八月基准 1270ms 与当日 1999ms 同为相位样本）；
 8. 立即请求 AUTO.LAND 4/6 → 确认 landed → 主动 DISARM。
 
 进入 Offboard 的次序说明（引导流）：PX4 要求进入 Offboard 前已有 setpoint 流（第 3A
@@ -527,9 +528,9 @@ ARM 请求/ACK accepted/PX4 已确认 armed
 相对起飞目标已建立 / 达到相对 1m 高度 / 目标高度稳定悬停 3 秒
 位置引导意图未被控制拒绝(含 Home 基准)
 零速意图 3 秒最大漂移 < 0.10m
-阶跃爬升斜率受限(≤max_accel×1.2) / 阶跃稳态速度=min(2, max_speed)
-停发后 COAST 零速刹车已触发 / 速度过零时间 < coast_timeout
-控制器已转 IDLE 停发 / PX4 已在 1.3s 内退出 Offboard
+阶跃设定值爬升斜率受限(≤max_accel×1.2，发布侧) / 阶跃稳态速度=min(2, max_speed)
+停发后 COAST 零速刹车已触发 / 速度过零时间 ≤ 2000ms(指数收敛物理下限)
+控制器已转 IDLE 停发 / PX4 已在 2.2s 内退出 Offboard(含 1Hz 心跳相位)
 停发后设定值发送已停止(≤2 条)
 AUTO.LAND 请求/ACK accepted/PX4 已确认 landed
 主动 DISARM 前未被自动上锁 / DISARM ACK accepted 且已确认 disarmed
@@ -538,11 +539,26 @@ AUTO.LAND 请求/ACK accepted/PX4 已确认 landed
 控制器诊断: setpoint=... rejected=... clamped=... error=... 引导注入=... 条
 ```
 
-### 12.1 第 4 阶段实跑状态（2026-10-13）
+### 12.1 第 4 阶段实跑状态（2026-10-14，WSL2 SITL 通过）
 
-**待线下执行**：本阶段实现期无 PX4 SITL 环境，线上只完成编译、参数互斥/门禁负对照
-（无 SITL 时 10 秒连接超时 → FAIL、退出码 3；串口配置在启动前被拒）。SITL 实跑通过后
-把实测值（漂移、斜率、稳态速度、两级时延、包线）回填本小节与 `docs/开发进度.md`。
+**G2 已通过**（PX4 v1.17.0 + Gazebo Harmonic 8.15，WSL2 Ubuntu 24.04，报告全 PASS）：
+
+```text
+零速最大漂移：0.0733 m（上限 0.1）
+阶跃设定值斜率(发布侧)：2.007 m/s²（上限 2.4；slew 限幅端到端生效）
+阶跃稳态速度：1.827 m/s（期望 2，遥测侧）
+COAST→速度过零：1500 ms（上限 2000）
+COAST→IDLE：972 ms；IDLE→PX4 退出 Offboard：1593 ms（上限 2200），退出模式 4/5
+停发后额外发送 0 条；包线：最大相对高度 0.968 m、水平漂移 0.049 m、北向 4.60 m
+控制器诊断：setpoint=368 rejected=1 clamped=0 error=0
+```
+
+**同日的判据修正**（门禁工具测量缺陷，控制器/PX4 行为经 ulog 地面真值复核均正确）：
+阶跃斜率改测发布侧设定值（原遥测差分受成簇/抖动影响测出 4.63 m/s² 伪值，ulog 真值
+设定值 2.12、实机 1.77）；速度过零上限由 coast_timeout(1s) 改为 2000ms（PX4 速度环
+指数收敛 τ≈0.45s，从 2m/s 到 ≤0.1m/s 物理下限 ≈1.4s）；退出 Offboard 上限由 1.3s
+改为 2.2s（COM_OF_LOSS_T 1.0s + HEARTBEAT 1Hz 相位 ≤1s + 余量，原上限按此测法
+随机失败）。详见 `tools/px4_link_smoke.md` §2.1。
 
 ## 8. 常见问题
 

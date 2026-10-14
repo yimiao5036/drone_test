@@ -122,9 +122,14 @@ echo "退出码=$?"
 
 | 门禁 | 命令（构建目录内） | 通过标准 | 状态 |
 |---|---|---|---|
-| G1 回归 | 第 0~3D 分阶段原样复跑（`--sitl-zero-velocity` … `--sitl-offboard-loss`） | 全部 PASS（退出码 0） | ⏳ 线下 |
-| G2 执行层 | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-controller` | 报告全 PASS（零速漂移/阶跃斜率/停发刹车/退出时延/降落上锁） | ⏳ 线下（代码+负对照已过） |
-| G3 全链 | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-mission` | 报告全 PASS（迁移序列 S5→S6→S7→回退、交接连续、备份接管、围栏钳制、模式停发 ≤200ms） | ⏳ 线下（代码+负对照+注入几何自检已过） |
+| G1 回归 | 第 0~3D 分阶段原样复跑（`--sitl-zero-velocity` … `--sitl-offboard-loss`） | 全部 PASS（退出码 0） | ✅ 2026-10-14（WSL2，七级全 PASS） |
+| G2 执行层 | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-controller` | 报告全 PASS（零速漂移/阶跃斜率/停发刹车/退出时延/降落上锁） | ✅ 2026-10-14（WSL2，全 PASS；实测值回填 `tools/PX4_SITL分级测试.md` §12.1） |
+| G3 全链 | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-mission` | 报告全 PASS（迁移序列 S5→S6→S7→回退、交接连续、备份接管、围栏钳制、模式停发 ≤200ms） | ✅ 2026-10-14（WSL2，全 PASS；环境前置条件见 `tools/px4_link_smoke.md` §2.2） |
+
+SITL 门禁运行环境（2026-10-14 建立）：本机 WSL2 Ubuntu 24.04（`~/PX4-Autopilot`
+v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前置条件见
+`tools/px4_link_smoke.md` §2.2 末节。仿真机（192.168.31.209，v1.18-beta 主线 +
+老 CPU 达不到实时）已弃用——EKF2 卡假位置/无航向参考系算力不足所致。
 
 判读与排查见 `tools/px4_link_smoke.md` §2.1/§2.2/§7；失败处置纪律：G2 起任一级出现
 非预期位移、非预期 armed、PX4 failsafe 触发，按缺陷处理（systematic-debugging），

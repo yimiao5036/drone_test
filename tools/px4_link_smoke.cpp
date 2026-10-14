@@ -479,7 +479,12 @@ constexpr float kStage4StepSpeedMps = 2.0f;            // 阶跃意图速度
 constexpr float kStage4ZeroDriftLimitM = 0.10f;        // 零速保持最大漂移上限
 constexpr float kStage4ZeroSpeedMps = 0.10f;           // “速度过零”判据
 constexpr float kStage4SteadyToleranceMps = 0.25f;     // 稳态速度容差
-constexpr double kStage4SlopeTolerance = 1.2;          // 爬升斜率采样容差倍数
+constexpr double kStage4SlopeTolerance = 1.2;          // 设定值爬升斜率容差倍数
+constexpr uint64_t kStage4SlopeWindowMs = 300;         // 爬升斜率时间窗（按时间，不按样本数）
+// 刹车过零上限：PX4 速度环对零速指令呈指数收敛（SITL 实测 τ≈0.45s），从
+// max_speed=2m/s 收敛到 ≤0.1m/s 物理下限约 1.4s，加遥测量化余量取 2000ms；
+// 早前用 coast_timeout(1000ms) 作上限物理不可达（2026-10-14 ulog 复核）。
+constexpr uint64_t kStage4BrakeZeroLimitMs = 2000;     // COAST→速度过零上限
 constexpr uint64_t kStage4IntentValidMs = 500;         // 意图有效期
 constexpr uint64_t kStage4IntentPeriodMs = 100;        // 意图发布周期（10Hz）
 constexpr uint64_t kStage4GuidePeriodMs = 100;         // 引导流注入周期（10Hz）
@@ -492,7 +497,11 @@ constexpr uint64_t kStage4BootstrapTimeoutMs = 20000;  // 引导/Offboard/ARM/�
 constexpr uint64_t kStage4TakeoffTimeoutMs = 15000;    // 起飞/悬停上限
 constexpr uint64_t kStage4StopTimeoutMs = 15000;       // 停发→Offboard 退出上限
 constexpr uint64_t kStage4LandTimeoutMs = 30000;       // AUTO.LAND→landed 上限
-constexpr uint64_t kStage4OffboardExitLimitMs = 1300;  // IDLE→PX4 退出 Offboard 上限
+// IDLE→PX4 退出 Offboard 上限：COM_OF_LOSS_T(1.0s) + PX4 HEARTBEAT 1Hz 相位
+// 抖动（0~1s，均匀随机）+ 200ms 余量 = 2200ms；八月基线 1270ms 只是心跳相位
+// 走运，1300ms 上限按此测法必然随机失败（2026-10-14 复核当日 3D 段同环境
+// 实测 1999ms 为同一量化效应）。
+constexpr uint64_t kStage4OffboardExitLimitMs = 2200;  // IDLE→PX4 退出 Offboard 上限
 constexpr uint64_t kStage4ExtraSendsAllowed = 2;       // 停发后容许的竞态额外发送
 
 /// stage4 执行阶段。
@@ -514,7 +523,7 @@ enum class Stage4IntentMode : uint8_t {
     kPositionTakeoff,   ///< 位置引导：相对起飞 1m
 };
 
-/// 阶跃段北向速度样本（2.5 秒 × 100ms，量级极小）。
+/// 阶跃段速度样本（遥测 vx 或控制器发布的设定值 vx；2.5 秒 × 100ms，量级极小）。
 struct Stage4SpeedSample {
     uint64_t time_ms = 0;
     float vx_mps = 0.f;
@@ -542,7 +551,12 @@ public:
           intent_topic_(intent_topic),
           controller_config_(controller_config),
           duration_ms_(static_cast<uint64_t>(duration.count()) * 1000),
-          subscription_(std::move(subscription)) {}
+          subscription_(std::move(subscription)) {
+        // 订阅控制器设定值输出：阶跃斜率以发布侧（含控制器打戳）为准，
+        // 不受 MAVLink 遥测成簇/抖动影响（2026-10-14 ulog 复核：遥测差分
+        // 测出 4.63 m/s² 伪值，实际设定值斜率 2.12、实机加速度 1.77）。
+        setpoint_subscription_ = controller_.SetpointOutput().Subscribe(64);
+    }
 
     /// 执行脚本主循环（返回到期/中断/完成后仍可能 armed，收尾见 FinishFlight）。
     void Execute() {
@@ -571,6 +585,15 @@ public:
                               << std::endl;
                 }
             }
+            // 排空控制器设定值输出：阶跃段斜率以发布侧样本为准（时间为
+            // 控制器发布打戳 receive_time_ms，免疫本工具排空批处理）。
+            while (auto setpoint = setpoint_subscription_.TryTake()) {
+                if ((*setpoint)->valid &&
+                    (*setpoint)->type == drone::common::SetpointType::kVelocity) {
+                    setpoint_samples_.push_back(
+                        {(*setpoint)->header.receive_time_ms, (*setpoint)->x});
+                }
+            }
             const uint64_t now_ms = MonotonicMs();
             PublishScriptIntent(now_ms);
             AdvancePhase(now_ms, now_ms - started_ms);
@@ -594,10 +617,8 @@ public:
         const double slope_limit = controller_config_.max_accel_mps2 * kStage4SlopeTolerance;
         const double expected_steady =
             std::min<double>(kStage4StepSpeedMps, controller_config_.max_speed_mps);
-        const uint64_t coast_limit_ms =
-            static_cast<uint64_t>(controller_config_.coast_timeout.count());
         const bool brake_ok = coast_seen_ && brake_zero_seen_ &&
-                              brake_zero_ms_ - coast_ms_ < coast_limit_ms;
+                              brake_zero_ms_ - coast_ms_ <= kStage4BrakeZeroLimitMs;
         const bool exit_ok = idle_seen_ && offboard_exit_seen_ &&
                              offboard_exit_ms_ - idle_ms_ <= kStage4OffboardExitLimitMs;
         const uint64_t sends_after_idle =
@@ -637,12 +658,13 @@ public:
         PrintCheck("位置引导意图未被控制拒绝(含 Home 基准)",
                    takeoff_target_ready_ && takeoff_rejected_delta_ == 0, true);
         PrintCheck("零速意图 3 秒最大漂移 < 0.10m", zero_hold_ok, true);
-        PrintCheck("阶跃爬升斜率受限(≤max_accel×1.2)", step_complete_ && step_slope_ok_, true);
+        PrintCheck("阶跃设定值爬升斜率受限(≤max_accel×1.2，发布侧)",
+                   step_complete_ && step_slope_ok_, true);
         PrintCheck("阶跃稳态速度=min(2, max_speed)", step_complete_ && step_steady_ok_, true);
         PrintCheck("停发后 COAST 零速刹车已触发", coast_seen_, true);
-        PrintCheck("速度过零时间 < coast_timeout", brake_ok, true);
+        PrintCheck("速度过零时间 ≤ 2000ms(指数收敛物理下限)", brake_ok, true);
         PrintCheck("控制器已转 IDLE 停发", idle_seen_, true);
-        PrintCheck("PX4 已在 1.3s 内退出 Offboard", exit_ok, true);
+        PrintCheck("PX4 已在 2.2s 内退出 Offboard(含 1Hz 心跳相位)", exit_ok, true);
         PrintCheck("停发后设定值发送已停止(≤2 条)",
                    idle_seen_ && sends_after_idle <= kStage4ExtraSendsAllowed, true);
         PrintCheck("AUTO.LAND 请求/ACK accepted/PX4 已确认 landed", land_ok, true);
@@ -662,14 +684,14 @@ public:
                           link_.MessageReceiveCount(MAVLINK_MSG_ID_EXTENDED_SYS_STATE),
                           observed_.landed);
         std::cout << "实测值: 零速最大漂移 " << zero_hold_max_drift_m_
-                  << " m（上限 " << kStage4ZeroDriftLimitM << "），阶跃爬升斜率 "
+                  << " m（上限 " << kStage4ZeroDriftLimitM << "），阶跃设定值斜率(发布侧) "
                   << step_max_slope_mps2_ << " m/s²（上限 " << slope_limit
                   << "），阶跃稳态速度 " << step_steady_speed_mps_ << " m/s（期望 "
                   << expected_steady << "），阶跃段位移 北向 " << step_north_m_
                   << " m / 东西 " << step_east_m_ << " m" << std::endl;
         std::cout << "实测时延: COAST→速度过零 "
                   << (coast_seen_ && brake_zero_seen_ ? brake_zero_ms_ - coast_ms_ : 0)
-                  << " ms（上限 " << coast_limit_ms << "），COAST→IDLE "
+                  << " ms（上限 " << kStage4BrakeZeroLimitMs << "），COAST→IDLE "
                   << (coast_seen_ && idle_seen_ ? idle_ms_ - coast_ms_ : 0)
                   << " ms，IDLE→PX4 退出 Offboard "
                   << (idle_seen_ && offboard_exit_seen_ ? offboard_exit_ms_ - idle_ms_ : 0)
@@ -990,6 +1012,7 @@ private:
             step_start_ms_ = now_ms;
             clamped_at_step_start_ = controller_.ClampedCount();
             speed_samples_.clear();
+            setpoint_samples_.clear();
         }
     }
 
@@ -1005,7 +1028,7 @@ private:
             return;
         }
         step_complete_ = true;
-        step_max_slope_mps2_ = MaxRampSlope();
+        step_max_slope_mps2_ = MaxRampSlope(setpoint_samples_);
         step_steady_speed_mps_ = SteadySpeed();
         const double expected =
             std::min<double>(kStage4StepSpeedMps, controller_config_.max_speed_mps);
@@ -1014,8 +1037,9 @@ private:
         step_steady_ok_ = std::fabs(step_steady_speed_mps_ - expected) <=
                           kStage4SteadyToleranceMps;
         clamped_delta_in_step_ = controller_.ClampedCount() - clamped_at_step_start_;
-        std::cout << "[SITL] 阶跃段完成：爬升斜率 " << step_max_slope_mps2_
-                  << " m/s²，稳态速度 " << step_steady_speed_mps_ << " m/s（期望 "
+        std::cout << "[SITL] 阶跃段完成：设定值爬升斜率 " << step_max_slope_mps2_
+                  << " m/s²（发布侧 " << setpoint_samples_.size()
+                  << " 样本），稳态速度 " << step_steady_speed_mps_ << " m/s（期望 "
                   << expected << "，限幅触发 " << clamped_delta_in_step_
                   << " 次）；停止发意图（超龄注入）" << std::endl;
         phase_ = Stage4Phase::kStopIntents;
@@ -1151,21 +1175,27 @@ private:
         }
     }
 
-    /// 阶跃段最大爬升斜率：以 300ms 窗口差分抑制单拍噪声。
-    double MaxRampSlope() const {
-        constexpr std::size_t kWindow = 3;
+    /// 阶跃段设定值最大爬升斜率：按 300ms 时间窗差分（不以样本数代替时间），
+    /// 输入为控制器发布侧样本（含发布打戳），验证 slew 限幅端到端生效。
+    double MaxRampSlope(const std::vector<Stage4SpeedSample>& samples) const {
         double max_slope = 0.0;
-        for (std::size_t index = kWindow; index < speed_samples_.size(); ++index) {
-            const Stage4SpeedSample& head = speed_samples_[index - kWindow];
-            const Stage4SpeedSample& tail = speed_samples_[index];
-            const uint64_t dt_ms = tail.time_ms - head.time_ms;
-            if (dt_ms == 0) {
-                continue;
+        for (std::size_t head_index = 0; head_index < samples.size(); ++head_index) {
+            const Stage4SpeedSample& head = samples[head_index];
+            for (std::size_t tail_index = head_index + 1; tail_index < samples.size();
+                 ++tail_index) {
+                const Stage4SpeedSample& tail = samples[tail_index];
+                const uint64_t dt_ms = tail.time_ms - head.time_ms;
+                if (dt_ms > kStage4SlopeWindowMs) {
+                    break;  // 样本按时间单调，超出窗口即停止
+                }
+                if (dt_ms < kStage4SlopeWindowMs * 5 / 6) {
+                    continue;  // 窗口不足 250ms 的对子差分噪声过大，跳过
+                }
+                const double slope = (static_cast<double>(tail.vx_mps) -
+                                      static_cast<double>(head.vx_mps)) /
+                                     (static_cast<double>(dt_ms) / 1000.0);
+                max_slope = std::max(max_slope, slope);
             }
-            const double slope = (static_cast<double>(tail.vx_mps) -
-                                  static_cast<double>(head.vx_mps)) /
-                                 (static_cast<double>(dt_ms) / 1000.0);
-            max_slope = std::max(max_slope, slope);
         }
         return max_slope;
     }
@@ -1329,6 +1359,9 @@ private:
     uint64_t clamped_at_step_start_ = 0;
     uint64_t clamped_delta_in_step_ = 0;
     std::vector<Stage4SpeedSample> speed_samples_;
+    // 控制器设定值输出订阅与样本（阶跃斜率发布侧测量）
+    drone::common::Topic<drone::common::Px4Setpoint>::Subscription setpoint_subscription_;
+    std::vector<Stage4SpeedSample> setpoint_samples_;
 
     // 停发/COAST/Offboard 退出
     uint64_t stop_intents_ms_ = 0;
@@ -1486,7 +1519,9 @@ constexpr uint64_t kMissionShortLostFrames = 10;   // 短期 LOST 注入帧数�
 constexpr uint64_t kMissionModeStopLimitMs = 200;  // 切非 Offboard 停发上限（设计 §4）
 constexpr uint64_t kMissionModeStopSettleMs = 300; // 停发后再观察时长（发送冻结核验）
 constexpr uint64_t kMissionStopTimeoutMs = 15000;  // 停发→Offboard 退出上限
-constexpr uint64_t kMissionOffboardExitLimitMs = 1300;  // IDLE→PX4 退出 Offboard 上限
+// 上限含义同 kStage4OffboardExitLimitMs：COM_OF_LOSS_T(1.0s) + HEARTBEAT 1Hz
+// 相位抖动（≤1s）+ 余量；早前 1300ms 按 1Hz 心跳测法随机失败。
+constexpr uint64_t kMissionOffboardExitLimitMs = 2200;  // IDLE→PX4 退出 Offboard 上限
 constexpr uint64_t kMissionExpiryTimeoutMs = 8000; // 目标过期→停发链上限
 constexpr uint64_t kMissionLandTimeoutMs = 30000;  // AUTO.LAND→landed 上限
 constexpr uint64_t kMissionExtraSendsAllowed = 2;  // 停发后容许的竞态额外发送

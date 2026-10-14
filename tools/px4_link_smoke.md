@@ -91,9 +91,9 @@ echo "退出码=$?"
 | 0 | 引导零速度流 → Offboard(6/0) → ARM | Offboard/ARM 的 ACK accepted + 真实模式/armed；控制器接管后链路发送持续增长 |
 | 1 | 位置引导意图（`control_source=0`）起飞至相对 1m 并稳定悬停 3 秒 | 高度误差 ≤0.15m、水平漂移 ≤0.30m、垂速 ≤0.30m/s；该段位置意图零拒绝（含 Home 基准） |
 | 2 | 零速度意图保持 3 秒（`control_source=1`） | 最大水平漂移 < 0.10m |
-| 3 | 北向 2m/s 阶跃意图保持 2.5 秒 | 速度爬升斜率 ≤ max_accel_mps2×1.2（300ms 窗口差分）；稳态速度 = min(2, max_speed_mps) ±0.25m/s |
-| 4 | 停止发布意图（超龄注入） | 控制器转 COAST 零速刹车；速度过零（≤0.10m/s）时间 < coast_timeout |
-| 5 | 持续停发 | 控制器转 IDLE 停发（`valid=false`），PX4 在 1.3s 内退出 Offboard；停发后额外发送 ≤2 条 |
+| 3 | 北向 2m/s 阶跃意图保持 2.5 秒 | **设定值**爬升斜率 ≤ max_accel_mps2×1.2（发布侧样本、300ms 时间窗差分，2026-10-14 起由遥测差分改为发布侧——遥测成簇/抖动曾测出 4.63 m/s² 伪值，ulog 地面真值：设定值 2.12、实机 1.77）；稳态速度 = min(2, max_speed_mps) ±0.25m/s（遥测侧） |
+| 4 | 停止发布意图（超龄注入） | 控制器转 COAST 零速刹车；速度过零（≤0.10m/s）时间 ≤ 2000ms（PX4 速度环指数收敛物理下限 ≈1.4s + 遥测量化余量；早前以 coast_timeout=1000ms 为上限物理不可达，2026-10-14 ulog 复核修正） |
+| 5 | 持续停发 | 控制器转 IDLE 停发（`valid=false`），PX4 在 2.2s 内退出 Offboard（COM_OF_LOSS_T 1.0s + HEARTBEAT 1Hz 相位 ≤1s + 余量；早前 1.3s 上限按此测法随机失败）；停发后额外发送 ≤2 条 |
 | 6 | AUTO.LAND → landed → 主动 DISARM | ACK accepted + 真实 landed/armed 状态；未落地禁止 DISARM |
 
 硬包线（armed 期间越界即安全回收 AUTO.LAND）：相对高度 ≤1.30m；阶跃前水平漂移 ≤0.50m；
@@ -103,6 +103,24 @@ echo "退出码=$?"
 退出码沿用第 5 节；无 SITL 时在 10 秒连接超时后中止脚本并报告 FAIL（退出码 3），不得误报 PASS。
 
 ### 2.2 stage4-mission 全链门禁脚本（`--sitl-stage4-mission`，G3）
+
+**运行环境前置条件（2026-10-14 实跑建立，缺一即失败）**：
+
+1. **机体朝北出生**：gz 世界为 ENU，模型默认 yaw=0 朝东；必须
+   `HEADLESS=1 PX4_GZ_MODEL_POSE=0,0,0,0,0,1.5708 make px4_sitl gz_x500`
+   启动（gz yaw=+90° ⇒ PX4 航向 0° 朝北，映射经 gz set_pose 活体实验标定）。
+   否则目标不在相机前向，视觉注入自检（`cam_z ≤ 0.1` 拒绝）会中止脚本。
+2. **干净会话**：注入目标为 Home 相对绝对坐标（主目标北向 40m），车辆必须位于
+   Home 原点附近——上一次运行会在降落点残留，复用会话会“出生在目标身后”直接
+   中止。每次跑 G3 前重启 SITL（tmux 会话与 gz 进程都清掉）。
+3. **PX4 巡航限速 2m/s**：S5 位置引导透传目标点，接近速度由 PX4
+   `MPC_XY_VEL_MAX`（默认 12m/s）决定，全速 6 秒即冲过 40m 目标导致几何退化；
+   开跑前 `param set MPC_XY_VEL_MAX 2.0`（SITL 参数持久化，重启不失，须复核）。
+   该行为同时是生产事实：远端引导段接近速度上限由 PX4 参数而非
+   `controller.max_speed_mps` 决定，现场围栏外接近速度规划需注意。
+4. **GCS 心跳在场**：无 GCS 心跳时 commander 拒绝解锁（Preflight Fail: No
+   connection to the GCS）；无 QGC 时可用 pymavlink 在 14550 端口 1Hz 回发
+   MAV_TYPE_GCS 心跳（注意必须先 `recv` 学习对端地址，否则发不出去）。
 
 装配与数据流：工具装配 **正式 `MissionStateMachine`**（唯一意图生产者）+
 `FlightController` + `Px4Link`，并扮演**地面站/视觉监视器/双目测距**三路生产者注入
@@ -168,7 +186,7 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 | 7 | 短期 LOST（10 帧 < `exit_lost_frames`） | 状态保持 S7；出现零速刹车意图（reason 低位 102） |
 | 8 | 持续 LOST（达 `exit_lost_frames`）→ 回退 | 状态回 S5；位置引导意图恢复（卡尔曼备份接管）；控制权全程不中断（ACTIVE） |
 | 9 | 交接/回退全程输出连续性 | 速度式设定值隐含加速度 ≤ `max_accel_mps2`×1.5（含位置式→速度式段首"从 0 起步"核验） |
-| 10 | 停止注入目标（过期） | 告警位 bit1 置位 + 意图停发（> `intent_timeout` 无新意图）→ COAST 零速刹车 → IDLE → PX4 ≤1.3s 退出 Offboard；停发后额外发送 ≤2 条 |
+| 10 | 停止注入目标（过期） | 告警位 bit1 置位 + 意图停发（> `intent_timeout` 无新意图）→ COAST 零速刹车 → IDLE → PX4 ≤2.2s 退出 Offboard（COM_OF_LOSS_T 1.0s + HEARTBEAT 1Hz 相位 ≤1s + 余量，2026-10-14 由 1.3s 修正）；停发后额外发送 ≤2 条 |
 | 11 | AUTO.LAND → landed → 主动 DISARM | 同 stage4 收尾（未落地禁止空中 DISARM） |
 
 硬包线（armed 期间越界即安全回收 AUTO.LAND）：相对高度 0.50~1.30m（下限只对升空后
@@ -363,7 +381,7 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | stage4 引导阶段超时 | 引导流是否 ≥2 秒且 ≥20 条、Offboard ACK 是否 accepted、PX4 是否真实 6/0；查日志中控制器迁移原因串 |
 | stage4“控制器未接管设定值流” | 控制器授权链未全通：查 `controller.reason_code` bit31 是否置位、快照是否 armed+6/0（工具每拍带请求位） |
 | stage4 起飞阶段超时 | 位置引导意图被拒（`home_valid=false` → 无 Home 基准）或 `local_position` 无效；报告打印控制器 rejected 计数 |
-| stage4 刹车/退出时延超标 | 对照 `controller.coast_timeout_ms` 与 PX4 `COM_OF_LOSS_T`；报告分别打印 COAST→过零与 IDLE→退出实测值 |
+| stage4 刹车/退出时延超标 | 刹车过零上限 2000ms（指数收敛物理下限 ≈1.4s + 量化余量）、退出上限 2200ms（COM_OF_LOSS_T 1.0s + HEARTBEAT 1Hz 相位）；超标先看 PX4 `COM_OF_LOSS_T` 是否被改大，再对照报告打印的两段实测值 |
 | stage4 无 SITL 时 | 10 秒连接超时后中止并 FAIL（退出码 3）；若退出码 1，先看参数互斥/时长/transport 门禁提示 |
 | stage4-mission 退出码 1 且报"注入几何自检失败" | 反变换/正变换不互逆（代码级缺陷）：查 `NedToCameraFrame`/`OffsetToGeodetic` 与 `visual_ned_converter.cpp`/`geodetic_converter.cpp` 是否同步改动 |
 | stage4-mission 卡在"交接段超时" | 按状态机排查要点四项逐项查（`include/state_machine/mission_state_machine.md`"停在 S5 不进 S6"）；工具侧另看：注入目标是否新鲜（Home 有效）、测距注入是否在跑、姿态/位置遥测是否有效、估计器诊断是否注入（本工具已注入真实估计器） |
