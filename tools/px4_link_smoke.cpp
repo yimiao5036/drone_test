@@ -1588,6 +1588,354 @@ inline bool CountsAsStateMachineIntent(MissionIntentClass value) {
     return value != MissionIntentClass::kToolBootstrap;
 }
 
+// ---------------------------------------------------------------------------
+// Stage4InjectionRig：三路注入构件（地面站目标 WGS-84 反解 + 模拟视觉观测 +
+// 测距），G3 门禁与整定场景共用——注入几何与估计器正变换互逆的单一真源。
+/// 所有发布节拍由 now_ms 显式驱动；错误经 error() 粘性上报（首个为准），
+/// 由调用方决定中止（Abort）。快照经参数显式传入（nullptr = 无快照）。
+// ---------------------------------------------------------------------------
+class Stage4InjectionRig {
+public:
+    Stage4InjectionRig(
+        drone::common::Topic<drone::common::GroundStationTarget>& ground_target_topic,
+        drone::common::Topic<drone::common::VisualTargetStatus>& visual_topic,
+        drone::common::Topic<drone::common::StereoTargetDistance>& distance_topic,
+        const drone::control::TrackingCameraGroupConfig& camera,
+        const drone::perception::VisualMountExtrinsics& mount, double fxb_m_px)
+        : ground_target_topic_(ground_target_topic),
+          visual_topic_(visual_topic),
+          distance_topic_(distance_topic),
+          camera_(camera),
+          mount_(mount),
+          fxb_m_px_(fxb_m_px) {}
+
+    /// 目标位置：Home 相对 NED（up 为正高，米）。阶跃换位由驱动类调此接口，
+    /// 地面站目标与视觉/测距注入共用同一目标点，卡尔曼热备份不发散。
+    void SetTargetNed(double north_m, double east_m, double up_m) {
+        target_north_m_ = north_m;
+        target_east_m_ = east_m;
+        target_up_m_ = up_m;
+    }
+    void SetTargetEnabled(bool on) { target_enabled_ = on; }
+    void SetVisionEnabled(bool on) { vision_enabled_ = on; }
+    void SetDistanceValid(bool valid) { distance_valid_ = valid; }
+
+    bool target_enabled() const { return target_enabled_; }
+    bool vision_enabled() const { return vision_enabled_; }
+    double target_north_m() const { return target_north_m_; }
+    double target_east_m() const { return target_east_m_; }
+    double target_up_m() const { return target_up_m_; }
+
+    /// 粘性错误（首个为准）；设置后注入停止，调用方应中止脚本。
+    bool HasError() const { return !error_.empty(); }
+    const std::string& error() const { return error_; }
+
+    /// 本拍注入几何（PublishSimulatedVision 内缓存；CSV 记录用）。
+    double last_pixel_x() const { return last_pixel_x_; }
+    double last_pixel_y() const { return last_pixel_y_; }
+    double last_cam_z_m() const { return last_cam_z_m_; }
+
+    /// 注入地面站目标：Home 相对 NED 位置反解 WGS-84 后按 10Hz 发布。
+    /// 反解与 perception::GeodeticToLocalNed 同一局部切平面公式（正向回验，
+    /// 偏差 >0.05m 判装配错误并置错误标志）。
+    bool PublishGroundTarget(uint32_t target_id, uint64_t now_ms,
+                             const drone::common::FlightStateSnapshot* latest) {
+        if (HasError() || !target_enabled_ || now_ms < next_target_publish_ms_ ||
+            latest == nullptr || !latest->home_valid) {
+            return false;
+        }
+        const double ref_lat = static_cast<double>(latest->home_lat_1e7) * 1e-7;
+        const double ref_lon = static_cast<double>(latest->home_lon_1e7) * 1e-7;
+        const double ref_alt = static_cast<double>(latest->home_altitude_mm) * 1e-3;
+        double lat = 0.0;
+        double lon = 0.0;
+        double alt = 0.0;
+        if (!OffsetToGeodetic(ref_lat, ref_lon, ref_alt, target_north_m_, target_east_m_,
+                              -target_up_m_, &lat, &lon, &alt)) {
+            SetError("注入目标反解失败（Home 基准非法）");
+            return false;
+        }
+        // 正向回验：同一公式必须还原（防装配式笔误导致注入点漂移）。
+        const auto verify = drone::perception::GeodeticToLocalNed(
+            {ref_lat, ref_lon, ref_alt}, {lat, lon, alt});
+        if (!verify.has_value() ||
+            std::fabs(verify->north_m - target_north_m_) > 0.05 ||
+            std::fabs(verify->east_m - target_east_m_) > 0.05 ||
+            std::fabs(verify->down_m + target_up_m_) > 0.05) {
+            SetError("注入目标反解回验偏差超限（>0.05m）");
+            return false;
+        }
+
+        drone::common::GroundStationTarget target;
+        target.header.receive_time_ms = now_ms;
+        target.header.valid_for_ms = kMissionTargetValidMs;
+        target.header.frame_id = 1;  // 1=WGS84 经纬度（与 GroundStationLink 同约定）
+        target.ground_station_boot_id = kMissionGroundBootId;
+        target.update_seq = ++target_update_seq_;
+        target.target_id = target_id;
+        target.latitude_1e7 = static_cast<int32_t>(std::llround(lat * 1e7));
+        target.longitude_1e7 = static_cast<int32_t>(std::llround(lon * 1e7));
+        target.altitude_mm = static_cast<int32_t>(std::llround(alt * 1e3));
+        target.alt_reference = 1;  // 1=MSL（估计器要求；Home 高度同基准）
+        target.protocol_version = 1;
+        target.transport_age_ms = 0;
+        target.validity_flags = kMissionValidityAltitude | kMissionValidityHorizontal |
+                                kMissionValidityVertical;
+        target.horizontal_accuracy_m = 2.0f;
+        target.vertical_accuracy_m = 3.0f;
+        target.heading_deg = std::numeric_limits<float>::quiet_NaN();
+        (void)ground_target_topic_.Emplace(target);
+        next_target_publish_ms_ = now_ms + kMissionTargetPeriodMs;
+        return true;
+    }
+
+    /// 注入一帧模拟视觉观测 + 对应测距：相机系坐标由（目标 NED − 自身 NED）
+    /// 经 姿态/安装外参 反变换得到，与 VisualCameraToLocalNed 正变换严格互逆，
+    /// 保证估计器视觉融合的横向位置与地面站目标一致（创新 ≈ 0，滤除几何分歧）。
+    /// distance_valid 独立于视觉状态：模拟"测距仍跟踪但跟踪器判丢"，
+    /// 使 S7 退出由 LOST 迟滞路径唯一决定（测距失效路径由单测覆盖）。
+    /// @return 本拍是否实际注入了一帧（按 20Hz 节流；调用方计数用）。
+    bool PublishSimulatedVision(common::VisualTargetState state, uint64_t now_ms,
+                                const drone::common::FlightStateSnapshot* latest) {
+        if (HasError() || !vision_enabled_ || now_ms < next_vision_publish_ms_ ||
+            latest == nullptr || !latest->attitude_valid ||
+            !latest->local_position_valid) {
+            return false;
+        }
+        const double north_m =
+            target_north_m_ - static_cast<double>(latest->local_x_m);
+        const double east_m = target_east_m_ - static_cast<double>(latest->local_y_m);
+        const double down_m = -target_up_m_ - static_cast<double>(latest->local_z_m);
+        double cam_x = 0.0;
+        double cam_y = 0.0;
+        double cam_z = 0.0;
+        NedToCameraFrame(north_m, east_m, down_m,
+                         static_cast<double>(latest->roll_rad),
+                         static_cast<double>(latest->pitch_rad),
+                         static_cast<double>(latest->yaw_rad), &cam_x, &cam_y, &cam_z);
+        if (cam_z <= 0.1) {
+            SetError("注入视觉几何非法（目标不在相机前向）");
+            return false;
+        }
+        last_cam_z_m_ = cam_z;
+        // 像素：与 control::PixelToAngle（angle = atan((pixel − c) / f)）互逆，
+        // 使状态机视线角/视场余量判据对注入几何成立。
+        const double azimuth_rad = std::atan2(cam_x, cam_z);
+        const double elevation_rad = std::atan2(cam_y, cam_z);
+        const float pixel_x = static_cast<float>(
+            camera_.cx_px + camera_.fx_px * std::tan(azimuth_rad));
+        const float pixel_y = static_cast<float>(
+            camera_.cy_px + camera_.fy_px * std::tan(elevation_rad));
+        last_pixel_x_ = pixel_x;
+        last_pixel_y_ = pixel_y;
+        const bool locked = state == common::VisualTargetState::kLocked;
+        const uint64_t frame_sequence = ++vision_frame_sequence_;
+
+        drone::common::VisualTargetStatus visual;
+        visual.header.receive_time_ms = now_ms;
+        visual.state = state;
+        visual.frame_sequence = frame_sequence;
+        visual.last_seen_ms = locked ? now_ms : visual_last_seen_ms_;
+        visual.consecutive_detected_frames = locked ? visual_locked_streak_ : 0;
+        visual.consecutive_missed_frames = locked ? 0 : visual_lost_streak_;
+        visual.confidence = locked ? 0.90f : 0.0f;
+        visual.center_pixel_x = pixel_x;
+        visual.center_pixel_y = pixel_y;
+        visual.frame_width = static_cast<uint32_t>(camera_.image_width);
+        visual.frame_height = static_cast<uint32_t>(camera_.image_height);
+        visual.valid = locked;
+        (void)visual_topic_.Emplace(visual);
+        if (locked) {
+            ++visual_locked_streak_;
+            visual_lost_streak_ = 0;
+            visual_last_seen_ms_ = now_ms;
+        } else {
+            ++visual_lost_streak_;
+            visual_locked_streak_ = 0;
+        }
+
+        drone::common::StereoTargetDistance distance;
+        distance.header.receive_time_ms = now_ms;
+        distance.header.source_time_ms = now_ms;  // 估计器按 source_time 排序/超龄
+        distance.frame_sequence = frame_sequence;
+        distance.class_id = 0;
+        distance.track_id = 0;
+        distance.forward_distance_m = static_cast<float>(cam_z);
+        distance.slant_range_m =
+            static_cast<float>(std::sqrt(cam_x * cam_x + cam_y * cam_y + cam_z * cam_z));
+        distance.disparity_px = static_cast<float>(fxb_m_px_ / cam_z);
+        distance.confidence = 0.90f;
+        distance.valid = distance_valid_;
+        distance.center_pixel_x_mid = pixel_x;
+        distance.camera_x_m = static_cast<float>(cam_x);
+        distance.camera_y_m = static_cast<float>(cam_y);
+        (void)distance_topic_.Emplace(distance);
+        next_vision_publish_ms_ = now_ms + kMissionVisionPeriodMs;
+        return true;
+    }
+
+    /// 装配期注入几何自检（开跑前调用）：反变换与正变换必须互逆——像素/测距
+    /// （NedToCameraFrame ↔ perception::VisualCameraToLocalNed）与地理坐标
+    /// （OffsetToGeodetic ↔ perception::GeodeticToLocalNed）。任一处不互逆即
+    /// 拒绝开跑：否则估计器视觉融合会与注入目标偏离、创新门限误拒交接。
+    bool VerifyInjectionGeometry() const {
+        constexpr double kRoll = 0.02;
+        constexpr double kPitch = -0.015;
+        constexpr double kYaw = 0.25;
+        const drone::perception::LocalNedCoordinate self{5.0, -2.0, -1.0};
+        const double north_m = 40.0 - self.north_m;
+        const double east_m = 0.0 - self.east_m;
+        const double down_m = -1.0 - self.down_m;
+        double cam_x = 0.0;
+        double cam_y = 0.0;
+        double cam_z = 0.0;
+        NedToCameraFrame(north_m, east_m, down_m, kRoll, kPitch, kYaw, &cam_x, &cam_y,
+                         &cam_z);
+        const auto back = drone::perception::VisualCameraToLocalNed(
+            cam_x, cam_y, cam_z, mount_, kRoll, kPitch, kYaw, self);
+        const auto offset = [](const drone::perception::LocalNedCoordinate& a, double n,
+                               double e, double d) {
+            return std::sqrt((a.north_m - n) * (a.north_m - n) +
+                             (a.east_m - e) * (a.east_m - e) +
+                             (a.down_m - d) * (a.down_m - d));
+        };
+        const double camera_error = back.has_value()
+            ? offset(*back, self.north_m + north_m, self.east_m + east_m,
+                     self.down_m + down_m)
+            : std::numeric_limits<double>::infinity();
+        constexpr double kRefLat = 47.397742;
+        constexpr double kRefLon = 8.545594;
+        constexpr double kRefAlt = 488.0;
+        double lat = 0.0;
+        double lon = 0.0;
+        double alt = 0.0;
+        const bool solved = OffsetToGeodetic(kRefLat, kRefLon, kRefAlt, north_m, east_m,
+                                             down_m, &lat, &lon, &alt);
+        const auto geo = solved ? drone::perception::GeodeticToLocalNed(
+                                      {kRefLat, kRefLon, kRefAlt}, {lat, lon, alt})
+                                : std::nullopt;
+        const double geodetic_error = geo.has_value()
+            ? std::sqrt((geo->north_m - north_m) * (geo->north_m - north_m) +
+                        (geo->east_m - east_m) * (geo->east_m - east_m) +
+                        (geo->down_m - down_m) * (geo->down_m - down_m))
+            : std::numeric_limits<double>::infinity();
+        std::cout << "  注入几何自检: 相机系互逆偏差 " << camera_error
+                  << " m，地理反解互逆偏差 " << geodetic_error << " m" << std::endl;
+        return camera_error < 1e-6 && geodetic_error < 0.01;
+    }
+
+private:
+    void SetError(const std::string& reason) {
+        if (error_.empty()) {
+            error_ = reason;
+        }
+    }
+
+    /// 目标 NED 差值 → 基准相机系（右/下/前）坐标：VisualCameraToLocalNed
+    /// 正变换的逐级逆（姿态 R^T → 安装外参逆 → 固定轴置换逆）。
+    void NedToCameraFrame(double north_m, double east_m, double down_m, double roll_rad,
+                          double pitch_rad, double yaw_rad, double* cam_x, double* cam_y,
+                          double* cam_z) const {
+        double r_body[9];
+        RotationRpy(roll_rad, pitch_rad, yaw_rad, r_body);
+        double bx = 0.0;
+        double by = 0.0;
+        double bz = 0.0;
+        ApplyTranspose(r_body, north_m, east_m, down_m, &bx, &by, &bz);
+        // 安装外参：正变换为 b' = R_mount·b + t ⇒ b = R_mount^T·(b' − t)
+        double r_mount[9];
+        RotationRpy(mount_.roll_deg * kMissionDegToRad, mount_.pitch_deg * kMissionDegToRad,
+                    mount_.yaw_deg * kMissionDegToRad, r_mount);
+        double mx = 0.0;
+        double my = 0.0;
+        double mz = 0.0;
+        ApplyTranspose(r_mount, bx - mount_.x_m, by - mount_.y_m, bz - mount_.z_m, &mx, &my,
+                       &mz);
+        // 固定轴置换逆：body = (cam_z, cam_x, cam_y) ⇒ cam = (body_y, body_z, body_x)
+        *cam_x = my;
+        *cam_y = mz;
+        *cam_z = mx;
+    }
+
+    /// 航空 RPY（ZYX）旋转矩阵（行主序，弧度；与 visual_ned_converter.cpp 同式）。
+    static void RotationRpy(double roll, double pitch, double yaw, double out[9]) {
+        const double cr = std::cos(roll);
+        const double sr = std::sin(roll);
+        const double cp = std::cos(pitch);
+        const double sp = std::sin(pitch);
+        const double cy = std::cos(yaw);
+        const double sy = std::sin(yaw);
+        out[0] = cy * cp;
+        out[1] = cy * sp * sr - sy * cr;
+        out[2] = cy * sp * cr + sy * sr;
+        out[3] = sy * cp;
+        out[4] = sy * sp * sr + cy * cr;
+        out[5] = sy * sp * cr - cy * sr;
+        out[6] = -sp;
+        out[7] = cp * sr;
+        out[8] = cp * cr;
+    }
+
+    /// R^T · v（转置左乘）。
+    static void ApplyTranspose(const double m[9], double x, double y, double z,
+                               double* out_x, double* out_y, double* out_z) {
+        *out_x = m[0] * x + m[3] * y + m[6] * z;
+        *out_y = m[1] * x + m[4] * y + m[7] * z;
+        *out_z = m[2] * x + m[5] * y + m[8] * z;
+    }
+
+    /// Home（WGS-84 参考点）按 NED 偏移反解目标 WGS-84（GeodeticToLocalNed 同式反演）。
+    static bool OffsetToGeodetic(double ref_lat_deg, double ref_lon_deg, double ref_alt_m,
+                                 double north_m, double east_m, double down_m,
+                                 double* lat_deg, double* lon_deg, double* alt_m) {
+        constexpr double kWgs84SemiMajorAxisM = 6378137.0;
+        constexpr double kWgs84Flattening = 1.0 / 298.257223563;
+        constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+        const double lat_rad = ref_lat_deg * kDegToRad;
+        const double e2 = kWgs84Flattening * (2.0 - kWgs84Flattening);
+        const double sin_lat = std::sin(lat_rad);
+        const double denom = std::sqrt(1.0 - e2 * sin_lat * sin_lat);
+        const double prime_vertical_radius_m = kWgs84SemiMajorAxisM / denom;
+        const double meridian_radius_m =
+            kWgs84SemiMajorAxisM * (1.0 - e2) / (denom * denom * denom);
+        const double delta_lat_rad = north_m / (meridian_radius_m + ref_alt_m);
+        const double delta_lon_rad =
+            east_m / ((prime_vertical_radius_m + ref_alt_m) * std::cos(lat_rad));
+        *lat_deg = ref_lat_deg + delta_lat_rad / kDegToRad;
+        *lon_deg = ref_lon_deg + delta_lon_rad / kDegToRad;
+        *alt_m = ref_alt_m - down_m;
+        return std::isfinite(*lat_deg) && std::isfinite(*lon_deg) &&
+               std::isfinite(*alt_m);
+    }
+
+    // ---- 依赖 ----
+    drone::common::Topic<drone::common::GroundStationTarget>& ground_target_topic_;
+    drone::common::Topic<drone::common::VisualTargetStatus>& visual_topic_;
+    drone::common::Topic<drone::common::StereoTargetDistance>& distance_topic_;
+    const drone::control::TrackingCameraGroupConfig& camera_;
+    const drone::perception::VisualMountExtrinsics& mount_;
+    const double fxb_m_px_ = 0.0;  // 校正矩阵同源深度系数（装配入口注入）
+
+    // ---- 目标/注入状态 ----
+    double target_north_m_ = 0.0;
+    double target_east_m_ = 0.0;
+    double target_up_m_ = 1.0;
+    bool target_enabled_ = true;
+    bool vision_enabled_ = false;
+    bool distance_valid_ = true;
+    uint64_t next_target_publish_ms_ = 0;
+    uint32_t target_update_seq_ = 0;
+    uint64_t next_vision_publish_ms_ = 0;
+    uint64_t vision_frame_sequence_ = 0;
+    uint64_t visual_locked_streak_ = 0;
+    uint64_t visual_lost_streak_ = 0;
+    uint64_t visual_last_seen_ms_ = 0;
+    double last_pixel_x_ = std::numeric_limits<double>::quiet_NaN();
+    double last_pixel_y_ = std::numeric_limits<double>::quiet_NaN();
+    double last_cam_z_m_ = std::numeric_limits<double>::quiet_NaN();
+    std::string error_;
+};
+
 /// G3 脚本阶段。
 enum class MissionPhase : uint8_t {
     kBootstrap,      ///< 连接 → 引导流 → Offboard → ARM → 工具引导意图接管
@@ -1622,15 +1970,12 @@ public:
         : link_(link),
           controller_(controller),
           machine_(machine),
-          ground_target_topic_(ground_target_topic),
-          visual_topic_(visual_topic),
-          distance_topic_(distance_topic),
+          rig_(ground_target_topic, visual_topic, distance_topic,
+               app_config.visual_tracking.camera, app_config.target_estimator.visual.mount,
+               fxb_m_px),
           estimated_topic_(estimated_topic),
           controller_config_(app_config.controller),
           handover_(app_config.handover),
-          camera_(app_config.visual_tracking.camera),
-          mount_(app_config.target_estimator.visual.mount),
-          fxb_m_px_(fxb_m_px),
           intent_valid_ms_(intent_valid_ms),
           duration_ms_(static_cast<uint64_t>(duration.count()) * 1000),
           subscription_(std::move(subscription)) {
@@ -1669,6 +2014,10 @@ public:
             DrainOutputs();
             PublishBootstrapIntent(now_ms);
             AdvancePhase(now_ms, now_ms - started_ms);
+            // 注入构件错误（几何非法/反解失败）→ 按中断处理（FinishFlight 统一回收）
+            if (!aborted_ && rig_.HasError()) {
+                Abort(rig_.error());
+            }
             if (have_snapshot_) {
                 CheckFlightEnvelope();
                 CheckAuthorityContinuity();
@@ -1686,55 +2035,10 @@ public:
         FinishFlight();
     }
 
-    /// 装配期注入几何自检（开跑前调用）：反变换与正变换必须互逆——像素/测距
-    /// （NedToCameraFrame ↔ perception::VisualCameraToLocalNed）与地理坐标
-    /// （OffsetToGeodetic ↔ perception::GeodeticToLocalNed）。任一处不互逆即
-    /// 拒绝开跑：否则估计器视觉融合会与注入目标偏离、创新门限误拒交接。
-    bool VerifyInjectionGeometry() const {
-        constexpr double kRoll = 0.02;
-        constexpr double kPitch = -0.015;
-        constexpr double kYaw = 0.25;
-        const drone::perception::LocalNedCoordinate self{5.0, -2.0, -1.0};
-        const double north_m = 40.0 - self.north_m;
-        const double east_m = 0.0 - self.east_m;
-        const double down_m = -1.0 - self.down_m;
-        double cam_x = 0.0;
-        double cam_y = 0.0;
-        double cam_z = 0.0;
-        NedToCameraFrame(north_m, east_m, down_m, kRoll, kPitch, kYaw, &cam_x, &cam_y,
-                        &cam_z);
-        const auto back = drone::perception::VisualCameraToLocalNed(
-            cam_x, cam_y, cam_z, mount_, kRoll, kPitch, kYaw, self);
-        const auto offset = [](const drone::perception::LocalNedCoordinate& a, double n,
-                               double e, double d) {
-            return std::sqrt((a.north_m - n) * (a.north_m - n) +
-                             (a.east_m - e) * (a.east_m - e) +
-                             (a.down_m - d) * (a.down_m - d));
-        };
-        const double camera_error = back.has_value()
-            ? offset(*back, self.north_m + north_m, self.east_m + east_m,
-                     self.down_m + down_m)
-            : std::numeric_limits<double>::infinity();
-        constexpr double kRefLat = 47.397742;
-        constexpr double kRefLon = 8.545594;
-        constexpr double kRefAlt = 488.0;
-        double lat = 0.0;
-        double lon = 0.0;
-        double alt = 0.0;
-        const bool solved = OffsetToGeodetic(kRefLat, kRefLon, kRefAlt, north_m, east_m,
-                                            down_m, &lat, &lon, &alt);
-        const auto geo = solved ? drone::perception::GeodeticToLocalNed(
-                                      {kRefLat, kRefLon, kRefAlt}, {lat, lon, alt})
-                                : std::nullopt;
-        const double geodetic_error = geo.has_value()
-            ? std::sqrt((geo->north_m - north_m) * (geo->north_m - north_m) +
-                        (geo->east_m - east_m) * (geo->east_m - east_m) +
-                        (geo->down_m - down_m) * (geo->down_m - down_m))
-            : std::numeric_limits<double>::infinity();
-        std::cout << "  注入几何自检: 相机系互逆偏差 " << camera_error
-                  << " m，地理反解互逆偏差 " << geodetic_error << " m" << std::endl;
-        return camera_error < 1e-6 && geodetic_error < 0.01;
-    }
+
+    /// 装配期注入几何自检（开跑前调用）：委托注入构件（反变换与正变换必须互逆，
+    /// 否则估计器视觉融合会与注入目标偏离、创新门限误拒交接）。
+    bool VerifyInjectionGeometry() const { return rig_.VerifyInjectionGeometry(); }
 
     /// 打印 G3 验收报告并返回总判定。
     bool Evaluate(bool connected_at_end) const {
@@ -2010,221 +2314,6 @@ private:
         ++guide_injected_;
     }
 
-    // ---- 注入：地面站目标（WGS-84） ----
-
-    /// 注入地面站目标：Home 相对 NED 位置反解 WGS-84 后按 10Hz 发布。
-    /// 反解与 perception::GeodeticToLocalNed 同一局部切平面公式（正向回验，
-    /// 偏差 >0.05m 判装配错误并中止）。
-    void PublishGroundTarget(double north_m, uint32_t target_id, uint64_t now_ms) {
-        if (!target_enabled_ || now_ms < next_target_publish_ms_ || !have_snapshot_ ||
-            !latest_.home_valid) {
-            return;
-        }
-        const double ref_lat = static_cast<double>(latest_.home_lat_1e7) * 1e-7;
-        const double ref_lon = static_cast<double>(latest_.home_lon_1e7) * 1e-7;
-        const double ref_alt = static_cast<double>(latest_.home_altitude_mm) * 1e-3;
-        double lat = 0.0;
-        double lon = 0.0;
-        double alt = 0.0;
-        if (!OffsetToGeodetic(ref_lat, ref_lon, ref_alt, north_m, 0.0,
-                              -kMissionTargetUpM, &lat, &lon, &alt)) {
-            Abort("注入目标反解失败（Home 基准非法）");
-            return;
-        }
-        // 正向回验：同一公式必须还原（防装配式笔误导致注入点漂移）。
-        const auto verify = drone::perception::GeodeticToLocalNed(
-            {ref_lat, ref_lon, ref_alt}, {lat, lon, alt});
-        if (!verify.has_value() ||
-            std::fabs(verify->north_m - north_m) > 0.05 ||
-            std::fabs(verify->down_m + kMissionTargetUpM) > 0.05) {
-            Abort("注入目标反解回验偏差超限（>0.05m）");
-            return;
-        }
-
-        drone::common::GroundStationTarget target;
-        target.header.receive_time_ms = now_ms;
-        target.header.valid_for_ms = kMissionTargetValidMs;
-        target.header.frame_id = 1;  // 1=WGS84 经纬度（与 GroundStationLink 同约定）
-        target.ground_station_boot_id = kMissionGroundBootId;
-        target.update_seq = ++target_update_seq_;
-        target.target_id = target_id;
-        target.latitude_1e7 = static_cast<int32_t>(std::llround(lat * 1e7));
-        target.longitude_1e7 = static_cast<int32_t>(std::llround(lon * 1e7));
-        target.altitude_mm = static_cast<int32_t>(std::llround(alt * 1e3));
-        target.alt_reference = 1;  // 1=MSL（估计器要求；Home 高度同基准）
-        target.protocol_version = 1;
-        target.transport_age_ms = 0;
-        target.validity_flags = kMissionValidityAltitude | kMissionValidityHorizontal |
-                                kMissionValidityVertical;
-        target.horizontal_accuracy_m = 2.0f;
-        target.vertical_accuracy_m = 3.0f;
-        target.heading_deg = std::numeric_limits<float>::quiet_NaN();
-        (void)ground_target_topic_.Emplace(target);
-        next_target_publish_ms_ = now_ms + kMissionTargetPeriodMs;
-    }
-
-    // ---- 注入：模拟视觉观测 + 测距 ----
-
-    /// 注入一帧模拟视觉观测 + 对应测距：相机系坐标由（目标 NED − 自身 NED）
-    /// 经 姿态/安装外参 反变换得到，与 VisualCameraToLocalNed 正变换严格互逆，
-    /// 保证估计器视觉融合的横向位置与地面站目标一致（创新 ≈ 0，滤除几何分歧）。
-    /// distance_valid 独立于视觉状态：模拟"测距仍跟踪但跟踪器判丢"，
-    /// 使 S7 退出由 LOST 迟滞路径唯一决定（测距失效路径由单测覆盖）。
-    /// @return 本拍是否实际注入了一帧（按 20Hz 节流；调用方计数用）。
-    bool PublishSimulatedVision(common::VisualTargetState state, uint64_t now_ms) {
-        if (!vision_enabled_ || now_ms < next_vision_publish_ms_ || !have_snapshot_ ||
-            !latest_.attitude_valid || !latest_.local_position_valid) {
-            return false;
-        }
-        const double target_north = target_north_m_;
-        const double target_east = 0.0;
-        const double target_down = -kMissionTargetUpM;
-        const double north_m =
-            target_north - static_cast<double>(latest_.local_x_m);
-        const double east_m = target_east - static_cast<double>(latest_.local_y_m);
-        const double down_m = target_down - static_cast<double>(latest_.local_z_m);
-        double cam_x = 0.0;
-        double cam_y = 0.0;
-        double cam_z = 0.0;
-        NedToCameraFrame(north_m, east_m, down_m,
-                         static_cast<double>(latest_.roll_rad),
-                         static_cast<double>(latest_.pitch_rad),
-                         static_cast<double>(latest_.yaw_rad), &cam_x, &cam_y, &cam_z);
-        if (cam_z <= 0.1) {
-            Abort("注入视觉几何非法（目标不在相机前向）");
-            return false;
-        }
-        // 像素：与 control::PixelToAngle（angle = atan((pixel − c) / f)）互逆，
-        // 使状态机视线角/视场余量判据对注入几何成立。
-        const double azimuth_rad = std::atan2(cam_x, cam_z);
-        const double elevation_rad = std::atan2(cam_y, cam_z);
-        const float pixel_x = static_cast<float>(
-            camera_.cx_px + camera_.fx_px * std::tan(azimuth_rad));
-        const float pixel_y = static_cast<float>(
-            camera_.cy_px + camera_.fy_px * std::tan(elevation_rad));
-        const bool locked = state == common::VisualTargetState::kLocked;
-        const uint64_t frame_sequence = ++vision_frame_sequence_;
-
-        drone::common::VisualTargetStatus visual;
-        visual.header.receive_time_ms = now_ms;
-        visual.state = state;
-        visual.frame_sequence = frame_sequence;
-        visual.last_seen_ms = locked ? now_ms : visual_last_seen_ms_;
-        visual.consecutive_detected_frames = locked ? visual_locked_streak_ : 0;
-        visual.consecutive_missed_frames = locked ? 0 : visual_lost_streak_;
-        visual.confidence = locked ? 0.90f : 0.0f;
-        visual.center_pixel_x = pixel_x;
-        visual.center_pixel_y = pixel_y;
-        visual.frame_width = static_cast<uint32_t>(camera_.image_width);
-        visual.frame_height = static_cast<uint32_t>(camera_.image_height);
-        visual.valid = locked;
-        (void)visual_topic_.Emplace(visual);
-        if (locked) {
-            ++visual_locked_streak_;
-            visual_lost_streak_ = 0;
-            visual_last_seen_ms_ = now_ms;
-        } else {
-            ++visual_lost_streak_;
-            visual_locked_streak_ = 0;
-        }
-
-        drone::common::StereoTargetDistance distance;
-        distance.header.receive_time_ms = now_ms;
-        distance.header.source_time_ms = now_ms;  // 估计器按 source_time 排序/超龄
-        distance.frame_sequence = frame_sequence;
-        distance.class_id = 0;
-        distance.track_id = 0;
-        distance.forward_distance_m = static_cast<float>(cam_z);
-        distance.slant_range_m =
-            static_cast<float>(std::sqrt(cam_x * cam_x + cam_y * cam_y + cam_z * cam_z));
-        distance.disparity_px = static_cast<float>(fxb_m_px_ / cam_z);
-        distance.confidence = 0.90f;
-        distance.valid = distance_valid_;
-        distance.center_pixel_x_mid = pixel_x;
-        distance.camera_x_m = static_cast<float>(cam_x);
-        distance.camera_y_m = static_cast<float>(cam_y);
-        (void)distance_topic_.Emplace(distance);
-        next_vision_publish_ms_ = now_ms + kMissionVisionPeriodMs;
-        return true;
-    }
-
-    /// 目标 NED 差值 → 基准相机系（右/下/前）坐标：VisualCameraToLocalNed
-    /// 正变换的逐级逆（姿态 R^T → 安装外参逆 → 固定轴置换逆）。
-    void NedToCameraFrame(double north_m, double east_m, double down_m, double roll_rad,
-                          double pitch_rad, double yaw_rad, double* cam_x, double* cam_y,
-                          double* cam_z) const {
-        double r_body[9];
-        RotationRpy(roll_rad, pitch_rad, yaw_rad, r_body);
-        double bx = 0.0;
-        double by = 0.0;
-        double bz = 0.0;
-        ApplyTranspose(r_body, north_m, east_m, down_m, &bx, &by, &bz);
-        // 安装外参：正变换为 b' = R_mount·b + t ⇒ b = R_mount^T·(b' − t)
-        double r_mount[9];
-        RotationRpy(mount_.roll_deg * kMissionDegToRad, mount_.pitch_deg * kMissionDegToRad,
-                    mount_.yaw_deg * kMissionDegToRad, r_mount);
-        double mx = 0.0;
-        double my = 0.0;
-        double mz = 0.0;
-        ApplyTranspose(r_mount, bx - mount_.x_m, by - mount_.y_m, bz - mount_.z_m, &mx, &my,
-                       &mz);
-        // 固定轴置换逆：body = (cam_z, cam_x, cam_y) ⇒ cam = (body_y, body_z, body_x)
-        *cam_x = my;
-        *cam_y = mz;
-        *cam_z = mx;
-    }
-
-    /// 航空 RPY（ZYX）旋转矩阵（行主序，弧度；与 visual_ned_converter.cpp 同式）。
-    static void RotationRpy(double roll, double pitch, double yaw, double out[9]) {
-        const double cr = std::cos(roll);
-        const double sr = std::sin(roll);
-        const double cp = std::cos(pitch);
-        const double sp = std::sin(pitch);
-        const double cy = std::cos(yaw);
-        const double sy = std::sin(yaw);
-        out[0] = cy * cp;
-        out[1] = cy * sp * sr - sy * cr;
-        out[2] = cy * sp * cr + sy * sr;
-        out[3] = sy * cp;
-        out[4] = sy * sp * sr + cy * cr;
-        out[5] = sy * sp * cr - cy * sr;
-        out[6] = -sp;
-        out[7] = cp * sr;
-        out[8] = cp * cr;
-    }
-
-    /// R^T · v（转置左乘）。
-    static void ApplyTranspose(const double m[9], double x, double y, double z, double* out_x,
-                               double* out_y, double* out_z) {
-        *out_x = m[0] * x + m[3] * y + m[6] * z;
-        *out_y = m[1] * x + m[4] * y + m[7] * z;
-        *out_z = m[2] * x + m[5] * y + m[8] * z;
-    }
-
-    /// Home（WGS-84 参考点）按 NED 偏移反解目标 WGS-84（GeodeticToLocalNed 同式反演）。
-    static bool OffsetToGeodetic(double ref_lat_deg, double ref_lon_deg, double ref_alt_m,
-                                 double north_m, double east_m, double down_m,
-                                 double* lat_deg, double* lon_deg, double* alt_m) {
-        constexpr double kWgs84SemiMajorAxisM = 6378137.0;
-        constexpr double kWgs84Flattening = 1.0 / 298.257223563;
-        constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
-        const double lat_rad = ref_lat_deg * kDegToRad;
-        const double e2 = kWgs84Flattening * (2.0 - kWgs84Flattening);
-        const double sin_lat = std::sin(lat_rad);
-        const double denom = std::sqrt(1.0 - e2 * sin_lat * sin_lat);
-        const double prime_vertical_radius_m = kWgs84SemiMajorAxisM / denom;
-        const double meridian_radius_m =
-            kWgs84SemiMajorAxisM * (1.0 - e2) / (denom * denom * denom);
-        const double delta_lat_rad = north_m / (meridian_radius_m + ref_alt_m);
-        const double delta_lon_rad =
-            east_m / ((prime_vertical_radius_m + ref_alt_m) * std::cos(lat_rad));
-        *lat_deg = ref_lat_deg + delta_lat_rad / kDegToRad;
-        *lon_deg = ref_lon_deg + delta_lon_rad / kDegToRad;
-        *alt_m = ref_alt_m - down_m;
-        return std::isfinite(*lat_deg) && std::isfinite(*lon_deg) &&
-               std::isfinite(*alt_m);
-    }
-
     // ---- 命令发送 ----
 
     bool SendOffboardRequest() {
@@ -2287,6 +2376,11 @@ private:
         aborted_ = true;
         abort_reason_ = reason;
         std::cout << "[SITL][中断] " << reason << std::endl;
+    }
+
+    /// 注入构件的快照视图：未收到快照时为 nullptr（rig 据此暂停注入）。
+    const drone::common::FlightStateSnapshot* SnapshotOrNull() const {
+        return have_snapshot_ ? &latest_ : nullptr;
     }
 
     // ---- 阶段推进 ----
@@ -2521,7 +2615,7 @@ private:
             std::cout << "[SITL] 悬停稳定完成，注入围栏外目标（北向 "
                       << kMissionFenceProbeNorthM << "m > max_radius "
                       << controller_config_.max_radius_m << "m）" << std::endl;
-            target_north_m_ = kMissionFenceProbeNorthM;
+            rig_.SetTargetNed(kMissionFenceProbeNorthM, 0.0, kMissionTargetUpM);
             fence_probe_clamped_at_ = controller_.ClampedCount();
             phase_ = MissionPhase::kFenceProbe;
             phase_start_ms_ = now_ms;
@@ -2535,7 +2629,7 @@ private:
     /// 注入围栏外目标：位置引导意图指向 150m，控制器应钳制到 max_radius。
     /// 验收证据：ClampedCount 增长 + 实测位置设定值水平模长 ≤ 围栏（+容差）。
     void AdvanceFenceProbe(uint64_t now_ms) {
-        PublishGroundTarget(kMissionFenceProbeNorthM, kMissionTargetIdProbe, now_ms);
+        (void)rig_.PublishGroundTarget(kMissionTargetIdProbe, now_ms, SnapshotOrNull());
         if (mission_state_ == common::MissionState::kGpsApproach && sm_intent_seen_ &&
             !bootstrap_intent_active_stopped_) {
             bootstrap_intent_active_ = false;  // 状态机意图已上线：工具停止注入意图
@@ -2554,7 +2648,7 @@ private:
                       << "，最大位置设定值水平模长 " << max_position_norm_m_ << " m（围栏 "
                       << controller_config_.max_radius_m << " m）；换注入近距目标（北向 "
                       << kMissionTargetNorthM << "m）" << std::endl;
-            target_north_m_ = kMissionTargetNorthM;
+            rig_.SetTargetNed(kMissionTargetNorthM, 0.0, kMissionTargetUpM);
             phase_ = MissionPhase::kApproach;
             phase_start_ms_ = now_ms;
             return;
@@ -2566,13 +2660,13 @@ private:
 
     /// 注入近距目标：S5 位置引导（状态机唯一意图生产者）。
     void AdvanceApproach(uint64_t now_ms) {
-        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        (void)rig_.PublishGroundTarget(kMissionTargetIdMain, now_ms, SnapshotOrNull());
         if (mission_state_ == common::MissionState::kGpsApproach && sm_intent_seen_ &&
             now_ms - phase_start_ms_ >= 2000) {
             std::cout << "[SITL] S5 位置引导稳定，开始注入模拟视觉观测"
                          "（SEARCHING → LOCKED）"
                       << std::endl;
-            vision_enabled_ = true;
+            rig_.SetVisionEnabled(true);
             vision_search_until_ms_ = now_ms + kMissionVisualSearchMs;
             phase_ = MissionPhase::kVisualInject;
             phase_start_ms_ = now_ms;
@@ -2585,9 +2679,10 @@ private:
 
     /// 注入 SEARCHING → LOCKED 帧序列：S5→S6（冻结位置意图续发）→ S7（视觉伺服）。
     void AdvanceVisualInject(uint64_t now_ms) {
-        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        (void)rig_.PublishGroundTarget(kMissionTargetIdMain, now_ms, SnapshotOrNull());
         if (now_ms < vision_search_until_ms_) {
-            PublishSimulatedVision(common::VisualTargetState::kSearching, now_ms);
+            (void)rig_.PublishSimulatedVision(common::VisualTargetState::kSearching,
+                                              now_ms, SnapshotOrNull());
             return;
         }
         if (vision_lock_started_ms_ == 0) {
@@ -2596,7 +2691,8 @@ private:
                       << "，exit_lost_frames=" << handover_.exit_lost_frames
                       << "，创新门限 " << handover_.innovation_gate_m << "m）" << std::endl;
         }
-        PublishSimulatedVision(common::VisualTargetState::kLocked, now_ms);
+        (void)rig_.PublishSimulatedVision(common::VisualTargetState::kLocked, now_ms,
+                                          SnapshotOrNull());
         if (mission_state_ == common::MissionState::kVisualTracking && servo_intent_seen_) {
             // 交接缝判据在视觉伺服接管时刻定格（设计 §2.5 无扰衔接）：
             // 末条 S5 位置意图 → 首条 S7 速度意图 < 意图有效期，且窗口内未跌入 COAST。
@@ -2626,9 +2722,10 @@ private:
 
     /// 短期 LOST（< exit_lost_frames）：保持 S7，输出判丢零速刹车意图。
     void AdvanceShortLost(uint64_t now_ms) {
-        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        (void)rig_.PublishGroundTarget(kMissionTargetIdMain, now_ms, SnapshotOrNull());
         if (short_lost_frames_ < kMissionShortLostFrames) {
-            if (PublishSimulatedVision(common::VisualTargetState::kLost, now_ms)) {
+            if (rig_.PublishSimulatedVision(common::VisualTargetState::kLost, now_ms,
+                                            SnapshotOrNull())) {
                 ++short_lost_frames_;
             }
             return;
@@ -2644,10 +2741,11 @@ private:
 
     /// 持续 LOST（达 exit_lost_frames）：回退 S5，卡尔曼备份接管位置引导。
     void AdvanceSustainedLost(uint64_t now_ms) {
-        PublishGroundTarget(kMissionTargetNorthM, kMissionTargetIdMain, now_ms);
+        (void)rig_.PublishGroundTarget(kMissionTargetIdMain, now_ms, SnapshotOrNull());
         if (mission_state_ == common::MissionState::kVisualTracking) {
             if (sustained_lost_frames_ <= handover_.exit_lost_frames + 5) {
-                if (PublishSimulatedVision(common::VisualTargetState::kLost, now_ms)) {
+                if (rig_.PublishSimulatedVision(common::VisualTargetState::kLost, now_ms,
+                                                SnapshotOrNull())) {
                     ++sustained_lost_frames_;
                 }
             }
@@ -2662,11 +2760,11 @@ private:
                           << std::endl;
             }
             if (backup_position_intent_seen_ || now_ms - phase_start_ms_ >= 3000) {
-                vision_enabled_ = false;  // 视觉链随目标一起收场
+                rig_.SetVisionEnabled(false);  // 视觉链随目标一起收场
                 std::cout << "[SITL] 卡尔曼备份位置意图恢复："
                           << YesNo(backup_position_intent_seen_) << "；停止注入目标（过期）"
                           << std::endl;
-                target_enabled_ = false;
+                rig_.SetTargetEnabled(false);
                 expiry_stop_ms_ = now_ms;
                 expect_offboard_exit_ = true;  // 停发链的 Offboard 退出属预期
                 phase_ = MissionPhase::kTargetExpiry;
@@ -2761,8 +2859,8 @@ private:
     void PrintMissionSummary() const {
         std::cout << "  状态机: state=" << static_cast<int>(mission_state_)
                   << " warnings=0x" << std::hex << mission_warning_bits_ << std::dec
-                  << " 注入目标北向=" << target_north_m_
-                  << " 视觉=" << (vision_enabled_ ? "注入中" : "停") << " 卡尔曼="
+                  << " 注入目标北向=" << rig_.target_north_m()
+                  << " 视觉=" << (rig_.vision_enabled() ? "注入中" : "停") << " 卡尔曼="
                   << (has_estimate_ ? (latest_estimate_.valid ? "有效" : "失效")
                                     : "未初始化");
         if (has_estimate_) {
@@ -2994,15 +3092,10 @@ private:
     drone::communication::Px4Link& link_;
     drone::control::FlightController& controller_;
     drone::state_machine::MissionStateMachine& machine_;
-    drone::common::Topic<drone::common::GroundStationTarget>& ground_target_topic_;
-    drone::common::Topic<drone::common::VisualTargetStatus>& visual_topic_;
-    drone::common::Topic<drone::common::StereoTargetDistance>& distance_topic_;
+    Stage4InjectionRig rig_;  // 三路注入构件（目标/视觉/测距，几何互逆单一真源）
     drone::common::Topic<drone::common::TargetState>& estimated_topic_;
     const drone::config::FlightControllerConfig& controller_config_;
     const drone::config::HandoverConfig& handover_;
-    const drone::control::TrackingCameraGroupConfig& camera_;
-    const drone::perception::VisualMountExtrinsics& mount_;
-    const double fxb_m_px_ = 0.0;  // 校正矩阵同源深度系数（装配入口注入）
     uint64_t intent_valid_ms_ = 0;  // 状态机意图有效期（= controller.intent_timeout）
     uint64_t duration_ms_ = 0;
     drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription subscription_;
@@ -3039,19 +3132,8 @@ private:
     bool guide_started_ = false;
     uint64_t guide_start_ms_ = 0;
     uint64_t guide_injected_ = 0;
-    uint64_t next_target_publish_ms_ = 0;
-    uint32_t target_update_seq_ = 0;
-    bool target_enabled_ = true;
-    bool vision_enabled_ = false;
-    bool distance_valid_ = true;
-    uint64_t next_vision_publish_ms_ = 0;
-    uint64_t vision_frame_sequence_ = 0;
-    uint64_t visual_locked_streak_ = 0;
-    uint64_t visual_lost_streak_ = 0;
-    uint64_t visual_last_seen_ms_ = 0;
     uint64_t vision_search_until_ms_ = 0;
     uint64_t vision_lock_started_ms_ = 0;
-    double target_north_m_ = 0.0;
     bool has_estimate_ = false;
     drone::common::TargetState latest_estimate_;
 
