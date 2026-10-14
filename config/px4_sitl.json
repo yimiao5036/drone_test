@@ -3,6 +3,55 @@
         "dir": "logs/",
         "level": "info"
     },
+    "visual_tracking": {
+        "_comment": "2026-10-14 新增：G3/stage4-tune 的 SITL 侧控制律配置（缺席时落到头文件默认值，distance PID=0/0/0 距离通道不工作——必须整节存在）。整定工作值，终值以 config/config.json 为准；camera 为 2026-09-23 左目标定实测内参（1280x720 档）",
+        "control": {
+            "frequency_hz": 20.0,
+            "visual_stale_ms": 200,
+            "distance_stale_ms": 500,
+            "attitude_stale_ms": 300
+        },
+        "camera": {
+            "image_width": 1280,
+            "image_height": 720,
+            "fx_px": 1007.82,
+            "fy_px": 1008.02,
+            "cx_px": 620.73,
+            "cy_px": 532.07
+        },
+        "heading": {
+            "mode": "rate",
+            "gain": 0.9,
+            "yaw_rate_limit_dps": 30.0,
+            "yaw_slew_limit_dps2": 60.0
+        },
+        "vertical": {
+            "vz_gain_mps_per_deg": 0.1,
+            "vz_limit_mps": 2.0
+        },
+        "distance": {
+            "d_exp_m": 10.0,
+            "kp": 0.5,
+            "ki": 0.05,
+            "kd": 0.1,
+            "integral_limit": 2.0,
+            "derivative_filter_coef": 0.2,
+            "approach_velocity_limit_mps": 3.0,
+            "retreat_velocity_limit_mps": 1.0,
+            "no_distance_action": "slow_approach",
+            "no_distance_approach_limit_mps": 0.5,
+            "no_distance_exit_grace_ms": 3000
+        },
+        "accel_limit": {
+            "ax_mps2": 2.0,
+            "ay_mps2": 2.0,
+            "az_mps2": 1.5
+        },
+        "shadow": {
+            "virtual_attitude_when_absent": true,
+            "summary_log_interval_ms": 10000
+        }
+    },
     "px4": {
         "transport": "udp",
         "onboard_system_id": 1,

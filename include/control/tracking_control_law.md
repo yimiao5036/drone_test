@@ -108,4 +108,43 @@ ctest --test-dir build -R 'ControlLaw|PixelToAngle|VisualTrackingShadow|Tracking
 | 垂直角方向反了/量值不对 | 确认 camera 组 cy_px 是标定值 532.07 而非 360；主点假设错误的典型症状就是垂直方向固定偏约 9.7° |
 | 换了分辨率档位后角度错 | 内参只对 1280×720 有效，换档重新标定并更新 camera 组 |
 | 影子 kControlIntent 没人消费 | 影子主题无消费者（2026-10-13 阶段四 Task 9 起正式路径 = 状态机 S7 `MissionStateMachine::IntentOutput` → `FlightController`）；影子保留供观察，靠摘要日志核对行为 |
-| 增益/PID 整定 | heading.gain、vertical.vz_gain、distance.kp/ki/kd 均为占位初值，整定后改 config.json，不动代码 |
+| 增益/PID 整定 | 已整定（2026-10-14，见下节）；调整时只改 config.json，不动代码，改后必须用 `--sitl-stage4-tune` 复跑验证 |
+
+## 7. 参数整定记录（2026-10-14，SITL 整定完成）
+
+**环境与工具**：WSL2 Ubuntu 24.04 + PX4 v1.17.0 SITL（环境前置条件见
+`tools/px4_link_smoke.md` §2.2）；整定平台 `--sitl-stage4-tune`（S7 长驻留 +
+分通道阶跃换位），逐拍 CSV + `tools/tune_report.py` 指标判定（指标定义与验收值见
+`tools/tune_report.md`）。整定顺序：heading(P) → vertical(P) → distance(PID)。
+
+**终值**（已回填 `config/config.json`，`config/px4_sitl.json` 同值）：
+
+| 参数 | 占位值 | 终值 | 第 5 轮实测（达标） |
+|---|---|---|---|
+| heading.gain | 1.0 | **0.9** | ±2/±4m 阶跃：收敛 2.0~3.8s（上限 4s）、变号 ≤1、稳态 ≤0.12°、指令 ≤21.4dps |
+| vertical.vz_gain | 0.1 | **0.1**（保持） | +1/+3m 阶跃：收敛 3.7~6.0s（上限 8s）、变号 0、稳态 ≤0.17°、vz ≤1.5m/s |
+| distance kp/ki/kd | 0.5/0.05/0.1 | **保持** | ±2.5/±5m 阶跃：零过冲、收敛 1.5~5.8s（上限 8s）、稳态 ≤0.13m、vx 无振荡、设定值 ≤2.0 |
+
+**证据**：`tools/tune_evidence/stage4_tune_20261014_r5.csv`（6049 行逐拍数据），
+复跑命令：
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 600 \
+  --sitl-stage4-tune --tune-script full --tune-csv /tmp/tune.csv
+python3 tools/tune_report.py /tmp/tune.csv    # 期望"全部指标达标"
+```
+
+**整定过程关键发现**（供后续复整定参考）：
+
+1. **姿态-几何耦合**：偏航机动/追赶加速的俯仰瞬态（SITL 实测峰值 4.7°）会经相机
+   外参几何直接注入 α/β（"相机固连机体"的固有耦合，非缺陷）。vz_gain=0.2 时该
+   耦合可在 1m 悬停下压 0.7m 触发安全回收——**垂直增益上限由该耦合约束，
+   vz_gain=0.1 是实测安全侧**；S5 位置引导是 3D 的（会把机体拉向目标高度），
+   不能靠抬高起飞高度获得垂直余量。
+2. **heading.gain**：0.8 在一段 ±4m 回摆收敛 4.24s（判定限 4s）边际超标；
+   0.9 全段 3.8s 内收敛且稳态/变号/指令纪律均达标。
+3. **距离 PID 占位值即可用**：0.5/0.05/0.1 在 d=10m 射程零过冲、无积分极限环；
+   微分支路（kd=0.1 + 低通 0.2）配合 slew 2m/s² 提供阻尼。
+4. **遗留**：`d_exp_m=10` 仍为占位期望射程；该值冻结后必须复跑本整定场景
+   复核零过冲硬判据（PID 增益基于该射程的闭环特性整定）。
+

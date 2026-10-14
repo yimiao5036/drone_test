@@ -197,10 +197,46 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 不得误报 PASS（无数据判定项不得空过：连续性要求速度样本非空、控制器异常计数要求
 已 armed）。
 
-**SITL 实跑属线下执行项**（本机无 PX4 SITL 环境）：任务内已完成 = 编译零警告 +
-参数门禁自测（互斥/时长/串口拒绝）+ 无 SITL 负对照（退出码 3、21 条 FAIL、0 条 PASS）
-+ 注入几何自检（相机系互逆 0m、地理反解 1.7e-10m）。实跑判据见
-`docs/PX4实链验证清单.md` §7。
+**SITL 实跑已于 2026-10-14 在本机 WSL2 完成并通过**（环境搭建与门禁结果见
+`docs/PX4实链验证清单.md` §7.1）；负对照（无 SITL → 退出码 3、21 条 FAIL、
+0 条 PASS）与注入几何自检（相机系互逆 0m、地理反解 1.7e-10m）在任务内完成。
+
+### 2.3 stage4-tune 控制律整定场景（`--sitl-stage4-tune`）
+
+装配与 G3 同构（`MissionStateMachine` + `FlightController` + `Px4Link` + 注入构件
+`Stage4InjectionRig`），剧本面向**控制律参数整定**（`visual_tracking.heading.gain` /
+`vertical.vz_gain` / `distance.kp/ki/kd`）：
+
+```text
+起飞悬停（相对 1m，与门禁同） → 注入主目标（北向 40m、up=1m）→ S5 位置引导接近至
+≤20m（--tune-approach-until-m；注意 S5 为 3D 引导，接近段会把机体拉向目标高度）
+→ SEARCHING 500ms → LOCKED → S7 长驻留（--tune-static-dwell-s，默认 25s）
+→ 横向阶跃 E: 0→+2→0→+4→0→−2→0→−4→0（航向通道）
+→ 距离阶跃 N: 40→42.5→40→45→40→37.5→40→35→40（距离 PID 通道；幅值上限 5m——
+  机体以 d_exp=10m 尾随，远跳追赶后目标回跳时几何余量最小，更大幅值会跌破
+  换位前向余量校验）
+→ 垂直阶跃 up: 1→2→1→4→1（垂直通道）
+→ 停视觉注入 → 断流回退 S5 → 停目标 → 过期停发链 → AUTO.LAND → DISARM
+```
+
+- 阶跃段每段驻留 `--tune-dwell-s`（默认 15s）；换位经 `SetTargetNed` 同步移动
+  地面站目标与视觉/测距注入点（卡尔曼热备份不发散），换位合法性校验：围栏内
+  （≤max_radius−10m）且换位后预算 cam_z ≥2m；
+- 逐拍（20Hz）落 CSV：注入像素/视线角/距离真值、意图与设定值（发布侧）、自机
+  遥测 NED/yaw、phase/目标列天然分段；指标分析用 `tools/tune_report.py`
+  （指标定义与验收值见 `tools/tune_report.md`）；
+- `--tune-script static|heading|distance|vertical|full`（默认 full）按通道裁剪
+  剧本；硬包线（armed 越界即 AUTO.LAND 回收）：相对高度 0.3~6.0m（垂直阶跃会爬升
+  至 ~4m，故高于 G3 的 1.3m）、水平半径 ≤90m；环境前置条件与 G3 完全相同
+  （§2.2 末节：朝北出生/干净会话/MPC_XY_VEL_MAX=2/GCS 心跳）；
+- **姿态-几何耦合**：偏航机动/追赶的俯仰瞬态会经相机外参直接注入视线角（相机
+  固连机体的固有耦合）。垂直通道的增益上限由该耦合约束——2026-10-14 实测
+  vz_gain=0.2 时可在 1m 悬停下压 0.7m 触发安全回收，**0.1 为实测安全侧**；
+  整定垂直增益时留意此现象，勿归因于垂直通道振荡；
+- **配置前置**：`config/px4_sitl.json` 必须带完整 `visual_tracking` 节——缺席时
+  落到头文件默认值（distance PID=0/0/0，距离通道不工作），整定结果无效；
+- 退出码沿用第 5 节：剧本走通（含回退与过期停发链）且 CSV 可写、无中断/安全回收
+  → 0，否则 3。
 
 ## 3. 当前配置
 

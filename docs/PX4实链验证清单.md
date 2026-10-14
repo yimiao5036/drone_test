@@ -141,7 +141,7 @@ v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前�
 |---|---|---|---|
 | 1 | G0~G4 全部通过 | 本文件 §7.1/§7.3 + `docs/开发进度.md` | ⏳ |
 | 2 | 双目测距卷尺级精度验收 + fxB 绝对精度对齐 | 独立测试工程结论回填 | ⏳ |
-| 3 | 控制律参数整定完成（非占位值：heading.gain / vertical.vz_gain / distance PID） | SITL/回放整定记录 | ⏳ |
+| 3 | 控制律参数整定完成（非占位值：heading.gain / vertical.vz_gain / distance PID） | SITL/回放整定记录 | ✅ 2026-10-14（SITL `--sitl-stage4-tune` 五轮整定，全指标达标；终值 heading.gain=0.9、vz_gain=0.1、distance 0.5/0.05/0.1；记录与证据见 `include/control/tracking_control_law.md` §7 + `tools/tune_evidence/`；遗留：d_exp=10m 冻结后须复跑复核零过冲） |
 | 4 | 相机安装外参标定（消除全 0 准直假设，`target_estimator.visual.mount_*`） | 标定参数入库 | ⏳ |
 | 5 | 围栏参数按试飞场地冻结（`controller.max_radius_m/max_altitude_m`） | `config.json` 评审 | ⏳ |
 | 6 | 室外实链只读验证通过（状态机越自检、NED 影子正常） | 本文件 §4/§6 回填 | ⏳ |

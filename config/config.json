@@ -212,7 +212,7 @@
         "prefer_rga_dma_transfer": true
     },
     "visual_tracking": {
-        "_comment": "视觉跟踪控制律（影子运行，不接 Px4Link）。camera 组为 2026-09-23 左目标定实测内参（1280x720 档，cy 偏离画面中心为实测值）；heading/vertical/distance 增益与 PID 为占位初值，待整定。",
+        "_comment": "视觉跟踪控制律（影子运行，不接 Px4Link）。camera 组为 2026-09-23 左目标定实测内参（1280x720 档，cy 偏离画面中心为实测值）；heading/vertical/distance 参数已于 2026-10-14 经 SITL 整定（证据与指标见 include/control/tracking_control_law.md「参数整定记录」；heading.gain 1.0→0.9，vz_gain 与 distance PID 占位值实测达标冻结）。",
         "control": {
             "frequency_hz": 20.0,
             "visual_stale_ms": 200,
@@ -230,7 +230,7 @@
         },
         "heading": {
             "mode": "rate",
-            "gain": 1.0,
+            "gain": 0.9,
             "yaw_rate_limit_dps": 30.0,
             "yaw_slew_limit_dps2": 60.0
         },
@@ -239,6 +239,7 @@
             "vz_limit_mps": 2.0
         },
         "distance": {
+            "_comment": "d_exp_m=10 为占位期望射程（由拦截设备接口给出，待定）；PID 在该射程整定，d_exp 冻结后须在 SITL 复核零过冲（tune_report.py 硬判据）",
             "d_exp_m": 10.0,
             "kp": 0.5,
             "ki": 0.05,
