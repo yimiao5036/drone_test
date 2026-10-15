@@ -261,6 +261,15 @@ struct FlightStateSnapshot {
     int32_t home_lat_1e7 = 0;
     int32_t home_lon_1e7 = 0;
     int32_t home_altitude_mm = 0;
+    /// EKF 投影参考锚点（MAVLink GPS_GLOBAL_ORIGIN = LOCAL_POSITION_NED.ref_* 的
+    /// MAVLink 出口）：局部坐标系的 WGS84 锚，与持续刷新的 Home 不同源。该消息为
+    /// 变化触发式（锚点变化 >1.1cm 才发），`ned_ref_received_count` 用于判读锚点
+    /// 稳定性（稳定则全程 ≈1 条）——Home 漂移处置方案裁决的现场观测依据。
+    bool ned_ref_valid = false;
+    int32_t ned_ref_lat_1e7 = 0;
+    int32_t ned_ref_lon_1e7 = 0;
+    int32_t ned_ref_alt_mm = 0;
+    uint64_t ned_ref_received_count = 0;
     bool battery_valid = false;         ///< 电压有效且数据新鲜
     float battery_voltage_v = 0.f;      ///< 动力电池电压
     bool battery_current_valid = false;

@@ -210,10 +210,12 @@ struct TargetEstimator::Impl {
         home = candidate;
         if (changed) {
             ResetFilterState();
-            // 附带 GPS 上下文，用于定位 Home 漂移根因（如边缘收星）
+            // 附带 GPS 上下文与 EKF 锚点/局部位置，用于定位 Home 漂移根因与
+            // 裁决处置方案（锚点稳定则 Home 漂为全局估计行为；收 n 条=锚点变化 n 次）
             SPDLOG_WARN("PX4 Home变化，目标估计器已重置局部NED滤波状态: "
                         "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) "
-                        "gps_fix={} 卫星={} eph={} epv={}",
+                        "gps_fix={} 卫星={} eph={} epv={} "
+                        "锚点ref={} 局部位置={}",
                         previous.latitude_deg, previous.longitude_deg,
                         previous.altitude_m, candidate.latitude_deg,
                         candidate.longitude_deg, candidate.altitude_m,
@@ -226,6 +228,17 @@ struct TargetEstimator::Impl {
                             : std::string("--"),
                         state.gps_accuracy_valid
                             ? fmt::format("{:.2f}m", state.gps_epv_m)
+                            : std::string("--"),
+                        state.ned_ref_valid
+                            ? fmt::format("({:.7f},{:.7f},{:.2f}m,收{})",
+                                          static_cast<double>(state.ned_ref_lat_1e7) * 1e-7,
+                                          static_cast<double>(state.ned_ref_lon_1e7) * 1e-7,
+                                          static_cast<double>(state.ned_ref_alt_mm) * 1e-3,
+                                          state.ned_ref_received_count)
+                            : std::string("--"),
+                        state.local_position_valid
+                            ? fmt::format("({:.2f},{:.2f},{:.2f})", state.local_x_m,
+                                          state.local_y_m, state.local_z_m)
                             : std::string("--"));
         }
     }

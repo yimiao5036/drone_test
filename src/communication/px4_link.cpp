@@ -560,6 +560,9 @@ private:
             case MAVLINK_MSG_ID_HOME_POSITION:
                 HandleHomePosition(message);
                 break;
+            case MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN:
+                HandleGpsGlobalOrigin(message);
+                break;
             case MAVLINK_MSG_ID_RC_CHANNELS:
                 HandleRcChannels(message, now_ms);
                 break;
@@ -643,6 +646,23 @@ private:
         state_.vz_mps = position.vz;
         state_.local_position_valid = true;
         last_local_position_time_ms_ = now_ms;
+    }
+
+    // EKF 投影参考锚点（GPS_GLOBAL_ORIGIN，内容为 LOCAL_POSITION_NED.ref_*）。
+    // 该消息为变化触发式（PX4 仅在锚点变化 >1.1cm 或收到请求时发送一条），
+    // 无周期新鲜度语义：valid 在连接期间保持，收到计数用于判读锚点稳定性。
+    void HandleGpsGlobalOrigin(const mavlink_message_t& message) {
+        mavlink_gps_global_origin_t origin{};
+        mavlink_msg_gps_global_origin_decode(&message, &origin);
+        // (0,0) 视为未初始化锚点（与 Home 同口径的显式防护）。
+        if (origin.latitude == 0 && origin.longitude == 0) {
+            return;
+        }
+        state_.ned_ref_lat_1e7 = origin.latitude;
+        state_.ned_ref_lon_1e7 = origin.longitude;
+        state_.ned_ref_alt_mm = origin.altitude;
+        state_.ned_ref_valid = true;
+        ++state_.ned_ref_received_count;
     }
 
     // 姿态欧拉角（弧度）。
@@ -932,6 +952,8 @@ private:
         state_.rc_state_valid = false;
         state_.rc_connected = false;
         state_.home_valid = false;
+        state_.ned_ref_valid = false;
+        state_.ned_ref_received_count = 0;
         rc_link_present_ = false;
     }
 

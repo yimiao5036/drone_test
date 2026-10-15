@@ -396,6 +396,16 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
             1, MAV_COMP_ID_AUTOPILOT1, status, message, &home);
     });
 
+    mavlink_gps_global_origin_t origin{};
+    origin.latitude = 312300000;
+    origin.longitude = 1212300000;
+    origin.altitude = 99900;
+    origin.time_usec = 123456789;
+    AppendEncoded(encoder, &bytes, [&](mavlink_status_t* status, mavlink_message_t* message) {
+        return mavlink_msg_gps_global_origin_encode_status(
+            1, MAV_COMP_ID_AUTOPILOT1, status, message, &origin);
+    });
+
     mavlink_rc_channels_t rc{};
     rc.chancount = 8;
     rc.rssi = 200;
@@ -423,7 +433,7 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
             (*message)->global_position_valid && (*message)->local_position_valid &&
             (*message)->attitude_valid && (*message)->battery_valid &&
             (*message)->home_valid && (*message)->rc_state_valid &&
-            (*message)->autopilot_version_valid) {
+            (*message)->ned_ref_valid && (*message)->autopilot_version_valid) {
             snapshot = **message;
             found = true;
             break;
@@ -458,6 +468,12 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
     EXPECT_EQ(snapshot.home_lat_1e7, home.latitude);
     EXPECT_EQ(snapshot.home_lon_1e7, home.longitude);
     EXPECT_EQ(snapshot.home_altitude_mm, home.altitude);
+    // EKF 投影参考锚点（GPS_GLOBAL_ORIGIN）：值与收到计数
+    EXPECT_TRUE(snapshot.ned_ref_valid);
+    EXPECT_EQ(snapshot.ned_ref_lat_1e7, origin.latitude);
+    EXPECT_EQ(snapshot.ned_ref_lon_1e7, origin.longitude);
+    EXPECT_EQ(snapshot.ned_ref_alt_mm, origin.altitude);
+    EXPECT_EQ(snapshot.ned_ref_received_count, 1U);
     EXPECT_TRUE(snapshot.rc_connected);
     EXPECT_EQ(snapshot.rc_rssi, 200);
     EXPECT_EQ(snapshot.firmware_major, 1);

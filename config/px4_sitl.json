@@ -69,7 +69,7 @@
         "setpoint_timeout_ms": 500,
         "setpoint_queue_capacity": 4,
         "command_queue_capacity": 16,
-        "one_shot_message_requests": [148, 242],
+        "one_shot_message_requests": [148, 242, 411],
         "message_interval_requests": [
             {"message_id": 1, "interval_us": 1000000},
             {"message_id": 24, "interval_us": 200000},

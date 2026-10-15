@@ -43,7 +43,8 @@
         "command_queue_capacity": 16,
         "one_shot_message_requests": [
             148,
-            242
+            242,
+            411
         ],
         "message_interval_requests": [
             {
