@@ -174,11 +174,14 @@ bits 24..31 → flight_sub_mode（sub mode）
 - **EKF 投影参考锚点**（2026-10-15 新增）：`GPS_GLOBAL_ORIGIN`（#411，内容为
   `vehicle_local_position.ref_*` 的 MAVLink 出口）→
   `ned_ref_valid/ned_ref_lat_1e7/ned_ref_lon_1e7/ned_ref_alt_mm` 与
-  `ned_ref_received_count`。**该消息为变化触发式**（PX4 仅在锚点变化 >1.1cm 或
-  收到 `REQUEST_MESSAGE` 请求时发送一条），无周期新鲜度语义：valid 在连接期间
-  保持、断连清除，**收到计数是锚点稳定性的直接度量**（稳定则全程 ≈1 条）——
+  `ned_ref_received_count`。**该消息为变化触发式**：流按 1Hz 调度、仅在锚点
+  变化 >1.1cm 或 `REQUEST_MESSAGE` 请求时发送一条——**锚点稳定则一条都不发
+  （计数≈0 是正常态，非链路故障）**；无周期新鲜度语义：valid 在连接期间保持、
+  断连清除。**`ned_ref_received_count`（收到计数）即锚点变化次数的直接度量**——
   与持续刷新的 Home 不同源，用于 Home 漂移处置方案（迟滞阈值 / 换锚点基准）
-  的现场裁决观测。一次性请求 `411` 已加入 `one_shot_message_requests`。
+  的现场裁决观测。启用方式：`message_interval_requests` 请求 411 1Hz（流对
+  客户端默认不启用，须显式请求；SITL 已实测验证：`commander set_ekf_origin`
+  改锚点 → 机载端收到 1 条）。
 - RC：链路有效性、在线状态和 RSSI，不自动等同人工接管；
 - 固件：`flight_sw_version`、语义版本、capabilities。
 
@@ -226,8 +229,9 @@ bits 24..31 → flight_sub_mode（sub mode）
 
 首次建立心跳后按 JSON 自动排队：
 
-- `MAV_CMD_REQUEST_MESSAGE`：请求 `AUTOPILOT_VERSION`、`HOME_POSITION` 和
-  `GPS_GLOBAL_ORIGIN`（411，EKF 锚点，配合变化触发式流做一次性采集）；
+- `MAV_CMD_REQUEST_MESSAGE`：请求 `AUTOPILOT_VERSION` 和 `HOME_POSITION`；
+- `MAV_CMD_SET_MESSAGE_INTERVAL`：周期遥测频率（含 `GPS_GLOBAL_ORIGIN` 411 1Hz，
+  显式启用 EKF 锚点流——变化触发式，启用后锚点变化即上报）；
 - `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
   `EXTENDED_SYS_STATE` 的配置频率（当前生产配置：姿态/局部位置 25Hz、GPS 10Hz、
   全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；

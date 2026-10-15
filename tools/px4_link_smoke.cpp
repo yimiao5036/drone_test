@@ -5332,6 +5332,11 @@ int main(int argc, char** argv) {
         PrintMessageCheck("HOME_POSITION",
                           link.MessageReceiveCount(MAVLINK_MSG_ID_HOME_POSITION),
                           observed.home);
+        // EKF 锚点：变化触发式（默认 1Hz 调度，锚点变化 >1.1cm 才发包）。
+        // 收到 ≥1 条 = 链路通；计数随锚点变化增长（用 SET_GPS_GLOBAL_ORIGIN 可主动验证）。
+        std::cout << "[INFO] GPS_GLOBAL_ORIGIN（EKF锚点） 收到 "
+                  << link.MessageReceiveCount(MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN) << " 条"
+                  << std::endl;
         PrintMessageCheck("RC_CHANNELS",
                           link.MessageReceiveCount(MAVLINK_MSG_ID_RC_CHANNELS),
                           observed.rc);

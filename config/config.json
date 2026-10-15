@@ -78,6 +78,10 @@
             {
                 "message_id": 245,
                 "interval_us": 500000
+            },
+            {
+                "message_id": 411,
+                "interval_us": 1000000
             }
         ],
         "serial": {
