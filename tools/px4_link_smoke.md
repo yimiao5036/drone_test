@@ -367,8 +367,15 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 [PASS] AUTOPILOT_VERSION 收到 1 条
 [PASS] ATTITUDE
 ...
+[INFO] GPS_GLOBAL_ORIGIN（EKF锚点） 收到 N 条
+...
 结果: 基础 PX4 串口链路通过
 ```
+
+> `GPS_GLOBAL_ORIGIN` 行为变化触发式（锚点变化 >1.1cm 才发一条）：
+> **收到 0 条是正常静默态**（锚点稳定），非链路故障；收到 ≥1 条说明锚点
+> 期间被重设过（次数 = 条数）。可用 `commander set_ekf_origin`（SITL/实机
+> shell）改锚点主动验证链路。
 
 退出码：
 
