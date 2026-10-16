@@ -218,6 +218,13 @@ bits 24..31 → flight_sub_mode（sub mode）
 - 坐标系必须为 `header.frame_id=3`（本地 NED）；
 - 根据类型构造严格的 `POSITION_TARGET_TYPEMASK`，忽略未使用的位置/速度/加速度/yaw 字段。
 
+**下行报文与执行帧（2026-10-16 补注）**：实际发送 `SET_POSITION_TARGET_LOCAL_NED`
+（#84），`frame = MAV_FRAME_LOCAL_NED`——**给 PX4 的是局部 NED 米制量，不是经纬度**；
+该局部帧的原点是 **EKF 投影参考锚点**（`GPS_GLOBAL_ORIGIN` #49 的 `ref_*`），
+PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地 NED"的实际基准是
+**锚点**（不是 Home）——目标换算若用 Home 会带来固定偏置 H，详见
+`docs/方案C锚点基准实施清单.md`。
+
 安全规则：
 
 - `valid=false` 清除缓存并停止发送，不会用空 mask 维持 Offboard；
