@@ -1,6 +1,6 @@
 # drone_test
 
-运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前视频/YOLO、PX4遥测、地面站MAVLink 2、TIMESYNC、目标UPDATE/ACK、健康/任务状态回传均已完成实机闭环；MissionStateMachine处于安全影子阶段。单目标`TargetEstimator`第一阶段已接入正式应用，将地面站WGS-84目标和PX4 Home转换为局部NED并进行恒速度线性卡尔曼影子估计。单目标视觉观测帧级链路也已接入：`YoloDetector`对每个成功推理帧发布一条`VisualTargetObservation`（允许无目标），`VisualTargetMonitor`据此输出视觉稳定性影子状态。正式配置继续保持`enable_control=false`，不向PX4发送飞行控制。
+运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前视频/YOLO、PX4遥测、地面站MAVLink 2、TIMESYNC、目标UPDATE/ACK、健康/任务状态回传均已完成实机闭环；MissionStateMachine处于安全影子阶段。单目标`TargetEstimator`第一阶段已接入正式应用，将地面站WGS-84目标和 EKF 锚点（`GPS_GLOBAL_ORIGIN` #49；2026-10-16 起，此前为 PX4 Home）转换为局部NED并进行恒速度线性卡尔曼影子估计。单目标视觉观测帧级链路也已接入：`YoloDetector`对每个成功推理帧发布一条`VisualTargetObservation`（允许无目标），`VisualTargetMonitor`据此输出视觉稳定性影子状态。正式配置继续保持`enable_control=false`，不向PX4发送飞行控制。
 
 ## 第一次接触项目先看这里
 
@@ -11,7 +11,7 @@
 3. [故障排查手册](docs/故障排查手册.md)：按“无画面、无检测、无图传、串口不通、无ACK”等现象定位；
 4. [新增设备接入指南](docs/新增设备接入指南.md)：以后替换摄像头、接双目或增加其他设备时的固定修改步骤。
 
-当前现场硬件只有香橙派、摄像头、图传/HM30和地面站，暂时没有PX4。当前可以完整验证视频和地面站物理链路；依赖PX4 Home、位置和姿态的目标NED实链、状态机导航和控制不能标记为当前已验证。
+**PX4 已到位（2026-10-10：装机体 + GPS，可出 Home/EKF 锚点流）**。视频和地面站物理链路已完整验证；依赖 PX4 位置/姿态/锚点的目标 NED 实链与状态机导航已完成室内只读与室外实链验证（结论见 `docs/开发进度.md`）。**飞行控制输出仍未启用**（`enable_control=false`），控制不能标记为已验证。
 
 ## 系统目标
 
