@@ -6,6 +6,8 @@
 
 阶段四新增（Task 7）：经`SetEstimationInputs`绑定目标估计/视觉稳定性/双目测距三个输入后，`GPS_APPROACH`（S5）开始发布`kPositionGuide`位置引导意图（指向估计目标 NED，`control_source=0`，`reason_code`带 bit31 控制权请求位`common::kControlIntentReasonRequestControl`）。**未绑定时不出意图、保持原影子行为**。意图是否真正转化为 PX4 输出由`FlightController`授权链与`enable_control`装配门禁决定，状态机侧不做最终裁决。
 
+> **注（2026-10-16）**：S5 引导为"目标当前估计位置"的直接位置设定值，对持续运动目标**本质是尾追**（能否跟住取决于速度优势与提前量，不由刷新率决定）；时间前视、位置+速度前馈、S7 比例导引等改进路径见 `docs/S5运动目标追踪改进方案.md`（待排期）。
+
 阶段四新增（Task 8）：经`SetEstimationDiagnostics`注入估计器诊断接口后，**交接判据**（`handover` 配置节）生效，状态在 S5→S6→S7 之间按下列判据推进/回退（`handover` 阈值全部来自配置，无代码字面量）：
 
 | 迁移 | 判据 |
