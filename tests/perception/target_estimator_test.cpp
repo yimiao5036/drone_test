@@ -27,6 +27,13 @@ common::FlightStateSnapshot MakeHome() {
     state.home_lat_1e7 = 300000000;
     state.home_lon_1e7 = 1200000000;
     state.home_altitude_mm = 100000;
+    // 转换基准：EKF 投影参考锚点（方案 C，2026-10-16）——默认与 Home 同点，
+    // 使既有用例的换算期望保持不变；基准差异另见专用用例。
+    state.ned_ref_valid = true;
+    state.ned_ref_lat_1e7 = 300000000;
+    state.ned_ref_lon_1e7 = 1200000000;
+    state.ned_ref_alt_mm = 100000;
+    state.ned_ref_received_count = 1;
     state.header.receive_time_ms = NowMs();
     return state;
 }
@@ -701,7 +708,7 @@ TEST(TargetEstimatorFusionTest, VisualSkippedAfterGroundExpiry) {
     EXPECT_FALSE(f.estimator.LastState().valid);  // 过期语义不变
 }
 
-TEST(TargetEstimatorFusionTest, HomeChangeResetsVisualBookkeeping) {
+TEST(TargetEstimatorFusionTest, HomeChangeKeepsFilterStateAndVisualBookkeeping) {
     FusionFixture f;
     ASSERT_TRUE(f.estimator.Start());
     f.InitByGroundTarget();
@@ -710,9 +717,34 @@ TEST(TargetEstimatorFusionTest, HomeChangeResetsVisualBookkeeping) {
     f.PublishVisual(MakeVisual(1, 10.0F));
     ASSERT_TRUE(f.WaitVisualUpdates(1));
 
-    // Home 变化 → 滤波器重置；此后视觉在无新地面站目标时不再更新
+    // 方案 C（2026-10-16）：Home 变化仅记录（PX4 地面跟随/解锁冻结），
+    // 不重置滤波器——锚点基准不随 Home 变化，视觉记账必须保留、后续观测照常接受。
     auto moved = MakeFlightFull();
     moved.home_lat_1e7 = 300100000;
+    ASSERT_TRUE(f.flight.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(moved)).accepted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_FALSE(std::isnan(f.estimator.LastVisualInnovationM()));  // 记账保留
+    const uint64_t errors_before = f.estimator.ErrorCount();
+    f.PublishVisual(MakeVisual(2, 10.0F));
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    f.estimator.Stop();
+    EXPECT_EQ(f.estimator.VisualUpdateCount(), 2U);  // Home 变化后视觉继续更新
+    EXPECT_EQ(f.estimator.ErrorCount(), errors_before);
+}
+
+TEST(TargetEstimatorFusionTest, AnchorChangeResetsVisualBookkeeping) {
+    FusionFixture f;
+    ASSERT_TRUE(f.estimator.Start());
+    f.InitByGroundTarget();
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    f.PublishFlight();
+    f.PublishVisual(MakeVisual(1, 10.0F));
+    ASSERT_TRUE(f.WaitVisualUpdates(1));
+
+    // 锚点变化（EKF 原点重设）→ 滤波器重置；此后视觉在无新地面站目标时不再更新
+    auto moved = MakeFlightFull();
+    moved.ned_ref_lat_1e7 = 300100000;
     ASSERT_TRUE(f.flight.Publish(
         std::make_shared<const common::FlightStateSnapshot>(moved)).accepted);
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -724,6 +756,72 @@ TEST(TargetEstimatorFusionTest, HomeChangeResetsVisualBookkeeping) {
     f.estimator.Stop();
     EXPECT_EQ(f.estimator.VisualUpdateCount(), 1U);
     EXPECT_EQ(f.estimator.ErrorCount(), errors_before);
+}
+
+TEST(TargetEstimatorBaselineTest, GroundTargetConvertsWithAnchorBaseline) {
+    FusionFixture f;
+    ASSERT_TRUE(f.estimator.Start());
+    // 锚点比 Home 北移 0.0001°（≈11.1m）→ 两套基准可区分（方案 C 的核心断言）
+    auto flight_state = MakeFlightFull();
+    flight_state.ned_ref_lat_1e7 = 300001000;  // 30.0001°
+    ASSERT_TRUE(f.flight.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight_state))
+            .accepted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    auto target = MakeTarget(1);
+    target.latitude_1e7 = 300000000;  // 与 Home 同点（Home 基准下 NED≈0）
+    target.altitude_mm = 100000;
+    target.validity_flags = 0;
+    target.horizontal_accuracy_m = 0.0F;
+    target.vertical_accuracy_m = 0.0F;
+    ASSERT_TRUE(f.ground.Publish(
+        std::make_shared<const common::GroundStationTarget>(target)).accepted);
+    ASSERT_TRUE(f.WaitGroundUpdates(1));
+    const auto state = f.estimator.LastState();
+    ASSERT_TRUE(state.valid);
+    // 期望值 = GeodeticToLocalNed(锚点, 目标)：以锚点为原点换算
+    const auto expected = GeodeticToLocalNed(
+        GeodeticCoordinate{30.0001, 120.0, 100.0},
+        GeodeticCoordinate{30.0, 120.0, 100.0});
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_LT(state.pos_x_m, -8.0F);  // 目标在锚点以南 ≈11m（Home 基准会给出 ≈0）
+    EXPECT_NEAR(state.pos_x_m, expected->north_m, 0.5);
+    EXPECT_NEAR(state.pos_y_m, expected->east_m, 0.5);
+    // 目标高度无效（flags=0）→ 垂直通道按既有语义发布 NaN
+    EXPECT_TRUE(std::isnan(state.pos_z_m));
+    f.estimator.Stop();
+}
+
+TEST(TargetEstimatorBaselineTest, WaitsForAnchorBeforeAcceptingGroundTarget) {
+    FusionFixture f;
+    ASSERT_TRUE(f.estimator.Start());
+    auto flight_state = MakeFlightFull();
+    flight_state.ned_ref_valid = false;  // 锚点未到（#49 尚未收到）
+    ASSERT_TRUE(f.flight.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight_state))
+            .accepted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    auto target = MakeTarget(1);
+    target.latitude_1e7 = 300000000;
+    target.altitude_mm = 100000;
+    target.validity_flags = 0;
+    ASSERT_TRUE(f.ground.Publish(
+        std::make_shared<const common::GroundStationTarget>(target)).accepted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    EXPECT_EQ(f.estimator.UpdateCount(), 0U);  // 等待锚点：不处理
+
+    // 锚点到齐后同一条目标流可正常接受
+    flight_state = MakeFlightFull();
+    ASSERT_TRUE(f.flight.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight_state))
+            .accepted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    target.update_seq = 2;
+    target.header.sequence = 2;
+    ASSERT_TRUE(f.ground.Publish(
+        std::make_shared<const common::GroundStationTarget>(target)).accepted);
+    ASSERT_TRUE(f.WaitGroundUpdates(1));
+    f.estimator.Stop();
 }
 
 TEST(TargetEstimatorFusionTest, MountYawRotatesVisualObservation) {

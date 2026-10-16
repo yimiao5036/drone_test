@@ -127,9 +127,14 @@ struct TargetEstimator::Impl {
     /// 这是一个"最新值"诊断，不要求与滤波状态严格同步。
     std::atomic<double> visual_innovation_m{
         std::numeric_limits<double>::quiet_NaN()};
-    uint64_t waiting_home_count = 0;
+    uint64_t waiting_anchor_count = 0;
     uint64_t output_sequence = 0;
 
+    /// 转换基准：EKF 投影参考锚点（`GPS_GLOBAL_ORIGIN` #49 的 `ref_*`，即
+    /// PX4 LOCAL_NED 原点、设定值执行帧的原点）。方案 C（2026-10-16）：目标
+    /// 经纬度一律以锚点为原点换算；仅锚点变化（EKF 原点重设）才重置滤波器。
+    std::optional<GeodeticCoordinate> anchor;
+    /// Home：仅作漂移观测（PX4 地面跟随/解锁冻结），不再参与换算与重置。
     std::optional<GeodeticCoordinate> home;
     uint32_t target_id = 0;
     uint32_t last_ground_boot_id = 0;
@@ -189,6 +194,47 @@ struct TargetEstimator::Impl {
         has_flight_snapshot = true;
         latest_flight_receive_ms = state.header.receive_time_ms;
 
+        // ---- 转换基准：EKF 投影参考锚点（方案 C，2026-10-16）----
+        // 锚点 = PX4 LOCAL_NED 原点（#49 ref_*），与设定值执行帧同源：目标经纬度
+        // 一律以锚点为原点换算，消除与 Home 的基准差 H（详见
+        // docs/方案C锚点基准实施清单.md）；仅锚点变化（EKF 原点重设）才重置滤波。
+        if (state.ned_ref_valid &&
+            IsValidLatitudeLongitude(state.ned_ref_lat_1e7,
+                                     state.ned_ref_lon_1e7)) {
+            GeodeticCoordinate anchor_candidate;
+            anchor_candidate.latitude_deg =
+                static_cast<double>(state.ned_ref_lat_1e7) * 1e-7;
+            anchor_candidate.longitude_deg =
+                static_cast<double>(state.ned_ref_lon_1e7) * 1e-7;
+            anchor_candidate.altitude_m =
+                static_cast<double>(state.ned_ref_alt_mm) * 1e-3;
+            if (std::isfinite(anchor_candidate.altitude_m)) {
+                const bool anchor_changed = anchor.has_value() &&
+                    (anchor->latitude_deg != anchor_candidate.latitude_deg ||
+                     anchor->longitude_deg != anchor_candidate.longitude_deg ||
+                     anchor->altitude_m != anchor_candidate.altitude_m);
+                const GeodeticCoordinate anchor_previous =
+                    anchor.value_or(anchor_candidate);
+                anchor = anchor_candidate;
+                if (anchor_changed) {
+                    ResetFilterState();
+                    SPDLOG_WARN(
+                        "EKF 锚点变化，目标估计器已重置局部NED滤波状态: "
+                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) {}",
+                        anchor_previous.latitude_deg,
+                        anchor_previous.longitude_deg,
+                        anchor_previous.altitude_m,
+                        anchor_candidate.latitude_deg,
+                        anchor_candidate.longitude_deg,
+                        anchor_candidate.altitude_m,
+                        FormatFlightContext(state));
+                }
+            }
+        }
+
+        // ---- Home：仅漂移观测，不参与换算与重置（方案 C）----
+        // PX4 地面阶段持续把 Home 贴到当前位置估计（阈值 1~2m 级）、解锁/起飞后
+        // 冻结；变化记录保留 GPS 上下文与锚点/局部位置，用于 Home 漂移裁决观测。
         if (!state.home_valid ||
             !IsValidLatitudeLongitude(state.home_lat_1e7, state.home_lon_1e7)) {
             return;
@@ -209,38 +255,41 @@ struct TargetEstimator::Impl {
         const GeodeticCoordinate previous = home.value_or(candidate);
         home = candidate;
         if (changed) {
-            ResetFilterState();
-            // 附带 GPS 上下文与 EKF 锚点/局部位置，用于定位 Home 漂移根因与
-            // 裁决处置方案（锚点稳定则 Home 漂为全局估计行为；收 n 条=锚点变化 n 次）
-            SPDLOG_WARN("PX4 Home变化，目标估计器已重置局部NED滤波状态: "
-                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) "
-                        "gps_fix={} 卫星={} eph={} epv={} "
-                        "锚点ref={} 局部位置={}",
+            SPDLOG_WARN("PX4 Home变化（诊断记录，估计器不重置）: "
+                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) {}",
                         previous.latitude_deg, previous.longitude_deg,
                         previous.altitude_m, candidate.latitude_deg,
                         candidate.longitude_deg, candidate.altitude_m,
-                        state.gps_fix_type,
-                        state.gps_satellites_valid
-                            ? std::to_string(state.gps_satellites_visible)
-                            : std::string("--"),
-                        state.gps_accuracy_valid
-                            ? fmt::format("{:.2f}m", state.gps_eph_m)
-                            : std::string("--"),
-                        state.gps_accuracy_valid
-                            ? fmt::format("{:.2f}m", state.gps_epv_m)
-                            : std::string("--"),
-                        state.ned_ref_valid
-                            ? fmt::format("({:.7f},{:.7f},{:.2f}m,收{})",
-                                          static_cast<double>(state.ned_ref_lat_1e7) * 1e-7,
-                                          static_cast<double>(state.ned_ref_lon_1e7) * 1e-7,
-                                          static_cast<double>(state.ned_ref_alt_mm) * 1e-3,
-                                          state.ned_ref_received_count)
-                            : std::string("--"),
-                        state.local_position_valid
-                            ? fmt::format("({:.2f},{:.2f},{:.2f})", state.local_x_m,
-                                          state.local_y_m, state.local_z_m)
-                            : std::string("--"));
+                        FormatFlightContext(state));
         }
+    }
+
+    /// 飞行上下文诊断串（GPS 质量 + 锚点 + 局部位置），锚点/Home 变化日志共用。
+    static std::string FormatFlightContext(
+        const common::FlightStateSnapshot& state) {
+        return fmt::format(
+            "gps_fix={} 卫星={} eph={} epv={} 锚点ref={} 局部位置={}",
+            state.gps_fix_type,
+            state.gps_satellites_valid
+                ? std::to_string(state.gps_satellites_visible)
+                : std::string("--"),
+            state.gps_accuracy_valid
+                ? fmt::format("{:.2f}m", state.gps_eph_m)
+                : std::string("--"),
+            state.gps_accuracy_valid
+                ? fmt::format("{:.2f}m", state.gps_epv_m)
+                : std::string("--"),
+            state.ned_ref_valid
+                ? fmt::format("({:.7f},{:.7f},{:.2f}m,收{})",
+                              static_cast<double>(state.ned_ref_lat_1e7) * 1e-7,
+                              static_cast<double>(state.ned_ref_lon_1e7) * 1e-7,
+                              static_cast<double>(state.ned_ref_alt_mm) * 1e-3,
+                              state.ned_ref_received_count)
+                : std::string("--"),
+            state.local_position_valid
+                ? fmt::format("({:.2f},{:.2f},{:.2f})", state.local_x_m,
+                              state.local_y_m, state.local_z_m)
+                : std::string("--"));
     }
 
     void DrainFlightStates() {
@@ -406,7 +455,7 @@ struct TargetEstimator::Impl {
 
     bool BuildMeasurement(const common::GroundStationTarget& target,
                           LinearTargetMeasurement& measurement) {
-        if (!home.has_value()) {
+        if (!anchor.has_value()) {
             return false;
         }
         if (!IsValidLatitudeLongitude(target.latitude_1e7,
@@ -420,9 +469,9 @@ struct TargetEstimator::Impl {
             target.alt_reference == 1;
         const double target_altitude_m = altitude_valid
             ? static_cast<double>(target.altitude_mm) * 1e-3
-            : home->altitude_m;
+            : anchor->altitude_m;
         const auto ned = GeodeticToLocalNed(
-            *home,
+            *anchor,
             GeodeticCoordinate{
                 static_cast<double>(target.latitude_1e7) * 1e-7,
                 static_cast<double>(target.longitude_1e7) * 1e-7,
@@ -471,10 +520,10 @@ struct TargetEstimator::Impl {
             Reject("目标已经过期");
             return;
         }
-        if (!home.has_value()) {
-            const uint64_t count = ++waiting_home_count;
+        if (!anchor.has_value()) {
+            const uint64_t count = ++waiting_anchor_count;
             if (ShouldLogThrottled(count)) {
-                SPDLOG_WARN("目标估计等待PX4 Home，暂不处理地面站目标: count={}",
+                SPDLOG_WARN("目标估计等待EKF锚点，暂不处理地面站目标: count={}",
                             count);
             }
             return;
@@ -703,6 +752,7 @@ bool TargetEstimator::Start() {
                 kDropOldest);
     }
     impl_->ResetFilterState();
+    impl_->anchor.reset();
     impl_->home.reset();
     impl_->has_flight_snapshot = false;
     impl_->latest_flight_receive_ms = 0;

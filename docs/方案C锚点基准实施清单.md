@@ -1,6 +1,8 @@
 # 方案 C（锚点基准）实施清单
 
-> 状态：**待实施**（2026-10-16 立项）。前置输入已齐：锚点流可用性 ✅、锚点稳定性 ✅、
+> 状态：**C1~C3 已实施（2026-10-16 晚）**，C4 未做（D2 裁决不需要）、C5 无逻辑改动、
+> C6 文档已同步；决策 D1/D2/D3 按建议定案（等待锚点 / 围栏语义按锚点原点 / 不留回退
+> 开关）。实施记录见 §7。前置输入已齐：锚点流可用性 ✅、锚点稳定性 ✅、
 > 两套原点差 H 的机理与边界 ✅。
 > 关联文档：`docs/开发进度.md` 2026-10-16 节点、`docs/故障排查手册.md` §12.1、
 > `include/control/flight_controller.md`「Home 漂移对控制的影响」、
@@ -81,3 +83,30 @@
 - **机理与边界**：`include/control/flight_controller.md`「Home 漂移对控制的影响」；
 - **PX4 Home 生命周期**：`docs/故障排查手册.md` §12.1（Commander.cpp:1841、
   2145-2150 等源码行号）。
+
+## 7. 实施记录（2026-10-16 晚）
+
+- **C1/C2/C3 落地**（`src/perception/target_estimator.cpp`）：
+  - 新增 `anchor` 成员（锚点候选来自快照 `ned_ref_*`）作为唯一换算基准，
+    `BuildMeasurement` / 就绪门全部改用它；目标高度无效时的回退高度改为锚点高度；
+  - 重置触发改为**锚点变化**（罕见），WARN：`EKF 锚点变化，目标估计器已重置局部NED
+    滤波状态: 旧/新 + 上下文`；
+  - Home 变化降级为诊断 WARN：`PX4 Home变化（诊断记录，估计器不重置）`，字段集
+    与既有一致（GPS 上下文 + `锚点ref` + `局部位置`），漂移观测设施保留；
+  - 就绪门/等待日志：`目标估计等待EKF锚点，暂不处理地面站目标`（节流）；
+  - 上下文格式化抽成 `FormatFlightContext()`（两类 WARN 共用，避免重复）。
+- **测试**（`tests/perception/target_estimator_test.cpp`）：`MakeHome()` 基线快照补齐
+  锚点字段（与 Home 同点，既有期望不动）；`HomeChangeResetsVisualBookkeeping` 拆为
+  `HomeChangeKeepsFilterStateAndVisualBookkeeping`（Home 变化不重置、视觉继续）与
+  `AnchorChangeResetsVisualBookkeeping`（锚点变化重置、记账清空）两个用例；新增
+  `GroundTargetConvertsWithAnchorBaseline`（锚点≠Home 11.1m 时可区分，期望值用
+  `GeodeticToLocalNed(锚点, 目标)` 现算）与 `WaitsForAnchorBeforeAcceptingGroundTarget`
+  （锚点未到不处理、到齐后同流可接受）。估计器 29→32 用例。
+- **回归**：WSL2 全量构建零告警；`ctest` **437/437** 通过（基线 434→437，已按惯例
+  同步 9 处基线位置）。
+- **文档同步**：`目标估计器.md`（职责/关键实现/日志/测试/排查）、
+  故障排查手册 §12.1（处置结果）、`flight_controller.md`（瞬态消除与结果）、
+  数据接口文档 §4.9（frame_id=3 定义订正）、`docs/开发进度.md`（2026-10-16 晚节点）。
+- **待实机核对**：板上重编后跑一次地面会话——预期 `PX4 Home变化（诊断记录…）` 照常
+  出现但**不再伴随重置**（无"已重置局部NED滤波状态"日志），`锚点ref` 诊断照常，
+  目标估计持续有效（不再每 2s 断一次）。
