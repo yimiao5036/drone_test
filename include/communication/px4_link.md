@@ -171,7 +171,7 @@ bits 24..31 → flight_sub_mode（sub mode）
 - 姿态：roll/pitch/yaw；
 - 动力电池：电压、电流、剩余量及各自有效标志；
 - Home：经纬度与 MSL 高度；
-- **EKF 投影参考锚点**（2026-10-15 新增）：`GPS_GLOBAL_ORIGIN`（#411，内容为
+- **EKF 投影参考锚点**（2026-10-15 新增）：`GPS_GLOBAL_ORIGIN`（**#49**，内容为
   `vehicle_local_position.ref_*` 的 MAVLink 出口）→
   `ned_ref_valid/ned_ref_lat_1e7/ned_ref_lon_1e7/ned_ref_alt_mm` 与
   `ned_ref_received_count`。**该消息为变化触发式**：流按 1Hz 调度、仅在锚点
@@ -179,9 +179,20 @@ bits 24..31 → flight_sub_mode（sub mode）
   （计数≈0 是正常态，非链路故障）**；无周期新鲜度语义：valid 在连接期间保持、
   断连清除。**`ned_ref_received_count`（收到计数）即锚点变化次数的直接度量**——
   与持续刷新的 Home 不同源，用于 Home 漂移处置方案（迟滞阈值 / 换锚点基准）
-  的现场裁决观测。启用方式：`message_interval_requests` 请求 411 1Hz（流对
+  的现场裁决观测。启用方式：`message_interval_requests` 请求 49 1Hz（流对
   客户端默认不启用，须显式请求；SITL 已实测验证：`commander set_ekf_origin`
   改锚点 → 机载端收到 1 条）。
+  **实机订正（2026-10-16，根因已定位：消息号写错）**：历史配置把锚点流请求写成
+  **411**，而本方言 GPS_GLOBAL_ORIGIN = **#49**（411 = CURRENT_EVENT_SEQUENCE）。
+  PX4 v1.17.0 对两条显式请求分别回 `REQUEST_MESSAGE(411)` → result=2（DENIED）、
+  `SET_MESSAGE_INTERVAL(411)` → result=4（FAILED）——与源码路径完全吻合：
+  `set_message_interval` 在 `get_stream_name(411)` 未命中时返回 ERROR；
+  `handle_request_message_command` 首轮找不到流对象、回退路径又因 `get_stream_name`
+  未命中而跳过 → DENIED。**该错误在 10-15 的 SITL 验证中被"改锚点 → 变化触发发送"
+  掩盖**（锚点流由链路 mode 默认实例化，改锚点即发一条，与请求无关）。
+  2026-10-16 会话 `锚点ref=--`（6 分钟收 0）= 锚点未变化（正常静默）或流未实例化，
+  两者此前无法区分；**配置已订正为 49**，定案工具：
+  `px4_link_smoke --probe-message-interval 49`（见 `tools/px4_link_smoke.md` §2.4）。
 - RC：链路有效性、在线状态和 RSSI，不自动等同人工接管；
 - 固件：`flight_sw_version`、语义版本、capabilities。
 
@@ -230,8 +241,8 @@ bits 24..31 → flight_sub_mode（sub mode）
 首次建立心跳后按 JSON 自动排队：
 
 - `MAV_CMD_REQUEST_MESSAGE`：请求 `AUTOPILOT_VERSION` 和 `HOME_POSITION`；
-- `MAV_CMD_SET_MESSAGE_INTERVAL`：周期遥测频率（含 `GPS_GLOBAL_ORIGIN` 411 1Hz，
-  显式启用 EKF 锚点流——变化触发式，启用后锚点变化即上报）；
+- `MAV_CMD_SET_MESSAGE_INTERVAL`：周期遥测频率（含 `GPS_GLOBAL_ORIGIN` 49 1Hz，
+  显式启用 EKF 锚点流——变化触发式，启用后锚点变化即上报；**消息号 49，勿写 411**）；
 - `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
   `EXTENDED_SYS_STATE` 的配置频率（当前生产配置：姿态/局部位置 25Hz、GPS 10Hz、
   全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；

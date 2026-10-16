@@ -4,11 +4,13 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,6 +24,7 @@
 #include <spdlog/spdlog.h>
 
 #include "common/logger.h"
+#include "communication/communication_transport.h"
 #include "communication/mavlink_handler.h"
 #include "communication/px4_link.h"
 #include "config/config.h"
@@ -71,6 +74,8 @@ struct Options {
     uint64_t tune_static_dwell_s = 25;               // 初始捕获段驻留
     uint64_t tune_dwell_s = 15;                      // 每个阶跃段驻留
     double tune_approach_until_m = 20.0;             // S5 接近到该射程内再注入视觉
+    bool probe_message_interval = false;             // 消息流可用性只读探针
+    uint32_t probe_message_id = 0;                   // 目标消息 ID（如 49=GPS_GLOBAL_ORIGIN）
     bool selftest = false;
 };
 
@@ -90,7 +95,12 @@ void PrintUsage(const char* program) {
               << "stage4-tune 控制律整定场景：S7 长驻留 + 分通道阶跃换位，逐拍落 CSV；\n"
               << "  [--tune-script static|heading|distance|vertical|full] [--tune-csv <路径>]\n"
               << "  [--tune-static-dwell-s <秒>] [--tune-dwell-s <秒>] [--tune-approach-until-m <米>]\n"
-              << "--selftest 离线自检工具纯逻辑（G3 意图分类等），不需要 SITL/配置。\n";
+              << "--probe-message-interval <消息ID> 只读探针：GET_MESSAGE_INTERVAL 查询该消息流\n"
+              << "  在 PX4 端是否实例化（PX4 回 MESSAGE_INTERVAL，#244；-1=未找到/未启用），\n"
+              << "  随后 REQUEST_MESSAGE 触发一次并统计实收帧；49=GPS_GLOBAL_ORIGIN 锚点流\n"
+              << "  （注意 #49 不是 411：411 是 CURRENT_EVENT_SEQUENCE，请求它会 FAILED/DENIED）。\n"
+              << "  只发 HEARTBEAT 与两条只读查询，不发送任何飞行控制指令。\n"
+              << "--selftest 离线自检工具纯逻辑（G3 意图分类 + 消息流探针判读），不需要 SITL/配置。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -177,6 +187,19 @@ Options ParseOptions(int argc, char** argv) {
                 throw std::invalid_argument("--tune-approach-until-m 缺少米数");
             }
             options.tune_approach_until_m = std::stod(argv[index]);
+            continue;
+        }
+        if (argument == "--probe-message-interval") {
+            if (++index >= argc) {
+                throw std::invalid_argument("--probe-message-interval 缺少消息 ID");
+            }
+            const long long message_id = std::strtoll(argv[index], nullptr, 10);
+            if (message_id < 1 || message_id > 0xFFFFFF) {
+                throw std::invalid_argument(
+                    "--probe-message-interval 消息 ID 必须在 1~16777215（MAVLink 24 位）");
+            }
+            options.probe_message_id = static_cast<uint32_t>(message_id);
+            options.probe_message_interval = true;
             continue;
         }
         if (argument == "--selftest") {
@@ -1597,6 +1620,36 @@ constexpr uint64_t kMissionExtraSendsAllowed = 2;  // 停发后容许的竞态�
 constexpr double kMissionSlewTolerance = 1.5;      // 输出连续性容差倍数
 constexpr double kMissionFenceToleranceM = 0.5;    // 围栏钳制实测容差
 constexpr uint64_t kMissionPollMs = 20;            // 主循环节拍（低于控制周期 50ms）
+
+/// MESSAGE_INTERVAL 应答判读（纯函数，2026-10-16；`--probe-message-interval`
+/// 在线报告与 `--selftest` 离线断言共用）。
+/// PX4 语义（v1.17.0 mavlink_receiver.cpp get_message_interval）：未找到流时回 -1；
+/// 找到时回该流的调度周期（µs，-1 亦表示该流被禁用/未配置）。
+struct IntervalReplyVerdict {
+    int32_t interval_us = -1;
+    bool instantiated = false;  ///< 流已实例化（interval_us >= 0）
+    bool scheduled = false;     ///< 按周期调度（interval_us > 0）
+    std::string text;
+};
+
+IntervalReplyVerdict JudgeIntervalReply(int32_t interval_us) {
+    IntervalReplyVerdict verdict;
+    verdict.interval_us = interval_us;
+    verdict.instantiated = interval_us >= 0;
+    verdict.scheduled = interval_us > 0;
+    if (interval_us < 0) {
+        verdict.text = "流未找到或未启用（-1）——该消息不会持续下发";
+    } else if (interval_us == 0) {
+        verdict.text = "流已实例化但周期为 0（不周期发送）";
+    } else {
+        const double hz = 1000000.0 / static_cast<double>(interval_us);
+        char buffer[96];
+        std::snprintf(buffer, sizeof(buffer), "流已实例化：周期 %dµs（%.2f Hz）",
+                      interval_us, hz);
+        verdict.text = buffer;
+    }
+    return verdict;
+}
 
 /// G3 意图来源分类（纯逻辑，`--selftest` 离线断言；工具不在 ctest 内的断言曾连漏
 /// 两次——2026-10-14 终审要求抽成纯函数 + 离线自检防复发）。
@@ -4483,7 +4536,7 @@ int RunToolSelfTest() {
          drone::common::ControlIntentType::kVelocityHeading,
          MissionIntentClass::kStateMachineOther, true},
     };
-    std::cout << "tools/px4_link_smoke 离线自检（G3 意图分类）" << std::endl;
+    std::cout << "tools/px4_link_smoke 离线自检（G3 意图分类 + 消息流探针判读）" << std::endl;
     bool passed = true;
     for (const auto& item : cases) {
         const MissionIntentClass actual =
@@ -4492,6 +4545,28 @@ int RunToolSelfTest() {
         const bool ok = actual == item.expected && counted == item.expected_counted;
         std::cout << (ok ? "[PASS] " : "[FAIL] ") << item.name << " → 分类="
                   << MissionIntentClassName(actual) << " 计入轨迹=" << YesNo(counted)
+                  << std::endl;
+        passed = passed && ok;
+    }
+    // 消息流探针判读（--probe-message-interval）：纯函数分类边界防复发。
+    struct IntervalCase {
+        const char* name;
+        int32_t interval_us;
+        bool instantiated;
+        bool scheduled;
+    };
+    const IntervalCase interval_cases[] = {
+        {"探针判读: -1（未找到/未启用）", -1, false, false},
+        {"探针判读: 0（已实例化未调度）", 0, true, false},
+        {"探针判读: 1000000µs（1 Hz）", 1000000, true, true},
+    };
+    for (const auto& item : interval_cases) {
+        const IntervalReplyVerdict verdict = JudgeIntervalReply(item.interval_us);
+        const bool ok = verdict.instantiated == item.instantiated &&
+                        verdict.scheduled == item.scheduled &&
+                        verdict.interval_us == item.interval_us &&
+                        !verdict.text.empty();
+        std::cout << (ok ? "[PASS] " : "[FAIL] ") << item.name << " → " << verdict.text
                   << std::endl;
         passed = passed && ok;
     }
@@ -4606,6 +4681,278 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
 
 }  // namespace
 
+// ============================================================================
+// 消息流可用性只读探针（--probe-message-interval，2026-10-16 新增）
+//
+// 背景（2026-10-16 定位）：锚点流请求长期失败的真因是 **消息号写错**——配置把
+// GPS_GLOBAL_ORIGIN 写成 411，而本方言里 GPS_GLOBAL_ORIGIN = #49（411 是
+// CURRENT_EVENT_SEQUENCE），因此 PX4 对两条显式请求分别回 DENIED/FAILED（结果
+// 码与源码路径完全吻合），锚点流从未被显式启用。本探针用只读查询实测该流状态：
+//   1. GET_MESSAGE_INTERVAL(#510) → PX4 回 MESSAGE_INTERVAL(#244)：
+//      interval_us = -1 表示未找到/未启用该流；> 0 表示该流按此周期调度；
+//   2. REQUEST_MESSAGE(#512) → 报告 COMMAND_ACK 结果（能否按需触发一条）；
+//   3. 统计等待窗内该消息 ID 实收帧数；message_id=49 时额外解码锚点经纬高。
+// 判读依据（PX4 v1.17.0 源码）：mavlink_receiver.cpp 的 get_message_interval
+// （未找到流时 interval 保持 -1）、handle_request_message_command 与
+// set_message_interval（get_stream_name 未命中即返回 ERROR → result=4）。
+// 边界：只发 HEARTBEAT 与两条只读查询，不发送任何飞行控制指令。
+// ============================================================================
+
+// 判读纯函数 JudgeIntervalReply 与其它纯逻辑助手同区定义（供 --selftest 引用）。
+
+/// 只读探针主流程。退出码：0=流可用/有数据；4=未找到且无数据；3=超时/写入失败；2=传输打开失败。
+int RunIntervalProbe(const Px4LinkConfig& config, uint32_t message_id) {
+    using Clock = std::chrono::steady_clock;
+    constexpr auto kHeartbeatInterval = std::chrono::milliseconds(500);
+    constexpr auto kHeartbeatWait = std::chrono::seconds(5);
+    constexpr auto kReplyWait = std::chrono::seconds(3);
+    constexpr auto kFrameGrace = std::chrono::milliseconds(800);  // ACK 后补收窗
+
+    std::cout << "消息流可用性探针（只读，不发送任何飞行控制指令）\n"
+              << "  message_id: " << message_id << '\n'
+              << "  onboard: " << static_cast<int>(config.onboard_system_id) << '/'
+              << static_cast<int>(config.onboard_component_id) << '\n'
+              << "  target: " << static_cast<int>(config.target_system_id) << '/'
+              << static_cast<int>(config.target_component_id) << '\n'
+              << "  transport: " << config.transport << '\n'
+              << std::endl;
+
+    std::unique_ptr<drone::communication::ICommunicationTransport> transport;
+    try {
+        transport = config.transport == "udp"
+                        ? drone::communication::CreateUdpTransport(config.udp)
+                        : drone::communication::CreateSerialTransport(config.serial);
+        transport->Open();
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] 传输打开失败: " << error.what() << std::endl;
+        return 2;
+    }
+    std::cout << "  传输: " << transport->Description() << std::endl;
+
+    enum class Phase {
+        kWaitPx4Heartbeat,
+        kWaitIntervalReply,
+        kWaitRequestAck,
+        kFrameGrace,  ///< ACK 后的补收窗：REQUEST_MESSAGE 触发的帧可能紧随 ACK 之后
+        kFinished,
+    };
+    drone::communication::MavlinkHandler mavlink;
+    Phase phase = Phase::kWaitPx4Heartbeat;
+    auto now = Clock::now();
+    auto phase_deadline = now + kHeartbeatWait;
+    auto next_heartbeat = now;
+    bool px4_heartbeat_seen = false;
+    bool interval_reply_received = false;
+    int32_t interval_us = -1;
+    bool interval_query_ack_received = false;
+    uint8_t interval_query_ack_result = 0;
+    bool request_ack_received = false;
+    uint8_t request_ack_result = 0;
+    uint64_t frames_received = 0;
+    bool anchor_received = false;
+    double anchor_latitude = 0.0;
+    double anchor_longitude = 0.0;
+    float anchor_altitude_m = 0.0f;
+    bool query_write_failed = false;
+
+    const auto send_heartbeat = [&]() {
+        const auto frame = mavlink.Encode(
+            [&](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_heartbeat_pack_status(
+                    config.onboard_system_id, config.onboard_component_id, status,
+                    message, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, 0, 0,
+                    MAV_STATE_ACTIVE);
+            });
+        if (frame.empty()) {
+            return;
+        }
+        (void)transport->Write(frame.data(), frame.size());
+    };
+    const auto send_query = [&](uint16_t command) {
+        const auto frame = mavlink.Encode(
+            [&](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_command_long_pack_status(
+                    config.onboard_system_id, config.onboard_component_id, status,
+                    message, config.target_system_id, config.target_component_id,
+                    command, 0, static_cast<float>(message_id), 0.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f);
+            });
+        if (frame.empty() || !transport->Write(frame.data(), frame.size())) {
+            query_write_failed = true;
+            return false;
+        }
+        return true;
+    };
+
+    uint8_t buffer[600];
+    while (!g_stop.load(std::memory_order_relaxed) && phase != Phase::kFinished &&
+           !query_write_failed) {
+        now = Clock::now();
+        if (now >= next_heartbeat) {
+            send_heartbeat();
+            next_heartbeat = now + kHeartbeatInterval;
+        }
+        const std::ptrdiff_t received = transport->Read(buffer, sizeof(buffer));
+        if (received > 0) {
+            mavlink.Feed(
+                buffer, static_cast<std::size_t>(received),
+                [&](const mavlink_message_t& message) {
+                    if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT &&
+                        message.sysid == config.target_system_id &&
+                        message.compid == config.target_component_id) {
+                        if (!px4_heartbeat_seen) {
+                            px4_heartbeat_seen = true;
+                            std::cout << "[PASS] PX4 心跳（"
+                                      << static_cast<int>(message.sysid) << '/'
+                                      << static_cast<int>(message.compid) << "）"
+                                      << std::endl;
+                        }
+                        if (phase == Phase::kWaitPx4Heartbeat) {
+                            if (send_query(MAV_CMD_GET_MESSAGE_INTERVAL)) {
+                                std::cout << "[INFO] 已发送 GET_MESSAGE_INTERVAL("
+                                          << message_id << ")" << std::endl;
+                            }
+                            phase = Phase::kWaitIntervalReply;
+                            phase_deadline = Clock::now() + kReplyWait;
+                        }
+                        return;
+                    }
+                    if (message.msgid == MAVLINK_MSG_ID_MESSAGE_INTERVAL &&
+                        phase == Phase::kWaitIntervalReply) {
+                        mavlink_message_interval_t reply{};
+                        mavlink_msg_message_interval_decode(&message, &reply);
+                        if (static_cast<uint32_t>(reply.message_id) != message_id) {
+                            return;
+                        }
+                        interval_reply_received = true;
+                        interval_us = reply.interval_us;
+                        const auto verdict = JudgeIntervalReply(interval_us);
+                        std::cout << "[PASS] MESSAGE_INTERVAL 应答: message_id="
+                                  << reply.message_id
+                                  << " interval_us=" << reply.interval_us << "\n"
+                                  << "      判读: " << verdict.text << std::endl;
+                        if (send_query(MAV_CMD_REQUEST_MESSAGE)) {
+                            std::cout << "[INFO] 已发送 REQUEST_MESSAGE("
+                                      << message_id << ")" << std::endl;
+                            phase = Phase::kWaitRequestAck;
+                            phase_deadline = Clock::now() + kReplyWait;
+                        } else {
+                            phase = Phase::kFinished;
+                        }
+                        return;
+                    }
+                    if (message.msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
+                        mavlink_command_ack_t ack{};
+                        mavlink_msg_command_ack_decode(&message, &ack);
+                        if (ack.command == MAV_CMD_GET_MESSAGE_INTERVAL) {
+                            interval_query_ack_received = true;
+                            interval_query_ack_result = ack.result;
+                        } else if (ack.command == MAV_CMD_REQUEST_MESSAGE) {
+                            request_ack_received = true;
+                            request_ack_result = ack.result;
+                            if (phase == Phase::kWaitRequestAck) {
+                                phase = Phase::kFrameGrace;
+                                phase_deadline = Clock::now() + kFrameGrace;
+                            }
+                        }
+                        return;
+                    }
+                    if (message.msgid == message_id) {
+                        ++frames_received;
+                        if (message_id == MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN) {
+                            mavlink_gps_global_origin_t origin{};
+                            mavlink_msg_gps_global_origin_decode(&message, &origin);
+                            anchor_received = true;
+                            anchor_latitude =
+                                static_cast<double>(origin.latitude) / 1e7;
+                            anchor_longitude =
+                                static_cast<double>(origin.longitude) / 1e7;
+                            anchor_altitude_m =
+                                static_cast<float>(origin.altitude) / 1000.0f;
+                        }
+                    }
+                });
+        }
+        now = Clock::now();
+        if (now < phase_deadline) {
+            continue;
+        }
+        if (phase == Phase::kWaitPx4Heartbeat) {
+            std::cerr << "[FAIL] 等待 PX4 心跳超时（"
+                      << std::chrono::duration_cast<std::chrono::seconds>(kHeartbeatWait)
+                             .count()
+                      << " 秒）：检查链路、波特率与身份配置" << std::endl;
+            transport->Close();
+            std::cout << "结果: 消息流探针未通过（未收到 PX4 心跳）" << std::endl;
+            return 3;
+        }
+        if (phase == Phase::kWaitIntervalReply) {
+            std::cerr << "[FAIL] 未收到 MESSAGE_INTERVAL 应答（超时 "
+                      << std::chrono::duration_cast<std::chrono::seconds>(kReplyWait)
+                             .count()
+                      << " 秒）：PX4 未回复 GET_MESSAGE_INTERVAL" << std::endl;
+            transport->Close();
+            std::cout << "结果: 消息流探针未通过（无 MESSAGE_INTERVAL 应答）" << std::endl;
+            return 3;
+        }
+        if (phase == Phase::kFrameGrace) {
+            phase = Phase::kFinished;  // 补收窗到期：正常收口
+            continue;
+        }
+        // 仅等待 REQUEST_MESSAGE 的 ACK 超时：ACK 缺失只告警（仍进入补收窗），不影响主判读。
+        std::cout << "[WARN] 未收到 REQUEST_MESSAGE 的 COMMAND_ACK（超时 "
+                  << std::chrono::duration_cast<std::chrono::seconds>(kReplyWait).count()
+                  << " 秒）" << std::endl;
+        phase = Phase::kFrameGrace;
+        phase_deadline = Clock::now() + kFrameGrace;
+    }
+    transport->Close();
+
+    if (query_write_failed) {
+        if (!interval_reply_received) {
+            std::cerr << "[FAIL] 查询命令写入失败（链路故障）" << std::endl;
+            std::cout << "结果: 消息流探针未通过（命令写入失败）" << std::endl;
+            return 3;
+        }
+        std::cout << "[WARN] 第二条查询写入失败，以下按已取得的信息报告" << std::endl;
+    }
+    if (!px4_heartbeat_seen) {
+        std::cout << "结果: 消息流探针未通过（未收到 PX4 心跳）" << std::endl;
+        return 3;
+    }
+    if (!interval_reply_received) {
+        std::cout << "结果: 消息流探针未通过（未取得 MESSAGE_INTERVAL 应答）"
+                  << std::endl;
+        return 3;
+    }
+    const auto verdict = JudgeIntervalReply(interval_us);
+    if (interval_query_ack_received) {
+        std::cout << "[INFO] GET_MESSAGE_INTERVAL 的 COMMAND_ACK: result="
+                  << static_cast<int>(interval_query_ack_result) << std::endl;
+    }
+    if (request_ack_received) {
+        std::cout << (request_ack_result == 0 ? "[PASS] " : "[WARN] ")
+                  << "REQUEST_MESSAGE(" << message_id
+                  << ") 的 COMMAND_ACK: result="
+                  << static_cast<int>(request_ack_result)
+                  << "（0=已接受并按需触发发送）" << std::endl;
+    } else {
+        std::cout << "[WARN] 未收到 REQUEST_MESSAGE 的 COMMAND_ACK" << std::endl;
+    }
+    std::cout << "[INFO] 等待窗内实收 message_id=" << message_id << " 帧 "
+              << frames_received << " 条" << std::endl;
+    if (anchor_received) {
+        std::cout << "[INFO] 锚点 ref=(" << anchor_latitude << ", "
+                  << anchor_longitude << ", " << anchor_altitude_m << "m)"
+                  << std::endl;
+    }
+    const bool stream_usable = verdict.instantiated || frames_received > 0;
+    std::cout << (stream_usable ? "结果: 消息流可用（该消息会下发）"
+                                : "结果: 消息流未找到/未启用且无数据——该消息不会自行下发")
+              << std::endl;
+    return stream_usable ? 0 : 4;
+}
+
 int main(int argc, char** argv) {
     try {
         const Options options = ParseOptions(argc, argv);
@@ -4650,7 +4997,10 @@ int main(int argc, char** argv) {
                   << "  firmware: " << config.firmware_version << '\n'
                   << "  duration: " << options.duration.count() << " 秒\n"
                   << "  安全边界: "
-                  << (options.sitl_stage4_tune
+                  << (options.probe_message_interval
+                          ? "只读消息流探针：HEARTBEAT + GET_MESSAGE_INTERVAL/"
+                            "REQUEST_MESSAGE 查询，不发送任何飞行控制指令"
+                          : (options.sitl_stage4_tune
                           ? "SITL UDP 控制律整定场景：长驻留 + 分通道阶跃，落 CSV"
                           : (options.sitl_stage4_mission
                           ? "SITL UDP 装配状态机全链（G3）：注入地面站目标 + 模拟视觉"
@@ -4670,9 +5020,14 @@ int main(int argc, char** argv) {
                                  ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
                                  : (options.sitl_zero_velocity
                                         ? "SITL UDP 零速度流，不切模式、不解锁"
-                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")))))))))
+                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令"))))))))))
                   << '\n'
                   << std::endl;
+
+        if (options.probe_message_interval) {
+            // 只读探针：不装配 Px4Link/控制器，不发送任何飞行控制指令。
+            return RunIntervalProbe(config, options.probe_message_id);
+        }
 
         drone::communication::Px4Link link(config);
         if (options.sitl_stage4_controller) {

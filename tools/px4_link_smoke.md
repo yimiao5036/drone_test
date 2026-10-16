@@ -238,6 +238,55 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 - 退出码沿用第 5 节：剧本走通（含回退与过期停发链）且 CSV 可写、无中断/安全回收
   → 0，否则 3。
 
+### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
+
+```bash
+# 实机（串口）：默认读 config/config.json；SITL（UDP）：--config config/px4_sitl.json
+./build/px4_link_smoke --probe-message-interval 49
+```
+
+只读查询指定消息流在 PX4 端的状态，不发送任何飞行控制指令（只发 HEARTBEAT 与
+`GET_MESSAGE_INTERVAL`/`REQUEST_MESSAGE` 两条查询）：
+
+1. `MAV_CMD_GET_MESSAGE_INTERVAL(#510)` → PX4 回 `MESSAGE_INTERVAL(#244)`：
+   `interval_us = -1` 表示该流未找到/未启用；`> 0` 为该流调度周期（µs）；
+2. `MAV_CMD_REQUEST_MESSAGE(#512)` → 报告 COMMAND_ACK 结果（能否按需触发一条）；
+3. 统计等待窗内该消息 ID 实收帧数；`--probe-message-interval 49`（GPS_GLOBAL_ORIGIN）
+   会额外解码打印锚点经纬高（EKF 投影参考锚点）。
+
+> ⚠️ **消息号提示**：GPS_GLOBAL_ORIGIN 的消息号是 **49**，不是 411——411 是
+> `CURRENT_EVENT_SEQUENCE`。2026-10-16 定位到历史配置把锚点流请求写成 411，
+> PX4 对两条请求分别回 DENIED(2)/FAILED(4)（`get_stream_name(411)` 未命中、
+> 请求流不存在），锚点流从未被显式启用；配置已订正为 49。
+
+退出码：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 探针完成，流已实例化（或等待窗内实收该消息帧 ≥1 条） |
+| 2 | 传输打开失败（串口占用/权限，或 UDP 绑定失败） |
+| 3 | 未收到 PX4 心跳，或未取得 MESSAGE_INTERVAL 应答（超时/写入失败） |
+| 4 | 探针完成但 flow 未找到/未启用且无数据——**该消息不会自行下发** |
+
+输出示例（伪 PX4 端到端用例，2026-10-16 验证）：
+
+```text
+[PASS] PX4 心跳（1/1）
+[INFO] 已发送 GET_MESSAGE_INTERVAL(49)
+[PASS] MESSAGE_INTERVAL 应答: message_id=49 interval_us=1000000
+      判读: 流已实例化：周期 1000000µs（1.00 Hz）
+[INFO] 已发送 REQUEST_MESSAGE(49)
+[INFO] GET_MESSAGE_INTERVAL 的 COMMAND_ACK: result=0
+[WARN] REQUEST_MESSAGE(49) 的 COMMAND_ACK: result=2（0=已接受并按需触发发送）
+[INFO] 等待窗内实收 message_id=49 帧 1 条
+[INFO] 锚点 ref=(28.8606, 105.496, 245.27m)
+结果: 消息流可用（该消息会下发）
+```
+
+判读依据（PX4 v1.17.0 源码 `mavlink_receiver.cpp`）：`get_message_interval` 未找到
+流时回 `-1`；`handle_request_message_command` 找不到流对象或 `send()` 返回 false 时
+回 DENIED；`set_message_interval` 在 `get_stream_name` 未命中时返回 ERROR（→ result=4）。
+
 ## 3. 当前配置
 
 机载身份（`onboard_system_id`/`onboard_component_id`）自 2026-09-02 多机区分配置改造起
