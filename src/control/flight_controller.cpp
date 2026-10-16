@@ -520,6 +520,12 @@ private:
     /// 原点即 PX4 Home（docs/数据接口文档.md、include/perception/目标估计器.md），
     /// 故目标值本身即 Home 相对量；`home_valid=false` 时该约定无基准，
     /// 位置式意图拒绝输出（无基准不可围栏）。
+    ///
+    /// 注意（2026-10-16 结论）：该约定是近似——PX4 局部帧原点实为 EKF 锚点，
+    /// Home 是另一点，两者相差 H（地面阶段 Home 贴住飞机故 H≤1~2m；解锁/起飞后
+    /// Home 冻结，H = 起飞时刻飞机的局部坐标，位置意图与围栏随之偏移 H）。
+    /// 影响与处置见 include/control/flight_controller.md「Home 漂移对控制的
+    /// 影响」一节。
     void PublishPosition(const common::ControlIntent& intent, uint64_t now_ms) {
         const auto state = px4_link_ != nullptr
                                ? px4_link_->LatestState()
