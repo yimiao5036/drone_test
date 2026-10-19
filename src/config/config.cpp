@@ -501,6 +501,54 @@ void HandoverConfig::Validate() const {
         throw std::invalid_argument("handover.distance_lost_ms 必须为正");
 }
 
+void InterceptionConfig::Validate() const {
+    if (lock_frames == 0) {
+        throw std::invalid_argument("interception.lock_frames 必须为正");
+    }
+    if (!std::isfinite(min_range_m) || min_range_m <= 0.0) {
+        throw std::invalid_argument("interception.min_range_m 必须为有限正数");
+    }
+    if (!std::isfinite(max_range_m) || max_range_m <= min_range_m) {
+        throw std::invalid_argument(
+            "interception.max_range_m 必须为有限正数且大于 min_range_m");
+    }
+    if (!std::isfinite(min_battery_percent) || min_battery_percent < 0.0 ||
+        min_battery_percent > 100.0) {
+        throw std::invalid_argument(
+            "interception.min_battery_percent 必须在 [0,100]");
+    }
+    if (authorization_timeout.count() <= 0) {
+        throw std::invalid_argument("interception.authorization_timeout_ms 必须为正");
+    }
+}
+
+void ReturnHomeConfig::Validate() const {
+    if (!std::isfinite(altitude_m) || altitude_m <= 0.0) {
+        throw std::invalid_argument("return_home.altitude_m 必须为有限正数");
+    }
+    if (!std::isfinite(arrival_radius_m) || arrival_radius_m <= 0.0) {
+        throw std::invalid_argument("return_home.arrival_radius_m 必须为有限正数");
+    }
+    if (!std::isfinite(arrival_vertical_m) || arrival_vertical_m <= 0.0) {
+        throw std::invalid_argument("return_home.arrival_vertical_m 必须为有限正数");
+    }
+    if (!std::isfinite(arrival_speed_mps) || arrival_speed_mps <= 0.0) {
+        throw std::invalid_argument("return_home.arrival_speed_mps 必须为有限正数");
+    }
+    if (arrival_hold.count() <= 0) {
+        throw std::invalid_argument("return_home.arrival_hold_ms 必须为正");
+    }
+    if (timeout.count() <= 0) {
+        throw std::invalid_argument("return_home.timeout_ms 必须为正");
+    }
+    if (fire_timeout.count() <= 0) {
+        throw std::invalid_argument("return_home.fire_timeout_ms 必须为正");
+    }
+    if (command_retry.count() <= 0) {
+        throw std::invalid_argument("return_home.command_retry_ms 必须为正");
+    }
+}
+
 double ActuatorConfig::NormalizePwm(double pwm_us) const {
     return 2.0 * (pwm_us - output_pwm_min_us) /
                (output_pwm_max_us - output_pwm_min_us) -
@@ -763,6 +811,55 @@ AppConfig LoadAppConfig(const std::string& path,
     config.handover.distance_lost_ms = ReadOptionalPositiveMilliseconds(
         handover, "distance_lost_ms", config.handover.distance_lost_ms);
     config.handover.Validate();
+
+    // 拦截入口/授权（interception 节，2026-10-19）：默认关闭；射程为占位值，
+    // 必须按捕网有效射程与授权策略实机冻结后才能在生产本地副本开启。
+    const json interception = root.value("interception", json::object());
+    config.interception.enabled =
+        interception.value("enabled", config.interception.enabled);
+    config.interception.auto_authorize = interception.value(
+        "auto_authorize", config.interception.auto_authorize);
+    config.interception.lock_frames = static_cast<uint32_t>(
+        ReadOptionalPositiveSize(interception, "lock_frames",
+                                 config.interception.lock_frames));
+    config.interception.min_range_m = ReadOptionalPositiveDouble(
+        interception, "min_range_m", config.interception.min_range_m);
+    config.interception.max_range_m = ReadOptionalPositiveDouble(
+        interception, "max_range_m", config.interception.max_range_m);
+    config.interception.min_battery_percent = ReadOptionalNonNegativeDouble(
+        interception, "min_battery_percent",
+        config.interception.min_battery_percent);
+    config.interception.authorization_timeout = ReadOptionalPositiveMilliseconds(
+        interception, "authorization_timeout_ms",
+        config.interception.authorization_timeout);
+    config.interception.Validate();
+
+    // 拦截后返航（return_home 节，S11~S14）：全部可选，缺席回退默认值。
+    const json return_home = root.value("return_home", json::object());
+    config.return_home.enabled =
+        return_home.value("enabled", config.return_home.enabled);
+    config.return_home.altitude_m = ReadOptionalPositiveDouble(
+        return_home, "altitude_m", config.return_home.altitude_m);
+    config.return_home.arrival_radius_m = ReadOptionalPositiveDouble(
+        return_home, "arrival_radius_m", config.return_home.arrival_radius_m);
+    config.return_home.arrival_vertical_m = ReadOptionalPositiveDouble(
+        return_home, "arrival_vertical_m", config.return_home.arrival_vertical_m);
+    config.return_home.arrival_speed_mps = ReadOptionalPositiveDouble(
+        return_home, "arrival_speed_mps", config.return_home.arrival_speed_mps);
+    config.return_home.arrival_hold = ReadOptionalPositiveMilliseconds(
+        return_home, "arrival_hold_ms", config.return_home.arrival_hold);
+    config.return_home.timeout = ReadOptionalPositiveMilliseconds(
+        return_home, "timeout_ms", config.return_home.timeout);
+    config.return_home.fire_timeout = ReadOptionalPositiveMilliseconds(
+        return_home, "fire_timeout_ms", config.return_home.fire_timeout);
+    config.return_home.command_retry = ReadOptionalPositiveMilliseconds(
+        return_home, "command_retry_ms", config.return_home.command_retry);
+    config.return_home.Validate();
+    if (config.interception.enabled && !config.return_home.enabled) {
+        throw std::invalid_argument(
+            "interception.enabled=true 时 return_home.enabled 必须为 true"
+            "（发射后必须有返航收口）");
+    }
 
     // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：通道号/行程/输出
     // 映射区间全部可选，缺席回退默认值；通道号仅 1..6（MAV_CMD_DO_SET_ACTUATOR

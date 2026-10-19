@@ -128,6 +128,26 @@
             "mount_z_m": 0.0
         }
     },
+    "interception": {
+        "enabled": false,
+        "auto_authorize": true,
+        "lock_frames": 10,
+        "min_range_m": 2.0,
+        "max_range_m": 10.0,
+        "min_battery_percent": 0.0,
+        "authorization_timeout_ms": 1000
+    },
+    "return_home": {
+        "enabled": true,
+        "altitude_m": 5.0,
+        "arrival_radius_m": 2.0,
+        "arrival_vertical_m": 0.5,
+        "arrival_speed_mps": 0.5,
+        "arrival_hold_ms": 1000,
+        "timeout_ms": 60000,
+        "fire_timeout_ms": 3000,
+        "command_retry_ms": 1000
+    },
     "visual_monitor": {
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,

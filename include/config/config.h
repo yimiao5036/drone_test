@@ -114,6 +114,45 @@ struct HandoverConfig {
     void Validate() const;
 };
 
+/// 拦截入口/授权（interception 节，2026-10-19）。
+/// V1 默认关闭：生产只有在 G4/实机射程与授权策略验证后，才允许在本地副本开启。
+struct InterceptionConfig {
+    bool enabled = false;
+    /// V1 自动授权。false 时 S9 等待授权并最终按超时返航；地面站确认协议尚未实现。
+    bool auto_authorize = true;
+    /// 连续 LOCKED 帧门限（拦截质量，与 handover.lock_frames 独立）。
+    uint32_t lock_frames = 10;
+    /// 允许发射的测距窗口（米）；默认值为占位，必须按捕网有效射程实机冻结。
+    double min_range_m = 2.0;
+    double max_range_m = 10.0;
+    /// 动力电池最低剩余百分比；0=不启用（当前尚无冻结门限，按需配置）。
+    double min_battery_percent = 0.0;
+    /// S9 等待授权的超时；超时按设计返航。
+    std::chrono::milliseconds authorization_timeout{1000};
+    void Validate() const;
+};
+
+/// 拦截后返航（return_home 节，2026-10-19）。
+struct ReturnHomeConfig {
+    /// 单发发射后是否自动进入 S11/S12（默认 true）。测试可关闭以隔离捕网
+    /// 执行器语义（S10 停留/复位重试用例）。
+    bool enabled = true;
+    /// 相对 Home 的返航高度：低于该值先原地爬升，再水平返航。
+    double altitude_m = 5.0;
+    /// 到达判据：水平半径、垂直误差、水平速度与稳定保持时长。
+    double arrival_radius_m = 2.0;
+    double arrival_vertical_m = 0.5;
+    double arrival_speed_mps = 0.5;
+    std::chrono::milliseconds arrival_hold{1000};
+    /// 返航超时：超时后原地悬停告警（不自动转 RTL，交地面站/人工）。
+    std::chrono::milliseconds timeout{60000};
+    /// S10 发射命令入队超时：超时按"发射失败"结束并返航。
+    std::chrono::milliseconds fire_timeout{3000};
+    /// AUTO.LAND / DISARM 命令重试间隔。
+    std::chrono::milliseconds command_retry{1000};
+    void Validate() const;
+};
+
 struct AppConfig {
     LogConfig log;
     RuntimeConfig runtime;
@@ -139,6 +178,8 @@ struct AppConfig {
     FlightControllerConfig controller;  ///< FlightController 参数（阶段四控制接入）
     HandoverConfig handover;            ///< 交接缝迟滞参数（阶段四控制接入）
     ActuatorConfig actuator;            ///< 捕网执行器（阶段四控制接入 Task 10）
+    InterceptionConfig interception;    ///< S9/S10 入口判据与授权（2026-10-19）
+    ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

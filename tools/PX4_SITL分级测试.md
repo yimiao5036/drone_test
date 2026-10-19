@@ -576,3 +576,6 @@ COAST→IDLE：972 ms；IDLE→PX4 退出 Offboard：1593 ms（上限 2200），
 | stage4-feedforward 从错误位置起飞/滞后为负 | 未重启干净 SITL：目标为 Home 相对绝对坐标，上一轮降落点残留会让自机从目标前方起飞；每次运行前重启 PX4 SITL |
 | stage4-feedforward 前馈样本为 0 | 未加 `--feedforward`（Controller 开关默认关闭），或目标地面站速度位未置位；查注入 rig 的 `SetTargetVelocityNed` |
 | stage4-feedforward 前馈值存在但滞后不降 | 核对 PX4 `MPC_XY_VEL_MAX`（SITL 前置 2.0）与 `MPC_XY_P`；用 `tools/feedforward_report.py` 复核最后 5s 窗口 |
+| stage4-return 一直不进 S9 | 确认使用 `config/px4_sitl_return.json`（`interception.enabled=true`），并查 LOCKED 连续帧、测距 2~12m 窗口、Offboard/armed/命令接口就绪；生产默认关闭 |
+| stage4-return 在 S13 触发“安全回收/高度越界” | 工具应在状态机接管返航后忽略降落段最低高度包线；确认 `state_machine_managed_return_` 置位且状态已到 S12/S13 |
+| stage4-return 未到 S14 | 查 AUTO.LAND/DISARM 是否发出/ACK、PX4 landed/armed；重启干净 SITL（目标为绝对坐标） |

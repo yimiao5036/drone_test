@@ -153,9 +153,10 @@ target_include_directories(drone_state_machine PUBLIC
 target_compile_features(drone_state_machine PUBLIC cxx_std_17)
 # control 模块：交接判据复用 PixelToAngle 视线角换算（Task 9 起还复用
 # TrackingControlLaw）。config 模块：捕网执行器行程换算（Task 10 起复用
-# ActuatorConfig::NormalizePwm）。静态库依赖经 LINK_ONLY 传播给最终可执行文件。
+# ActuatorConfig::NormalizePwm）。perception：返航 Home 局部 NED 换算
+# （GeodeticToLocalNed，S11~S14）。静态库依赖经 LINK_ONLY 传播给最终可执行文件。
 target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog drone_control_core
-    drone_config)
+    drone_config drone_perception)
 
 # ---- control 模块（飞行控制接口+视觉跟踪控制律；库名加 _core 避免与可执行 drone_control 冲突） ----
 add_library(drone_control_core STATIC

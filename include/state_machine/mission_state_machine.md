@@ -43,7 +43,7 @@ norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min
 
 `output_pwm_min_us/max_us`为配置项（必须与所接通道的 `PWM_AUX_MINn/MAXn` 一致，装机后按实配核对）；行程必须落在该区间内（`ActuatorConfig::Validate` fail-fast，否则归一化超出 -1..1 不可表达）。默认行程 1100/1900µs 在默认区间下换算为 **-0.8 / +0.8**。换算公式的单测见`ConfigTest.ActuatorNormalizePwmMapsOutputRangeToMinusOneToOne`；实际行程方向/到位由 **G4 拆桨台架**核对。
 
-**拦截序列入口边界（T10 交付范围外，防误读）**：S9/S10 的**进入判据**（锁定质量、相对状态/射程、执行机构就绪、`IInterceptionAuthorizationPolicy` 授权）未在阶段四冻结，本任务**不发明**——状态机现有迁移逻辑只覆盖到 S7，拦截序列当前**无生产入口**（`DroneApplication`不驱动、整机不可达），捕网触发路径因此处于"已接通、待入口"状态。补充入口判据属后续任务；在此之前仅 `ForceStateForTest` 测试入口可达（需显式开启测试钩子，见下与测试方式）。
+**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（占位值，待实机射程冻结）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、捕网未触发/无复位挂起。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
 
 阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
 
@@ -51,8 +51,8 @@ norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min
 
 本阶段仍不做以下事情：
 
-- 不发送模式切换、解锁、起飞、降落或setpoint（`SetCommandSender`注入的命令接口当前唯一消费点是捕网执行器触发/复位，Task 10；ARM/模式切换命令仍待后续任务）。
-- 不实现拦截序列（S9/S10/S11）的进入判据与授权策略（上段），不直接调用拦截设备接口。
+- 不发送解锁、起飞或外部 setpoint（`SetCommandSender` 当前消费点：S10 捕网触发/复位、S13 AUTO.LAND、S14 前 DISARM；ARM/起飞仍待后续任务）。
+- S9/S10 入口判据与自动授权已落地（上段），但**默认 `interception.enabled=false`**；地面站确认授权协议尚未实现（`auto_authorize=false` 时只等超时返航），执行机构就绪仍以命令接口注入 + 未触发/无复位挂起为代理，未接硬件状态反馈。
 - 不把地面站目标透传为PX4航点。
 - 不实现设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量（依赖
   控制侧反馈与尚未冻结的阈值配置），S6→S7 仍用"条件持续 + 视觉链推进 +
@@ -253,14 +253,47 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
   - 边界：状态驻留 <1 决策周期（100ms）的极端迁移可能被跳过——生产语义下
     S10 驻留由拦截结果决定（远长于决策周期），不构成风险。
+- **S9/S10 入口判据（2026-10-19）**：`EvaluateInterceptSequence` 在 S7 每拍评估
+  `InterceptEntrySatisfied`——`interception.enabled`、视觉新鲜且 `LOCKED`、
+  `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
+  `[min_range_m,max_range_m]`、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
+  `command_sender_` 非空、`net_fired_/net_reset_pending_` 均为 false。满足→S9；
+  S9 条件失效→S7；`auto_authorize=true`→S10；false 时等
+  `authorization_timeout_ms` 超时→S12。S9/S10 仍走 `EvaluateVisualServoIntent`
+  保持伺服/瞄准，不因状态切换产生意图空窗。默认关闭（生产安全）。
+- **拦截后返航（S11~S14，2026-10-19 V1 单发口径）**：
+  - **完成判据**：S10 内 `net_fired_`（触发命令成功入队）或发射重试超时
+    （`ReturnHomeConfig::fire_timeout`）→ S11；**V1 不判断命中**，只记录
+    “已发射/发射失败”，随后 S11 当拍/下一拍进入 S12。摄像头状态不参与返航判断。
+  - **Home 局部 NED**：`HomeLocalNed()` 用 Home 经纬度（`home_*`）+ EKF 锚点
+    （`ned_ref_*`）经 `perception::GeodeticToLocalNed` 换算；不依赖
+    `HOME_POSITION.x/y/z`（MAVLink 无 `valid_lpos` 标志）。`home_valid`/
+    `ned_ref_valid`/`local_position_valid` 任一无效 → 原地悬停并告警（不盲目返航）。
+  - **S12 返航**：相对 Home 高度 <`altitude_m`（5m）先原地爬升，达标后再水平
+    飞 Home；≥5m 保持当前高度。位置意图 10Hz 重发，`reason_code` 低位=8
+    （`kReasonReturnHome`），不带速度前馈。PX4 离开 Offboard（failsafe/人工）→
+    立即停发、转 S13 仅监控，不与其争控。
+  - **到达判据**：水平距 Home ≤`arrival_radius_m`（2m）、垂直误差
+    ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
+    持续 `arrival_hold`（1s）→ S13。返航超 `timeout`（60s）→ 原地悬停告警。
+  - **S13/S14**：S13 发 `MAV_CMD_DO_SET_MODE`（AUTO.LAND，4/6）；停止位置意图；
+    落地后若仍 armed 发 `MAV_CMD_COMPONENT_ARM_DISARM`（0）；确认 disarmed →
+    S14。正常返航不使用 PX4 自动 RTL；PX4 已接管则只监控 landed/disarmed。
+  - **配置**：`MissionStateMachineConfig::return_home`（`config::ReturnHomeConfig`，
+    默认 `enabled=true`；`interception`/`return_home` 两节已接入 JSON 加载）。
+    捕网执行器隔离用例显式 `enabled=false`。
+  - **依赖**：状态机为 Home 换算链接 `drone_perception`（纯函数 `GeodeticToLocalNed`）。
+  - **边界**：S9/S10 入口已配置化（`interception` 节，默认关闭；射程占位待实机）；
+    V1 返航段可通过测试钩子/测试用例或显式开启配置驱动。多发命中判据/再交战策略
+    V2 立项；`MissionStatus` 结果字段暂不新增（用状态+日志）。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
 - `ForceStateForTest`为测试入口（**运行期门控**）：与生产路径共用`TransitionTo`
-  统一迁移挂点，用于驱动当前无生产入口的拦截序列（S9/S10/S11），验证进入/离开
-  动作语义。**门控**：`MissionStateMachineConfig::test_hooks_enabled` 默认 false
-  （生产装配语义，`DroneApplication` 不置位），此时调用**直接拒绝并记 ERROR、不产生
-  任何迁移**——强推到 S9/S10 会在 `enable_control=true` 装配下经命令窄接口发出
-  **不可逆的捕网触发命令**，而拦截序列当前无生产入口，该入口是唯一误触路径；
-  单测与 SITL 验收工具显式置 true。
+  统一迁移挂点，用于驱动拦截序列（S9/S10/S11）的进入/离开动作。**门控**：
+  `MissionStateMachineConfig::test_hooks_enabled` 默认 false（生产装配语义，
+  `DroneApplication` 不置位），此时调用**直接拒绝并记 ERROR、不产生任何迁移**——
+  强推到 S9/S10 会在 `enable_control=true` 装配下经命令窄接口发出**不可逆的捕网
+  触发命令**；单测与 SITL 验收工具显式置 true。生产侧另有 `interception.enabled`
+  显式开关（默认 false）。
 - 构造期对 `actuator` 配置执行 `Validate()` 兜底（`SendNetActuatorStroke` 以
   `params[net_channel-1]` 索引固定 7 元素参数数组：程序化构造的 channel 越界即 UB、
   channel=7 静默无效）；配置加载期已校验，此处对程序化构造 fail-fast，先例见
@@ -276,11 +309,13 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   便于事后区分是哪条退出路径生效）；位置引导意图启动/停止（含"交接冻结最后位置目标"、
   "交接冻结位置意图续发"、"位置引导意图停止: 视觉伺服接续"、交接段收口）；
   S7 视觉伺服意图启动（带首拍 vx/vy/vz/yaw_rate 摘要）；PX4 命令接口与估计器
-  诊断接口注入；首次/节流接收地面站目标。
+  诊断接口注入；首次/节流接收地面站目标；**返航开始/爬升完成/降落阶段/
+  AUTO.LAND 入队/DISARM 入队/任务结束（S14）**（S11~S14，2026-10-19）。
 - WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
   S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）；
   **捕网执行器触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
-  捕网命令入队失败（节流，下拍重试）。
+  捕网命令入队失败（节流，下拍重试）；**单发发射超时/返航超时/Home 或锚点无效/
+  PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）。
 - ERROR：订阅或线程启动异常；运行中重绑输入/注入接口；估计输入部分绑定；
   估计输入已绑定但未注入估计器诊断（交接不评估）。
 - 高频周期（100ms 决策、10Hz 意图重发、S7 逐拍伺服计算）不打印日志；
@@ -379,8 +414,51 @@ ctest --test-dir build --output-on-failure
     → 恰好对应 3 个用例失败，恢复后全绿；评审修复另作 2 处次序负对照——触发
     判据前移到复位挂起检查之前 → `NetActuatorTriggerWaitsForResetEnqueued`
     失败；复位入队失败即清除挂起（不重试）→ 两个复位用例失败。
+- 拦截后返航（S11~S14，2026-10-19；`MakeReturnHomeTestConfig` 默认
+  `return_home.enabled=true`，缩短到达保持/命令重试/发射超时便于测试）：
+  - `InterceptionFiresThenReturnsHomeAndLands`：强制 S10 → 发射命令入队 →
+    S11/S12 → 位置意图 reason=8、目标 Home 局部 NED（≥5m 保持当前高度）→
+    到达后 S13 发 176（AUTO.LAND，param2=4/param3=6）→ landed+armed 发 400
+    （DISARM）→ disarmed 进 S14；
+  - `ReturnHomeClimbsToFiveMetersBeforeCruise`：相对 Home 2m → 先原地爬升到
+    Home 上方 5m（intent x/y=当前），到高后改为水平飞 Home；
+  - `ReturnHomeHoldsWhenHomeInvalid`：`home_valid=false` → 原地悬停意图
+    （当前 x/y/z），状态保持 S12，不盲目返航；
+  - `ReturnHomeYieldsWhenPx4LeavesOffboard`：S12 中 PX4 切 4/5 → 停发返航
+    设定值、转 S13 仅监控，不再发 AUTO.LAND（176）。
+  - `MakeNetActuatorTestConfig` 显式 `return_home.enabled=false`，保持捕网
+    执行器用例的 S10 停留/显式离开语义不变。
+- S9/S10 入口（2026-10-19；`MakeInterceptEntryTestConfig` 开启
+  `interception.enabled=true`、`lock_frames=3`、窗口 2~12m、自动授权）：
+  - `InterceptEntryLockAndRangeThenFiresAndReturns`：强制 S7 + 连续 LOCKED
+    帧 + 8m 测距 + Offboard/armed/姿态/位置有效 → S9 → 自动授权 S10 →
+    捕网 187 入队 → S11/S12；
+  - `InterceptEntryRejectsDistanceOutsideWindow`：测距 20m（>12m）→ 停在 S7、
+    不发射（0 次命令）。
+- 配置（`interception`/`return_home` 节）：默认值、显式解析、非法窗口/
+  返航高度拒绝、`interception.enabled=true` 且 `return_home.enabled=false`
+  拒绝（发射后必须有返航收口）。
+- SITL 返航专项（2026-10-19，`tools/px4_link_smoke --sitl-stage4-return` +
+  `config/px4_sitl_return.json`）：S7→S9→S10 发射→S12 算力板返航 Home→
+  S13 AUTO.LAND→S14 DISARMED 全 PASS（状态机迁移 11 次、错误 0；最大高度
+  4.99m；S12 起始射程约 11.6m）；证据 `tools/return_evidence/`。该场景为
+  非门禁，`interception.enabled` 生产默认关闭。
 
 ## 排查/修改要点
+
+- **S10 发射后不返航**：查 `MissionStateMachineConfig::return_home.enabled`
+  （默认 true；捕网执行器隔离测试显式 false）、`net_fired_`/发射超时日志；
+  S9/S10 生产入口仍未冻结，整机只能经测试钩子进入。
+- **S12 原地不动/不飞 Home**：查 `home_valid`/`ned_ref_valid`/
+  `local_position_valid`（任一无效按设计原地悬停并 WARN）；查返航超时日志
+  （60s 后原地悬停）；确认 PX4 仍在 Offboard(6/0)，否则状态机按设计转 S13 让权。
+- **S12 不进入 S13**：到达判据为水平 2m、垂直 0.5m、水平速度 0.5m/s
+  持续 1s；查位置/速度遥测是否持续满足；位置意图 reason 低位应为 8。
+- **S13 不发 AUTO.LAND**：确认 `SetCommandSender` 已注入（`enable_control=true`
+  装配分支），查 `AUTO.LAND 命令已入队`/入队失败 WARN；PX4 已被 failsafe
+  接管时状态机按设计不再发 176，只等 landed/disarmed。
+- **S13 已落地但不到 S14**：通常为仍 armed 且 DISARM 未 accepted；查 400 命令
+  入队/ACK 与 PX4 disarmed 状态。
 
 - 如果地面站目标ACK已成功但状态机不进入`GPS_APPROACH`，先检查PX4快照是否满足`connected/gps_fix/global_position_valid/home_valid`（PX4 已到位后该组条件可实链成立，不再是"必然不满足"）。
 - 如果状态机没有状态回传，检查主程序是否启用了PX4和地面站链路，以及`GroundStationLink::TargetOutput()`是否已绑定到状态机。

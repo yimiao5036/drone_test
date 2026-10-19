@@ -1373,6 +1373,9 @@ state_machine::MissionStateMachineConfig MakeNetActuatorTestConfig() {
     state_machine::MissionStateMachineConfig config;
     config.actuator.net_channel = 3;
     config.test_hooks_enabled = true;
+    // 本组用例只验证捕网执行器触发/复位语义；关闭单发自动返航，
+    // 保持 S10 停留/离开由测试显式强制。
+    config.return_home.enabled = false;
     return config;
 }
 
@@ -1645,6 +1648,390 @@ TEST(MissionStateMachineTest, ForceStateForTestRejectedWithoutTestHooks) {
     EXPECT_NE(machine.CurrentState(), common::MissionState::kInterceptExecuting);
     EXPECT_EQ(sender.CallCount(), 0U);  // 任何命令都不得发出
 
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// S11~S14 单发拦截后返航（2026-10-19 V1 口径）
+// 强制 S10 模拟“发射”，走：S10→S11→S12 算力板位置返航→S13 AUTO.LAND→
+// S14 DISARMED。Home 局部 NED 由 Home 经纬度 + EKF 锚点换算（Home=锚点时
+// Home 局部坐标应为 0,0,0）。
+// ---------------------------------------------------------------------------
+
+common::FlightStateSnapshot MakeReturnHomeFlight(float x_m, float y_m, float z_m,
+                                                 float vx_mps = 0.0f,
+                                                 float vy_mps = 0.0f,
+                                                 float vz_mps = 0.0f,
+                                                 bool armed = true,
+                                                 bool landed = false,
+                                                 uint8_t main_mode = 6,
+                                                 uint8_t sub_mode = 0,
+                                                 bool home_valid = true,
+                                                 bool ned_ref_valid = true) {
+    common::FlightStateSnapshot flight = MakeNavigationReadyFlight();
+    flight.armed = armed;
+    flight.landed = landed;
+    flight.landed_state_valid = true;
+    flight.flight_mode = main_mode;
+    flight.flight_sub_mode = sub_mode;
+    flight.attitude_valid = true;
+    flight.local_position_valid = true;
+    flight.local_x_m = x_m;
+    flight.local_y_m = y_m;
+    flight.local_z_m = z_m;
+    flight.vx_mps = vx_mps;
+    flight.vy_mps = vy_mps;
+    flight.vz_mps = vz_mps;
+    flight.home_valid = home_valid;
+    flight.ned_ref_valid = ned_ref_valid;
+    flight.ned_ref_lat_1e7 = flight.home_lat_1e7;
+    flight.ned_ref_lon_1e7 = flight.home_lon_1e7;
+    flight.ned_ref_alt_mm = flight.home_altitude_mm;
+    return flight;
+}
+
+state_machine::MissionStateMachineConfig MakeReturnHomeTestConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.test_hooks_enabled = true;
+    // 默认 return_home.enabled=true；缩短稳定/重试时间便于测试。
+    config.return_home.arrival_hold = 300ms;
+    config.return_home.command_retry = 100ms;
+    config.return_home.fire_timeout = 1000ms;
+    return config;
+}
+
+bool WaitForCommand(const FakeCommandSender& sender, uint16_t command,
+                    std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (const auto& call : sender.History()) {
+            if (call.command == command) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+std::optional<common::ControlIntent> WaitForReturnIntent(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& intent = **message;
+        if (intent.type == common::ControlIntentType::kPositionGuide &&
+            (intent.reason_code & 0xFFU) == 8U) {
+            return intent;
+        }
+    }
+    return std::nullopt;
+}
+
+TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 当前在 Home 北 10m/东 5m、高 10m（≥5m → 保持当前高度返航）。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(10.0f, 5.0f, -10.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto return_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(return_intent.has_value());
+    EXPECT_EQ(return_intent->control_source, 0U);
+    EXPECT_NE(return_intent->reason_code & common::kControlIntentReasonRequestControl,
+              0U);
+    EXPECT_NEAR(return_intent->target_x, 0.0f, 0.05f);   // Home 局部 NED x
+    EXPECT_NEAR(return_intent->target_y, 0.0f, 0.05f);
+    EXPECT_NEAR(return_intent->target_z, -10.0f, 0.05f); // 保持当前高度
+    EXPECT_EQ(return_intent->feedforward_valid_mask, 0U);
+
+    // 到达 Home 附近并稳定 300ms → S13；发 AUTO.LAND（176，4/6）。
+    for (int round = 0; round < 8; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(0.5f, 0.0f, -10.0f))).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kLanding, 2500ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForCommand(sender, 176U));
+    {
+        const auto history = sender.History();
+        bool found = false;
+        for (const auto& call : history) {
+            if (call.command == 176U) {
+                found = true;
+                EXPECT_FLOAT_EQ(call.params[0], 1.0f);  // custom mode enabled
+                EXPECT_FLOAT_EQ(call.params[1], 4.0f);  // AUTO
+                EXPECT_FLOAT_EQ(call.params[2], 6.0f);  // LAND
+            }
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // 落地但仍 armed → DISARM（400，param1=0）。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(0.0f, 0.0f, 0.0f, 0,0,0, /*armed=*/true,
+                                 /*landed=*/true, 4, 6))).accepted);
+    ASSERT_TRUE(WaitForCommand(sender, 400U));
+
+    // 确认 disarmed → S14。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(0.0f, 0.0f, 0.0f, 0,0,0, /*armed=*/false,
+                                 /*landed=*/true, 4, 6))).accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kDisarmed, 2500ms)
+                    .has_value());
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ReturnHomeClimbsToFiveMetersBeforeCruise) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 相对 Home 仅 2m：先原地爬到 5m，再水平返航。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(10.0f, 5.0f, -2.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto climb_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(climb_intent.has_value());
+    EXPECT_NEAR(climb_intent->target_x, 10.0f, 0.05f);  // 原地爬升
+    EXPECT_NEAR(climb_intent->target_y, 5.0f, 0.05f);
+    EXPECT_NEAR(climb_intent->target_z, -5.0f, 0.05f);  // Home 上方 5m
+
+    // 到达 5m、垂速归零 → 进入水平巡航（目标 Home x/y）。
+    for (int round = 0; round < 8; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -5.0f))).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    std::optional<common::ControlIntent> cruise_intent;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto intent = WaitForReturnIntent(intent_subscription, 100ms);
+        if (!intent) {
+            continue;
+        }
+        if (std::fabs(intent->target_x) < 0.05f &&
+            std::fabs(intent->target_y) < 0.05f) {
+            cruise_intent = intent;
+            break;
+        }
+    }
+    ASSERT_TRUE(cruise_intent.has_value());
+    EXPECT_NEAR(cruise_intent->target_z, -5.0f, 0.05f);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ReturnHomeHoldsWhenHomeInvalid) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f, 0,0,0, true, false, 6, 0,
+                                 /*home_valid=*/false))).accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto hold_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(hold_intent.has_value());
+    EXPECT_NEAR(hold_intent->target_x, 10.0f, 0.05f);
+    EXPECT_NEAR(hold_intent->target_y, 5.0f, 0.05f);
+    EXPECT_NEAR(hold_intent->target_z, -10.0f, 0.05f);
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kReturnHome);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ReturnHomeYieldsWhenPx4LeavesOffboard) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(10.0f, 5.0f, -10.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    // PX4 自主切到 AUTO.RTL（4/5）：状态机停止返航设定值，转 S13 仅监控。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f, 0,0,0, true, false, 4, 5)))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kLanding, 2500ms)
+                    .has_value());
+    // PX4 接管时不得再发 AUTO.LAND（176）。
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : sender.History()) {
+        EXPECT_NE(call.command, 176U);
+    }
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// S9/S10 生产入口（2026-10-19）：LOCKED 连续帧 + 测距窗口 + Offboard/armed/
+// 姿态/位置有效 + 命令接口就绪 → S9 → 自动授权 → S10 发射。
+// ---------------------------------------------------------------------------
+
+state_machine::MissionStateMachineConfig MakeInterceptEntryTestConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.test_hooks_enabled = true;
+    config.interception.enabled = true;
+    config.interception.auto_authorize = true;
+    config.interception.lock_frames = 3;
+    config.interception.min_range_m = 2.0;
+    config.interception.max_range_m = 12.0;
+    config.return_home.arrival_hold = 300ms;
+    config.return_home.command_retry = 100ms;
+    return config;
+}
+
+TEST(MissionStateMachineTest, InterceptEntryLockAndRangeThenFiresAndReturns) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeInterceptEntryTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_topic, distance_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(32);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    bool saw_ready = false;
+    bool saw_executing = false;
+    bool saw_return = false;
+    for (uint64_t frame = 1; frame <= 20 && !saw_return; ++frame) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+        ASSERT_TRUE(visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)))
+                        .accepted);
+        ASSERT_TRUE(distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 8.0F))).accepted);
+        std::this_thread::sleep_for(60ms);
+        while (auto status = status_subscription.TryTake()) {
+            switch ((*status)->state) {
+                case common::MissionState::kInterceptReady: saw_ready = true; break;
+                case common::MissionState::kInterceptExecuting:
+                    saw_executing = true;
+                    break;
+                case common::MissionState::kReturnHome: saw_return = true; break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_ready) << "锁定+测距窗口满足后应进入 S9";
+    EXPECT_TRUE(saw_executing) << "自动授权后应进入 S10";
+    EXPECT_TRUE(saw_return) << "单发发射后应进入 S12 返航";
+    EXPECT_TRUE(WaitForCommand(sender, 187U)) << "S10 应发捕网触发命令";
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, InterceptEntryRejectsDistanceOutsideWindow) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeInterceptEntryTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_topic, distance_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    // 测距 20m 超出 2~12m 窗口：LOCKED 再多也不得进入 S9/发射。
+    for (uint64_t frame = 1; frame <= 15; ++frame) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+        ASSERT_TRUE(visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)))
+                        .accepted);
+        ASSERT_TRUE(distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 20.0F))).accepted);
+        std::this_thread::sleep_for(60ms);
+    }
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kVisualTracking);
+    EXPECT_EQ(sender.CallCount(), 0U);
     machine.Stop();
 }
 

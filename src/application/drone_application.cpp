@@ -135,6 +135,8 @@ void DroneApplication::BuildComponents() {
         state_machine_config.distance_stale = std::chrono::milliseconds(
             config_.visual_tracking.control.distance_stale_ms);
         state_machine_config.actuator = config_.actuator;
+        state_machine_config.interception = config_.interception;
+        state_machine_config.return_home = config_.return_home;
         mission_state_machine_ =
             std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
     }

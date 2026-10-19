@@ -726,6 +726,17 @@ TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
     EXPECT_FALSE(config.controller.enable_position_velocity_feedforward);
     EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
     EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 5u);
+    // S9/S10 入口默认关闭；返航默认启用以保证发射后有收口。
+    EXPECT_FALSE(config.interception.enabled);
+    EXPECT_TRUE(config.interception.auto_authorize);
+    EXPECT_EQ(config.interception.lock_frames, 10u);
+    EXPECT_DOUBLE_EQ(config.interception.min_range_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.interception.max_range_m, 10.0);
+    EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 0.0);
+    EXPECT_TRUE(config.return_home.enabled);
+    EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 5.0);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 2.0);
+    EXPECT_EQ(config.return_home.arrival_hold, std::chrono::milliseconds(1000));
     EXPECT_EQ(config.handover.lock_frames, 10u);
     EXPECT_EQ(config.handover.exit_lost_frames, 30u);
     EXPECT_EQ(config.handover.distance_lost_ms, std::chrono::milliseconds(3000));
@@ -798,6 +809,83 @@ TEST(ConfigTest, RejectsZeroVelocityUpdateThreshold) {
     value["target_estimator"]["min_velocity_position_updates"] = 0;
     const auto path =
         WriteTemporaryConfig(value, "drone_config_velocity_updates_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
+    json value = ReadSourceConfig();
+    value["interception"]["enabled"] = true;
+    value["interception"]["auto_authorize"] = false;
+    value["interception"]["lock_frames"] = 7;
+    value["interception"]["min_range_m"] = 3.5;
+    value["interception"]["max_range_m"] = 14.0;
+    value["interception"]["min_battery_percent"] = 35.0;
+    value["interception"]["authorization_timeout_ms"] = 1500;
+    value["return_home"]["enabled"] = true;
+    value["return_home"]["altitude_m"] = 6.5;
+    value["return_home"]["arrival_radius_m"] = 1.5;
+    value["return_home"]["arrival_vertical_m"] = 0.4;
+    value["return_home"]["arrival_speed_mps"] = 0.3;
+    value["return_home"]["arrival_hold_ms"] = 800;
+    value["return_home"]["timeout_ms"] = 45000;
+    value["return_home"]["fire_timeout_ms"] = 2500;
+    value["return_home"]["command_retry_ms"] = 700;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_interception_return.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.interception.enabled);
+    EXPECT_FALSE(config.interception.auto_authorize);
+    EXPECT_EQ(config.interception.lock_frames, 7u);
+    EXPECT_DOUBLE_EQ(config.interception.min_range_m, 3.5);
+    EXPECT_DOUBLE_EQ(config.interception.max_range_m, 14.0);
+    EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 35.0);
+    EXPECT_EQ(config.interception.authorization_timeout,
+              std::chrono::milliseconds(1500));
+    EXPECT_TRUE(config.return_home.enabled);
+    EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 6.5);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 1.5);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_vertical_m, 0.4);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_speed_mps, 0.3);
+    EXPECT_EQ(config.return_home.arrival_hold, std::chrono::milliseconds(800));
+    EXPECT_EQ(config.return_home.timeout, std::chrono::milliseconds(45000));
+    EXPECT_EQ(config.return_home.fire_timeout, std::chrono::milliseconds(2500));
+    EXPECT_EQ(config.return_home.command_retry, std::chrono::milliseconds(700));
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidInterceptionRange) {
+    json value = ReadSourceConfig();
+    value["interception"]["min_range_m"] = 12.0;
+    value["interception"]["max_range_m"] = 5.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_interception_range_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidReturnHomeAltitude) {
+    json value = ReadSourceConfig();
+    value["return_home"]["altitude_m"] = 0.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_return_home_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInterceptionEnabledWithoutReturnHome) {
+    json value = ReadSourceConfig();
+    value["interception"]["enabled"] = true;
+    value["return_home"]["enabled"] = false;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_interception_no_return.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

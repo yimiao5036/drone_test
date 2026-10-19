@@ -39,6 +39,7 @@
 #include "control/staleness_checker.h"
 #include "control/tracking_control_law.h"
 #include "control/tracking_types.h"
+#include "perception/geodetic_converter.h"
 #include "perception/target_estimator.h"
 
 namespace drone::state_machine {
@@ -84,6 +85,20 @@ constexpr uint32_t kReasonGroundStationTask = 7;
 /// 按控制律判丢语义映射为 102。
 constexpr uint32_t kReasonVisualTracking = 100;
 constexpr uint32_t kReasonVisualBrake = 102;
+/// 拦截后返航位置意图低位原因码（8 在 0~7 规划语义之外；S11~S14 V1 口径）。
+constexpr uint32_t kReasonReturnHome = 8;
+/// MAVLink 命令号/模式编码（状态机不引 MAVLink 头，与 Px4Link/工具同源）。
+constexpr uint16_t kMavCmdDoSetMode = 176;          // MAV_CMD_DO_SET_MODE
+constexpr uint16_t kMavCmdComponentArmDisarm = 400; // MAV_CMD_COMPONENT_ARM_DISARM
+constexpr float kMavModeFlagCustomModeEnabled = 1.0F;
+constexpr float kPx4MainModeOffboard = 6.0F;
+constexpr float kPx4SubModeOffboard = 0.0F;
+constexpr float kPx4MainModeAuto = 4.0F;
+constexpr float kPx4SubModeAutoLand = 6.0F;
+constexpr uint8_t kPx4FlightMainModeOffboard = 6;
+constexpr uint8_t kPx4FlightSubModeOffboard = 0;
+constexpr uint8_t kPx4FlightMainModeAuto = 4;
+constexpr uint8_t kPx4FlightSubModeAutoLand = 6;
 /// 局部 NED 坐标系编码（types.h 文件头约定：3=局部NED）。
 /// 视觉伺服输出（机体系→NED 旋转在控制律内完成）按该坐标系标注。
 constexpr uint8_t kFrameLocalNed = 3;
@@ -278,6 +293,8 @@ public:
           tracking_config_(config.tracking),
           tracking_law_(config.tracking),
           actuator_config_(config.actuator),
+          interception_(config.interception),
+          return_home_(config.return_home),
           test_hooks_enabled_(config.test_hooks_enabled),
           azimuth_converter_(config.tracking.camera.fx_px,
                              config.tracking.camera.cx_px),
@@ -289,6 +306,14 @@ public:
         // （`LoadAppConfig`）已校验，此处对程序化构造 fail-fast，先例见
         // FlightController 构造期 period 防御。
         config.actuator.Validate();
+        // 拦截入口与返航配置构造期兜底（程序化构造非法值 fail-fast）。
+        config.interception.Validate();
+        config.return_home.Validate();
+        if (config.interception.enabled && !config.return_home.enabled) {
+            throw std::invalid_argument(
+                "interception.enabled=true 时 return_home.enabled 必须为 true"
+                "（发射后必须有返航收口）");
+        }
         // 视场半角由内参推（主点非画面中心，见 control/tracking_config.h）：
         // 水平取 (W−cx) 侧、垂直取 (H−cy) 侧，构造期固化。
         const double width = static_cast<double>(config.tracking.camera.image_width);
@@ -380,6 +405,23 @@ public:
         net_fired_ = false;
         net_sequence_active_ = false;
         net_reset_pending_ = false;
+        // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
+        interception_fired_ = false;
+        interception_fire_timeout_ = false;
+        return_climb_phase_ = true;
+        return_px4_takeover_ = false;
+        return_timeout_warned_ = false;
+        return_home_wait_logged_ = false;
+        arrival_stable_since_ms_ = 0;
+        landing_command_sent_ = false;
+        landing_command_ms_ = 0;
+        landing_takeover_ = false;
+        landing_command_unavailable_logged_ = false;
+        landing_command_fail_count_ = 0;
+        disarm_command_sent_ = false;
+        disarm_command_ms_ = 0;
+        disarm_command_fail_count_ = 0;
+        mission_end_logged_ = false;
         PublishStatus(now_ms);
 
         running_.store(true, std::memory_order_release);
@@ -563,6 +605,9 @@ private:
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
         // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
         EvaluateHandover(now_ms);
+        // S9/S10 入口（2026-10-19）：S7 条件满足→S9；自动授权→S10。
+        // 放在位置/伺服意图之前，迁移当拍即可按新状态发布（S9/S10 继续伺服）。
+        EvaluateInterceptSequence(now_ms);
         EvaluatePositionIntent(now_ms);
         EvaluateVisualServoIntent(now_ms);
         // 告警位：S7 报告状态与实际控制输出背离标注（T9 评审裁决 I2）——本拍
@@ -578,10 +623,108 @@ private:
         // 捕网执行器联动（Task 10）：本拍迁移后立即评估（进入 S10 当拍触发、
         // 离开拦截序列当拍复位；入队失败下拍重试，误差 <1 决策周期）。
         EvaluateNetActuator();
+        // 单发拦截结束（S10→S11→S12）与返航/降落（S11~S14，2026-10-19）。
+        // 顺序：先完成拦截判定，再执行返航/降落；S12 的位置意图在本拍最后发布。
+        EvaluateInterceptionCompletion(now_ms);
+        EvaluateReturnHome(now_ms);
+        EvaluateLandingAndDisarm(now_ms);
 
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
             PublishStatus(now_ms);
+        }
+    }
+
+    /// S9/S10 入口判据（interception 配置节，2026-10-19）。
+    /// 条件：视觉 LOCKED 连续帧 + 测距窗口 + PX4 Offboard/armed/姿态/位置有效
+    /// + 命令接口就绪 + 机构未触发/复位挂起。
+    bool InterceptEntrySatisfied(uint64_t now_ms) const {
+        if (!interception_.enabled) {
+            return false;
+        }
+        if (!latest_flight_) {
+            return false;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.connected || !flight.armed || !flight.attitude_valid ||
+            !flight.local_position_valid) {
+            return false;
+        }
+        if (interception_.min_battery_percent > 0.0) {
+            if (!flight.battery_remaining_valid ||
+                static_cast<double>(flight.battery_remaining_pct) <
+                    interception_.min_battery_percent) {
+                return false;
+            }
+        }
+        if (flight.flight_mode != kPx4FlightMainModeOffboard ||
+            flight.flight_sub_mode != kPx4SubModeOffboard) {
+            return false;
+        }
+        if (command_sender_ == nullptr || net_fired_ || net_reset_pending_) {
+            return false;  // 命令接口未注入 / 机构已触发 / 复位未完成
+        }
+        if (VisualStatusStale(now_ms) || !latest_visual_status_ ||
+            latest_visual_status_->state != common::VisualTargetState::kLocked) {
+            return false;
+        }
+        if (consecutive_lock_frames_ < interception_.lock_frames) {
+            return false;
+        }
+        if (!latest_distance_ || !latest_distance_->valid ||
+            !DistanceFresh(now_ms)) {
+            return false;
+        }
+        const double range_m =
+            static_cast<double>(latest_distance_->forward_distance_m);
+        return std::isfinite(range_m) && range_m >= interception_.min_range_m &&
+               range_m <= interception_.max_range_m;
+    }
+
+    /// S7→S9（入口条件满足）、S9 条件失效→S7、S9 自动授权→S10 /
+    /// 非自动授权超时→S12。S10 的发射/完成由 EvaluateNetActuator +
+    /// EvaluateInterceptionCompletion 处理。
+    void EvaluateInterceptSequence(uint64_t now_ms) {
+        if (!interception_.enabled) {
+            return;
+        }
+        const auto state = CurrentState();
+        if (state == common::MissionState::kVisualTracking) {
+            if (!InterceptEntrySatisfied(now_ms)) {
+                return;
+            }
+            const double range_m = latest_distance_
+                ? static_cast<double>(latest_distance_->forward_distance_m)
+                : std::numeric_limits<double>::quiet_NaN();
+            SPDLOG_WARN("拦截入口条件满足: LOCKED 帧={} 测距={:.2f}m（窗口 "
+                        "{:.1f}~{:.1f}m）→ S9",
+                        consecutive_lock_frames_, range_m,
+                        interception_.min_range_m, interception_.max_range_m);
+            TransitionTo(common::MissionState::kInterceptReady,
+                         "拦截入口条件满足");
+            return;
+        }
+        if (state == common::MissionState::kInterceptReady) {
+            if (!InterceptEntrySatisfied(now_ms)) {
+                SPDLOG_WARN("拦截条件失效，退出 S9 返回视觉跟踪");
+                TransitionTo(common::MissionState::kVisualTracking,
+                             "拦截条件失效");
+                return;
+            }
+            if (interception_.auto_authorize) {
+                SPDLOG_WARN("拦截自动授权通过 → S10");
+                TransitionTo(common::MissionState::kInterceptExecuting,
+                             "自动授权通过");
+                return;
+            }
+            const uint64_t wait_ms =
+                now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
+            if (wait_ms >= static_cast<uint64_t>(
+                               interception_.authorization_timeout.count())) {
+                SPDLOG_WARN("拦截授权超时，进入返航");
+                TransitionTo(common::MissionState::kReturnHome,
+                             "拦截授权超时");
+            }
         }
     }
 
@@ -1018,11 +1161,13 @@ private:
         last_intent_target_ = target;
     }
 
-    /// 组装并发布位置引导意图（S5 估计引导与 S6 冻结续发共用）。
+    /// 组装并发布位置引导意图（S5/S6 引导与 S12 返航共用）。
     /// 高度无效时 pos_z 为 NaN（合法语义）：原样透传，由 FlightController
     /// 有限性门禁拒绝，状态机侧不得改成 0。
+    /// reason_low：低位原因码（S5/S6=7 地面站任务，S12=8 返航）。
     void PublishPositionIntent(const PositionIntentTarget& target,
-                               uint64_t now_ms) {
+                               uint64_t now_ms,
+                               uint32_t reason_low = kReasonGroundStationTask) {
         common::ControlIntent intent;
         intent.header.sequence = ++intent_sequence_;
         intent.header.source_time_ms = now_ms;
@@ -1041,9 +1186,9 @@ private:
         intent.feedforward_vz_mps = target.feedforward_vz_mps;
         intent.feedforward_valid_mask = target.feedforward_valid_mask;
         // bit31 显式请求控制权（FlightController 授权链必要条件）+
-        // 低位 7=地面站任务下发。
+        // 低位原因码（S5/S6=7 地面站任务；S12=8 返航）。
         intent.reason_code =
-            common::kControlIntentReasonRequestControl | kReasonGroundStationTask;
+            common::kControlIntentReasonRequestControl | reason_low;
         intent.valid_until_ms = now_ms + intent_valid_for_ms_;
         (void)intent_output_.Publish(
             std::make_shared<const common::ControlIntent>(intent));
@@ -1060,8 +1205,13 @@ private:
         if (!estimation_inputs_active_) {
             return;
         }
-        if (CurrentState() != common::MissionState::kVisualTracking) {
-            return;  // 离开 S7 的收口在 EvaluateHandover 内完成（含标志复位）
+        const auto state = CurrentState();
+        // S7 正常跟踪；S9/S10 期间继续输出伺服意图（保持瞄准/稳定，避免
+        // 拦截准备段因意图停发触发控制器 COAST 刹车）。S11/S12 起返航接管。
+        if (state != common::MissionState::kVisualTracking &&
+            state != common::MissionState::kInterceptReady &&
+            state != common::MissionState::kInterceptExecuting) {
+            return;
         }
         servo_intent_active_ = false;  // 本拍默认停发（S7 背离告警位按拍评估）
         const auto intent = BuildVisualIntent(now_ms);
@@ -1275,6 +1425,291 @@ private:
         return false;
     }
 
+    // ---- 拦截后返航/降落（S11~S14，2026-10-19 V1 单发口径） ----
+
+    /// Home 在 EKF 锚点坐标系下的局部 NED（返航目标）。
+    /// 使用 Home 经纬度 + 锚点换算，避免依赖 HOME_POSITION.x/y/z（MAVLink
+    /// 报文未携带 PX4 的 valid_lpos 标志）；home/锚点/当前位置任一无效返回 nullopt。
+    std::optional<perception::LocalNedCoordinate> HomeLocalNed() const {
+        if (!latest_flight_.has_value()) {
+            return std::nullopt;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.home_valid || !flight.ned_ref_valid ||
+            !flight.local_position_valid) {
+            return std::nullopt;
+        }
+        const perception::GeodeticCoordinate anchor{
+            static_cast<double>(flight.ned_ref_lat_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_lon_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_alt_mm) * 1e-3};
+        const perception::GeodeticCoordinate home{
+            static_cast<double>(flight.home_lat_1e7) * 1e-7,
+            static_cast<double>(flight.home_lon_1e7) * 1e-7,
+            static_cast<double>(flight.home_altitude_mm) * 1e-3};
+        return perception::GeodeticToLocalNed(anchor, home);
+    }
+
+    /// 发布返航位置意图（低位原因码 8；不带目标速度前馈）。
+    void PublishReturnHomeIntent(float x, float y, float z, uint64_t now_ms) {
+        PositionIntentTarget target;
+        target.x = x;
+        target.y = y;
+        target.z = z;
+        target.frame_id = kFrameLocalNed;
+        PublishPositionIntent(target, now_ms, kReasonReturnHome);
+    }
+
+    /// 单发拦截完成：S10 发射命令入队/超时 → S11 记录 → S12 返航。
+    /// V1 不判断命中；摄像头状态不参与返航判断。
+    void EvaluateInterceptionCompletion(uint64_t now_ms) {
+        if (!return_home_.enabled) {
+            return;
+        }
+        const auto state = CurrentState();
+        if (state == common::MissionState::kInterceptExecuting) {
+            // 同一拍刚由 ForceStateForTest 进入 S10 时，state_entered_ms_ 可能
+            // 大于本拍 now_ms（unsigned 相减会回绕成巨大值），必须钳到 0。
+            const uint64_t held_ms =
+                now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
+            if (net_fired_) {
+                interception_fired_ = true;
+                SPDLOG_WARN("单发拦截命令已入队，进入 POST_INTERCEPT（V1 不判命中）");
+                TransitionTo(common::MissionState::kPostIntercept,
+                             "单发拦截命令已入队（不判命中）");
+            } else if (held_ms >=
+                       static_cast<uint64_t>(return_home_.fire_timeout.count())) {
+                interception_fire_timeout_ = true;
+                SPDLOG_WARN("单发拦截发射超时（命令未入队），按失败结果返航");
+                TransitionTo(common::MissionState::kPostIntercept,
+                             "单发拦截发射超时");
+            }
+            return;
+        }
+        if (state == common::MissionState::kPostIntercept) {
+            TransitionTo(common::MissionState::kReturnHome,
+                         interception_fired_ ? "单发拦截已发射，进入返航"
+                                             : "单发拦截发射失败，进入返航");
+        }
+    }
+
+    /// S12 返航：低于 5m 先原地爬升，再位置设定值飞 Home；到达后进 S13。
+    /// PX4 离开 Offboard（failsafe/人工）→ 停止争控，转 S13 仅监控降落。
+    void EvaluateReturnHome(uint64_t now_ms) {
+        if (!return_home_.enabled ||
+            CurrentState() != common::MissionState::kReturnHome) {
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (flight.flight_mode != kPx4FlightMainModeOffboard ||
+            flight.flight_sub_mode != kPx4FlightSubModeOffboard) {
+            return_px4_takeover_ = true;
+            SPDLOG_WARN("返航中 PX4 已离开 Offboard（mode={}/{}），停止返航设定值",
+                        flight.flight_mode, flight.flight_sub_mode);
+            TransitionTo(common::MissionState::kLanding, "PX4 接管返航/降落");
+            return;
+        }
+        if (!flight.local_position_valid) {
+            if (!return_home_wait_logged_) {
+                SPDLOG_WARN("返航等待 PX4 局部位置有效");
+                return_home_wait_logged_ = true;
+            }
+            return;
+        }
+        // 同一拍刚进入 S12 时 state_entered_ms_ 可能晚于本拍 now_ms，unsigned
+        // 相减会回绕；钳到 0，避免"刚进返航就超时"。
+        const uint64_t return_elapsed_ms =
+            now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
+        if (return_elapsed_ms >=
+            static_cast<uint64_t>(return_home_.timeout.count())) {
+            if (!return_timeout_warned_) {
+                SPDLOG_WARN("返航超时，原地悬停等待地面站/人工处置");
+                return_timeout_warned_ = true;
+            }
+            PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
+                                    flight.local_z_m, now_ms);
+            return;
+        }
+        const auto home = HomeLocalNed();
+        if (!home.has_value()) {
+            if (!return_home_wait_logged_) {
+                SPDLOG_WARN("返航等待 Home/EKF 锚点有效（无局部返航基准）");
+                return_home_wait_logged_ = true;
+            }
+            // 无 Home 基准时原地悬停，不盲目返航。
+            PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
+                                    flight.local_z_m, now_ms);
+            return;
+        }
+
+        // 返航高度：低于 5m 先原地爬升；≥5m 保持当前高度。
+        const double relative_alt_m =
+            home->down_m - static_cast<double>(flight.local_z_m);
+        double target_z = static_cast<double>(flight.local_z_m);
+        if (relative_alt_m < return_home_.altitude_m) {
+            target_z = home->down_m - return_home_.altitude_m;
+        } else {
+            return_climb_phase_ = false;
+        }
+        if (return_climb_phase_) {
+            const bool climbed =
+                std::fabs(static_cast<double>(flight.local_z_m) - target_z) <=
+                    return_home_.arrival_vertical_m &&
+                std::fabs(static_cast<double>(flight.vz_mps)) <=
+                    return_home_.arrival_speed_mps;
+            if (climbed) {
+                return_climb_phase_ = false;
+                SPDLOG_INFO("返航爬升完成（相对 Home {:.1f}m），开始水平返航",
+                            return_home_.altitude_m);
+            }
+        }
+        const double target_x = return_climb_phase_
+                                    ? static_cast<double>(flight.local_x_m)
+                                    : home->north_m;
+        const double target_y = return_climb_phase_
+                                    ? static_cast<double>(flight.local_y_m)
+                                    : home->east_m;
+        PublishReturnHomeIntent(static_cast<float>(target_x),
+                                static_cast<float>(target_y),
+                                static_cast<float>(target_z), now_ms);
+
+        if (return_climb_phase_) {
+            return;
+        }
+        const double horizontal_m = std::hypot(
+            home->north_m - static_cast<double>(flight.local_x_m),
+            home->east_m - static_cast<double>(flight.local_y_m));
+        const double vertical_m =
+            std::fabs(target_z - static_cast<double>(flight.local_z_m));
+        const double horizontal_speed_mps =
+            std::hypot(static_cast<double>(flight.vx_mps),
+                       static_cast<double>(flight.vy_mps));
+        const bool inside = horizontal_m <= return_home_.arrival_radius_m &&
+                            vertical_m <= return_home_.arrival_vertical_m &&
+                            horizontal_speed_mps <= return_home_.arrival_speed_mps;
+        if (!inside) {
+            arrival_stable_since_ms_ = 0;
+            return;
+        }
+        if (arrival_stable_since_ms_ == 0) {
+            arrival_stable_since_ms_ = now_ms;
+        }
+        const uint64_t arrival_held_ms =
+            now_ms >= arrival_stable_since_ms_
+                ? now_ms - arrival_stable_since_ms_
+                : 0;
+        if (arrival_held_ms >=
+            static_cast<uint64_t>(return_home_.arrival_hold.count())) {
+            TransitionTo(common::MissionState::kLanding,
+                         "到达 Home 附近，进入降落");
+        }
+    }
+
+    /// S13 发 AUTO.LAND（4/6），S14 前发 DISARM；PX4 接管时只监控不争控。
+    void EvaluateLandingAndDisarm(uint64_t now_ms) {
+        if (!return_home_.enabled) {
+            return;
+        }
+        const auto state = CurrentState();
+        if (state == common::MissionState::kLanding) {
+            if (!latest_flight_.has_value()) {
+                return;
+            }
+            const auto& flight = *latest_flight_;
+            if (flight.landed_state_valid && flight.landed) {
+                if (!flight.armed) {
+                    TransitionTo(common::MissionState::kDisarmed,
+                                 "PX4 已确认 landed + disarmed，任务结束");
+                    return;
+                }
+                if (command_sender_ == nullptr) {
+                    if (!landing_command_unavailable_logged_) {
+                        SPDLOG_ERROR("S13 无法 DISARM：命令接口未注入");
+                        landing_command_unavailable_logged_ = true;
+                    }
+                    return;
+                }
+                if (now_ms - disarm_command_ms_ >=
+                    static_cast<uint64_t>(return_home_.command_retry.count())) {
+                    const bool queued = command_sender_->SendCommand(
+                        kMavCmdComponentArmDisarm, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+                        0.f);
+                    disarm_command_ms_ = now_ms;
+                    if (queued) {
+                        if (!disarm_command_sent_) {
+                            disarm_command_sent_ = true;
+                            SPDLOG_INFO("S14 前 DISARM 命令已入队");
+                        }
+                    } else {
+                        const uint64_t count = ++disarm_command_fail_count_;
+                        if (ShouldLogThrottled(count)) {
+                            SPDLOG_WARN("DISARM 入队失败（下拍重试）累计={}", count);
+                        }
+                    }
+                }
+                return;
+            }
+
+            if (landing_takeover_) {
+                return;  // PX4 主导返航/降落，仅等待 landed/disarmed
+            }
+            if (command_sender_ == nullptr) {
+                if (!landing_command_unavailable_logged_) {
+                    SPDLOG_ERROR("S13 无法发 AUTO.LAND：命令接口未注入");
+                    landing_command_unavailable_logged_ = true;
+                }
+                return;
+            }
+            const bool offboard =
+                flight.flight_mode == kPx4FlightMainModeOffboard &&
+                flight.flight_sub_mode == kPx4FlightSubModeOffboard;
+            if (!offboard) {
+                const bool auto_land =
+                    flight.flight_mode == kPx4FlightMainModeAuto &&
+                    flight.flight_sub_mode == kPx4FlightSubModeAutoLand;
+                if (!auto_land) {
+                    landing_takeover_ = true;
+                    SPDLOG_WARN(
+                        "S13 PX4 已离开 Offboard 且非 AUTO.LAND（mode={}/{}），"
+                        "停止命令重试，等待降落",
+                        flight.flight_mode, flight.flight_sub_mode);
+                }
+                return;
+            }
+            if (now_ms - landing_command_ms_ >=
+                static_cast<uint64_t>(return_home_.command_retry.count())) {
+                const bool queued = command_sender_->SendCommand(
+                    kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled,
+                    kPx4MainModeAuto, kPx4SubModeAutoLand, 0.f, 0.f, 0.f, 0.f);
+                landing_command_ms_ = now_ms;
+                if (queued) {
+                    if (!landing_command_sent_) {
+                        landing_command_sent_ = true;
+                        SPDLOG_INFO("S13 AUTO.LAND 命令已入队");
+                    }
+                } else {
+                    const uint64_t count = ++landing_command_fail_count_;
+                    if (ShouldLogThrottled(count)) {
+                        SPDLOG_WARN("AUTO.LAND 入队失败（下拍重试）累计={}", count);
+                    }
+                }
+            }
+            return;
+        }
+        if (state == common::MissionState::kDisarmed && !mission_end_logged_) {
+            mission_end_logged_ = true;
+            SPDLOG_INFO("任务结束: S14 DISARMED，拦截结果={}",
+                        interception_fired_
+                            ? "已发射"
+                            : interception_fire_timeout_
+                                  ? "发射失败"
+                                  : "未发射");
+        }
+    }
+
     /// GPS位置引导的最低导航前置条件。后续接入控制前还需增加模式/高度/电池等门禁。
     // GPS 引导最低门禁：连接、3D fix、全局位置和 Home 必须同时有效。
     bool HasNavigationForGps() const {
@@ -1312,6 +1747,32 @@ private:
             state_ = next_state;
             state_entered_ms_ = now_ms;
             ++transition_count_;
+            // 拦截后返航/降落段入口状态初始化（S11~S14，2026-10-19）。
+            if (next_state == common::MissionState::kReturnHome) {
+                return_climb_phase_ = true;
+                return_px4_takeover_ = false;
+                return_timeout_warned_ = false;
+                return_home_wait_logged_ = false;
+                arrival_stable_since_ms_ = 0;
+                SPDLOG_INFO("返航开始: Home 局部NED 由 Home+EKF锚点换算，"
+                            "返航高度 {:.1f}m，到达半径 {:.1f}m",
+                            return_home_.altitude_m, return_home_.arrival_radius_m);
+            } else if (next_state == common::MissionState::kLanding) {
+                landing_command_sent_ = false;
+                landing_command_ms_ = 0;
+                landing_takeover_ = return_px4_takeover_;
+                landing_command_unavailable_logged_ = false;
+                landing_command_fail_count_ = 0;
+                disarm_command_sent_ = false;
+                disarm_command_ms_ = 0;
+                disarm_command_fail_count_ = 0;
+                SPDLOG_INFO("降落阶段: {}",
+                            landing_takeover_
+                                ? "PX4 已接管，停止发设定值并等待 landed/disarmed"
+                                : "发 AUTO.LAND（4/6）");
+            } else if (next_state == common::MissionState::kDisarmed) {
+                mission_end_logged_ = false;
+            }
         }
         PublishStatus(now_ms);
     }
@@ -1444,6 +1905,9 @@ private:
     uint64_t hot_backup_starved_count_ = 0;
     /// 捕网执行器配置（构造注入，actuator 配置节同源；装机确认前为默认值）。
     const config::ActuatorConfig actuator_config_;
+    /// 拦截入口/授权与返航配置（构造注入；JSON interception/return_home 节）。
+    const config::InterceptionConfig interception_;
+    const config::ReturnHomeConfig return_home_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
     /// 捕网触发命令已入队（防重复触发；离开拦截序列清除，再进入可重新触发）。
@@ -1454,6 +1918,23 @@ private:
     bool net_reset_pending_ = false;
     /// 捕网命令入队失败累计计数（节流日志用）。
     uint64_t net_command_fail_count_ = 0;
+    // ---- 拦截后返航（S11~S14，2026-10-19）----
+    bool interception_fired_ = false;       ///< 单发命令已入队
+    bool interception_fire_timeout_ = false;///< 单发命令重试超时
+    bool return_climb_phase_ = true;        ///< S12：先爬升到 5m（若不足）
+    bool return_px4_takeover_ = false;      ///< S12 中 PX4 离开 Offboard（停止争控）
+    bool return_timeout_warned_ = false;    ///< 返航超时告警已打印
+    bool return_home_wait_logged_ = false;  ///< Home/锚点无效告警已打印
+    uint64_t arrival_stable_since_ms_ = 0;  ///< 到达判据连续成立起点
+    bool landing_command_sent_ = false;     ///< AUTO.LAND 曾成功入队
+    uint64_t landing_command_ms_ = 0;       ///< 最近一次 AUTO.LAND 入队尝试时刻
+    bool landing_takeover_ = false;         ///< S13 由 PX4 接管（不再发 AUTO.LAND）
+    bool landing_command_unavailable_logged_ = false;  ///< 命令接口未注入只报一次
+    uint64_t landing_command_fail_count_ = 0;          ///< AUTO.LAND 入队失败计数
+    bool disarm_command_sent_ = false;      ///< DISARM 曾成功入队
+    uint64_t disarm_command_ms_ = 0;        ///< 最近一次 DISARM 入队尝试时刻
+    uint64_t disarm_command_fail_count_ = 0;///< DISARM 入队失败计数
+    bool mission_end_logged_ = false;       ///< S14 结束日志只打一次
     uint64_t intent_sequence_ = 0;
     uint64_t last_intent_publish_ms_ = 0;
     uint64_t intent_stale_count_ = 0;

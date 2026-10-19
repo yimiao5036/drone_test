@@ -280,6 +280,37 @@ python3 tools/feedforward_report.py logs/ff_off.csv logs/ff_on.csv
 - **非门禁**：不替代 G2/G3；G3 以 FF 默认关闭回归（2026-10-19 复跑全 PASS）。
   退出码：FF 专项剧本/判据通过 → 0，否则 3。
 
+### 2.3.2 stage4-return S9~S14 返航专项（`--sitl-stage4-return`，非门禁）
+
+装配与 stage4-tune 同构（状态机 + 控制器 + PX4Link + 注入台），剧本验证
+**S9/S10 入口判据 → 发射 → S11~S14 返航/降落/上锁**：
+
+```text
+bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ SEARCHING→LOCKED
+→ S6→S7 视觉伺服 → 测距收敛（d_exp=10m）→ interception 入口（LOCKED 帧/
+测距 2~12m/Offboard+armed/命令接口就绪）→ S9 → 自动授权 S10 → 捕网触发
+→ S11（不判命中）→ S12 算力板位置返航 Home → 到达 → S13 AUTO.LAND
+→ S14 DISARMED
+```
+
+```bash
+# 使用专用 SITL 配置：复制 px4_sitl.json + interception(enabled=true, 2~12m)
+# + return_home 默认值；仅 SITL 验证使用，禁止作为生产配置。
+./build/px4_link_smoke --config config/px4_sitl_return.json --duration 120 \
+  --sitl-stage4-return
+```
+
+- 环境前置与 G3 相同（§2.2：朝北出生、干净 SITL、`MPC_XY_VEL_MAX=2.0`、
+  GCS 心跳）；**每次运行前重启 SITL**（目标为 Home 相对绝对坐标）。
+- 判据（工具报告）：状态序列包含 S9/S10/S12/S13/S14；S10 发射（187）后
+  由状态机接管返航；S13 AUTO.LAND（176，4/6）与 S14 前 DISARM（400）；
+  飞行包线/回收链安全；CSV 可写。
+- 2026-10-19 本机 WSL2 实跑：**全 PASS**，状态机迁移 11 次、错误 0 次；
+  最大相对高度 4.99m、最大北向 28.93m；S12 起始射程约 11.6m；证据 CSV
+  `tools/return_evidence/stage4_return_20261019.csv`。
+- **非门禁**：不替代 G2/G3；`interception.enabled` 生产默认关闭，射程为
+  占位值，需按实机捕网有效射程与授权策略冻结后再开启。
+
 ### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
 
 ```bash

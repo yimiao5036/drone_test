@@ -71,6 +71,12 @@ struct MissionStateMachineConfig {
     /// 构造期对其实施 `Validate()` 兜底（程序化构造的 channel 越界会索引固定
     /// 7 元素参数数组，属 UB；参照 FlightController 构造期 period 防御先例）。
     config::ActuatorConfig actuator;
+    /// S9/S10 入口判据与授权（interception 配置节，2026-10-19）。默认关闭，
+    /// 需实机射程/授权策略验证后开启。
+    config::InterceptionConfig interception;
+    /// 拦截后返航（S11~S14，return_home 配置节）：单发发射结束→算力板位置
+    /// 返航→AUTO.LAND→DISARM。默认启用；测试可关闭以隔离捕网执行器语义。
+    config::ReturnHomeConfig return_home;
     /// 测试钩子开关（默认关闭）：只有显式置位后 `ForceStateForTest` 才生效。
     /// **生产装配（`DroneApplication`）必须保持默认 false** —— 该入口可强推到
     /// 拦截状态（S9/S10），在 `enable_control=true` 装配下会经命令窄接口发出
@@ -138,7 +144,11 @@ public:
 /// enable_control 装配门禁决定。
 /// 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）发一次
 /// 捕网触发命令（MAV_CMD_DO_SET_ACTUATOR），离开拦截序列（S9/S10）发复位
-/// 行程；拦截序列入口判据（授权策略/射程门限）属后续任务，本类不发明。
+/// 行程。2026-10-19：S9/S10 入口判据由 `interception` 配置节提供（默认
+/// disabled=false；锁定帧/测距窗口/Offboard+armed/命令接口就绪），自动授权后
+/// 进入 S10；S11~S14 单发返航闭环——S10 发射命令入队/超时 → S11 记录
+/// （不判命中）→ S12 算力板位置返航 Home → S13 AUTO.LAND → S14 DISARMED；
+/// 正常返航不使用 PX4 自动 RTL。
 class MissionStateMachine final : public IMissionStateMachine {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});
@@ -172,8 +182,9 @@ public:
     // ---- 测试入口（生产装配不可达） ----
     /// 强制提交一次状态迁移（单测/SITL 验收入口；Start 后调用，由决策线程消费
     /// 进入/离开动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
-    /// EvaluateNetActuator），用于验证当前尚无生产入口的状态——拦截序列
-    /// S9/S10/S11（入口判据=授权策略/射程门限，属后续任务，本任务不发明）。
+    /// EvaluateNetActuator），用于验证拦截序列 S9/S10/S11 的进入/离开动作。
+    /// S9/S10 生产入口已由 `interception` 配置节提供（默认关闭），本入口仍用于
+    /// 自动授权之外的场景与测试注入。
     ///
     /// **风险与门控**：强推到 S9/S10 会让状态机在 `enable_control=true` 装配下
     /// 经命令窄接口发出**捕网触发命令（动作不可逆）**。因此本函数要求构造配置
