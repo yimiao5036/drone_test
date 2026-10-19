@@ -34,8 +34,10 @@ kControlIntent 当前无消费者，不产生真实控制输出。**
 独立 Topic，互不干扰；影子保留供观察（见 `visual_tracking_shadow.h` 并存说明）。
 
 不做什么：不接 Px4Link；不做多目标选举；不做 NED 空间转换（属
-TargetEstimator 融合阶段）；双目测距未实现前 distance_valid 恒 false
-（距离通道走配置的 no_distance_action 支路）。
+TargetEstimator 融合阶段）。距离通道仅在注入 `StereoTargetDistance` 且该帧
+有效时启用；未注入/无效时 distance_valid 恒 false，走配置的
+`no_distance_action` 支路。生产装配当前尚未调用 `SetEstimationInputs`
+（视觉/测距输入未接线），S7 保持影子；SITL 验收工具会注入三路输入。
 
 ## 2. 接口与数据流
 

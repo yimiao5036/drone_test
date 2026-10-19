@@ -36,43 +36,49 @@
 - 线程间通过消息队列或通知机制通信
 - 各模块可独立编译、独立测试
 
-### 7 个线程
+### 主要线程
 
 | 线程 | 职责 |
 |------|------|
-| 摄像头采集线程 | 网口采集原始画面 → 内存池 A |
-| YOLO 识别线程 | 从内存池 A 取画面识别目标 → 内存池 B |
-| 图传发送线程 | 从内存池 B 取图像 → 网口发送给图传 |
+| 摄像头采集线程 | RTSP/UVC 采集原始画面 → 解码 → 内存池 |
+| YOLO 识别线程 | 取解码帧识别目标 → 检测结果 |
+| 图传发送线程 | 叠加帧 → 编码 → RTSP 推送 |
 | PX4 串口通信线程 | 与 PX4 飞控 MAVLink 双向通信 |
 | 电台数传线程 | 与地面站 MAVLink 双向通信 |
-| 双目深度线程（规划） | 消费左右同步图像/厂商深度输出，生成带质量与时间戳的距离数据；硬件接口确认前不启用 |
-| 状态机与控制线程 | 消费各线程数据，轨迹预测、状态机决策、生成控制指令 |
+| 双目深度线程 | 消费左右目帧与检测框，输出带质量/时间戳的稀疏 Census 距离（影子，无控制输出） |
+| 状态机与控制线程 | 消费各线程数据，状态机决策并生成控制意图；`enable_control=false` 时控制器影子停发 |
 
 ## 目录结构
 
 ```
 drone_test/
 ├── CMakeLists.txt
-├── README.md
-├── docs/                    # 全部设计文档（含 开发思路.md、状态机设计.md）
-├── include/
-│   ├── communication/       # serial_port.h, px4_link.h, ground_station_link.h
-│   ├── perception/          # yolo_detector.h, optical_flow_estimator.h, laser_range_finder.h,
-│   │                        #   perception_fusion.h, target_estimator.h
-│   ├── control/             # flight_controller.h
-│   ├── state_machine/       # mission_state_machine.h
-│   ├── video/               # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h
-│   ├── video_transmission/  # video_sender.h
+├── main.cpp                 # 唯一正式入口：配置/日志/信号 + DroneApplication
+├── README.md / CLAUDE.md / AGENTS.md
+├── docs/                    # 全部设计、进度、排查与协议文档
+├── include/                 # 与 src/ 镜像；每个模块同级维护 *.md 实现文档
+│   ├── application/         # drone_application.h（组件装配根）
+│   ├── common/              # topic.h, types.h, logger.h, latency_statistics.h
+│   ├── video/               # RTSP/UVC 接收、解码、帧池、SBS 拆分、RGA 转存、叠加
+│   ├── video_transmission/  # 编码 + 图传
+│   ├── perception/          # YOLO/RKNN、双目测距、WGS84→NED、目标估计、视觉稳定性
+│   ├── communication/       # serial_port.h, mavlink_handler.h, px4_link.h, ground_station_link.h
+│   ├── control/             # flight_controller.h, tracking_control_law.h, shadow 等
+│   ├── state_machine/       # mission_state_machine.h（S0~S16）
 │   ├── health/              # health_manager.h
-│   ├── common/              # logger.h, topic.h, types.h
-│   └── config/              # config.h（配置文件解析与参数管理）
-├── src/                     # 对应的 .cpp 实现文件 + main.cpp
-├── tests/                   # 单元测试（含 tests/skeleton/ 骨架冒烟测试），与 src/ 结构对应
-├── config/                  # 配置文件（JSON/YAML）
-└── third_party/
-    ├── mavlink/             # MAVLink 库
-    ├── spdlog/              # spdlog 日志库
-    └── nlohmann/            # JSON 库
+│   └── config/              # config.h（AppConfig 解析与校验）
+├── src/                     # 与 include/ 对应的 .cpp 实现
+├── tests/                   # Google Test，目录与 src/ 对应
+├── config/                  # JSON 配置 + 相机标定/立体校正矩阵
+├── tools/                   # SITL/冒烟、探针、标定、Web 地面站、证据目录
+├── models/                  # RKNN 模型（生产文件名见 config.json）
+├── third_party/             # spdlog / mavlink / nlohmann / rknn 头文件
+├── target_tracker/          # 独立多目标追踪库（不接入主应用）
+├── visual_track_control/    # 独立视觉控制律库（核心律已移植主工程）
+├── stereo_depth/            # 独立双目深度子工程（不接入）
+├── yolo_pt/                 # 模型训练与 pt→RKNN 导出（Python）
+├── videoPart/               # 视频/RKNN 历史验证原型
+└── deploy/ logs/            # 部署文件 / 运行时日志（logs 不入库）
 ```
 
 ## 语言、命名与信息核实规则

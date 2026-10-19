@@ -257,7 +257,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `InterceptEntrySatisfied`——`interception.enabled`、视觉新鲜且 `LOCKED`、
   `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
   `[min_range_m,max_range_m]`、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
-  `command_sender_` 非空、`net_fired_/net_reset_pending_` 均为 false。满足→S9；
+  `command_sender_` 非空、`net_fired_/net_reset_pending_` 均为 false；可选
+  `min_battery_percent>0` 时还要求电池遥测有效且剩余电量达标（**当前生产保持 0，
+  实机后冻结**）。满足→S9；
   S9 条件失效→S7；`auto_authorize=true`→S10；false 时等
   `authorization_timeout_ms` 超时→S12。S9/S10 仍走 `EvaluateVisualServoIntent`
   保持伺服/瞄准，不因状态切换产生意图空窗。默认关闭（生产安全）。
