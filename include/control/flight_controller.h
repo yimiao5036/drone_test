@@ -142,9 +142,11 @@ public:
     /// 超龄在转入 COAST 那一拍 +1，不再逐拍增长；位置式意图无 Home 基准
     /// 拒绝按拍计，直至意图超龄转 COAST）。
     uint64_t RejectedIntentCount() const;
-    /// 限幅触发累计计数（速度幅值等比钳制 + 位置式围栏钳制，
-    /// 每次钳制生效 +1，供 G2 验收核对）。
+    /// 限幅触发累计计数（速度幅值等比钳制 + 位置式围栏钳制 +
+    /// 位置前馈幅值钳制，每次钳制生效 +1，供 G2 验收核对）。
     uint64_t ClampedCount() const;
+    /// 位置前馈因非有限值/未知掩码位被丢弃的轴次累计计数（P3）。
+    uint64_t FeedforwardDroppedCount() const;
     /// 注入 PX4 链路只读快照源（控制权门禁与 Home 围栏数据源）；
     /// 未注入时授权链恒不通过，控制器保持 IDLE 影子运行。
     void SetPx4LinkSource(const communication::IPx4Link* link);

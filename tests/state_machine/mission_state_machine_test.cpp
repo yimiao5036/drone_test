@@ -251,8 +251,13 @@ TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
 
     ASSERT_TRUE(machine.Start());
     DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    auto estimated = MakeValidEstimatedTarget();
+    estimated.vel_x_mps = 2.5f;
+    estimated.vel_y_mps = -1.5f;
+    estimated.vel_z_mps = 0.5f;
+    estimated.velocity_valid_mask = common::kVelocityValidAll;
     (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(MakeValidEstimatedTarget()));
+        std::make_shared<const common::TargetState>(estimated));
 
     const auto intent = WaitForIntent(intent_subscription);
     ASSERT_TRUE(intent.has_value());
@@ -266,6 +271,94 @@ TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
     EXPECT_EQ(intent->header.valid_for_ms, 300U);
     EXPECT_EQ(intent->valid_until_ms,
               intent->header.receive_time_ms + intent->header.valid_for_ms);
+    // P3：S5 位置意图携带逐轴速度前馈。
+    EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidAll);
+    EXPECT_FLOAT_EQ(intent->feedforward_vx_mps, 2.5f);
+    EXPECT_FLOAT_EQ(intent->feedforward_vy_mps, -1.5f);
+    EXPECT_FLOAT_EQ(intent->feedforward_vz_mps, 0.5f);
+
+    machine.Stop();
+}
+
+// P3：未置位的速度轴必须清零，避免无效 KF 值污染意图；位置照发。
+TEST(MissionStateMachineTest, GpsApproachNormalizesUnsetFeedforwardAxes) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    auto estimated = MakeValidEstimatedTarget();
+    estimated.velocity_valid_mask = common::kVelocityValidNorth;  // 仅 N 有效
+    estimated.vel_x_mps = 3.0f;
+    estimated.vel_y_mps = 9.0f;  // E 未置位：必须被清零
+    estimated.vel_z_mps = 9.0f;  // D 未置位：必须被清零
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidNorth);
+    EXPECT_FLOAT_EQ(intent->feedforward_vx_mps, 3.0f);
+    EXPECT_FLOAT_EQ(intent->feedforward_vy_mps, 0.0f);
+    EXPECT_FLOAT_EQ(intent->feedforward_vz_mps, 0.0f);
+
+    machine.Stop();
+}
+
+// P3：位置不变、仅速度/有效位变化时立即重发（不等待 10Hz 节流窗口）。
+TEST(MissionStateMachineTest, GpsApproachRepublishesOnFeedforwardChange) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    auto estimated = MakeValidEstimatedTarget();
+    estimated.velocity_valid_mask = common::kVelocityValidNorth;
+    estimated.vel_x_mps = 1.0f;
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+    ASSERT_TRUE(WaitForIntent(intent_subscription).has_value());
+
+    // 位置不变，仅改变前馈速度；决策下一拍应立即发布新内容。
+    estimated.header.sequence += 1;
+    estimated.header.receive_time_ms = TestMonotonicMs();
+    estimated.vel_x_mps = 2.0f;
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+
+    std::optional<common::ControlIntent> updated;
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto intent = intent_subscription.WaitTakeFor(50ms);
+        if (!intent) {
+            continue;
+        }
+        if (std::fabs((*intent)->feedforward_vx_mps - 2.0f) < 1e-6f) {
+            updated = **intent;
+            break;
+        }
+    }
+    ASSERT_TRUE(updated.has_value());
+    EXPECT_FLOAT_EQ(updated->target_x, 12.5f);  // 位置未变
+    EXPECT_EQ(updated->feedforward_valid_mask, common::kVelocityValidNorth);
 
     machine.Stop();
 }
@@ -392,6 +485,11 @@ common::TargetState MakeHandoverEstimate() {
     common::TargetState state = MakeValidEstimatedTarget();
     state.header.valid_for_ms = 5000;
     state.header.receive_time_ms = TestMonotonicMs();
+    // P3：交接测试带速度前馈，用于证明 S6 冻结段显式丢弃前馈。
+    state.vel_x_mps = 1.5f;
+    state.vel_y_mps = -0.5f;
+    state.vel_z_mps = 0.0f;
+    state.velocity_valid_mask = common::kVelocityValidAll;
     return state;
 }
 
@@ -1141,6 +1239,11 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
         EXPECT_FLOAT_EQ(intent.target_x, 12.5F);  // 冻结值（非更新后的 99）
         EXPECT_FLOAT_EQ(intent.target_y, -3.0F);
         EXPECT_FLOAT_EQ(intent.target_z, -8.0F);
+        // P3：S6 冻结段显式无前馈（即使进入时估计带速度位）。
+        EXPECT_EQ(intent.feedforward_valid_mask, 0U);
+        EXPECT_FLOAT_EQ(intent.feedforward_vx_mps, 0.0F);
+        EXPECT_FLOAT_EQ(intent.feedforward_vy_mps, 0.0F);
+        EXPECT_FLOAT_EQ(intent.feedforward_vz_mps, 0.0F);
         // 滚动续期：valid_until 按 300ms 窗逐拍推进
         EXPECT_EQ(intent.valid_until_ms, intent.header.receive_time_ms + 300U);
     }

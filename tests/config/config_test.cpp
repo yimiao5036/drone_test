@@ -722,6 +722,10 @@ TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
     const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
     EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
     EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
+    // P3：位置速度前馈默认关闭、独立上限 2.0 m/s；KF 速度门限 5 次。
+    EXPECT_FALSE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
+    EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 5u);
     EXPECT_EQ(config.handover.lock_frames, 10u);
     EXPECT_EQ(config.handover.exit_lost_frames, 30u);
     EXPECT_EQ(config.handover.distance_lost_ms, std::chrono::milliseconds(3000));
@@ -756,6 +760,44 @@ TEST(ConfigTest, RejectsNonPositiveControllerLimits) {
     json value = ReadSourceConfig();
     value["controller"]["max_speed_mps"] = 0.0;
     const auto path = WriteTemporaryConfig(value, "drone_config_controller_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ParsesFeedforwardConfig) {
+    // P3：显式开关、独立前馈上限、KF 速度更新门限。
+    json value = ReadSourceConfig();
+    value["controller"]["enable_position_velocity_feedforward"] = true;
+    value["controller"]["max_feedforward_mps"] = 3.5;
+    value["target_estimator"]["min_velocity_position_updates"] = 7;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_feedforward.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 3.5);
+    EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 7u);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveFeedforwardLimit) {
+    json value = ReadSourceConfig();
+    value["controller"]["max_feedforward_mps"] = 0.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_feedforward_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsZeroVelocityUpdateThreshold) {
+    json value = ReadSourceConfig();
+    value["target_estimator"]["min_velocity_position_updates"] = 0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_velocity_updates_bad.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

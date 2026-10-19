@@ -238,6 +238,48 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 - 退出码沿用第 5 节：剧本走通（含回退与过期停发链）且 CSV 可写、无中断/安全回收
   → 0，否则 3。
 
+### 2.3.1 stage4-feedforward P3 前馈专项（`--sitl-stage4-feedforward`，非门禁）
+
+装配与 G3 同构，剧本只跑 **S5 位置引导 + 匀速运动目标**（不注入视觉，不进
+S6/S7），用于验证 P3 位置+速度前馈：
+
+```text
+起飞悬停 1m → 注入地面站目标（起点北向 15m、up=1m，速度 1.0m/s 北向，
+速度位 N/E/D 置位）→ 状态机 S5 位置引导跟踪 25s → 停目标 → 过期停发链
+→ AUTO.LAND → DISARM
+```
+
+```bash
+# FF 关闭基线（controller 开关默认 false）
+./build/px4_link_smoke --config config/px4_sitl.json --duration 90 \
+  --sitl-stage4-feedforward --tune-csv logs/ff_off.csv
+# FF 打开（命令行仅覆盖本进程 controller 副本，不改 JSON）
+./build/px4_link_smoke --config config/px4_sitl.json --duration 90 \
+  --sitl-stage4-feedforward --feedforward --tune-csv logs/ff_on.csv
+python3 tools/feedforward_report.py logs/ff_off.csv logs/ff_on.csv
+```
+
+- **环境前置与 G3 完全相同**（§2.2 末节：朝北出生、干净会话、
+  `MPC_XY_VEL_MAX=2.0`、GCS 心跳在线）；**每次运行前必须重启 PX4 SITL**——
+  目标坐标为 Home 相对绝对坐标，上一轮降落点残留会让本轮从错误位置起飞
+  （2026-10-19 实测：未重启时自机从 ~41m 北起飞，目标在身后，滞后统计失效）；
+- **判定（工具报告，硬判据）**：剧本走通/回收链完整/无安全回收/控制器无异常；
+  S5 接管且位置设定值流建立；FF 关闭时 N 轴前馈样本为 0，FF 打开时 >0 且
+  均值≈目标速度（容差 0.3m/s）；运动段结束水平间隙 ≤5m；
+- **A/B 指标（软判据）**：`tools/feedforward_report.py` 统计最后 5s 北向
+  稳态滞后。2026-10-19 本机 WSL2 SITL 实测（目标 1.0m/s、MPC_XY_VEL_MAX=2.0）：
+
+  | 运行 | N 轴前馈样本 | 平均前馈 | 滞后均值 | p95\|lag\| | 末端间隙 |
+  |---|---|---|---|---|---|
+  | FF off | 0 | 0 | 1.391 m | 1.492 m | 1.453 m |
+  | FF on | 413 | 1.000 m/s | 0.321 m | 0.400 m | 0.329 m |
+
+  p95\|lag\| 降低约 73%，均值降低约 77%。证据 CSV：
+  `tools/feedforward_evidence/ff_off_20261019.csv`、
+  `ff_on_20261019.csv`；
+- **非门禁**：不替代 G2/G3；G3 以 FF 默认关闭回归（2026-10-19 复跑全 PASS）。
+  退出码：FF 专项剧本/判据通过 → 0，否则 3。
+
 ### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
 
 ```bash

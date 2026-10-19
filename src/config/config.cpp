@@ -480,6 +480,8 @@ void FlightControllerConfig::Validate() const {
     if (max_jerk_mps3 < 0.0) throw std::invalid_argument("controller.max_jerk_mps3 不得为负");
     if (max_altitude_m <= 0.0 || max_radius_m <= 0.0)
         throw std::invalid_argument("controller 围栏参数必须为正");
+    if (!std::isfinite(max_feedforward_mps) || max_feedforward_mps <= 0.0)
+        throw std::invalid_argument("controller.max_feedforward_mps 必须为有限正数");
     if (intent_timeout.count() <= 0)
         throw std::invalid_argument("controller.intent_timeout_ms 必须为正");
     if (coast_timeout.count() <= intent_timeout.count())
@@ -680,6 +682,9 @@ AppConfig LoadAppConfig(const std::string& path,
         ReadOptionalPositiveDouble(target_estimator,
                                    "minimum_measurement_std_m",
                                    config.target_estimator.minimum_measurement_std_m);
+    config.target_estimator.min_velocity_position_updates = ReadOptionalPositiveSize(
+        target_estimator, "min_velocity_position_updates",
+        config.target_estimator.min_velocity_position_updates);
     // 视觉融合子组（runtime.enable_visual_position_fusion 开启后生效；
     // enabled 与 fxb_m_px 在校正矩阵加载后装配填充并复核 Validate）。
     // mount_* 默认全 0 = 准直安装假设（未标定），允许 0/负值故直接 value()。
@@ -730,6 +735,11 @@ AppConfig LoadAppConfig(const std::string& path,
         controller, "max_altitude_m", config.controller.max_altitude_m);
     config.controller.max_radius_m = ReadOptionalPositiveDouble(
         controller, "max_radius_m", config.controller.max_radius_m);
+    config.controller.enable_position_velocity_feedforward =
+        controller.value("enable_position_velocity_feedforward",
+                         config.controller.enable_position_velocity_feedforward);
+    config.controller.max_feedforward_mps = ReadOptionalPositiveDouble(
+        controller, "max_feedforward_mps", config.controller.max_feedforward_mps);
     config.controller.intent_timeout = ReadOptionalPositiveMilliseconds(
         controller, "intent_timeout_ms", config.controller.intent_timeout);
     config.controller.coast_timeout = ReadOptionalPositiveMilliseconds(

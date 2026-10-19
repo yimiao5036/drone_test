@@ -659,8 +659,14 @@ private:
             SPDLOG_INFO("交接冻结位置意图续发: 滚动续期直至视觉伺服接续");
         }
         const auto& frozen = *frozen_handover_target_;
-        PublishPositionIntent(frozen.pos_x_m, frozen.pos_y_m, frozen.pos_z_m,
-                              frozen.header.frame_id, now_ms);
+        PositionIntentTarget position_target;
+        position_target.x = frozen.pos_x_m;
+        position_target.y = frozen.pos_y_m;
+        position_target.z = frozen.pos_z_m;
+        position_target.frame_id = frozen.header.frame_id;
+        // P3 决策：S6 保持冻结语义，不带速度前馈（即使冻结快照有速度位）。
+        // 交接后由 S7 速度伺服接管，避免固定位置目标 + 持续前馈造成越过冻结点。
+        PublishPositionIntent(position_target, now_ms);
     }
 
     /// 停止位置类意图发布（离开位置引导段/交接段）；幂等。
@@ -936,15 +942,60 @@ private:
         return now_ms <= target.header.receive_time_ms + target.header.valid_for_ms;
     }
 
+    /// 位置型意图的组装输入（S5 估计引导 / S6 冻结续发共用）。
+    /// 前馈字段只对 S5 生效；S6 构造时保持 mask=0、前馈值=0（P3 冻结决策）。
+    struct PositionIntentTarget {
+        float x = 0.f;
+        float y = 0.f;
+        float z = 0.f;
+        uint8_t frame_id = 0;
+        float feedforward_vx_mps = 0.f;
+        float feedforward_vy_mps = 0.f;
+        float feedforward_vz_mps = 0.f;
+        uint8_t feedforward_valid_mask = 0;
+    };
+
     /// 发布 S5 估计引导位置意图。节流纪律：内容无变化按 10Hz 上限重发
     /// （意图是周期语义，FlightController 50ms 周期消费）；内容变化立即发。
     void PublishEstimateGuidedIntent(const common::TargetState& target,
                                      uint64_t now_ms) {
+        // 前馈逐轴归一化：只保留“有效位 + 值有限”的轴；其余轴清零，
+        // 避免无效 KF 值污染内容比较或下发。S6 不走本函数（冻结段无前馈）。
+        PositionIntentTarget position_target;
+        position_target.x = target.pos_x_m;
+        position_target.y = target.pos_y_m;
+        position_target.z = target.pos_z_m;
+        position_target.frame_id = target.header.frame_id;
+        const uint8_t target_ff_mask =
+            target.velocity_valid_mask & common::kVelocityValidAll;
+        if ((target_ff_mask & common::kVelocityValidNorth) != 0 &&
+            std::isfinite(target.vel_x_mps)) {
+            position_target.feedforward_vx_mps = target.vel_x_mps;
+            position_target.feedforward_valid_mask |= common::kVelocityValidNorth;
+        }
+        if ((target_ff_mask & common::kVelocityValidEast) != 0 &&
+            std::isfinite(target.vel_y_mps)) {
+            position_target.feedforward_vy_mps = target.vel_y_mps;
+            position_target.feedforward_valid_mask |= common::kVelocityValidEast;
+        }
+        if ((target_ff_mask & common::kVelocityValidDown) != 0 &&
+            std::isfinite(target.vel_z_mps)) {
+            position_target.feedforward_vz_mps = target.vel_z_mps;
+            position_target.feedforward_valid_mask |= common::kVelocityValidDown;
+        }
+
         const bool content_changed = !last_intent_target_.has_value() ||
             !FloatContentEqual(last_intent_target_->pos_x_m, target.pos_x_m) ||
             !FloatContentEqual(last_intent_target_->pos_y_m, target.pos_y_m) ||
             !FloatContentEqual(last_intent_target_->pos_z_m, target.pos_z_m) ||
-            last_intent_target_->valid != target.valid;
+            last_intent_target_->valid != target.valid ||
+            last_intent_target_->velocity_valid_mask != target_ff_mask ||
+            ((target_ff_mask & common::kVelocityValidNorth) != 0 &&
+             !FloatContentEqual(last_intent_target_->vel_x_mps, target.vel_x_mps)) ||
+            ((target_ff_mask & common::kVelocityValidEast) != 0 &&
+             !FloatContentEqual(last_intent_target_->vel_y_mps, target.vel_y_mps)) ||
+            ((target_ff_mask & common::kVelocityValidDown) != 0 &&
+             !FloatContentEqual(last_intent_target_->vel_z_mps, target.vel_z_mps));
         if (position_intent_source_ == PositionIntentSource::kEstimate &&
             !content_changed &&
             now_ms - last_intent_publish_ms_ < kIntentRepublishIntervalMs) {
@@ -952,21 +1003,25 @@ private:
         }
         if (position_intent_source_ != PositionIntentSource::kEstimate) {
             SPDLOG_INFO(
-                "GPS_APPROACH 位置引导意图启动: target_id={} pos=({:.2f},{:.2f},{:.2f})",
+                "GPS_APPROACH 位置引导意图启动: target_id={} pos=({:.2f},{:.2f},{:.2f}) "
+                "ff_mask=0x{:02x} ff=({:.2f},{:.2f},{:.2f})",
                 target.target_id, static_cast<double>(target.pos_x_m),
                 static_cast<double>(target.pos_y_m),
-                static_cast<double>(target.pos_z_m));
+                static_cast<double>(target.pos_z_m),
+                position_target.feedforward_valid_mask,
+                static_cast<double>(position_target.feedforward_vx_mps),
+                static_cast<double>(position_target.feedforward_vy_mps),
+                static_cast<double>(position_target.feedforward_vz_mps));
             position_intent_source_ = PositionIntentSource::kEstimate;
         }
-        PublishPositionIntent(target.pos_x_m, target.pos_y_m, target.pos_z_m,
-                              target.header.frame_id, now_ms);
+        PublishPositionIntent(position_target, now_ms);
         last_intent_target_ = target;
     }
 
     /// 组装并发布位置引导意图（S5 估计引导与 S6 冻结续发共用）。
     /// 高度无效时 pos_z 为 NaN（合法语义）：原样透传，由 FlightController
     /// 有限性门禁拒绝，状态机侧不得改成 0。
-    void PublishPositionIntent(float x, float y, float z, uint8_t frame_id,
+    void PublishPositionIntent(const PositionIntentTarget& target,
                                uint64_t now_ms) {
         common::ControlIntent intent;
         intent.header.sequence = ++intent_sequence_;
@@ -975,12 +1030,16 @@ private:
         intent.header.valid_for_ms = intent_valid_for_ms_;
         intent.header.source_id = 1;
         intent.header.health = 1;
-        intent.header.frame_id = frame_id;
+        intent.header.frame_id = target.frame_id;
         intent.type = common::ControlIntentType::kPositionGuide;
         intent.control_source = 0;  // 位置链
-        intent.target_x = x;
-        intent.target_y = y;
-        intent.target_z = z;
+        intent.target_x = target.x;
+        intent.target_y = target.y;
+        intent.target_z = target.z;
+        intent.feedforward_vx_mps = target.feedforward_vx_mps;
+        intent.feedforward_vy_mps = target.feedforward_vy_mps;
+        intent.feedforward_vz_mps = target.feedforward_vz_mps;
+        intent.feedforward_valid_mask = target.feedforward_valid_mask;
         // bit31 显式请求控制权（FlightController 授权链必要条件）+
         // 低位 7=地面站任务下发。
         intent.reason_code =

@@ -71,6 +71,8 @@ bool ShouldLogThrottled(uint64_t count) {
 }
 
 /// 意图字段有限性检查：数值通道全部 std::isfinite，NaN/Inf 直接拒绝。
+/// 注意：位置前馈字段刻意不在此检查——前馈是可选增强项，坏值应在
+/// PublishPosition 中逐轴丢弃并继续发布位置，不能让整条位置意图被拒。
 bool IsFiniteIntent(const common::ControlIntent& intent) {
     return std::isfinite(intent.target_x) && std::isfinite(intent.target_y) &&
            std::isfinite(intent.target_z) && std::isfinite(intent.yaw_deg) &&
@@ -155,9 +157,12 @@ public:
             return true;  // 幂等：已启动直接成功
         }
         worker_ = std::thread([this] { Run(); });
-        SPDLOG_INFO("飞行控制器启动: period={}ms intent_timeout={}ms coast_timeout={}ms",
+        SPDLOG_INFO("飞行控制器启动: period={}ms intent_timeout={}ms coast_timeout={}ms "
+                    "feedforward={} cap={:.2f}m/s",
                     config_.period.count(), config_.intent_timeout.count(),
-                    config_.coast_timeout.count());
+                    config_.coast_timeout.count(),
+                    config_.enable_position_velocity_feedforward ? "on" : "off",
+                    config_.max_feedforward_mps);
         return true;
     }
 
@@ -185,6 +190,9 @@ public:
     uint64_t ErrorCount() const { return error_count_.load(); }
     uint64_t RejectedIntentCount() const { return rejected_intent_count_.load(); }
     uint64_t ClampedCount() const { return clamped_count_.load(); }
+    uint64_t FeedforwardDroppedCount() const {
+        return feedforward_dropped_count_.load();
+    }
 
     ControlAuthority Authority() const {
         return authority_.load(std::memory_order_acquire);
@@ -513,8 +521,9 @@ private:
     }
 
     /// 位置式（S5 远端引导）：透传位置目标，不做 slew——位置阶跃由 PX4
-    /// 内部轨迹规划平滑，本控制器只管速度式连续性；速度上限写入由 Px4Link
-    /// 侧 type mask 语义保证。完整联调测试归 Task 7。
+    /// 内部位置控制器平滑，本控制器只管速度式连续性。P3（2026-10-19）起，
+    /// 开关打开时可携带逐轴速度前馈；前馈只做有限性降级与幅值钳制，不做
+    /// slew、不参与位置围栏（PX4 geofence 兜底）。完整联调测试归 Task 7。
     ///
     /// Home 相对围栏（Task 5）：意图目标为局部 NED，项目坐标约定局部 NED
     /// 原点即 PX4 Home（docs/数据接口文档.md、include/perception/目标估计器.md），
@@ -559,11 +568,81 @@ private:
                             altitude_m, config_.max_altitude_m, count);
             }
         }
+        // ---- 位置速度前馈（P3）：可选增强，开关关闭时完全忽略 ----
+        float ff_vx = 0.f;
+        float ff_vy = 0.f;
+        float ff_vz = 0.f;
+        uint8_t ff_mask = 0;
+        if (config_.enable_position_velocity_feedforward) {
+            ff_mask = intent.feedforward_valid_mask & common::kVelocityValidAll;
+            if ((intent.feedforward_valid_mask & ~common::kVelocityValidAll) != 0) {
+                const uint64_t count = ++feedforward_dropped_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN(
+                        "飞行控制器前馈掩码含未知位: mask=0x{:02x} 累计={}",
+                        intent.feedforward_valid_mask, count);
+                }
+            }
+            // 逐轴有限性降级：坏轴只丢该轴，位置照常发布。
+            const auto take_axis = [&](uint8_t bit, float value, float& out) {
+                if ((ff_mask & bit) == 0) {
+                    out = 0.f;
+                    return;
+                }
+                if (!std::isfinite(value)) {
+                    ff_mask = static_cast<uint8_t>(ff_mask & ~bit);
+                    out = 0.f;
+                    const uint64_t count = ++feedforward_dropped_count_;
+                    if (ShouldLogThrottled(count)) {
+                        SPDLOG_WARN(
+                            "飞行控制器前馈轴非有限已丢弃: bit=0x{:02x} 累计={}",
+                            bit, count);
+                    }
+                    return;
+                }
+                out = value;
+            };
+            take_axis(common::kVelocityValidNorth, intent.feedforward_vx_mps, ff_vx);
+            take_axis(common::kVelocityValidEast, intent.feedforward_vy_mps, ff_vy);
+            take_axis(common::kVelocityValidDown, intent.feedforward_vz_mps, ff_vz);
+            // 水平模长独立钳制（方向不变）；垂直分量保号钳制。
+            const double horizontal =
+                std::hypot(static_cast<double>(ff_vx), static_cast<double>(ff_vy));
+            if (horizontal > config_.max_feedforward_mps) {
+                const double scale = config_.max_feedforward_mps / horizontal;
+                ff_vx = static_cast<float>(ff_vx * scale);
+                ff_vy = static_cast<float>(ff_vy * scale);
+                const uint64_t count = ++clamped_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN(
+                        "飞行控制器前馈水平幅值钳制: |v|={:.2f} > max={:.2f} 累计={}",
+                        horizontal, config_.max_feedforward_mps, count);
+                }
+            }
+            const double ff_vz_before_clamp = static_cast<double>(ff_vz);
+            if ((ff_mask & common::kVelocityValidDown) != 0 &&
+                std::fabs(ff_vz_before_clamp) > config_.max_feedforward_mps) {
+                ff_vz = ff_vz_before_clamp > 0.0
+                            ? static_cast<float>(config_.max_feedforward_mps)
+                            : static_cast<float>(-config_.max_feedforward_mps);
+                const uint64_t count = ++clamped_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN(
+                        "飞行控制器前馈垂直分量钳制: |vz|={:.2f} > max={:.2f} 累计={}",
+                        std::fabs(ff_vz_before_clamp),
+                        config_.max_feedforward_mps, count);
+                }
+            }
+        }
         common::Px4Setpoint setpoint;
         setpoint.type = common::SetpointType::kPosition;
         setpoint.x = static_cast<float>(target_x);
         setpoint.y = static_cast<float>(target_y);
         setpoint.z = static_cast<float>(target_z);
+        setpoint.feedforward_vx_mps = ff_vx;
+        setpoint.feedforward_vy_mps = ff_vy;
+        setpoint.feedforward_vz_mps = ff_vz;
+        setpoint.feedforward_valid_mask = ff_mask;
         // 航向通道透传（互斥约束同速度式，沿用 Px4Link 现有校验）。
         setpoint.use_yaw = intent.yaw_deg != 0.f;
         setpoint.yaw_deg = intent.yaw_deg;
@@ -610,6 +689,7 @@ private:
     std::atomic<uint64_t> rejected_intent_count_{0};
     std::atomic<uint64_t> error_count_{0};
     std::atomic<uint64_t> clamped_count_{0};
+    std::atomic<uint64_t> feedforward_dropped_count_{0};
 
     // 限幅流水线状态（仅周期线程访问；成员声明在 config_ 之后，
     // 保证初始化顺序正确）。slew 初值 0：天然实现首条指令突变抑制（S6）。
@@ -654,6 +734,10 @@ uint64_t FlightController::RejectedIntentCount() const {
 }
 
 uint64_t FlightController::ClampedCount() const { return impl_->ClampedCount(); }
+
+uint64_t FlightController::FeedforwardDroppedCount() const {
+    return impl_->FeedforwardDroppedCount();
+}
 
 void FlightController::SetPx4LinkSource(const communication::IPx4Link* link) {
     impl_->SetPx4LinkSource(link);

@@ -195,6 +195,40 @@ std::vector<uint8_t> EncodePx4Heartbeat(communication::MavlinkHandler& encoder, 
         });
 }
 
+/// PX4 HOME_POSITION：位置型意图的 home_valid 门禁数据源（P3 契约用例）。
+std::vector<uint8_t> EncodePx4HomePosition(communication::MavlinkHandler& encoder) {
+    const float q[4] = {1.f, 0.f, 0.f, 0.f};
+    return encoder.Encode(
+        [=](mavlink_status_t* status, mavlink_message_t* message) {
+            return mavlink_msg_home_position_pack_status(
+                1, MAV_COMP_ID_AUTOPILOT1, status, message,
+                300000000, 1200000000, 100000,  // 任意合法经纬度/高度
+                0.f, 0.f, 0.f, q, 0.f, 0.f, 0.f, 0);
+        });
+}
+
+/// 状态机侧位置意图（带前馈与 bit31 显式请求位，保持新鲜）。
+void PublishPositionIntent(common::Topic<common::ControlIntent>& topic,
+                           bool with_feedforward, uint64_t now_ms) {
+    common::ControlIntent intent;
+    intent.type = common::ControlIntentType::kPositionGuide;
+    intent.control_source = 0;  // 位置链
+    intent.reason_code = common::kControlIntentReasonRequestControl;
+    intent.header.receive_time_ms = now_ms;
+    intent.header.frame_id = 3;
+    intent.target_x = 10.f;
+    intent.target_y = 20.f;
+    intent.target_z = -5.f;
+    if (with_feedforward) {
+        intent.feedforward_vx_mps = 0.5f;
+        intent.feedforward_vy_mps = -0.25f;
+        intent.feedforward_valid_mask = static_cast<uint8_t>(
+            common::kVelocityValidNorth | common::kVelocityValidEast);
+    }
+    intent.valid_until_ms = now_ms + 500;
+    (void)topic.Emplace(intent);
+}
+
 /// 状态机侧速度意图（带 bit31 显式请求位，保持新鲜）。
 void PublishVelocityIntent(common::Topic<common::ControlIntent>& topic, float vx) {
     common::ControlIntent intent;
@@ -271,6 +305,98 @@ TEST(FlightControllerLinkContractTest, SetpointsReachPx4LinkWire) {
     EXPECT_TRUE(wire_contract_ok)
         << "线上未解码出等于指令速度的 SET_POSITION_TARGET_LOCAL_NED（LOCAL_NED、"
            "速度通道生效）";
+
+    controller.Stop();
+    link.Stop();
+}
+
+/// P3 跨模块契约：位置意图的位置+速度前馈必须穿透控制器与 Px4Link，
+/// 在线上同时表现为有效位置轴与有效速度轴；关闭前馈后回退纯位置。
+TEST(FlightControllerLinkContractTest, PositionWithFeedforwardReachesPx4LinkWire) {
+    constexpr uint32_t kMainModeOffboard = 6;
+
+    PseudoTerminal terminal;
+    drone::communication::Px4Link link(MakeLinkConfig(terminal.SlaveName()));
+
+    drone::config::FlightControllerConfig controller_config;
+    controller_config.period = 20ms;
+    controller_config.intent_timeout = 200ms;
+    controller_config.coast_timeout = 1000ms;
+    controller_config.enable_position_velocity_feedforward = true;
+    controller_config.max_feedforward_mps = 1.0;
+    FlightController controller(controller_config);
+
+    common::Topic<common::ControlIntent> intent_topic;
+    controller.SetInput(intent_topic);
+    controller.SetPx4LinkSource(&link);
+    link.SetInput(controller.SetpointOutput());
+    ASSERT_TRUE(link.Start());
+    ASSERT_TRUE(controller.Start());
+
+    communication::MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(
+        EncodePx4Heartbeat(px4_encoder, true, static_cast<uint8_t>(kMainModeOffboard), 0)));
+    ASSERT_TRUE(terminal.Write(EncodePx4HomePosition(px4_encoder)));
+    ASSERT_TRUE(WaitUntil(
+        [&link] {
+            const auto state = link.LatestState();
+            return link.IsConnected() && state.home_valid;
+        },
+        1s));
+
+    // 阶段 1：带前馈的位置意图 → 线上位置与 N/E 速度同时有效。
+    bool feedforward_ok = false;
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < deadline && !feedforward_ok) {
+        PublishPositionIntent(intent_topic, true, MonotonicMs());
+        (void)terminal.Write(
+            EncodePx4Heartbeat(px4_encoder, true, static_cast<uint8_t>(kMainModeOffboard), 0));
+        mavlink_message_t message{};
+        if (terminal.WaitForMessage(MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED, 20ms,
+                                    &message)) {
+            mavlink_set_position_target_local_ned_t target{};
+            mavlink_msg_set_position_target_local_ned_decode(&message, &target);
+            if (target.coordinate_frame == MAV_FRAME_LOCAL_NED &&
+                (target.type_mask & POSITION_TARGET_TYPEMASK_X_IGNORE) == 0 &&
+                (target.type_mask & POSITION_TARGET_TYPEMASK_VX_IGNORE) == 0 &&
+                (target.type_mask & POSITION_TARGET_TYPEMASK_VY_IGNORE) == 0 &&
+                (target.type_mask & POSITION_TARGET_TYPEMASK_VZ_IGNORE) != 0 &&
+                std::fabs(target.x - 10.f) < 1e-3f &&
+                std::fabs(target.vx - 0.5f) < 1e-5f &&
+                std::fabs(target.vy + 0.25f) < 1e-5f) {
+                feedforward_ok = true;
+            }
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+
+    // 阶段 2：无前馈位置意图 → 线上速度三轴全部忽略、速度字段为 0。
+    bool fallback_ok = false;
+    const auto fallback_deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < fallback_deadline && !fallback_ok) {
+        PublishPositionIntent(intent_topic, false, MonotonicMs());
+        (void)terminal.Write(
+            EncodePx4Heartbeat(px4_encoder, true, static_cast<uint8_t>(kMainModeOffboard), 0));
+        mavlink_message_t message{};
+        if (terminal.WaitForMessage(MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED, 20ms,
+                                    &message)) {
+            mavlink_set_position_target_local_ned_t target{};
+            mavlink_msg_set_position_target_local_ned_decode(&message, &target);
+            if ((target.type_mask & POSITION_TARGET_TYPEMASK_VX_IGNORE) != 0 &&
+                (target.type_mask & POSITION_TARGET_TYPEMASK_VY_IGNORE) != 0 &&
+                (target.type_mask & POSITION_TARGET_TYPEMASK_VZ_IGNORE) != 0 &&
+                std::fabs(target.vx) < 1e-6f && std::fabs(target.vy) < 1e-6f &&
+                std::fabs(target.vz) < 1e-6f) {
+                fallback_ok = true;
+            }
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+
+    EXPECT_EQ(controller.Authority(), ControlAuthority::kActive);
+    EXPECT_TRUE(feedforward_ok)
+        << "位置+前馈未穿透到 PX4 线上（位置/速度轴或数值不符）";
+    EXPECT_TRUE(fallback_ok) << "无前馈位置意图未回退为纯位置（速度轴仍生效）";
 
     controller.Stop();
     link.Stop();

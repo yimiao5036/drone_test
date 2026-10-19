@@ -214,6 +214,11 @@ bits 24..31 → flight_sub_mode（sub mode）
 
 - `SetpointType::kPosition`：x/y/z 为 NED 位置（米）；
 - `SetpointType::kVelocity`：x/y/z 为 NED 速度（m/s）；
+- **位置+速度前馈（P3，2026-10-19）**：位置型可携带 `feedforward_vx/vy/vz_mps`
+  与逐轴 `feedforward_valid_mask`（bit0=N/bit1=E/bit2=D）。掩码置位的轴在
+  `type_mask` 中清除对应 `VX/VY/VZ_IGNORE` 并填速度字段；未置位轴仍置 IGNORE、
+  打包写 0。掩码为 0 时与旧实现逐位一致（位置型速度三轴全忽略、字段全 0）。
+  速度型设定值必须保持掩码为 0。
 - 可选 yaw 或 yaw rate，度/度每秒在发送前转换为弧度/弧度每秒；
 - 坐标系必须为 `header.frame_id=3`（本地 NED）；
 - 根据类型构造严格的 `POSITION_TARGET_TYPEMASK`，忽略未使用的位置/速度/加速度/yaw 字段。
@@ -230,6 +235,7 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 - `valid=false` 清除缓存并停止发送，不会用空 mask 维持 Offboard；
 - 刹停/悬停必须由控制器生成有效零速度或位置保持设定值；
 - `kNone/kAttitude`、非 NED、NaN/Inf、同时启用 yaw 和 yaw rate 均拒绝；
+  位置前馈掩码越界、置位轴非有限、速度型携带前馈掩码同样按结构非法拒绝；
 - 有效期取 `min(header.valid_for_ms, setpoint_timeout)`；头部未给有效期时使用配置上限；
 - 设定值收到时已过期、时间戳在未来或缓存过期时停止发送；
 - 只在 PX4 心跳连接期间发送，断开/Stop/Start 都清除旧设定值。
@@ -296,6 +302,8 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 - 首次心跳后按顺序发送单次消息请求和消息频率请求；
 - `LatestState()` 未发布时返回默认快照，连接后反映已发布快照（connected/armed）；
 - 本地 NED 位置设定值、type mask 和 yaw 角转换；
+- 位置+逐轴速度前馈的 type mask/字段打包（仅 N 时 VY/VZ 保持忽略）；
+- 非有限置位轴、未知前馈掩码位、速度型携带前馈掩码均拒绝；
 - 本地 NED 速度设定值、type mask 和 yaw rate 转换；
 - 过期设定值停止重发；
 - 非 NED、姿态、NaN/Inf 和 yaw 选择冲突拒绝。

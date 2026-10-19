@@ -42,6 +42,9 @@ struct TargetEstimatorConfig {
     double default_horizontal_accuracy_m = 10.0;
     double default_vertical_accuracy_m = 15.0;
     double minimum_measurement_std_m = 0.5;
+    /// 速度前馈可用门限：KF 自算速度需在滤波器重置后累计至少该次数的
+    /// 位置更新（地面站/视觉）才置速度有效位；地面站显式速度位不受此限。
+    std::size_t min_velocity_position_updates = 5;
     VisualFusionConfig visual;
 
     void Validate() const;

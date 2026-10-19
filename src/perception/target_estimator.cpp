@@ -96,6 +96,10 @@ void TargetEstimatorConfig::Validate() const {
         !IsPositiveFinite(minimum_measurement_std_m)) {
         throw std::invalid_argument("目标估计器噪声与精度参数必须为有限正数");
     }
+    if (min_velocity_position_updates == 0) {
+        throw std::invalid_argument(
+            "目标估计器 min_velocity_position_updates 必须为正数");
+    }
     visual.Validate();
 }
 
@@ -169,6 +173,15 @@ struct TargetEstimator::Impl {
     uint64_t visual_skipped_uninitialized = 0;
     uint64_t visual_skipped_ground_expired = 0;
     uint64_t ground_degraded_out_of_order = 0;  ///< 视觉推前状态后地面站原地降级更新
+    // ---- 速度前馈可用性（P3，2026-10-19）----
+    // 地面站显式速度位优先；否则 KF 自算速度需累计足够位置更新才可信。
+    // 计数自滤波器重置起算（初始化计为第 1 次）；水平/垂直分别计数。
+    uint64_t horizontal_position_update_count = 0;
+    uint64_t vertical_position_update_count = 0;
+    uint8_t ground_velocity_valid_mask = 0;  ///< kVelocityValid*（地面站最新接受观测）
+    double ground_velocity_north_mps = 0.0;
+    double ground_velocity_east_mps = 0.0;
+    double ground_velocity_down_mps = 0.0;
 
     void ResetFilterState() {
         filter.Reset();
@@ -180,6 +193,13 @@ struct TargetEstimator::Impl {
         valid_until_ms = 0;
         original_valid_for_ms = 0;
         expired_state_published = false;
+        // 速度前馈可用性随滤波器重置清空：新旧目标/原点的速度不可延续
+        horizontal_position_update_count = 0;
+        vertical_position_update_count = 0;
+        ground_velocity_valid_mask = 0;
+        ground_velocity_north_mps = 0.0;
+        ground_velocity_east_mps = 0.0;
+        ground_velocity_down_mps = 0.0;
         // 视觉记账一并清空（Home 变化/target_id 切换走同一入口）
         visual_last_frame_sequence = 0;
         visual_frame_seen = false;
@@ -427,6 +447,10 @@ struct TargetEstimator::Impl {
             return;
         }
         visual_innovation_m.store(innovation_m, std::memory_order_relaxed);
+        // 位置观测计数：视觉观测带有效垂直分量（down_valid=true），
+        // 水平/垂直计数同时推进，供 KF 速度前馈门限使用。
+        ++horizontal_position_update_count;
+        ++vertical_position_update_count;
 
         visual_last_frame_sequence = msg.frame_sequence;
         visual_frame_seen = true;
@@ -589,6 +613,29 @@ struct TargetEstimator::Impl {
             return;
         }
 
+        // 速度前馈可用性：地面站显式速度位优先并立即生效；
+        // 未带速度位的轴回退 KF（需累计更新次数达门限）。
+        ++horizontal_position_update_count;
+        if (measurement.down_valid) {
+            ++vertical_position_update_count;
+        }
+        ground_velocity_valid_mask = 0;
+        ground_velocity_north_mps = 0.0;
+        ground_velocity_east_mps = 0.0;
+        ground_velocity_down_mps = 0.0;
+        if (measurement.velocity_north_valid) {
+            ground_velocity_valid_mask |= common::kVelocityValidNorth;
+            ground_velocity_north_mps = measurement.velocity_north_mps;
+        }
+        if (measurement.velocity_east_valid) {
+            ground_velocity_valid_mask |= common::kVelocityValidEast;
+            ground_velocity_east_mps = measurement.velocity_east_mps;
+        }
+        if (measurement.velocity_down_valid) {
+            ground_velocity_valid_mask |= common::kVelocityValidDown;
+            ground_velocity_down_mps = measurement.velocity_down_mps;
+        }
+
         target_id = target.target_id;
         last_ground_boot_id = target.ground_station_boot_id;
         last_update_seq = target.update_seq;
@@ -643,6 +690,44 @@ struct TargetEstimator::Impl {
         state.vel_z_mps = estimate.vertical_valid
             ? static_cast<float>(estimate.velocity_down_mps)
             : std::numeric_limits<float>::quiet_NaN();
+        // ---- 速度前馈可用性（P3，2026-10-19）----
+        // 地面站显式速度位优先（不受更新次数门限约束）；缺失轴回退 KF，
+        // 需自滤波器重置后累计足够位置更新。水平/垂直逐轴独立；过期清零。
+        const bool fresh = now_ms < valid_until_ms;
+        const bool kf_horizontal_ready =
+            horizontal_position_update_count >= config.min_velocity_position_updates;
+        const bool kf_vertical_ready =
+            vertical_position_update_count >= config.min_velocity_position_updates;
+        uint8_t velocity_valid_mask = 0;
+        if (fresh && estimate.horizontal_valid) {
+            if ((ground_velocity_valid_mask & common::kVelocityValidNorth) != 0 &&
+                std::isfinite(ground_velocity_north_mps)) {
+                state.vel_x_mps = static_cast<float>(ground_velocity_north_mps);
+                velocity_valid_mask |= common::kVelocityValidNorth;
+            } else if (kf_horizontal_ready &&
+                       std::isfinite(estimate.velocity_north_mps)) {
+                velocity_valid_mask |= common::kVelocityValidNorth;
+            }
+            if ((ground_velocity_valid_mask & common::kVelocityValidEast) != 0 &&
+                std::isfinite(ground_velocity_east_mps)) {
+                state.vel_y_mps = static_cast<float>(ground_velocity_east_mps);
+                velocity_valid_mask |= common::kVelocityValidEast;
+            } else if (kf_horizontal_ready &&
+                       std::isfinite(estimate.velocity_east_mps)) {
+                velocity_valid_mask |= common::kVelocityValidEast;
+            }
+        }
+        if (fresh && estimate.vertical_valid) {
+            if ((ground_velocity_valid_mask & common::kVelocityValidDown) != 0 &&
+                std::isfinite(ground_velocity_down_mps)) {
+                state.vel_z_mps = static_cast<float>(ground_velocity_down_mps);
+                velocity_valid_mask |= common::kVelocityValidDown;
+            } else if (kf_vertical_ready &&
+                       std::isfinite(estimate.velocity_down_mps)) {
+                velocity_valid_mask |= common::kVelocityValidDown;
+            }
+        }
+        state.velocity_valid_mask = velocity_valid_mask;
         const double remaining_ratio = original_valid_for_ms > 0 &&
                                                now_ms < valid_until_ms
             ? static_cast<double>(valid_until_ms - now_ms) /

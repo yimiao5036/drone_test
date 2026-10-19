@@ -399,6 +399,29 @@ private:
             (setpoint.use_yaw && setpoint.use_yaw_rate)) {
             return false;
         }
+        // 位置前馈（P3）：只允许位置型；掩码合法且置位轴有限。
+        // 掩码为 0 时（所有旧生产者）不改变任何既有接受条件。
+        const uint8_t ff_mask = setpoint.feedforward_valid_mask;
+        if ((ff_mask & static_cast<uint8_t>(~common::kVelocityValidAll)) != 0) {
+            return false;
+        }
+        if (ff_mask != 0) {
+            if (setpoint.type != common::SetpointType::kPosition) {
+                return false;
+            }
+            if ((ff_mask & common::kVelocityValidNorth) != 0 &&
+                !std::isfinite(setpoint.feedforward_vx_mps)) {
+                return false;
+            }
+            if ((ff_mask & common::kVelocityValidEast) != 0 &&
+                !std::isfinite(setpoint.feedforward_vy_mps)) {
+                return false;
+            }
+            if ((ff_mask & common::kVelocityValidDown) != 0 &&
+                !std::isfinite(setpoint.feedforward_vz_mps)) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -461,9 +484,18 @@ private:
                         POSITION_TARGET_TYPEMASK_AY_IGNORE |
                         POSITION_TARGET_TYPEMASK_AZ_IGNORE;
         if (setpoint.type == common::SetpointType::kPosition) {
-            mask |= POSITION_TARGET_TYPEMASK_VX_IGNORE |
-                    POSITION_TARGET_TYPEMASK_VY_IGNORE |
-                    POSITION_TARGET_TYPEMASK_VZ_IGNORE;
+            // P3：位置始终有效；速度轴按前馈掩码逐轴放行。
+            // 掩码为 0 时三个 IGNORE 全置位，与旧行为逐位一致。
+            const uint8_t ff_mask = setpoint.feedforward_valid_mask;
+            if ((ff_mask & common::kVelocityValidNorth) == 0) {
+                mask |= POSITION_TARGET_TYPEMASK_VX_IGNORE;
+            }
+            if ((ff_mask & common::kVelocityValidEast) == 0) {
+                mask |= POSITION_TARGET_TYPEMASK_VY_IGNORE;
+            }
+            if ((ff_mask & common::kVelocityValidDown) == 0) {
+                mask |= POSITION_TARGET_TYPEMASK_VZ_IGNORE;
+            }
         } else {
             mask |= POSITION_TARGET_TYPEMASK_X_IGNORE |
                     POSITION_TARGET_TYPEMASK_Y_IGNORE |
@@ -497,20 +529,38 @@ private:
                                    ? setpoint.yaw_rate_dps * kDegreesToRadians
                                    : 0.f;
         const uint16_t type_mask = BuildSetpointTypeMask(setpoint);
+        // 位置+速度前馈（P3）：位置型按掩码逐轴填速度字段；未置位轴写 0
+        //（type mask 同时忽略该轴）。速度型仍用 x/y/z 作为速度。
+        const uint8_t ff_mask = setpoint.feedforward_valid_mask;
+        const float position_x = position ? setpoint.x : 0.f;
+        const float position_y = position ? setpoint.y : 0.f;
+        const float position_z = position ? setpoint.z : 0.f;
+        const float velocity_x = position
+            ? (((ff_mask & common::kVelocityValidNorth) != 0)
+                   ? setpoint.feedforward_vx_mps
+                   : 0.f)
+            : setpoint.x;
+        const float velocity_y = position
+            ? (((ff_mask & common::kVelocityValidEast) != 0)
+                   ? setpoint.feedforward_vy_mps
+                   : 0.f)
+            : setpoint.y;
+        const float velocity_z = position
+            ? (((ff_mask & common::kVelocityValidDown) != 0)
+                   ? setpoint.feedforward_vz_mps
+                   : 0.f)
+            : setpoint.z;
         const auto frame = mavlink_.Encode(
-            [this, &setpoint, position, now_ms, type_mask, yaw, yaw_rate](
+            [this, now_ms, type_mask, position_x, position_y, position_z,
+             velocity_x, velocity_y, velocity_z, yaw, yaw_rate](
                 mavlink_status_t* status, mavlink_message_t* message) {
                 return mavlink_msg_set_position_target_local_ned_pack_status(
                     config_.onboard_system_id, config_.onboard_component_id,
                     status, message, static_cast<uint32_t>(now_ms),
                     config_.target_system_id, config_.target_component_id,
                     MAV_FRAME_LOCAL_NED, type_mask,
-                    position ? setpoint.x : 0.f,
-                    position ? setpoint.y : 0.f,
-                    position ? setpoint.z : 0.f,
-                    position ? 0.f : setpoint.x,
-                    position ? 0.f : setpoint.y,
-                    position ? 0.f : setpoint.z,
+                    position_x, position_y, position_z,
+                    velocity_x, velocity_y, velocity_z,
                     0.f, 0.f, 0.f, yaw, yaw_rate);
             });
         if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {

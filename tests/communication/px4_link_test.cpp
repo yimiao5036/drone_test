@@ -698,6 +698,97 @@ TEST(Px4LinkTest, SendsLocalNedPositionSetpointWithYaw) {
     link.Stop();
 }
 
+TEST(Px4LinkTest, SendsPositionSetpointWithPerAxisFeedforward) {
+    // P3：位置型设定值携带 N/E 速度前馈；位置与速度字段同时有效。
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 3;
+    setpoint.header.valid_for_ms = 200;
+    setpoint.type = common::SetpointType::kPosition;
+    setpoint.x = 1.5f;
+    setpoint.y = -2.5f;
+    setpoint.z = -3.f;
+    setpoint.feedforward_vx_mps = 0.5f;
+    setpoint.feedforward_vy_mps = -0.25f;
+    setpoint.feedforward_vz_mps = 9.f;  // D 未置位：不得生效
+    setpoint.feedforward_valid_mask = static_cast<uint8_t>(
+        common::kVelocityValidNorth | common::kVelocityValidEast);
+    setpoint.valid = true;
+    (void)topic.Emplace(setpoint);
+
+    mavlink_message_t message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED, 500ms, &message));
+    mavlink_set_position_target_local_ned_t target{};
+    mavlink_msg_set_position_target_local_ned_decode(&message, &target);
+    EXPECT_EQ(target.coordinate_frame, MAV_FRAME_LOCAL_NED);
+    EXPECT_FLOAT_EQ(target.x, 1.5f);
+    EXPECT_FLOAT_EQ(target.y, -2.5f);
+    EXPECT_FLOAT_EQ(target.z, -3.f);
+    EXPECT_FLOAT_EQ(target.vx, 0.5f);
+    EXPECT_FLOAT_EQ(target.vy, -0.25f);
+    EXPECT_FLOAT_EQ(target.vz, 0.f);  // D 轴被忽略
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_X_IGNORE, 0);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_VX_IGNORE, 0);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_VY_IGNORE, 0);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_VZ_IGNORE, 0);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_AX_IGNORE, 0);
+    EXPECT_GT(link.SetpointSendCount(), 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, PositionFeedforwardMaskIsPerAxis) {
+    // 仅 N 轴前馈：VY/VZ 必须保持忽略位。
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 3;
+    setpoint.header.valid_for_ms = 200;
+    setpoint.type = common::SetpointType::kPosition;
+    setpoint.x = 1.f;
+    setpoint.feedforward_vx_mps = 0.5f;
+    setpoint.feedforward_vy_mps = 9.f;  // E 未置位：不得生效
+    setpoint.feedforward_valid_mask = common::kVelocityValidNorth;
+    setpoint.valid = true;
+    (void)topic.Emplace(setpoint);
+
+    mavlink_message_t message{};
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED, 500ms, &message));
+    mavlink_set_position_target_local_ned_t target{};
+    mavlink_msg_set_position_target_local_ned_decode(&message, &target);
+    EXPECT_FLOAT_EQ(target.vx, 0.5f);
+    EXPECT_FLOAT_EQ(target.vy, 0.f);
+    EXPECT_FLOAT_EQ(target.vz, 0.f);
+    EXPECT_EQ(target.type_mask & POSITION_TARGET_TYPEMASK_VX_IGNORE, 0);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_VY_IGNORE, 0);
+    EXPECT_NE(target.type_mask & POSITION_TARGET_TYPEMASK_VZ_IGNORE, 0);
+    link.Stop();
+}
+
 TEST(Px4LinkTest, SendsLocalNedVelocitySetpointWithYawRate) {
     PseudoTerminal terminal;
     auto config = MakeConfig(terminal.SlaveName());
@@ -799,6 +890,53 @@ TEST(Px4LinkTest, RejectsUnsupportedOrAmbiguousSetpoint) {
     (void)topic.Emplace(setpoint);
     std::this_thread::sleep_for(50ms);
     EXPECT_EQ(link.SetpointSendCount(), 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, RejectsInvalidFeedforwardSetpoints) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    common::Topic<common::Px4Setpoint> topic;
+    link.SetInput(topic);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    common::Px4Setpoint setpoint;
+    setpoint.header.frame_id = 3;
+    setpoint.header.valid_for_ms = 200;
+    setpoint.type = common::SetpointType::kPosition;
+    setpoint.x = 1.f;
+    setpoint.y = 2.f;
+    setpoint.z = -3.f;
+    setpoint.valid = true;
+
+    // 1) 置位轴非有限 → 结构校验拒绝
+    setpoint.feedforward_valid_mask = common::kVelocityValidNorth;
+    setpoint.feedforward_vx_mps = std::numeric_limits<float>::quiet_NaN();
+    (void)topic.Emplace(setpoint);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(link.SetpointSendCount(), 0u);
+
+    // 2) 未知掩码位 → 拒绝
+    setpoint.feedforward_valid_mask = 0x80U;
+    setpoint.feedforward_vx_mps = 0.5f;
+    (void)topic.Emplace(setpoint);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(link.SetpointSendCount(), 0u);
+
+    // 3) 速度型设定值不得携带前馈掩码 → 拒绝
+    setpoint.type = common::SetpointType::kVelocity;
+    setpoint.feedforward_valid_mask = common::kVelocityValidNorth;
+    (void)topic.Emplace(setpoint);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(link.SetpointSendCount(), 0u);
+
     link.Stop();
 }
 

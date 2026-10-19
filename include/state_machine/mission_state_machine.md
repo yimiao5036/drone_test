@@ -27,7 +27,7 @@
 | `kBrakeHover`（视觉短期 LOST 判丢刹车，valid=true） | `kBrakeHover`零速安全意图（速度分量全零），reason 低位 102；**主链路无预测坐标**（`is_predicted`恒 false，101 Coast 低码不可达）——图像空间 coast 在本链路以判丢刹车形态落地 |
 | `kDegradedHold`（valid=false：姿态/视觉超龄） | **不发布意图**（安全语义：控制律已明确"禁止正常控制"，补发零速与其矛盾）；超龄收口交 FlightController 意图超时门禁（`intent_timeout`）刹停 |
 
-**S6 冻结最后位置目标（评审裁决 (a)，Task 9 落地）**：S5→S6 当拍冻结进入时刻的`TargetState`坐标；S6 驻留期逐拍续发该位置意图（`valid_until`由状态机每拍滚动续期），直到首条视觉速度意图被发出再停（S7 首拍若伺服降级停发，冻结续发继续顶住，不留意图缺口）。此策略对应用户设计 §2.1「进入 S6 后冻结最后位置目标」与 §2.5「位置式→速度式无扰斜坡过渡」——若交接期停发位置意图，控制器在`intent_timeout`(300ms)后 COAST 刹车，真实系统会在交接点先刹停再起步。
+**S6 冻结最后位置目标（评审裁决 (a)，Task 9 落地）**：S5→S6 当拍冻结进入时刻的`TargetState`坐标；S6 驻留期逐拍续发该位置意图（`valid_until`由状态机每拍滚动续期），直到首条视觉速度意图被发出再停（S7 首拍若伺服降级停发，冻结续发继续顶住，不留意图缺口）。此策略对应用户设计 §2.1「进入 S6 后冻结最后位置目标」与 §2.5「位置式→速度式无扰斜坡过渡」——若交接期停发位置意图，控制器在`intent_timeout`(300ms)后 COAST 刹车，真实系统会在交接点先刹停再起步。**P3 决策（2026-10-19）：S6 冻结续发保持纯位置、显式不带速度前馈**（即使冻结快照带速度位），避免固定位置目标 + 持续前馈使飞机越过冻结点；S7 速度伺服接管后自然连续。
 
 **热备份核对（设计 §2.4）**：S7 期间每秒核对卡尔曼状态年龄——`TargetState.header.receive_time_ms`年龄是否超出其自报有效期窗（`valid_for_ms`，与 S5 意图门禁`HasFreshEstimate`同一口径；无快照/`valid=false`亦视为断粮）。断粮 → 节流 WARN「S7 热备份断粮」+ `MissionStatus.active_warning_bits` bit2 置位，**不退出 S7**（S7 去留由四条收口路径决定，热备份告警只提示"假备份"风险）。
 
@@ -151,8 +151,15 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   透传——高度无效的合法语义，由 FlightController 有限性门禁拒绝，状态机侧不得改 0），
   `reason_code = kControlIntentReasonRequestControl | 7（地面站任务下发）`，
   `valid_for_ms/valid_until_ms`来自注入的意图有效期配置。
-- 意图节流纪律：内容（目标位置/有效性）无变化按 10Hz 上限重发（意图是周期语义，
-  FlightController 50ms 周期消费）；内容变化立即发。NaN 与 NaN 视为内容相等。
+- **S5 速度前馈（P3，2026-10-19）**：位置意图同时携带 `feedforward_vx/vy/vz_mps`
+  与 `feedforward_valid_mask`。来源为 `TargetState.velocity_valid_mask`（地面站
+  速度位优先、KF 自算速度 ≥5 次位置更新兜底）；状态机逐轴归一化——只有位为 1
+  且值有限的轴保留，其余轴值清零/位清零（无效 KF 值不污染意图）。状态机不做
+  幅值钳制，全部交 FlightController（开关/上限/降级）。S5 启动日志追加
+  `ff_mask/ff=(...)` 摘要，仅来源切换时打印一次。
+- 意图节流纪律：内容（目标位置/有效性/**前馈速度与逐轴有效位**）无变化按 10Hz
+  上限重发（意图是周期语义，FlightController 50ms 周期消费）；内容变化立即发。
+  NaN 与 NaN 视为内容相等；未置位轴不参与比较。
 - 估计失效或超龄时停止发布意图（不补发安全类意图，刹停语义归后续状态迁移任务）；
   超龄收口由 FlightController 的`intent_timeout`门禁接管。
 - 估计/视觉/测距三输入必须成组绑定；只绑部分时记 ERROR 并按未绑定处理（保持影子）。
@@ -300,6 +307,10 @@ ctest --test-dir build --output-on-failure
 - 未绑定估计输入时`IntentOutput()`不发布自动控制意图（影子行为兜底）。
 - 绑定估计输入后 S5 发布`kPositionGuide`意图：指向估计目标、`control_source=0`、
   reason_code 带 bit31 控制权请求位、`valid_until_ms = receive_time_ms + valid_for_ms`。
+- P3 前馈（`GpsApproachPublishesPositionIntent` 扩展 +
+  `GpsApproachNormalizesUnsetFeedforwardAxes`/`GpsApproachRepublishesOnFeedforwardChange`）：
+  S5 逐轴复制有效且有限的 `TargetState.vel_*` 到 `feedforward_*`；未置位轴清零；
+  只改前馈值/掩码也会立即重发；S6 冻结意图 `feedforward_valid_mask==0`。
 - 意图有效期来自注入配置（不写死字面量）。
 - 估计失效（`valid=false`）后停止发布意图。
 - 交接判据（`HandoverFixture` + `MakeHandoverTestConfig`，阈值取小值压缩用例时长；

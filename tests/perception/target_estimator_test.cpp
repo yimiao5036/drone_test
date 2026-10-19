@@ -193,6 +193,10 @@ TEST(TargetEstimatorTest, PublishesGroundTargetAsLocalNedShadowState) {
     EXPECT_NEAR(state.pos_z_m, -20.0F, 0.1F);
     EXPECT_NEAR(state.vel_x_mps, 4.0F, 0.1F);
     EXPECT_NEAR(state.vel_y_mps, -1.0F, 0.1F);
+    // 地面站 N/E 速度位有效：立即可用，不受 KF 更新次数门限约束。
+    EXPECT_EQ(state.velocity_valid_mask,
+              static_cast<uint8_t>(common::kVelocityValidNorth |
+                                   common::kVelocityValidEast));
     EXPECT_EQ(estimator.UpdateCount(), 1U);
 }
 
@@ -222,6 +226,10 @@ TEST(TargetEstimatorTest, MissingAltitudePublishesHorizontalStateWithNanVertical
     EXPECT_TRUE((*received)->valid);
     EXPECT_TRUE(std::isnan((*received)->pos_z_m));
     EXPECT_TRUE(std::isnan((*received)->vel_z_mps));
+    // 水平速度位可用；垂直轴无效 → D 位清零（逐轴独立）。
+    EXPECT_EQ((*received)->velocity_valid_mask,
+              static_cast<uint8_t>(common::kVelocityValidNorth |
+                                   common::kVelocityValidEast));
 }
 
 TEST(TargetEstimatorTest, RejectsAlreadyExpiredGroundTarget) {
@@ -280,6 +288,10 @@ TEST(TargetEstimatorTest, PublishesOneInvalidStateWhenTargetExpires) {
         }
         saw_valid = saw_valid || (*item)->valid;
         saw_invalid = saw_invalid || !(*item)->valid;
+        if (!(*item)->valid) {
+            // 过期快照不得携带可用的速度前馈位。
+            EXPECT_EQ((*item)->velocity_valid_mask, 0U);
+        }
         if (saw_valid && saw_invalid) {
             break;
         }
@@ -926,6 +938,130 @@ TEST(TargetEstimatorFusionTest, FarObservationPullsWeakerThanNear) {
     // 归一化收敛度：近距显著更接近各自目标点
     EXPECT_GT(near_north / 20.0, 0.3);
     EXPECT_GT(near_north / 20.0, 2.0 * (far_north / 60.0));
+}
+
+// ---- P3 速度前馈可用性（2026-10-19）----
+// 地面站速度位优先且立即生效；缺失轴回退 KF，需累计足够位置更新。
+class VelocityValidityFixture {
+public:
+    VelocityValidityFixture()
+        : estimator(MakeConfig()) {
+        estimator.SetGroundTargetInput(ground);
+        estimator.SetFlightStateInput(flight);
+    }
+    ~VelocityValidityFixture() { estimator.Stop(); }
+
+    bool Start() {
+        if (!flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                MakeHome()))
+                 .accepted) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return estimator.Start();
+    }
+
+    /// flags 直接写 GroundStationTarget.validity_flags（bit0 高度、
+    /// bit1/2/3 速度 N/E/D）。每次位置略变，保证 KF 有位置观测。
+    bool PublishTarget(uint32_t sequence, uint32_t flags, float velocity_north,
+                       float velocity_east, float velocity_down,
+                       uint32_t target_id = 42) {
+        auto target = MakeTarget(sequence);
+        target.target_id = target_id;
+        target.update_seq = sequence;
+        target.header.sequence = sequence;
+        target.header.receive_time_ms = NowMs();
+        target.header.valid_for_ms = 2000;
+        target.validity_flags = flags;
+        target.velocity_north_mps = velocity_north;
+        target.velocity_east_mps = velocity_east;
+        target.velocity_down_mps = velocity_down;
+        target.latitude_1e7 += static_cast<int32_t>(sequence) * 100;
+        if (!ground.Publish(
+                std::make_shared<const common::GroundStationTarget>(target))
+                 .accepted) {
+            return false;
+        }
+        return WaitUpdates(sequence);
+    }
+
+    bool WaitUpdates(uint64_t expected, int timeout_ms = 1000) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (estimator.UpdateCount() >= expected) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    }
+
+    common::TargetState Latest() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        return estimator.LastState();
+    }
+
+    common::Topic<common::GroundStationTarget> ground;
+    common::Topic<common::FlightStateSnapshot> flight;
+    TargetEstimator estimator;
+
+private:
+    static TargetEstimatorConfig MakeConfig() {
+        TargetEstimatorConfig config;
+        config.publish_interval = std::chrono::milliseconds(10);
+        return config;
+    }
+};
+
+TEST(TargetEstimatorVelocityValidityTest, KalmanVelocityRequiresFiveUpdates) {
+    VelocityValidityFixture f;
+    ASSERT_TRUE(f.Start());
+    const uint32_t altitude_only = 1U << 0U;
+    for (uint32_t seq = 1; seq <= 4; ++seq) {
+        ASSERT_TRUE(f.PublishTarget(seq, altitude_only, 0.f, 0.f, 0.f));
+    }
+    auto state = f.Latest();
+    EXPECT_TRUE(state.valid);
+    EXPECT_EQ(state.velocity_valid_mask, 0U);  // 4 次更新，KF 速度尚不可用
+
+    ASSERT_TRUE(f.PublishTarget(5, altitude_only, 0.f, 0.f, 0.f));
+    state = f.Latest();
+    EXPECT_TRUE(state.valid);
+    EXPECT_EQ(state.velocity_valid_mask, common::kVelocityValidAll);
+}
+
+TEST(TargetEstimatorVelocityValidityTest, GroundVelocityIsImmediatePerAxis) {
+    VelocityValidityFixture f;
+    ASSERT_TRUE(f.Start());
+    // 仅 D 轴有地面速度位：D 立即可用，N/E 仍等 KF 门限。
+    const uint32_t altitude_and_down = (1U << 0U) | (1U << 3U);
+    ASSERT_TRUE(f.PublishTarget(1, altitude_and_down, 0.f, 0.f, 2.0f));
+    auto state = f.Latest();
+    EXPECT_EQ(state.velocity_valid_mask, common::kVelocityValidDown);
+    EXPECT_NEAR(state.vel_z_mps, 2.0f, 1e-3f);
+
+    for (uint32_t seq = 2; seq <= 5; ++seq) {
+        ASSERT_TRUE(f.PublishTarget(seq, altitude_and_down, 0.f, 0.f, 2.0f));
+    }
+    state = f.Latest();
+    EXPECT_EQ(state.velocity_valid_mask, common::kVelocityValidAll);
+}
+
+TEST(TargetEstimatorVelocityValidityTest, TargetResetClearsVelocityValidity) {
+    VelocityValidityFixture f;
+    ASSERT_TRUE(f.Start());
+    const uint32_t altitude_only = 1U << 0U;
+    for (uint32_t seq = 1; seq <= 5; ++seq) {
+        ASSERT_TRUE(f.PublishTarget(seq, altitude_only, 0.f, 0.f, 0.f));
+    }
+    EXPECT_EQ(f.Latest().velocity_valid_mask, common::kVelocityValidAll);
+
+    // target_id 变化 → 滤波器重置；新目标重新累计 5 次前不可用。
+    ASSERT_TRUE(f.PublishTarget(6, altitude_only, 0.f, 0.f, 0.f, 99));
+    const auto state = f.Latest();
+    EXPECT_EQ(state.target_id, 99U);
+    EXPECT_EQ(state.velocity_valid_mask, 0U);
 }
 
 }  // namespace

@@ -113,6 +113,7 @@
         "default_horizontal_accuracy_m": 10.0,
         "default_vertical_accuracy_m": 15.0,
         "minimum_measurement_std_m": 0.5,
+        "min_velocity_position_updates": 5,
         "visual": {
             "queue_capacity": 8,
             "max_observation_age_ms": 200,

@@ -133,6 +133,7 @@ echo "退出码=$?"
 | G1 回归 | 第 0~3D 分阶段原样复跑（`--sitl-zero-velocity` … `--sitl-offboard-loss`） | 全部 PASS（退出码 0） | ✅ 2026-10-14（WSL2，七级全 PASS） |
 | G2 执行层 | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-controller` | 报告全 PASS（零速漂移/阶跃斜率/停发刹车/退出时延/降落上锁） | ✅ 2026-10-14（WSL2，全 PASS；实测值回填 `tools/PX4_SITL分级测试.md` §12.1） |
 | G3 全链 | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-mission` | 报告全 PASS（迁移序列 S5→S6→S7→回退、交接连续、备份接管、围栏钳制、模式停发 ≤200ms） | ✅ 2026-10-14（WSL2，全 PASS；环境前置条件见 `tools/px4_link_smoke.md` §2.2） |
+| P3 前馈专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-feedforward [--feedforward]` | 前馈到达 PX4、S5 稳态滞后 A/B、包线/回收链安全 | ✅ 2026-10-19（WSL2）：FF off 滞后均值 1.391m / p95 1.492m；FF on 0.321m / 0.400m，p95 降低 73.2%；G3 以 FF=false 同步复跑全 PASS |
 
 SITL 门禁运行环境（2026-10-14 建立）：本机 WSL2 Ubuntu 24.04（`~/PX4-Autopilot`
 v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前置条件见

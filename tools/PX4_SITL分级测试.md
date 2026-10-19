@@ -573,3 +573,6 @@ COAST→IDLE：972 ms；IDLE→PX4 退出 Offboard：1593 ms（上限 2200），
 | stage4 引导阶段超时 | 引导流未达 ≥2 秒/≥20 条、Offboard ACK 非 accepted、未真实 6/0；查控制器 WARN 迁移日志 |
 | stage4 起飞阶段超时 | 位置引导意图被拒（Home 基准缺失）或位置遥测无效；报告打印 rejected 计数 |
 | stage4 停发后未退出 Offboard | 对照 `controller.coast_timeout_ms` 与 PX4 `COM_OF_LOSS_T`；报告打印 IDLE→退出实测时延 |
+| stage4-feedforward 从错误位置起飞/滞后为负 | 未重启干净 SITL：目标为 Home 相对绝对坐标，上一轮降落点残留会让自机从目标前方起飞；每次运行前重启 PX4 SITL |
+| stage4-feedforward 前馈样本为 0 | 未加 `--feedforward`（Controller 开关默认关闭），或目标地面站速度位未置位；查注入 rig 的 `SetTargetVelocityNed` |
+| stage4-feedforward 前馈值存在但滞后不降 | 核对 PX4 `MPC_XY_VEL_MAX`（SITL 前置 2.0）与 `MPC_XY_P`；用 `tools/feedforward_report.py` 复核最后 5s 窗口 |

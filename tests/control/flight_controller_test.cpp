@@ -383,8 +383,38 @@ TEST_F(FlightControllerPipelineTest, PositionGuidePassthrough) {
     EXPECT_TRUE(out->use_yaw);
     EXPECT_FLOAT_EQ(out->yaw_deg, 30.f);
     EXPECT_EQ(controller_.ClampedCount(), 0u);
+    // P3 默认开关关闭：不携带前馈，行为与旧版一致。
+    EXPECT_EQ(out->feedforward_valid_mask, 0U);
+    EXPECT_FLOAT_EQ(out->feedforward_vx_mps, 0.f);
+    EXPECT_FLOAT_EQ(out->feedforward_vy_mps, 0.f);
+    EXPECT_FLOAT_EQ(out->feedforward_vz_mps, 0.f);
     // 坐标系契约：位置式输出同样标注局部 NED(frame_id=3)
     EXPECT_EQ(out->header.frame_id, 3);
+}
+
+TEST_F(FlightControllerPipelineTest, PositionFeedforwardIgnoredWhenSwitchOff) {
+    // 开关关闭：即使意图误带前馈，控制器也完全忽略（掩码/值清零）。
+    common::ControlIntent intent;
+    intent.type = common::ControlIntentType::kPositionGuide;
+    intent.control_source = 0;
+    intent.target_x = 10.f;
+    intent.target_y = 20.f;
+    intent.target_z = -5.f;
+    intent.feedforward_vx_mps = 2.0f;
+    intent.feedforward_vy_mps = -1.0f;
+    intent.feedforward_vz_mps = 0.5f;
+    intent.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(intent);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_FLOAT_EQ(out->x, 10.f);
+    EXPECT_EQ(out->feedforward_valid_mask, 0U);
+    EXPECT_FLOAT_EQ(out->feedforward_vx_mps, 0.f);
+    EXPECT_FLOAT_EQ(out->feedforward_vy_mps, 0.f);
+    EXPECT_FLOAT_EQ(out->feedforward_vz_mps, 0.f);
+    EXPECT_EQ(controller_.ClampedCount(), 0u);
+    EXPECT_EQ(controller_.FeedforwardDroppedCount(), 0u);
 }
 
 TEST_F(FlightControllerPipelineTest, PositionToVelocitySlewStartsFromZero) {
@@ -654,6 +684,179 @@ TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
     Tick();
     EXPECT_FALSE(TakeOutput().has_value());
     EXPECT_GT(controller_.RejectedIntentCount(), 0u);
+}
+
+// =============================================================================
+// P3 位置速度前馈用例（2026-10-19）：开关显式打开，合成时间轴 + TestTick。
+// 配置：max_feedforward_mps=1.0（前馈独立上限，与 max_speed_mps 无关）。
+// =============================================================================
+
+drone::config::FlightControllerConfig MakeFeedforwardConfig() {
+    auto config = MakePipelineConfig();
+    config.enable_position_velocity_feedforward = true;
+    config.max_feedforward_mps = 1.0;
+    return config;
+}
+
+class FlightControllerFeedforwardTest : public ::testing::Test {
+protected:
+    FlightControllerFeedforwardTest() : controller_(MakeFeedforwardConfig()) {
+        controller_.SetInput(intents_);
+        px4_link_.SetState(MakeOffboardSnapshot());
+        controller_.SetPx4LinkSource(&px4_link_);
+        output_ = controller_.SetpointOutput().Subscribe(kOutputCapacity);
+        controller_.TestForceAuthority(ControlAuthority::kActive);
+    }
+
+    void PublishIntent(common::ControlIntent intent) {
+        intent.valid_until_ms = now_ms_ + kValidForMs;
+        intent.reason_code |= common::kControlIntentReasonRequestControl;
+        (void)intents_.Publish(
+            std::make_shared<const common::ControlIntent>(intent));
+    }
+
+    void Tick() {
+        controller_.TestTick(now_ms_);
+        now_ms_ += kPeriodMs;
+    }
+
+    std::optional<common::Px4Setpoint> TakeOutput() {
+        auto message = output_.TryTake();
+        if (!message.has_value()) {
+            return std::nullopt;
+        }
+        return **message;
+    }
+
+    common::ControlIntent MakePositionIntent(float x, float y, float z) {
+        common::ControlIntent intent;
+        intent.type = common::ControlIntentType::kPositionGuide;
+        intent.control_source = 0;
+        intent.target_x = x;
+        intent.target_y = y;
+        intent.target_z = z;
+        return intent;
+    }
+
+    static constexpr uint64_t kStartMs = 1000000;
+    static constexpr uint64_t kPeriodMs = 20;
+    static constexpr uint64_t kValidForMs = 60000;
+    static constexpr std::size_t kOutputCapacity = 512;
+    static constexpr double kMaxStep = 2.0 * 0.02;
+
+    uint64_t now_ms_ = kStartMs;
+    common::Topic<common::ControlIntent> intents_;
+    MockPx4Link px4_link_;
+    FlightController controller_;
+    common::Topic<common::Px4Setpoint>::Subscription output_;
+};
+
+TEST_F(FlightControllerFeedforwardTest, PositionFeedforwardPassthrough) {
+    auto intent = MakePositionIntent(10.f, 20.f, -5.f);
+    intent.feedforward_vx_mps = 0.5f;
+    intent.feedforward_vy_mps = -0.25f;
+    intent.feedforward_vz_mps = 0.25f;
+    intent.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(intent);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->type, common::SetpointType::kPosition);
+    EXPECT_FLOAT_EQ(out->x, 10.f);  // 位置仍透传
+    EXPECT_FLOAT_EQ(out->y, 20.f);
+    EXPECT_FLOAT_EQ(out->z, -5.f);
+    EXPECT_EQ(out->feedforward_valid_mask, common::kVelocityValidAll);
+    EXPECT_FLOAT_EQ(out->feedforward_vx_mps, 0.5f);
+    EXPECT_FLOAT_EQ(out->feedforward_vy_mps, -0.25f);
+    EXPECT_FLOAT_EQ(out->feedforward_vz_mps, 0.25f);
+    EXPECT_EQ(controller_.ClampedCount(), 0u);
+    EXPECT_EQ(controller_.FeedforwardDroppedCount(), 0u);
+}
+
+TEST_F(FlightControllerFeedforwardTest, HorizontalAndVerticalClampedIndependently) {
+    auto intent = MakePositionIntent(0.f, 0.f, -1.f);
+    intent.feedforward_vx_mps = 3.f;   // 水平模长 5 → 等比缩放到 1
+    intent.feedforward_vy_mps = 4.f;
+    intent.feedforward_vz_mps = -5.f;  // 垂直独立钳制到 -1
+    intent.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(intent);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(out->feedforward_valid_mask, common::kVelocityValidAll);
+    EXPECT_NEAR(out->feedforward_vx_mps, 0.6f, 1e-5f);
+    EXPECT_NEAR(out->feedforward_vy_mps, 0.8f, 1e-5f);
+    EXPECT_FLOAT_EQ(out->feedforward_vz_mps, -1.f);
+    EXPECT_EQ(controller_.ClampedCount(), 2u);  // 水平 + 垂直各一次
+}
+
+TEST_F(FlightControllerFeedforwardTest, PerAxisFiniteDegradationKeepsPosition) {
+    auto intent = MakePositionIntent(1.f, 2.f, -3.f);
+    intent.feedforward_vx_mps = 1.f;
+    intent.feedforward_vy_mps = std::numeric_limits<float>::quiet_NaN();
+    intent.feedforward_vz_mps = std::numeric_limits<float>::infinity();
+    intent.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(intent);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->feedforward_valid_mask, common::kVelocityValidNorth);
+    EXPECT_FLOAT_EQ(out->feedforward_vx_mps, 1.f);
+    EXPECT_FLOAT_EQ(out->feedforward_vy_mps, 0.f);
+    EXPECT_FLOAT_EQ(out->feedforward_vz_mps, 0.f);
+    EXPECT_EQ(controller_.FeedforwardDroppedCount(), 2u);
+    // 位置照常发布（坏前馈不拒绝整条意图）。
+    EXPECT_FLOAT_EQ(out->x, 1.f);
+    EXPECT_FLOAT_EQ(out->y, 2.f);
+    EXPECT_FLOAT_EQ(out->z, -3.f);
+
+    // 三轴全部非有限：前馈全丢，位置仍发布。
+    auto all_bad = MakePositionIntent(4.f, 5.f, -6.f);
+    all_bad.feedforward_vx_mps = std::numeric_limits<float>::quiet_NaN();
+    all_bad.feedforward_vy_mps = std::numeric_limits<float>::infinity();
+    all_bad.feedforward_vz_mps = std::numeric_limits<float>::quiet_NaN();
+    all_bad.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(all_bad);
+    Tick();
+    auto second = TakeOutput();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->feedforward_valid_mask, 0U);
+    EXPECT_EQ(controller_.FeedforwardDroppedCount(), 5u);
+    EXPECT_FLOAT_EQ(second->x, 4.f);
+}
+
+TEST_F(FlightControllerFeedforwardTest, PositionToVelocitySlewStartsFromZero) {
+    auto position = MakePositionIntent(10.f, 0.f, 0.f);
+    position.feedforward_vx_mps = 1.f;
+    position.feedforward_valid_mask = common::kVelocityValidNorth;
+    PublishIntent(position);
+    Tick();
+    (void)TakeOutput();
+
+    auto velocity = MakeVelocityIntent(2.0, 0.0, 0.0);
+    velocity.control_source = 1;
+    PublishIntent(velocity);
+    Tick();
+    auto first = TakeOutput();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->type, common::SetpointType::kVelocity);
+    // 前馈不参与速度式无扰衔接：仍从 0 起步推进一拍。
+    EXPECT_NEAR(first->x, kMaxStep, 1e-5);
+    EXPECT_EQ(first->feedforward_valid_mask, 0U);
+}
+
+TEST_F(FlightControllerFeedforwardTest, VelocityIntentIgnoresFeedforwardFields) {
+    auto intent = MakeVelocityIntent(1.5, 0.0, 0.0);
+    intent.control_source = 1;
+    intent.feedforward_vx_mps = 9.f;
+    intent.feedforward_valid_mask = common::kVelocityValidNorth;
+    PublishIntent(intent);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->type, common::SetpointType::kVelocity);
+    EXPECT_NEAR(out->x, kMaxStep, 1e-5);  // 速度意图走自身斜坡，忽略前馈字段
+    EXPECT_EQ(out->feedforward_valid_mask, 0U);
 }
 
 }  // namespace drone::control

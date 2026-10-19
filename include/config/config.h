@@ -70,6 +70,10 @@ struct FlightControllerConfig {
     double max_jerk_mps3 = 0.0;                  // jerk 上限；0=不启用（v1 预留）
     double max_altitude_m = 30.0;                // 围栏：相对 Home 最大高度
     double max_radius_m = 100.0;                 // 围栏：相对 Home 最大水平半径
+    // 位置型意图速度前馈（P3，2026-10-19）：开关默认关闭；上限独立于
+    // max_speed_mps（后者只约束速度式意图），水平模长/垂直分量分别钳制。
+    bool enable_position_velocity_feedforward = false;
+    double max_feedforward_mps = 2.0;
     std::chrono::milliseconds intent_timeout{300};   // 意图超龄阈值
     std::chrono::milliseconds coast_timeout{1000};   // COAST 最长保持
     std::chrono::milliseconds slew_transition{500};  // 无扰衔接斜坡时长

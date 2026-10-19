@@ -126,6 +126,37 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
   `z = -max_altitude_m`（不设下限，近地/贴地由任务层负责）。
 - 每次钳制生效 `ClampedCount()+1` 并节流 WARN（第 1 次与每满 100 次）。
 
+## 位置速度前馈（P3，2026-10-19）
+
+位置式意图可携带逐轴速度前馈，经 `Px4Link` 与位置同时下发（PX4 位置环把它作为
+速度前馈叠加到位置 P 输出，消除恒速目标的尾追稳态滞后）。边界：
+
+- **配置**：`controller.enable_position_velocity_feedforward`（默认 `false`）、
+  `controller.max_feedforward_mps`（默认 `2.0`，独立于 `max_speed_mps`；
+  后者只约束速度式意图）。开关关闭时完全忽略意图前馈，输出与旧版逐位等价。
+- **来源**：仅 S5 `kPositionGuide` 使用（状态机从 `TargetState.velocity_valid_mask`
+  逐轴填充）；S6 冻结段与 S7 速度意图不带前馈。
+- **流水线（`PublishPosition`，围栏钳制之后）**：
+  1. 掩码清洗：未知位丢弃并节流 WARN；
+  2. 逐轴有限性降级：置位轴非有限 → 只清该轴、值写 0、`FeedforwardDroppedCount+1`，
+     **位置照常发布**（前馈是增强项，不因坏值拒绝整条意图）；
+  3. 水平有效分量 `hypot` 超 `max_feedforward_mps` → 等比缩放，`ClampedCount+1`；
+     垂直 D 分量按绝对值保号钳制，`ClampedCount+1`；
+  4. 写入 `Px4Setpoint.feedforward_*`。
+- **不做 slew**：与位置通道“透传不 slew”一致；前馈阶跃由 PX4 速度环/倾角限制吸收。
+- **不参与位置围栏**：围栏只钳制位置目标；前馈是速度量，边界附近可能产生瞬态
+  过冲，由 PX4 geofence 兜底（与速度式意图的既有语义一致）。
+- **无扰衔接**：位置→速度切换仍由 `PublishVelocity` 的“上一输出非速度式从 0
+  起步”守卫处理，前馈不参与斜坡初值。
+- **坐标系**：前馈为局部 NED（与位置目标同帧），控制器不做二次旋转。
+- **诊断/日志**：`ClampedCount` 现包含速度幅值 + 位置围栏 + 位置前馈钳制；
+  新增 `FeedforwardDroppedCount()`（非有限/未知掩码丢弃轴次）。启动日志带
+  `feedforward=on/off cap=...`；钳制/丢弃按第 1 次与每满 100 次节流 WARN。
+- **测试**：`FlightControllerPipelineTest.PositionFeedforwardIgnoredWhenSwitchOff`；
+  `FlightControllerFeedforwardTest.*`（透传、水平/垂直独立钳制、逐轴非有限降级、
+  位置→速度从 0 起步、速度意图忽略前馈字段）；跨模块 PTY 契约
+  `FlightControllerLinkContractTest.PositionWithFeedforwardReachesPx4LinkWire`。
+
 ## Home 漂移对控制的影响（2026-10-16 结论）
 
 控制链里 Home 只从三处进入。**速度型控制不受影响**（速度/角速度是平移不变量，
@@ -235,9 +266,9 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
   （PTY 真实链路契约用例，见下「测试方式」）。
 - **类型映射**：`kVelocityHeading`→`SetpointType::kVelocity`（限幅流水线）；
   `kPositionGuide`→`kPosition`（**透传位置目标不做 slew**——位置阶跃由 PX4
-  内部轨迹规划平滑，本控制器只管速度式连续性；速度上限写入由 Px4Link 侧
-  type mask 语义保证；完整联调测试归 Task 7；**发布前经 Home 相对围栏
-  钳制**，见「Home 相对围栏」节）；`kBrakeHover`→零速刹停；
+  内部位置控制器平滑，本控制器只管速度式连续性；**发布前经 Home 相对围栏
+  钳制**，见「Home 相对围栏」节；P3 开关打开时按「位置速度前馈」节处理
+  逐轴前馈与独立幅值钳制）；`kBrakeHover`→零速刹停；
   起飞/降落/返航/人工接管等类型暂不支持，计入 `ErrorCount`。
 - **航向通道透传**：`use_yaw = (yaw_deg != 0)`、
   `use_yaw_rate = (yaw_rate_dps != 0)`；互斥约束沿用 Px4Link 现有校验
@@ -285,6 +316,15 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
     类型映射 `kPosition`、航向透传）；
   - `PositionToVelocitySlewStartsFromZero`：位置→速度类型切换，速度
     斜坡从 0 起步（量纲守卫）。
+- 位置速度前馈用例（P3）：
+  - `PositionFeedforwardIgnoredWhenSwitchOff`：开关默认关闭时忽略意图前馈；
+  - `FlightControllerFeedforwardTest.PositionFeedforwardPassthrough`：开关打开时
+    位置与逐轴前馈原值透传；
+  - `HorizontalAndVerticalClampedIndependently`：水平模长/垂直分量分别钳制，
+    `ClampedCount==2`；
+  - `PerAxisFiniteDegradationKeepsPosition`：坏前馈轴丢弃（计数）但位置照发；
+  - `PositionToVelocitySlewStartsFromZero`：前馈不参与位置→速度斜坡初值；
+  - `VelocityIntentIgnoresFeedforwardFields`：速度意图不读前馈字段。
 - 控制权三态用例（`FlightControllerAuthorityTest` 夹具：MockPx4Link 注入
   快照 + 合成时间轴，配置 period=20ms/intent_timeout=100ms/coast_timeout=
   400ms）：

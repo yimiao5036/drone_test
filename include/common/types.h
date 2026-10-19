@@ -303,6 +303,15 @@ enum class ControlIntentType : uint8_t {
     kManualOverride,    ///< 禁止自动输出/人工接管意图
 };
 
+/// 逐轴速度有效位（TargetState / ControlIntent / Px4Setpoint 共用）。
+/// 位号约定：bit0=N、bit1=E、bit2=D；与 GroundStationTarget.validity_flags
+/// 的 bit1/2/3（vN/vE/vD）不同，估计器内负责显式映射。
+constexpr uint8_t kVelocityValidNorth = 1u << 0;
+constexpr uint8_t kVelocityValidEast = 1u << 1;
+constexpr uint8_t kVelocityValidDown = 1u << 2;
+constexpr uint8_t kVelocityValidAll =
+    kVelocityValidNorth | kVelocityValidEast | kVelocityValidDown;
+
 /// 控制意图（状态机/策略 → 飞行控制器）。
 /// 生成状态、优先级、有效期、坐标系、限制条件和产生原因齐备；
 /// PX4 通信线程发送前再次检查控制权和有效期。
@@ -318,6 +327,12 @@ struct ControlIntent {
     float yaw_rate_dps = 0.f;    ///< 偏航角速度指令（度/秒；速率式航向通道，
                                  ///< 2026-09-23 视觉跟踪移植新增，默认 0=不使用）
     float max_speed_mps = 0.f;   ///< 速度限制；0=不限制
+    /// 位置型意图的速度前馈（局部 NED，m/s；2026-10-19 P3）。
+    float feedforward_vx_mps = 0.f;
+    float feedforward_vy_mps = 0.f;
+    float feedforward_vz_mps = 0.f;
+    /// 前馈逐轴有效位（kVelocityValid*）；0=无前馈。仅 kPositionGuide 使用。
+    uint8_t feedforward_valid_mask = 0;
     uint32_t reason_code = 0;    ///< 产生原因编码（见 docs/数据接口文档.md 附录）
     uint64_t valid_until_ms = 0; ///< 有效期截止（单调时钟）
 };
@@ -344,6 +359,12 @@ struct Px4Setpoint {
     float x = 0.f;         ///< 位置或速度分量
     float y = 0.f;
     float z = 0.f;
+    /// 位置型设定值的速度前馈（局部 NED，m/s；2026-10-19 P3）。
+    float feedforward_vx_mps = 0.f;
+    float feedforward_vy_mps = 0.f;
+    float feedforward_vz_mps = 0.f;
+    /// 前馈逐轴有效位（kVelocityValid*）；0=无前馈。速度型必须为 0。
+    uint8_t feedforward_valid_mask = 0;
     float yaw_deg = 0.f;       ///< 目标航向；仅 use_yaw=true 时使用
     float yaw_rate_dps = 0.f;  ///< 目标航向角速度；仅 use_yaw_rate=true 时使用
     bool use_yaw = false;      ///< 是否启用航向角控制
@@ -389,6 +410,8 @@ struct TargetState {
     float vel_x_mps = 0.f;     ///< 目标速度
     float vel_y_mps = 0.f;
     float vel_z_mps = 0.f;     ///< 垂直状态无效时为NaN
+    /// 逐轴速度可用位（kVelocityValid*）；0=不可用于前馈。目标过期时清零。
+    uint8_t velocity_valid_mask = 0;
     float confidence = 0.f;    ///< 估计置信度 [0,1]
     uint64_t last_observed_ms = 0;  ///< 最近有效观测时间
     bool valid = false;        ///< 水平估计是否新鲜有效；需要三维的消费者还必须检查Z/VZ有限
