@@ -27,6 +27,13 @@ constexpr uint32_t kHorizontalAccuracyValid = 1U << 5U;
 constexpr uint32_t kVerticalAccuracyValid = 1U << 6U;
 constexpr uint8_t kFrameLocalNed = 3;
 constexpr double kMillisecondsToSeconds = 0.001;
+// Home 漂移观测：首次变化立即记录，其后按 30s 窗口汇总（PX4 地面阶段 0.5Hz
+// 刷新 Home，逐条打印会以 ≈2s 周期刷屏并淹没真实告警）。
+constexpr uint64_t kHomeLogSummaryIntervalMs = 30000;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDegreesToRadians = kPi / 180.0;
+// 仅用于日志范围读数（不参与定位）：1° 纬度 ≈ 111.32km。
+constexpr double kMetersPerDegreeLatitude = 111320.0;
 
 uint64_t SteadyNowMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -140,6 +147,25 @@ struct TargetEstimator::Impl {
     std::optional<GeodeticCoordinate> anchor;
     /// Home：仅作漂移观测（PX4 地面跟随/解锁冻结），不再参与换算与重置。
     std::optional<GeodeticCoordinate> home;
+    /// Home 漂移观测窗口：首次变化立即记录，其后每 30s 汇总一次窗口统计，
+    /// 保留观测能力的同时避免 0.5Hz Home 刷新逐条刷屏。
+    struct HomeChangeWindow {
+        bool active = false;
+        uint64_t count = 0;
+        uint64_t start_ms = 0;
+        uint64_t last_ms = 0;
+        GeodeticCoordinate first{};
+        GeodeticCoordinate last{};
+        double min_latitude_deg = 0.0;
+        double max_latitude_deg = 0.0;
+        double min_longitude_deg = 0.0;
+        double max_longitude_deg = 0.0;
+        double min_altitude_m = 0.0;
+        double max_altitude_m = 0.0;
+        double max_step_horizontal_m = 0.0;
+    };
+    HomeChangeWindow home_window;
+    bool home_change_logged = false;  ///< 本次启动是否已记录首条 Home 变化明细
     uint32_t target_id = 0;
     uint32_t last_ground_boot_id = 0;
     uint32_t last_update_seq = 0;
@@ -200,7 +226,7 @@ struct TargetEstimator::Impl {
         ground_velocity_north_mps = 0.0;
         ground_velocity_east_mps = 0.0;
         ground_velocity_down_mps = 0.0;
-        // 视觉记账一并清空（Home 变化/target_id 切换走同一入口）
+        // 视觉记账一并清空（锚点变化/target_id 切换走同一入口）
         visual_last_frame_sequence = 0;
         visual_frame_seen = false;
         // 创新诊断一并清空：跨原点/跨目标的创新值没有意义（防陈旧值通过门限）
@@ -275,13 +301,118 @@ struct TargetEstimator::Impl {
         const GeodeticCoordinate previous = home.value_or(candidate);
         home = candidate;
         if (changed) {
-            SPDLOG_WARN("PX4 Home变化（诊断记录，估计器不重置）: "
-                        "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) {}",
-                        previous.latitude_deg, previous.longitude_deg,
-                        previous.altitude_m, candidate.latitude_deg,
-                        candidate.longitude_deg, candidate.altitude_m,
-                        FormatFlightContext(state));
+            const uint64_t now_ms = SteadyNowMs();
+            if (!home_change_logged) {
+                // 本次启动的第一条变化保留完整明细（旧/新 + 上下文），
+                // 后续变化进入窗口汇总，不再逐条打印。
+                home_change_logged = true;
+                SPDLOG_WARN("PX4 Home变化（诊断记录，估计器不重置）: "
+                            "旧=({:.7f},{:.7f},{:.3f}m) 新=({:.7f},{:.7f},{:.3f}m) {}",
+                            previous.latitude_deg, previous.longitude_deg,
+                            previous.altitude_m, candidate.latitude_deg,
+                            candidate.longitude_deg, candidate.altitude_m,
+                            FormatFlightContext(state));
+            } else {
+                AccumulateHomeChange(previous, candidate, now_ms);
+                MaybeFlushHomeWindow(now_ms, "周期");
+            }
         }
+    }
+
+    /// 两点水平距离（等距圆柱近似，仅用于日志范围读数）。
+    static double HorizontalDistanceMeters(const GeodeticCoordinate& from,
+                                           const GeodeticCoordinate& to) {
+        const double mean_latitude_rad =
+            (from.latitude_deg + to.latitude_deg) * 0.5 * kDegreesToRadians;
+        const double north_m =
+            (to.latitude_deg - from.latitude_deg) * kMetersPerDegreeLatitude;
+        const double east_m =
+            (to.longitude_deg - from.longitude_deg) * kMetersPerDegreeLatitude *
+            std::cos(mean_latitude_rad);
+        return std::hypot(north_m, east_m);
+    }
+
+    /// 把一次 Home 变化并入当前窗口；窗口首条记录时初始化边界。
+    void AccumulateHomeChange(const GeodeticCoordinate& previous,
+                              const GeodeticCoordinate& current,
+                              uint64_t now_ms) {
+        if (!home_window.active) {
+            home_window = HomeChangeWindow{};
+            home_window.active = true;
+            home_window.start_ms = now_ms;
+            home_window.first = current;
+            home_window.min_latitude_deg = home_window.max_latitude_deg =
+                current.latitude_deg;
+            home_window.min_longitude_deg = home_window.max_longitude_deg =
+                current.longitude_deg;
+            home_window.min_altitude_m = home_window.max_altitude_m =
+                current.altitude_m;
+        }
+        home_window.count++;
+        home_window.last_ms = now_ms;
+        home_window.last = current;
+        home_window.min_latitude_deg =
+            std::min(home_window.min_latitude_deg, current.latitude_deg);
+        home_window.max_latitude_deg =
+            std::max(home_window.max_latitude_deg, current.latitude_deg);
+        home_window.min_longitude_deg =
+            std::min(home_window.min_longitude_deg, current.longitude_deg);
+        home_window.max_longitude_deg =
+            std::max(home_window.max_longitude_deg, current.longitude_deg);
+        home_window.min_altitude_m =
+            std::min(home_window.min_altitude_m, current.altitude_m);
+        home_window.max_altitude_m =
+            std::max(home_window.max_altitude_m, current.altitude_m);
+        home_window.max_step_horizontal_m = std::max(
+            home_window.max_step_horizontal_m,
+            HorizontalDistanceMeters(previous, current));
+    }
+
+    /// 窗口到期（或停止时强制）输出一条汇总并清空窗口。
+    void EmitHomeWindowSummary(const char* reason) {
+        if (!home_window.active) {
+            return;
+        }
+        const double duration_s = static_cast<double>(
+            home_window.last_ms - home_window.start_ms) * kMillisecondsToSeconds;
+        const double mean_latitude_rad =
+            (home_window.min_latitude_deg + home_window.max_latitude_deg) *
+            0.5 * kDegreesToRadians;
+        const double latitude_span_m =
+            (home_window.max_latitude_deg - home_window.min_latitude_deg) *
+            kMetersPerDegreeLatitude;
+        const double longitude_span_m =
+            (home_window.max_longitude_deg - home_window.min_longitude_deg) *
+            kMetersPerDegreeLatitude * std::cos(mean_latitude_rad);
+        const double net_horizontal_m =
+            HorizontalDistanceMeters(home_window.first, home_window.last);
+        const double net_altitude_m =
+            home_window.last.altitude_m - home_window.first.altitude_m;
+        const double altitude_span_m =
+            home_window.max_altitude_m - home_window.min_altitude_m;
+        SPDLOG_WARN(
+            "PX4 Home变化窗口汇总（{}）: 窗口={:.1f}s 变化={}次 "
+            "首=({:.7f},{:.7f},{:.3f}m) 末=({:.7f},{:.7f},{:.3f}m) "
+            "水平范围={:.1f}x{:.1f}m 净漂移={:.1f}m "
+            "高度净漂移={:+.2f}m 高度范围={:.2f}m 最大单步={:.2f}m {}",
+            reason, duration_s, home_window.count,
+            home_window.first.latitude_deg, home_window.first.longitude_deg,
+            home_window.first.altitude_m, home_window.last.latitude_deg,
+            home_window.last.longitude_deg, home_window.last.altitude_m,
+            latitude_span_m, longitude_span_m, net_horizontal_m,
+            net_altitude_m, altitude_span_m,
+            home_window.max_step_horizontal_m,
+            FormatFlightContext(latest_flight));
+        home_window = HomeChangeWindow{};
+    }
+
+    /// 周期检查：窗口自首条变化起满 30s 即汇总（不依赖后续变化触发）。
+    void MaybeFlushHomeWindow(uint64_t now_ms, const char* reason) {
+        if (!home_window.active ||
+            now_ms < home_window.start_ms + kHomeLogSummaryIntervalMs) {
+            return;
+        }
+        EmitHomeWindowSummary(reason);
     }
 
     /// 飞行上下文诊断串（GPS 质量 + 锚点 + 局部位置），锚点/Home 变化日志共用。
@@ -776,6 +907,7 @@ struct TargetEstimator::Impl {
             }
 
             const uint64_t now_ms = SteadyNowMs();
+            MaybeFlushHomeWindow(now_ms, "周期");
             if (now_ms >= next_publish_ms) {
                 PublishState(now_ms);
                 next_publish_ms = SaturatingAdd(
@@ -794,6 +926,8 @@ struct TargetEstimator::Impl {
         if (thread.joinable()) {
             thread.join();
         }
+        // 停止时强制输出最后一个未满 30s 的窗口，避免尾部观测丢失。
+        EmitHomeWindowSummary("停止");
     }
 };
 
@@ -839,6 +973,8 @@ bool TargetEstimator::Start() {
     impl_->ResetFilterState();
     impl_->anchor.reset();
     impl_->home.reset();
+    impl_->home_window = decltype(impl_->home_window){};
+    impl_->home_change_logged = false;
     impl_->has_flight_snapshot = false;
     impl_->latest_flight_receive_ms = 0;
     {

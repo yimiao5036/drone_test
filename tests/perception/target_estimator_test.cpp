@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include "../common/log_capture.h"
 #include "common/topic.h"
 #include "common/types.h"
 #include "perception/geodetic_converter.h"
@@ -743,6 +744,40 @@ TEST(TargetEstimatorFusionTest, HomeChangeKeepsFilterStateAndVisualBookkeeping) 
     f.estimator.Stop();
     EXPECT_EQ(f.estimator.VisualUpdateCount(), 2U);  // Home 变化后视觉继续更新
     EXPECT_EQ(f.estimator.ErrorCount(), errors_before);
+}
+
+TEST(TargetEstimatorFusionTest, HomeDriftLogsAreWindowedInsteadOfPerChange) {
+    // Home 变化逐条 WARN 会以 0.5Hz 刷屏：首次明细 + 后续 30s 窗口汇总；
+    // 停止时强制输出未满窗口，保证尾部观测不丢。
+    drone::test::LogCapture logs;  // 必须在组件启动前挂载
+    FusionFixture f;
+    ASSERT_TRUE(f.estimator.Start());
+    f.PublishFlight();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    logs.Clear();
+
+    // 连续 5 次 Home 变化（逐条等待消费，避开容量 2 的快照队列覆盖）：
+    // 第 1 条打明细，第 2~5 条进入窗口，30s 未到不输出。
+    for (int i = 1; i <= 5; ++i) {
+        auto moved = MakeFlightFull();
+        moved.home_lat_1e7 = 300000000 + i * 10;  // 每次约 0.11m
+        ASSERT_TRUE(f.flight.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(moved)).accepted);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+    EXPECT_EQ(logs.Count("PX4 Home变化（诊断记录"), 1);
+    EXPECT_EQ(logs.Count("PX4 Home变化窗口汇总"), 0);
+
+    f.estimator.Stop();
+    EXPECT_EQ(logs.Count("PX4 Home变化窗口汇总"), 1);
+    bool saw_stop_summary = false;
+    for (const std::string& line : logs.Lines()) {
+        if (line.find("PX4 Home变化窗口汇总（停止）") != std::string::npos) {
+            saw_stop_summary = true;
+            EXPECT_NE(line.find("变化=4次"), std::string::npos);
+        }
+    }
+    EXPECT_TRUE(saw_stop_summary);
 }
 
 TEST(TargetEstimatorFusionTest, AnchorChangeResetsVisualBookkeeping) {
