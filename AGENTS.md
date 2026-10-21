@@ -55,7 +55,7 @@ drone_test/
 ├── CMakeLists.txt
 ├── main.cpp                 # 唯一正式入口：配置/日志/信号 + DroneApplication
 ├── README.md / CLAUDE.md / AGENTS.md
-├── docs/                    # 全部设计、进度、排查与协议文档
+├── docs/                    # 文档入口 + 当前设计/进度/排查 + archive/ 历史材料
 ├── include/                 # 与 src/ 镜像；每个模块同级维护 *.md 实现文档
 │   ├── application/         # drone_application.h（组件装配根）
 │   ├── common/              # topic.h, types.h, logger.h, latency_statistics.h
@@ -149,6 +149,9 @@ drone_test/
 - 硬件相关的模块测试使用 mock 替代真实设备
 
 ### 实现文档规范（强制规则）
+- **文档入口**：`docs/README.md` 是唯一入口，包含文档地图、单一事实来源和
+  「改代码时至少更新哪些文档」矩阵；当前状态看 `docs/开发进度.md`，历史时间线看
+  `docs/开发历史.md`。不要在两处重复维护同一状态。
 - **每个功能模块实现完成后，必须编写对应的实现文档**，供查看、后期排查与修改参考。
 - **文档写在对应功能实现的文件夹内**，与头文件同级（如 `include/video/video_decoder.md`、
   `include/common/logger.md`），文件名与功能对应、使用中文名；沿用 `include/common/topic.md` 先例。
@@ -161,6 +164,18 @@ drone_test/
   - **排查/修改要点**：常见问题现象与定位方法、修改时需要注意的关联点。
 - 修改代码时必须同步更新对应实现文档；新增功能同样在实现时补文档，不得只写代码不留文档。
 - 基础设施已有文档的（如 `include/common/topic.md`），实现文档中引用即可，不重复抄录。
+- 提交前必须运行：
+
+  ```bash
+  python3 tools/check_docs.py
+  python3 tools/check_docs.py --changed
+  ```
+
+  前者校验基线数字、当前文档相对链接和模块实现文档是否存在；后者按 git 改动列出
+  应核对的文档。测试数量变化时，先改 `docs/README.md` 的「当前基线」，再同步脚本列出的
+  10 处位置。
+- 历史/过时文档移入 `docs/archive/`（在 `docs/archive/README.md` 登记），不要留在当前
+  文档入口；当前维护文档不得指向不存在的路径。
 
 ### C++ 设计规范
 - 遵守 C++17 标准，优先使用现代 C++ 特性

@@ -17,6 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cmake -S . -B build
 cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure     # 基线 496/496
+python3 tools/check_docs.py                    # 文档基线/链接/模块文档检查
 ./build/drone_control                          # 生成 logs/0001_xxx.log
 ./build/drone_control --config /路径/config.json
 
@@ -85,12 +86,31 @@ PX4 /dev/ttyS1 → Px4Link → kFlightState → GroundStationLink → /dev/ttyS6
 | `videoPart/` | 视频/RKNN 历史验证原型，不进正式装配 |
 | `yolo_pt/` | 模型训练与 pt→RKNN 导出（Python） |
 | `tools/` | 冒烟/探针/地面站测试工具 + `web平台/`（Vue3 开发版地面站） |
-| `docs/` | 全部设计文档（中文文件名） |
+| `docs/` | 当前文档入口 + `archive/`/`superpowers/` 历史材料（中文文件名） |
 
 ## 维护文档入口（排查/改动前先读）
 
-1. `docs/项目总览与数据流.md` — 正式/影子/Stub 边界、全部数据流、线程模型
-2. `docs/模块索引.md` — 按类名/Topic/配置/测试定位代码
-3. `docs/故障排查手册.md` — 按现象定位（无画面、无检测、无 ACK 等）
-4. `docs/新增设备接入指南.md` — 替换/新增硬件的固定步骤
-5. 各模块头文件同级的实现文档
+1. `docs/README.md` — **文档唯一入口**：文档地图、单一事实来源、更新矩阵、基线位置
+2. `docs/项目总览与数据流.md` — 正式/影子/Stub 边界、全部数据流、线程模型
+3. `docs/模块索引.md` — 按类名/Topic/配置/测试定位代码
+4. `docs/故障排查手册.md` — 按现象定位（无画面、无检测、无 ACK 等）
+5. `docs/新增设备接入指南.md` — 替换/新增硬件的固定步骤
+6. `docs/开发进度.md` — 当前状态/门禁/最近变更；`docs/开发历史.md` — 历史时间线
+7. 各模块头文件同级的实现文档
+
+## 文档更新（提交前强制）
+
+- 改代码前先看 `docs/README.md` §4「改代码时至少更新哪些文档」；
+- 改完运行：
+
+  ```bash
+  python3 tools/check_docs.py
+  python3 tools/check_docs.py --changed
+  ```
+
+- `check_docs.py` 会校验：`docs/README.md` 当前基线、10 处基线位置、当前文档相对链接、
+  `docs/模块索引.md` 中的实现文档是否存在；
+- 行为/门禁变化更新 `docs/开发进度.md`；里程碑在 `docs/开发历史.md` 顶部追加一条；
+- 消息/Topic 变更新 `docs/数据接口文档.md`；故障现象变更新 `docs/故障排查手册.md`；
+- 测试数量变化：先改 `docs/README.md`「当前基线」一行，再同步 10 处基线位置；
+- 历史文档只进 `docs/archive/` 或 `docs/superpowers/`，当前维护文档不得指向不存在的路径。

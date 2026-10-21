@@ -1,7 +1,7 @@
 # 视觉观测 → 局部 NED 转换（visual_ned_converter）
 
 > 实现：`include/perception/visual_ned_converter.h` + `src/perception/visual_ned_converter.cpp`
-> 设计依据：`docs/物理追踪思路.md` §3.1/§6.3、`docs/感知与避障设计.md` §单目标线性卡尔曼
+> 设计依据：`docs/物理追踪思路.md` §3.1/§6.3、`docs/archive/早期设计/感知与避障设计.md` §单目标线性卡尔曼
 > 消费者：`TargetEstimator` 第二阶段（视觉融合，见 `include/perception/目标估计器.md`）
 
 ## 功能职责

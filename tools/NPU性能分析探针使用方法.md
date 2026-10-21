@@ -3,8 +3,8 @@
 > 适用对象：在香橙派（RK3588）上分析 YOLO/RKNN 推理耗时、定位"单次推理慢"原因的维护者。
 > 本文只描述 NPU 相关的探针用法与判读；视频链路其他阶段（解码、叠加、编码）的完整指标定义见
 > [视频链路延迟探针文档](video_latency_probe.md)。
-> 历史实测结论见 [YOLO26 RKNN逐层性能分析](../docs/YOLO26_RKNN逐层性能分析.md) 与
-> [YOLO26在RK3588上的性能来源核查](../docs/YOLO26在RK3588上的性能来源核查.md)。
+> 历史实测结论见 [YOLO26 RKNN逐层性能分析](../docs/archive/性能核查/YOLO26_RKNN逐层性能分析.md) 与
+> [YOLO26在RK3588上的性能来源核查](../docs/archive/性能核查/YOLO26在RK3588上的性能来源核查.md)。
 
 ## 1. 功能职责
 
@@ -165,9 +165,9 @@ OS 工具显示的 NPU 利用率是**采样窗口内忙碌时间占比**，不�
 ## 7. 相关文档
 
 - [视频链路延迟探针文档](video_latency_probe.md)：探针全部指标定义与通用用法；
-- [YOLO26 RKNN逐层性能分析](../docs/YOLO26_RKNN逐层性能分析.md)：OP 耗时排名、
+- [YOLO26 RKNN逐层性能分析](../docs/archive/性能核查/YOLO26_RKNN逐层性能分析.md)：OP 耗时排名、
   核心分配与 Amdahl 上限推导；
-- [YOLO26在RK3588上的性能来源核查](../docs/YOLO26在RK3588上的性能来源核查.md)：
+- [YOLO26在RK3588上的性能来源核查](../docs/archive/性能核查/YOLO26在RK3588上的性能来源核查.md)：
   core mask 与 governor A/B 实测数据；
-- [视频链路延迟实测分析](../docs/视频链路延迟实测分析.md)：端到端延迟预算；
+- [视频链路延迟实测分析](../docs/archive/性能核查/视频链路延迟实测分析.md)：端到端延迟预算；
 - [模型导出与转换说明](../yolo_pt/模型导出与转换说明.md)：候选模型来源。

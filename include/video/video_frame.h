@@ -5,7 +5,7 @@
  * 属于 drone/video 模块，是视频链路的公共数据类型。
  *
  * 设计目标：让视频帧以"句柄"形式在 Topic 中零拷贝传递。
- * 链路如下（对应 docs/项目文件结构.md §5）：
+ * 链路如下（对应 docs/archive/历史计划/项目文件结构.md §5）：
  *
  *   内存池分配槽位 ──► FrameHandle（可写）── Publish ──► Topic<FrameHandle>
  *         ▲                                                    │
