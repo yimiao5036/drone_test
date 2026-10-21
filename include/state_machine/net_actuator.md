@@ -1,8 +1,8 @@
 # 捕网执行器抽象（net_actuator）
 
 > 对应实现：`include/state_machine/net_actuator.h`、`src/state_machine/net_actuator.cpp`
-> 使用方：`MissionStateMachine`（S10 触发、离开拦截序列复位；ACK 反馈接线在
-> Task 5 接入，当前状态机只调用 `Trigger()/Reset()`）
+> 使用方：`MissionStateMachine`（每拍 `Update(ActuatorFeedback)`；S10 触发、
+> 执行器按触发 ACK 自行计时复位；故障由状态机映射为 S16）
 
 ## 1. 功能边界
 
@@ -125,6 +125,8 @@ class INetActuator {
   `reset_delay` 再复位；复位 ACK + `reset_settle` 回 Ready；IN_PROGRESS 保持；
   拒绝 ACK / 187 超时 / 等待期断连 → Faulted 且不补发；无关 ACK 忽略；
   入队失败重试不扣发数、复位重试不混入触发行程；`reset_delay` 越界告警。
-- `MissionStateMachineTest.*NetActuator*`：S10 触发一次、停留不重复、离开
-  拦截序列复位、入队失败重试、未注入命令接口零调用（ACK 驱动时序集成待 Task 5）。
+- 状态机集成（`mission_state_machine_test`，Task 5）：S10 触发一次、停留不重复、
+  触发 ACK 后复位（状态保持 S10）、S12 中 ACK 后仍复位、入队失败重试、未触发
+  离开零命令、ACK 超时/断连/入队超时 → S16 + bit4 + 取消一次、未注入命令接口
+  零调用。
 - 命令参数断言：`net_channel=1` 时 p1=`-0.7`（触发）/`0.0`（复位），其余 NaN，p7=0。

@@ -66,7 +66,8 @@ struct MissionStateMachineConfig {
     /// 双目测距超龄阈值（visual_tracking.control.distance_stale_ms 同源）。
     std::chrono::milliseconds distance_stale{500};
     /// 捕网执行器配置（actuator 配置节同源注入，阶段四 Task 10）：状态机只
-    /// 通过 INetActuator 抽象接口在 S10 触发、离开拦截序列复位；当前
+    /// 通过 INetActuator 抽象接口每拍 `Update()` 并观察状态，S10 触发；触发
+    /// ACK 后的保持/复位/稳定时序由执行器按配置自行推进（Task 5）。当前
     /// `type=single_pwm` 发送归一化 -0.7/0.0，PWM 映射在 PX4/QGC 侧配置。
     /// 未注入命令接口（enable_control=false 装配语义）时本功能物理缺席。
     /// 构造期对其实施 `Validate()` 兜底（程序化构造的非法 Set/归一化值
@@ -144,12 +145,14 @@ public:
 /// （输出已是局部 NED）。是否真正输出控制由 FlightController 授权链与
 /// enable_control 装配门禁决定。
 /// 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）发一次
-/// 捕网触发命令（MAV_CMD_DO_SET_ACTUATOR），离开拦截序列（S9/S10）发复位
-/// 行程。2026-10-19：S9/S10 入口判据由 `interception` 配置节提供（默认
+/// 捕网触发命令（MAV_CMD_DO_SET_ACTUATOR）；触发 ACK 后的保持/复位/稳定时序
+/// 由执行器自身按 `actuator.reset_delay/reset_settle` 推进（Task 5）。
+/// 2026-10-19：S9/S10 入口判据由 `interception` 配置节提供（默认
 /// disabled=false；锁定帧/测距窗口/Offboard+armed/命令接口就绪），自动授权后
-/// 进入 S10；S11~S14 单发返航闭环——S10 发射命令入队/超时 → S11 记录
-/// （不判命中）→ S12 算力板位置返航 Home → S13 AUTO.LAND → S14 DISARMED；
-/// 正常返航不使用 PX4 自动 RTL。
+/// 进入 S10；S11~S14 单发返航闭环——S10 触发入队 → S11 记录（不判命中）→
+/// S12 算力板位置返航 Home → S13 AUTO.LAND → S14 DISARMED；正常返航不使用
+/// PX4 自动 RTL。执行器 ACK 超时/非 ACCEPTED/PX4 断连/入队超时 → S16
+/// FAILSAFE（bit4 告警、取消待发命令、停发意图，不重试/不补发复位）。
 class MissionStateMachine final : public IMissionStateMachine {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});
@@ -182,8 +185,9 @@ public:
 
     // ---- 测试入口（生产装配不可达） ----
     /// 强制提交一次状态迁移（单测/SITL 验收入口；Start 后调用，由决策线程消费
-    /// 进入/离开动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
-    /// EvaluateNetActuator），用于验证拦截序列 S9/S10/S11 的进入/离开动作。
+    /// 触发/完成动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
+    /// MaybeTriggerNetActuator/EvaluateInterceptionCompletion），用于验证拦截
+    /// 序列 S9/S10/S11 的进入/离开动作。
     /// S9/S10 生产入口已由 `interception` 配置节提供（默认关闭），本入口仍用于
     /// 自动授权之外的场景与测试注入。
     ///

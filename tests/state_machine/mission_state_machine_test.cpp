@@ -1286,8 +1286,9 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
 // 阶段四 Task 10：捕网执行器命令（MAV_CMD_DO_SET_ACTUATOR=187）
 //
 // 状态机在进入 S10 INTERCEPT_EXECUTING 时经命令窄接口 IPx4CommandSender 发
-// 一次触发命令（net_fired_ 防重复；入队失败不置位、下拍重试）；离开拦截序列
-// （S9/S10 → 回退/返航/POST_INTERCEPT）时发复位行程并清除触发标志。
+// 一次触发命令（执行器 `Fired()` 防重复；入队失败下拍重试）。Task 5 起复位
+// 由执行器在触发 ACK 后按 reset_delay 自行发起（不再由离开拦截序列触发），
+// ACK 超时/断连/入队超时 → S16 故障。
 // 通道号/行程来自 actuator 配置节；PWM 微秒按 PX4 输出映射区间换算为
 // MAV_CMD_DO_SET_ACTUATOR 的归一化参数（-1..1），未用参数位 NaN（规范语义
 // 为"忽略"，0 会误动其他执行器组）；p7=执行器组序号（PX4 仅处理 0）。
@@ -1342,10 +1343,9 @@ bool WaitForSelfCheck(const state_machine::MissionStateMachine& machine,
     return machine.CurrentState() == common::MissionState::kSelfCheck;
 }
 
-// 进入 S10 → 恰好一次触发命令；停留不重复；离开拦截序列 → 复位行程。
-// （单发执行器 RemainingShots 1→0，复位不恢复发数，故本任务不再断言重进触发；
-// ACK 驱动的保持/复位时序由 net_actuator_test 覆盖，Task 5 再做状态机集成。）
-TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
+// 进入 S10 → 恰好一次触发命令；停留多拍不重复触发。触发前置是 PX4 在线
+// （Task 5 起状态机要求连接证据，见 MaybeTriggerNetActuator）。
+TEST(MissionStateMachineTest, InterceptExecutingFiresOnce) {
     common::Topic<common::GroundStationTarget> ground_target_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
     common::Topic<common::HealthStatus> health_topic;
@@ -1355,34 +1355,18 @@ TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
     machine.SetCommandSender(&sender);
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight())).accepted);
+    std::this_thread::sleep_for(150ms);
 
     machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
-    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
     EXPECT_EQ(sender.LastCommand(), 187U);  // MAV_CMD_DO_SET_ACTUATOR
-    {
-        const auto params = sender.LastParams();
-        EXPECT_FLOAT_EQ(params[2], kNetFireNormalized);  // p3=通道 3（触发行程）
-        EXPECT_TRUE(std::isnan(params[0]));              // p1 未用 → NaN（忽略）
-        EXPECT_TRUE(std::isnan(params[1]));
-        EXPECT_TRUE(std::isnan(params[3]));
-        EXPECT_TRUE(std::isnan(params[4]));
-        EXPECT_TRUE(std::isnan(params[5]));
-        EXPECT_FLOAT_EQ(params[6], 0.0F);                // p7=执行器组序号 0
-    }
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetFireNormalized);
 
-    // 停留 S10 多拍：不重复触发
     std::this_thread::sleep_for(400ms);
-    EXPECT_EQ(sender.CallCount(), 1U);
-    EXPECT_EQ(machine.CurrentState(), common::MissionState::kInterceptExecuting);
-
-    // 离开拦截序列（S10→S11 POST_INTERCEPT）：发复位行程（待命行程），只发一次
-    machine.ForceStateForTest(common::MissionState::kPostIntercept);
-    ASSERT_TRUE(WaitForCallCount(sender, 2)) << "离开拦截序列应发复位行程";
-    EXPECT_EQ(sender.LastCommand(), 187U);
-    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
-    std::this_thread::sleep_for(300ms);
-    EXPECT_EQ(sender.CallCount(), 2U);
-
+    EXPECT_EQ(sender.CallCount(), 1U);  // 单发不重复触发
     machine.Stop();
 }
 
@@ -1398,6 +1382,11 @@ TEST(MissionStateMachineTest, NetActuatorFiringRetriesWhenEnqueueFails) {
     machine.SetCommandSender(&sender);
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
+    // Task 5 起无连接证据不触发：先发布在线快照（PX4 connected）。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight())).accepted);
+    std::this_thread::sleep_for(150ms);
 
     sender.FailNextCalls(2);  // 前两次入队失败
     machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
@@ -1414,10 +1403,9 @@ TEST(MissionStateMachineTest, NetActuatorFiringRetriesWhenEnqueueFails) {
     machine.Stop();
 }
 
-// 复位入队失败同样下拍重试：复位是安全动作（机构归位到待命行程），链路瞬时
-// 不可用（PX4 未连接/命令队列满）不得让其静默丢失——重试至成功，且重试期间
-// 只反复位行程、不得混入触发命令。
-TEST(MissionStateMachineTest, NetActuatorResetRetriesWhenEnqueueFails) {
+// 未触发即离开拦截序列：不发任何命令。Task 5 起复位由执行器在触发 ACK 后
+// 按自身计时推进（不再由“离开 S9/S10”触发），未发射过的机构无需归位行程。
+TEST(MissionStateMachineTest, LeavingInterceptWithoutFireSendsNoCommand) {
     common::Topic<common::GroundStationTarget> ground_target_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
     common::Topic<common::HealthStatus> health_topic;
@@ -1427,59 +1415,16 @@ TEST(MissionStateMachineTest, NetActuatorResetRetriesWhenEnqueueFails) {
     machine.SetCommandSender(&sender);
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight())).accepted);
+    std::this_thread::sleep_for(150ms);
 
-    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
-    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
-
-    sender.FailNextCalls(2);  // 复位前两次入队失败
-    machine.ForceStateForTest(common::MissionState::kPostIntercept);
-    ASSERT_TRUE(WaitForCallCount(sender, 4)) << "复位入队失败应下拍重试直至成功";
-
-    // 成功入队后不再补发（含不补发触发）
-    std::this_thread::sleep_for(400ms);
-    ASSERT_EQ(sender.CallCount(), 4U);
-    const auto history = sender.History();
-    ASSERT_EQ(history.size(), 4U);
-    // 次序：1=触发成功；2/3=复位失败（重试内容一致）；4=复位成功
-    EXPECT_EQ(history[0].command, 187U);
-    EXPECT_FLOAT_EQ(history[0].params[2], kNetFireNormalized);
-    EXPECT_TRUE(history[0].queued);
-    for (std::size_t index = 1; index < history.size(); ++index) {
-        EXPECT_EQ(history[index].command, 187U);
-        EXPECT_FLOAT_EQ(history[index].params[2], kNetIdleNormalized)
-            << "复位重试期间不得混入触发行程 index=" << index;
-        EXPECT_EQ(history[index].queued, index == 3U)
-            << "入队结果序列不符（前两次复位应失败、第三次成功）index=" << index;
-    }
-
-    machine.Stop();
-}
-
-// 离开拦截序列发复位行程不依赖是否触发过：S9 进入后未进 S10（如授权拒绝
-// 返航/条件失效回退）即离开，同样发复位行程让机构归位到待命行程。
-TEST(MissionStateMachineTest, LeavingInterceptSequenceSendsResetStroke) {
-    common::Topic<common::GroundStationTarget> ground_target_topic;
-    common::Topic<common::FlightStateSnapshot> flight_topic;
-    common::Topic<common::HealthStatus> health_topic;
-    FakeCommandSender sender;
-    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
-    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
-    machine.SetCommandSender(&sender);
-    ASSERT_TRUE(machine.Start());
-    ASSERT_TRUE(WaitForSelfCheck(machine));
-
-    // S9（INTERCEPT_READY）不触发：只在 S10 执行态触发
     machine.ForceStateForTest(common::MissionState::kInterceptReady);
     std::this_thread::sleep_for(300ms);
-    EXPECT_EQ(sender.CallCount(), 0U);
-
-    // 返航离开拦截序列 → 复位行程
     machine.ForceStateForTest(common::MissionState::kReturnHome);
-    ASSERT_TRUE(WaitForCallCount(sender, 1));
-    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
     std::this_thread::sleep_for(300ms);
-    EXPECT_EQ(sender.CallCount(), 1U);
-
+    EXPECT_EQ(sender.CallCount(), 0U);  // 未发射 → 无复位命令
     machine.Stop();
 }
 
@@ -1615,6 +1560,173 @@ std::optional<common::ControlIntent> WaitForReturnIntent(
         }
     }
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Task 5：执行器 ACK 驱动复位 / 故障 S16（2026-10-21）
+// 复位不再由“离开拦截序列”触发：触发 ACK 后执行器按 reset_delay 自身计时
+// 发复位，复位 ACK 后再稳定 reset_settle 回到 Ready；等待 ACK 期间超时、
+// 非 ACCEPTED、PX4 断连均进入故障 S16（停发一切控制意图、取消待发命令、
+// 不重试/不补发复位）。
+// ---------------------------------------------------------------------------
+
+TEST(MissionStateMachineTest, ResetRunsAfterFireAckWithoutLeavingS10) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
+    EXPECT_EQ(sender.LastCommand(), 187U);
+
+    sender.SimulateAck(187U, 0U, TestMonotonicMs());
+    ASSERT_TRUE(WaitForCallCount(sender, 2));
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
+    EXPECT_EQ(machine.CurrentState(),
+              common::MissionState::kInterceptExecuting);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, FireAckTimeoutEntersFailsafeAndCancelsCommands) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
+
+    sender.SimulateTimeout(187U);
+    const auto failsafe = WaitForState(
+        status_subscription, common::MissionState::kFailsafe, 2000ms);
+    ASSERT_TRUE(failsafe.has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+    // 故障后不得补发复位
+    EXPECT_EQ(sender.CallCount(), 1U);
+    EXPECT_NE(failsafe->active_warning_bits & (1U << 4U), 0U);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, DisconnectDuringFireWaitFaults) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    const auto connected = MakeReturnHomeFlight(10.f, 5.f, -10.f);
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(connected))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));  // 触发已入队，等待 ACK
+
+    auto disconnected = connected;
+    disconnected.connected = false;
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(disconnected))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+    EXPECT_EQ(sender.CallCount(), 1U);  // 不得补发复位
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, FireEnqueueTimeoutFaults) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.return_home.fire_timeout = 300ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(100ms);
+    sender.FailNextCalls(1000);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ResetRunsDuringReturnAfterFireAck) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeReturnHomeTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+    ASSERT_EQ(sender.CallCount(), 1u);  // 触发已入队
+
+    // 已在 S12 返航；ACK 到达后执行器仍按计时发复位（通道 1 → p1）。
+    sender.SimulateAck(187U, 0U, TestMonotonicMs());
+    ASSERT_TRUE(WaitForCallCount(sender, 2));
+    EXPECT_FLOAT_EQ(sender.LastParams()[0], kNetIdleNormalized);
+    machine.Stop();
 }
 
 TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {

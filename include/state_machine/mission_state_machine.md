@@ -33,12 +33,23 @@
 
 **与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
 
-阶段四新增（Task 10，2026-10-21 抽象化）：**捕网执行器 `INetActuator`**——注入命令窄接口
-`IPx4CommandSender`后，工厂按 `actuator.type` 创建实现（当前 `single_pwm`）。状态机在进入
-**S10（INTERCEPT_EXECUTING）** 时调用一次 `Trigger()`（`net_fired_`防重复；入队失败不置位、
-下拍重试），离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）调用 `Reset()` 并清除触发标志
-（机构归位待机；复位入队失败同样下拍重试，且复位未入队前不发触发）。状态机不感知单发/多发、
-通道数或弹仓结构；后续多发只需实现同一接口并在工厂按 `type` 接入。
+阶段四新增（Task 10 / Task 5，2026-10-21）：**捕网执行器 `INetActuator`**——注入命令窄接口
+`IPx4CommandSender`后，工厂按 `actuator.type` 创建实现（当前 `single_pwm`）。状态机**每拍**
+调用 `Update(ActuatorFeedback)` 推进执行器内部时序（ACK 确认 → 触发保持 → 复位 → 复位稳定
+→ Ready），并在 **S10（INTERCEPT_EXECUTING）** 调一次 `Trigger()`（执行器 `Fired()` 防重复；
+入队失败保持 Ready、下拍重试，超过 `return_home.fire_timeout` 判故障）。**S10→S11 以
+`Fired()`（触发命令已入队）为依据，不等发射 ACK**；复位不再由“离开拦截序列”触发——执行器
+在触发 ACK ACCEPTED 后按 `actuator.reset_delay` 保持，再发复位行程，复位 ACK 后按
+`actuator.reset_settle` 稳定回 Ready；离开拦截序列（S9 未触发）不发任何命令。状态机不感知
+单发/多发、通道数或弹仓结构；后续多发只需实现同一接口并在工厂按 `type` 接入。
+
+**故障 S16（Task 5）**：执行器在等待 ACK 期间遇到 187 超时 / 非 ACCEPTED（IN_PROGRESS 除外）
+/ PX4 断连，或状态机在 S10 发现 `fire_timeout` 内触发命令未入队、飞行快照存在但
+`connected=false`，即 `HandleMissionFault()`：置 `kWarningActuatorFault`（bit4）、调用
+`IPx4CommandSender::CancelPendingCommands()` **恰好一次**、打一条 ERROR、迁移 S16 FAILSAFE。
+此后 `Evaluate` 只维护告警位与状态发布，**停发位置/伺服/返航/降落一切控制意图**；不重试、
+不补发复位（机构停在原位交人工处置）。故障为终态，`Start()` 才复位 `mission_faulted_`。
+无飞行快照（启动早期/测试未注入）不算连接证据，**不触发**也不判故障。
 
 **MAVLink/PX4 语义**：`MAV_CMD_DO_SET_ACTUATOR=187` 的 p1..p6 = Actuator Set 1..6 的
 归一化值（-1..1，NaN=忽略），p7=执行器组序号（PX4 仅组 0）。**PWM 输出功能、映射区间
@@ -62,9 +73,15 @@
 PWM 微秒或输出区间，避免与 PX4 参数重复维护。接口与工厂见
 `include/state_machine/net_actuator.h` / `.md`。
 
-**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（占位值，待实机射程冻结）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、捕网未触发/无复位挂起。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
+**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（占位值，待实机射程冻结）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、执行器未触发且 `Ready()`（触发保持/复位/稳定途中不重入）、未进入故障。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
 
 阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
+
+**捕网执行器故障告警位 bit4（Task 5，2026-10-21）**：`MissionStatus.active_warning_bits`
+bit4 =「捕网执行器 ACK 故障」（`kWarningActuatorFault`）。触发条件为执行器 187 ACK 超时/
+非 ACCEPTED/PX4 断连，或 S10 触发命令入队超时；置位同时状态机进入 S16 FAILSAFE（见上段）。
+故障为终态，bit4 持续置位（不再叠加其余告警位）直至重启，供地面站识别“任务已中止、交
+PX4/遥控”。
 
 **G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
 
@@ -251,18 +268,24 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     退出路径 ④ 收口回 S5，不得无限续期）；发出后停发（`StopPositionIntent`）。
     交接段收口（含冻结清空、控制律`Reset`、热备份状态清零）统一在
     `ResetHandoverHysteresis`内完成。
-- **捕网执行器（Task 10，2026-10-21 抽象化）**（`EvaluateNetActuator` /
-  `INetActuator`）：
-  - 判定按"状态驻留"而非"迁移边沿"：决策线程每拍末段评估（`Evaluate` 内迁移后
-    立即调用，进入 S10 当拍触发、离开拦截序列当拍复位，无额外延迟）；
-    拦截序列={S9, S10}，离开=任一其他状态（回退/返航/POST_INTERCEPT）。
-  - 触发语义：S10 内 `net_fired_` 未置位才调用 `Trigger()`；返回 true（入队）
-    才置位，失败（PX4 未连接/命令队列满）节流 WARN 并下拍重试。S9 只标记序列
-    开始，不触发（设计：S10 才调用执行机构）。
-  - 复位语义：离开拦截序列置 `net_reset_pending_` 并当拍调用 `Reset()`；
-    入队成功才清除，失败下拍重试；**复位未入队前不发触发**（先复位、后触发
-    的次序在异常重试下仍保持）。`net_fired_` 随离开清除——再次进入 S10 是新
-    一次拦截；多发实现可自行在 `Trigger()` 内推进弹仓/通道。
+- **捕网执行器（Task 10 / Task 5，2026-10-21）**（`UpdateNetActuator` /
+  `MaybeTriggerNetActuator` / `HandleMissionFault` / `INetActuator`）：
+  - 每拍顺序：`Evaluate` 开头先 `UpdateNetActuator()`（组装 `ActuatorFeedback`：
+    PX4 连接证据取最新飞行快照、ACK 快照取 `IPx4CommandSender::AckStatus()`），
+    故障则整拍只维护告警/发布状态并返回；随后 `EvaluateInterceptSequence` →
+    `MaybeTriggerNetActuator` → 其余控制意图评估。
+  - 触发语义：S10 内且执行器未 `Fired()` 时，至少满足 `Ready()` 与
+    `RemainingShots()>0` 才调 `Trigger()`；**无飞行快照不触发**（没有连接证据），
+    快照存在但 `connected=false` → 故障；入队失败保持 Ready、下拍重试，
+    超过 `return_home.fire_timeout` → 故障。S9 只标记序列开始，不触发。
+  - 完成语义：`EvaluateInterceptionCompletion` 以 `Fired()`（触发命令已入队）
+    判 S10→S11，**不等发射 ACK**；V1 不判命中。
+  - 复位语义：**由执行器自身计时**——触发 ACK ACCEPTED 后保持
+    `reset_delay`，发复位行程；复位 ACK 后稳定 `reset_settle` 回到 Ready。
+    状态机不复制计时逻辑。未触发即离开 S9/S10 不发任何命令。
+  - 故障（S16）：187 ACK 超时/非 ACCEPTED/PX4 断连/发射入队超时 →
+    `HandleMissionFault()` 置 bit4、`CancelPendingCommands()` 恰好一次、ERROR、
+    迁移 S16；不重试、不补发复位。之后 `Evaluate` 早退，停发一切控制意图。
   - 命令参数（single_pwm）：只有本 Actuator Set 参数位填归一化值，**其余位
     NaN**（规范"忽略"；0=中位行程会误动其他 Set），p7=0。机载只发 -0.7/0.0，
     PWM 映射在 PX4 侧。
@@ -270,22 +293,20 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     本功能物理缺席；触发/复位同为控制输出，不另开旁路。
   - 进程退出不补发复位行程（`Stop()` 不触发机构动作）：机构实际位置由
     G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
-  - 边界：状态驻留 <1 决策周期（100ms）的极端迁移可能被跳过——生产语义下
-    S10 驻留由拦截结果决定（远长于决策周期），不构成风险。
 - **S9/S10 入口判据（2026-10-19）**：`EvaluateInterceptSequence` 在 S7 每拍评估
   `InterceptEntrySatisfied`——`interception.enabled`、视觉新鲜且 `LOCKED`、
   `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
   `[min_range_m,max_range_m]`、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
-  `net_actuator_` 非空、`net_fired_/net_reset_pending_` 均为 false；可选
+  `net_actuator_` 非空且未触发、`Ready()`、未故障、任务未进入 S16；可选
   `min_battery_percent>0` 时还要求电池遥测有效且剩余电量达标（**当前生产保持 0，
   实机后冻结**）。满足→S9；
   S9 条件失效→S7；`auto_authorize=true`→S10；false 时等
   `authorization_timeout_ms` 超时→S12。S9/S10 仍走 `EvaluateVisualServoIntent`
   保持伺服/瞄准，不因状态切换产生意图空窗。默认关闭（生产安全）。
 - **拦截后返航（S11~S14，2026-10-19 V1 单发口径）**：
-  - **完成判据**：S10 内 `net_fired_`（触发命令成功入队）或发射重试超时
-    （`ReturnHomeConfig::fire_timeout`）→ S11；**V1 不判断命中**，只记录
-    “已发射/发射失败”，随后 S11 当拍/下一拍进入 S12。摄像头状态不参与返航判断。
+  - **完成判据**：S10 内执行器 `Fired()`（触发命令成功入队，不等 ACK）→ S11；
+    **V1 不判断命中**，随后 S11 当拍/下一拍进入 S12。发射入队超时/断连不再走
+    “失败返航”，而是 `HandleMissionFault()` 进入 S16。摄像头状态不参与返航判断。
   - **Home 局部 NED**：`HomeLocalNed()` 用 Home 经纬度（`home_*`）+ EKF 锚点
     （`ned_ref_*`）经 `perception::GeodeticToLocalNed` 换算；不依赖
     `HOME_POSITION.x/y/z`（MAVLink 无 `valid_lpos` 标志）。`home_valid`/
@@ -410,31 +431,31 @@ ctest --test-dir build --output-on-failure
   - `ServoSuspendedBitTracksVisualServoOutput`：S7 中伺服未启动（控制律降级）→
     `MissionStatus` 告警位 bit3 置位且状态保持 S7；恢复新鲜姿态、首条视觉意图
     发出后 bit3 在同一 S7 驻留内清除（标注"报告状态与实际输出背离"的两态）。
-- 捕网执行器（Task 10，`FakeCommandSender` 假件按调用顺序记录 SendCommand
-  （命令/参数/入队结果）并可脚本化入队失败；用例经 `ForceStateForTest`（配置
-  置 `test_hooks_enabled=true`）驱动拦截序列——与生产路径共用 TransitionTo/
-  决策线程挂点）：
-  - `InterceptExecutingFiresNetActuator`：进入 S10 → 恰好一条 187 命令
-    （p3=归一化触发行程 −0.8、其余参数位 NaN、p7=0），停留多拍不重复；
-    离开（S10→S11）→ 复位行程（+0.8）且只发一次；再次进入 → 新一次触发；
+- 捕网执行器（Task 10 / Task 5，`FakeCommandSender` 假件按调用顺序记录
+  SendCommand（命令/参数/入队结果）并可脚本化入队失败/ACK/超时/取消；用例经
+  `ForceStateForTest`（配置置 `test_hooks_enabled=true`）驱动拦截序列——与生产
+  路径共用 TransitionTo/决策线程挂点。**触发类用例必须先发布 connected 飞行
+  快照**（Task 5 起无连接证据不触发）：
+  - `InterceptExecutingFiresOnce`：进入 S10 → 恰好一条 187 命令
+    （p3=归一化触发行程 -0.7），停留多拍不重复；
+  - `LeavingInterceptWithoutFireSendsNoCommand`：S9 未触发即离开 → 零命令
+    （复位不再由离开触发）；
+  - `ResetRunsAfterFireAckWithoutLeavingS10`：触发 ACK 到达后 `reset_delay=0`
+    → 执行器发复位行程（p3=0.0），状态保持 S10；
   - `NetActuatorFiringRetriesWhenEnqueueFails`：前两次入队失败 → 下拍重试直至
     成功（成功入队后不再补发，重试内容一致）；
-  - `NetActuatorResetRetriesWhenEnqueueFails`：复位前两次入队失败 → 下拍重试
-    直至成功（按调用顺序断言：重试期间只反复位行程、不混入触发；成功入队后
-    不再补发）；
-  - `NetActuatorTriggerWaitsForResetEnqueued`：复位连续三次入队失败（挂起重试）
-    期间重进 S10 → 复位未成功入队前不发触发，触发排在复位成功入队之后
-    （逐条断言命令参数与入队结果，钉住"先复位、后触发"在异常重试下的次序）；
-  - `LeavingInterceptSequenceSendsResetStroke`：S9 不触发；S9→返航离开 →
-    发复位行程（不依赖是否触发过）；
+  - `FireEnqueueTimeoutFaults`：入队持续失败超过 `fire_timeout` → S16、
+    `CancelPendingCommands` 恰好一次；
+  - `FireAckTimeoutEntersFailsafeAndCancelsCommands`：187 ACK 超时 → S16、
+    bit4 置位、取消一次、不再补发复位；
+  - `DisconnectDuringFireWaitFaults`：等待触发 ACK 期间 PX4 断连 → S16、取消一次、
+    零补发；
+  - `ResetRunsDuringReturnAfterFireAck`：已进 S12 后 ACK 到达，执行器仍按计时
+    发复位（p1=0.0），证明复位与状态迁移解耦；
   - `NoCommandSenderNeverFires`：未注入命令接口 → 即使进入拦截态也零调用；
   - `ForceStateForTestRejectedWithoutTestHooks`：`test_hooks_enabled=false`（生产
     装配默认）时强制迁移被拒绝并记 ERROR、状态不变、已注入的命令接口零调用
     （防"生产路径误触发射网"）。
-  - 负对照（一次性注入 3 处破坏：未用参数位填 0、入队失败也置位、离开不发复位）
-    → 恰好对应 3 个用例失败，恢复后全绿；评审修复另作 2 处次序负对照——触发
-    判据前移到复位挂起检查之前 → `NetActuatorTriggerWaitsForResetEnqueued`
-    失败；复位入队失败即清除挂起（不重试）→ 两个复位用例失败。
 - 拦截后返航（S11~S14，2026-10-19；`MakeReturnHomeTestConfig` 默认
   `return_home.enabled=true`，缩短到达保持/命令重试/发射超时便于测试）：
   - `InterceptionFiresThenReturnsHomeAndLands`：强制 S10 → 发射命令入队 →
@@ -468,8 +489,8 @@ ctest --test-dir build --output-on-failure
 ## 排查/修改要点
 
 - **S10 发射后不返航**：查 `MissionStateMachineConfig::return_home.enabled`
-  （默认 true；捕网执行器隔离测试显式 false）、`net_fired_`/发射超时日志；
-  S9/S10 生产入口仍未冻结，整机只能经测试钩子进入。
+  （默认 true；捕网执行器隔离测试显式 false）、执行器 `Fired()`/发射超时日志；
+  若已进入 S16，说明发射入队超时或执行器故障，属故障处置而非返航路径。
 - **S12 原地不动/不飞 Home**：查 `home_valid`/`ned_ref_valid`/
   `local_position_valid`（任一无效按设计原地悬停并 WARN）；查返航超时日志
   （60s 后原地悬停）；确认 PX4 仍在 Offboard(6/0)，否则状态机按设计转 S13 让权。
@@ -544,7 +565,12 @@ ctest --test-dir build --output-on-failure
   映射在 PX4 侧）；
   ③ 行程方向以 **G4 台架**为准（本层只保证归一化命令语义正确，方向属 PX4/
   接线配置）；日志中的 `set/norm` 摘要可核对。
-- 离开拦截序列后机构停在触发位：查「复位行程命令入队失败（下拍重试）」节流
-  WARN——入队失败会持续重试直至成功；若从未出现复位日志，确认离开时是否
-  真的到过 S9/S10（`net_sequence_active_` 只在对序列内状态驻留过之后才置位）。
+- 触发后机构停在触发位、无复位：复位由执行器在**触发 ACK** 后按 `reset_delay`
+  发起，不再由离开 S9/S10 触发。先查 PX4 是否回 187 ACK（无 ACK 会先按超时
+  → S16）；查「复位行程命令入队失败（下拍重试）」节流 WARN（连接正常但队列满
+  时下拍重试）；若已进 S16，按故障处置（不补发复位）。
+- **进 S16 / 地面站 bit4 置位**：查 ERROR「捕网执行器故障，停止任务控制并交
+  PX4/遥控」的原因串（187 ACK 超时 / 非 ACCEPTED / PX4 断连 / 触发命令未入队
+  （发射超时））。S16 为终态，状态机不再发任何控制意图，需人工/维护处置后
+  重启程序；`CancelPendingCommands()` 只取消待发命令，不会撤回机构已执行动作。
 - 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和`enable_control`安全配置。

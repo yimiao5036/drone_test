@@ -74,6 +74,10 @@ constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
 /// 供地面站观测（65013 全量下发；Web UI 渲染待补。T9 评审裁决 I2，
 /// 阶段四 Task 12 落地）。
 constexpr uint32_t kWarningServoSuspended = 1U << 3U;
+/// 告警位：捕网执行器故障（ACK 超时/非 ACCEPTED/PX4 断连/入队超时）。
+/// 状态机进入 S16 FAILSAFE：停发一切控制意图、取消待发命令、不重试/不补发
+/// 复位，交 PX4/遥控处置。地面站 65013 全量下发，Web UI 渲染待补。
+constexpr uint32_t kWarningActuatorFault = 1U << 4U;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。
 constexpr uint64_t kIntentRepublishIntervalMs = 100;
@@ -396,14 +400,11 @@ public:
         // 重启后同一锁定帧不得沿用上一轮的计数。
         ResetHandoverHysteresis();
         last_counted_locked_frame_.reset();
-        // 捕网执行器标志复位：重启后不得沿用上一轮触发记忆（机构实际位置
-        // 由 G4 台架/人工确认，见实现文档"排查/修改要点"）。
-        net_fired_ = false;
-        net_sequence_active_ = false;
-        net_reset_pending_ = false;
+        // 任务故障标志复位：重启后不得沿用上一轮 S16 记忆（执行器本体若已
+        // 处于终态故障仍由执行器自身拒绝动作，需人工/维护处置）。
+        mission_faulted_ = false;
         // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
-        interception_fire_timeout_ = false;
         return_climb_phase_ = true;
         return_px4_takeover_ = false;
         return_timeout_warned_ = false;
@@ -583,10 +584,20 @@ private:
     // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
     void Evaluate(uint64_t now_ms) {
         uint32_t warnings = 0;
+        // 捕网执行器每拍推进（ACK/保持/复位/稳定时序全在执行器内）。
+        // 故障或已处于 S16：只维护告警位与状态发布，本拍跳过一切任务控制
+        // 逻辑（位置/伺服/返航/降落意图全部停发）。
+        if (UpdateNetActuator(now_ms)) {
+            SetWarnings(kWarningActuatorFault);
+            if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+                PublishStatus(now_ms);
+            }
+            return;
+        }
+
         if (!HasNavigationForGps()) {
             warnings |= kWarningNavigationUnavailable;
         }
-
         const bool target_fresh = HasFreshGroundTarget(now_ms);
         const auto state = CurrentState();
         if (state == common::MissionState::kSelfCheck && HasNavigationForGps()) {
@@ -610,6 +621,17 @@ private:
         // S9/S10 入口（2026-10-19）：S7 条件满足→S9；自动授权→S10。
         // 放在位置/伺服意图之前，迁移当拍即可按新状态发布（S9/S10 继续伺服）。
         EvaluateInterceptSequence(now_ms);
+        // S9→S10 迁移当拍触发捕网（有连接证据才触发；入队失败下拍重试，
+        // 超过 fire_timeout 判故障）。
+        MaybeTriggerNetActuator(now_ms);
+        if (mission_faulted_) {
+            SetWarnings(kWarningActuatorFault);
+            if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+                PublishStatus(now_ms);
+            }
+            return;
+        }
+
         EvaluatePositionIntent(now_ms);
         EvaluateVisualServoIntent(now_ms);
         // 告警位：S7 报告状态与实际控制输出背离标注（T9 评审裁决 I2）——本拍
@@ -622,15 +644,16 @@ private:
         }
         // 热备份核对（Task 9）：S7 期间每秒核对卡尔曼状态年龄，断粮置告警位。
         warnings |= EvaluateHotBackup(now_ms);
-        // 捕网执行器联动（Task 10）：本拍迁移后立即评估（进入 S10 当拍触发、
-        // 离开拦截序列当拍复位；入队失败下拍重试，误差 <1 决策周期）。
-        EvaluateNetActuator();
         // 单发拦截结束（S10→S11→S12）与返航/降落（S11~S14，2026-10-19）。
         // 顺序：先完成拦截判定，再执行返航/降落；S12 的位置意图在本拍最后发布。
-        EvaluateInterceptionCompletion(now_ms);
+        EvaluateInterceptionCompletion();
         EvaluateReturnHome(now_ms);
         EvaluateLandingAndDisarm(now_ms);
 
+        // 本拍任一评估触发的故障：保留 bit4（其余告警不再覆盖故障位）。
+        if (mission_faulted_) {
+            warnings |= kWarningActuatorFault;
+        }
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
             PublishStatus(now_ms);
@@ -663,8 +686,10 @@ private:
             flight.flight_sub_mode != kPx4SubModeOffboard) {
             return false;
         }
-        if (command_sender_ == nullptr || net_fired_ || net_reset_pending_) {
-            return false;  // 命令接口未注入 / 机构已触发 / 复位未完成
+        if (command_sender_ == nullptr || net_actuator_ == nullptr ||
+            mission_faulted_ || net_actuator_->Faulted() ||
+            net_actuator_->Fired() || !net_actuator_->Ready()) {
+            return false;  // 命令接口未注入 / 已触发 / 时序未回到 Ready / 故障
         }
         if (VisualStatusStale(now_ms) || !latest_visual_status_ ||
             latest_visual_status_->state != common::VisualTargetState::kLocked) {
@@ -684,8 +709,8 @@ private:
     }
 
     /// S7→S9（入口条件满足）、S9 条件失效→S7、S9 自动授权→S10 /
-    /// 非自动授权超时→S12。S10 的发射/完成由 EvaluateNetActuator +
-    /// EvaluateInterceptionCompletion 处理。
+    /// 非自动授权超时→S12。S10 的触发由 MaybeTriggerNetActuator 处理，
+    /// 触发入队（`Fired()`）后由 EvaluateInterceptionCompletion 进入 S11。
     void EvaluateInterceptSequence(uint64_t now_ms) {
         if (!interception_.enabled) {
             return;
@@ -1357,43 +1382,83 @@ private:
 
     // ---- 捕网执行器（Task 10：MAV_CMD_DO_SET_ACTUATOR 命令窄接口） ----
 
-    /// 捕网执行器联动（决策线程每拍，本函数内状态仅决策线程访问）。语义：
-    /// - 进入 S10（INTERCEPT_EXECUTING）：发一次触发命令；net_fired_ 防重复，
-    ///   入队失败不置位、下拍重试（PX4 未连接/命令队列满时自动补发）；
-    /// - 离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）：发复位行程并清
-    ///   触发标志（机构归位到待命行程）；复位入队失败同样下拍重试，且复位
-    ///   未入队前不发触发（先复位、后触发的次序不变）。
-    /// S9（INTERCEPT_READY）只标记序列开始，不触发（设计：S10 才调用执行机构）。
-    /// 未注入命令接口（enable_control=false 装配语义）→ 零调用（物理缺席）；
-    /// 触发/复位同为控制输出，仅经 enable_control 门禁注入的窄接口可达。
-    /// 注：本函数按"状态驻留"而非"迁移边沿"判定——生产路径同一决策拍内完成
-    /// 迁移与评估（Evaluate 末段调用），S10 驻留远长于决策周期，不存在漏触发；
-    /// 无生产入口的拦截序列经 ForceStateForTest 驱动时同样满足该时序约束。
-    void EvaluateNetActuator() {
+    /// 组装执行器每拍反馈：PX4 连接证据（最新飞行快照）与命令 ACK 快照。
+    /// 执行器内部时序只认本次 Update 的反馈，状态机不复制计时逻辑。
+    ActuatorFeedback BuildActuatorFeedback(uint64_t now_ms) const {
+        ActuatorFeedback feedback;
+        feedback.now_ms = now_ms;
+        feedback.px4_connected =
+            latest_flight_.has_value() && latest_flight_->connected;
+        if (command_sender_ != nullptr) {
+            feedback.ack = command_sender_->AckStatus();
+        }
+        return feedback;
+    }
+
+    /// 每拍推进捕网执行器并处理其故障。返回 true 表示已进入/处于故障态，
+    /// 本拍应跳过任务控制逻辑（S16 只维护告警与状态发布）。
+    bool UpdateNetActuator(uint64_t now_ms) {
+        if (mission_faulted_) {
+            return true;
+        }
         if (net_actuator_ == nullptr) {
-            return;  // 物理缺席（影子/未开控制）：不产生任何命令
+            return false;  // 物理缺席（影子/未开控制）：不产生任何命令
         }
-        const auto state = CurrentState();
-        const bool in_intercept_sequence =
-            state == common::MissionState::kInterceptReady ||
-            state == common::MissionState::kInterceptExecuting;
-        if (net_sequence_active_ && !in_intercept_sequence) {
-            // 离开拦截序列（回退/返航/POST_INTERCEPT）
-            net_sequence_active_ = false;
-            net_fired_ = false;
-            net_reset_pending_ = true;
+        net_actuator_->Update(BuildActuatorFeedback(now_ms));
+        if (net_actuator_->Faulted()) {
+            HandleMissionFault(net_actuator_->FaultReason());
+            return true;
         }
-        if (in_intercept_sequence) {
-            net_sequence_active_ = true;
-        }
-        if (net_reset_pending_) {
-            // 复位：入队成功才清除，失败下拍重试
-            net_reset_pending_ = !net_actuator_->Reset();
+        return false;
+    }
+
+    /// S10 内触发一次捕网。语义：
+    /// - 无飞行快照 = 没有连接证据（启动早期/测试未注入）→ 不触发；
+    /// - 快照在线才触发；快照存在但 connected=false → 故障；
+    /// - 入队失败由执行器保持 Ready、下拍重试；超过 return_home.fire_timeout
+    ///   仍未入队 → 故障（不再“按失败结果返航”）；
+    /// - 触发成功后由执行器维护 ACK 保持/复位时序，状态机不重复触发。
+    void MaybeTriggerNetActuator(uint64_t now_ms) {
+        if (net_actuator_ == nullptr || mission_faulted_ ||
+            CurrentState() != common::MissionState::kInterceptExecuting) {
             return;
         }
-        if (state == common::MissionState::kInterceptExecuting && !net_fired_) {
-            net_fired_ = net_actuator_->Trigger();
+        if (net_actuator_->Fired()) {
+            return;
         }
+        const uint64_t held_ms =
+            now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
+        if (held_ms >= static_cast<uint64_t>(return_home_.fire_timeout.count())) {
+            HandleMissionFault("触发命令未入队（发射超时）");
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            return;  // 启动早期/测试未注入：没有连接证据，不触发
+        }
+        if (!latest_flight_->connected) {
+            HandleMissionFault("S10 期间 PX4 连接断开");
+            return;
+        }
+        if (net_actuator_->Ready() && net_actuator_->RemainingShots() > 0) {
+            if (net_actuator_->Trigger()) {
+                interception_fired_ = true;
+            }
+        }
+    }
+
+    /// 捕网执行器故障 → S16 FAILSAFE：置 bit4、取消待发命令（恰好一次）、
+    /// 停发一切控制意图，交 PX4/遥控处置；不重试、不补发复位。
+    void HandleMissionFault(const char* reason) {
+        if (mission_faulted_) {
+            return;
+        }
+        mission_faulted_ = true;
+        SetWarnings(kWarningActuatorFault);
+        if (command_sender_ != nullptr) {
+            command_sender_->CancelPendingCommands();
+        }
+        SPDLOG_ERROR("捕网执行器故障，停止任务控制并交 PX4/遥控: {}", reason);
+        TransitionTo(common::MissionState::kFailsafe, reason);
     }
 
     // ---- 拦截后返航/降落（S11~S14，2026-10-19 V1 单发口径） ----
@@ -1431,36 +1496,27 @@ private:
         PublishPositionIntent(target, now_ms, kReasonReturnHome);
     }
 
-    /// 单发拦截完成：S10 发射命令入队/超时 → S11 记录 → S12 返航。
-    /// V1 不判断命中；摄像头状态不参与返航判断。
-    void EvaluateInterceptionCompletion(uint64_t now_ms) {
-        if (!return_home_.enabled) {
+    /// 单发拦截完成：S10 触发命令已入队（`Fired()`，不等 ACK）→ S11 → S12。
+    /// V1 不判断命中；摄像头状态不参与返航判断。发射超时/断连已由
+    /// MaybeTriggerNetActuator/执行器判故障进入 S16，不再走“失败返航”。
+    void EvaluateInterceptionCompletion() {
+        if (!return_home_.enabled || mission_faulted_) {
             return;
         }
         const auto state = CurrentState();
         if (state == common::MissionState::kInterceptExecuting) {
-            // 同一拍刚由 ForceStateForTest 进入 S10 时，state_entered_ms_ 可能
-            // 大于本拍 now_ms（unsigned 相减会回绕成巨大值），必须钳到 0。
-            const uint64_t held_ms =
-                now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
-            if (net_fired_) {
+            if (net_actuator_ != nullptr && net_actuator_->Fired()) {
                 interception_fired_ = true;
                 SPDLOG_WARN("单发拦截命令已入队，进入 POST_INTERCEPT（V1 不判命中）");
                 TransitionTo(common::MissionState::kPostIntercept,
                              "单发拦截命令已入队（不判命中）");
-            } else if (held_ms >=
-                       static_cast<uint64_t>(return_home_.fire_timeout.count())) {
-                interception_fire_timeout_ = true;
-                SPDLOG_WARN("单发拦截发射超时（命令未入队），按失败结果返航");
-                TransitionTo(common::MissionState::kPostIntercept,
-                             "单发拦截发射超时");
             }
             return;
         }
         if (state == common::MissionState::kPostIntercept) {
             TransitionTo(common::MissionState::kReturnHome,
                          interception_fired_ ? "单发拦截已发射，进入返航"
-                                             : "单发拦截发射失败，进入返航");
+                                             : "单发拦截未发射，进入返航");
         }
     }
 
@@ -1673,11 +1729,7 @@ private:
         if (state == common::MissionState::kDisarmed && !mission_end_logged_) {
             mission_end_logged_ = true;
             SPDLOG_INFO("任务结束: S14 DISARMED，拦截结果={}",
-                        interception_fired_
-                            ? "已发射"
-                            : interception_fire_timeout_
-                                  ? "发射失败"
-                                  : "未发射");
+                        interception_fired_ ? "已发射" : "未发射");
         }
     }
 
@@ -1884,15 +1936,12 @@ private:
     const config::ReturnHomeConfig return_home_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
-    /// 捕网触发命令已入队（防重复触发；离开拦截序列清除，再进入可重新触发）。
-    bool net_fired_ = false;
-    /// 处于拦截序列（S9/S10）——离开时的复位行程检测基准（决策线程独占）。
-    bool net_sequence_active_ = false;
-    /// 复位行程待入队（离开拦截序列置位；入队成功清除，失败下拍重试）。
-    bool net_reset_pending_ = false;
+    /// 任务故障（S16 FAILSAFE）：捕网执行器 ACK 超时/非 ACCEPTED/PX4 断连/
+    /// 入队超时。置位后本拍只维护告警与状态发布，停发一切控制意图；
+    /// 故障为终态（需人工/维护处置），Start() 复位。
+    bool mission_faulted_ = false;
     // ---- 拦截后返航（S11~S14，2026-10-19）----
-    bool interception_fired_ = false;       ///< 单发命令已入队
-    bool interception_fire_timeout_ = false;///< 单发命令重试超时
+    bool interception_fired_ = false;       ///< 单发触发命令已入队（S10→S11 依据）
     bool return_climb_phase_ = true;        ///< S12：先爬升到 5m（若不足）
     bool return_px4_takeover_ = false;      ///< S12 中 PX4 离开 Offboard（停止争控）
     bool return_timeout_warned_ = false;    ///< 返航超时告警已打印
