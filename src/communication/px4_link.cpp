@@ -1007,6 +1007,13 @@ private:
             ack_status_.last_command = ack.command;
             ack_status_.last_result = ack.result;
             ack_status_.last_time_ms = now_ms;
+            // 187 专用关联：捕网执行器的复位等待可能跨 S12~S14，同期
+            // AUTO.LAND/DISARM 的 ACK 会覆盖全局 last_*，这里独立累计。
+            if (ack.command == MAV_CMD_DO_SET_ACTUATOR) {
+                ++ack_status_.do_set_actuator_ack_count;
+                ack_status_.do_set_actuator_last_result = ack.result;
+                ack_status_.do_set_actuator_last_time_ms = now_ms;
+            }
         }
         const bool in_progress = ack.result == MAV_RESULT_IN_PROGRESS;
         if (ack.result == MAV_RESULT_ACCEPTED || in_progress) {
@@ -1046,6 +1053,10 @@ private:
             ack_status_.timeout_count =
                 ack_timeout_count_.load(std::memory_order_relaxed);
             ack_status_.last_timeout_command = timed_out.command;
+            // 187 专用超时计数：执行器只据此判故障，不受其它命令超时影响。
+            if (timed_out.command == MAV_CMD_DO_SET_ACTUATOR) {
+                ++ack_status_.do_set_actuator_timeout_count;
+            }
         }
         if (ShouldLogThrottled(count)) {
             SPDLOG_WARN("PX4 命令 ACK 超时: sequence={} command={} internal={} timeout_ms={}，累计 {}",

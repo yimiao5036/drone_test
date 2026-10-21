@@ -11,6 +11,10 @@
 
 namespace drone::test {
 
+/// MAV_CMD_DO_SET_ACTUATOR（MAVLink common.xml #187）。测试假件不引入
+/// MAVLink 头，使用显式常量与实现侧关联字段对应。
+inline constexpr uint16_t kDoSetActuatorCommand = 187;
+
 /// 命令窄接口共享假件：记录 SendCommand 调用（顺序/参数/入队结果），
 /// ACK/超时/取消均可脚本化，供状态机与执行器相关测试复用。
 /// 非 final：需要模拟“ACK 在 SendCommand 返回前到达”等并发时序时，可在
@@ -59,12 +63,18 @@ public:
     }
 
     /// 模拟一次 ACK 匹配（更新匹配计数与最近 ACK 快照）。
+    /// 187 同时更新专用关联字段，供执行器独立于其它命令判断推进/故障。
     void SimulateAck(uint16_t command, uint8_t result, uint64_t time_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++ack_.matched_count;
         ack_.last_command = command;
         ack_.last_result = result;
         ack_.last_time_ms = time_ms;
+        if (command == kDoSetActuatorCommand) {
+            ++ack_.do_set_actuator_ack_count;
+            ack_.do_set_actuator_last_result = result;
+            ack_.do_set_actuator_last_time_ms = time_ms;
+        }
     }
 
     /// 模拟一次 ACK 超时（更新超时计数与最近超时命令）。
@@ -72,6 +82,9 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         ++ack_.timeout_count;
         ack_.last_timeout_command = command;
+        if (command == kDoSetActuatorCommand) {
+            ++ack_.do_set_actuator_timeout_count;
+        }
     }
 
     /// 令接下来 count 次 SendCommand 返回失败（模拟 PX4 未连接/队列满）。

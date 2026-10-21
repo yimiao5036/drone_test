@@ -1080,6 +1080,47 @@ TEST(Px4LinkTest, AckStatusReportsLatestMatchedAck) {
     link.Stop();
 }
 
+// 回归（最终评审 Important 1）：187 的 ACK 关联独立于全局 last_*；
+// 后续 AUTO.LAND/DO_SET_MODE 等 ACK 不得覆盖 187 专用计数与终态。
+TEST(Px4LinkTest, AckStatusRetains187AfterUnrelatedAck) {
+    PseudoTerminal terminal;
+    Px4Link link(MakeConfig(terminal.SlaveName()));
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_DO_SET_ACTUATOR,
+                                 -0.7f, NAN, NAN, NAN, NAN, NAN, 0.f));
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
+    ASSERT_TRUE(terminal.Write(
+        EncodeCommandAck(px4_encoder, MAV_CMD_DO_SET_ACTUATOR,
+                         MAV_RESULT_ACCEPTED)));
+    ASSERT_TRUE(WaitUntil(
+        [&link] { return link.AckStatus().do_set_actuator_ack_count == 1; },
+        500ms));
+
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_DO_SET_MODE,
+                                 1.f, 4.f, 6.f, 0.f, 0.f, 0.f, 0.f));
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
+    ASSERT_TRUE(terminal.Write(EncodeCommandAck(
+        px4_encoder, MAV_CMD_DO_SET_MODE, MAV_RESULT_ACCEPTED)));
+    ASSERT_TRUE(WaitUntil([&link] {
+        return link.AckStatus().last_command == MAV_CMD_DO_SET_MODE;
+    }, 500ms));
+
+    const auto ack = link.AckStatus();
+    EXPECT_EQ(ack.do_set_actuator_ack_count, 1u);
+    EXPECT_EQ(ack.do_set_actuator_last_result, MAV_RESULT_ACCEPTED);
+    EXPECT_GT(ack.do_set_actuator_last_time_ms, 0u);
+    EXPECT_EQ(ack.last_command, MAV_CMD_DO_SET_MODE);
+    link.Stop();
+}
+
 TEST(Px4LinkTest, AckStatusReportsTimeoutCommand) {
     PseudoTerminal terminal;
     auto config = MakeConfig(terminal.SlaveName());

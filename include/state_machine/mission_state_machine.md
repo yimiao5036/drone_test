@@ -49,7 +49,9 @@
 `IPx4CommandSender::CancelPendingCommands()` **恰好一次**、打一条 ERROR、迁移 S16 FAILSAFE。
 此后 `Evaluate` 只维护告警位与状态发布，**停发位置/伺服/返航/降落一切控制意图**；不重试、
 不补发复位（机构停在原位交人工处置）。故障为终态，`Start()` 才复位 `mission_faulted_`。
-无飞行快照（启动早期/测试未注入）不算连接证据，**不触发**也不判故障。
+无飞行快照（启动早期/测试未注入）不算连接证据，**不触发**；但 S10 内持续无快照
+超过 `return_home.fire_timeout` 仍按“触发命令未入队（发射超时）”判故障并进入 S16
+（生产 S10 入口要求快照/连接证据，测试路径除外）。
 
 **MAVLink/PX4 语义**：`MAV_CMD_DO_SET_ACTUATOR=187` 的 p1..p6 = Actuator Set 1..6 的
 归一化值（-1..1，NaN=忽略），p7=执行器组序号（PX4 仅组 0）。**PWM 输出功能、映射区间

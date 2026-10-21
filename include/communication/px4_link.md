@@ -84,12 +84,20 @@ struct CommandAckStatus {          // common/types.h
     uint8_t last_result;           // 最近一次匹配 ACK 的 MAV_RESULT
     uint64_t last_time_ms;         // 最近一次匹配 ACK 的单调时钟毫秒
     uint16_t last_timeout_command; // 最近一次超时的 MAV_CMD
+    // MAV_CMD_DO_SET_ACTUATOR(187) 专用关联，避免 176/400 等 ACK 覆盖
+    uint64_t do_set_actuator_ack_count;        // 187 匹配 ACK 累计数
+    uint8_t do_set_actuator_last_result;       // 最近 187 ACK 的 MAV_RESULT
+    uint64_t do_set_actuator_last_time_ms;     // 最近 187 ACK 到达时刻
+    uint64_t do_set_actuator_timeout_count;    // 187 ACK 超时累计数
 };
 ```
 
 - `IPx4CommandSender` 暴露命令发送、ACK 计数、ACK 快照与取消，供状态机在
   `enable_control=true` 时注入（装配期物理隔离；`false` 时不注入，命令通道在装配层缺席）。
 - `AckStatus()` 返回最近 ACK/超时快照，互斥量保护一次结构拷贝，可由状态机线程随时调用。
+  `do_set_actuator_*` 在 `HandleCommandAck` / `CheckCommandTimeout` 的同一把锁内维护，
+  只统计 `MAV_CMD_DO_SET_ACTUATOR(187)`：捕网复位等待跨越 S12~S14，期间
+  AUTO.LAND(176)/DISARM(400) 的 ACK 不得覆盖 187 的终态；全局 `last_*` 仍用于通用诊断。
 - `CancelPendingCommands()` 只置原子取消标志，由链路通信线程在下一次循环自己执行
   `ClearCommands()`（线程安全，不跨线程修改在途命令）。语义边界：**已写入串口的命令
   无法撤回**；排队命令与未超时的在途命令最迟在下一次读超时后失效，因此取消在
@@ -346,6 +354,7 @@ UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复
 - 未连接拒绝命令；
 - `COMMAND_LONG` 参数编码、最终 ACK 匹配和快照更新；
 - `AckStatus()` 报告最近匹配 ACK（command/result/time）与超时命令；
+- 187 专用 ACK 计数/终态在后续其它命令 ACK 到达后保持不变；
 - `CancelPendingCommands()` 清掉排队命令，在途命令超时后不得发出；
 - ACK 超时计数后继续队列；
 - 首次心跳后按顺序发送单次消息请求和消息频率请求；

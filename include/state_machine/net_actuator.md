@@ -37,11 +37,18 @@ Faulted：终态，Update/Trigger/Reset 均不再产生命令
 - **计时起点**：对应命令 ACK 的 `last_time_ms`（PX4 接收时刻）；为 0 时回退
   本拍 `now_ms`。保持/稳定截止均以 ACK 时间为基准，不受决策拍抖动影响。
 - **IN_PROGRESS（5）**：保持原等待态，继续等待最终 ACK，不判故障。
-- **无关 ACK**：`last_command != 187` 的新 ACK 被忽略，不推进也不判故障。
-- **ACK 判定**：以 `matched_count/timeout_count` 基线识别“新到达”的 ACK，
-  同一 ACK 不会被重复消费；不做 ACK 重试。基线在命令入队（`SendNorm()`）
-  **之前**抓取——PX4 worker 可能在 `SendCommand()` 返回前就完成命令往返，
-  入队后再抓会把该 ACK 吞掉，导致执行器永久停在等待态。
+- **ACK 关联（187 专用）**：执行器只消费 `CommandAckStatus` 的
+  `do_set_actuator_ack_count / do_set_actuator_last_result /
+  do_set_actuator_last_time_ms / do_set_actuator_timeout_count`，不使用全局
+  `matched_count / last_command / last_result / last_time_ms`。复位等待横跨
+  S12~S14，期间状态机会发 AUTO.LAND(176)/DISARM(400)；若只看“最近一条 ACK”，
+  同一 100ms 决策拍内后到的 176/400 ACK 会覆盖 187，执行器将停在
+  `ResetQueued` 且不推进也不故障（静默挂死）。使用专用字段后，176/400 的
+  ACK/超时不会推进、覆盖或判故障，187 的 ACK 也不会被吞掉。
+- **新 ACK 识别**：以 187 专用计数基线识别“新到达”的 ACK，同一 ACK 不会被
+  重复消费；不做 ACK 重试。基线在命令入队（`SendNorm()`）**之前**抓取——
+  PX4 worker 可能在 `SendCommand()` 返回前就完成命令往返，入队后再抓会把该
+  ACK 吞掉，导致执行器永久停在等待态。
 - **发数**：`Trigger()` 成功入队才扣发数（1→0）；入队失败保留 pending，
   调用方下拍重试，发数不变。复位不恢复发数，故单发执行器全生命周期只触发一次。
 - **手动 `Reset()`（维护/测试用 API）**：取消进行中的保持/复位周期，立即发复位
@@ -124,8 +131,9 @@ class INetActuator {
 - `NetActuatorTest.*`（`tests/state_machine/net_actuator_test.cpp`，使用共享
   `FakeCommandSender`）：初始 Ready/单发；触发参数与扣发数；ACK 后保持
   `reset_delay` 再复位；复位 ACK + `reset_settle` 回 Ready；IN_PROGRESS 保持；
-  拒绝 ACK / 187 超时 / 等待期断连 → Faulted 且不补发；无关 ACK 忽略；
-  入队失败重试不扣发数、复位重试不混入触发行程；`reset_delay` 越界告警。
+  拒绝 ACK / 187 超时 / 等待期断连 → Faulted 且不补发；无关 ACK/超时忽略；
+  同一拍 176 ACK 不吞 187；手动 `Reset()` 取消周期且不补发；入队失败重试
+  不扣发数、复位重试不混入触发行程；`reset_delay` 越界告警。
 - 状态机集成（`mission_state_machine_test`，Task 5）：S10 触发一次、停留不重复、
   触发 ACK 后复位（状态保持 S10）、S12 中 ACK 后仍复位、入队失败重试、未触发
   离开零命令、ACK 超时/断连/入队超时 → S16 + bit4 + 取消一次、未注入命令接口

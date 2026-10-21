@@ -253,6 +253,67 @@ TEST(NetActuatorTest, UnrelatedAckDoesNotAdvanceOrFault) {
     EXPECT_EQ(sender.CallCount(), 2u);
 }
 
+// 回归（最终评审 Important 1）：复位等待跨越 S12~S14 时，同一决策拍内
+// AUTO.LAND(176)/DISARM(400) 的 ACK 不得覆盖 187 专用终态；否则执行器会
+// 停在 ResetQueued 且不故障（静默挂死）。
+TEST(NetActuatorTest, InterleavedAckDoesNotSwallow187) {
+    FakeCommandSender sender;
+    auto actuator =
+        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Trigger());
+
+    sender.SimulateAck(kDoSetActuator, kAccepted, 10);
+    sender.SimulateAck(176, kAccepted, 11);  // AUTO.LAND，与 187 同拍到达
+    actuator->Update(Feedback(sender, true, 11));
+
+    ASSERT_EQ(sender.CallCount(), 2u);
+    EXPECT_FLOAT_EQ(sender.LastParams()[0], 0.0F);  // 复位行程已发出
+    EXPECT_FALSE(actuator->Faulted());
+}
+
+// 回归（最终评审 Important 1）：无关命令超时只更新全局 last_timeout_command，
+// 不得让执行器 Faulted；随后真正的 187 ACK 仍能推进。
+TEST(NetActuatorTest, UnrelatedCommandTimeoutDoesNotFault) {
+    FakeCommandSender sender;
+    auto actuator =
+        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Trigger());
+
+    sender.SimulateTimeout(176);  // AUTO.LAND ACK 超时
+    actuator->Update(Feedback(sender, true, 10));
+    EXPECT_FALSE(actuator->Faulted());
+    EXPECT_EQ(sender.CallCount(), 1u);  // 不得补发复位
+
+    sender.SimulateAck(kDoSetActuator, kAccepted, 20);
+    actuator->Update(Feedback(sender, true, 20));
+    ASSERT_EQ(sender.CallCount(), 2u);
+    EXPECT_FLOAT_EQ(sender.LastParams()[0], 0.0F);
+}
+
+// 回归（最终评审 Important 3）：手动 Reset() 取消保持/稳定计时、回到 Ready，
+// 但不恢复发数，且此后不得再补发命令。
+TEST(NetActuatorTest, ManualResetCancelsCycleKeepsShotsConsumed) {
+    FakeCommandSender sender;
+    auto actuator =
+        drone::state_machine::CreateNetActuator(MakeConfig(1500, 0), &sender);
+    ASSERT_TRUE(actuator->Trigger());
+
+    sender.SimulateAck(kDoSetActuator, kAccepted, 10);
+    actuator->Update(Feedback(sender, true, 10));
+    ASSERT_EQ(sender.CallCount(), 1u);  // 保持中，尚未复位
+
+    ASSERT_TRUE(actuator->Reset());
+    ASSERT_EQ(sender.CallCount(), 2u);
+    EXPECT_FLOAT_EQ(sender.LastParams()[0], 0.0F);
+    EXPECT_TRUE(actuator->Ready());
+    EXPECT_EQ(actuator->RemainingShots(), 0u);
+
+    // 手动复位后保持/稳定计时已取消，不再产生任何命令。
+    actuator->Update(Feedback(sender, true, 5000));
+    EXPECT_EQ(sender.CallCount(), 2u);
+    EXPECT_FALSE(actuator->Trigger());  // 发数已扣，不能再次触发
+}
+
 TEST(NetActuatorTest, EnqueueFailureRetriesWithoutConsumingShot) {
     FakeCommandSender sender;
     auto actuator =

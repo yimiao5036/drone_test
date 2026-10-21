@@ -54,6 +54,8 @@ void WarnIfResetDelayOutsideManualRange(const config::ActuatorConfig& config) {
 ///   Settling --now>=ACK 时刻+reset_settle--> Ready
 /// 任意等待态 187 ACK 超时 / 非 ACCEPTED / IN_PROGRESS 之外的非法结果 /
 /// PX4 断连 → Faulted（终态，不自动恢复、不重试、不补发复位）。
+/// ACK 关联只使用 CommandAckStatus 的 187 专用计数/终态字段：复位等待跨
+/// S12~S14，同期 AUTO.LAND(176)/DISARM(400) 的 ACK 不得覆盖或推进本时序。
 class SinglePwmNetActuator final : public INetActuator {
 public:
     SinglePwmNetActuator(config::ActuatorConfig config,
@@ -141,40 +143,45 @@ private:
         kFaulted,
     };
 
-    /// 抓取 ACK/超时计数基线，之后只处理“新到达”的 ACK。
+    /// 抓取 187 专用 ACK/超时计数基线，之后只处理“新到达”的 187 ACK。
     /// 必须在对应命令入队（SendNorm）之前调用，见 Trigger/Update 中的说明。
     void CaptureAckBaseline() {
         const auto ack = sender_->AckStatus();
-        ack_baseline_ = ack.matched_count;
-        timeout_baseline_ = ack.timeout_count;
+        ack_baseline_ = ack.do_set_actuator_ack_count;
+        timeout_baseline_ = ack.do_set_actuator_timeout_count;
     }
 
-    /// 处理本拍新到达的 ACK/超时。返回 true 表示已判故障、本拍不再推进。
+    /// 处理本拍新到达的 187 ACK/超时。返回 true 表示已判故障、本拍不再推进。
     bool ProcessAck(const ActuatorFeedback& feedback) {
         const auto& ack = feedback.ack;
-        const bool matched_new = ack.matched_count != ack_baseline_;
-        const bool timeout_new = ack.timeout_count != timeout_baseline_;
-        ack_baseline_ = ack.matched_count;
-        timeout_baseline_ = ack.timeout_count;
+        // 只认 187 专用计数：176/400 等命令即使在同一拍到达，也不会推进
+        // 本状态机，更不会覆盖 187 的终态。
+        const bool matched_new =
+            ack.do_set_actuator_ack_count != ack_baseline_;
+        const bool timeout_new =
+            ack.do_set_actuator_timeout_count != timeout_baseline_;
+        ack_baseline_ = ack.do_set_actuator_ack_count;
+        timeout_baseline_ = ack.do_set_actuator_timeout_count;
 
-        if (timeout_new && ack.last_timeout_command == kMavCmdDoSetActuator) {
+        if (timeout_new) {
             EnterFault("等待 187 ACK 超时");
             return true;
         }
-        if (!matched_new || ack.last_command != kMavCmdDoSetActuator) {
-            return false;  // 无关命令的 ACK：忽略，不推进也不判故障
+        if (!matched_new) {
+            return false;  // 无新 187 ACK：无关命令的 ACK/超时已由专用计数隔离
         }
-        if (ack.last_result == kMavResultInProgress) {
+        if (ack.do_set_actuator_last_result == kMavResultInProgress) {
             return false;  // 仍在执行：保持等待，等最终结果
         }
-        if (ack.last_result != kMavResultAccepted) {
+        if (ack.do_set_actuator_last_result != kMavResultAccepted) {
             EnterFault("187 ACK 结果非 ACCEPTED");
             return true;
         }
 
         // 计时起点优先用 PX4 ACK 到达时间；缺失时回退本拍时钟。
-        const uint64_t ack_time =
-            ack.last_time_ms == 0 ? feedback.now_ms : ack.last_time_ms;
+        const uint64_t ack_time = ack.do_set_actuator_last_time_ms == 0
+                                      ? feedback.now_ms
+                                      : ack.do_set_actuator_last_time_ms;
         if (state_ == State::kFireQueued) {
             state_ = State::kFireAcked;
             hold_deadline_ms_ =

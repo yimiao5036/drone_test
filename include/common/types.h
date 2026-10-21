@@ -374,6 +374,10 @@ struct Px4Setpoint {
 
 /// PX4 命令 ACK 状态快照（命令窄接口 → 状态机/执行器）。
 /// matched_count/timeout_count 单调递增；last_* 为最近一次匹配 ACK/超时。
+/// do_set_actuator_* 为 MAV_CMD_DO_SET_ACTUATOR(187) 专用关联字段：捕网复位
+/// 等待横跨 S12~S14，期间可能插入 AUTO.LAND(176)/DISARM(400) 的 ACK；若只看
+/// 全局 last_*，同一决策拍内后到的 ACK 会覆盖 187，执行器将静默挂死。
+/// 执行器必须用本节字段判断 187 的推进/故障；全局字段保留给通用诊断。
 struct CommandAckStatus {
     uint64_t matched_count = 0;
     uint64_t timeout_count = 0;
@@ -381,6 +385,11 @@ struct CommandAckStatus {
     uint8_t last_result = 0;
     uint64_t last_time_ms = 0;
     uint16_t last_timeout_command = 0;
+    /// MAV_CMD_DO_SET_ACTUATOR(187) 专用最近终态：避免 176/400 等 ACK 覆盖。
+    uint64_t do_set_actuator_ack_count = 0;
+    uint8_t do_set_actuator_last_result = 0;
+    uint64_t do_set_actuator_last_time_ms = 0;
+    uint64_t do_set_actuator_timeout_count = 0;
 };
 
 /// 健康状态（健康管理 → 状态机/地面站回传）。

@@ -1729,6 +1729,47 @@ TEST(MissionStateMachineTest, ResetRunsDuringReturnAfterFireAck) {
     machine.Stop();
 }
 
+// 回归（最终评审 Important 3）：S16 故障后不得再发布任何控制意图。
+// 故障前必须先真正进入会持续出意图的状态（S12 返航），否则“无意图”断言无意义。
+TEST(MissionStateMachineTest, NoIntentsAfterActuatorFault) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(32);
+    auto intent_subscription = machine.IntentOutput().Subscribe(32);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));  // 触发已入队，等待 ACK
+
+    // 先进入 S12 并确认返航意图在持续发布，再制造执行器 ACK 超时。
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForReturnIntent(intent_subscription).has_value());
+
+    sender.SimulateTimeout(187U);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+
+    // 清空故障前已排队的意图，之后 300ms 内不得再出现新意图。
+    while (intent_subscription.WaitTakeFor(20ms).has_value()) {
+    }
+    std::this_thread::sleep_for(300ms);
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(100ms).has_value());
+    machine.Stop();
+}
+
 TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
     common::Topic<common::GroundStationTarget> ground_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
