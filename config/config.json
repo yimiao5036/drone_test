@@ -132,7 +132,9 @@
         "type": "single_pwm",
         "net_channel": 1,
         "net_fire_norm": -0.7,
-        "net_idle_norm": 0.0
+        "net_idle_norm": 0.0,
+        "reset_delay_ms": 1500,
+        "reset_settle_ms": 0
     },
     "interception": {
         "enabled": false,

@@ -98,6 +98,10 @@ struct ActuatorConfig {
     /// 标准 1000..2000µs 映射下，-0.7→1150µs（发射）、0.0→1500µs（待机）。
     double net_fire_norm = -0.7;    ///< 发射控制量（-1..1）
     double net_idle_norm = 0.0;     ///< 待机/复位控制量（-1..1）
+    /// 触发 ACK ACCEPTED 后到发复位的保持时间；当前捕网枪说明书要求 1~2s。
+    std::chrono::milliseconds reset_delay{1500};
+    /// 复位 ACK ACCEPTED 后到 Ready 的稳定时间（多发用；单发默认 0）。
+    std::chrono::milliseconds reset_settle{0};
     void Validate() const;
 };
 

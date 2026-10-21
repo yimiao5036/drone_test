@@ -972,6 +972,39 @@ TEST(ConfigTest, RejectsEqualActuatorNorm) {
     std::filesystem::remove(path);
 }
 
+// 捕网执行器 ACK 复位时序：发射 ACK 后保持 reset_delay 再发复位，
+// 复位 ACK 后再稳定 reset_settle 才回 Ready（多发用，单发默认 0）。
+TEST(ConfigTest, ActuatorResetTimingDefaults) {
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_EQ(config.actuator.reset_delay, std::chrono::milliseconds(1500));
+    EXPECT_EQ(config.actuator.reset_settle, std::chrono::milliseconds(0));
+}
+
+TEST(ConfigTest, ParsesActuatorResetTiming) {
+    json value = ReadSourceConfig();
+    value["actuator"]["reset_delay_ms"] = 1000;
+    value["actuator"]["reset_settle_ms"] = 200;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_timing.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.actuator.reset_delay, std::chrono::milliseconds(1000));
+    EXPECT_EQ(config.actuator.reset_settle, std::chrono::milliseconds(200));
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNegativeActuatorResetTiming) {
+    json value = ReadSourceConfig();
+    value["actuator"]["reset_delay_ms"] = -1;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_timing_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
     json value = ReadSourceConfig();
     value["runtime"]["enable_video"] = false;

@@ -563,6 +563,10 @@ void ActuatorConfig::Validate() const {
         throw std::invalid_argument("actuator.net_idle_norm 必须在 [-1, 1] 内");
     if (net_fire_norm == net_idle_norm)
         throw std::invalid_argument("actuator.net_fire_norm 与 net_idle_norm 不得相同");
+    if (reset_delay.count() < 0)
+        throw std::invalid_argument("actuator.reset_delay_ms 必须 >= 0");
+    if (reset_settle.count() < 0)
+        throw std::invalid_argument("actuator.reset_settle_ms 必须 >= 0");
 }
 
 // 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
@@ -859,6 +863,12 @@ AppConfig LoadAppConfig(const std::string& path,
         actuator.value("net_fire_norm", config.actuator.net_fire_norm);
     config.actuator.net_idle_norm =
         actuator.value("net_idle_norm", config.actuator.net_idle_norm);
+    config.actuator.reset_delay = std::chrono::milliseconds(
+        actuator.value("reset_delay_ms",
+                       static_cast<int>(config.actuator.reset_delay.count())));
+    config.actuator.reset_settle = std::chrono::milliseconds(
+        actuator.value("reset_settle_ms",
+                       static_cast<int>(config.actuator.reset_settle.count())));
     config.actuator.Validate();
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。
