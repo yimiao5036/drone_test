@@ -41,6 +41,11 @@ namespace common = drone::common;  // stage4-mission（G3 全链）段使用
 
 std::atomic<bool> g_stop{false};
 
+/// 进程退出前关闭异步日志：确保最后一段验收/断链日志已刷盘。
+struct LogShutdownGuard {
+    ~LogShutdownGuard() { spdlog::shutdown(); }
+};
+
 void OnSignal(int) {
     g_stop.store(true, std::memory_order_release);
 }
@@ -119,6 +124,9 @@ void PrintUsage(const char* program) {
               << "  Offboard → DISARM；不发送起飞/降落/返航指令。必须同时给\n"
               << "  --bench-ack-props-off 确认已拆桨、机体固定、遥控器可随时接管；\n"
               << "  自动流程只判定序列/离地/时延，电机怠速响应与方向需人工观察。\n"
+              << "  若运行中拔串口导致心跳断开：立即停止意图、关闭串口并刷盘退出\n"
+              << "  （退出码4）；PX4 侧失控保护需 QGC/飞控日志确认，工具不再发\n"
+              << "  AUTO.LAND/DISARM。\n"
               << "--probe-message-interval <消息ID> 只读探针：GET_MESSAGE_INTERVAL 查询该消息流\n"
               << "  在 PX4 端是否实例化（PX4 回 MESSAGE_INTERVAL，#244；-1=未找到/未启用），\n"
               << "  随后 REQUEST_MESSAGE 触发一次并统计实收帧；49=GPS_GLOBAL_ORIGIN 锚点流\n"
@@ -1661,11 +1669,20 @@ public:
         setpoint_subscription_ = controller_.SetpointOutput().Subscribe(128);
     }
 
+    bool LinkLost() const { return link_lost_; }
+
     void Execute() {
         const uint64_t started_ms = MonotonicMs();
         uint64_t next_summary_ms = started_ms;
         while (!g_stop.load(std::memory_order_acquire) &&
                MonotonicMs() - started_ms < duration_ms_) {
+            // G4-4 拔串口：Px4Link 心跳超时后置 connected=false。机上已无法
+            // 观察/控制 PX4，继续等 Offboard 退出或发 AUTO.LAND 都是无效写入；
+            // 立即停止意图并退出，由 QGC/PX4 飞控日志确认失控保护行为。
+            if (preflight_passed_ && !link_lost_ && !link_.IsConnected()) {
+                MarkLinkLost();
+                break;
+            }
             if (auto message = subscription_.WaitTakeFor(std::chrono::milliseconds(100))) {
                 latest_ = **message;
                 have_snapshot_ = true;
@@ -1695,6 +1712,24 @@ public:
     }
 
     bool Evaluate(bool connected_at_end) const {
+        if (link_lost_) {
+            std::cout << "\n========== G4 串口台架：串口链路中断"
+                         "（拔串口分支，工具无法继续观察 PX4）=========="
+                      << std::endl;
+            std::cout << "链路中断时最后快照: armed=" << YesNo(latest_.armed)
+                      << " mode=" << static_cast<int>(latest_.flight_mode) << '/'
+                      << static_cast<int>(latest_.flight_sub_mode)
+                      << " landed="
+                      << (latest_.landed_state_valid ? YesNo(latest_.landed) : "未知")
+                      << "；中断原因: " << abort_reason_ << std::endl;
+            std::cout << "工具处置: 停止控制意图、关闭串口（机载心跳停止）、"
+                         "不再尝试 AUTO.LAND/DISARM；日志已请求刷盘。" << std::endl;
+            std::cout << "PX4 侧结果需用 QGC/飞控日志确认：COM_OF_LOSS_T、"
+                         "COM_OBL_RC_ACT、Offboard 退出/上锁行为。" << std::endl;
+            std::cout << "结果: 串口链路中断，G4-4 拔串口分支需外部观察确认"
+                         "（不是工具自动通过）。" << std::endl;
+            return false;
+        }
         const bool guide_ok = guide_injected_ >= kBenchGuideMinSends &&
                               guide_elapsed_ms_ >= kBenchGuideMinMs;
         const bool offboard_ok = offboard_command_queued_ && offboard_ack_received_ &&
@@ -1782,8 +1817,10 @@ public:
         }
         std::cout << "\n[MANUAL] G4-1 电机怠速级响应：ARM 后电机应仅低速响应，"
                      "不得出现高速/持续加速" << std::endl;
-        std::cout << "[MANUAL] G4-2 电机/机体方向：北/东/南/西脉冲时应分别向对应"
-                     "方向响应，方向不得反转" << std::endl;
+        std::cout << "[MANUAL] G4-2 电机/机体方向：北=机头下俯趋势/后侧加速、"
+                     "南=机头上仰趋势/前侧加速、东=右滚趋势/左侧加速、"
+                     "西=左滚趋势/右侧加速；以 QGC Actuators 输出条或电机声音为准，"
+                     "先确认机架电机布局，不要按编号死记" << std::endl;
         std::cout << "[MANUAL] G4-3 捕网执行器：本模式不自动触发；通道/接线/"
                      "PWM 行程确认后单独验证" << std::endl;
         std::cout << (passed ? "结果: G4 串口台架自动部分通过；请人工勾选上述三项"
@@ -1968,6 +2005,23 @@ private:
         abort_reason_ = reason;
         intent_mode_ = BenchIntentMode::kNone;
         std::cout << "[G4][中断] " << reason << std::endl;
+    }
+
+    /// 串口链路丢失：不再向已断开的端口写 setpoint/命令；由 RunBenchStage4
+    /// 停止 Px4Link/控制器并关闭串口（机载心跳随之停止）。
+    void MarkLinkLost() {
+        if (link_lost_) {
+            return;
+        }
+        link_lost_ = true;
+        aborted_ = true;
+        abort_reason_ = "串口链路中断（PX4 心跳超时）";
+        intent_mode_ = BenchIntentMode::kNone;
+        command_north_mps_ = 0.f;
+        command_east_mps_ = 0.f;
+        std::cout << "[G4][链路中断] PX4 心跳已断开，停止意图并退出；"
+                     "不再尝试 AUTO.LAND/DISARM（写入已断开的串口无效）。"
+                     "PX4 侧失控保护请用 QGC/飞控日志确认。" << std::endl;
     }
 
     void Advance(uint64_t now_ms, uint64_t elapsed_ms) {
@@ -2333,6 +2387,11 @@ private:
 
     void Finish() {
         intent_mode_ = BenchIntentMode::kNone;
+        if (link_lost_) {
+            // 串口已断，任何 AUTO.LAND/DISARM 都送不到 PX4；必须由 QGC/
+            // 飞控 failsafe 处理，工具只负责停意图、关闭链路并保存日志。
+            return;
+        }
         if (!latest_.armed && !armed_reached_) {
             return;
         }
@@ -2415,6 +2474,7 @@ private:
     BenchPhase phase_ = BenchPhase::kPreflight;
     BenchIntentMode intent_mode_ = BenchIntentMode::kNone;
     bool aborted_ = false;
+    bool link_lost_ = false;
     std::string abort_reason_;
     bool safety_violation_ = false;
     bool takeoff_detected_ = false;
@@ -2518,8 +2578,8 @@ int RunBenchStage4(drone::communication::Px4Link& link, const json& root,
               << "m），脉冲 " << kBenchPulseSpeedMps
               << "m/s；不发送起飞/降落/返航指令" << std::endl;
     std::cout << "  [提示] PX4 默认 COM_DISARM_PRFLT=10s：解锁后未起飞会自动上锁。"
-                 "本序列约 7.5s 完成；人工观察需要更长时间时，先把 "
-                 "COM_DISARM_PRFLT 临时调到 ≥30s，测后恢复 10s。" << std::endl;
+                 "本序列解锁到 DISARM 约 9s，默认值余量仅约 1s；每次台架前建议"
+                 "先把 COM_DISARM_PRFLT 临时调到 ≥30s，测后恢复 10s。" << std::endl;
 
     drone::common::Topic<drone::common::ControlIntent> intent_topic;
     drone::control::FlightController controller(controller_config);
@@ -2540,9 +2600,14 @@ int RunBenchStage4(drone::communication::Px4Link& link, const json& root,
                        std::move(subscription));
     run.Execute();
     const bool connected_at_end = link.IsConnected();
+    const bool link_lost = run.LinkLost();
     controller.Stop();
-    link.Stop();
-    return run.Evaluate(connected_at_end) ? 0 : 3;
+    link.Stop();  // 断链时关闭串口，机载心跳随之停止
+    const bool passed = run.Evaluate(connected_at_end);
+    if (link_lost) {
+        return 4;  // 链路中断：PX4 侧结果无法由本工具观察
+    }
+    return passed ? 0 : 3;
 }
 
 /// stage4 入口：装配 FlightController → Px4Link 全链并运行脚本。
@@ -6487,6 +6552,8 @@ int main(int argc, char** argv) {
         const auto log_level = spdlog::level::from_str(
             log_config.value("level", std::string("info")));
         drone::common::InitializeAsyncLogger(ResolveLogDirectory(root), log_level);
+        // 任何 return/异常路径都先冲刷异步日志，避免断链/中止时最后几行丢失。
+        const LogShutdownGuard log_shutdown_guard;
 
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
