@@ -1052,5 +1052,84 @@ TEST(Px4LinkTest, QueuesSafeTelemetryRequestsAfterFirstHeartbeat) {
     link.Stop();
 }
 
+TEST(Px4LinkTest, AckStatusReportsLatestMatchedAck) {
+    PseudoTerminal terminal;
+    Px4Link link(MakeConfig(terminal.SlaveName()));
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_DO_SET_ACTUATOR,
+                                 -0.7f, NAN, NAN, NAN, NAN, NAN, 0.f));
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
+    ASSERT_TRUE(terminal.Write(
+        EncodeCommandAck(px4_encoder, MAV_CMD_DO_SET_ACTUATOR,
+                         MAV_RESULT_ACCEPTED)));
+    ASSERT_TRUE(WaitUntil(
+        [&link] { return link.AckStatus().matched_count == 1; }, 500ms));
+
+    const auto ack = link.AckStatus();
+    EXPECT_EQ(ack.last_command, MAV_CMD_DO_SET_ACTUATOR);
+    EXPECT_EQ(ack.last_result, MAV_RESULT_ACCEPTED);
+    EXPECT_GT(ack.last_time_ms, 0u);
+    EXPECT_EQ(ack.timeout_count, 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, AckStatusReportsTimeoutCommand) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.command_ack_timeout = 50ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_DO_SET_ACTUATOR,
+                                 -0.7f, NAN, NAN, NAN, NAN, NAN, 0.f));
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
+    ASSERT_TRUE(WaitUntil(
+        [&link] { return link.AckStatus().timeout_count == 1; }, 500ms));
+
+    const auto ack = link.AckStatus();
+    EXPECT_EQ(ack.last_timeout_command, MAV_CMD_DO_SET_ACTUATOR);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, CancelPendingCommandsDropsQueuedCommand) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.command_ack_timeout = 50ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_DO_SET_ACTUATOR,
+                                 -0.7f, NAN, NAN, NAN, NAN, NAN, 0.f));
+    ASSERT_TRUE(terminal.WaitForMessage(
+        MAVLINK_MSG_ID_COMMAND_LONG, 500ms, nullptr));
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_DO_SET_ACTUATOR,
+                                 0.f, NAN, NAN, NAN, NAN, NAN, 0.f));
+    link.CancelPendingCommands();
+
+    // 第一条在途命令超时后，排队的第二条必须已被清掉，不得发出。
+    std::this_thread::sleep_for(150ms);
+    EXPECT_EQ(terminal.WaitForMessage(
+                  MAVLINK_MSG_ID_COMMAND_LONG, 50ms, nullptr),
+              false);
+    link.Stop();
+}
+
 }  // namespace
 }  // namespace drone::communication

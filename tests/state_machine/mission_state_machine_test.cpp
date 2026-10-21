@@ -1330,6 +1330,8 @@ public:
 
     uint64_t AckMatchCount() const override { return 0; }
     uint64_t AckTimeoutCount() const override { return 0; }
+    common::CommandAckStatus AckStatus() const override { return {}; }
+    void CancelPendingCommands() override {}
 
     uint64_t CallCount() const {
         std::lock_guard<std::mutex> lock(mutex_);

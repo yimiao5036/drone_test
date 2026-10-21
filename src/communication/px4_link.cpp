@@ -258,6 +258,18 @@ public:
         return ack_timeout_count_.load(std::memory_order_relaxed);
     }
 
+    // 最近 ACK/超时状态快照；由通信线程写、其它线程只读，互斥量保护一次结构拷贝。
+    common::CommandAckStatus AckStatus() const {
+        std::lock_guard<std::mutex> lock(ack_status_mutex_);
+        return ack_status_;
+    }
+
+    // 取消排队与在途命令：只置原子标志，由通信线程在下一轮循环执行 ClearCommands()，
+    // 避免跨线程直接修改通信线程独占的 in_flight_command_。
+    void CancelPendingCommands() {
+        cancel_pending_.store(true, std::memory_order_release);
+    }
+
     uint64_t ErrorCount() const {
         return error_count_.load(std::memory_order_relaxed);
     }
@@ -466,6 +478,11 @@ private:
             DrainSetpointInput(now_ms);   // 消费控制器新设定值
             CheckHeartbeatTimeout(now_ms); // 心跳超时断连
             CheckCommandTimeout(now_ms);   // 在途命令 ACK 超时
+            // 外部取消请求（状态机线程置标志）：在本线程清空排队与在途命令，
+            // 保证发送前生效，旧命令不会在本轮被发出。
+            if (cancel_pending_.exchange(false, std::memory_order_acq_rel)) {
+                ClearCommands();
+            }
             SendNextCommand(now_ms);       // 发送下一条排队命令
 
             if (now >= next_setpoint_send) {
@@ -982,6 +999,15 @@ private:
         }
 
         ack_match_count_.fetch_add(1, std::memory_order_relaxed);
+        {
+            // 快照与匹配计数同口径：先更新计数再发布快照。
+            std::lock_guard<std::mutex> lock(ack_status_mutex_);
+            ack_status_.matched_count =
+                ack_match_count_.load(std::memory_order_relaxed);
+            ack_status_.last_command = ack.command;
+            ack_status_.last_result = ack.result;
+            ack_status_.last_time_ms = now_ms;
+        }
         const bool in_progress = ack.result == MAV_RESULT_IN_PROGRESS;
         if (ack.result == MAV_RESULT_ACCEPTED || in_progress) {
             SPDLOG_INFO("PX4 命令 ACK: sequence={} command={} result={} internal={} progress={}",
@@ -1015,6 +1041,12 @@ private:
         in_flight_command_.reset();
         const uint64_t count =
             ack_timeout_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        {
+            std::lock_guard<std::mutex> lock(ack_status_mutex_);
+            ack_status_.timeout_count =
+                ack_timeout_count_.load(std::memory_order_relaxed);
+            ack_status_.last_timeout_command = timed_out.command;
+        }
         if (ShouldLogThrottled(count)) {
             SPDLOG_WARN("PX4 命令 ACK 超时: sequence={} command={} internal={} timeout_ms={}，累计 {}",
                         timed_out.sequence, timed_out.command, timed_out.internal,
@@ -1221,6 +1253,9 @@ private:
     std::deque<CommandRequest> command_queue_;
     std::optional<InFlightCommand> in_flight_command_;
     std::atomic<uint64_t> next_command_sequence_{1};
+    mutable std::mutex ack_status_mutex_;
+    common::CommandAckStatus ack_status_;
+    std::atomic<bool> cancel_pending_{false};
     std::optional<CachedSetpoint> cached_setpoint_;
 
     std::atomic<uint64_t> setpoint_send_count_{0};
@@ -1257,6 +1292,8 @@ uint64_t Px4Link::SetpointSendCount() const { return impl_->SetpointSendCount();
 uint64_t Px4Link::ReceiveCount() const { return impl_->ReceiveCount(); }
 uint64_t Px4Link::AckMatchCount() const { return impl_->AckMatchCount(); }
 uint64_t Px4Link::AckTimeoutCount() const { return impl_->AckTimeoutCount(); }
+common::CommandAckStatus Px4Link::AckStatus() const { return impl_->AckStatus(); }
+void Px4Link::CancelPendingCommands() { impl_->CancelPendingCommands(); }
 uint64_t Px4Link::ErrorCount() const { return impl_->ErrorCount(); }
 common::FlightStateSnapshot Px4Link::LatestState() const {
     return impl_->LatestState();
@@ -1313,6 +1350,8 @@ uint64_t Px4LinkStub::SetpointSendCount() const { return setpoint_send_count_; }
 uint64_t Px4LinkStub::ReceiveCount() const { return receive_count_; }
 uint64_t Px4LinkStub::AckMatchCount() const { return ack_match_count_; }
 uint64_t Px4LinkStub::AckTimeoutCount() const { return ack_timeout_count_; }
+common::CommandAckStatus Px4LinkStub::AckStatus() const { return {}; }
+void Px4LinkStub::CancelPendingCommands() {}
 uint64_t Px4LinkStub::ErrorCount() const { return error_count_; }
 
 common::FlightStateSnapshot Px4LinkStub::LatestState() const {

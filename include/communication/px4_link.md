@@ -73,11 +73,27 @@ class IPx4CommandSender {          // IPx4Link 的父接口
     virtual bool SendCommand(uint16_t mavlink_command, float p1, ..., float p7) = 0;
     virtual uint64_t AckMatchCount() const = 0;
     virtual uint64_t AckTimeoutCount() const = 0;
+    virtual CommandAckStatus AckStatus() const = 0;   // 最近 ACK/超时快照
+    virtual void CancelPendingCommands() = 0;         // 清空排队与在途命令
+};
+
+struct CommandAckStatus {          // common/types.h
+    uint64_t matched_count;        // 累计匹配 ACK（单调递增）
+    uint64_t timeout_count;        // 累计 ACK 超时（单调递增）
+    uint16_t last_command;         // 最近一次匹配 ACK 的 MAV_CMD
+    uint8_t last_result;           // 最近一次匹配 ACK 的 MAV_RESULT
+    uint64_t last_time_ms;         // 最近一次匹配 ACK 的单调时钟毫秒
+    uint16_t last_timeout_command; // 最近一次超时的 MAV_CMD
 };
 ```
 
-- `IPx4CommandSender` 仅暴露命令发送与 ACK 计数，供状态机在 `enable_control=true` 时
-  注入（装配期物理隔离；`false` 时不注入，命令通道在装配层缺席）。
+- `IPx4CommandSender` 暴露命令发送、ACK 计数、ACK 快照与取消，供状态机在
+  `enable_control=true` 时注入（装配期物理隔离；`false` 时不注入，命令通道在装配层缺席）。
+- `AckStatus()` 返回最近 ACK/超时快照，互斥量保护一次结构拷贝，可由状态机线程随时调用。
+- `CancelPendingCommands()` 只置原子取消标志，由链路通信线程在下一次循环自己执行
+  `ClearCommands()`（线程安全，不跨线程修改在途命令）。语义边界：**已写入串口的命令
+  无法撤回**；排队命令与未超时的在途命令最迟在下一次读超时后失效，因此取消在
+  ≤ 一次读超时内生效，返回后不再发送旧命令。
 - `IPx4Link::LatestState()` 返回最近一次发布快照的拷贝，供 FlightController 控制权
   门禁做只读判断——门禁不订阅 `kFlightState` Topic，避免控制环路经 Topic 回环。
   未发布过快照时返回默认值（`connected=false`）。线程安全（互斥锁保护一次结构拷贝），
@@ -120,7 +136,7 @@ PX4 串口
 
 1. 带超时读取串口；
 2. 增量解析收到的 MAVLink 帧；
-3. 检查 PX4 心跳和命令 ACK 超时；
+3. 检查 PX4 心跳和命令 ACK 超时，并处理外部取消请求（清空排队/在途命令）；
 4. 发送下一条排队命令；
 5. 到期发送机载电脑心跳；
 6. 到期发布飞行状态快照。
@@ -246,11 +262,19 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 `SendCommand()` 只负责把命令放入有界队列，返回 true 表示成功入队，不表示 PX4 已接受。
 链路线程同一时刻只发送一条 `COMMAND_LONG` 并等待同 command ID 的 `COMMAND_ACK`：
 
-- 最终 ACK 增加 `AckMatchCount()`，更新快照最近 ACK 后发送下一条；
+- 最终 ACK 增加 `AckMatchCount()`，更新 `AckStatus()` 快照（`matched_count`/
+  `last_command`/`last_result`/`last_time_ms`）后发送下一条；
 - `MAV_RESULT_IN_PROGRESS` 保持在途并刷新超时时间；
-- 超过 `command_ack_timeout` 增加 `AckTimeoutCount()`，丢弃该在途命令并继续队列；
+- 超过 `command_ack_timeout` 增加 `AckTimeoutCount()`，更新 `AckStatus()`
+  （`timeout_count`/`last_timeout_command`），丢弃该在途命令并继续队列；
+- `CancelPendingCommands()` 由状态机线程调用时只置原子标志，通信线程在检查 ACK 超时后、
+  发送下一条命令前清空排队与在途命令——保证本轮不会再发出旧命令；已写入串口的
+  命令无法撤回（≤ 一次读超时内生效）；
 - 队列满、未运行或未连接时拒绝外部命令；
 - 心跳断开和 Stop 清空排队/在途命令，禁止重连后恢复旧命令。
+
+`AckStatus()` 与原有 `AckMatchCount()/AckTimeoutCount()` 口径一致（计数单调递增、
+重启不归零）；`last_*` 字段用于状态机判断最近一条命令是否被接受。
 
 首次建立心跳后按 JSON 自动排队：
 
@@ -321,6 +345,8 @@ UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复
 - Stop 后重新 Start；
 - 未连接拒绝命令；
 - `COMMAND_LONG` 参数编码、最终 ACK 匹配和快照更新；
+- `AckStatus()` 报告最近匹配 ACK（command/result/time）与超时命令；
+- `CancelPendingCommands()` 清掉排队命令，在途命令超时后不得发出；
 - ACK 超时计数后继续队列；
 - 首次心跳后按顺序发送单次消息请求和消息频率请求；
 - `LatestState()` 未发布时返回默认快照，连接后反映已发布快照（connected/armed）；

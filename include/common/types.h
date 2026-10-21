@@ -372,6 +372,17 @@ struct Px4Setpoint {
     bool valid = false;        ///< false 时停止发送；刹停/悬停必须生成有效零速度或位置保持值
 };
 
+/// PX4 命令 ACK 状态快照（命令窄接口 → 状态机/执行器）。
+/// matched_count/timeout_count 单调递增；last_* 为最近一次匹配 ACK/超时。
+struct CommandAckStatus {
+    uint64_t matched_count = 0;
+    uint64_t timeout_count = 0;
+    uint16_t last_command = 0;
+    uint8_t last_result = 0;
+    uint64_t last_time_ms = 0;
+    uint16_t last_timeout_command = 0;
+};
+
 /// 健康状态（健康管理 → 状态机/地面站回传）。
 struct HealthStatus {
     MessageHeader header;

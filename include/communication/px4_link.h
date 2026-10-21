@@ -50,6 +50,12 @@ public:
     virtual uint64_t AckMatchCount() const = 0;
     /// ACK 超时次数。
     virtual uint64_t AckTimeoutCount() const = 0;
+    /// 最近 ACK/超时状态快照（线程安全）。
+    virtual common::CommandAckStatus AckStatus() const = 0;
+    /// 清空排队与在途命令（故障处置）；返回后不再发送旧命令。
+    /// 仅置取消标志，由链路通信线程在下一次循环执行清空；
+    /// 已写入串口的命令无法撤回，最迟在下一次读超时后生效。
+    virtual void CancelPendingCommands() = 0;
 };
 
 /// PX4 通信部件抽象接口。
@@ -147,6 +153,8 @@ public:
     uint64_t ReceiveCount() const override;
     uint64_t AckMatchCount() const override;
     uint64_t AckTimeoutCount() const override;
+    common::CommandAckStatus AckStatus() const override;
+    void CancelPendingCommands() override;
     uint64_t ErrorCount() const override;
 
     /// 指定 MAVLink message ID 的累计接收数（用于硬件 smoke 诊断）。
@@ -185,6 +193,8 @@ public:
     uint64_t ReceiveCount() const override;
     uint64_t AckMatchCount() const override;
     uint64_t AckTimeoutCount() const override;
+    common::CommandAckStatus AckStatus() const override;
+    void CancelPendingCommands() override;
     uint64_t ErrorCount() const override;
 
 private:

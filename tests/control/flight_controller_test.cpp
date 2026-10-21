@@ -83,6 +83,8 @@ public:
     uint64_t ReceiveCount() const override { return 0; }
     uint64_t AckMatchCount() const override { return 0; }
     uint64_t AckTimeoutCount() const override { return 0; }
+    common::CommandAckStatus AckStatus() const override { return {}; }
+    void CancelPendingCommands() override {}
     uint64_t ErrorCount() const override { return 0; }
 
     void SetState(const common::FlightStateSnapshot& state) { state_ = state; }
