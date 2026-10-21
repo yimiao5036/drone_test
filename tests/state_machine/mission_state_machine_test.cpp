@@ -16,11 +16,13 @@
 #include "state_machine/mission_state_machine.h"
 
 #include "../common/log_capture.h"
+#include "../communication/fake_command_sender.h"
 
 namespace {
 
 using namespace drone;
 using namespace std::chrono_literals;
+using drone::test::FakeCommandSender;
 
 uint64_t TestMonotonicMs() {
     return static_cast<uint64_t>(
@@ -1300,74 +1302,6 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
 /// 的归一化期望值：norm = 2·(pwm − 1000)/1000 − 1。
 constexpr float kNetFireNormalized = -0.7F;
 constexpr float kNetIdleNormalized = 0.0F;
-
-/// 命令窄接口假件：记录 SendCommand 调用（顺序/参数/入队结果）并可脚本化
-/// 前 N 次入队失败。
-class FakeCommandSender final : public communication::IPx4CommandSender {
-public:
-    /// 单条命令调用记录：供触发/复位次序与各次入队结果断言。
-    struct CallRecord {
-        uint16_t command = 0;
-        std::array<float, 7> params{};
-        bool queued = false;  // SendCommand 返回值（false=链路未就绪/队列满）
-    };
-
-    bool SendCommand(uint16_t mavlink_command, float param1, float param2,
-                     float param3, float param4, float param5, float param6,
-                     float param7) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++call_count_;
-        last_command_ = mavlink_command;
-        last_params_ = {param1, param2, param3, param4, param5, param6, param7};
-        bool queued = true;
-        if (fail_calls_remaining_ > 0) {
-            --fail_calls_remaining_;
-            queued = false;
-        }
-        history_.push_back({mavlink_command, last_params_, queued});
-        return queued;
-    }
-
-    uint64_t AckMatchCount() const override { return 0; }
-    uint64_t AckTimeoutCount() const override { return 0; }
-    common::CommandAckStatus AckStatus() const override { return {}; }
-    void CancelPendingCommands() override {}
-
-    uint64_t CallCount() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return call_count_;
-    }
-
-    uint16_t LastCommand() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_command_;
-    }
-
-    std::array<float, 7> LastParams() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return last_params_;
-    }
-
-    /// 全部调用记录（按时间顺序的拷贝）。
-    std::vector<CallRecord> History() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return history_;
-    }
-
-    /// 令接下来 count 次 SendCommand 返回失败（模拟 PX4 未连接/队列满）。
-    void FailNextCalls(uint64_t count) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        fail_calls_remaining_ = count;
-    }
-
-private:
-    mutable std::mutex mutex_;
-    uint64_t call_count_ = 0;
-    uint16_t last_command_ = 0;
-    std::array<float, 7> last_params_{};
-    std::vector<CallRecord> history_;
-    uint64_t fail_calls_remaining_ = 0;
-};
 
 /// 捕网执行器用例配置：通道 3（验证通道号落在 p3 而非 p1），行程取默认值；
 /// 显式开启测试钩子（拦截序列无生产入口，用例经 `ForceStateForTest` 驱动）。
