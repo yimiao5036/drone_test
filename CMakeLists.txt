@@ -483,6 +483,23 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(mission_state_machine_test)
 
+        # 捕网执行器内部时序测试：触发 ACK 保持、复位 ACK/稳定、故障与重试
+        add_executable(net_actuator_test
+            tests/state_machine/net_actuator_test.cpp)
+        target_link_libraries(net_actuator_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(net_actuator_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(net_actuator_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(net_actuator_test)
+
         # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
         add_executable(serial_port_test tests/communication/serial_port_test.cpp)
         target_link_libraries(serial_port_test PRIVATE

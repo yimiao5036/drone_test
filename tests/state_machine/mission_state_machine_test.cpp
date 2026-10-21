@@ -1342,8 +1342,9 @@ bool WaitForSelfCheck(const state_machine::MissionStateMachine& machine,
     return machine.CurrentState() == common::MissionState::kSelfCheck;
 }
 
-// 进入 S10 → 恰好一次触发命令；停留不重复；离开拦截序列 → 复位行程；
-// 再次进入 → 新一次触发（触发标志随离开清除，防重复仅限同一拦截段）。
+// 进入 S10 → 恰好一次触发命令；停留不重复；离开拦截序列 → 复位行程。
+// （单发执行器 RemainingShots 1→0，复位不恢复发数，故本任务不再断言重进触发；
+// ACK 驱动的保持/复位时序由 net_actuator_test 覆盖，Task 5 再做状态机集成。）
 TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
     common::Topic<common::GroundStationTarget> ground_target_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
@@ -1381,11 +1382,6 @@ TEST(MissionStateMachineTest, InterceptExecutingFiresNetActuator) {
     EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
     std::this_thread::sleep_for(300ms);
     EXPECT_EQ(sender.CallCount(), 2U);
-
-    // 再次进入 S10：新一次拦截触发（net_fired_ 已随离开清除）
-    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
-    ASSERT_TRUE(WaitForCallCount(sender, 3));
-    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetFireNormalized);
 
     machine.Stop();
 }
@@ -1455,53 +1451,6 @@ TEST(MissionStateMachineTest, NetActuatorResetRetriesWhenEnqueueFails) {
         EXPECT_EQ(history[index].queued, index == 3U)
             << "入队结果序列不符（前两次复位应失败、第三次成功）index=" << index;
     }
-
-    machine.Stop();
-}
-
-// 复位未入队前不发触发：离开拦截序列后复位尚在重试（未成功入队）期间重进
-// S10，触发命令必须等复位成功入队后才发——"先复位、后触发"的次序在异常重试
-// 下仍保持，机构不会带着上一次拦截的残留行程直接触发。
-TEST(MissionStateMachineTest, NetActuatorTriggerWaitsForResetEnqueued) {
-    common::Topic<common::GroundStationTarget> ground_target_topic;
-    common::Topic<common::FlightStateSnapshot> flight_topic;
-    common::Topic<common::HealthStatus> health_topic;
-    FakeCommandSender sender;
-    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
-    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
-    machine.SetCommandSender(&sender);
-    ASSERT_TRUE(machine.Start());
-    ASSERT_TRUE(WaitForSelfCheck(machine));
-
-    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
-    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "进入 S10 应发出触发命令";
-
-    sender.FailNextCalls(3);  // 复位连续三次入队失败
-    machine.ForceStateForTest(common::MissionState::kPostIntercept);
-    // 等复位首拍落地，确保决策线程已消费"离开拦截序列"（复位挂起中）
-    ASSERT_TRUE(WaitForCallCount(sender, 2)) << "离开拦截序列应发复位行程";
-
-    // 复位仍挂起（未成功入队）时重进 S10：不得抢发触发
-    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
-    ASSERT_TRUE(WaitForCallCount(sender, 6)) << "复位重试成功后应恢复触发";
-    std::this_thread::sleep_for(400ms);
-    ASSERT_EQ(sender.CallCount(), 6U);
-
-    const auto history = sender.History();
-    ASSERT_EQ(history.size(), 6U);
-    // 期望次序：1=触发成功；2~4=复位重试全失败；5=复位成功；6=新触发
-    EXPECT_FLOAT_EQ(history[0].params[2], kNetFireNormalized);
-    EXPECT_TRUE(history[0].queued);
-    for (std::size_t index = 1; index <= 3; ++index) {
-        EXPECT_FLOAT_EQ(history[index].params[2], kNetIdleNormalized)
-            << "复位未入队前不得发触发 index=" << index;
-        EXPECT_FALSE(history[index].queued);
-    }
-    EXPECT_FLOAT_EQ(history[4].params[2], kNetIdleNormalized);
-    EXPECT_TRUE(history[4].queued) << "第 5 条应为复位成功入队";
-    // 触发排在复位成功之后
-    EXPECT_FLOAT_EQ(history[5].params[2], kNetFireNormalized);
-    EXPECT_TRUE(history[5].queued);
 
     machine.Stop();
 }
