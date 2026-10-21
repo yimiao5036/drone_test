@@ -71,6 +71,13 @@ struct Options {
     bool sitl_stage4_tune = false;
     bool sitl_stage4_feedforward = false;  // P3 前馈专项（非门禁）
     bool sitl_stage4_return = false;       // S9~S14 拦截后返航专项（非门禁）
+    /// G4 串口台架（真实 PX4 + 机体，卸桨）：只做零速/Offboard/ARM/小量
+    /// 方向激励/停发失控保护，不执行起飞、降落航线或返航。
+    bool bench_stage4_controller = false;
+    /// 显式确认台架安全条件（拆桨、机体固定、遥控器可随时接管）。缺少该
+    /// 开关时拒绝启动，避免把台架脚本误用于带桨机体。
+    bool bench_ack_props_off = false;
+    bool duration_explicit = false;
     bool feedforward = false;              // 打开 controller 前馈开关（A/B 用）
     std::string tune_csv_path;                       // 空 = logs/stage4_tune_<时间戳>.csv
     std::string tune_script = "full";                // static|heading|distance|vertical|full
@@ -91,6 +98,7 @@ void PrintUsage(const char* program) {
               << "        | --sitl-stage4-mission | --sitl-stage4-tune\n"
               << "        | --sitl-stage4-feedforward [--feedforward]\n"
               << "        | --sitl-stage4-return]\n"
+              << "       | --bench-stage4-controller --bench-ack-props-off\n"
               << "SITL 参数仅允许 UDP；offboard-loss 起飞 1m 后主动停止 setpoint，\n"
               << "验证 PX4 退出 Offboard，再统一 AUTO.LAND 回收。\n"
               << "stage4-controller 装配真实 FlightController（意图脚本 → 限幅/门禁 → setpoint），\n"
@@ -106,12 +114,18 @@ void PrintUsage(const char* program) {
               << "stage4-return S9~S14 专项（非门禁）：S7 锁定/测距 → S9/S10 自动授权\n"
               << "  发射 → S12 算力板返航 Home → S13 AUTO.LAND → S14 DISARM；\n"
               << "  使用 config/px4_sitl_return.json（interception.enabled=true）。\n"
+              << "bench-stage4-controller G4 串口台架（仅 serial）：零速引导 → Offboard\n"
+              << "  → ARM → 零速保持 → 北/东/南/西小量速度脉冲 → 停发验证 PX4 退出\n"
+              << "  Offboard → DISARM；不发送起飞/降落/返航指令。必须同时给\n"
+              << "  --bench-ack-props-off 确认已拆桨、机体固定、遥控器可随时接管；\n"
+              << "  自动流程只判定序列/离地/时延，电机怠速响应与方向需人工观察。\n"
               << "--probe-message-interval <消息ID> 只读探针：GET_MESSAGE_INTERVAL 查询该消息流\n"
               << "  在 PX4 端是否实例化（PX4 回 MESSAGE_INTERVAL，#244；-1=未找到/未启用），\n"
               << "  随后 REQUEST_MESSAGE 触发一次并统计实收帧；49=GPS_GLOBAL_ORIGIN 锚点流\n"
               << "  （注意 #49 不是 411：411 是 CURRENT_EVENT_SEQUENCE，请求它会 FAILED/DENIED）。\n"
               << "  只发 HEARTBEAT 与两条只读查询，不发送任何飞行控制指令。\n"
-              << "--selftest 离线自检工具纯逻辑（G3 意图分类 + 消息流探针判读），不需要 SITL/配置。\n";
+              << "--selftest 离线自检工具纯逻辑（G3 意图分类 + 消息流探针判读 + "
+                 "G4 台架脚本/诊断阈值），不需要 SITL/配置。\n";
 }
 
 Options ParseOptions(int argc, char** argv) {
@@ -173,6 +187,14 @@ Options ParseOptions(int argc, char** argv) {
         if (argument == "--sitl-stage4-return") {
             options.sitl_stage4_return = true;
             options.tune_script = "intercept_return";
+            continue;
+        }
+        if (argument == "--bench-stage4-controller") {
+            options.bench_stage4_controller = true;
+            continue;
+        }
+        if (argument == "--bench-ack-props-off") {
+            options.bench_ack_props_off = true;
             continue;
         }
         if (argument == "--feedforward") {
@@ -240,6 +262,7 @@ Options ParseOptions(int argc, char** argv) {
                 throw std::invalid_argument("--duration 必须在 1~3600 秒之间");
             }
             options.duration = std::chrono::seconds(seconds);
+            options.duration_explicit = true;
             continue;
         }
         throw std::invalid_argument("未知参数: " + argument);
@@ -254,9 +277,29 @@ Options ParseOptions(int argc, char** argv) {
                                  static_cast<int>(options.sitl_stage4_mission) +
                                  static_cast<int>(options.sitl_stage4_tune) +
                                  static_cast<int>(options.sitl_stage4_feedforward) +
-                                 static_cast<int>(options.sitl_stage4_return);
+                                 static_cast<int>(options.sitl_stage4_return) +
+                                 static_cast<int>(options.bench_stage4_controller);
     if (sitl_stage_count > 1) {
-        throw std::invalid_argument("多个 SITL 阶段参数不能同时使用");
+        throw std::invalid_argument("多个 SITL/台架阶段参数不能同时使用");
+    }
+    if (options.bench_ack_props_off && !options.bench_stage4_controller) {
+        throw std::invalid_argument(
+            "--bench-ack-props-off 仅用于 --bench-stage4-controller");
+    }
+    if (options.bench_stage4_controller) {
+        if (!options.bench_ack_props_off) {
+            throw std::invalid_argument(
+                "G4 台架模式必须同时提供 --bench-ack-props-off：确认螺旋桨已拆除、"
+                "机体已固定、遥控器可随时接管");
+        }
+        // 台架序列包含预检、引导、Offboard/ARM、零速保持、四向脉冲与停发验证；
+        // 未显式给 --duration 时使用 60 秒，避免默认 30 秒在中途截断。
+        if (!options.duration_explicit) {
+            options.duration = std::chrono::seconds(60);
+        }
+        if (options.duration < std::chrono::seconds(45)) {
+            throw std::invalid_argument("G4 台架测试时长不能少于 45 秒（建议 60 秒）");
+        }
     }
     if (options.sitl_arm_zero_velocity && options.duration < std::chrono::seconds(10)) {
         throw std::invalid_argument("解锁零速度测试时长不能少于 10 秒");
@@ -1531,6 +1574,906 @@ private:
     bool safety_violation_ = false;
     float max_north_m_ = 0.f;
 };
+
+// ---------------------------------------------------------------------------
+// G4 串口台架（2026-10-20）：真实 PX4 + 机体、卸桨、机体固定。
+//
+// 与 stage4（SITL G2）的边界：
+//   - 只允许 serial；UDP SITL 继续使用 --sitl-stage4-*，两条路径互斥；
+//   - 预检必须已落地、未解锁；离地硬判据 = landed=false 持续 1s 且本地
+//     上升 >0.25m（拆桨失效/误操作）；一旦成立立即停发并 AUTO.LAND。
+//     仅 landed=false 不直接判离地——台上电机起转可能让 PX4 暂时报未落地；
+//   - 本地上升/水平位移只作诊断：GNSS/EKF 静止游走可能达到米级，不能拿它
+//     当硬包线，否则会把正常台架误判成离地；
+//   - 不执行起飞、AUTO.LAND 航线或返航；零速保持后只做北/东/南/西四个
+//     0.20m/s 短脉冲，用于人工观察电机响应方向；
+//   - 停发 setpoint 后验证控制器 COAST→IDLE、PX4 退出 Offboard，并在落地
+//     状态主动 DISARM。
+//
+// 自动报告只判定序列、包线、ACK 与时延；G4-1 的电机怠速响应、G4-2 的
+// 电机/机体方向必须由现场人员在报告后勾选。G4-3 捕网执行器行程不在本模式
+// 内自动触发（通道/接线/PWM 行程未冻结，禁止猜参数）。
+// ---------------------------------------------------------------------------
+constexpr float kBenchPulseSpeedMps = 0.20f;
+// 仅用于日志诊断，不参与通过/失败判定（GNSS/EKF 游走可达米级）。
+constexpr float kBenchDiagnosticAscentM = 0.50f;
+constexpr float kBenchDiagnosticHorizontalM = 1.00f;
+constexpr float kBenchTakeoffAscentM = 0.25f;
+constexpr uint64_t kBenchTakeoffConfirmMs = 1000;
+constexpr float kBenchZeroDriftLimitM = 0.15f;
+constexpr uint64_t kBenchPulseDriveMs = 800;
+constexpr uint64_t kBenchPulseSettleMs = 800;
+constexpr uint64_t kBenchGuideMinSends = 20;
+constexpr uint64_t kBenchGuideMinMs = 2000;
+constexpr uint64_t kBenchGuidePeriodMs = 100;
+constexpr uint64_t kBenchIntentValidMs = 500;
+constexpr uint64_t kBenchIntentPeriodMs = 100;
+constexpr uint64_t kBenchZeroHoldMs = 2000;
+constexpr uint64_t kBenchConnectTimeoutMs = 15000;
+constexpr uint64_t kBenchBootstrapTimeoutMs = 25000;
+constexpr uint64_t kBenchStopTimeoutMs = 15000;
+constexpr uint64_t kBenchOffboardExitLimitMs = 2200;
+constexpr uint64_t kBenchDisarmTimeoutMs = 5000;
+constexpr uint64_t kBenchLandTimeoutMs = 30000;
+constexpr uint64_t kBenchExtraSendsAllowed = 2;
+constexpr uint64_t kBenchHandoverGraceMs = 500;
+
+struct BenchPulse {
+    const char* label;
+    float north_mps;
+    float east_mps;
+};
+
+/// G4-2 四向小量激励：每轴只在一个方向给 0.20m/s，其余轴为零；
+/// 期间高度目标保持当前值（不主动爬升）。
+constexpr BenchPulse kBenchPulses[] = {
+    {"北向 +", kBenchPulseSpeedMps, 0.0f},
+    {"东向 +", 0.0f, kBenchPulseSpeedMps},
+    {"南向 -", -kBenchPulseSpeedMps, 0.0f},
+    {"西向 -", 0.0f, -kBenchPulseSpeedMps},
+};
+constexpr std::size_t kBenchPulseCount = sizeof(kBenchPulses) / sizeof(kBenchPulses[0]);
+
+bool BenchDiagnosticExceeded(float ascent_m, float horizontal_m) {
+    return ascent_m > kBenchDiagnosticAscentM ||
+           horizontal_m > kBenchDiagnosticHorizontalM;
+}
+
+/// G4 台架运行体：控制器始终是唯一 setpoint 生产者，工具只在接管前注入
+/// 零速引导流，接管后只发布脚本化速度意图。
+class BenchStage4Run {
+public:
+    BenchStage4Run(drone::communication::Px4Link& link,
+                   drone::control::FlightController& controller,
+                   drone::common::Topic<drone::common::ControlIntent>& intent_topic,
+                   std::chrono::seconds duration,
+                   drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription
+                       subscription)
+        : link_(link),
+          controller_(controller),
+          intent_topic_(intent_topic),
+          duration_ms_(static_cast<uint64_t>(duration.count()) * 1000),
+          subscription_(std::move(subscription)) {
+        setpoint_subscription_ = controller_.SetpointOutput().Subscribe(128);
+    }
+
+    void Execute() {
+        const uint64_t started_ms = MonotonicMs();
+        uint64_t next_summary_ms = started_ms;
+        while (!g_stop.load(std::memory_order_acquire) &&
+               MonotonicMs() - started_ms < duration_ms_) {
+            if (auto message = subscription_.WaitTakeFor(std::chrono::milliseconds(100))) {
+                latest_ = **message;
+                have_snapshot_ = true;
+                UpdateObserved(latest_, &observed_);
+                PrintStateChange();
+                if (!preflight_passed_) {
+                    CheckPreflight(MonotonicMs(), MonotonicMs() - started_ms);
+                }
+            }
+            DrainSetpoints();
+            const uint64_t now_ms = MonotonicMs();
+            PublishIntent(now_ms);
+            Advance(now_ms, now_ms - started_ms);
+            if (have_snapshot_) {
+                CheckEnvelope();
+            }
+            if (now_ms >= next_summary_ms) {
+                PrintSummary(latest_, std::chrono::duration_cast<std::chrono::seconds>(
+                                           std::chrono::milliseconds(now_ms - started_ms)));
+                next_summary_ms = now_ms + 1000;
+            }
+            if (aborted_ || safety_violation_ || phase_ == BenchPhase::kDone) {
+                break;
+            }
+        }
+        Finish();
+    }
+
+    bool Evaluate(bool connected_at_end) const {
+        const bool guide_ok = guide_injected_ >= kBenchGuideMinSends &&
+                              guide_elapsed_ms_ >= kBenchGuideMinMs;
+        const bool offboard_ok = offboard_command_queued_ && offboard_ack_received_ &&
+                                 offboard_ack_accepted_ && offboard_mode_reached_;
+        const bool arm_ok = arm_command_queued_ && arm_ack_received_ &&
+                            arm_ack_accepted_ && armed_reached_;
+        const bool handover_ok = handover_done_ && takeover_stream_ok_;
+        const bool zero_ok = zero_hold_complete_ && zero_hold_drift_ok_;
+        const bool pulses_ok = pulses_complete_ && pulse_rejected_delta_ == 0 &&
+                               pulse_setpoint_ok_;
+        const bool stop_exit_ok = coast_seen_ && idle_seen_ && offboard_exit_seen_ &&
+                                  offboard_exit_ms_ - idle_ms_ <= kBenchOffboardExitLimitMs;
+        const uint64_t sends_after_idle =
+            idle_seen_ && link_.SetpointSendCount() >= sends_at_idle_
+                ? link_.SetpointSendCount() - sends_at_idle_
+                : 0;
+        const bool stop_ok = stop_exit_ok && sends_after_idle <= kBenchExtraSendsAllowed &&
+                             landed_at_stop_;
+        const bool disarm_ok = disarm_command_queued_ || auto_disarmed_after_stop_;
+        const bool disarm_confirmed = disarmed_confirmed_ || !latest_.armed;
+        const bool envelope_ok = !safety_violation_ && !takeoff_detected_;
+        const bool preflight_ok = preflight_passed_ && preflight_landed_ &&
+                                  preflight_disarmed_;
+        const bool passed = observed_.heartbeat && connected_at_end &&
+                            link_.ErrorCount() == 0 && preflight_ok && guide_ok &&
+                            offboard_ok && arm_ok && handover_ok && zero_ok &&
+                            pulses_ok && stop_ok && disarm_ok && disarm_confirmed &&
+                            envelope_ok && !aborted_ && !unexpected_disarm_ &&
+                            controller_.ErrorCount() == 0;
+
+        std::cout << "\n========== G4 串口台架自动报告"
+                     "（G4-1/2/4 自动部分；仅 serial）=========="
+                  << std::endl;
+        PrintCheck("PX4 HEARTBEAT", observed_.heartbeat, true);
+        PrintCheck("测试结束时心跳仍连接", connected_at_end, true);
+        PrintCheck("预检：已落地、未解锁", preflight_ok, true);
+        PrintCheck("引导零速度流已注入(≥20 条且≥2s)", guide_ok, true);
+        PrintCheck("Offboard 请求/ACK accepted/模式 6/0", offboard_ok, true);
+        PrintCheck("ARM 请求/ACK accepted/PX4 armed", arm_ok, true);
+        PrintCheck("控制器已接管设定值流", handover_ok, true);
+        PrintCheck("零速保持 2s 且漂移 ≤0.15m", zero_ok, true);
+        PrintCheck("四向速度脉冲设定值方向正确", pulses_ok, true);
+        PrintCheck("停发后 COAST/IDLE 已触发", coast_seen_ && idle_seen_, true);
+        PrintCheck("PX4 已在 2.2s 内退出 Offboard", stop_exit_ok, true);
+        PrintCheck("停发后设定值发送已停止(≤2 条)", sends_after_idle <= kBenchExtraSendsAllowed, true);
+        PrintCheck("停发时仍处于落地状态", landed_at_stop_, true);
+        PrintCheck("DISARM 已确认（主动或 PX4 自动）", disarm_ok && disarm_confirmed, true);
+        PrintCheck("未发生未请求的上锁/解锁", !unexpected_disarm_, true);
+        PrintCheck("未检测到 armed 后离地", envelope_ok, true);
+        PrintCheck("控制器无异常计数", armed_reached_ && controller_.ErrorCount() == 0, true);
+        PrintMessageCheck("LOCAL_POSITION_NED",
+                          link_.MessageReceiveCount(MAVLINK_MSG_ID_LOCAL_POSITION_NED),
+                          observed_.local_position);
+        PrintMessageCheck("ATTITUDE", link_.MessageReceiveCount(MAVLINK_MSG_ID_ATTITUDE),
+                          observed_.attitude);
+        PrintMessageCheck("EXTENDED_SYS_STATE",
+                          link_.MessageReceiveCount(MAVLINK_MSG_ID_EXTENDED_SYS_STATE),
+                          observed_.landed);
+        std::cout << "实测值: 最大上升 " << max_ascent_m_ << " m、最大水平位移 "
+                  << max_horizontal_m_ << " m（本地位置诊断，EKF/GNSS 游走不计失败；"
+                     "硬判据为 landed 状态），零速漂移 "
+                  << zero_hold_max_drift_m_ << " m，脉冲速度 "
+                  << kBenchPulseSpeedMps << " m/s，停发后额外发送 " << sends_after_idle
+                  << " 条" << std::endl;
+        if (!abort_reason_.empty()) {
+            std::cout << "[信息] 台架中断原因: " << abort_reason_ << std::endl;
+        }
+        std::cout << "\n[MANUAL] G4-1 电机怠速级响应：ARM 后电机应仅低速响应，"
+                     "不得出现高速/持续加速" << std::endl;
+        std::cout << "[MANUAL] G4-2 电机/机体方向：北/东/南/西脉冲时应分别向对应"
+                     "方向响应，方向不得反转" << std::endl;
+        std::cout << "[MANUAL] G4-3 捕网执行器：本模式不自动触发；通道/接线/"
+                     "PWM 行程确认后单独验证" << std::endl;
+        std::cout << (passed ? "结果: G4 串口台架自动部分通过；请人工勾选上述三项"
+                             : "结果: G4 串口台架自动部分未通过")
+                  << std::endl;
+        return passed;
+    }
+
+private:
+    enum class BenchPhase : uint8_t {
+        kPreflight,   ///< 等落地/未解锁/位置姿态有效
+        kGuide,       ///< 注入零速引导流 → Offboard → ARM → 控制器接管
+        kZeroHold,    ///< 零速意图保持
+        kPulseDrive,  ///< 四向速度脉冲
+        kPulseSettle, ///< 每段脉冲后的零速回落
+        kStopStream,  ///< 停发意图，验证 Offboard 退出
+        kDisarm,      ///< 主动 DISARM
+        kDone,
+    };
+
+    enum class BenchIntentMode : uint8_t {
+        kNone,
+        kZeroVelocity,
+        kPulse,
+    };
+
+    void CheckPreflight(uint64_t now_ms, uint64_t elapsed_ms) {
+        if (!link_.IsConnected()) {
+            if (elapsed_ms >= kBenchConnectTimeoutMs) {
+                Abort("预检超时：未收到 PX4 心跳（检查串口/波特率/接线）");
+            }
+            return;
+        }
+        if (!have_snapshot_) {
+            return;
+        }
+        if (latest_.armed) {
+            Abort("预检失败：PX4 已 armed，请先手动上锁并确认拆桨后再启动");
+            return;
+        }
+        if (!latest_.landed_state_valid || !latest_.landed) {
+            if (elapsed_ms >= kBenchConnectTimeoutMs) {
+                Abort("预检超时：PX4 未处于 landed 状态（台架只允许落地状态启动）");
+            }
+            return;
+        }
+        preflight_disarmed_ = true;
+        preflight_landed_ = true;
+        if (!latest_.local_position_valid || !latest_.attitude_valid) {
+            if (elapsed_ms >= kBenchConnectTimeoutMs) {
+                Abort("预检超时：局部位置或姿态无效（需要 EKF 位置估计）");
+            }
+            return;
+        }
+        if (!latest_.home_valid) {
+            std::cout << "[G4][WARN] Home 尚未有效；ARM 可能被 PX4 拒绝（不伪造 Home）"
+                      << std::endl;
+        }
+        if (!latest_.rc_connected) {
+            std::cout << "[G4][WARN] 未检测到遥控器链路；现场必须保留人工接管手段"
+                      << std::endl;
+        }
+        preflight_passed_ = true;
+        ground_x_m_ = latest_.local_x_m;
+        ground_y_m_ = latest_.local_y_m;
+        ground_z_m_ = latest_.local_z_m;
+        phase_ = BenchPhase::kGuide;
+        guide_start_ms_ = now_ms;
+        next_guide_ms_ = now_ms;
+        std::cout << "[G4] 预检通过：landed=是 armed=否 local=是 attitude=是；"
+                     "开始零速引导（拆桨/固定/遥控器接管由 --bench-ack-props-off 确认）"
+                  << std::endl;
+    }
+
+    void DrainSetpoints() {
+        while (auto setpoint = setpoint_subscription_.TryTake()) {
+            if (!(*setpoint)->valid || phase_ != BenchPhase::kPulseDrive) {
+                continue;
+            }
+            // 记录带符号的最大幅值：方向判定依赖符号，不能先取绝对值。
+            if (std::fabs((*setpoint)->x) > std::fabs(pulse_max_north_mps_)) {
+                pulse_max_north_mps_ = (*setpoint)->x;
+            }
+            if (std::fabs((*setpoint)->y) > std::fabs(pulse_max_east_mps_)) {
+                pulse_max_east_mps_ = (*setpoint)->y;
+            }
+        }
+    }
+
+    void PublishIntent(uint64_t now_ms) {
+        if (intent_mode_ == BenchIntentMode::kNone || now_ms < next_intent_ms_) {
+            return;
+        }
+        drone::common::ControlIntent intent;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = kBenchIntentValidMs;
+        intent.header.frame_id = 3;
+        intent.reason_code = drone::common::kControlIntentReasonRequestControl;
+        intent.valid_until_ms = now_ms + kBenchIntentValidMs;
+        intent.type = drone::common::ControlIntentType::kVelocityHeading;
+        intent.control_source = 1;
+        intent.target_x = command_north_mps_;
+        intent.target_y = command_east_mps_;
+        intent.target_z = 0.0f;
+        (void)intent_topic_.Emplace(intent);
+        next_intent_ms_ = now_ms + kBenchIntentPeriodMs;
+    }
+
+    void InjectGuideSetpoint() {
+        drone::common::Px4Setpoint setpoint;
+        setpoint.header.receive_time_ms = MonotonicMs();
+        setpoint.header.valid_for_ms = 300;
+        setpoint.header.frame_id = 3;
+        setpoint.type = drone::common::SetpointType::kVelocity;
+        setpoint.valid = true;
+        (void)controller_.SetpointOutput().Emplace(setpoint);
+        ++guide_injected_;
+    }
+
+    bool SendOffboardRequest() {
+        constexpr uint8_t kPx4MainModeOffboard = 6;
+        const bool queued = link_.SendCommand(
+            MAV_CMD_DO_SET_MODE, static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            static_cast<float>(kPx4MainModeOffboard), 0.f, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            offboard_request_ms_ = MonotonicMs();
+        }
+        return queued;
+    }
+
+    bool SendArm(bool arm) {
+        const bool queued = link_.SendCommand(MAV_CMD_COMPONENT_ARM_DISARM, arm ? 1.f : 0.f,
+                                              0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            if (arm) {
+                arm_request_ms_ = MonotonicMs();
+            } else {
+                disarm_command_queued_ = true;
+                disarm_request_ms_ = MonotonicMs();
+            }
+        }
+        return queued;
+    }
+
+    bool SendAutoLand() {
+        constexpr uint8_t kPx4MainModeAuto = 4;
+        constexpr uint8_t kPx4SubModeAutoLand = 6;
+        const bool queued = link_.SendCommand(
+            MAV_CMD_DO_SET_MODE, static_cast<float>(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            static_cast<float>(kPx4MainModeAuto), static_cast<float>(kPx4SubModeAutoLand),
+            0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            land_command_queued_ = true;
+            land_request_ms_ = MonotonicMs();
+        }
+        return queued;
+    }
+
+    void Abort(const std::string& reason) {
+        if (aborted_) {
+            return;
+        }
+        aborted_ = true;
+        abort_reason_ = reason;
+        intent_mode_ = BenchIntentMode::kNone;
+        std::cout << "[G4][中断] " << reason << std::endl;
+    }
+
+    void Advance(uint64_t now_ms, uint64_t elapsed_ms) {
+        CheckUnexpectedDisarm();
+        if (aborted_ || safety_violation_) {
+            return;
+        }
+        switch (phase_) {
+            case BenchPhase::kPreflight:
+                return;
+            case BenchPhase::kGuide:
+                AdvanceGuide(now_ms, elapsed_ms);
+                return;
+            case BenchPhase::kZeroHold:
+                AdvanceZeroHold(now_ms);
+                return;
+            case BenchPhase::kPulseDrive:
+                AdvancePulseDrive(now_ms);
+                return;
+            case BenchPhase::kPulseSettle:
+                AdvancePulseSettle(now_ms);
+                return;
+            case BenchPhase::kStopStream:
+                AdvanceStopStream(now_ms);
+                return;
+            case BenchPhase::kDisarm:
+                AdvanceDisarm(now_ms);
+                return;
+            case BenchPhase::kDone:
+                return;
+        }
+    }
+
+    void CheckUnexpectedDisarm() {
+        if (!armed_reached_ || latest_.armed || disarm_command_queued_ || aborted_ ||
+            phase_ == BenchPhase::kStopStream || phase_ == BenchPhase::kDisarm ||
+            phase_ == BenchPhase::kDone) {
+            return;
+        }
+        // 停发阶段允许 PX4 failsafe 自动上锁；停发前未请求的上锁记失败。
+        unexpected_disarm_ = true;
+        Abort("ARM 后发生未请求的上锁（检查 PX4 failsafe/供电/COM_DISARM_PRFLT）");
+    }
+
+    void AdvanceGuide(uint64_t now_ms, uint64_t elapsed_ms) {
+        if (!guide_started_) {
+            guide_started_ = true;
+            std::cout << "[G4] 零速引导开始（PX4 进 Offboard 前需已有 setpoint 流；"
+                         "控制器 IDLE 不发布，故由工具注入）" << std::endl;
+        }
+        if (!handover_done_ && now_ms >= next_guide_ms_) {
+            InjectGuideSetpoint();
+            next_guide_ms_ = now_ms + kBenchGuidePeriodMs;
+        }
+        guide_elapsed_ms_ = now_ms - guide_start_ms_;
+        if (!offboard_command_queued_ && guide_injected_ >= kBenchGuideMinSends &&
+            guide_elapsed_ms_ >= kBenchGuideMinMs) {
+            offboard_command_queued_ = SendOffboardRequest();
+            std::cout << "[G4] Offboard 模式请求"
+                      << (offboard_command_queued_ ? "已入队" : "入队失败") << std::endl;
+        }
+        if (!have_snapshot_) {
+            return;
+        }
+        if (offboard_command_queued_ && !offboard_ack_received_ &&
+            latest_.last_ack_time_ms >= offboard_request_ms_ &&
+            latest_.last_ack_command == MAV_CMD_DO_SET_MODE) {
+            offboard_ack_received_ = true;
+            offboard_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+        }
+        if (offboard_command_queued_) {
+            offboard_mode_reached_ =
+                offboard_mode_reached_ ||
+                (latest_.flight_mode == 6 && latest_.flight_sub_mode == 0);
+        }
+        if (!arm_command_queued_ && offboard_ack_accepted_ && offboard_mode_reached_ &&
+            latest_.landed_state_valid && latest_.landed && !latest_.armed &&
+            latest_.local_position_valid && latest_.attitude_valid) {
+            arm_command_queued_ = SendArm(true);
+            std::cout << "[G4] ARM 请求" << (arm_command_queued_ ? "已入队" : "入队失败")
+                      << std::endl;
+        }
+        if (arm_command_queued_ && !arm_ack_received_ &&
+            latest_.last_ack_time_ms >= arm_request_ms_ &&
+            latest_.last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+            arm_ack_received_ = true;
+            arm_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+        }
+        if (latest_.armed) {
+            if (!arm_command_queued_) {
+                Abort("检测到未请求的 ARM（台架只允许脚本在 Offboard 后主动 ARM）");
+                return;
+            }
+            armed_reached_ = true;
+        }
+        if (armed_reached_ && !handover_done_ &&
+            controller_.Authority() == drone::control::ControlAuthority::kActive) {
+            handover_done_ = true;
+            handover_ms_ = now_ms;
+            send_count_at_handover_ = link_.SetpointSendCount();
+            std::cout << "[G4] 控制器已接管设定值流（armed+Offboard+请求位），"
+                         "停止工具引导流" << std::endl;
+        }
+        if (handover_done_) {
+            if (!takeover_stream_ok_ && link_.SetpointSendCount() > send_count_at_handover_) {
+                takeover_stream_ok_ = true;
+            }
+            if (takeover_stream_ok_ && now_ms - handover_ms_ >= kBenchHandoverGraceMs) {
+                guide_started_ = true;
+                phase_ = BenchPhase::kZeroHold;
+                intent_mode_ = BenchIntentMode::kZeroVelocity;
+                command_north_mps_ = 0.f;
+                command_east_mps_ = 0.f;
+                std::cout << "[G4] 接管稳定 500ms，进入零速保持 2s" << std::endl;
+                return;
+            }
+        }
+        if (elapsed_ms >= kBenchBootstrapTimeoutMs) {
+            Abort("引导/Offboard/ARM/接管超时（检查 ACK、PX4 preflight 与授权链）");
+        }
+    }
+
+    void AdvanceZeroHold(uint64_t now_ms) {
+        if (!latest_.local_position_valid) {
+            return;
+        }
+        if (zero_hold_start_ms_ == 0) {
+            zero_hold_start_ms_ = now_ms;
+            zero_x0_m_ = latest_.local_x_m;
+            zero_y0_m_ = latest_.local_y_m;
+            zero_hold_max_drift_m_ = 0.f;
+            std::cout << "[G4] 零速保持开始（2s）" << std::endl;
+            return;
+        }
+        const float dx = latest_.local_x_m - zero_x0_m_;
+        const float dy = latest_.local_y_m - zero_y0_m_;
+        zero_hold_max_drift_m_ =
+            std::max(zero_hold_max_drift_m_, std::sqrt(dx * dx + dy * dy));
+        if (now_ms - zero_hold_start_ms_ >= kBenchZeroHoldMs) {
+            zero_hold_complete_ = true;
+            zero_hold_drift_ok_ = zero_hold_max_drift_m_ <= kBenchZeroDriftLimitM;
+            std::cout << "[G4] 零速保持完成：最大漂移 " << zero_hold_max_drift_m_
+                      << " m，开始四向小量激励" << std::endl;
+            StartPulse(0, now_ms);
+        }
+    }
+
+    void StartPulse(std::size_t index, uint64_t now_ms) {
+        pulse_index_ = index;
+        pulse_start_ms_ = now_ms;
+        pulse_max_north_mps_ = 0.f;
+        pulse_max_east_mps_ = 0.f;
+        pulse_rejected_at_start_ = controller_.RejectedIntentCount();
+        phase_ = BenchPhase::kPulseDrive;
+        intent_mode_ = BenchIntentMode::kPulse;
+        command_north_mps_ = kBenchPulses[index].north_mps;
+        command_east_mps_ = kBenchPulses[index].east_mps;
+        std::cout << "[G4][方向] " << kBenchPulses[index].label << " "
+                  << kBenchPulseSpeedMps << " m/s（观察电机/机体响应方向）"
+                  << std::endl;
+    }
+
+    void AdvancePulseDrive(uint64_t now_ms) {
+        if (now_ms - pulse_start_ms_ < kBenchPulseDriveMs) {
+            return;
+        }
+        command_north_mps_ = 0.f;
+        command_east_mps_ = 0.f;
+        phase_ = BenchPhase::kPulseSettle;
+        pulse_settle_start_ms_ = now_ms;
+    }
+
+    void AdvancePulseSettle(uint64_t now_ms) {
+        if (now_ms - pulse_settle_start_ms_ < kBenchPulseSettleMs) {
+            return;
+        }
+        const BenchPulse& pulse = kBenchPulses[pulse_index_];
+        bool direction_ok = false;
+        if (pulse.north_mps > 0.f) {
+            direction_ok = pulse_max_north_mps_ >= 0.10f &&
+                           std::fabs(pulse_max_east_mps_) <= 0.05f;
+        } else if (pulse.north_mps < 0.f) {
+            direction_ok = pulse_max_north_mps_ <= -0.10f &&
+                           std::fabs(pulse_max_east_mps_) <= 0.05f;
+        } else if (pulse.east_mps > 0.f) {
+            direction_ok = pulse_max_east_mps_ >= 0.10f &&
+                           std::fabs(pulse_max_north_mps_) <= 0.05f;
+        } else {
+            direction_ok = pulse_max_east_mps_ <= -0.10f &&
+                           std::fabs(pulse_max_north_mps_) <= 0.05f;
+        }
+        if (!direction_ok) {
+            pulse_setpoint_ok_ = false;
+        }
+        const uint64_t rejected_now = controller_.RejectedIntentCount();
+        if (rejected_now > pulse_rejected_at_start_) {
+            pulse_rejected_delta_ += rejected_now - pulse_rejected_at_start_;
+        }
+        std::cout << "[G4][方向] " << pulse.label << " 完成：设定值北="
+                  << pulse_max_north_mps_ << " 东=" << pulse_max_east_mps_
+                  << " 方向判定=" << YesNo(direction_ok) << std::endl;
+        if (pulse_index_ + 1 < kBenchPulseCount) {
+            StartPulse(pulse_index_ + 1, now_ms);
+            return;
+        }
+        pulses_complete_ = true;
+        intent_mode_ = BenchIntentMode::kNone;
+        command_north_mps_ = 0.f;
+        command_east_mps_ = 0.f;
+        phase_ = BenchPhase::kStopStream;
+        stop_start_ms_ = now_ms;
+        std::cout << "[G4] 四向脉冲完成，停止发意图（验证 COAST→IDLE→PX4 退出 Offboard）"
+                  << std::endl;
+    }
+
+    void AdvanceStopStream(uint64_t now_ms) {
+        if (!coast_seen_ &&
+            controller_.Authority() == drone::control::ControlAuthority::kCoast) {
+            coast_seen_ = true;
+            coast_ms_ = now_ms;
+            std::cout << "[G4] 控制器进入 COAST（意图超龄）" << std::endl;
+        }
+        if (!idle_seen_ &&
+            controller_.Authority() == drone::control::ControlAuthority::kIdle) {
+            idle_seen_ = true;
+            idle_ms_ = now_ms;
+            sends_at_idle_ = link_.SetpointSendCount();
+            std::cout << "[G4] 控制器转 IDLE 停发" << std::endl;
+        }
+        if (!offboard_exit_seen_ && have_snapshot_ && latest_.flight_mode != 6) {
+            offboard_exit_seen_ = true;
+            offboard_exit_ms_ = now_ms;
+            offboard_exit_mode_ = latest_.flight_mode;
+            offboard_exit_sub_mode_ = latest_.flight_sub_mode;
+            landed_at_stop_ = latest_.landed_state_valid && latest_.landed;
+            std::cout << "[G4] PX4 已退出 Offboard: mode="
+                      << static_cast<int>(offboard_exit_mode_) << '/'
+                      << static_cast<int>(offboard_exit_sub_mode_) << "，landed="
+                      << YesNo(landed_at_stop_) << "（IDLE 后 "
+                      << (idle_seen_ ? offboard_exit_ms_ - idle_ms_ : 0) << " ms）"
+                      << std::endl;
+        }
+        if (offboard_exit_seen_) {
+            if (latest_.armed) {
+                if (!landed_at_stop_) {
+                    safety_violation_ = true;
+                    Abort("停发后 PX4 已离地，拒绝 DISARM；发送 AUTO.LAND");
+                    if (!land_command_queued_) {
+                        SendAutoLand();
+                    }
+                    return;
+                }
+                phase_ = BenchPhase::kDisarm;
+                disarm_command_queued_ = SendArm(false);
+                std::cout << "[G4] DISARM 请求"
+                          << (disarm_command_queued_ ? "已入队" : "入队失败") << std::endl;
+            } else {
+                auto_disarmed_after_stop_ = true;
+                disarmed_confirmed_ = true;
+                phase_ = BenchPhase::kDone;
+                std::cout << "[G4] PX4 在停发后自动上锁" << std::endl;
+            }
+            return;
+        }
+        if (now_ms - stop_start_ms_ >= kBenchStopTimeoutMs) {
+            Abort("停发意图后 PX4 未在限时内退出 Offboard");
+        }
+    }
+
+    void AdvanceDisarm(uint64_t now_ms) {
+        if (!have_snapshot_) {
+            return;
+        }
+        if (disarm_command_queued_ && !disarm_ack_received_ &&
+            latest_.last_ack_time_ms >= disarm_request_ms_ &&
+            latest_.last_ack_command == MAV_CMD_COMPONENT_ARM_DISARM) {
+            disarm_ack_received_ = true;
+            disarm_ack_accepted_ = latest_.last_ack_result == MAV_RESULT_ACCEPTED;
+        }
+        if (!latest_.armed) {
+            disarmed_confirmed_ = true;
+            phase_ = BenchPhase::kDone;
+            std::cout << "[G4] 已确认 disarmed" << std::endl;
+            return;
+        }
+        if (now_ms - disarm_request_ms_ >= kBenchDisarmTimeoutMs) {
+            Abort("DISARM 后未确认 disarmed（请现场手动上锁/断电）");
+        }
+    }
+
+    void CheckEnvelope() {
+        if (!preflight_passed_ || !latest_.local_position_valid) {
+            return;
+        }
+        const float ascent_m = ground_z_m_ - latest_.local_z_m;
+        const float dx = latest_.local_x_m - ground_x_m_;
+        const float dy = latest_.local_y_m - ground_y_m_;
+        const float horizontal_m = std::hypot(dx, dy);
+        max_ascent_m_ = std::max(max_ascent_m_, ascent_m);
+        max_horizontal_m_ = std::max(max_horizontal_m_, horizontal_m);
+        // armed 期间只允许在停发验证阶段退出 Offboard；其它阶段退出说明
+        // PX4 已触发保护/人工接管，立即停止意图，不能继续当台架试验。
+        if (latest_.armed && phase_ != BenchPhase::kStopStream &&
+            phase_ != BenchPhase::kDisarm && phase_ != BenchPhase::kDone &&
+            latest_.flight_mode != 6) {
+            safety_violation_ = true;
+            Abort("armed 期间非预期退出 Offboard（检查 PX4 failsafe/人工接管）");
+            return;
+        }
+        // 硬安全判据：armed 后 PX4 报告离地。不能拿本地位置当硬包线——
+        // GNSS/EKF 静止游走可能达到米级，会把正常台架误判为离地。
+        if (latest_.armed && latest_.landed_state_valid && !latest_.landed) {
+            if (airborne_since_ms_ == 0) {
+                airborne_since_ms_ = MonotonicMs();
+            }
+            if (MonotonicMs() - airborne_since_ms_ >= kBenchTakeoffConfirmMs &&
+                ascent_m > kBenchTakeoffAscentM) {
+                takeoff_detected_ = true;
+                safety_violation_ = true;
+                intent_mode_ = BenchIntentMode::kNone;
+                std::cout << "[G4][安全] armed 后 landed=false 持续且上升 "
+                          << ascent_m << " m，判定离地；停止意图" << std::endl;
+                if (!land_command_queued_) {
+                    (void)SendAutoLand();
+                }
+                return;
+            }
+        } else {
+            airborne_since_ms_ = 0;
+        }
+        if (!diagnostic_warned_ && BenchDiagnosticExceeded(ascent_m, horizontal_m)) {
+            diagnostic_warned_ = true;
+            std::cout << "[G4][诊断] 本地位置变化: 上升 " << ascent_m
+                      << " m，水平 " << horizontal_m
+                      << " m（EKF/GNSS 游走可能；landed 仍为是，不计失败）"
+                      << std::endl;
+        }
+    }
+
+    void Finish() {
+        intent_mode_ = BenchIntentMode::kNone;
+        if (!latest_.armed && !armed_reached_) {
+            return;
+        }
+        if (!latest_.armed) {
+            disarmed_confirmed_ = true;
+            return;
+        }
+        // 未请求的 ARM 也走同一安全收尾；armed_reached_ 仅用于报告归因。
+        armed_reached_ = true;
+        // 收尾只允许在落地状态主动上锁；若已离地（拆桨失效/误操作），先
+        // AUTO.LAND 回收，绝不空中 DISARM。
+        if (!latest_.landed_state_valid || !latest_.landed) {
+            if (!land_command_queued_) {
+                (void)SendAutoLand();
+                std::cout << "[G4][回收] 收尾检测到未落地，发送 AUTO.LAND" << std::endl;
+            }
+            const uint64_t deadline = MonotonicMs() + kBenchLandTimeoutMs;
+            while (MonotonicMs() < deadline) {
+                if (auto message = subscription_.WaitTakeFor(std::chrono::milliseconds(100))) {
+                    latest_ = **message;
+                    UpdateObserved(latest_, &observed_);
+                    if (latest_.landed_state_valid && latest_.landed) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (!latest_.landed_state_valid || !latest_.landed) {
+            std::cout << "[G4][回收] 未能确认落地，保持 armed，请现场接管" << std::endl;
+            return;
+        }
+        (void)SendArm(false);
+        const uint64_t deadline = MonotonicMs() + kBenchDisarmTimeoutMs;
+        while (MonotonicMs() < deadline) {
+            if (auto message = subscription_.WaitTakeFor(std::chrono::milliseconds(100))) {
+                latest_ = **message;
+                UpdateObserved(latest_, &observed_);
+                if (!latest_.armed) {
+                    disarmed_confirmed_ = true;
+                    break;
+                }
+            }
+        }
+        if (!latest_.armed) {
+            disarmed_confirmed_ = true;
+        }
+    }
+
+    void PrintStateChange() {
+        if (latest_.connected == last_connected_ && latest_.armed == last_armed_ &&
+            latest_.flight_mode == last_mode_ &&
+            latest_.flight_sub_mode == last_sub_mode_) {
+            return;
+        }
+        std::cout << "[状态变化] connected=" << YesNo(latest_.connected)
+                  << " armed=" << YesNo(latest_.armed)
+                  << " mode=" << static_cast<int>(latest_.flight_mode) << '/'
+                  << static_cast<int>(latest_.flight_sub_mode) << std::endl;
+        last_connected_ = latest_.connected;
+        last_armed_ = latest_.armed;
+        last_mode_ = latest_.flight_mode;
+        last_sub_mode_ = latest_.flight_sub_mode;
+    }
+
+    drone::communication::Px4Link& link_;
+    drone::control::FlightController& controller_;
+    drone::common::Topic<drone::common::ControlIntent>& intent_topic_;
+    uint64_t duration_ms_ = 0;
+    drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription subscription_;
+    drone::common::Topic<drone::common::Px4Setpoint>::Subscription setpoint_subscription_;
+
+    drone::common::FlightStateSnapshot latest_;
+    bool have_snapshot_ = false;
+    ObservedState observed_;
+    bool last_connected_ = false;
+    bool last_armed_ = false;
+    uint8_t last_mode_ = 0;
+    uint8_t last_sub_mode_ = 0;
+
+    BenchPhase phase_ = BenchPhase::kPreflight;
+    BenchIntentMode intent_mode_ = BenchIntentMode::kNone;
+    bool aborted_ = false;
+    std::string abort_reason_;
+    bool safety_violation_ = false;
+    bool takeoff_detected_ = false;
+    uint64_t airborne_since_ms_ = 0;
+    bool diagnostic_warned_ = false;
+    bool unexpected_disarm_ = false;
+
+    bool preflight_passed_ = false;
+    bool preflight_landed_ = false;
+    bool preflight_disarmed_ = false;
+    float ground_x_m_ = 0.f;
+    float ground_y_m_ = 0.f;
+    float ground_z_m_ = 0.f;
+    float max_ascent_m_ = 0.f;
+    float max_horizontal_m_ = 0.f;
+
+    bool guide_started_ = false;
+    uint64_t guide_start_ms_ = 0;
+    uint64_t next_guide_ms_ = 0;
+    uint64_t guide_injected_ = 0;
+    uint64_t guide_elapsed_ms_ = 0;
+    uint64_t next_intent_ms_ = 0;
+    float command_north_mps_ = 0.f;
+    float command_east_mps_ = 0.f;
+
+    bool offboard_command_queued_ = false;
+    bool offboard_ack_received_ = false;
+    bool offboard_ack_accepted_ = false;
+    bool offboard_mode_reached_ = false;
+    uint64_t offboard_request_ms_ = 0;
+    bool arm_command_queued_ = false;
+    bool arm_ack_received_ = false;
+    bool arm_ack_accepted_ = false;
+    bool armed_reached_ = false;
+    uint64_t arm_request_ms_ = 0;
+    bool handover_done_ = false;
+    bool takeover_stream_ok_ = false;
+    uint64_t handover_ms_ = 0;
+    uint64_t send_count_at_handover_ = 0;
+
+    uint64_t zero_hold_start_ms_ = 0;
+    float zero_x0_m_ = 0.f;
+    float zero_y0_m_ = 0.f;
+    float zero_hold_max_drift_m_ = 0.f;
+    bool zero_hold_complete_ = false;
+    bool zero_hold_drift_ok_ = false;
+
+    std::size_t pulse_index_ = 0;
+    uint64_t pulse_start_ms_ = 0;
+    uint64_t pulse_settle_start_ms_ = 0;
+    float pulse_max_north_mps_ = 0.f;
+    float pulse_max_east_mps_ = 0.f;
+    uint64_t pulse_rejected_at_start_ = 0;
+    uint64_t pulse_rejected_delta_ = 0;
+    bool pulse_setpoint_ok_ = true;
+    bool pulses_complete_ = false;
+
+    uint64_t stop_start_ms_ = 0;
+    bool coast_seen_ = false;
+    uint64_t coast_ms_ = 0;
+    bool idle_seen_ = false;
+    uint64_t idle_ms_ = 0;
+    uint64_t sends_at_idle_ = 0;
+    bool offboard_exit_seen_ = false;
+    uint64_t offboard_exit_ms_ = 0;
+    uint8_t offboard_exit_mode_ = 0;
+    uint8_t offboard_exit_sub_mode_ = 0;
+    bool landed_at_stop_ = false;
+
+    bool disarm_command_queued_ = false;
+    bool disarm_ack_received_ = false;
+    bool disarm_ack_accepted_ = false;
+    bool disarmed_confirmed_ = false;
+    bool auto_disarmed_after_stop_ = false;
+    uint64_t disarm_request_ms_ = 0;
+    bool land_command_queued_ = false;
+    uint64_t land_request_ms_ = 0;
+};
+
+/// G4 串口台架入口：真实 PX4 串口 + FlightController 全链，脚本不产生起飞。
+int RunBenchStage4(drone::communication::Px4Link& link, const json& root,
+                   const Options& options) {
+    const drone::config::FlightControllerConfig controller_config =
+        LoadControllerConfig(root);
+    if (controller_config.max_speed_mps < kBenchPulseSpeedMps) {
+        throw std::invalid_argument(
+            "controller.max_speed_mps 小于 G4 脉冲速度 0.20m/s，禁止启动台架");
+    }
+    std::cout << "  controller: period=" << controller_config.period.count()
+              << "ms max_speed=" << controller_config.max_speed_mps
+              << "m/s max_accel=" << controller_config.max_accel_mps2
+              << "m/s² intent_timeout=" << controller_config.intent_timeout.count()
+              << "ms coast_timeout=" << controller_config.coast_timeout.count()
+              << "ms" << std::endl;
+    std::cout << "  台架安全: 硬判据=armed 后 landed 状态；本地上升/水平仅诊断"
+                 "（诊断阈值 "
+              << kBenchDiagnosticAscentM << "m/" << kBenchDiagnosticHorizontalM
+              << "m），脉冲 " << kBenchPulseSpeedMps
+              << "m/s；不发送起飞/降落/返航指令" << std::endl;
+
+    drone::common::Topic<drone::common::ControlIntent> intent_topic;
+    drone::control::FlightController controller(controller_config);
+    controller.SetInput(intent_topic);
+    controller.SetPx4LinkSource(&link);
+    link.SetInput(controller.SetpointOutput());
+    auto subscription = link.StateOutput().Subscribe(64);
+    if (!link.Start()) {
+        std::cerr << "[FAIL] PX4 串口启动失败，请检查设备、权限和波特率" << std::endl;
+        return 2;
+    }
+    if (!controller.Start()) {
+        std::cerr << "[FAIL] 飞行控制器启动失败" << std::endl;
+        link.Stop();
+        return 2;
+    }
+    BenchStage4Run run(link, controller, intent_topic, options.duration,
+                       std::move(subscription));
+    run.Execute();
+    const bool connected_at_end = link.IsConnected();
+    controller.Stop();
+    link.Stop();
+    return run.Evaluate(connected_at_end) ? 0 : 3;
+}
 
 /// stage4 入口：装配 FlightController → Px4Link 全链并运行脚本。
 int RunStage4(drone::communication::Px4Link& link, const json& root,
@@ -5027,6 +5970,34 @@ int RunToolSelfTest() {
                   << "P3 剧本解析: feedforward / 非法值拒绝" << std::endl;
         passed = passed && feedforward_ok && invalid_ok;
     }
+    // G4 串口台架：四向脉冲必须覆盖 N/E/S/W、单轴且不超过固定幅值；
+    // 包线函数必须在 0.30m 上升/0.50m 水平处翻转，防止误放宽台架限制。
+    {
+        bool pulse_ok = kBenchPulseCount == 4;
+        const bool north = kBenchPulses[0].north_mps > 0.f &&
+                           kBenchPulses[0].east_mps == 0.f;
+        const bool east = kBenchPulses[1].east_mps > 0.f &&
+                          kBenchPulses[1].north_mps == 0.f;
+        const bool south = kBenchPulses[2].north_mps < 0.f &&
+                           kBenchPulses[2].east_mps == 0.f;
+        const bool west = kBenchPulses[3].east_mps < 0.f &&
+                          kBenchPulses[3].north_mps == 0.f;
+        pulse_ok = pulse_ok && north && east && south && west;
+        for (std::size_t index = 0; index < kBenchPulseCount; ++index) {
+            pulse_ok = pulse_ok &&
+                       std::fabs(kBenchPulses[index].north_mps) <= kBenchPulseSpeedMps &&
+                       std::fabs(kBenchPulses[index].east_mps) <= kBenchPulseSpeedMps;
+        }
+        const bool diagnostic_ok =
+            !BenchDiagnosticExceeded(0.f, 0.f) &&
+            !BenchDiagnosticExceeded(kBenchDiagnosticAscentM,
+                                     kBenchDiagnosticHorizontalM) &&
+            BenchDiagnosticExceeded(kBenchDiagnosticAscentM + 0.01f, 0.f) &&
+            BenchDiagnosticExceeded(0.f, kBenchDiagnosticHorizontalM + 0.01f);
+        std::cout << ((pulse_ok && diagnostic_ok) ? "[PASS] " : "[FAIL] ")
+                  << "G4 台架脚本: 四向脉冲/幅值/诊断阈值边界" << std::endl;
+        passed = passed && pulse_ok && diagnostic_ok;
+    }
     std::cout << (passed ? "结果: 工具离线自检通过" : "结果: 工具离线自检未通过")
               << std::endl;
     return passed ? 0 : 1;
@@ -5436,6 +6407,11 @@ int main(int argc, char** argv) {
             config.transport != "udp") {
             throw std::invalid_argument("SITL 设定值参数只允许 transport=udp，禁止在真实串口运行");
         }
+        if (options.bench_stage4_controller && config.transport != "serial") {
+            throw std::invalid_argument(
+                "G4 串口台架模式只允许 transport=serial；UDP SITL 请使用 "
+                "--sitl-stage4-controller");
+        }
 
         const json log_config = root.value("log", json::object());
         const auto log_level = spdlog::level::from_str(
@@ -5460,6 +6436,9 @@ int main(int argc, char** argv) {
                   << (options.probe_message_interval
                           ? "只读消息流探针：HEARTBEAT + GET_MESSAGE_INTERVAL/"
                             "REQUEST_MESSAGE 查询，不发送任何飞行控制指令"
+                          : (options.bench_stage4_controller
+                          ? "G4 串口台架（拆桨确认）：零速引导/Offboard/ARM/"
+                            "四向小量脉冲/停发失控保护，无起飞/降落/返航指令"
                           : (options.sitl_stage4_return
                           ? "SITL UDP S9~S14 返航专项（非门禁）：S7 锁定/测距 → "
                             "S9/S10 自动授权发射 → S12 返航 → S13 AUTO.LAND → S14"
@@ -5486,7 +6465,7 @@ int main(int argc, char** argv) {
                                  ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
                                  : (options.sitl_zero_velocity
                                         ? "SITL UDP 零速度流，不切模式、不解锁"
-                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令"))))))))))))
+                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")))))))))))))
                   << '\n'
                   << std::endl;
 
@@ -5496,6 +6475,10 @@ int main(int argc, char** argv) {
         }
 
         drone::communication::Px4Link link(config);
+        if (options.bench_stage4_controller) {
+            // G4 串口台架：真实 PX4，拆桨/固定/遥控器接管已由命令行确认。
+            return RunBenchStage4(link, root, options);
+        }
         if (options.sitl_stage4_controller) {
             // stage4 独立装配（意图主题 + FlightController + Px4Link）与独立报告，
             // 与 stage 0~3D 的直发 setpoint 路径完全分离。

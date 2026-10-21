@@ -40,7 +40,7 @@
 | 地面站 | 自研，通过电台与算力板使用 MAVLink 通信 |
 | 摄像头 | USB 双目（SBS MJPG，UVC）已接入并完成内参/立体标定；左目用于 YOLO 检测与图传，右目用于稀疏 Census 测距（影子） |
 | 视觉算法 | YOLOv26 RKNN；正式模型输出 `[1,5,8400]` 归一化框与置信度，类别名称由 JSON 配置 |
-| 测距 | 双目稀疏 Census v2 已影子接入（2026-10-10 板上有效占比 95.9%、约 40ms/帧；2026-10-15 室外会话有效率 0%，待按手册 11.1 排查）；卷尺级精度验收待独立测试工程回填，深度无效时显式降级 |
+| 测距 | 双目稀疏 Census v2 已影子接入（2026-10-10 板上有效占比 95.9%、约 40ms/帧；2026-10-20 室外实测目标 <8m 可正常使用，近距 1.9m 有效占比 99.2%；0% 根因为超出 ≈7.95m 量程）；卷尺级精度验收待独立测试工程回填，深度无效时显式降级 |
 | 导航信息 | PX4 融合 GPS、IMU、磁力计和气压计；算力板自身没有 GPS |
 | Home 点 | 目标估计以 EKF 锚点（`GPS_GLOBAL_ORIGIN` #49）为原点；S12 返航使用 PX4 上报的 Home 点（由 Home 经纬度 + EKF 锚点换算为局部 NED） |
 | 遥控器 | 用于测试、故障处理和人工接管 |
@@ -162,4 +162,4 @@ drone_test/
 - C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
 - 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
 
-正式视频链路已在香橙派闭环：H.265 RTSP → rkmpp 硬解 → RGA DMA-BUF 转存 → RKNN YOLO → 红色动态框叠加 → h264_rkmpp → MediaMTX/HM30；RGA DMA 600 秒长测回退 0。双目 UVC 链路（MJPG 硬解 + SBS 拆分 + 稀疏 Census 测距）已板上冒烟（2026-10-10 有效占比 95.9%、约 40ms/帧；2026-10-15 室外会话有效率 0%，待排查）。PX4 链路已完成 MAVLink 解析、遥测快照、命令 ACK 与 NED setpoint 底层能力；G1~G3 SITL 门禁已全部实跑通过（2026-10-14），P3 前馈 A/B 与 S9~S14 返航专项通过（2026-10-19）；正式应用仍只接入只读遥测。地面站链路已完成捕网-01=`1/25` 多机身份、TIMESYNC、65010/65011 目标 UPDATE/ACK、65012 健康状态和 65013 任务状态回传，Web/HM30 实链闭环已通过。`MissionStateMachine` 已实现 S5/S6/S7 与 S9~S14 意图链（含 `interception` 入口配置化与返航/降落/上锁），生产装配保持影子；正式单目标 `TargetEstimator` 以 EKF 锚点（#49）为基准并行接入，输出尚不参与 PX4 控制。`target_tracker` 独立目录保持不动，`visual_track_control` 核心控制律已移植主工程、原库未接入 `DroneApplication`。主工程在 WSL2 Ubuntu 24.04 下 **466/466** 测试通过。PX4 室内只读（10-10）与室外实链只读（10-15：`SELF_CHECK→READY`、目标 UPDATE→估计器出 NED→`GPS_APPROACH`、Home 漂移对照）均已通过。正式配置保持 `enable_control=false` 与 `interception.enabled=false`；打开控制前剩余 G4 拆桨台架、G5 室外首飞、双目卷尺级精度验收、相机安装外参、围栏参数冻结等前置项（见 `docs/PX4实链验证清单.md` §7.2）。
+正式视频链路已在香橙派闭环：H.265 RTSP → rkmpp 硬解 → RGA DMA-BUF 转存 → RKNN YOLO → 红色动态框叠加 → h264_rkmpp → MediaMTX/HM30；RGA DMA 600 秒长测回退 0。双目 UVC 链路（MJPG 硬解 + SBS 拆分 + 稀疏 Census 测距）已板上冒烟（2026-10-10 有效占比 95.9%、约 40ms/帧）；**室外实测目标 <8m 可正常使用**（2026-10-20 近距 1.9m 有效占比 99.2%，0% 根因为超出 ≈7.95m 量程）；卷尺级精度与 `fxB` 对齐仍为控制接入前置。PX4 链路已完成 MAVLink 解析、遥测快照、命令 ACK 与 NED setpoint 底层能力；G1~G3 SITL 门禁已全部实跑通过（2026-10-14），P3 前馈 A/B 与 S9~S14 返航专项通过（2026-10-19）；正式应用仍只接入只读遥测。地面站链路已完成捕网-01=`1/25` 多机身份、TIMESYNC、65010/65011 目标 UPDATE/ACK、65012 健康状态和 65013 任务状态回传，Web/HM30 实链闭环已通过。`MissionStateMachine` 已实现 S5/S6/S7 与 S9~S14 意图链（含 `interception` 入口配置化与返航/降落/上锁），生产装配保持影子；正式单目标 `TargetEstimator` 以 EKF 锚点（#49）为基准并行接入，输出尚不参与 PX4 控制。`target_tracker` 独立目录保持不动，`visual_track_control` 核心控制律已移植主工程、原库未接入 `DroneApplication`。主工程在 WSL2 Ubuntu 24.04 下 **466/466** 测试通过。PX4 室内只读（10-10）与室外实链只读（10-15：`SELF_CHECK→READY`、目标 UPDATE→估计器出 NED→`GPS_APPROACH`、Home 漂移对照）均已通过。正式配置保持 `enable_control=false` 与 `interception.enabled=false`；打开控制前剩余 G4 拆桨台架（串口台架入口已落地 2026-10-20，待实跑）、G5 室外首飞、双目卷尺级精度验收、相机安装外参、围栏参数冻结等前置项（见 `docs/PX4实链验证清单.md` §7.2/§7.3）。

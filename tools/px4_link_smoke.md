@@ -2,7 +2,7 @@
 
 > 对应实现：`tools/px4_link_smoke.cpp`
 > 使用模块：`SerialPort`、`MavlinkHandler`、`Px4Link`、`FlightStateSnapshot`、
-> `FlightController`（stage4/stage4-mission）、`MissionStateMachine` +
+> `FlightController`（stage4/stage4-mission/bench-stage4）、`MissionStateMachine` +
 > `TargetEstimator`（stage4-mission）
 
 ## 1. 功能职责
@@ -12,6 +12,9 @@
 `FlightController` 验证执行层全链（G2 门禁），stage4-mission
 （`--sitl-stage4-mission`）装配状态机全链验证 S5→S6→S7→回退→停发（G3 门禁，
 另补验 G2 表列的围栏钳制与切模式停发），两者均不依赖视频/相机链路。
+**G4 串口台架（`--bench-stage4-controller`，2026-10-20）**在真实 PX4 串口上装配同一
+`FlightController`，只覆盖零速引导、Offboard/ARM、零速保持、四向小量速度脉冲与停发
+失控保护，不执行起飞/降落/返航；详见 §2.5。
 
 测试内容：
 
@@ -28,12 +31,14 @@
   地面站目标/模拟视觉观测/模拟测距，验收迁移序列（S5→S6→S7→回退→停发）、交接处
   输出连续与卡尔曼备份接管，另含围栏钳制与切非 Offboard 停发时延补验。
 
-安全边界：不带 SITL 阶段参数时，程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、
+安全边界：不带阶段参数时，程序不绑定 `Px4Setpoint`，不会发送解锁、模式切换、起飞、
 降落或 Offboard 控制；主动内容仅为 HEARTBEAT 和遥测请求。stage4-mission 会在 SITL 中
 真实起飞（相对 1m）、水平引导至注入目标点并在该点降落上锁（全程 armed 包线内），
-不得在真实飞机上运行。所有控制阶段参数强制要求
+不得在真实飞机上运行。所有 `--sitl-*` 控制阶段参数强制要求
 `transport=udp` 且互斥，串口配置会在启动前拒绝。`--sitl-takeoff-land` 固定相对起飞 1m，
 不可通过命令行扩大，确认 landed 前禁止 DISARM。stage4 的意图/边界同样固定，不可经命令行放大。
+**G4 台架模式相反：只允许 `transport=serial`，必须显式给出 `--bench-ack-props-off`，
+且启动预检要求 PX4 已落地、未解锁；不会发送起飞/降落/返航指令。**
 
 ## 2. 构建与运行
 
@@ -66,7 +71,9 @@ echo "退出码=$?"
 | `--sitl-offboard-loss` | 仅 UDP，起飞 1m 后停止 setpoint、验证 PX4 退出 Offboard，再 AUTO.LAND 回收；最短 25 秒 |
 | `--sitl-stage4-controller` | 仅 UDP，装配真实 `FlightController` + 意图脚本（G2 执行层门禁）；最短 60 秒 |
 | `--sitl-stage4-mission` | 仅 UDP，装配状态机全链 + 注入模拟数据（G3 全链门禁，含 G2 补验两项）；最短 60 秒 |
-| `--selftest` | 离线自检工具纯逻辑（G3 意图分类等），不读配置、不触 SITL/硬件；已纳入 `ctest`（`px4_link_smoke_selftest`） |
+| `--bench-stage4-controller` | **仅串口**，G4 拆桨台架：零速引导 → Offboard → ARM → 零速保持 → 四向 0.20m/s 脉冲 → 停发验证；不发送起飞/降落/返航；最短 45 秒（未给 `--duration` 时默认 60 秒） |
+| `--bench-ack-props-off` | 台架安全确认：已拆桨、机体固定、遥控器可随时接管；缺省时台架模式拒绝启动 |
+| `--selftest` | 离线自检工具纯逻辑（G3 意图分类、G4 台架脚本/诊断阈值等），不读配置、不触 SITL/硬件；已纳入 `ctest`（`px4_link_smoke_selftest`） |
 | `--help` | 显示帮助 |
 
 ### 2.1 stage4 执行层门禁脚本（`--sitl-stage4-controller`）
@@ -360,6 +367,68 @@ bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ SEARCHIN
 流时回 `-1`；`handle_request_message_command` 找不到流对象或 `send()` 返回 false 时
 回 DENIED；`set_message_interval` 在 `get_stream_name` 未命中时返回 ERROR（→ result=4）。
 
+### 2.5 G4 串口台架（`--bench-stage4-controller`，2026-10-20）
+
+真实 PX4 + 机体、**卸桨、机体固定、遥控器可随时接管**的 G4-1/2/4 自动流程。
+该模式只允许 `transport=serial`；UDP SITL 请继续使用 `--sitl-stage4-*`。
+
+```bash
+# 台架前置：拆桨、机体固定、遥控器 kill/接管可用；PX4 已上电且 landed、未解锁
+./build/px4_link_smoke --config config/config.json --duration 60 \
+  --bench-stage4-controller --bench-ack-props-off
+echo "退出码=$?"
+```
+
+`--bench-ack-props-off` 是强制安全确认；缺少时工具在打开串口前直接拒绝。
+未显式给 `--duration` 时台架模式默认 60 秒，最短 45 秒。
+
+**启动预检（任一不满足不会进入控制序列）**：
+
+- 收到 PX4 心跳、局部位置/姿态有效；
+- PX4 报 `landed=是` 且 `armed=否`；已 armed 或未落地直接拒绝；
+- `home_valid`/遥控器链路缺失只打 WARN，不伪造，ARM 可能被 PX4 拒绝。
+
+**自动序列**：
+
+1. 10Hz 注入零速引导 setpoint（≥20 条且 ≥2s）→ `DO_SET_MODE(6/0)` → 等 ACK 与
+   真实模式 6/0；
+2. `ARM` → 等 ACK、真实 armed、控制器授权链全通并接管 setpoint 流；
+3. 零速速度意图保持 2 秒（漂移判据 ≤0.15m）；
+4. 依次下发北/东/南/西四个 **0.20m/s、800ms** 速度脉冲，每段后零速回落 800ms；
+   工具同时检查控制器发布侧设定值方向（北/东为正、南/西为负）；
+5. 停止发意图：等控制器 `COAST → IDLE`、PX4 在 2.2s 内退出 Offboard、
+   设定值发送停止（≤2 条额外发送）；
+6. 确认仍落地后主动 `DISARM`；若 PX4 已自动上锁则接受。
+
+**自动判定项**：心跳/链路错误、预检状态、引导流、Offboard/ARM ACK 与真实状态、
+控制器接管、零速漂移、四向设定值方向、COAST/IDLE/Offboard 退出时延、
+停发后发送停止、落地状态、DISARM 确认、控制器异常计数。
+
+**必须人工勾选（工具不能替代）**：
+
+- G4-1：ARM 后电机仅怠速级响应，不得高速/持续加速；
+- G4-2：四个脉冲时电机/机体响应方向与指令一致，不得反转；
+- G4-3：捕网执行器行程/方向。本模式**不自动触发** `DO_SET_ACTUATOR`：
+  `actuator.*` 通道、接线与 `PWM_AUX_MINn/MAXn` 行程尚未冻结，猜参数可能
+  损坏机构。确认映射后再按 G4-3 单独验证；
+- G4-4 的“拔串口”分支不由本模式自动执行（本模式验证“停 setpoint”分支）；
+  拔串口需在停机后单独按 PX4 `COM_OF_LOSS_T`/`COM_OBL_RC_ACT` 记录，避免
+  在运行中热拔损坏接口。
+
+**安全设计**：
+
+- 离地硬判据 = `landed=false` 持续 ≥1s **且**本地上升 >0.25m；一旦成立立即停发
+  意图并 `AUTO.LAND`。只看 `landed=false` 会把台上电机起转误判为离地；
+- armed 期间除停发验证段外，PX4 一旦退出 Offboard（failsafe/人工接管）立即停止
+  意图并判失败，不继续发脉冲；
+- 本地位置的最大上升/水平位移只作诊断：GNSS/EKF 静止游走可能达到米级，
+  不能作为硬包线；
+- 收尾若未确认落地，保持 armed 并提示现场接管，绝不空中 DISARM；
+- 任何异常先停发意图，再按 PX4 状态回收；现场始终保留遥控器接管/断电手段。
+
+**退出码**：`0` 自动部分通过（人工项仍需勾选）；`1` 参数/配置错误；`2` 串口或
+控制器启动失败；`3` 自动判定未通过。
+
 ## 3. 当前配置
 
 机载身份（`onboard_system_id`/`onboard_component_id`）自 2026-09-02 多机区分配置改造起
@@ -506,7 +575,7 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | 0 | PX4 心跳建立、结束时仍连接且链路错误为 0 |
 | 1 | 参数、配置文件或 JSON 解析失败 |
 | 2 | 串口打开/线程启动失败 |
-| 3 | 未收到 PX4 心跳、结束时断开或链路出现错误 |
+| 3 | 未收到 PX4 心跳、结束时断开或链路出现错误；G4 台架自动判定未通过 |
 
 缺少某一遥测消息只记 WARN，不直接判定基础串口失败。它通常表示 PX4 对应 MAVLink 实例没有
 配置该消息流，后续需要设置流频率或由 `Px4Link` 主动请求。
@@ -520,6 +589,8 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 - SITL 飞行阶段仅打印状态变化、阶段切换、安全回收和最终验收，不逐设定值打印；
 - stage4 期间控制器的控制权迁移（IDLE/ACTIVE/COAST 及原因串）由 `FlightController`
   自身 WARN 日志记录，工具侧只打印阶段切换与实测值；
+- G4 台架只打印预检、阶段切换、四向脉冲方向、离地/安全回收和最终报告；
+  不逐条打印设定值；报告末尾单独列出待人工勾选的 G4-1/2/3 项；
 - stage4-mission 每秒打印一行任务摘要（状态机状态/告警位/注入目标/视觉注入状态/
   卡尔曼估计/控制权），阶段切换与验收证据打印实测值；状态机/估计器/控制器的业务
   日志按各自模块纪律记录，工具不逐条转发。
@@ -555,6 +626,12 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | stage4-mission 卡在"切非 Offboard 停发补验" | AUTO.LOITER 是否被 ACK accepted、真实模式是否离开 6/0（快照 `flight_mode/flight_sub_mode`）、控制器是否仍 ACTIVE（授权链快照门禁） |
 | stage4-mission 模式停发时延超标（>200ms） | 测量起点是**工具首个非 Offboard 快照**，终点是控制器转 IDLE；超标多为控制周期/快照发布周期设置过大（`controller.period_ms`、`px4.state_publish_interval_ms`），非状态机问题 |
 | stage4-mission"目标过期链"超时 | 过期判据依赖注入目标有效期（工具 2s）；看状态机告警位 bit1、控制器 COAST（意图超龄）与 IDLE（`coast_timeout`）、PX4 `COM_OF_LOSS_T` 是否与配置自洽 |
+| G4 台架启动即拒绝 | 缺少 `--bench-ack-props-off`、duration<45s 或 transport≠serial；按提示逐项修正，不要绕过安全确认 |
+| G4 预检不通过 | 必须 landed+disarmed、局部位置/姿态有效；armed/空中启动会被拒绝；Home 无效只 WARN，ARM 可能被 PX4 拒绝 |
+| G4 ARM ACK denied | 查 PX4 preflight/GPS/Home/遥控器；禁止 force arm；`--bench-ack-props-off` 不是绕过 preflight 的开关 |
+| G4 四向脉冲方向判定失败 | 先看打印的控制器发布侧设定值北/东分量；若设定值方向正确而电机实际方向错误，按 G4-2 人工记录并查电机/桨序/机架坐标，不改工具阈值 |
+| G4 停发后不退出 Offboard | 查 `COM_OF_LOSS_T`、Offboard 丢失保护与串口链路；工具只停发意图，不主动切模式 |
+| G4 停发时 landed=false | 工具拒绝 DISARM 并尝试 AUTO.LAND；先确认是否真的离地，禁止伪造 landed/强制上锁 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 
