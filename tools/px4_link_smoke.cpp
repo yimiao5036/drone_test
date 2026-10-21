@@ -2778,6 +2778,35 @@ IntervalReplyVerdict JudgeIntervalReply(int32_t interval_us) {
     return verdict;
 }
 
+/// 187 ACK/复位保持时序判据（纯逻辑，在线报告与 `--selftest` 共用）。
+/// 触发 ACK 与复位 ACK 的间隔必须覆盖 `reset_delay`，并允许一个决策拍 +
+/// 命令/ACK 抖动（默认 500ms）；两端 ACK 均须 ACCEPTED，且不得有超时/多余 187。
+struct ActuatorAckTiming {
+    bool trigger_ack = false;
+    bool reset_ack = false;
+    bool trigger_accepted = false;
+    bool reset_accepted = false;
+    bool no_extra = true;
+    bool no_timeout = true;
+    uint64_t trigger_ms = 0;
+    uint64_t reset_ms = 0;
+    uint64_t reset_delay_ms = 0;
+    uint64_t tolerance_ms = 500;
+
+    bool ok() const {
+        if (!trigger_ack || !reset_ack || !trigger_accepted ||
+            !reset_accepted || !no_extra || !no_timeout) {
+            return false;
+        }
+        if (reset_ms < trigger_ms) {
+            return false;
+        }
+        const uint64_t hold_ms = reset_ms - trigger_ms;
+        return hold_ms >= reset_delay_ms &&
+               hold_ms <= reset_delay_ms + tolerance_ms;
+    }
+};
+
 /// G3 意图来源分类（纯逻辑，`--selftest` 离线断言；工具不在 ctest 内的断言曾连漏
 /// 两次——2026-10-14 终审要求抽成纯函数 + 离线自检防复发）。
 enum class MissionIntentClass : uint8_t {
@@ -4774,6 +4803,12 @@ public:
         status_subscription_ = machine_.StatusOutput().Subscribe(64);
         intent_subscription_ = machine_.IntentOutput().Subscribe(64);
         setpoint_subscription_ = controller_.SetpointOutput().Subscribe(64);
+        reset_delay_ms_ =
+            static_cast<uint64_t>(app_config.actuator.reset_delay.count());
+        const auto ack = link_.AckStatus();
+        actuator_ack_baseline_ = ack.do_set_actuator_ack_count;
+        actuator_timeout_baseline_ = ack.do_set_actuator_timeout_count;
+        actuator_last_seen_ack_count_ = actuator_ack_baseline_;
         if (script_ == TuneScript::kFeedforward) {
             rig_.SetTargetNed(kFeedforwardStartNorthM, 0.0, kTuneBaseTargetUpM);
             rig_.SetTargetVelocityNed(kFeedforwardTargetSpeedMps, 0.0, 0.0);
@@ -4806,6 +4841,7 @@ public:
             }
             const uint64_t now_ms = MonotonicMs();
             DrainOutputs();
+            ObserveActuatorAcks();
             PublishBootstrapIntent(now_ms);
             AdvancePhase(now_ms, now_ms - started_ms);
             if (!aborted_ && rig_.HasError()) {
@@ -4871,12 +4907,13 @@ public:
         const bool ff_ok =
             !feedforward_scenario || (ff_samples_ok && ff_s5_ok && ff_caught);
         const bool return_scenario = script_ == TuneScript::kInterceptReturn;
+        const ActuatorAckTiming actuator_ack_timing = actuator_timing();
         const bool return_ok =
             !return_scenario ||
             (saw_intercept_ready_ && saw_intercept_executing_ &&
              saw_return_home_ && saw_landing_ && saw_disarmed_ &&
              state_machine_managed_return_ && landed_after_flight_ &&
-             disarmed_confirmed_);
+             disarmed_confirmed_ && actuator_ack_timing.ok());
         const bool passed = phase_ == TunePhase::kDone && csv_.ok() && !aborted_ &&
                             !safety_violation_ && controller_.ErrorCount() == 0 &&
                             landed_after_flight_ && disarmed_confirmed_ &&
@@ -4901,6 +4938,38 @@ public:
             PrintCheck("S12 RETURN_HOME 进入", saw_return_home_, true);
             PrintCheck("S13 AUTO.LAND 进入", saw_landing_, true);
             PrintCheck("S14 DISARMED 完成", saw_disarmed_, true);
+            PrintCheck("187 触发 ACK accepted",
+                       actuator_ack_timing.trigger_ack &&
+                           actuator_ack_timing.trigger_accepted,
+                       true);
+            PrintCheck("187 复位 ACK accepted",
+                       actuator_ack_timing.reset_ack &&
+                           actuator_ack_timing.reset_accepted,
+                       true);
+            PrintCheck("187 复位保持时序(reset_delay~+500ms)",
+                       actuator_ack_timing.ok(), true);
+            PrintCheck("187 ACK 无超时/多余命令",
+                       actuator_ack_timing.no_timeout &&
+                           actuator_ack_timing.no_extra,
+                       true);
+            if (actuator_ack_timing.trigger_ack && actuator_ack_timing.reset_ack) {
+                const uint64_t hold_ms =
+                    actuator_ack_timing.reset_ms - actuator_ack_timing.trigger_ms;
+                std::cout << "187 实测: 触发 ACK "
+                          << actuator_ack_timing.trigger_ms << "ms，复位 ACK "
+                          << actuator_ack_timing.reset_ms << "ms，间隔 " << hold_ms
+                          << "ms（reset_delay " << reset_delay_ms_ << "ms，容差 "
+                          << actuator_ack_timing.tolerance_ms
+                          << "ms；无超时/多余="
+                          << YesNo(actuator_ack_timing.no_timeout &&
+                                   actuator_ack_timing.no_extra)
+                          << "）" << std::endl;
+            } else {
+                std::cout << "187 实测: 触发 ACK="
+                          << YesNo(actuator_ack_timing.trigger_ack)
+                          << "，复位 ACK="
+                          << YesNo(actuator_ack_timing.reset_ack) << std::endl;
+            }
             std::cout << "S9~S14 实测: 状态机接管返航="
                       << YesNo(state_machine_managed_return_)
                       << "，迁移 " << machine_.TransitionCount() << " 次，错误 "
@@ -5022,6 +5091,54 @@ private:
                 }
             }
         }
+    }
+
+    /// 轮询 Px4Link 的 187 专用 ACK 快照，记录触发/复位 ACK 及异常。
+    /// 只在 S9~S14 专项使用；其他剧本保持零开销。
+    void ObserveActuatorAcks() {
+        if (script_ != TuneScript::kInterceptReturn) {
+            return;
+        }
+        const auto ack = link_.AckStatus();
+        if (ack.do_set_actuator_timeout_count > actuator_timeout_baseline_) {
+            actuator_timeout_ = true;
+        }
+        if (ack.do_set_actuator_ack_count <= actuator_last_seen_ack_count_) {
+            return;
+        }
+        actuator_last_seen_ack_count_ = ack.do_set_actuator_ack_count;
+        if (ack.do_set_actuator_last_result == MAV_RESULT_IN_PROGRESS) {
+            return;  // 等最终结果
+        }
+        const bool accepted =
+            ack.do_set_actuator_last_result == MAV_RESULT_ACCEPTED;
+        if (!actuator_trigger_seen_) {
+            actuator_trigger_seen_ = true;
+            actuator_trigger_accepted_ = accepted;
+            actuator_trigger_ms_ = ack.do_set_actuator_last_time_ms;
+            return;
+        }
+        if (!actuator_reset_seen_) {
+            actuator_reset_seen_ = true;
+            actuator_reset_accepted_ = accepted;
+            actuator_reset_ms_ = ack.do_set_actuator_last_time_ms;
+            return;
+        }
+        actuator_extra_acks_ = true;
+    }
+
+    ActuatorAckTiming actuator_timing() const {
+        ActuatorAckTiming timing;
+        timing.trigger_ack = actuator_trigger_seen_;
+        timing.reset_ack = actuator_reset_seen_;
+        timing.trigger_accepted = actuator_trigger_accepted_;
+        timing.reset_accepted = actuator_reset_accepted_;
+        timing.no_extra = !actuator_extra_acks_;
+        timing.no_timeout = !actuator_timeout_;
+        timing.trigger_ms = actuator_trigger_ms_;
+        timing.reset_ms = actuator_reset_ms_;
+        timing.reset_delay_ms = reset_delay_ms_;
+        return timing;
     }
 
     void WriteCsvRow(uint64_t t_ms) {
@@ -5812,6 +5929,19 @@ private:
     bool saw_landing_ = false;
     bool saw_disarmed_ = false;
     bool state_machine_managed_return_ = false;
+    // 187 ACK/复位保持时序（S9~S14 专项）
+    uint64_t reset_delay_ms_ = 1500;
+    uint64_t actuator_ack_baseline_ = 0;
+    uint64_t actuator_timeout_baseline_ = 0;
+    uint64_t actuator_last_seen_ack_count_ = 0;
+    bool actuator_trigger_seen_ = false;
+    bool actuator_reset_seen_ = false;
+    bool actuator_trigger_accepted_ = false;
+    bool actuator_reset_accepted_ = false;
+    uint64_t actuator_trigger_ms_ = 0;
+    uint64_t actuator_reset_ms_ = 0;
+    bool actuator_extra_acks_ = false;
+    bool actuator_timeout_ = false;
     // ---- P3 前馈专项观测（2026-10-19）----
     uint64_t motion_start_ms_ = 0;
     bool feedforward_window_entered_ = false;
@@ -6061,7 +6191,7 @@ int RunToolSelfTest() {
          MissionIntentClass::kStateMachineOther, true},
     };
     std::cout << "tools/px4_link_smoke 离线自检（G3 意图分类 + 消息流探针判读 + "
-                 "P3 剧本解析）"
+                 "P3 剧本解析 + 187 ACK 时序）"
               << std::endl;
     bool passed = true;
     for (const auto& item : cases) {
@@ -6095,6 +6225,53 @@ int RunToolSelfTest() {
         std::cout << (ok ? "[PASS] " : "[FAIL] ") << item.name << " → " << verdict.text
                   << std::endl;
         passed = passed && ok;
+    }
+    // 187 ACK/复位保持时序判据：覆盖正常 1.585s、过早/过晚、非 accepted、
+    // 缺少复位 ACK、多余 187、ACK 超时。
+    {
+        auto MakeTiming = [](bool trigger, bool reset, bool trigger_ok,
+                             bool reset_ok, bool no_extra, bool no_timeout,
+                             uint64_t trigger_ms, uint64_t reset_ms,
+                             uint64_t delay_ms) {
+            ActuatorAckTiming timing;
+            timing.trigger_ack = trigger;
+            timing.reset_ack = reset;
+            timing.trigger_accepted = trigger_ok;
+            timing.reset_accepted = reset_ok;
+            timing.no_extra = no_extra;
+            timing.no_timeout = no_timeout;
+            timing.trigger_ms = trigger_ms;
+            timing.reset_ms = reset_ms;
+            timing.reset_delay_ms = delay_ms;
+            return timing;
+        };
+        struct TimingCase {
+            const char* name;
+            bool expected;
+            ActuatorAckTiming timing;
+        };
+        const TimingCase timing_cases[] = {
+            {"187 时序: 1.585s（1.5s+85ms）通过", true,
+             MakeTiming(true, true, true, true, true, true, 1000, 2585, 1500)},
+            {"187 时序: 早于 reset_delay 拒绝", false,
+             MakeTiming(true, true, true, true, true, true, 1000, 2400, 1500)},
+            {"187 时序: 超过 +500ms 拒绝", false,
+             MakeTiming(true, true, true, true, true, true, 1000, 3100, 1500)},
+            {"187 时序: 触发 ACK 非 accepted", false,
+             MakeTiming(true, true, false, true, true, true, 1000, 2585, 1500)},
+            {"187 时序: 缺少复位 ACK", false,
+             MakeTiming(true, false, true, true, true, true, 1000, 0, 1500)},
+            {"187 时序: 多余 187 ACK", false,
+             MakeTiming(true, true, true, true, false, true, 1000, 2585, 1500)},
+            {"187 时序: ACK 超时", false,
+             MakeTiming(true, true, true, true, true, false, 1000, 2585, 1500)},
+        };
+        for (const auto& item : timing_cases) {
+            const bool ok = item.timing.ok();
+            std::cout << (ok == item.expected ? "[PASS] " : "[FAIL] ") << item.name
+                      << " → " << YesNo(ok) << std::endl;
+            passed = passed && (ok == item.expected);
+        }
     }
     // P3 前馈专项剧本解析（CLI 参数 → TuneScript）。
     {

@@ -312,15 +312,20 @@ bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ SEARCHIN
 - 判据（工具报告）：状态序列包含 S9/S10/S12/S13/S14；S10 发射（187）后
   由状态机接管返航；S13 AUTO.LAND（176，4/6）与 S14 前 DISARM（400）；
   飞行包线/回收链安全；CSV 可写。
+- **187 ACK/保持时序自动断言（2026-10-22）**：触发 ACK accepted、复位 ACK
+  accepted、复位相对触发在 `[reset_delay, reset_delay+500ms]`、无 ACK 超时/
+  多余 187 命令；判据与 `--selftest` 的纯函数用例共用。
 - 2026-10-19 本机 WSL2 实跑：**全 PASS**，状态机迁移 11 次、错误 0 次；
   最大相对高度 4.99m、最大北向 28.93m；S12 起始射程约 11.6m；证据 CSV
   `tools/return_evidence/stage4_return_20261019.csv`。
 - 2026-10-21 新 ACK 时序复跑：**全 PASS**，状态机迁移 11 次、错误 0 次；
   187 触发 ACK 24ms、复位在触发 ACK 后 **1.585s** 发出、复位 ACK 10ms；
   S12/S13/S14 全 PASS，无 S16；证据 CSV
-  `tools/return_evidence/stage4_return_20261021.csv`。工具报告目前只校验状态序列/
-  命令，不直接断言保持时长；判读时需在运行日志中核对
-  `捕网执行器触发/复位行程命令已入队` 与 187 ACK 的时间戳。
+  `tools/return_evidence/stage4_return_20261021.csv`。
+- 2026-10-22 报告自动断言复跑：**全 PASS**，187 触发/复位 ACK 均 accepted，
+  复位相对触发 **1596ms**（`reset_delay=1500ms`，容差 500ms），无 ACK 超时/
+  多余命令；证据 CSV `tools/return_evidence/stage4_return_20261022.csv`、
+  报告日志 `tools/return_evidence/stage4_return_20261022_ack.log`。
 - **非门禁**：不替代 G2/G3；`interception.enabled` 生产默认关闭，射程为
   占位值，需按实机捕网有效射程与授权策略冻结后再开启。
 
