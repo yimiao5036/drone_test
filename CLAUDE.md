@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # 主工程
 cmake -S . -B build
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure     # 基线 468/468 通过
+ctest --test-dir build --output-on-failure     # 基线 490/491（唯一失败为既有偶发 TargetEstimatorBaselineTest.GroundTargetConvertsWithAnchorBaseline，整套 target_estimator_test 36/36 通过）
 ./build/drone_control                          # 生成 logs/0001_xxx.log
 ./build/drone_control --config /路径/config.json
 

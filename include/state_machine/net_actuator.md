@@ -44,8 +44,9 @@ Faulted：终态，Update/Trigger/Reset 均不再产生命令
   入队后再抓会把该 ACK 吞掉，导致执行器永久停在等待态。
 - **发数**：`Trigger()` 成功入队才扣发数（1→0）；入队失败保留 pending，
   调用方下拍重试，发数不变。复位不恢复发数，故单发执行器全生命周期只触发一次。
-- **手动 `Reset()`**：取消进行中的保持/复位周期，立即发复位行程并回到 Ready，
-  但不恢复发数；Faulted 时返回 false（故障不自动清除）。
+- **手动 `Reset()`（维护/测试用 API）**：取消进行中的保持/复位周期，立即发复位
+  行程并回到 Ready，但不恢复发数；Faulted 时返回 false（故障不自动清除）。
+  状态机正常流程（含 S16 故障处置）不调用该接口，也不补发复位。
 
 ## 3. 接口
 
@@ -58,7 +59,7 @@ struct ActuatorFeedback {
 
 class INetActuator {
     virtual bool Trigger() = 0;                       // 仅 Ready 且有发数时成功
-    virtual bool Reset() = 0;                         // 手动归位；Faulted 拒绝
+    virtual bool Reset() = 0;                         // 维护/测试用归位；Faulted 拒绝
     virtual void Update(const ActuatorFeedback&) = 0; // 每拍推进内部时序
     virtual bool Ready() const = 0;
     virtual uint32_t RemainingShots() const = 0;      // 单发 1→0

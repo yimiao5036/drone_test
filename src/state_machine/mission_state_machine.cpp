@@ -13,7 +13,8 @@
  * 判丢语义映射为零速刹车意图。是否真正输出由 FlightController 授权链与
  * enable_control 装配门禁决定。
  * 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）经
- * INetActuator 抽象接口触发一次、离开拦截序列复位；当前 single_pwm 实现
+ * INetActuator 抽象接口触发一次，复位由执行器在触发 ACK 后自行计时完成
+ * （离开拦截序列不补发复位）；当前 single_pwm 实现
  * 发送 MAV_CMD_DO_SET_ACTUATOR（PWM 微秒 → -1..1 归一化），后续多发实现
  * 通过 actuator.type 工厂切换，状态机不感知通道/弹仓结构。
  */
@@ -662,7 +663,7 @@ private:
 
     /// S9/S10 入口判据（interception 配置节，2026-10-19）。
     /// 条件：视觉 LOCKED 连续帧 + 测距窗口 + PX4 Offboard/armed/姿态/位置有效
-    /// + 命令接口就绪 + 机构未触发/复位挂起。
+    /// + 命令接口就绪 + 机构未触发且 Ready()（无在途触发/复位时序）。
     bool InterceptEntrySatisfied(uint64_t now_ms) const {
         if (!interception_.enabled) {
             return false;
