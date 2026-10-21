@@ -20,8 +20,10 @@ namespace {
 /// p1..p6 = Actuator Set 1..6 归一化值（-1..1，NaN=忽略）；p7=执行器组序号。
 constexpr uint16_t kMavCmdDoSetActuator = 187;
 
-/// 单发舵机式执行器：PX4 侧配置 AUX 输出为 Actuator Set N，并把 -1..1
-/// 映射到 PWM_AUX_MINn/MAXn（标准 1000..2000µs）；机载只发送归一化控制量。
+/// 单发舵机式执行器：PX4 侧把物理输出的 Output Function 配为
+/// `Peripheral via Actuator Set N`，并把 -1..1 映射到该输出通道的
+/// PWM_MAIN_MINn/MAXn（AUX 输出为 PWM_AUX_*，标准 1000..2000µs）；
+/// 机载只发送归一化控制量。当前装机（2026-10-21）：MAIN5 = Actuator Set 1。
 /// 后续多发实现应实现同一个 INetActuator，并在 CreateNetActuator 中按
 /// actuator.type 接入；状态机不感知通道数/弹仓结构。
 class SinglePwmNetActuator final : public INetActuator {

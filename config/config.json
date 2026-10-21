@@ -130,6 +130,7 @@
     },
     "actuator": {
         "type": "single_pwm",
+        "net_channel": 1,
         "net_fire_norm": -0.7,
         "net_idle_norm": 0.0
     },

@@ -42,16 +42,21 @@
 
 **MAVLink/PX4 语义**：`MAV_CMD_DO_SET_ACTUATOR=187` 的 p1..p6 = Actuator Set 1..6 的
 归一化值（-1..1，NaN=忽略），p7=执行器组序号（PX4 仅组 0）。**PWM 输出功能、映射区间
-`PWM_AUX_MINn/MAXn`、舵机行程与方向全部在 PX4/QGC 侧配置**；机载只配置
-`actuator.net_channel` 和归一化量：
+对应输出通道的 PWM 映射区间（当前 MAIN5 为 `PWM_MAIN_MIN5/MAX5`）、舵机行程与方向
+全部在 PX4/QGC 侧配置**；机载只配置 `actuator.net_channel` 和归一化量：
 
 ```json
 "actuator": {
   "type": "single_pwm",
+  "net_channel": 1,
   "net_fire_norm": -0.7,
   "net_idle_norm": 0.0
 }
 ```
+
+**当前装机（2026-10-21 确认）**：捕网接 **MAIN5**，Output Function =
+`Peripheral via Actuator Set 1`，PWM 已配置；`net_channel` 是 Actuator Set 编号，
+**不是物理通道号 5**。
 
 单发捕网在 PX4 标准 `1000/2000µs` 映射下对应 `1150µs 发射 / 1500µs 待机`。机载不再保存
 PWM 微秒或输出区间，避免与 PX4 参数重复维护。接口与工厂见
@@ -533,9 +538,10 @@ ctest --test-dir build --output-on-failure
   ③ 已注入但仍无日志 → 查「入队失败（下拍重试）」节流 WARN（PX4 未连接/命令
   队列满）；三者都在调试时用状态转移日志确认当前是否真的到过 S10。
 - 捕网触发了但机构不动/行程反向：① 核对 PX4 侧该输出通道是否已分配「Peripheral
-  via Actuator Set N」（N 与 `actuator.net_channel` 对应）且已解锁/预解锁
-  （PX4 默认在 disarmed 下不驱动执行器，台架用 pre-arm 状态测）；② 核对 PX4
-  `PWM_AUX_MINn/MAXn` 与舵机实际行程（机载只发 -0.7/0.0，映射在 PX4 侧）；
+  via Actuator Set N」（当前装机：MAIN5 = Actuator Set 1，与 `actuator.net_channel=1`
+  对应）且已解锁/预解锁（PX4 默认在 disarmed 下不驱动执行器，台架用 pre-arm
+  状态测）；② 核对 `PWM_MAIN_MIN5/MAX5` 与舵机实际行程（机载只发 -0.7/0.0，
+  映射在 PX4 侧）；
   ③ 行程方向以 **G4 台架**为准（本层只保证归一化命令语义正确，方向属 PX4/
   接线配置）；日志中的 `set/norm` 摘要可核对。
 - 离开拦截序列后机构停在触发位：查「复位行程命令入队失败（下拍重试）」节流

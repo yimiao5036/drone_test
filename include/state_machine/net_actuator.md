@@ -10,7 +10,7 @@
 
 | type | 行为 |
 |---|---|
-| `single_pwm` | 经 `IPx4CommandSender` 发 `MAV_CMD_DO_SET_ACTUATOR`；配置归一化 `net_fire_norm=-0.7`、`net_idle_norm=0.0` |
+| `single_pwm` | 经 `IPx4CommandSender` 发 `MAV_CMD_DO_SET_ACTUATOR`；配置 `net_channel=1`（Actuator Set 1）、归一化 `net_fire_norm=-0.7`、`net_idle_norm=0.0` |
 
 未来多发实现（多个 Actuator Set、转盘/弹仓、多发时序）实现同一接口，并在
 `CreateNetActuator()` 按 `actuator.type` 注册即可；状态机 S9/S10/S11 流程不改。
@@ -32,19 +32,24 @@ class INetActuator {
 
 ## 3. PX4 / 机载边界
 
-- **PX4/QGC**：把 AUX 输出功能设为 `Peripheral via Actuator Set N`，设置
-  `PWM_AUX_MINn/MAXn`（标准 1000/2000µs），核对舵机行程/方向；
+- **PX4/QGC**：把物理输出的 Output Function 设为 `Peripheral via Actuator Set N`，
+  设置该输出通道的 PWM 映射区间（MAIN 输出为 `PWM_MAIN_MINn/MAXn`，AUX 输出为
+  `PWM_AUX_MINn/MAXn`，标准 1000/2000µs），核对舵机行程/方向；
+- **当前装机（2026-10-21 确认）**：捕网接 **MAIN5**，Output Function =
+  `Peripheral via Actuator Set 1`，PWM 已配置；因此机载 `net_channel=1`。
+  **注意 `net_channel` 是 Actuator Set 编号，不是物理通道号 5**；
 - **机载**：只配置 `actuator.net_channel`（Actuator Set N）与归一化量；
   `MAV_CMD_DO_SET_ACTUATOR` 的 p1..p6 只有对应 Set 位填值，其余 NaN，p7=0；
-- 单发捕网：`-0.7` → 1150µs（发射），`0.0` → 1500µs（待机）；
+- 单发捕网：`-0.7` → 1150µs（发射），`0.0` → 1500µs（待机，按 1000/2000µs
+  标准映射计算；实际行程以 QGC 中 MAIN5 的 `PWM_MAIN_MIN5/MAX5` 为准）；
 - 机载不再保存 PWM 微秒/输出区间，避免与 PX4 参数重复维护。
 
 ## 4. 日志与排查
 
 - 成功：`WARN 捕网执行器触发/复位行程命令已入队: type=single_pwm set=N norm=...`
 - 失败：首次与每 100 次节流 `WARN ...入队失败（下拍重试）`
-- 机构不动/反向：先查 PX4 输出功能、Actuator Set N、`PWM_AUX_MINn/MAXn`
-  与接线；机载只保证归一化命令语义。
+- 机构不动/反向：先查 MAIN5 的输出功能是否为 `Peripheral via Actuator Set 1`、
+  `PWM_MAIN_MIN5/MAX5` 与接线；机载只保证归一化命令语义。
 - 未注入命令接口（`enable_control=false`）时零日志、零命令，属预期影子行为。
 
 ## 5. 测试
