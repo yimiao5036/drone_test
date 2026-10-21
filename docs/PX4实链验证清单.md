@@ -151,8 +151,8 @@ echo "退出码=$?"
 | 门禁 | 命令（构建目录内） | 通过标准 | 状态 |
 |---|---|---|---|
 | G1 回归 | 第 0~3D 分阶段原样复跑（`--sitl-zero-velocity` … `--sitl-offboard-loss`） | 全部 PASS（退出码 0） | ✅ 2026-10-14（WSL2，七级全 PASS） |
-| G2 执行层 | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-controller` | 报告全 PASS（零速漂移/阶跃斜率/停发刹车/退出时延/降落上锁） | ✅ 2026-10-14（WSL2，全 PASS；实测值回填 `tools/PX4_SITL分级测试.md` §12.1） |
-| G3 全链 | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-mission` | 报告全 PASS（迁移序列 S5→S6→S7→回退、交接连续、备份接管、围栏钳制、模式停发 ≤200ms） | ✅ 2026-10-14（WSL2，全 PASS；环境前置条件见 `tools/px4_link_smoke.md` §2.2） |
+| G2 执行层 | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-controller` | 报告全 PASS（零速漂移/阶跃斜率/停发刹车/退出时延/降落上锁） | ✅ 2026-10-14（WSL2，全 PASS；实测值回填 `tools/PX4_SITL分级测试.md` §12.1）。**2026-10-22 新 ACK 时序回归 PASS**：零速漂移 0.0507m、斜率 2m/s²、稳态 1.87575m/s、COAST 过零 1600ms、IDLE→退出 Offboard 1799ms；证据 `tools/sitl_evidence/stage4_controller_20261022.log` |
+| G3 全链 | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-mission` | 报告全 PASS（迁移序列 S5→S6→S7→回退、交接连续、备份接管、围栏钳制、模式停发 ≤200ms） | ✅ 2026-10-14（WSL2，全 PASS；环境前置条件见 `tools/px4_link_smoke.md` §2.2）。**2026-10-22 新 ACK 时序回归 PASS**：迁移 0→1→2→5→6→7→5、交接缝 201ms、切非 Offboard 停发 21ms；证据 `tools/sitl_evidence/stage4_mission_20261022.log` |
 | P3 前馈专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 90 --sitl-stage4-feedforward [--feedforward]` | 前馈到达 PX4、S5 稳态滞后 A/B、包线/回收链安全 | ✅ 2026-10-19（WSL2）：FF off 滞后均值 1.391m / p95 1.492m；FF on 0.321m / 0.400m，p95 降低 73.2%；G3 以 FF=false 同步复跑全 PASS |
 | S11~S14 返航专项（非门禁） | `./px4_link_smoke --config config/px4_sitl_return.json --duration 120 --sitl-stage4-return` | S9/S10 入口→发射→S12 返航 Home→S13 AUTO.LAND→S14 DISARM；包线/回收链安全 | ✅ 2026-10-19（WSL2 全 PASS）：状态机迁移 11 次/错误 0；最大相对高度 4.99m、北向 28.93m；S12 起始射程约 11.6m；证据 `tools/return_evidence/stage4_return_20261019.csv`。**2026-10-21 新 ACK 时序复跑 PASS**：187 触发 ACK 24ms → 保持 1.585s → 复位 → 复位 ACK 10ms；迁移 11 次/错误 0，无 S16；证据 `tools/return_evidence/stage4_return_20261021.csv` |
 
