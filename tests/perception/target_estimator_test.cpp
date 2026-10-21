@@ -445,6 +445,21 @@ struct FusionFixture {
         return false;
     }
 
+    /// 轮询直到 LastState 已发布且有效。
+    /// UpdateCount 在 HandleGroundTarget 内即时递增，而 LastState 只在
+    /// publish_interval（10ms）节拍更新；只等计数会读到尚未发布的默认状态。
+    bool WaitForValidLastState(int timeout_ms = 500) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (estimator.LastState().valid) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return estimator.LastState().valid;
+    }
+
     /// 轮询直到视觉更新计数达到 expected（或超时）。
     bool WaitVisualUpdates(uint64_t expected, int timeout_ms = 1000) {
         const auto deadline = std::chrono::steady_clock::now() +
@@ -824,6 +839,7 @@ TEST(TargetEstimatorBaselineTest, GroundTargetConvertsWithAnchorBaseline) {
     ASSERT_TRUE(f.ground.Publish(
         std::make_shared<const common::GroundStationTarget>(target)).accepted);
     ASSERT_TRUE(f.WaitGroundUpdates(1));
+    ASSERT_TRUE(f.WaitForValidLastState());
     const auto state = f.estimator.LastState();
     ASSERT_TRUE(state.valid);
     // 期望值 = GeodeticToLocalNed(锚点, 目标)：以锚点为原点换算
