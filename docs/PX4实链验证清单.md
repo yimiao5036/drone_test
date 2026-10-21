@@ -214,12 +214,19 @@ echo "退出码=$?"
   上升 >0.25m；本地位置漂移只作诊断（GNSS/EKF 游走可达米级）；
 - 详细步骤、报告字段与退出码见 `tools/px4_link_smoke.md` §2.5。
 
-**2026-10-21 首次台架尝试（未通过，未进入 ARM）**：预检 landed/未解锁/位置姿态
-通过，但全程 `rc=否`、`global=否`（`home` 在 1s 后有效）；零速引导与 Offboard
-ACK accepted，ARM 请求已入队但 PX4 未 armed，25s 后引导超时。旧版工具未打印 ARM
-ACK 结果。处置：G4 预检现强制 **RC_CHANNELS 在线**（无 RC 不启动），ARM ACK
-拒绝时立即打印 result 并中止；报告新增 RC/Home/global/local 与最近 ACK 诊断。
-复测前先连接/对频遥控器并确认 `rc=是`；若 QGC 报 no global position，再查
-GLOBAL_POSITION_INT 流/定位状态。
+**2026-10-21 台架尝试记录**：
+
+- 第一次：预检 landed/未解锁/位置姿态通过，但全程 `rc=否`、`global=否`
+  （`home` 在 1s 后有效）；零速引导与 Offboard ACK accepted，ARM 请求已入队
+  但 PX4 未 armed，25s 后引导超时。处置：G4 预检强制 **RC_CHANNELS 在线**，
+  ARM ACK 拒绝时立即打印 result 并中止；报告新增 RC/Home/global/local 与
+  最近 ACK 诊断。
+- 第二次（RC/global 已正常，ARM ACK accepted、真实 armed）：控制器未接管，
+  解锁约 10s 后 PX4 `COM_DISARM_PRFLT` 自动上锁。根因是台架脚本在接管前
+  只注入引导 setpoint，没有发布带 bit31 请求位的 `ControlIntent`，控制器
+  授权链无法转 ACTIVE。已修复：预检通过即发布零速请求意图；同时把台架序列
+  压缩到解锁后约 7.5s，并在工具/文档提示 `COM_DISARM_PRFLT` 默认 10s。
+- 复测前确认 `rc=是`、`home/global/local=是`；若需更长观察时间，临时将
+  `COM_DISARM_PRFLT` 调到 ≥30s，测后恢复。
 
 G5 详细清单在设计稿 §5 G5 行标注"另行冻结"，建立时同步更新本节。

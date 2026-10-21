@@ -1862,6 +1862,12 @@ private:
         ground_x_m_ = latest_.local_x_m;
         ground_y_m_ = latest_.local_y_m;
         ground_z_m_ = latest_.local_z_m;
+        // 控制器必须在 ARM 前就收到带 bit31 请求位的零速意图，否则授权链
+        // 永远停在 IDLE（引导 setpoint 只维持 PX4 Offboard 流，不等于控制器
+        // 的控制请求）。姿态/位置门禁通过后即开始发布，控制器 Active 后接管。
+        intent_mode_ = BenchIntentMode::kZeroVelocity;
+        command_north_mps_ = 0.f;
+        command_east_mps_ = 0.f;
         phase_ = BenchPhase::kGuide;
         guide_start_ms_ = now_ms;
         next_guide_ms_ = now_ms;
