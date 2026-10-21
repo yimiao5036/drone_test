@@ -13,7 +13,9 @@ namespace drone::test {
 
 /// 命令窄接口共享假件：记录 SendCommand 调用（顺序/参数/入队结果），
 /// ACK/超时/取消均可脚本化，供状态机与执行器相关测试复用。
-class FakeCommandSender final : public communication::IPx4CommandSender {
+/// 非 final：需要模拟“ACK 在 SendCommand 返回前到达”等并发时序时，可在
+/// 测试内派生并覆写 SendCommand（见 net_actuator_test）。
+class FakeCommandSender : public communication::IPx4CommandSender {
 public:
     struct CallRecord {
         uint16_t command = 0;

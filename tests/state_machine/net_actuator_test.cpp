@@ -34,6 +34,27 @@ ActuatorFeedback Feedback(const FakeCommandSender& sender, bool connected,
     return {connected, sender.AckStatus(), now_ms};
 }
 
+/// 模拟 PX4 worker 在 SendCommand() 返回前就完成命令往返：ACK 已写入
+/// 快照。用于验证执行器的 ACK 基线必须在入队前抓取。
+class AckDuringSendSender final : public FakeCommandSender {
+public:
+    explicit AckDuringSendSender(uint64_t ack_time_ms)
+        : ack_time_ms_(ack_time_ms) {}
+
+    bool SendCommand(uint16_t mavlink_command, float param1, float param2,
+                     float param3, float param4, float param5, float param6,
+                     float param7) override {
+        const bool queued = FakeCommandSender::SendCommand(
+            mavlink_command, param1, param2, param3, param4, param5, param6,
+            param7);
+        SimulateAck(mavlink_command, kAccepted, ack_time_ms_);
+        return queued;
+    }
+
+private:
+    uint64_t ack_time_ms_;
+};
+
 TEST(NetActuatorTest, InitialStateReadyWithOneShot) {
     FakeCommandSender sender;
     auto actuator =
@@ -77,6 +98,24 @@ TEST(NetActuatorTest, FireAckStartsHoldThenSendsReset) {
     actuator->Update(Feedback(sender, true, 1550));
     ASSERT_EQ(sender.CallCount(), 2u);
     EXPECT_FLOAT_EQ(sender.LastParams()[0], 0.0F);  // 复位/待机
+}
+
+// 回归：ACK 在 SendCommand() 返回前到达时，基线若在入队后才抓取会把该
+// ACK 当成旧 ACK 吞掉，执行器永久停在 FireQueued/ResetQueued。
+TEST(NetActuatorTest, AckArrivingBeforeSendReturnsStillAdvances) {
+    AckDuringSendSender sender(50);
+    auto actuator =
+        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Trigger());  // 触发 ACK 在 SendCommand 内到达
+
+    actuator->Update(Feedback(sender, true, 50));
+    EXPECT_EQ(sender.CallCount(), 2u) << "入队前到达的 ACK 不得被基线吞掉";
+    EXPECT_FALSE(actuator->Faulted());
+
+    // 复位 ACK 同样在 SendCommand 内到达：下一拍应完成稳定并回到 Ready。
+    actuator->Update(Feedback(sender, true, 50));
+    EXPECT_TRUE(actuator->Ready());
+    EXPECT_EQ(sender.CallCount(), 2u);
 }
 
 TEST(NetActuatorTest, ResetAckAndSettleMakesReady) {

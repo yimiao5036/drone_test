@@ -39,7 +39,9 @@ Faulted：终态，Update/Trigger/Reset 均不再产生命令
 - **IN_PROGRESS（5）**：保持原等待态，继续等待最终 ACK，不判故障。
 - **无关 ACK**：`last_command != 187` 的新 ACK 被忽略，不推进也不判故障。
 - **ACK 判定**：以 `matched_count/timeout_count` 基线识别“新到达”的 ACK，
-  同一 ACK 不会被重复消费；不做 ACK 重试。
+  同一 ACK 不会被重复消费；不做 ACK 重试。基线在命令入队（`SendNorm()`）
+  **之前**抓取——PX4 worker 可能在 `SendCommand()` 返回前就完成命令往返，
+  入队后再抓会把该 ACK 吞掉，导致执行器永久停在等待态。
 - **发数**：`Trigger()` 成功入队才扣发数（1→0）；入队失败保留 pending，
   调用方下拍重试，发数不变。复位不恢复发数，故单发执行器全生命周期只触发一次。
 - **手动 `Reset()`**：取消进行中的保持/复位周期，立即发复位行程并回到 Ready，

@@ -64,12 +64,16 @@ public:
         if (state_ != State::kReady || remaining_shots_ == 0) {
             return false;
         }
+        // 基线必须在入队前抓取：PX4 worker 可能在 SendCommand() 返回前就把
+        // 该命令的 ACK 写入快照；入队后再抓会把这个 ACK 当成旧 ACK 吞掉，
+        // 执行器将永久停在等待态（既不推进也不故障）。
+        CaptureAckBaseline();
         if (!SendNorm(config_.net_fire_norm, "触发")) {
             return false;
         }
         remaining_shots_ = 0;
         fired_ = true;
-        BeginWait(State::kFireQueued);
+        state_ = State::kFireQueued;
         return true;
     }
 
@@ -101,10 +105,12 @@ public:
             state_ = State::kHolding;
         }
         if (state_ == State::kHolding && feedback.now_ms >= hold_deadline_ms_) {
+            // 同 Trigger：复位命令的 ACK 也可能在入队返回前到达，先抓基线。
+            CaptureAckBaseline();
             if (!SendNorm(config_.net_idle_norm, "复位行程")) {
                 return;  // 连接正常但队列满：下拍重试
             }
-            BeginWait(State::kResetQueued);
+            state_ = State::kResetQueued;
             return;
         }
         if (state_ == State::kResetAcked) {
@@ -135,12 +141,12 @@ private:
         kFaulted,
     };
 
-    /// 记下当前 ACK/超时计数基线，之后只处理“新到达”的 ACK。
-    void BeginWait(State next) {
+    /// 抓取 ACK/超时计数基线，之后只处理“新到达”的 ACK。
+    /// 必须在对应命令入队（SendNorm）之前调用，见 Trigger/Update 中的说明。
+    void CaptureAckBaseline() {
         const auto ack = sender_->AckStatus();
         ack_baseline_ = ack.matched_count;
         timeout_baseline_ = ack.timeout_count;
-        state_ = next;
     }
 
     /// 处理本拍新到达的 ACK/超时。返回 true 表示已判故障、本拍不再推进。
