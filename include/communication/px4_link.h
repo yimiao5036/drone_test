@@ -8,7 +8,9 @@
  *
  * 当前实现阶段：
  * - Px4Link 已实现独占串口线程、MAVLink 1/2 心跳、连接超时、版本与飞行遥测快照；
- * - 可靠命令队列、ACK 和安全遥测请求已实现；设定值与串口自动重连后续接入；
+ * - 可靠命令队列、ACK、安全遥测请求和本地 NED 设定值已实现；
+ * - 串口连续读错误时关闭端口并按 reconnect_interval 自动重开（UDP 不重连）；
+ *   断链期间发布 connected=false 快照，控制器授权链随之停发；
  * - Px4LinkStub 继续保留用于骨架冒烟测试。
  *
  * 数据流：
@@ -105,6 +107,7 @@ struct Px4LinkConfig {
     std::chrono::milliseconds heartbeat_timeout{3000};
     std::chrono::milliseconds telemetry_timeout{2000};
     std::chrono::milliseconds state_publish_interval{100};
+    /// 串口连续读错误后关闭端口的重试周期（仅 transport=serial；UDP 不重连）。
     std::chrono::milliseconds reconnect_interval{1000};
     std::chrono::milliseconds command_ack_timeout{1000};
     std::chrono::milliseconds setpoint_send_interval{50};

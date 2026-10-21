@@ -17,10 +17,11 @@
 - 维护 connected、armed、PX4 main/sub mode 和 system status；
 - 解析固件版本/能力、落地、全局/局部位置、姿态、GPS、电池、Home 和 RC；
 - 心跳超时后将连接状态置为断开，各类遥测按 `telemetry_timeout` 独立失效；
+- **串口连续读错误时关闭端口，按 `reconnect_interval` 自动重开**；UDP 不重连；
 - 周期及状态变化时发布 `Topic<FlightStateSnapshot>`；
 - Start/Stop 幂等，停止后可以重新启动。
 
-当前不做：姿态设定值、全局坐标设定值和串口运行时自动重连。`Px4Setpoint` 的本地 NED
+当前不做：姿态设定值、全局坐标设定值。`Px4Setpoint` 的本地 NED
 位置/速度发送、可靠 `COMMAND_LONG` 队列、ACK 和安全遥测请求已经实现。
 
 `Px4LinkStub` 继续保留，仅供骨架冒烟测试，不参与真实硬件通信。
@@ -269,12 +270,33 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 若停止前已连接，会发布最终 `connected=false` 快照。再次 `Start()` 时重置 MAVLink 半包、发送序号、
 状态快照和心跳时间，不恢复旧控制状态。
 
+### 3.8 串口断链与自动重连
+
+仅 `transport=serial`：
+
+1. `Read()` 连续返回错误达到 3 次（单次 EINTR/瞬时错误不触发）→ 判定串口/设备丢失；
+2. 立即 `connected=false`、清命令队列与在途 ACK、清设定值缓存、失效遥测，发布断开快照；
+3. `transport_->Close()`，按 `reconnect_interval` 周期 `Open()` 重试；
+4. 重连成功：重置 MAVLink 半包/解析状态、遥测时间与固件上报标记，保持
+   `connected=false`，等待新的 PX4 HEARTBEAT；心跳到达后再置 connected；
+5. 断链期间 Worker 不发送心跳/setpoint，不读取旧 fd；重连失败只写节流 WARN
+   （首次 + 每 10 次），进程不退出；
+6. `Stop()` 可随时打断重连等待并正常关闭。
+
+`FlightController` 通过快照 `connected` 观察断链，授权链立即撤权并停发；
+正式程序不会因串口断开退出，视频/地面站继续运行。重连成功后控制是否恢复仍由
+现有授权链（PX4 connected+armed+Offboard+请求位）决定，不恢复旧命令队列。
+UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复）。
+
+日志：断链一条 WARN（含原因/设备/重试周期）；重连成功一条 INFO（含尝试次数）；
+重连失败首次与每 10 次 WARN；底层串口错误仍由 `SerialPort` 节流记录。
+
 ## 4. 日志行为
 
 | 等级 | 场景 |
 |---|---|
-| INFO | 创建/销毁、启动/停止、首次心跳、遥测请求入队、命令 ACK、固件版本、正常停止 |
-| WARN | 心跳超时、固件不一致、命令队列满、ACK 超时、非法/过期设定值（均节流） |
+| INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、命令 ACK、固件版本、正常停止 |
+| WARN | 心跳超时、串口断链/重连失败、固件不一致、命令队列满、ACK 超时、非法/过期设定值（均节流） |
 | ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
 
 不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
@@ -293,6 +315,7 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 - 落地、GPS、全局/局部位置、姿态、电池、Home、RC、固件版本与 capabilities；
 - `FlightStateSnapshot` 发布、消息头和 NED frame ID；
 - 心跳超时断开并发布快照；
+- 串口读错误后关闭旧端口、重开同一路径，并在新 PTY 心跳到达后恢复 connected；
 - 遥测超时后有效标志清零但心跳连接保持；
 - 忽略非目标 system ID；
 - Stop 后重新 Start；

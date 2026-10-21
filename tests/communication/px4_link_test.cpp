@@ -51,6 +51,14 @@ public:
 
     const std::string& SlaveName() const { return slave_name_; }
 
+    /// 关闭主端模拟 USB 串口拔出：从端后续 read/poll 会返回 HUP/EIO。
+    void CloseMaster() {
+        if (master_fd_ >= 0) {
+            ::close(master_fd_);
+            master_fd_ = -1;
+        }
+    }
+
     bool Write(const std::vector<uint8_t>& data) const {
         std::size_t written = 0;
         while (written < data.size()) {
@@ -284,6 +292,53 @@ TEST(Px4LinkTest, HeartbeatTimeoutPublishesDisconnectedState) {
         }
     }
     EXPECT_TRUE(found_disconnected_snapshot);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, SerialReadErrorReopensDeviceAndReconnects) {
+    // 用符号链接指向 PTY 从端：关闭旧 master 模拟 USB 串口拔出，再把同一个
+    // 路径指向新 PTY，验证 Px4Link 关闭旧 fd、按 reconnect_interval 重开并在
+    // 新链路心跳到达前保持 disconnected。
+    const std::string link_path =
+        "/tmp/px4_link_reconnect_" + std::to_string(::getpid());
+    struct LinkPathCleanup {
+        std::string path;
+        ~LinkPathCleanup() { ::unlink(path.c_str()); }
+    } cleanup{link_path};
+    ::unlink(link_path.c_str());
+
+    PseudoTerminal first;
+    ASSERT_EQ(::symlink(first.SlaveName().c_str(), link_path.c_str()), 0);
+    auto config = MakeConfig(link_path);
+    config.reconnect_interval = 50ms;
+    config.heartbeat_timeout = 200ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(first.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    // 旧 PTY master 关闭：读端收到 HUP/EIO，Px4Link 应进入重连并发布断开快照。
+    first.CloseMaster();
+    ASSERT_TRUE(WaitUntil([&link] { return !link.IsConnected(); }, 1000ms));
+    ASSERT_TRUE(WaitUntil([&link] { return !link.LatestState().connected; }, 1000ms));
+
+    PseudoTerminal second;
+    ASSERT_EQ(::unlink(link_path.c_str()), 0);
+    ASSERT_EQ(::symlink(second.SlaveName().c_str(), link_path.c_str()), 0);
+
+    // 重连成功后才会重新打开新从端；持续发送心跳直到 connected 恢复。
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!link.IsConnected() && std::chrono::steady_clock::now() < deadline) {
+        (void)second.Write(EncodePx4Heartbeat(
+            px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0));
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(link.IsConnected());
+    EXPECT_TRUE(link.LatestState().connected);
+
     link.Stop();
 }
 

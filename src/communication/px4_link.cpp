@@ -1,5 +1,6 @@
 #include "communication/px4_link.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -33,10 +34,19 @@ namespace {
 //   - 解析 PX4 飞行遥测（落地/全局/局部位置、姿态、GPS、电池、Home、RC、固件），
 //     按 telemetry_timeout 独立判新，发布 FlightStateSnapshot；
 //   - 可靠 COMMAND_LONG 命令队列 + ACK 匹配/超时，以及安全遥测请求；
-//   - 本地 NED 位置/速度设定值发送与过期保护。
-// 边界：不实现姿态/机体系/全局设定值；串口运行时自动重连本阶段未接入。
+//   - 本地 NED 位置/速度设定值发送与过期保护；
+//   - 串口连续读错误时关闭端口并按 reconnect_interval 自动重开（UDP 不重连）。
+// 边界：不实现姿态/机体系/全局设定值。
 // 线程模型：WorkerLoop 独占读写 transport，其它线程只能经 Topic/有界队列间接发送。
 // ============================================================================
+
+/// 串口连续读错误达到该次数即判定设备/链路丢失，进入重连。
+/// 单次 EIO/EINTR 不触发，避免把瞬时错误当成拔线。
+constexpr uint32_t kSerialReadErrorReconnectThreshold = 3;
+/// 重连失败日志：首次 + 每 10 次，避免设备长期不在时刷屏。
+bool ShouldLogReconnectAttempt(uint64_t attempts) {
+    return attempts == 1 || attempts % 10 == 0;
+}
 
 // 异常日志节流：第 1 次与每满 100 次打印，防止高频刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
@@ -142,6 +152,10 @@ public:
             next_command_sequence_.store(1, std::memory_order_relaxed);
             telemetry_requests_queued_ = false;
             firmware_version_logged_ = false;
+            reconnect_pending_ = false;
+            read_error_streak_ = 0;
+            next_reconnect_ms_ = 0;
+            reconnect_attempts_ = 0;
             connected_.store(false, std::memory_order_release);
 
             if (setpoint_topic_ != nullptr) {
@@ -333,6 +347,79 @@ private:
         }
     }
 
+    /// 串口读错误达到阈值：立即置断开、清命令/遥测，关闭 fd，并按
+    /// reconnect_interval 重开。该函数只由 WorkerLoop 调用；UDP 不重连。
+    void EnterSerialReconnect(const char* reason, uint64_t now_ms) {
+        if (config_.transport != "serial" || reconnect_pending_) {
+            return;
+        }
+        reconnect_pending_ = true;
+        reconnect_attempts_ = 0;
+        read_error_streak_ = 0;
+        connected_.store(false, std::memory_order_release);
+        state_.connected = false;
+        telemetry_requests_queued_ = false;
+        ClearCommands();
+        cached_setpoint_.reset();
+        InvalidateVolatileState();
+        next_reconnect_ms_ = now_ms + static_cast<uint64_t>(
+                                          config_.reconnect_interval.count());
+        try {
+            transport_->Close();
+        } catch (const std::exception& error) {
+            SPDLOG_WARN("PX4 串口关闭失败（继续重连）: {}", error.what());
+        }
+        SPDLOG_WARN("PX4 串口链路中断，关闭端口准备重连: reason={} device={} "
+                    "interval_ms={}",
+                    reason, config_.serial.device,
+                    config_.reconnect_interval.count());
+        // 立即发布断开快照，FlightController 授权链随之撤权停发。
+        PublishState(now_ms);
+    }
+
+    /// 按 reconnect_interval 尝试重开串口；成功后重置解析器/遥测并等待心跳，
+    /// 失败只记录节流 WARN，工作线程保持运行。
+    void TrySerialReconnect(uint64_t now_ms) {
+        if (!reconnect_pending_ || config_.transport != "serial" ||
+            now_ms < next_reconnect_ms_) {
+            return;
+        }
+        ++reconnect_attempts_;
+        try {
+            transport_->Open();
+            transport_->Flush();
+            mavlink_.Reset();
+            state_ = common::FlightStateSnapshot{};
+            last_heartbeat_time_ms_ = 0;
+            ResetTelemetryTimes();
+            ClearCommands();
+            cached_setpoint_.reset();
+            telemetry_requests_queued_ = false;
+            firmware_version_logged_ = false;
+            rc_link_present_ = false;
+            connected_.store(false, std::memory_order_release);
+            reconnect_pending_ = false;
+            read_error_streak_ = 0;
+            SPDLOG_INFO("PX4 串口重连成功: device={} attempts={}，等待心跳",
+                        config_.serial.device, reconnect_attempts_);
+            // 重置后的快照必须是断开态；收到新心跳后才重新 connected。
+            PublishState(now_ms);
+        } catch (const std::exception& error) {
+            try {
+                transport_->Close();
+            } catch (...) {
+            }
+            next_reconnect_ms_ = now_ms + static_cast<uint64_t>(
+                                              config_.reconnect_interval.count());
+            if (ShouldLogReconnectAttempt(reconnect_attempts_)) {
+                SPDLOG_WARN("PX4 串口重连失败: device={} attempts={} error={}"
+                            "（下次 {} ms 后重试）",
+                            config_.serial.device, reconnect_attempts_, error.what(),
+                            config_.reconnect_interval.count());
+            }
+        }
+    }
+
     // 通信线程主循环：读传输 → 解析 MAVLink → 消费设定值 → 检查心跳/命令超时 →
     // 发送下一条命令与到期的心跳/设定值/状态快照。
     void WorkerLoop() {
@@ -342,18 +429,36 @@ private:
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
+            const uint64_t loop_now_ms = MonotonicMs();
+            if (reconnect_pending_) {
+                TrySerialReconnect(loop_now_ms);
+                // 重连期间不读旧 fd、不发心跳/setpoint；短暂睡眠避免空转。
+                const auto wait = std::min(config_.reconnect_interval,
+                                           std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(wait);
+                continue;
+            }
+
             const std::ptrdiff_t count = transport_->Read(read_buffer.data(), read_buffer.size());
             if (count > 0) {
+                read_error_streak_ = 0;
                 mavlink_.Feed(
                     read_buffer.data(), static_cast<std::size_t>(count),
                     [this](const mavlink_message_t& message) { HandleMessage(message); });
             } else if (count < 0) {
                 error_count_.fetch_add(1, std::memory_order_relaxed);
-                // 串口持续异常时避免通信线程无等待自旋；自动关闭/重连在下一阶段接入。
+                if (config_.transport == "serial" &&
+                    ++read_error_streak_ >= kSerialReadErrorReconnectThreshold) {
+                    EnterSerialReconnect("连续串口读取错误", loop_now_ms);
+                    continue;
+                }
+                // 串口持续异常时避免通信线程无等待自旋；UDP 仍只按读超时退避。
                 const auto retry_delay = config_.transport == "serial"
                                              ? config_.serial.read_timeout
                                              : config_.udp.read_timeout;
                 std::this_thread::sleep_for(retry_delay);
+            } else {
+                read_error_streak_ = 0;
             }
 
             const auto now = std::chrono::steady_clock::now();
@@ -1105,6 +1210,12 @@ private:
     bool rc_link_present_ = false;
     bool firmware_version_logged_ = false;
     bool telemetry_requests_queued_ = false;
+
+    // 串口重连（仅 WorkerLoop 访问）：读错误连续计数、待重连标志与重试时刻。
+    bool reconnect_pending_ = false;
+    uint32_t read_error_streak_ = 0;
+    uint64_t next_reconnect_ms_ = 0;
+    uint64_t reconnect_attempts_ = 0;
 
     std::mutex command_mutex_;
     std::deque<CommandRequest> command_queue_;
