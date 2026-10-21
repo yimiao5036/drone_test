@@ -13,12 +13,12 @@
  * 判丢语义映射为零速刹车意图。是否真正输出由 FlightController 授权链与
  * enable_control 装配门禁决定。
  * 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）经
- * MAV_CMD_DO_SET_ACTUATOR 发一次捕网触发命令、离开拦截序列发复位行程
- * （actuator 配置节，PWM 微秒 → -1..1 归一化）。
+ * INetActuator 抽象接口触发一次、离开拦截序列复位；当前 single_pwm 实现
+ * 发送 MAV_CMD_DO_SET_ACTUATOR（PWM 微秒 → -1..1 归一化），后续多发实现
+ * 通过 actuator.type 工厂切换，状态机不感知通道/弹仓结构。
  */
 #include "state_machine/mission_state_machine.h"
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -41,6 +41,7 @@
 #include "control/tracking_types.h"
 #include "perception/geodetic_converter.h"
 #include "perception/target_estimator.h"
+#include "state_machine/net_actuator.h"
 
 namespace drone::state_machine {
 namespace {
@@ -105,10 +106,6 @@ constexpr uint8_t kFrameLocalNed = 3;
 /// 热备份年龄核对周期（设计 §2.4「S7 期间每秒核对」）。
 constexpr uint64_t kHotBackupCheckIntervalMs = 1000;
 /// MAV_CMD_DO_SET_ACTUATOR（MAVLink common.xml #187，Task 10 捕网触发）。
-/// 参数语义（third_party/c_library_v2 common.xml）：p1..p6 = Actuator Set 1..6
-/// 归一化值（-1..1，NaN=忽略不改动）；p7 = 执行器组序号（PX4 仅处理 0）。
-/// 状态机不引 MAVLink 头，命令号以常量携带（与 px4_link 的数值约定一致）。
-constexpr uint16_t kMavCmdDoSetActuator = 187;
 /// 弧度 → 度换算（视线角与视场半角比较统一用度，与配置项单位一致）。
 constexpr double kRadToDeg = 57.29577951308232;
 /// 交接状态迁移原因（状态转移日志用，中文可读）。
@@ -300,11 +297,10 @@ public:
                              config.tracking.camera.cx_px),
           elevation_converter_(config.tracking.camera.fy_px,
                                config.tracking.camera.cy_px) {
-        // 执行器配置构造期兜底校验（Task 10 评审遗留）：`SendNetActuatorStroke`
-        // 以 `params[net_channel-1]` 索引固定 7 元素数组，程序化构造的越界
-        // channel（如 8）即 UB、channel=7 会静默无效。配置加载期
-        // （`LoadAppConfig`）已校验，此处对程序化构造 fail-fast，先例见
-        // FlightController 构造期 period 防御。
+        // 执行器配置构造期兜底校验：single_pwm 实现最终以
+        // `params[net_channel-1]` 索引固定 7 元素数组，程序化构造的越界
+        // channel（如 8）即 UB。配置加载期（`LoadAppConfig`）已校验，此处
+        // 对程序化构造 fail-fast，先例见 FlightController 构造期 period 防御。
         config.actuator.Validate();
         // 拦截入口与返航配置构造期兜底（程序化构造非法值 fail-fast）。
         config.interception.Validate();
@@ -484,7 +480,13 @@ public:
             return;
         }
         command_sender_ = sender;
-        SPDLOG_INFO("任务状态机 PX4 命令接口已注入: sender={}", static_cast<const void*>(sender));
+        net_actuator_.reset();
+        if (sender != nullptr) {
+            net_actuator_ = CreateNetActuator(actuator_config_, sender);
+        }
+        SPDLOG_INFO("任务状态机 PX4 命令接口已注入: sender={} net_type={}",
+                    static_cast<const void*>(sender),
+                    net_actuator_ ? net_actuator_->Type() : "disabled");
     }
 
     /// 注入目标估计器诊断接口（交接创新门限的数据来源）。必须在Start前调用；
@@ -1368,8 +1370,8 @@ private:
     /// 迁移与评估（Evaluate 末段调用），S10 驻留远长于决策周期，不存在漏触发；
     /// 无生产入口的拦截序列经 ForceStateForTest 驱动时同样满足该时序约束。
     void EvaluateNetActuator() {
-        if (command_sender_ == nullptr) {
-            return;  // 物理缺席：不产生任何命令
+        if (net_actuator_ == nullptr) {
+            return;  // 物理缺席（影子/未开控制）：不产生任何命令
         }
         const auto state = CurrentState();
         const bool in_intercept_sequence =
@@ -1385,44 +1387,13 @@ private:
             net_sequence_active_ = true;
         }
         if (net_reset_pending_) {
-            // 复位行程：入队成功才清除，失败下拍重试
-            net_reset_pending_ =
-                !SendNetActuatorStroke(actuator_config_.net_idle_pwm, "复位行程");
+            // 复位：入队成功才清除，失败下拍重试
+            net_reset_pending_ = !net_actuator_->Reset();
             return;
         }
         if (state == common::MissionState::kInterceptExecuting && !net_fired_) {
-            net_fired_ =
-                SendNetActuatorStroke(actuator_config_.net_fire_pwm, "触发");
+            net_fired_ = net_actuator_->Trigger();
         }
-    }
-
-    /// 发送一条捕网行程命令（触发/复位共用）。参数按 MAV_CMD_DO_SET_ACTUATOR
-    /// 规范组装：仅本通道对应的参数位填归一化值（PWM 微秒按输出映射区间换算
-    /// 为 -1..1），其余参数位 NaN（规范语义"忽略"，不得填 0——0 为中位行程，
-    /// 会误动其他执行器组）；p7=执行器组序号固定 0（PX4 仅处理组 0）。
-    /// @return 是否成功入队（false=链路未就绪/队列满，由调用方决定重试）。
-    bool SendNetActuatorStroke(double pwm_us, const char* action) {
-        const int32_t channel = actuator_config_.net_channel;
-        const double normalized = actuator_config_.NormalizePwm(pwm_us);
-        std::array<float, 7> params;
-        params.fill(std::numeric_limits<float>::quiet_NaN());
-        params[static_cast<std::size_t>(channel - 1)] =
-            static_cast<float>(normalized);
-        params[6] = 0.0F;
-        const bool queued = command_sender_->SendCommand(
-            kMavCmdDoSetActuator, params[0], params[1], params[2], params[3],
-            params[4], params[5], params[6]);
-        if (queued) {
-            SPDLOG_WARN("捕网执行器{}命令已入队: channel={} pwm={:.0f}us norm={:.2f}",
-                        action, channel, pwm_us, normalized);
-            return true;
-        }
-        const uint64_t count = ++net_command_fail_count_;
-        if (ShouldLogThrottled(count)) {
-            SPDLOG_WARN("捕网执行器{}命令入队失败（下拍重试）: channel={} count={}",
-                        action, channel, count);
-        }
-        return false;
     }
 
     // ---- 拦截后返航/降落（S11~S14，2026-10-19 V1 单发口径） ----
@@ -1825,8 +1796,11 @@ private:
     common::Topic<common::VisualTargetStatus>* visual_status_topic_ = nullptr;
     common::Topic<common::StereoTargetDistance>* distance_topic_ = nullptr;
     /// PX4 命令窄接口（仅 enable_control=true 装配期注入）。当前消费点：
-    /// 捕网执行器触发/复位（Task 10，EvaluateNetActuator）；未注入时零调用。
+    /// S13 AUTO.LAND / S14 DISARM；未注入时零调用。
     communication::IPx4CommandSender* command_sender_ = nullptr;
+    /// 捕网执行器抽象（随命令接口注入创建；actuator.type 工厂选择单发/未来多发）。
+    /// 为空=影子/未开控制，触发/复位物理缺席。
+    std::unique_ptr<INetActuator> net_actuator_;
     /// 估计器诊断接口（只读；交接创新门限的数据来源，Start 前注入）。
     const perception::ITargetEstimator* estimator_diagnostics_ = nullptr;
 
@@ -1916,8 +1890,6 @@ private:
     bool net_sequence_active_ = false;
     /// 复位行程待入队（离开拦截序列置位；入队成功清除，失败下拍重试）。
     bool net_reset_pending_ = false;
-    /// 捕网命令入队失败累计计数（节流日志用）。
-    uint64_t net_command_fail_count_ = 0;
     // ---- 拦截后返航（S11~S14，2026-10-19）----
     bool interception_fired_ = false;       ///< 单发命令已入队
     bool interception_fire_timeout_ = false;///< 单发命令重试超时

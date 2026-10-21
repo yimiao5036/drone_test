@@ -147,14 +147,16 @@ target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
 # ---- state_machine 模块（任务状态机接口） ----
 add_library(drone_state_machine STATIC
-    src/state_machine/mission_state_machine.cpp)
+    src/state_machine/mission_state_machine.cpp
+    src/state_machine/net_actuator.cpp)
 target_include_directories(drone_state_machine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_state_machine PUBLIC cxx_std_17)
 # control 模块：交接判据复用 PixelToAngle 视线角换算（Task 9 起还复用
-# TrackingControlLaw）。config 模块：捕网执行器行程换算（Task 10 起复用
-# ActuatorConfig::NormalizePwm）。perception：返航 Home 局部 NED 换算
-# （GeodeticToLocalNed，S11~S14）。静态库依赖经 LINK_ONLY 传播给最终可执行文件。
+# TrackingControlLaw）。config 模块：捕网执行器配置（Task 10 起复用
+# ActuatorConfig；归一化量直接下发，PX4 负责 PWM 映射）。perception：返航
+# Home 局部 NED 换算（GeodeticToLocalNed，S11~S14）。静态库依赖经 LINK_ONLY
+# 传播给最终可执行文件。
 target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog drone_control_core
     drone_config drone_perception)
 

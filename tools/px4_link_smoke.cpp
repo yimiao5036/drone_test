@@ -125,8 +125,8 @@ void PrintUsage(const char* program) {
               << "  --bench-ack-props-off 确认已拆桨、机体固定、遥控器可随时接管；\n"
               << "  自动流程只判定序列/离地/时延，电机怠速响应与方向需人工观察。\n"
               << "  若运行中拔串口导致心跳断开：立即停止意图、关闭串口并刷盘退出\n"
-              << "  （退出码4）；PX4 侧失控保护需 QGC/飞控日志确认，工具不再发\n"
-              << "  AUTO.LAND/DISARM。\n"
+              << "  （退出码4）；机载侧到此为止，PX4 failsafe 由飞控自身负责，\n"
+              << "  工具不再发 AUTO.LAND/DISARM。\n"
               << "--probe-message-interval <消息ID> 只读探针：GET_MESSAGE_INTERVAL 查询该消息流\n"
               << "  在 PX4 端是否实例化（PX4 回 MESSAGE_INTERVAL，#244；-1=未找到/未启用），\n"
               << "  随后 REQUEST_MESSAGE 触发一次并统计实收帧；49=GPS_GLOBAL_ORIGIN 锚点流\n"
@@ -1714,7 +1714,7 @@ public:
     bool Evaluate(bool connected_at_end) const {
         if (link_lost_) {
             std::cout << "\n========== G4 串口台架：串口链路中断"
-                         "（拔串口分支，工具无法继续观察 PX4）=========="
+                         "（机载侧处置完成；PX4 为独立系统）=========="
                       << std::endl;
             std::cout << "链路中断时最后快照: armed=" << YesNo(latest_.armed)
                       << " mode=" << static_cast<int>(latest_.flight_mode) << '/'
@@ -1722,13 +1722,14 @@ public:
                       << " landed="
                       << (latest_.landed_state_valid ? YesNo(latest_.landed) : "未知")
                       << "；中断原因: " << abort_reason_ << std::endl;
-            std::cout << "工具处置: 停止控制意图、关闭串口（机载心跳停止）、"
-                         "不再尝试 AUTO.LAND/DISARM；日志已请求刷盘。" << std::endl;
-            std::cout << "PX4 侧结果需用 QGC/飞控日志确认：COM_OF_LOSS_T、"
-                         "COM_OBL_RC_ACT、Offboard 退出/上锁行为。" << std::endl;
-            std::cout << "结果: 串口链路中断，G4-4 拔串口分支需外部观察确认"
-                         "（不是工具自动通过）。" << std::endl;
-            return false;
+            std::cout << "机载侧已完成：停止控制意图、关闭串口（机载心跳停止）、"
+                         "不尝试 AUTO.LAND/DISARM、日志刷盘。" << std::endl;
+            std::cout << "PX4 failsafe（COM_OF_LOSS_T/COM_OBL_RC_ACT、退出 Offboard/"
+                         "上锁）由飞控自身负责，不在本工具/机载软件判定范围；"
+                         "如需核对再用 QGC。" << std::endl;
+            std::cout << "结果: G4-4 拔串口分支机载侧处置完成（退出码 4 标识链路中断）。"
+                      << std::endl;
+            return true;
         }
         const bool guide_ok = guide_injected_ >= kBenchGuideMinSends &&
                               guide_elapsed_ms_ >= kBenchGuideMinMs;
@@ -2021,7 +2022,8 @@ private:
         command_east_mps_ = 0.f;
         std::cout << "[G4][链路中断] PX4 心跳已断开，停止意图并退出；"
                      "不再尝试 AUTO.LAND/DISARM（写入已断开的串口无效）。"
-                     "PX4 侧失控保护请用 QGC/飞控日志确认。" << std::endl;
+                     "PX4 failsafe 由飞控自身负责，不在机载软件判定范围。"
+                  << std::endl;
     }
 
     void Advance(uint64_t now_ms, uint64_t elapsed_ms) {

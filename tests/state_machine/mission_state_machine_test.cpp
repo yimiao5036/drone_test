@@ -1296,10 +1296,10 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
 // 与生产路径共用同一 TransitionTo/决策线程挂点，触发/复位语义等同生产。
 // ---------------------------------------------------------------------------
 
-/// 触发行程 1100µs、复位行程 1900µs、输出映射区间 1000..2000µs 的归一化期望值：
-/// norm = 2·(pwm − 1000)/1000 − 1。
-constexpr float kNetFireNormalized = -0.8F;
-constexpr float kNetIdleNormalized = 0.8F;
+/// 单发捕网触发行程 1150µs、待机/复位 1500µs、输出映射区间 1000..2000µs
+/// 的归一化期望值：norm = 2·(pwm − 1000)/1000 − 1。
+constexpr float kNetFireNormalized = -0.7F;
+constexpr float kNetIdleNormalized = 0.0F;
 
 /// 命令窄接口假件：记录 SendCommand 调用（顺序/参数/入队结果）并可脚本化
 /// 前 N 次入队失败。

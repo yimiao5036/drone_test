@@ -81,22 +81,19 @@ struct FlightControllerConfig {
 };
 
 /// 捕网执行器配置（actuator 配置节，阶段四控制接入 Task 10）。
-/// 捕网机构为 PWM 行程型执行器，经 PX4 执行器通道驱动
-/// （MAV_CMD_DO_SET_ACTUATOR=187，命令窄接口 IPx4CommandSender）。
-/// 通道号/接线/行程参数待装机确认后冻结（G4 拆桨台架验证行程与方向）。
-/// 行程以 PWM 微秒填写；下发前按 PX4 输出映射区间归一到 [-1, 1]
-/// （PX4 把该区间线性映射回 PWM 输出，换算式见 NormalizePwm）。
+/// 机载只负责发送 MAV_CMD_DO_SET_ACTUATOR 的归一化控制量（-1..1）；
+/// PWM 通道功能、PWM_AUX_MINn/MAXn、舵机行程与方向在 PX4/QGC 侧配置，
+/// 机载不再保存 PWM 微秒或输出映射区间，避免两套系统重复维护。
+/// `net_channel` 是 Actuator Set N（1..6），不是物理 AUX 通道号。
 struct ActuatorConfig {
-    int32_t net_channel = 1;       ///< 捕网执行器通道号（1..6，对应 PX4 Actuator Set N）
-    double net_fire_pwm = 1100.0;  ///< 触发行程 PWM（微秒；待装机确认后冻结）
-    double net_idle_pwm = 1900.0;  ///< 复位/待命行程 PWM（微秒；待装机确认后冻结）
-    /// PX4 输出映射区间（微秒）：必须与该通道 PWM_AUX_MINn/PWM_AUX_MAXn
-    /// （PX4 默认 1000/2000）一致——归一化换算依赖该区间，装机后按实配核对。
-    double output_pwm_min_us = 1000.0;
-    double output_pwm_max_us = 2000.0;
-    /// PWM 行程（微秒）→ MAV_CMD_DO_SET_ACTUATOR 归一化参数（-1..1）：
-    /// norm = 2·(pwm − min)/(max − min) − 1。调用前须通过 Validate。
-    double NormalizePwm(double pwm_us) const;
+    /// 执行器实现类型：当前 `single_pwm`=单发舵机式；后续多发实现通过该键
+    /// 在工厂切换，状态机只依赖 INetActuator 抽象接口。
+    std::string type = "single_pwm";
+    int32_t net_channel = 1;        ///< PX4 Actuator Set N（1..6）
+    /// 归一化控制量：PX4 按该通道 PWM_AUX_MINn/MAXn 线性映射为 PWM。
+    /// 标准 1000..2000µs 映射下，-0.7→1150µs（发射）、0.0→1500µs（待机）。
+    double net_fire_norm = -0.7;    ///< 发射控制量（-1..1）
+    double net_idle_norm = 0.0;     ///< 待机/复位控制量（-1..1）
     void Validate() const;
 };
 

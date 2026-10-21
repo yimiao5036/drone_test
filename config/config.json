@@ -128,6 +128,11 @@
             "mount_z_m": 0.0
         }
     },
+    "actuator": {
+        "type": "single_pwm",
+        "net_fire_norm": -0.7,
+        "net_idle_norm": 0.0
+    },
     "interception": {
         "enabled": false,
         "auto_authorize": true,

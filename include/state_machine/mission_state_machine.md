@@ -33,15 +33,29 @@
 
 **与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
 
-阶段四新增（Task 10）：**捕网执行器命令（`MAV_CMD_DO_SET_ACTUATOR`）**——注入命令窄接口`IPx4CommandSender`后，状态机在进入 **S10（INTERCEPT_EXECUTING）** 时发一次捕网触发命令（`net_fired_`防重复；入队失败不置位、下拍重试），离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）时发**复位行程**并清除触发标志（机构归位到待命行程；复位入队失败同样下拍重试，且复位未入队前不发触发）。命令参数按配置换算：`actuator`节的 PWM 微秒行程经 PX4 输出映射区间归一到 **-1..1**（换算式见下），只有本通道对应的参数位填值、**其余参数位 NaN**（MAVLink 规范语义"忽略"；不得填 0——0 为中位行程，会误动其他执行器组），`p7=0`（执行器组序号，PX4 仅处理组 0）。
+阶段四新增（Task 10，2026-10-21 抽象化）：**捕网执行器 `INetActuator`**——注入命令窄接口
+`IPx4CommandSender`后，工厂按 `actuator.type` 创建实现（当前 `single_pwm`）。状态机在进入
+**S10（INTERCEPT_EXECUTING）** 时调用一次 `Trigger()`（`net_fired_`防重复；入队失败不置位、
+下拍重试），离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）调用 `Reset()` 并清除触发标志
+（机构归位待机；复位入队失败同样下拍重试，且复位未入队前不发触发）。状态机不感知单发/多发、
+通道数或弹仓结构；后续多发只需实现同一接口并在工厂按 `type` 接入。
 
-**MAVLink/PX4 语义核对（2026-10-13，实现前查证）**：`MAV_CMD_DO_SET_ACTUATOR=187` 的官方参数语义是 **p1..p6 = Actuator Set 1..6 的归一化值（-1..1，NaN=忽略）**、**p7 = 执行器组序号**——执行器"通道号"是**参数位**而非参数值。PX4 把 Actuator Set N 映射到配置了输出功能「Peripheral via Actuator Set N」的输出（`FunctionActuatorSet`，仅组 0、最多 6 组），并把 -1..1 线性映射到该输出的 PWM 区间（`PWM_AUX_MINn/MAXn`，默认 1000/2000µs）。因此实现**不把毫秒/微秒直填参数**，而是：
+**MAVLink/PX4 语义**：`MAV_CMD_DO_SET_ACTUATOR=187` 的 p1..p6 = Actuator Set 1..6 的
+归一化值（-1..1，NaN=忽略），p7=执行器组序号（PX4 仅组 0）。**PWM 输出功能、映射区间
+`PWM_AUX_MINn/MAXn`、舵机行程与方向全部在 PX4/QGC 侧配置**；机载只配置
+`actuator.net_channel` 和归一化量：
 
-```text
-norm = 2·(pwm_us − output_pwm_min_us) / (output_pwm_max_us − output_pwm_min_us) − 1
+```json
+"actuator": {
+  "type": "single_pwm",
+  "net_fire_norm": -0.7,
+  "net_idle_norm": 0.0
+}
 ```
 
-`output_pwm_min_us/max_us`为配置项（必须与所接通道的 `PWM_AUX_MINn/MAXn` 一致，装机后按实配核对）；行程必须落在该区间内（`ActuatorConfig::Validate` fail-fast，否则归一化超出 -1..1 不可表达）。默认行程 1100/1900µs 在默认区间下换算为 **-0.8 / +0.8**。换算公式的单测见`ConfigTest.ActuatorNormalizePwmMapsOutputRangeToMinusOneToOne`；实际行程方向/到位由 **G4 拆桨台架**核对。
+单发捕网在 PX4 标准 `1000/2000µs` 映射下对应 `1150µs 发射 / 1500µs 待机`。机载不再保存
+PWM 微秒或输出区间，避免与 PX4 参数重复维护。接口与工厂见
+`include/state_machine/net_actuator.h` / `.md`。
 
 **拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（占位值，待实机射程冻结）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、捕网未触发/无复位挂起。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
 
@@ -232,22 +246,22 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     退出路径 ④ 收口回 S5，不得无限续期）；发出后停发（`StopPositionIntent`）。
     交接段收口（含冻结清空、控制律`Reset`、热备份状态清零）统一在
     `ResetHandoverHysteresis`内完成。
-- **捕网执行器（Task 10）**（`EvaluateNetActuator` / `SendNetActuatorStroke`）：
+- **捕网执行器（Task 10，2026-10-21 抽象化）**（`EvaluateNetActuator` /
+  `INetActuator`）：
   - 判定按"状态驻留"而非"迁移边沿"：决策线程每拍末段评估（`Evaluate` 内迁移后
     立即调用，进入 S10 当拍触发、离开拦截序列当拍复位，无额外延迟）；
     拦截序列={S9, S10}，离开=任一其他状态（回退/返航/POST_INTERCEPT）。
-  - 触发语义：S10 内 `net_fired_` 未置位才发；`SendCommand` 成功（入队）才置位，
-    失败（PX4 未连接/命令队列满）节流 WARN 并下拍重试——触发命令不得因一次
-    入队失败而丢失。S9 只标记序列开始，不触发（设计：S10 才调用执行机构）。
-  - 复位语义：离开拦截序列置 `net_reset_pending_` 并当拍尝试发复位行程；
+  - 触发语义：S10 内 `net_fired_` 未置位才调用 `Trigger()`；返回 true（入队）
+    才置位，失败（PX4 未连接/命令队列满）节流 WARN 并下拍重试。S9 只标记序列
+    开始，不触发（设计：S10 才调用执行机构）。
+  - 复位语义：离开拦截序列置 `net_reset_pending_` 并当拍调用 `Reset()`；
     入队成功才清除，失败下拍重试；**复位未入队前不发触发**（先复位、后触发
     的次序在异常重试下仍保持）。`net_fired_` 随离开清除——再次进入 S10 是新
-    一次拦截（"防重复"仅限同一拦截段；设计 V1「一次上电一次拦截」由后续入口
-    判据承担，本层不越权裁决）。
-  - 参数组装：只有本通道参数位填归一化值，**其余位 NaN**（规范"忽略"；
-    0=中位行程会误动其他执行器组），p7=0。命令号 187 以常量携带
-    （`kMavCmdDoSetActuator`，状态机不引 MAVLink 头）。
-  - 门禁：`command_sender_==nullptr`（enable_control=false 装配语义）→ 零调用，
+    一次拦截；多发实现可自行在 `Trigger()` 内推进弹仓/通道。
+  - 命令参数（single_pwm）：只有本 Actuator Set 参数位填归一化值，**其余位
+    NaN**（规范"忽略"；0=中位行程会误动其他 Set），p7=0。机载只发 -0.7/0.0，
+    PWM 映射在 PX4 侧。
+  - 门禁：`net_actuator_==nullptr`（enable_control=false 装配语义）→ 零调用，
     本功能物理缺席；触发/复位同为控制输出，不另开旁路。
   - 进程退出不补发复位行程（`Stop()` 不触发机构动作）：机构实际位置由
     G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
@@ -257,7 +271,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `InterceptEntrySatisfied`——`interception.enabled`、视觉新鲜且 `LOCKED`、
   `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
   `[min_range_m,max_range_m]`、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
-  `command_sender_` 非空、`net_fired_/net_reset_pending_` 均为 false；可选
+  `net_actuator_` 非空、`net_fired_/net_reset_pending_` 均为 false；可选
   `min_battery_percent>0` 时还要求电池遥测有效且剩余电量达标（**当前生产保持 0，
   实机后冻结**）。满足→S9；
   S9 条件失效→S7；`auto_authorize=true`→S10；false 时等
@@ -296,10 +310,10 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   强推到 S9/S10 会在 `enable_control=true` 装配下经命令窄接口发出**不可逆的捕网
   触发命令**；单测与 SITL 验收工具显式置 true。生产侧另有 `interception.enabled`
   显式开关（默认 false）。
-- 构造期对 `actuator` 配置执行 `Validate()` 兜底（`SendNetActuatorStroke` 以
-  `params[net_channel-1]` 索引固定 7 元素参数数组：程序化构造的 channel 越界即 UB、
-  channel=7 静默无效）；配置加载期已校验，此处对程序化构造 fail-fast，先例见
-  FlightController 构造期 period 防御。
+- 构造期对 `actuator` 配置执行 `Validate()` 兜底（single_pwm 实现以
+  `params[net_channel-1]` 索引固定 7 元素参数数组：程序化构造的 Set 越界即 UB；
+  归一化值超出 [-1,1] 也会被拒）；配置加载期已校验，此处对程序化构造 fail-fast，
+  先例见 FlightController 构造期 period 防御。
 - 控制输出是否接 PX4 仍由`DroneApplication`的`enable_control`门禁决定（绑定
   `Px4Setpoint`+注入快照源+注入命令接口只在 true 分支）；诊断接口注入与
   `enable_control` 无关（只读诊断，影子期即可用）。
@@ -520,11 +534,10 @@ ctest --test-dir build --output-on-failure
   队列满）；三者都在调试时用状态转移日志确认当前是否真的到过 S10。
 - 捕网触发了但机构不动/行程反向：① 核对 PX4 侧该输出通道是否已分配「Peripheral
   via Actuator Set N」（N 与 `actuator.net_channel` 对应）且已解锁/预解锁
-  （PX4 默认在 disarmed 下不驱动执行器，台架用 pre-arm 状态测）；② 核对
-  `actuator.output_pwm_min_us/max_us` 与该通道 `PWM_AUX_MINn/MAXn` 是否一致
-  （不一致则归一化值对应的实际 PWM 偏移）；③ 行程方向以 **G4 台架**为准
-  （本层只保证换算与命令语义正确，方向属装机接线问题）；日志中的
-  `pwm/norm` 摘要即换算式输入输出，可反算核对。
+  （PX4 默认在 disarmed 下不驱动执行器，台架用 pre-arm 状态测）；② 核对 PX4
+  `PWM_AUX_MINn/MAXn` 与舵机实际行程（机载只发 -0.7/0.0，映射在 PX4 侧）；
+  ③ 行程方向以 **G4 台架**为准（本层只保证归一化命令语义正确，方向属 PX4/
+  接线配置）；日志中的 `set/norm` 摘要可核对。
 - 离开拦截序列后机构停在触发位：查「复位行程命令入队失败（下拍重试）」节流
   WARN——入队失败会持续重试直至成功；若从未出现复位日志，确认离开时是否
   真的到过 S9/S10（`net_sequence_active_` 只在对序列内状态驻留过之后才置位）。

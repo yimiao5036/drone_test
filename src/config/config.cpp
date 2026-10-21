@@ -549,33 +549,20 @@ void ReturnHomeConfig::Validate() const {
     }
 }
 
-double ActuatorConfig::NormalizePwm(double pwm_us) const {
-    return 2.0 * (pwm_us - output_pwm_min_us) /
-               (output_pwm_max_us - output_pwm_min_us) -
-           1.0;
-}
-
 void ActuatorConfig::Validate() const {
+    if (type != "single_pwm")
+        throw std::invalid_argument(
+            "actuator.type 目前仅支持 single_pwm（多发实现待接入）: " + type);
     if (net_channel < 1 || net_channel > 6)
         throw std::invalid_argument("actuator.net_channel 必须在 1~6（执行器组）之间");
-    if (!std::isfinite(net_fire_pwm) || net_fire_pwm <= 0.0)
-        throw std::invalid_argument("actuator.net_fire_pwm 必须为有限正数");
-    if (!std::isfinite(net_idle_pwm) || net_idle_pwm <= 0.0)
-        throw std::invalid_argument("actuator.net_idle_pwm 必须为有限正数");
-    if (!std::isfinite(output_pwm_min_us) || !std::isfinite(output_pwm_max_us) ||
-        output_pwm_max_us <= output_pwm_min_us)
-        throw std::invalid_argument(
-            "actuator 输出映射区间必须满足 output_pwm_max_us > output_pwm_min_us（有限值）");
-    if (net_fire_pwm < output_pwm_min_us || net_fire_pwm > output_pwm_max_us)
-        throw std::invalid_argument(
-            "actuator.net_fire_pwm 必须落在输出映射区间 [output_pwm_min_us, "
-            "output_pwm_max_us] 内（否则无法表达为 -1..1 执行器值）");
-    if (net_idle_pwm < output_pwm_min_us || net_idle_pwm > output_pwm_max_us)
-        throw std::invalid_argument(
-            "actuator.net_idle_pwm 必须落在输出映射区间 [output_pwm_min_us, "
-            "output_pwm_max_us] 内（否则无法表达为 -1..1 执行器值）");
-    if (net_fire_pwm == net_idle_pwm)
-        throw std::invalid_argument("actuator.net_fire_pwm 与 net_idle_pwm 不得相同");
+    if (!std::isfinite(net_fire_norm) || net_fire_norm < -1.0 ||
+        net_fire_norm > 1.0)
+        throw std::invalid_argument("actuator.net_fire_norm 必须在 [-1, 1] 内");
+    if (!std::isfinite(net_idle_norm) || net_idle_norm < -1.0 ||
+        net_idle_norm > 1.0)
+        throw std::invalid_argument("actuator.net_idle_norm 必须在 [-1, 1] 内");
+    if (net_fire_norm == net_idle_norm)
+        throw std::invalid_argument("actuator.net_fire_norm 与 net_idle_norm 不得相同");
 }
 
 // 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
@@ -861,21 +848,17 @@ AppConfig LoadAppConfig(const std::string& path,
             "（发射后必须有返航收口）");
     }
 
-    // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：通道号/行程/输出
-    // 映射区间全部可选，缺席回退默认值；通道号仅 1..6（MAV_CMD_DO_SET_ACTUATOR
-    // 的执行器组），行程必须落在输出映射区间内（否则无法表达为 -1..1）。
-    // 装机确认（G4 台架）前不要显式改配：参数错误直接转化为行程/方向错误。
+    // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：机载只保存
+    // Actuator Set N 与归一化控制量；PWM 输出功能/区间/舵机行程在 PX4 侧配置。
     const json actuator = root.value("actuator", json::object());
+    config.actuator.type =
+        actuator.value("type", config.actuator.type);
     config.actuator.net_channel =
         actuator.value("net_channel", config.actuator.net_channel);
-    config.actuator.net_fire_pwm = ReadOptionalPositiveDouble(
-        actuator, "net_fire_pwm", config.actuator.net_fire_pwm);
-    config.actuator.net_idle_pwm = ReadOptionalPositiveDouble(
-        actuator, "net_idle_pwm", config.actuator.net_idle_pwm);
-    config.actuator.output_pwm_min_us = ReadOptionalPositiveDouble(
-        actuator, "output_pwm_min_us", config.actuator.output_pwm_min_us);
-    config.actuator.output_pwm_max_us = ReadOptionalPositiveDouble(
-        actuator, "output_pwm_max_us", config.actuator.output_pwm_max_us);
+    config.actuator.net_fire_norm =
+        actuator.value("net_fire_norm", config.actuator.net_fire_norm);
+    config.actuator.net_idle_norm =
+        actuator.value("net_idle_norm", config.actuator.net_idle_norm);
     config.actuator.Validate();
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。

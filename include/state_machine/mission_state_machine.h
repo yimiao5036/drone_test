@@ -65,11 +65,12 @@ struct MissionStateMachineConfig {
     std::chrono::milliseconds visual_stale{200};
     /// 双目测距超龄阈值（visual_tracking.control.distance_stale_ms 同源）。
     std::chrono::milliseconds distance_stale{500};
-    /// 捕网执行器配置（actuator 配置节同源注入，阶段四 Task 10）：进入拦截
-    /// 执行态（S10）触发、离开拦截序列（S9/S10 → 回退/返航/POST_INTERCEPT）
-    /// 复位；未注入命令接口（enable_control=false 装配语义）时本功能物理缺席。
-    /// 构造期对其实施 `Validate()` 兜底（程序化构造的 channel 越界会索引固定
-    /// 7 元素参数数组，属 UB；参照 FlightController 构造期 period 防御先例）。
+    /// 捕网执行器配置（actuator 配置节同源注入，阶段四 Task 10）：状态机只
+    /// 通过 INetActuator 抽象接口在 S10 触发、离开拦截序列复位；当前
+    /// `type=single_pwm` 发送归一化 -0.7/0.0，PWM 映射在 PX4/QGC 侧配置。
+    /// 未注入命令接口（enable_control=false 装配语义）时本功能物理缺席。
+    /// 构造期对其实施 `Validate()` 兜底（程序化构造的非法 Set/归一化值
+    /// fail-fast；参照 FlightController 构造期 period 防御先例）。
     config::ActuatorConfig actuator;
     /// S9/S10 入口判据与授权（interception 配置节，2026-10-19）。默认关闭，
     /// 需实机射程/授权策略验证后开启。
