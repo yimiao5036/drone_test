@@ -180,6 +180,10 @@ struct TakeoffConfig {
     double max_vz_mps = 0.3;                       ///< 到达判据：垂直速度
     std::chrono::milliseconds target_wait_timeout{10000};  ///< 等待目标位置超时
     std::chrono::milliseconds target_lost_timeout{10000};  ///< 目标丢失收口超时
+    /// S5 目标失效期间“原地保持”的累计时长上限（绝对兜底）。目标反复闪烁时
+    /// target_lost_timeout 每次恢复都会清零，单靠它无法防止无限悬停；本上限按
+    /// 本次 S5 内累计保持时长收口，超限 → 65015 aborted + S12 返航。
+    std::chrono::milliseconds target_hold_max{60000};
     std::chrono::milliseconds battery_low_debounce{1000};  ///< 低电防抖时长
     void Validate() const;
 };

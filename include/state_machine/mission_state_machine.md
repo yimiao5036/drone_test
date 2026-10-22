@@ -85,6 +85,12 @@ bit4 =「捕网执行器 ACK 故障」（`kWarningActuatorFault`）。触发条�
 故障为终态，bit4 持续置位（不再叠加其余告警位）直至重启，供地面站识别“任务已中止、交
 PX4/遥控”。
 
+**目标保持告警位 bit5（2026-10-22）**：`MissionStatus.active_warning_bits`
+bit5 =「S5 目标失效保持中」（`kWarningTargetHold`）。目标不可用且正在发原地保持
+位置意图（原因码 9）时置位；目标恢复（连续 3 拍）或离开 S5 后清除。与 bit1
+（目标过期）可同时出现——bit1 表示“目标已过期”，bit5 表示“控制流已切换为原地
+保持”。映射表见 `docs/数据接口文档.md` §3.4/§3.5。
+
 **G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
 
 本阶段仍不做以下事情：
@@ -141,6 +147,33 @@ PX4/遥控”。
   - 中止当拍停发位置引导（S12 接管返航意图），不触发拦截/187；
     `mission_abort_latched_` 保证一次任务只中止一次（接受新分配/`Start()` 复位）；
   - 仅在 S5 生效，不改变 S6/S7 既有交接/视觉丢失逻辑；影子模式不启用。
+
+**S5 目标失效原地保持（2026-10-22，替代“直接停发”）**：目标不可用（过期 /
+`target_id` 不匹配 / 估计器无输出）时，控制任务在 S5 不再立即停发位置意图，
+改为每决策拍发布 **`kPositionGuide` 原地保持意图**：
+
+- 目标 = PX4 **当前局部位置** `local_x/y/z_m`（`frame_id=3` 局部 NED），
+  **绝不使用过期目标坐标**；`reason_code = bit31 | 9`（新增低位原因码 9），
+  不带速度前馈；
+- 目的：保持 setpoint 流不断 → FlightController 维持 ACTIVE、PX4 维持
+  Offboard，避免 `COM_OF_LOSS_T`（1s）触发 PX4 失效兜底（Position 回落；
+  SITL 无 RC 时 `NAV_RCL_ACT=2` 会升级为 RTL），让状态机保留控制权直到
+  看门狗作出中止决定；
+- 恢复迟滞：连续 `kHoldReleaseFreshFrames=3` 个决策拍（100ms/拍）看到新鲜
+  估计才退出保持、回到估计引导（原因码 7），防抖动来回切换；
+- 能力门禁：仅控制任务（`command_sender_ != nullptr`）、仅 S5、且 PX4
+  `connected && local_position_valid`；局部位置不可用时回落为停发（刹停
+  语义仍归 FlightController 意图超时门禁），不猜坐标；
+- 累计上限 `takeoff.target_hold_max_ms`（默认 60000）：目标反复闪烁会不断
+  清零 `target_lost_timeout` 计时，本上限按本次 S5 **累计保持时长**收口，
+  超限 → 65015 aborted（已获得目标按 `target_lost`，从未获得按
+  `target_wait_timeout`）→ S12；`ResetTargetHold()` 在 S5 入口/中止复位；
+- 可观测：保持期间 65013 `active_warning_bits` 置 **bit5**（目标保持中），
+  进入/退出各打一条 INFO（`S5 目标失效，进入原地保持` /
+  `S5 原地保持结束`），保持期内不刷屏；
+- 单测覆盖：保持目标/无前馈/10Hz 续流、3 拍恢复迟滞、影子不保持、
+  局部位置无效回落、累计上限两条回执路径、引导期间不因历史累计中止
+  （`S5*Hold*` 用例）。
 
 **S3 ARMING / S4 TAKEOFF 自动起飞（Task 5，2026-10-22）**：由
 `EvaluateTakeoffSequence()` 每决策拍推进（放在分配入口之后、交接/目标/拦截

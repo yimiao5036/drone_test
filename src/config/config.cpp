@@ -614,6 +614,9 @@ void TakeoffConfig::Validate() const {
     if (target_lost_timeout.count() <= 0) {
         throw std::invalid_argument("takeoff.target_lost_timeout_ms 必须为正");
     }
+    if (target_hold_max.count() <= 0) {
+        throw std::invalid_argument("takeoff.target_hold_max_ms 必须为正");
+    }
     if (battery_low_debounce.count() < 0) {
         throw std::invalid_argument("takeoff.battery_low_debounce_ms 必须 >= 0");
     }
@@ -952,6 +955,8 @@ AppConfig LoadAppConfig(const std::string& path,
         takeoff, "target_wait_timeout_ms", config.takeoff.target_wait_timeout);
     config.takeoff.target_lost_timeout = ReadOptionalPositiveMilliseconds(
         takeoff, "target_lost_timeout_ms", config.takeoff.target_lost_timeout);
+    config.takeoff.target_hold_max = ReadOptionalPositiveMilliseconds(
+        takeoff, "target_hold_max_ms", config.takeoff.target_hold_max);
     config.takeoff.battery_low_debounce = ReadOptionalNonNegativeMilliseconds(
         takeoff, "battery_low_debounce_ms",
         config.takeoff.battery_low_debounce);

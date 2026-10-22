@@ -3785,7 +3785,8 @@ TEST(MissionStateMachineTest, S5TargetIdFilterIgnoresNonMatchingTargets) {
               common::MissionState::kGpsApproach);
     DrainIntents(harness.intent_subscription);
 
-    // 非匹配 65010（target_id=99）与估计：状态机忽略，不发布位置意图。
+    // 非匹配 65010（target_id=99）与估计：不得进入引导（不能飞向别人的目标）；
+    // 控制任务下目标不可用按“原地保持”续流（原因码 9），不是停发。
     auto foreign_ground = MakeFreshGroundTarget();
     foreign_ground.target_id = 99;
     ASSERT_TRUE(harness.ground_topic
@@ -3798,27 +3799,27 @@ TEST(MissionStateMachineTest, S5TargetIdFilterIgnoresNonMatchingTargets) {
                     .Publish(std::make_shared<const common::TargetState>(
                         foreign_estimate))
                     .accepted);
-    std::this_thread::sleep_for(400ms);
+    const auto hold = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kPositionGuide &&
+                   (value.reason_code & 0xFFU) == 9U;
+        });
+    ASSERT_TRUE(hold.has_value())
+        << "非匹配 target_id 不得进入引导，但应按原地保持续流";
+    EXPECT_FLOAT_EQ(hold->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(hold->target_y, kTakeoffOriginY);
     EXPECT_EQ(harness.machine.CurrentState(),
               common::MissionState::kGpsApproach);
-    EXPECT_FALSE(WaitForIntent(
-                     harness.intent_subscription,
-                     [](const common::ControlIntent& value) {
-                         return value.type ==
-                                common::ControlIntentType::kPositionGuide;
-                     },
-                     100ms)
-                     .has_value())
-        << "非匹配 target_id 不得产生位置引导";
 
-    // 匹配 target_id=7 的估计 → S5 位置意图恢复。
+    // 匹配 target_id=7 的估计 → 连续 3 拍恢复后回到 S5 位置引导（原因码 7）。
     ASSERT_TRUE(harness.estimated_topic
                     .Publish(std::make_shared<const common::TargetState>(
                         MakeValidEstimatedTarget()))
                     .accepted);
     const auto intent = WaitForIntent(
         harness.intent_subscription, [](const common::ControlIntent& value) {
-            return value.type == common::ControlIntentType::kPositionGuide;
+            return value.type == common::ControlIntentType::kPositionGuide &&
+                   (value.reason_code & 0xFFU) == 7U;
         });
     ASSERT_TRUE(intent.has_value());
     EXPECT_FLOAT_EQ(intent->target_x, 12.5f);
@@ -3965,6 +3966,391 @@ TEST(MissionStateMachineTest, ShadowS5IgnoresFilterAndWaitTimeout) {
     std::this_thread::sleep_for(500ms);
     EXPECT_EQ(harness.machine.CurrentState(),
               common::MissionState::kGpsApproach);
+}
+
+// ---------------------------------------------------------------------------
+// S5 目标失效“原地保持”（2026-10-22）
+// 目标失效不再直接停发：控制任务以 PX4 当前局部位置续流（原因码 9、无前馈、
+// 10Hz），保证控制器与 PX4 Offboard 不断流，10s 看门狗到点后由 S12 无缝接管。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool IsPositionIntent(const common::ControlIntent& value) {
+    return value.type == common::ControlIntentType::kPositionGuide;
+}
+
+/// 低位原因码（bit31 为控制权请求位，需剥离）。
+uint32_t LowReasonCode(const common::ControlIntent& value) {
+    return value.reason_code & 0xFFU;
+}
+
+constexpr uint32_t kLowReasonGroundTask = 7U;
+constexpr uint32_t kLowReasonTargetHold = 9U;
+
+}  // namespace
+
+// 目标失效：保持意图以 PX4 当前位置为目标（绝不用过期目标）、无前馈、
+// 10Hz 续流，65013 置 bit5；保持期间不中止任务。
+TEST(MissionStateMachineTest, S5TargetLossHoldsCurrentPosition) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 3000ms;
+    config.takeoff.target_lost_timeout = 3000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 308));
+
+    // 先获得匹配目标：估计引导（原因码 7）。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    const auto guided = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return IsPositionIntent(value) &&
+                   LowReasonCode(value) == kLowReasonGroundTask;
+        });
+    ASSERT_TRUE(guided.has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 目标失效：保持意图（原因码 9），目标=PX4 当前局部位置、无前馈。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    const auto hold = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return IsPositionIntent(value) &&
+                   LowReasonCode(value) == kLowReasonTargetHold;
+        });
+    ASSERT_TRUE(hold.has_value());
+    EXPECT_EQ(hold->header.frame_id, kFrameLocalNed);
+    EXPECT_FLOAT_EQ(hold->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(hold->target_y, kTakeoffOriginY);
+    EXPECT_FLOAT_EQ(hold->target_z, kTakeoffOriginZ - 0.5f);
+    EXPECT_EQ(hold->feedforward_valid_mask, 0U)
+        << "保持意图不得携带目标速度前馈";
+    EXPECT_NE(hold->reason_code & common::kControlIntentReasonRequestControl, 0U)
+        << "保持意图必须继续携带控制权请求位";
+
+    // 10Hz 续流：500ms 内应出现多条保持意图（而不是停发）。
+    DrainIntents(harness.intent_subscription);
+    std::this_thread::sleep_for(500ms);
+    int hold_count = 0;
+    while (auto message = harness.intent_subscription.TryTake()) {
+        if (IsPositionIntent(**message) &&
+            LowReasonCode(**message) == kLowReasonTargetHold) {
+            ++hold_count;
+        }
+    }
+    EXPECT_GE(hold_count, 3) << "目标失效期间必须持续发送保持意图";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "保持期间不得中止任务";
+
+    // 65013 告警位 bit5：目标保持中（状态周期 500ms，留 1.5s）。
+    bool hold_warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.status_subscription.WaitTakeFor(50ms);
+        if (status && ((*status)->active_warning_bits & (1U << 5U)) != 0U) {
+            hold_warning_seen = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_warning_seen) << "65013 应置位目标保持告警 bit5";
+}
+
+// 恢复迟滞：不足 3 拍的新鲜估计不退出保持；持续新鲜到第 3 拍才回到引导。
+TEST(MissionStateMachineTest, S5HoldReleasesAfterThreeFreshFrames) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 4000ms;
+    config.takeoff.target_lost_timeout = 4000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 309));
+
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonTargetHold;
+                    })
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 只新鲜 150ms（< 3 个决策拍）：仍保持，不得立刻回到引导。
+    auto brief = MakeValidEstimatedTarget();
+    brief.header.valid_for_ms = 150;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(brief))
+                    .accepted);
+    std::this_thread::sleep_for(250ms);
+    int guided_during_brief = 0;
+    while (auto message = harness.intent_subscription.TryTake()) {
+        if (IsPositionIntent(**message) &&
+            LowReasonCode(**message) == kLowReasonGroundTask) {
+            ++guided_during_brief;
+        }
+    }
+    EXPECT_EQ(guided_during_brief, 0)
+        << "不足 3 拍的新鲜估计不得退出保持";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 持续新鲜：第一拍仍是保持（恢复确认），第 3 拍后回到引导。
+    auto persistent = MakeValidEstimatedTarget();
+    persistent.header.valid_for_ms = 2000;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        persistent))
+                    .accepted);
+    const auto first = WaitForIntent(
+        harness.intent_subscription, IsPositionIntent);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(LowReasonCode(*first), kLowReasonTargetHold)
+        << "恢复确认的第一拍仍应为保持";
+    const auto resumed = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return IsPositionIntent(value) &&
+                   LowReasonCode(value) == kLowReasonGroundTask;
+        });
+    ASSERT_TRUE(resumed.has_value()) << "连续 3 拍新鲜后必须回到估计引导";
+    EXPECT_FLOAT_EQ(resumed->target_x, 12.5f);
+}
+
+// 影子兼容：未注入命令接口时不发保持意图（保持仅控制任务语义）。
+TEST(MissionStateMachineTest, ShadowS5DoesNotHoldOnTargetLoss) {
+    auto config = MakeAssignmentHarnessConfig();
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_FALSE(WaitForIntent(harness.intent_subscription, IsPositionIntent,
+                               200ms)
+                     .has_value())
+        << "影子模式不得发保持意图";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// 保持能力门禁：PX4 局部位置无效时不得发保持意图（停发交兜底链），
+// 且任务在看门狗到点前不中止。
+TEST(MissionStateMachineTest, S5HoldRequiresValidLocalPosition) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 3000ms;
+    config.takeoff.target_lost_timeout = 3000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 310));
+
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 局部位置失效（连接/armed/Offboard 仍在）。
+    auto no_position = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    no_position.local_position_valid = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, no_position));
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_FALSE(WaitForIntent(harness.intent_subscription, IsPositionIntent,
+                               200ms)
+                     .has_value())
+        << "局部位置无效时不得发保持意图";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// 累计保持上限（已获得目标）：丢失计时被抖动清零也不得无限悬停，
+// 累计超 target_hold_max → 65015 aborted(target_lost) + S12。
+TEST(MissionStateMachineTest, S5HoldMaxAbortsAfterTargetAcquired) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 5000ms;
+    config.takeoff.target_hold_max = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+
+    // 先获得目标（assigned_target_acquired_ 置位），再持续失效。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kTargetLost)
+        << "已获得目标后超时按目标丢失回执";
+    EXPECT_EQ(aborted->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome);
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "目标保持超时不得触发发射";
+    }
+}
+
+// 累计保持上限（从未获得目标）：早于 target_wait_timeout 收口，
+// 回执按等待超时（未获得目标）语义。
+TEST(MissionStateMachineTest, S5HoldMaxAbortsBeforeTargetWaitTimeout) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 5000ms;
+    config.takeoff.target_hold_max = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 312));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTargetWaitTimeout)
+        << "从未获得目标时按等待超时回执";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome);
+}
+
+// 累计上限只在“目标当前不可用”时收口：短暂丢失累计未超限后恢复引导，
+// 不得因历史累计立刻中止；再次失效时按累计上限收口。
+TEST(MissionStateMachineTest, S5HoldMaxDoesNotAbortWhileGuiding) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 5000ms;
+    config.takeoff.target_hold_max = 1000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 313));
+
+    auto persistent = MakeValidEstimatedTarget();
+    persistent.header.valid_for_ms = 2000;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        persistent))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+
+    // 短暂丢失 400ms（< 1000ms 上限）→ 保持，随后恢复引导。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonTargetHold;
+                    })
+                    .has_value());
+    std::this_thread::sleep_for(400ms);
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        persistent))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value())
+        << "目标恢复后必须回到引导";
+
+    // 引导期间不得因历史累计中止。
+    DrainAcks(harness.ack_subscription);
+    std::this_thread::sleep_for(800ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标恢复引导中不得因累计保持中止";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "引导期间不得回 aborted";
+
+    // 再次失效：累计（约 400ms + 本次）到 1000ms 后按上限收口。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    const auto aborted2 = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted2.has_value());
+    EXPECT_EQ(aborted2->reason,
+              common::MissionAssignmentReason::kTargetLost);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome);
 }
 
 }  // namespace

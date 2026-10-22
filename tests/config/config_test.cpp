@@ -1030,6 +1030,7 @@ TEST(ConfigTest, TakeoffDefaultsAndParse) {
     EXPECT_EQ(config.takeoff.mode_timeout.count(), 2000);
     EXPECT_EQ(config.takeoff.arm_timeout.count(), 3000);
     EXPECT_EQ(config.takeoff.bootstrap_timeout.count(), 6000);
+    EXPECT_EQ(config.takeoff.target_hold_max.count(), 60000);
 }
 
 TEST(ConfigTest, RejectsBadTakeoffTimeouts) {
@@ -1038,6 +1039,28 @@ TEST(ConfigTest, RejectsBadTakeoffTimeouts) {
     const auto path = WriteTemporaryConfig(value, "drone_config_takeoff_bad.json");
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 目标保持累计上限：非正数拒绝；缺席回退默认 60s（2026-10-22）。
+TEST(ConfigTest, RejectsBadTakeoffHoldMax) {
+    json value = ReadSourceConfig();
+    value["takeoff"]["target_hold_max_ms"] = 0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_takeoff_hold_bad.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, TakeoffHoldMaxDefaultsWhenAbsent) {
+    json value = ReadSourceConfig();
+    value["takeoff"].erase("target_hold_max_ms");
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_takeoff_hold_default.json");
+    const auto config =
+        drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.takeoff.target_hold_max.count(), 60000);
     std::filesystem::remove(path);
 }
 

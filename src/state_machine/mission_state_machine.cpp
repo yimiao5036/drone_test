@@ -81,6 +81,10 @@ constexpr uint32_t kWarningServoSuspended = 1U << 3U;
 /// 状态机进入 S16 FAILSAFE：停发一切控制意图、取消待发命令、不重试/不补发
 /// 复位，交 PX4/遥控处置。地面站 65013 全量下发，Web UI 渲染待补。
 constexpr uint32_t kWarningActuatorFault = 1U << 4U;
+/// 告警位：S5 目标失效后处于"原地保持"（不发过期目标，只发 PX4 当前位置）。
+/// 地面站可据此显示"悬停等待目标"；累计保持超过 `takeoff.target_hold_max_ms`
+/// 会中止任务并转 S12 返航（65013 全量下发，Web UI 渲染待补）。
+constexpr uint32_t kWarningTargetHold = 1U << 5U;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。
 constexpr uint64_t kIntentRepublishIntervalMs = 100;
@@ -95,6 +99,12 @@ constexpr uint32_t kReasonVisualTracking = 100;
 constexpr uint32_t kReasonVisualBrake = 102;
 /// 拦截后返航位置意图低位原因码（8 在 0~7 规划语义之外；S11~S14 V1 口径）。
 constexpr uint32_t kReasonReturnHome = 8;
+/// 目标失效"原地保持"位置意图低位原因码（9）：目标取 PX4 当前局部位置、
+/// 不携带前馈；目标恢复后回到编码 7（地面站任务）。
+constexpr uint32_t kReasonTargetHold = 9;
+/// 目标恢复迟滞：连续 N 个决策拍看到新鲜估计才退出保持（防抖动来回切换；
+/// 100ms 决策周期下 N=3 即 300ms，与控制器的意图超龄门限同量级）。
+constexpr uint32_t kHoldReleaseFreshFrames = 3;
 /// MAVLink 命令号/模式编码（状态机不引 MAVLink 头，与 Px4Link/工具同源）。
 constexpr uint16_t kMavCmdDoSetMode = 176;          // MAV_CMD_DO_SET_MODE
 constexpr uint16_t kMavCmdComponentArmDisarm = 400; // MAV_CMD_COMPONENT_ARM_DISARM
@@ -441,6 +451,7 @@ public:
         target_wait_started_ms_ = 0;
         assigned_target_acquired_ = false;
         target_lost_since_ms_.reset();
+        ResetTargetHold();
         last_cancel_action_ms_.reset();
         // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
@@ -666,6 +677,13 @@ private:
         if (!HasNavigationForGps()) {
             warnings |= kWarningNavigationUnavailable;
         }
+        // 目标保持累计时长（2026-10-22）：目标失效期间保持意图维持控制流，
+        // 按决策拍累计；仅在“上一拍处于保持”时累加，恢复引导的间隙不计入。
+        if (last_evaluate_ms_ != 0 && now_ms > last_evaluate_ms_ &&
+            position_intent_source_ == PositionIntentSource::kHold) {
+            target_hold_accumulated_ms_ += now_ms - last_evaluate_ms_;
+        }
+        last_evaluate_ms_ = now_ms;
         const bool target_fresh = HasFreshGroundTarget(now_ms);
         const auto state = CurrentState();
         if (state == common::MissionState::kSelfCheck && HasNavigationForGps()) {
@@ -721,6 +739,11 @@ private:
         }
 
         EvaluatePositionIntent(now_ms);
+        // 告警位：S5 目标失效原地保持中（地面站可显示“悬停等待目标”）；
+        // 保持意图仍带 bit31 控制权请求，离开 S5/S12 接管后自然清除。
+        if (position_intent_source_ == PositionIntentSource::kHold) {
+            warnings |= kWarningTargetHold;
+        }
         EvaluateVisualServoIntent(now_ms);
         // 告警位：S7 报告状态与实际控制输出背离标注（T9 评审裁决 I2）——本拍
         // 未发出视觉伺服意图：伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图）
@@ -944,6 +967,7 @@ private:
                 target_wait_started_ms_ = 0;
                 assigned_target_acquired_ = false;
                 target_lost_since_ms_.reset();
+                ResetTargetHold();
                 // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致。
                 const auto& flight = *latest_flight_;
                 assignment_tracker_.BeginTakeoff(
@@ -1353,6 +1377,7 @@ private:
     /// 保持既有 S5 行为，不因目标缺失自动中止）。
     void BeginTargetWatchdog(uint64_t now_ms) {
         target_lost_since_ms_.reset();
+        ResetTargetHold();
         if (command_sender_ == nullptr) {
             target_wait_started_ms_ = 0;
             assigned_target_acquired_ = false;
@@ -1361,16 +1386,31 @@ private:
         target_wait_started_ms_ = now_ms;
         assigned_target_acquired_ = false;
         SPDLOG_INFO("S5 目标看门狗启动: target_id={} wait_timeout={}ms "
-                    "lost_timeout={}ms",
+                    "lost_timeout={}ms hold_max={}ms",
                     assignment_tracker_.TargetId(),
                     takeoff_.target_wait_timeout.count(),
-                    takeoff_.target_lost_timeout.count());
+                    takeoff_.target_lost_timeout.count(),
+                    takeoff_.target_hold_max.count());
+    }
+
+    /// 目标保持簿记复位（per-S5 语义：S5 入口与中止时调用）。
+    /// 累计保持时长按“本次 S5”收口，不跨 S5 循环累计。
+    void ResetTargetHold() {
+        target_hold_started_ms_.reset();
+        target_hold_accumulated_ms_ = 0;
+        target_hold_count_ = 0;
+        fresh_estimate_streak_ = 0;
+        hold_logged_ = false;
+        last_evaluate_ms_ = 0;
     }
 
     /// 每决策拍（仅 S5、仅控制任务）：未获得匹配目标超过 target_wait_timeout，
     /// 或已获得后匹配目标持续失效超过 target_lost_timeout → 中止分配、S12 返航、
     /// 65015 aborted(target_wait_timeout/target_lost)。一次任务只中止一次。
     /// S6/S7 的交接/视觉丢失逻辑不受本函数影响。
+    /// 目标保持（2026-10-22）：目标失效期间由原地保持意图续住控制流，本函数
+    /// 之外另有 `target_hold_max` 绝对兜底——目标反复闪烁会不断清零丢失计时，
+    /// 单靠 lost_timeout 无法收口，累计保持超限同样走中止返航。
     void EvaluateTargetWatchdog(uint64_t now_ms) {
         if (command_sender_ == nullptr) {
             return;  // 影子模式不启用
@@ -1384,6 +1424,17 @@ private:
         if (HasFreshAssignedTarget(now_ms)) {
             assigned_target_acquired_ = true;
             target_lost_since_ms_.reset();
+            return;
+        }
+        // 目标当前不可用：累计保持超限即收口（目标恢复后正在引导时不得因历史
+        // 累计立刻中止；下一次不可用时才按累计上限中止）。
+        if (target_hold_accumulated_ms_ >=
+            static_cast<uint64_t>(takeoff_.target_hold_max.count())) {
+            AbortForTargetWatchdog(
+                assigned_target_acquired_
+                    ? common::MissionAssignmentReason::kTargetLost
+                    : common::MissionAssignmentReason::kTargetWaitTimeout,
+                "目标保持累计超时（target_hold_max_ms）");
             return;
         }
         if (!assigned_target_acquired_) {
@@ -1417,6 +1468,7 @@ private:
         mission_abort_latched_ = true;
         target_lost_since_ms_.reset();
         StopPositionIntent("目标等待/丢失超时中止任务");
+        ResetTargetHold();
         assignment_tracker_.AbortAirborne();
         RememberTakeoffAbort(reason);
         SPDLOG_WARN("S5 目标看门狗中止: reason={} detail={} → S12 返航",
@@ -2024,14 +2076,35 @@ private:
         }
     }
 
-    /// S5 估计引导意图：估计新鲜有效 → 发布/重发（内容变化立即发，内容不变
-    /// 按 10Hz 上限续期）；估计失效或超龄 → 停发（不补发安全类意图，
-    /// 刹停语义归 FlightController 意图超时门禁）。
+    /// S5 估计引导意图（2026-10-22 目标保持改造）：
+    /// - 估计新鲜：连续 `kHoldReleaseFreshFrames` 拍确认后回到估计引导
+    ///   （恢复迟滞，防目标在门限附近抖动导致保持/引导频繁切换）；
+    /// - 估计失效但控制任务在位且 PX4 局部位置有效：发“原地保持”意图
+    ///   （目标=PX4 当前局部位置，原因码 9，无前馈）——目标过期也绝不发旧目标，
+    ///   但控制流不断，PX4 不会在 S5 看门狗前按 Offboard 丢失兜底接管；
+    /// - 连局部位置都不可用：停发，刹停语义仍归 FlightController 意图超时门禁。
     void EvaluateEstimateGuidedIntent(uint64_t now_ms) {
         if (HasFreshEstimate(now_ms)) {
+            if (fresh_estimate_streak_ < kHoldReleaseFreshFrames) {
+                ++fresh_estimate_streak_;
+            }
+            if (position_intent_source_ == PositionIntentSource::kHold &&
+                fresh_estimate_streak_ < kHoldReleaseFreshFrames &&
+                HoldAllowed()) {
+                // 恢复确认中：继续保持，避免抖动切换。
+                PublishHoldIntent(now_ms);
+                return;
+            }
+            ReleaseHoldIfActive("目标恢复", now_ms);
             PublishEstimateGuidedIntent(*latest_estimated_, now_ms);
             return;
         }
+        fresh_estimate_streak_ = 0;
+        if (HoldAllowed()) {
+            PublishHoldIntent(now_ms);
+            return;
+        }
+        ReleaseHoldIfActive("目标失效且无有效局部位置", now_ms);
         if (position_intent_source_ != PositionIntentSource::kNone) {
             position_intent_source_ = PositionIntentSource::kNone;
             last_intent_target_.reset();
@@ -2041,6 +2114,69 @@ private:
                             count);
             }
         }
+    }
+
+    /// 是否允许“原地保持”：仅控制任务（影子保持既有停发语义）、仅 S5、
+    /// 且 PX4 连接与局部位置有效（保持目标必须来自真实位置，不能猜）。
+    bool HoldAllowed() const {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        if (CurrentState() != common::MissionState::kGpsApproach) {
+            return false;
+        }
+        if (!latest_flight_.has_value()) {
+            return false;
+        }
+        const auto& flight = *latest_flight_;
+        return flight.connected && flight.local_position_valid;
+    }
+
+    /// 发布“原地保持”位置意图：目标是 PX4 当前局部位置（绝不使用过期目标），
+    /// 原因码 9、无前馈；每决策拍发布（10Hz，满足控制器 300ms 意图超龄门禁）。
+    void PublishHoldIntent(uint64_t now_ms) {
+        const auto& flight = *latest_flight_;
+        if (!hold_logged_) {
+            hold_logged_ = true;
+            target_hold_started_ms_ = now_ms;
+            ++target_hold_count_;
+            SPDLOG_INFO(
+                "S5 目标失效，进入原地保持: target_id={} hold=({:.2f},{:.2f},{:.2f}) "
+                "reason={} accumulated_ms={}",
+                assignment_tracker_.TargetId(),
+                static_cast<double>(flight.local_x_m),
+                static_cast<double>(flight.local_y_m),
+                static_cast<double>(flight.local_z_m), kReasonTargetHold,
+                target_hold_accumulated_ms_);
+        }
+        PositionIntentTarget target;
+        target.x = flight.local_x_m;
+        target.y = flight.local_y_m;
+        target.z = flight.local_z_m;
+        target.frame_id = kFrameLocalNed;
+        PublishPositionIntent(target, now_ms, kReasonTargetHold);
+        position_intent_source_ = PositionIntentSource::kHold;
+        last_intent_target_.reset();  // 保持意图不做内容节流比较
+    }
+
+    /// 退出保持：记录保持时长并复位本次保持簿记；累计时长保留到本次 S5 结束
+    /// （`target_hold_max` 按本次 S5 累计收口）。
+    void ReleaseHoldIfActive(const char* reason, uint64_t now_ms) {
+        if (position_intent_source_ != PositionIntentSource::kHold) {
+            return;
+        }
+        const uint64_t held_ms =
+            target_hold_started_ms_.has_value() && now_ms >= *target_hold_started_ms_
+                ? now_ms - *target_hold_started_ms_
+                : 0;
+        SPDLOG_INFO(
+            "S5 原地保持结束: {} held_ms={} hold_count={} accumulated_ms={}",
+            reason, held_ms, target_hold_count_, target_hold_accumulated_ms_);
+        position_intent_source_ = PositionIntentSource::kNone;
+        last_intent_target_.reset();
+        target_hold_started_ms_.reset();
+        hold_logged_ = false;
+        fresh_estimate_streak_ = 0;
     }
 
     /// 冻结最后位置目标（S5→S6 进入时调用，设计 §2.1）：取进入时刻的估计
@@ -2079,6 +2215,11 @@ private:
     /// 停止位置类意图发布（离开位置引导段/交接段）；幂等。
     void StopPositionIntent(const char* reason) {
         if (position_intent_source_ == PositionIntentSource::kNone) {
+            return;
+        }
+        if (position_intent_source_ == PositionIntentSource::kHold) {
+            // 保持被其它路径（中止/切段）打断：走统一的保持退出日志与簿记复位。
+            ReleaseHoldIfActive(reason, MonotonicMs());
             return;
         }
         position_intent_source_ = PositionIntentSource::kNone;
@@ -3229,9 +3370,11 @@ private:
     /// S7 测距失效计时起始时刻（nullopt=测距未失效；恢复有效即清零）
     std::optional<uint64_t> distance_lost_since_ms_;
     bool estimation_inputs_active_ = false;  ///< 估计/视觉/测距输入组已成功订阅
-    /// 位置类意图来源（Task 9 起含 S6 冻结续发与 S7 首拍过渡续发）：
-    /// kNone=未发布，kEstimate=S5 估计引导，kFrozen=S6/S7 冻结续发。
-    enum class PositionIntentSource { kNone, kEstimate, kFrozen };
+    /// 位置类意图来源（Task 9 起含 S6 冻结续发与 S7 首拍过渡续发；
+    /// 2026-10-22 增 kHold：S5 目标失效时的原地保持）：
+    /// kNone=未发布，kEstimate=S5 估计引导，kFrozen=S6/S7 冻结续发，
+    /// kHold=S5 目标失效保持（目标=PX4 当前局部位置，原因码 9）。
+    enum class PositionIntentSource { kNone, kEstimate, kFrozen, kHold };
     PositionIntentSource position_intent_source_ = PositionIntentSource::kNone;
     /// S5→S6 冻结的最后位置目标（进入时刻的估计快照；交接段结束清空）。
     std::optional<common::TargetState> frozen_handover_target_;
@@ -3288,6 +3431,14 @@ private:
     uint64_t target_wait_started_ms_ = 0;  ///< S5 入口时刻（等待目标基准）
     bool assigned_target_acquired_ = false;  ///< 本次 S5 是否已获得匹配目标
     std::optional<uint64_t> target_lost_since_ms_;  ///< 目标持续失效起点
+    /// 目标保持（2026-10-22）：S5 目标失效时以 PX4 当前局部位置续流，
+    /// 避免 PX4 在 10s 看门狗前按 Offboard 丢失兜底（→ Position → RTL）接管。
+    std::optional<uint64_t> target_hold_started_ms_;  ///< 本次保持起点（诊断）
+    uint64_t target_hold_accumulated_ms_ = 0;  ///< 本次 S5 累计保持时长
+    uint64_t target_hold_count_ = 0;           ///< 本次 S5 保持进入次数
+    uint32_t fresh_estimate_streak_ = 0;       ///< 连续新鲜估计拍数（恢复迟滞）
+    uint64_t last_evaluate_ms_ = 0;            ///< 上一决策拍（累计计时）
+    bool hold_logged_ = false;                 ///< 本次保持已打印（进入日志一次）
     /// 最近一次执行的取消动作时刻（500ms 内不重复下发命令）。
     std::optional<uint64_t> last_cancel_action_ms_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。

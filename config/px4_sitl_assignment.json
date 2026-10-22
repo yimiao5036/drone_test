@@ -170,6 +170,7 @@
         "max_vz_mps": 0.3,
         "target_wait_timeout_ms": 10000,
         "target_lost_timeout_ms": 10000,
+        "target_hold_max_ms": 60000,
         "battery_low_debounce_ms": 1000
     },
     "visual_monitor": {
