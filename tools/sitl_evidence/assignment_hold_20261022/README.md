@@ -55,3 +55,13 @@ GCS 心跳建立后消失）。
 - 与改造前对比：旧证据 `tools/sitl_evidence/assignment_20261022/0007` 中
   目标丢失后 PX4 自行 RTL，S12 只做监控；本目录为改造后行为。
 - 场景 7a/7b 通过标准更新见 `docs/PX4实链验证清单.md` §7.4。
+
+## 保持改造后的门禁回归（2026-10-22）
+
+| 场景 | 结果 | 证据 | 关键观测 |
+|---|---|---|---|
+| G3 全链（`--sitl-stage4-mission`，`config/px4_sitl.json`） | ✅ 全 PASS | `regression_g3_stage4_mission_20261022.log`、`regression_g3_px4_console.log`、`regression_g3_gcs.log` | 迁移 0→1→2→5→6→7→5；S5 引导 `reason=7`（保持未介入）；交接缝 201ms、窗口内无 COAST；切非 Offboard 停发 40ms；退出 Offboard 1459ms（上限 2200） |
+| stage4-return（`--sitl-stage4-return`，`config/px4_sitl_return.json`） | ✅ 全 PASS | `regression_return_stage4_20261022.log`、`regression_return_px4_console.log`、`regression_return_gcs.log` | S9→S10（发射）→S12 机载返航→S13 AUTO.LAND→S14；187 触发/复位 ACK accepted，保持间隔 1609ms（reset_delay 1500ms，容差 500ms）；迁移 11 次、错误 0 |
+
+两次回归均在 S5 目标连续新鲜的正常引导路径上运行，保持逻辑未介入，确认改造
+未影响既有 S5→S6→S7 交接链与 S9~S14 返航链。

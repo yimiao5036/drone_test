@@ -272,7 +272,7 @@ echo "退出码=$?"
 | 7 | 目标等待超时 / 目标丢失超时 | 目标失效期间**原地保持**（65013 bit5、PX4 不退出 Offboard），10s 看门狗 → 65015 aborted → S12 由机载位置返航（不再由 PX4 RTL 抢先） | ✅ 2026-10-22 新语义复跑：7b 保持 10009ms→`target_lost`→S12 爬 5m→返航→S13/S14；7a 保持 10009ms→`target_wait_timeout`→S12；保持期间无 COAST、PX4 无 RTL；证据 `tools/sitl_evidence/assignment_hold_20261022/` |
 | 8 | 低电 / 电池遥测失效 | S12，不走 PX4 RTL；遥测失效立即中止 | ✅ 2026-10-22（修复 BAT_LOW_THR 量纲） |
 | 9 | 中止后清理 | 无残留 setpoint、无重试、无重复 ARM | ✅ 2026-10-22 |
-| 10 | 回归 | G2/G3/stage4-return 仍 PASS | ✅ 2026-10-22（stage4-return 工具侧已修 S5 入口） |
+| 10 | 回归 | G2/G3/stage4-return 仍 PASS | ✅ 2026-10-22（stage4-return 工具侧已修 S5 入口）。**保持改造后复跑**：G3 迁移 0→1→2→5→6→7→5、S5 引导 `reason=7`、交接缝 201ms；stage4-return 187 间隔 1609ms、迁移 11 次/错误 0；证据 `tools/sitl_evidence/assignment_hold_20261022/regression_*` |
 
 **证据**：`tools/sitl_evidence/assignment_20261022/`（场景→日志映射、运行步骤、
 发现与修复见该目录 `README.md`）。
