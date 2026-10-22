@@ -1681,6 +1681,17 @@ private:
                ack.last_result != 5;
     }
 
+    /// 本轮 S3 的 400 ARM 是否已收到 ACCEPTED（实际 armed 位可能尚未刷新）。
+    bool TakeoffArmCommandAccepted() const {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        const auto ack = command_sender_->AckStatus();
+        return ack.matched_count > takeoff_ack_baseline_matched_ &&
+               ack.last_command == kMavCmdComponentArmDisarm &&
+               ack.last_result == 0;
+    }
+
     /// S3/S4 中止统一处置：
     /// - 已实际离地（armed && !landed）：tracker AbortAirborne → S12，
     ///   **不空中 disarm**；
@@ -1714,7 +1725,10 @@ private:
             PublishTakeoffAbortAck(reason);
             return;
         }
-        if (landed_known && landed && armed) {
+        // armed 位可能滞后于 400 ACK（心跳/遥测刷新周期）：ACK 已 accepted
+        // 时同样按已解锁处置，补发一次 DISARM，避免地面中止把飞机留在 armed。
+        if (landed_known && landed &&
+            (armed || TakeoffArmCommandAccepted())) {
             SendTakeoffDisarmOnce();
         }
         assignment_tracker_.AbortOnGround();
@@ -2787,6 +2801,15 @@ private:
             return;
         }
         const auto& flight = *latest_flight_;
+        // 进入返航前 PX4 已自行落地并上锁（例如 S5 无目标停发后 PX4 RTL
+        // 完成，模式又恢复为 Offboard）：不再发返航设定值，直接交 S13 收口。
+        // 否则 S12 会对着已落地/已上锁的飞机持续发位置目标并卡到返航超时。
+        if (flight.landed_state_valid && flight.landed && !flight.armed) {
+            SPDLOG_INFO("返航前 PX4 已落地并上锁，直接进入降落收口");
+            TransitionTo(common::MissionState::kLanding,
+                         "返航前已落地/上锁");
+            return;
+        }
         if (flight.flight_mode != kPx4FlightMainModeOffboard ||
             flight.flight_sub_mode != kPx4FlightSubModeOffboard) {
             return_px4_takeover_ = true;

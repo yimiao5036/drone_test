@@ -1858,6 +1858,40 @@ TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
     machine.Stop();
 }
 
+// S5 无目标停发后 PX4 已自行 RTL 落地/上锁、模式又恢复 Offboard：
+// S12 不得继续发返航设定值（会卡到返航超时），直接 S13→S14 收口。
+TEST(MissionStateMachineTest, ReturnHomeAlreadyLandedDisarmedCloses) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(
+                                             0.0f, 0.0f, 0.0f, 0, 0, 0,
+                                             /*armed=*/false, /*landed=*/true)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kLanding, 2500ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kDisarmed, 2500ms)
+                    .has_value());
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(100ms).has_value())
+        << "已落地/上锁不得继续发布返航位置意图";
+    machine.Stop();
+}
+
 TEST(MissionStateMachineTest, ReturnHomeClimbsToFiveMetersBeforeCruise) {
     common::Topic<common::GroundStationTarget> ground_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
@@ -2835,6 +2869,40 @@ TEST(MissionStateMachineTest, TakeoffGroundArmedAbortSendsDisarmOnce) {
 
     std::this_thread::sleep_for(300ms);
     EXPECT_EQ(harness.sender.CallCount(), 2U) << "DISARM 只发一次";
+}
+
+// 400 ACK 已 accepted、armed 快照尚未刷新时地面取消：仍补发一次 DISARM，
+// 避免飞机被留在 armed（SITL 2026-10-22 实测竞态）。
+TEST(MissionStateMachineTest, TakeoffGroundCancelAfterArmAckSendsDisarm) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(150)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));  // ARM 已入队
+    harness.sender.SimulateAck(400U, 0U, TestMonotonicMs());  // ACCEPTED
+
+    ASSERT_TRUE(harness.Send(MakeCancel(150)));
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 3));
+    const auto history = harness.sender.History();
+    ASSERT_FALSE(history.empty());
+    EXPECT_EQ(history.back().command, 400U);
+    EXPECT_FLOAT_EQ(history.back().params[0], 0.0f)
+        << "ARM ACK accepted 后地面取消必须补发 DISARM";
 }
 
 // 已离地中止（PX4 断连）：不空中 disarm，tracker AbortAirborne → S12；

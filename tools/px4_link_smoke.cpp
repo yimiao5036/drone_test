@@ -5295,6 +5295,10 @@ private:
             hover_stable_since_ms_ = 0;
         }
         if (hover_complete_) {
+            // 生产装配在注入命令接口后关闭了 S2→S5 的影子目标通路（Task 5：
+            // 65010 不得单独把 S2 推到 S5）。本工具已完成自身起飞，用测试钩子
+            // 显式进入 S5，让状态机接管位置引导（仅工具装配，test_hooks_enabled）。
+            machine_.ForceStateForTest(common::MissionState::kGpsApproach);
             if (script_ == TuneScript::kFeedforward) {
                 std::cout << "[SITL] 悬停稳定完成，进入 P3 前馈专项：目标起点 N="
                           << kFeedforwardStartNorthM << "m，速度 "
@@ -6081,6 +6085,8 @@ int RunStage4Tune(drone::communication::Px4Link& link, const std::string& config
     mission_config.actuator = app.actuator;
     mission_config.interception = app.interception;
     mission_config.return_home = app.return_home;
+    // 工具装配显式启用测试钩子：自身起飞后强制进入 S5（见悬停完成处）。
+    mission_config.test_hooks_enabled = true;
     drone::state_machine::MissionStateMachine machine(mission_config);
 
     drone::control::FlightController controller(app.controller);

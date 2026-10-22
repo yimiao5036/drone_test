@@ -176,9 +176,11 @@ PX4/遥控”。
 - **S4 空中超时**（`height_timeout`）：PX4 仍在 Offboard → 转 **S13**，由现有
   `EvaluateLandingAndDisarm` 发 AUTO.LAND(4/6)；PX4 已离开 Offboard → 设置
   让权标志，转 **S13 仅监控**，不再发 AUTO.LAND、不再争控。
-- **地面超时/条件失败**：停止发布 kTakeoff/位置意图；若 `armed && landed`
-  只发一次 DISARM（400 param1=0）；`AbortOnGround()`；回 S2 READY（状态
-  不明时 availability=unavailable）。
+- **地面超时/条件失败**：停止发布 kTakeoff/位置意图；若 `landed` 且
+  （`armed` **或本轮 400 ACK 已 ACCEPTED**）只发一次 DISARM（400 param1=0）——
+  后者覆盖 armed 位尚未随心跳/遥测刷新的竞态（SITL 2026-10-22 实测地面取消
+  会短暂留下 armed）；`AbortOnGround()`；回 S2 READY（状态不明时
+  availability=unavailable）。
 - **已离地后任何中止**（armed && !landed）：`AbortAirborne()` → **S12**；
   **不空中 disarm**（返航/降落链接管，最终由 S13/S14 解锁）。
 - **65015 aborted**：`result=kCancelledOrAborted`，reason 为
@@ -541,6 +543,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - **到达判据**：水平距 Home ≤`arrival_radius_m`（2m）、垂直误差
     ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
     持续 `arrival_hold`（1s）→ S13。返航超 `timeout`（60s）→ 原地悬停告警。
+  - **进入 S12 时已落地/上锁**（`landed && !armed`，例如 S5 无目标停发后
+    PX4 自行 RTL 完成、模式又恢复 Offboard）：不再发返航位置意图，直接转
+    S13 → S14 收口（SITL 2026-10-22 实测：否则会停在 S12 直到返航超时）。
   - **S13/S14**：S13 发 `MAV_CMD_DO_SET_MODE`（AUTO.LAND，4/6）；停止位置意图；
     落地后若仍 armed 发 `MAV_CMD_COMPONENT_ARM_DISARM`（0）；确认 disarmed →
     S14。正常返航不使用 PX4 自动 RTL；PX4 已接管则只监控 landed/disarmed。

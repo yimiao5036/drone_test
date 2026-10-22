@@ -18,9 +18,17 @@
   # 取消当前分配（flags.bit1）
   python3 tools/assignment_sitl.py --assignment-id 1 --cancel
 
+  # 起飞前取消（800ms 后切取消）/ 起飞后取消（如 15000ms）
+  python3 tools/assignment_sitl.py ... --cancel-after-ms 800
+
+  # 目标丢失：先持续发送 65010，15s 后停止，等待目标超龄/丢失看门狗
+  python3 tools/assignment_sitl.py ... --send-target --stop-target-after-ms 15000
+
   # 台架/实机：经 HM30/串口转发时沿用地面站链路连接串
   python3 tools/assignment_sitl.py --connection udpout:192.168.144.12:19856 \
       --aircraft-system 1 --aircraft-component 25 --assignment-id 1 --target-id 7
+  # 直连串口设备时 pymavlink 直接传设备路径（默认 115200）：
+  python3 tools/assignment_sitl.py --connection /dev/ttyUSB0
 
 前置条件（自动分配才会被接受）：
 - 目标飞机 enable_control=true 且已通过 G2~G4 门禁（生产配置保持 false）；
@@ -519,6 +527,8 @@ def parse_args():
     parser.add_argument("--interceptor-type", type=int, default=25,
                         help="拦截类型，必须等于飞机component_id")
     parser.add_argument("--cancel", action="store_true", help="发送取消（flags.bit1）而非授权起飞")
+    parser.add_argument("--cancel-after-ms", type=int, default=0,
+                        help="运行N毫秒后把65014切为取消（起飞前/后取消场景）；0=不切换")
     parser.add_argument("--no-grant", action="store_true", help="不置flags.bit0（负向测试）")
     parser.add_argument("--valid-for-ms", type=int, default=5000, help="分配有效期")
     parser.add_argument("--duration", type=float, default=15.0, help="运行时长（秒）")
@@ -526,6 +536,8 @@ def parse_args():
                         help="65014重发间隔；同一assignment_id重发是幂等的")
     parser.add_argument("--heartbeat-interval", type=float, default=1.0)
     parser.add_argument("--send-target", action="store_true", help="同时发送匹配target_id的65010目标")
+    parser.add_argument("--stop-target-after-ms", type=int, default=0,
+                        help="运行N毫秒后停止发送65010（目标丢失场景）；0=不停")
     parser.add_argument("--target-interval", type=float, default=0.5)
     parser.add_argument("--target-valid-for-ms", type=int, default=5000)
     parser.add_argument("--target-latitude", type=float, default=23.123)
@@ -558,6 +570,8 @@ def main():
         raise ValueError("target-interval 必须为正数")
     if args.cancel and args.no_grant:
         raise ValueError("cancel 与 no-grant 不能同时使用")
+    if args.cancel_after_ms < 0 or args.stop_target_after_ms < 0:
+        raise ValueError("cancel-after-ms 和 stop-target-after-ms 不能为负数")
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
@@ -596,20 +610,34 @@ def main():
         )
 
     deadline = time.monotonic() + args.duration
+    run_start = time.monotonic()
     last_heartbeat = 0.0
     last_assignment = 0.0
     last_target = 0.0
     assignment_sent = 0
+    cancel_active = bool(args.cancel)
+    target_active = bool(args.send_target)
     while running and time.monotonic() < deadline:
         now = time.monotonic()
+        elapsed_ms = (now - run_start) * 1000.0
+        if (not cancel_active and args.cancel_after_ms > 0 and
+                elapsed_ms >= args.cancel_after_ms):
+            cancel_active = True
+            print("[INFO] 已到取消时刻，65014切换为取消（flags.bit1）", flush=True)
+        if (target_active and args.stop_target_after_ms > 0 and
+                elapsed_ms >= args.stop_target_after_ms):
+            target_active = False
+            print("[INFO] 已到停止目标时刻，停止发送65010（目标将超龄）", flush=True)
+        current_flags = (FLAG_CANCEL if cancel_active else
+                         (0 if args.no_grant else FLAG_TAKEOFF_AUTHORIZED))
         if now - last_heartbeat >= args.heartbeat_interval:
             send_heartbeat(master)
             last_heartbeat = now
         if now - last_assignment >= args.assignment_interval:
-            send_assignment(master, args, flags)
+            send_assignment(master, args, current_flags)
             assignment_sent += 1
             last_assignment = now
-        if args.send_target and now - last_target >= args.target_interval:
+        if target_active and now - last_target >= args.target_interval:
             send_target(master, args, boot_id, target_seq)
             target_seq += 1
             last_target = now

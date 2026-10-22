@@ -256,22 +256,42 @@ echo "退出码=$?"
 
 设计/协议见 `docs/superpowers/specs/2026-10-22-多机任务分配与自动起飞-design.md`。
 机载已实现 65014/65015/65013 v2、`MissionAssignmentTracker`、S2→S3→S4→S5、
-`FlightController::kBootstrap` 与电池守卫；**以下实跑项均未执行，状态为待验收**。
+`FlightController::kBootstrap` 与电池守卫。**SITL 专项 2026-10-22 已实跑**；
+台架（拆桨）与 G5 仍未执行。
 
 **SITL 专项**（255/190 模拟地面站，定向发送 65014，不依赖 RC）：
 
 | # | 场景 | 通过标准 | 状态 |
 |---:|---|---|---|
-| 1 | 正常自动起飞 | S2→S3→S4→S5；PX4 模式 6/0、armed、高度/位置达标；65015 accepted、65013 availability 依次 assigned/engaged | ⏳ |
-| 2 | 无分配 | 不起飞、不发 176/400 | ⏳ |
-| 3 | 地址错误/类型不匹配 | 静默忽略、不回 65015 | ⏳ |
-| 4 | 176 超时/ACK 拒绝、400 超时/ACK 拒绝 | 中止、保持地面/上锁、65015 aborted | ⏳ |
-| 5 | bootstrap 超时 | 控制器停流回 IDLE、状态机中止 | ⏳ |
-| 6 | 起飞前取消 / 起飞后取消 | 前者回 READY；后者 S12→S13→S14 | ⏳ 待实跑（`flags.bit1` 取消已落地，单测覆盖） |
-| 7 | 目标等待超时 / 目标丢失超时 | S12 返航 | ⏳ 待实跑（看门狗与 S5 `target_id` 过滤已落地，单测覆盖） |
-| 8 | 低电 / 电池遥测失效 | S12，不走 PX4 RTL；遥测失效立即中止 | ⏳ |
-| 9 | 中止后清理 | 无残留 setpoint、无重试、无重复 ARM | ⏳ |
-| 10 | 回归 | G2/G3/stage4-return 仍 PASS | ⏳ |
+| 1 | 正常自动起飞 | S2→S3→S4→S5；PX4 模式 6/0、armed、高度/位置达标；65015 accepted、65013 availability 依次 assigned/engaged | ✅ 2026-10-22 |
+| 2 | 无分配 | 不起飞、不发 176/400 | ✅ 2026-10-22 |
+| 3 | 地址错误/类型不匹配 | 静默忽略、不回 65015；类型不匹配回 rejected | ✅ 2026-10-22 |
+| 4 | 176 超时/ACK 拒绝、400 超时/ACK 拒绝 | 中止、保持地面/上锁、65015 aborted | ✅ 2026-10-22（176 超时、400 超时、400 ACK 拒绝、PX4 GCS 丢失外部失效；176 ACK 拒绝无法单点注入，单测覆盖） |
+| 5 | bootstrap 超时 | 控制器停流回 IDLE、状态机中止 | ⚠️ 结构性不可达：配置校验要求 `bootstrap_timeout > lead+mode+arm`，S3 模式/解锁超时总是先触发；S3 中止后控制器 BOOTSTRAP→IDLE 已在 4a/4b 观测 |
+| 6 | 起飞前取消 / 起飞后取消 | 前者回 READY；后者 S12→S13→S14 | ✅ 2026-10-22（起飞前取消补齐 DISARM 竞态） |
+| 7 | 目标等待超时 / 目标丢失超时 | S12 返航 | ✅ 2026-10-22（修复 S12 落地卡死；PX4 先于看门狗自 RTL，见下方待决策项） |
+| 8 | 低电 / 电池遥测失效 | S12，不走 PX4 RTL；遥测失效立即中止 | ✅ 2026-10-22（修复 BAT_LOW_THR 量纲） |
+| 9 | 中止后清理 | 无残留 setpoint、无重试、无重复 ARM | ✅ 2026-10-22 |
+| 10 | 回归 | G2/G3/stage4-return 仍 PASS | ✅ 2026-10-22（stage4-return 工具侧已修 S5 入口） |
+
+**证据**：`tools/sitl_evidence/assignment_20261022/`（场景→日志映射、运行步骤、
+发现与修复见该目录 `README.md`）。
+
+**本次 SITL 发现（已修复）**：
+
+- `BAT_LOW_THR` 为 PX4 norm（0.15=15%），机载原按百分比直接比较，低电守卫
+  永不触发；`Px4Link` 现读取时 ×100，单测与 SITL（15.0%/50.0%）复核；
+- 400 ACK 已 accepted 但 armed 位未刷新时地面取消，原逻辑不发 DISARM；现按
+  “armed 或本轮 ACK accepted”补发一次；
+- S12 进入时 PX4 已自行 RTL 落地/上锁、模式又恢复 Offboard 时原逻辑会卡到
+  返航超时；现先判 `landed && !armed` 直接 S13→S14；
+- Task 5 关闭“65010 单独 S2→S5”后，注入了命令接口的 stage4-tune/feedforward/
+  return 工具无法进入 S5；工具在自身起飞后以测试钩子显式进入 S5（仅工具装配）。
+
+**待决策（设计层）**：S5 目标看门狗（10s）晚于 PX4 Offboard 丢失兜底
+（`intent_timeout 300ms` + `coast_timeout 1000ms` + `COM_OF_LOSS_T 1s`），
+目标缺失/丢失时实际由 PX4 RTL 接管，S12 的“机载位置返航”无法执行。若现场
+要求必须由 S12 返航，需缩短看门狗或在估计失效时保持位置保持意图；本次未改设计。
 
 **台架（拆桨）**：PX4 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 读取成功/失败；
 176/400 命令与实际状态；`kBootstrap` 原点保持流；中止停流、DISARM；**无 RC
@@ -283,16 +303,28 @@ echo "退出码=$?"
 验收工具（不接入正式程序）：
 
 ```bash
-# SITL：以 255/190 发送 65014，可选发送匹配 target_id 的 65010，并打印 65015/65013
-python3 tools/assignment_sitl.py --connection udpin:0.0.0.0:14550 \
+# SITL 全流程（WSL2；一次干净启动）：
+python3 tools/sitl_pty_bridge.py          # 终端1：PTY 桥，保持运行
+bash tools/sitl_restart.sh                # 终端2：PX4 SITL + GCS 心跳 + 机载
+python3 tools/assignment_sitl.py --connection /tmp/gcs_test \
   --aircraft-system 1 --aircraft-component 25 \
   --assignment-id 1 --target-id 7 --interceptor-type 25 \
-  --send-target --duration 30
+  --send-target --target-latitude <Home+20m 纬度> --target-longitude <Home 经度> \
+  --target-altitude-m 2.0 --duration 45
 
 # 取消 / 不授权（负向）
 python3 tools/assignment_sitl.py --assignment-id 1 --cancel
 python3 tools/assignment_sitl.py --assignment-id 1 --no-grant
+# 定时取消（起飞前/后）：800ms 或 15000ms 后切 flags.bit1
+python3 tools/assignment_sitl.py ... --cancel-after-ms 15000
+# 目标丢失：先发 65010，15s 后停止
+python3 tools/assignment_sitl.py ... --send-target --stop-target-after-ms 15000
 ```
+
+`sitl_restart.sh` 启动的机载使用 `config/px4_sitl_assignment.json`
+（`enable_control=true`，仅 SITL；地面站走 PTY）。`sitl_gcs.py` 以 255/190
+提供 PX4 GCS 心跳并打印 Home。直连串口设备时 `--connection` 直接传设备路径
+（pymavlink 默认 115200；不使用 `serial:` 前缀，该写法在 2.4.50 会被当作 UDP）。
 
 台架/实机经 HM30 时沿用地面站链路连接串（如
 `--connection udpout:192.168.144.12:19856`），仍须拆桨并满足 §7.3 安全要求。

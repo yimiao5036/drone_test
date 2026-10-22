@@ -1074,7 +1074,9 @@ private:
 
         bool matched = false;
         if (ParamIdMatches(parameter.param_id, kParamBatteryLowThreshold)) {
-            state_.battery_low_threshold_pct = parameter.param_value;
+            // PX4 BAT_LOW_THR 为归一化比例（module.yaml：unit=norm，默认 0.15=15%），
+            // 机载快照统一为百分比，避免与 battery_remaining_pct(0~100) 混用。
+            state_.battery_low_threshold_pct = parameter.param_value * 100.0f;
             state_.battery_low_threshold_valid = true;
             matched = true;
         } else if (ParamIdMatches(parameter.param_id, kParamLowBatteryAction)) {

@@ -226,6 +226,11 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 → 停视觉注入 → 断流回退 S5 → 停目标 → 过期停发链 → AUTO.LAND → DISARM
 ```
 
+- **S5 进入方式（2026-10-22 起）**：本工具注入了命令窄接口（S10/S13/S14），
+  而生产语义在 Task 5 后禁止“65010 单独把 S2 推到 S5”。因此工具在自身起飞悬停
+  完成后用测试钩子 `ForceStateForTest(kGpsApproach)` 显式进入 S5
+  （`test_hooks_enabled=true`，仅工具装配；G3/stage4-controller 不变）。无活动
+  分配时 S5 目标过滤不生效，目标看门狗按新鲜估计正常续命。
 - 阶跃段每段驻留 `--tune-dwell-s`（默认 15s）；换位经 `SetTargetNed` 同步移动
   地面站目标与视觉/测距注入点（卡尔曼热备份不发散），换位合法性校验：围栏内
   （≤max_radius−10m）且换位后预算 cam_z ≥2m；
@@ -693,6 +698,7 @@ sudo systemctl disable --now serial-getty@ttyS1.service
 | G4 四向脉冲方向判定失败 | 先看打印的控制器发布侧设定值北/东分量；若设定值方向正确而电机实际方向错误，按 G4-2 人工记录并查电机/桨序/机架坐标，不改工具阈值 |
 | G4 停发后不退出 Offboard | 查 `COM_OF_LOSS_T`、Offboard 丢失保护与串口链路；工具只停发意图，不主动切模式 |
 | G4 停发时 landed=false | 工具拒绝 DISARM 并尝试 AUTO.LAND；先确认是否真的离地，禁止伪造 landed/强制上锁 |
+| stage4-tune/feedforward/return 停在 S2（状态机=2），不进入 S5 | 2026-10-22 起工具在自身起飞悬停完成后用测试钩子强制进入 S5；仍停在 S2 多为运行了旧工具二进制（`test_hooks_enabled` 未启用）或悬停未被判定完成 |
 
 测试后请保存完整控制台输出和对应日志文件，供后续调整 PX4 1.17.0 消息流与串口参数。
 

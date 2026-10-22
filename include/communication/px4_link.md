@@ -350,8 +350,11 @@ UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复
    `parameter_request_interval`（默认 1000ms）时重发缺失项。两个参数都有效后
    停止请求，避免周期性刷屏。
 3. **回包**：`PARAM_VALUE` 按 `param_id` 精确匹配（`char[16]` 长度恰为 16 时
-   没有 NUL 结尾，使用定长比较，不能直接 `strcmp`）。`BAT_LOW_THR` 写
-   `battery_low_threshold_pct`；`COM_LOW_BAT_ACT` 的 float 四舍五入并夹紧到
+   没有 NUL 结尾，使用定长比较，不能直接 `strcmp`）。`BAT_LOW_THR` 在 PX4
+   1.17 中是**归一化比例**（`module.yaml`：`unit: norm`，范围 0.12~0.5，
+   默认 0.15 即 15%），写入快照前乘 100 换算为 `battery_low_threshold_pct`
+   （0~100 百分比），与 `battery_remaining_pct` 同量纲；`COM_LOW_BAT_ACT`
+   的 float 四舍五入并夹紧到
    `uint8_t` 后写 `low_battery_action`。每次命中更新
    `battery_parameter_time_ms` 并立即 `PublishState()`，状态机无需等待下一个
    周期快照。非有限数值丢弃；其它参数名完全忽略，不影响电池参数或 ACK 状态。

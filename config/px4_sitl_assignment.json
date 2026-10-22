@@ -1,0 +1,343 @@
+{
+    "log": {
+        "dir": "logs/",
+        "level": "info"
+    },
+    "runtime": {
+        "enable_video": true,
+        "enable_px4": true,
+        "enable_ground_station": true,
+        "enable_target_estimator": true,
+        "enable_visual_monitor": true,
+        "enable_control": true,
+        "enable_visual_tracking": true,
+        "enable_stereo_ranging": true,
+        "enable_visual_position_fusion": false
+    },
+    "health": {
+        "cpu_sample_period_ms": 1000,
+        "startup_grace_ms": 5000,
+        "camera_max_age_ms": 1000,
+        "decoder_max_age_ms": 1000,
+        "yolo_max_age_ms": 1000,
+        "video_max_age_ms": 1000,
+        "px4_max_age_ms": 3000,
+        "ground_station_max_age_ms": 3000
+    },
+    "px4": {
+        "transport": "udp",
+        "onboard_system_id": 1,
+        "onboard_component_id": 191,
+        "firmware_version": "1.17.0",
+        "target_system_id": 1,
+        "target_component_id": 1,
+        "mavlink_version": 2,
+        "heartbeat_send_interval_ms": 1000,
+        "heartbeat_timeout_ms": 3000,
+        "telemetry_timeout_ms": 2000,
+        "state_publish_interval_ms": 100,
+        "command_ack_timeout_ms": 1000,
+        "setpoint_send_interval_ms": 50,
+        "setpoint_timeout_ms": 500,
+        "setpoint_queue_capacity": 4,
+        "command_queue_capacity": 16,
+        "one_shot_message_requests": [
+            148,
+            242,
+            49
+        ],
+        "message_interval_requests": [
+            {
+                "message_id": 1,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 24,
+                "interval_us": 100000
+            },
+            {
+                "message_id": 30,
+                "interval_us": 40000
+            },
+            {
+                "message_id": 32,
+                "interval_us": 40000
+            },
+            {
+                "message_id": 33,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 65,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 147,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 245,
+                "interval_us": 500000
+            },
+            {
+                "message_id": 49,
+                "interval_us": 1000000
+            }
+        ],
+        "serial": {
+            "device": "/dev/ttyS1",
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "stop_bits": 1,
+            "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "udp": {
+            "bind_address": "127.0.0.1",
+            "bind_port": 14540,
+            "remote_address": "127.0.0.1",
+            "remote_port": 14580,
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "reconnect_interval_ms": 1000
+    },
+    "target_estimator": {
+        "ground_target_queue_capacity": 4,
+        "flight_state_queue_capacity": 2,
+        "publish_interval_ms": 100,
+        "process_acceleration_std_mps2": 8.0,
+        "initial_velocity_std_mps": 20.0,
+        "velocity_measurement_std_mps": 5.0,
+        "default_horizontal_accuracy_m": 10.0,
+        "default_vertical_accuracy_m": 15.0,
+        "minimum_measurement_std_m": 0.5,
+        "min_velocity_position_updates": 5,
+        "visual": {
+            "queue_capacity": 8,
+            "max_observation_age_ms": 200,
+            "flight_state_max_age_ms": 150,
+            "disparity_std_px": 0.5,
+            "min_confidence": 0.0,
+            "mount_roll_deg": 0.0,
+            "mount_pitch_deg": 0.0,
+            "mount_yaw_deg": 0.0,
+            "mount_x_m": 0.0,
+            "mount_y_m": 0.0,
+            "mount_z_m": 0.0
+        }
+    },
+    "actuator": {
+        "type": "single_pwm",
+        "net_channel": 1,
+        "net_fire_norm": -0.7,
+        "net_idle_norm": 0.0,
+        "reset_delay_ms": 1500,
+        "reset_settle_ms": 0
+    },
+    "interception": {
+        "enabled": false,
+        "auto_authorize": true,
+        "lock_frames": 10,
+        "min_range_m": 2.0,
+        "max_range_m": 10.0,
+        "min_battery_percent": 0.0,
+        "authorization_timeout_ms": 1000
+    },
+    "return_home": {
+        "enabled": true,
+        "altitude_m": 5.0,
+        "arrival_radius_m": 2.0,
+        "arrival_vertical_m": 0.5,
+        "arrival_speed_mps": 0.5,
+        "arrival_hold_ms": 1000,
+        "timeout_ms": 60000,
+        "fire_timeout_ms": 3000,
+        "command_retry_ms": 1000
+    },
+    "takeoff": {
+        "height_m": 2.0,
+        "climb_rate_mps": 0.5,
+        "bootstrap_lead_ms": 300,
+        "mode_timeout_ms": 2000,
+        "arm_timeout_ms": 3000,
+        "bootstrap_timeout_ms": 6000,
+        "height_timeout_ms": 15000,
+        "stable_time_ms": 1000,
+        "z_tolerance_m": 0.2,
+        "xy_tolerance_m": 0.5,
+        "max_vz_mps": 0.3,
+        "target_wait_timeout_ms": 10000,
+        "target_lost_timeout_ms": 10000,
+        "battery_low_debounce_ms": 1000
+    },
+    "visual_monitor": {
+        "input_queue_capacity": 2,
+        "publish_interval_ms": 100,
+        "observation_timeout_ms": 500,
+        "lock_frames": 5,
+        "lost_frames": 10,
+        "smoothing_alpha": 0.3,
+        "transition_log_interval_ms": 1000,
+        "status_log_interval_ms": 5000
+    },
+    "ground_station": {
+        "aircraft_system_id": 1,
+        "aircraft_component_id": 25,
+        "aircraft_type": "net_capture",
+        "aircraft_number": 1,
+        "callsign": "捕网-01",
+        "ground_system_id": 255,
+        "ground_component_id": 190,
+        "mavlink_version": 2,
+        "heartbeat_send_interval_ms": 1000,
+        "heartbeat_timeout_ms": 3000,
+        "time_sync": {
+            "enabled": true,
+            "acquire_interval_ms": 200,
+            "steady_interval_ms": 1000,
+            "minimum_samples": 5,
+            "window_capacity": 10,
+            "sync_timeout_ms": 5000,
+            "max_rtt_ms": 300,
+            "max_offset_jump_ms": 100
+        },
+        "target_input": {
+            "minimum_valid_for_ms": 100,
+            "maximum_valid_for_ms": 5000,
+            "minimum_remaining_valid_ms": 100,
+            "maximum_transport_delay_ms": 1000,
+            "future_tolerance_ms": 200
+        },
+        "flight_state_queue_capacity": 2,
+        "send_interval_ms": {
+            "health": 1000,
+            "mission": 500,
+            "attitude": 100,
+            "local_position": 200,
+            "global_position": 200,
+            "gps": 200,
+            "extended_state": 500,
+            "system_status": 1000,
+            "battery": 1000,
+            "home": 1000
+        },
+        "serial": {
+            "device": "/tmp/gcs_app",
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "stop_bits": 1,
+            "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        }
+    },
+    "yolo": {
+        "model_path": "models/yolov26_ReLU6_09_13-rk3588_384_640.rknn",
+        "conf_threshold": 0.3,
+        "nms_threshold": 0.45,
+        "input_queue_capacity": 1,
+        "npu_core_mode": "all",
+        "collect_npu_internal_perf": false,
+        "collect_npu_perf_detail": false,
+        "max_detection_frame_lag": 10,
+        "class_names": [
+            "drone"
+        ]
+    },
+    "video": {
+        "camera_source": "uvc",
+        "stereo_split": true,
+        "uvc_device": "/dev/video0",
+        "uvc_width": 2560,
+        "uvc_height": 720,
+        "uvc_fps": 30,
+        "input_rtsp": "rtsp://192.168.144.25:8554/main.264",
+        "output_rtsp": "rtsp://127.0.0.1:8554/drone_{aircraft_component_id}_{aircraft_system_id}",
+        "width": 1280,
+        "height": 720,
+        "fps": 25,
+        "bitrate": 6000000,
+        "prefer_rga_dma_transfer": true
+    },
+    "visual_tracking": {
+        "_comment": "视觉跟踪控制律（影子运行，不接 Px4Link）。camera 组为 2026-09-23 左目标定实测内参（1280x720 档，cy 偏离画面中心为实测值）；heading/vertical/distance 参数已于 2026-10-14 经 SITL 整定（证据与指标见 include/control/tracking_control_law.md「参数整定记录」；heading.gain 1.0→0.9，vz_gain 与 distance PID 占位值实测达标冻结）。",
+        "control": {
+            "frequency_hz": 20.0,
+            "visual_stale_ms": 200,
+            "distance_stale_ms": 500,
+            "attitude_stale_ms": 300
+        },
+        "camera": {
+            "_comment": "2026-09-23 左目标定实测（config/camera_calibration_uvc_1280x720.json）；只对 1280x720 档有效，换档必须重标定",
+            "image_width": 1280,
+            "image_height": 720,
+            "fx_px": 1007.82,
+            "fy_px": 1008.02,
+            "cx_px": 620.73,
+            "cy_px": 532.07
+        },
+        "heading": {
+            "mode": "rate",
+            "gain": 0.9,
+            "yaw_rate_limit_dps": 30.0,
+            "yaw_slew_limit_dps2": 60.0
+        },
+        "vertical": {
+            "vz_gain_mps_per_deg": 0.1,
+            "vz_limit_mps": 2.0
+        },
+        "distance": {
+            "_comment": "d_exp_m=10 为占位期望射程（由拦截设备接口给出，待定）；PID 在该射程整定，d_exp 冻结后须在 SITL 复核零过冲（tune_report.py 硬判据）",
+            "d_exp_m": 10.0,
+            "kp": 0.5,
+            "ki": 0.05,
+            "kd": 0.1,
+            "integral_limit": 2.0,
+            "derivative_filter_coef": 0.2,
+            "approach_velocity_limit_mps": 3.0,
+            "retreat_velocity_limit_mps": 1.0,
+            "no_distance_action": "slow_approach",
+            "no_distance_approach_limit_mps": 0.5,
+            "no_distance_exit_grace_ms": 3000
+        },
+        "accel_limit": {
+            "ax_mps2": 2.0,
+            "ay_mps2": 2.0,
+            "az_mps2": 1.5
+        },
+        "shadow": {
+            "_comment": "现场无 PX4 姿态时以零姿态继续计算（仅供观察）；摘要日志 10s",
+            "virtual_attitude_when_absent": true,
+            "summary_log_interval_ms": 10000
+        }
+    },
+    "stereo_ranger": {
+        "_comment": "双目测距 v2（稀疏 Census，影子）：基准图=SBS右半=物理左目=左目Topic。校正矩阵与本文件同目录（stereo_rectify_uvc_1280x720.json，重标定后必须重跑 export_rectify.py）；以下参数默认即 Python 参考实现实测配置。collect_detailed_latency 为诊断开关：开发阶段置 true（记录阶段耗时/逐点快照，开销实测在噪声内），生产调优定型后改回 false",
+        "rectify_matrices_path": "stereo_rectify_uvc_1280x720.json",
+        "disp_min_px": 8.0,
+        "disp_max_px": 160.0,
+        "coarse_stride": 2,
+        "fine_halfwidth": 6,
+        "uniqueness_ratio": 1.05,
+        "lr_tol_px": 1.0,
+        "census_win": 7,
+        "max_points_per_target": 80,
+        "grid_cells": 4,
+        "warmup_frames": 15,
+        "black_frame_mean_threshold": 2.0,
+        "bbox_erode_px": 5,
+        "min_points": 30,
+        "near_pct": 90.0,
+        "near_tol_px": 3.0,
+        "smooth_alpha": 0.4,
+        "collect_detailed_latency": true,
+        "input_queue_capacity": 2,
+        "frame_buffer_depth": 4,
+        "pair_window_ms": 20,
+        "settle_ms": 50,
+        "summary_log_interval_ms": 10000
+    },
+    "_comment": "SITL 多机任务分配/自动起飞验收配置（2026-10-22）：enable_control=true 仅用于 WSL2 PX4 SITL 验收；地面站链路走 /tmp/gcs_app（PTY 桥接，由验收脚本创建）；视频/双目仅为绑定 SetEstimationInputs，UVC 设备不存在时降级不影响控制链。生产 config.json 必须保持 enable_control=false。"
+}

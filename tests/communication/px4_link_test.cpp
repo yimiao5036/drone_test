@@ -1306,7 +1306,8 @@ TEST(Px4LinkTest, BatteryParameterValuesUpdateSnapshot) {
     MavlinkHandler px4_encoder;
     std::vector<uint8_t> bytes = EncodePx4Heartbeat(
         px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
-    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 15.f);
+    // PX4 BAT_LOW_THR 为 norm（0.15=15%）；快照统一换算为百分比。
+    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 0.15f);
     AppendParamValue(px4_encoder, &bytes, "COM_LOW_BAT_ACT", 0.f);
     ASSERT_TRUE(terminal.Write(bytes));
 
@@ -1377,7 +1378,8 @@ TEST(Px4LinkTest, UnknownParamValueDoesNotChangeBatteryConfiguration) {
     MavlinkHandler px4_encoder;
     std::vector<uint8_t> bytes = EncodePx4Heartbeat(
         px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
-    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 15.f);
+    // PX4 BAT_LOW_THR 为 norm（0.15=15%）；快照统一换算为百分比。
+    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 0.15f);
     ASSERT_TRUE(terminal.Write(bytes));
     ASSERT_TRUE(WaitUntil(
         [&] { return link.LatestState().battery_low_threshold_valid; }, 500ms));
@@ -1406,7 +1408,7 @@ TEST(Px4LinkTest, DisconnectClearsBatteryParametersAndReconnectRequestsAgain) {
     MavlinkHandler px4_encoder;
     std::vector<uint8_t> bytes = EncodePx4Heartbeat(
         px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
-    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 20.f);
+    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 0.2f);
     AppendParamValue(px4_encoder, &bytes, "COM_LOW_BAT_ACT", 1.f);
     ASSERT_TRUE(terminal.Write(bytes));
     ASSERT_TRUE(WaitUntil([&] {
