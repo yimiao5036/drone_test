@@ -118,6 +118,10 @@ struct Px4LinkConfig {
     std::chrono::milliseconds command_ack_timeout{1000};
     std::chrono::milliseconds setpoint_send_interval{50};
     std::chrono::milliseconds setpoint_timeout{500};
+    /// 电池参数（BAT_LOW_THR/COM_LOW_BAT_ACT）未读到时按此周期重发请求。
+    std::chrono::milliseconds parameter_request_interval{1000};
+    /// 连接建立后超过该时长仍无有效电池参数，保持 valid=false 并节流告警。
+    std::chrono::milliseconds parameter_timeout{5000};
     std::size_t setpoint_queue_capacity = 4;
     std::size_t command_queue_capacity = 16;
     std::vector<uint32_t> one_shot_message_requests;

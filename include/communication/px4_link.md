@@ -16,6 +16,7 @@
 - 接收并筛选目标 PX4 `HEARTBEAT`；
 - 维护 connected、armed、PX4 main/sub mode 和 system status；
 - 解析固件版本/能力、落地、全局/局部位置、姿态、GPS、电池、Home 和 RC；
+- 连接后读取 PX4 电池参数 `BAT_LOW_THR` / `COM_LOW_BAT_ACT`（静态配置，非遥测流）；
 - 心跳超时后将连接状态置为断开，各类遥测按 `telemetry_timeout` 独立失效；
 - **串口连续读错误时关闭端口，按 `reconnect_interval` 自动重开**；UDP 不重连；
 - 周期及状态变化时发布 `Topic<FlightStateSnapshot>`；
@@ -47,6 +48,8 @@ struct Px4LinkConfig {
     std::chrono::milliseconds command_ack_timeout;
     std::chrono::milliseconds setpoint_send_interval;
     std::chrono::milliseconds setpoint_timeout;
+    std::chrono::milliseconds parameter_request_interval;  // 参数请求重试周期
+    std::chrono::milliseconds parameter_timeout;           // 连接后无有效参数的告警阈值
     std::size_t setpoint_queue_capacity;
     std::size_t command_queue_capacity;
     std::vector<uint32_t> one_shot_message_requests;
@@ -116,6 +119,8 @@ PX4 串口
   → MavlinkHandler::Feed
   → 目标 system/component ID 过滤
   → 心跳/版本/飞行遥测解码与新鲜度校验
+  → BatteryStatus/SYS_STATUS → 电池遥测
+  → PARAM_VALUE → 电池参数快照（BAT_LOW_THR/COM_LOW_BAT_ACT）
   → FlightStateSnapshot
   → kFlightState Topic
   → 后续状态机/控制/感知融合
@@ -131,6 +136,9 @@ PX4 串口
   → SerialPort::Write
   → PX4
   → COMMAND_ACK 匹配/超时
+
+PARAM_REQUEST_READ（BAT_LOW_THR / COM_LOW_BAT_ACT）
+  → 直接 MavlinkHandler::Encode + SerialPort::Write（不进命令队列、不占 ACK 通道）
 ```
 
 `SetInput()` 必须在 `Start()` 前调用。订阅采用容量可配置、丢旧留新策略；通信线程缓存最新
@@ -144,10 +152,11 @@ PX4 串口
 
 1. 带超时读取串口；
 2. 增量解析收到的 MAVLink 帧；
-3. 检查 PX4 心跳和命令 ACK 超时，并处理外部取消请求（清空排队/在途命令）；
-4. 发送下一条排队命令；
-5. 到期发送机载电脑心跳；
-6. 到期发布飞行状态快照。
+3. 检查 PX4 心跳和命令 ACK 超时，处理外部取消请求（清空排队/在途命令）；
+4. 按 `parameter_request_interval` 重发缺失的电池参数请求（直接写 transport）；
+5. 发送下一条排队命令；
+6. 到期发送机载电脑心跳；
+7. 到期发布飞行状态快照。
 
 其他线程不得访问 `SerialPort::Write()`。设定值和命令只能进入 Topic/有界队列，由本线程发送。
 
@@ -195,6 +204,10 @@ bits 24..31 → flight_sub_mode（sub mode）
   NED 速度；
 - 姿态：roll/pitch/yaw；
 - 动力电池：电压、电流、剩余量及各自有效标志；
+- 电池参数：`battery_low_threshold_valid/pct`（`BAT_LOW_THR`）、
+  `low_battery_action_valid/action`（`COM_LOW_BAT_ACT`，float 四舍五入到 uint8）
+  与 `battery_parameter_time_ms`；属于静态配置，**不参与 `telemetry_timeout`**，
+  断连/Stop 直接失效（见 §3.9）；
 - Home：经纬度与 MSL 高度；
 - **EKF 投影参考锚点**（2026-10-15 新增）：`GPS_GLOBAL_ORIGIN`（**#49**，内容为
   `vehicle_local_position.ref_*` 的 MAVLink 出口）→
@@ -323,12 +336,43 @@ UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复
 日志：断链一条 WARN（含原因/设备/重试周期）；重连成功一条 INFO（含尝试次数）；
 重连失败首次与每 10 次 WARN；底层串口错误仍由 `SerialPort` 节流记录。
 
+### 3.9 PX4 电池参数读取（BAT_LOW_THR / COM_LOW_BAT_ACT）
+
+自动分配/起飞和机载低电守卫需要 PX4 自身的电池保护参数（设计文档 §9）。
+这两个参数是**静态配置**，不是周期遥测：
+
+1. **请求**：首次收到 PX4 心跳（连接建立）后，通信线程发送
+   `PARAM_REQUEST_READ`，`param_id` 分别为 `BAT_LOW_THR`、`COM_LOW_BAT_ACT`，
+   `param_index=-1`（按名称读取），target system/component 取配置值。
+   请求帧直接 `MavlinkHandler::Encode` + `transport_->Write`，
+   **不进入 `COMMAND_LONG` 命令队列，不占用 ACK 通道**。
+2. **重试**：连接的每个参数独立判断；未收到有效值且距上次请求达到
+   `parameter_request_interval`（默认 1000ms）时重发缺失项。两个参数都有效后
+   停止请求，避免周期性刷屏。
+3. **回包**：`PARAM_VALUE` 按 `param_id` 精确匹配（`char[16]` 长度恰为 16 时
+   没有 NUL 结尾，使用定长比较，不能直接 `strcmp`）。`BAT_LOW_THR` 写
+   `battery_low_threshold_pct`；`COM_LOW_BAT_ACT` 的 float 四舍五入并夹紧到
+   `uint8_t` 后写 `low_battery_action`。每次命中更新
+   `battery_parameter_time_ms` 并立即 `PublishState()`，状态机无需等待下一个
+   周期快照。非有限数值丢弃；其它参数名完全忽略，不影响电池参数或 ACK 状态。
+4. **超时**：连接建立超过 `parameter_timeout`（默认 5000ms）仍无有效值时，
+   **保持 `valid=false`，不得用 0 冒充真实阈值**；按首次 + 每 100 次节流 WARN。
+   读取失败由上层映射为 `battery_config_unknown`（Task 8）。
+5. **失效**：心跳超时、串口断链重连、Worker 退出与 `Stop()` 都会清空两个
+   valid 标志、`battery_parameter_time_ms` 和请求簿记；重连后重新请求。
+   数值字段保留最后一次读数仅供排查，`valid=false` 时上层不得使用。
+6. 参数读取与 RC 无关：不读取、不修改遥控器通道；参数读取本身也不下发任何
+   飞行控制命令。
+
+`Px4LinkStub` 不实现参数请求，`LatestState()` 返回默认快照（两个 valid 均为
+false）。
+
 ## 4. 日志行为
 
 | 等级 | 场景 |
 |---|---|
-| INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、命令 ACK、固件版本、正常停止 |
-| WARN | 心跳超时、串口断链/重连失败、固件不一致、命令队列满、ACK 超时、非法/过期设定值（均节流） |
+| INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、电池参数读取完成（每连接一次）、命令 ACK、固件版本、正常停止 |
+| WARN | 心跳超时、串口断链/重连失败、电池参数读取超时（首次 + 每 100 次）、固件不一致、命令队列满、ACK 超时、非法/过期设定值（均节流） |
 | ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
 
 不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
@@ -358,6 +402,14 @@ UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复
 - `CancelPendingCommands()` 清掉排队命令，在途命令超时后不得发出；
 - ACK 超时计数后继续队列；
 - 首次心跳后按顺序发送单次消息请求和消息频率请求；
+- 首次心跳后发送 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 两条 `PARAM_REQUEST_READ`
+  （index=-1，target 身份正确）；
+- `PARAM_VALUE` 回包后 `LatestState()` 与 `StateOutput()` 的
+  `battery_low_threshold_valid/pct`、`low_battery_action_valid/action`、
+  `battery_parameter_time_ms` 正确，且不改变 ACK 计数/快照；
+- 参数超时保持 `valid=false`（不伪造 0）；未知/16 字节无 NUL 参数名不影响已有值；
+- 断连清除两个 valid，重连后重新发起参数请求；
+- `Px4LinkStub` 默认两个 valid 均为 false；
 - `LatestState()` 未发布时返回默认快照，连接后反映已发布快照（connected/armed）；
 - 本地 NED 位置设定值、type mask 和 yaw 角转换；
 - 位置+逐轴速度前馈的 type mask/字段打包（仅 N 时 VY/VZ 保持忽略）；
@@ -391,6 +443,7 @@ HEARTBEAT、`REQUEST_MESSAGE` 和 `SET_MESSAGE_INTERVAL`，不发送解锁、模
 | Stop 延迟 | `serial.read_timeout_ms` 决定最坏退出等待时间 |
 | 重启后旧控制恢复 | 属于缺陷；Start 必须清空状态和后续的设定值/命令缓存 |
 | 收到其他 MAVLink 设备消息 | 当前按目标 ID 过滤；未来多组件遥测需明确白名单后扩展 |
+| 电池参数一直无效 | 确认 PX4 有 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 参数、链路已连接；检查 `parameter_timeout` 内的超时 WARN 与 `PARAM_VALUE` 是否到达 |
 
 PX4 1.17.0 SITL 第 3A~3D 已完成：Offboard 前置流、ARM/DISARM、零速度、相对起飞、
 位置悬停、水平速度/制动/返回、AUTO.LAND，以及停止 setpoint 后退出 Offboard 的保护闭环。

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -59,6 +60,22 @@ uint64_t MonotonicMs() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// 电池守卫读取的 PX4 参数名（自动分配/起飞门禁使用，见设计文档 §9）。
+constexpr char kParamBatteryLowThreshold[] = "BAT_LOW_THR";
+constexpr char kParamLowBatteryAction[] = "COM_LOW_BAT_ACT";
+
+// MAVLink param_id 为 char[16]：长度恰为 16 时没有 NUL 结尾，不能直接用 strcmp。
+bool ParamIdMatches(const char (&param_id)[16], const char* expected) {
+    const std::size_t expected_length = std::strlen(expected);
+    if (expected_length > sizeof(param_id)) {
+        return false;
+    }
+    if (std::memcmp(param_id, expected, expected_length) != 0) {
+        return false;
+    }
+    return expected_length == sizeof(param_id) || param_id[expected_length] == '\0';
+}
+
 }  // namespace
 
 // PX4 配置校验：传输方式、身份、版本、周期与超时、队列容量与请求 ID 范围。
@@ -88,6 +105,9 @@ void Px4LinkConfig::Validate() const {
         reconnect_interval.count() <= 0 || command_ack_timeout.count() <= 0 ||
         setpoint_send_interval.count() <= 0 || setpoint_timeout.count() <= 0) {
         throw std::invalid_argument("PX4 链路读取、遥测、命令 ACK、设定值周期与超时必须为正数");
+    }
+    if (parameter_request_interval.count() <= 0 || parameter_timeout.count() <= 0) {
+        throw std::invalid_argument("PX4 参数请求周期与超时必须为正数");
     }
     if (setpoint_queue_capacity == 0 || command_queue_capacity == 0) {
         throw std::invalid_argument("PX4 设定值和命令队列容量必须大于 0");
@@ -147,6 +167,7 @@ public:
             state_sequence_ = 0;
             last_heartbeat_time_ms_ = 0;
             ResetTelemetryTimes();
+            InvalidateBatteryParameters();
             ClearCommands();
             cached_setpoint_.reset();
             next_command_sequence_.store(1, std::memory_order_relaxed);
@@ -404,6 +425,7 @@ private:
             state_ = common::FlightStateSnapshot{};
             last_heartbeat_time_ms_ = 0;
             ResetTelemetryTimes();
+            InvalidateBatteryParameters();
             ClearCommands();
             cached_setpoint_.reset();
             telemetry_requests_queued_ = false;
@@ -477,6 +499,7 @@ private:
             const uint64_t now_ms = MonotonicMs();
             DrainSetpointInput(now_ms);   // 消费控制器新设定值
             CheckHeartbeatTimeout(now_ms); // 心跳超时断连
+            SendParameterRequestsIfDue(now_ms);  // 重试未读到的电池参数
             CheckCommandTimeout(now_ms);   // 在途命令 ACK 超时
             // 外部取消请求（状态机线程置标志）：在本线程清空排队与在途命令，
             // 保证发送前生效，旧命令不会在本轮被发出。
@@ -744,6 +767,9 @@ private:
             case MAVLINK_MSG_ID_COMMAND_ACK:
                 HandleCommandAck(message, now_ms);
                 break;
+            case MAVLINK_MSG_ID_PARAM_VALUE:
+                HandleParamValue(message, now_ms);
+                break;
             default:
                 break;
         }
@@ -772,6 +798,9 @@ private:
         // 经 LatestState() 必能读到 connected=true 的快照（happens-before）。
         PublishState(now_ms);
         if (!connected_.exchange(true, std::memory_order_acq_rel)) {
+            // 连接起点用于 parameter_timeout 判据；断连时由
+            // InvalidateBatteryParameters() 清零。
+            connected_since_ms_ = now_ms;
             SPDLOG_INFO("PX4 心跳已连接: source={}/{} mode={}/{} armed={}",
                         message.sysid, message.compid, state_.flight_mode,
                         state_.flight_sub_mode, state_.armed);
@@ -1033,6 +1062,44 @@ private:
         PublishState(now_ms);
     }
 
+    // PX4 参数回包：仅按名称匹配 BAT_LOW_THR / COM_LOW_BAT_ACT，其它参数忽略。
+    // 参数属于静态配置而非遥测流：收到即更新数值/有效位/时间，并立即发布快照，
+    // 让状态机尽快看到；不参与 telemetry_timeout，只在断连/Stop 时失效。
+    void HandleParamValue(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_param_value_t parameter{};
+        mavlink_msg_param_value_decode(&message, &parameter);
+        if (!std::isfinite(parameter.param_value)) {
+            return;  // 非法数值不伪造有效值。
+        }
+
+        bool matched = false;
+        if (ParamIdMatches(parameter.param_id, kParamBatteryLowThreshold)) {
+            state_.battery_low_threshold_pct = parameter.param_value;
+            state_.battery_low_threshold_valid = true;
+            matched = true;
+        } else if (ParamIdMatches(parameter.param_id, kParamLowBatteryAction)) {
+            // PX4 以 float 返回枚举，四舍五入并夹紧到 uint8 范围。
+            const long rounded = std::lround(parameter.param_value);
+            state_.low_battery_action =
+                static_cast<uint8_t>(std::clamp(rounded, 0L, 255L));
+            state_.low_battery_action_valid = true;
+            matched = true;
+        }
+        if (!matched) {
+            return;
+        }
+
+        state_.battery_parameter_time_ms = now_ms;
+        if (!parameter_read_logged_ && state_.battery_low_threshold_valid &&
+            state_.low_battery_action_valid) {
+            parameter_read_logged_ = true;
+            SPDLOG_INFO("PX4 电池参数读取完成: BAT_LOW_THR={:.1f}% COM_LOW_BAT_ACT={}",
+                        state_.battery_low_threshold_pct,
+                        state_.low_battery_action);
+        }
+        PublishState(now_ms);
+    }
+
     // 在途命令 ACK 超时：丢弃当前命令并继续队列。
     void CheckCommandTimeout(uint64_t now_ms) {
         if (!in_flight_command_ || now_ms < in_flight_command_->sent_time_ms) {
@@ -1153,6 +1220,20 @@ private:
         state_.ned_ref_valid = false;
         state_.ned_ref_received_count = 0;
         rc_link_present_ = false;
+        InvalidateBatteryParameters();
+    }
+
+    // 电池参数属于静态配置而非遥测流：断连/Stop 时直接失效并清请求簿记，
+    // 重连后由 WorkerLoop 重新发送 PARAM_REQUEST_READ。保留最后数值仅供排查
+    // （valid=false 时上层不得使用，也不参与 telemetry_timeout）。
+    void InvalidateBatteryParameters() {
+        state_.battery_low_threshold_valid = false;
+        state_.low_battery_action_valid = false;
+        state_.battery_parameter_time_ms = 0;
+        last_parameter_request_ms_ = 0;
+        connected_since_ms_ = 0;
+        parameter_read_logged_ = false;
+        parameter_timeout_count_ = 0;
     }
 
     // 清空各遥测接收时间，使后续新鲜度判断立即失效。
@@ -1185,6 +1266,68 @@ private:
                     config_.target_system_id, config_.target_component_id,
                     config_.heartbeat_timeout.count());
         PublishState(now_ms);
+    }
+
+    // 发送一条 PARAM_REQUEST_READ（param_index=-1，按名称读取）。参数请求是静态
+    // 读取，直接写 transport，不进入 COMMAND_LONG 命令队列，避免占用 ACK 通道。
+    // 仅由通信线程调用。
+    bool SendParamRequestRead(const char* param_id) {
+        // 生成库按 char[16] 整块复制，必须提供定长缓冲，避免读取字符串字面量越界。
+        char param_id_buffer[16] = {};
+        std::strncpy(param_id_buffer, param_id, sizeof(param_id_buffer));
+        const auto frame = mavlink_.Encode(
+            [this, &param_id_buffer](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_param_request_read_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, config_.target_system_id,
+                    config_.target_component_id, param_id_buffer, -1);
+            });
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+
+    // 连接期间按 parameter_request_interval 重发缺失的电池参数请求；两个参数都
+    // 有效后停止请求，避免周期性刷屏。超过 parameter_timeout 仍缺失时保持
+    // valid=false（不得用 0 冒充真实阈值），并按首次 + 每 100 次节流 WARN。
+    void SendParameterRequestsIfDue(uint64_t now_ms) {
+        if (!connected_.load(std::memory_order_acquire)) {
+            return;
+        }
+        const bool need_threshold = !state_.battery_low_threshold_valid;
+        const bool need_action = !state_.low_battery_action_valid;
+        if (!need_threshold && !need_action) {
+            return;
+        }
+
+        const uint64_t interval_ms =
+            static_cast<uint64_t>(config_.parameter_request_interval.count());
+        if (last_parameter_request_ms_ != 0 && now_ms >= last_parameter_request_ms_ &&
+            now_ms - last_parameter_request_ms_ < interval_ms) {
+            return;
+        }
+        last_parameter_request_ms_ = now_ms;
+        if (need_threshold) {
+            (void)SendParamRequestRead(kParamBatteryLowThreshold);
+        }
+        if (need_action) {
+            (void)SendParamRequestRead(kParamLowBatteryAction);
+        }
+
+        const uint64_t timeout_ms =
+            static_cast<uint64_t>(config_.parameter_timeout.count());
+        if (connected_since_ms_ != 0 && now_ms >= connected_since_ms_ &&
+            now_ms - connected_since_ms_ > timeout_ms) {
+            const uint64_t count = ++parameter_timeout_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("PX4 电池参数读取超时: BAT_LOW_THR_valid={} "
+                            "COM_LOW_BAT_ACT_valid={} timeout_ms={}，累计 {}",
+                            state_.battery_low_threshold_valid,
+                            state_.low_battery_action_valid, timeout_ms, count);
+            }
+        }
     }
 
     // 周期发送机载电脑 HEARTBEAT，声明本链路为 onboard computer。
@@ -1253,6 +1396,13 @@ private:
     bool rc_link_present_ = false;
     bool firmware_version_logged_ = false;
     bool telemetry_requests_queued_ = false;
+
+    // 电池参数请求簿记（仅通信线程访问）：上次请求时刻、连接起点、是否已打印
+    // 成功日志、超时告警节流计数。
+    uint64_t last_parameter_request_ms_ = 0;
+    uint64_t connected_since_ms_ = 0;
+    uint64_t parameter_timeout_count_ = 0;
+    bool parameter_read_logged_ = false;
 
     // 串口重连（仅 WorkerLoop 访问）：读错误连续计数、待重连标志与重试时刻。
     bool reconnect_pending_ = false;

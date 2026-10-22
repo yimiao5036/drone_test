@@ -276,6 +276,13 @@ struct FlightStateSnapshot {
     float battery_current_a = 0.f;      ///< 动力电池电流
     bool battery_remaining_valid = false;
     float battery_remaining_pct = 0.f;  ///< 剩余电量百分比
+    /// PX4 电池保护参数（PARAM_REQUEST_READ/PARAM_VALUE 读取，静态配置、非遥测流）：
+    /// 断连或 Stop 立即失效；连接期间读取成功后保持，不参与 telemetry_timeout。
+    bool battery_low_threshold_valid = false;
+    float battery_low_threshold_pct = 0.f;  ///< PX4 BAT_LOW_THR（百分比）
+    bool low_battery_action_valid = false;
+    uint8_t low_battery_action = 0;         ///< PX4 COM_LOW_BAT_ACT 枚举值（四舍五入）
+    uint64_t battery_parameter_time_ms = 0; ///< 最近一次参数回包的单调时钟毫秒
     bool rc_state_valid = false;
     bool rc_connected = false;          ///< 遥控器链路在线，不等于人工接管
     uint8_t rc_rssi = 0;                ///< MAVLink RC_CHANNELS.rssi

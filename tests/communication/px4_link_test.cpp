@@ -5,9 +5,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -76,6 +78,54 @@ public:
             written += static_cast<std::size_t>(count);
         }
         return true;
+    }
+
+    /// 收集若干条同 ID 消息。一次 read 可能包含多帧，单条 WaitForMessage 会丢弃
+    /// 同批后续帧，参数请求成对发送时必须用本函数。
+    bool CollectMessages(uint32_t message_id, std::size_t expected,
+                         std::chrono::milliseconds timeout,
+                         std::vector<mavlink_message_t>* output) const {
+        MavlinkHandler decoder;
+        output->clear();
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline && output->size() < expected) {
+            pollfd descriptor{};
+            descriptor.fd = master_fd_;
+            descriptor.events = POLLIN;
+            if (::poll(&descriptor, 1, 10) <= 0) {
+                continue;
+            }
+
+            std::array<uint8_t, 512> buffer{};
+            const ssize_t count = ::read(master_fd_, buffer.data(), buffer.size());
+            if (count <= 0) {
+                continue;
+            }
+            decoder.Feed(buffer.data(), static_cast<std::size_t>(count),
+                         [&](const mavlink_message_t& message) {
+                             if (message.msgid == message_id &&
+                                 output->size() < expected) {
+                                 output->push_back(message);
+                             }
+                         });
+        }
+        return output->size() >= expected;
+    }
+
+    /// 丢弃当前主端缓冲的全部字节，用于区分断连前后的消息。
+    void Drain(std::chrono::milliseconds timeout) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pollfd descriptor{};
+            descriptor.fd = master_fd_;
+            descriptor.events = POLLIN;
+            if (::poll(&descriptor, 1, 10) <= 0) {
+                continue;
+            }
+            std::array<uint8_t, 512> buffer{};
+            const ssize_t drained = ::read(master_fd_, buffer.data(), buffer.size());
+            (void)drained;
+        }
     }
 
     bool WaitForMessage(uint32_t message_id, std::chrono::milliseconds timeout,
@@ -168,6 +218,30 @@ std::vector<uint8_t> EncodePx4Heartbeat(MavlinkHandler& encoder, uint8_t system_
         });
 }
 
+/// 编码 PARAM_VALUE。param_id 按 MAVLink 约定复制到定长 char[16]，
+/// 允许传入正好 16 字节且无 NUL 结尾的参数名。
+std::vector<uint8_t> EncodeParamValue(MavlinkHandler& encoder,
+                                      const std::string& param_id, float value,
+                                      uint16_t param_index = 0) {
+    char id[16] = {};
+    const std::size_t length =
+        param_id.size() < sizeof(id) ? param_id.size() : sizeof(id);
+    std::memcpy(id, param_id.data(), length);
+    return encoder.Encode(
+        [&](mavlink_status_t* status, mavlink_message_t* message) {
+            return mavlink_msg_param_value_pack_status(
+                1, MAV_COMP_ID_AUTOPILOT1, status, message, id, value,
+                MAV_PARAM_TYPE_REAL32, 2, param_index);
+        });
+}
+
+/// 把已编码的 PARAM_VALUE 追加到待发送字节流。
+void AppendParamValue(MavlinkHandler& encoder, std::vector<uint8_t>* output,
+                      const std::string& param_id, float value) {
+    auto frame = EncodeParamValue(encoder, param_id, value);
+    output->insert(output->end(), frame.begin(), frame.end());
+}
+
 template <typename Packer>
 void AppendEncoded(MavlinkHandler& encoder, std::vector<uint8_t>* output,
                    Packer&& packer) {
@@ -206,6 +280,14 @@ TEST(Px4LinkTest, ConfigRejectsInvalidIdentityAndVersion) {
 
     config.command_queue_capacity = 16;
     config.message_interval_requests = {{MAVLINK_MSG_ID_ATTITUDE, 0}};
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.message_interval_requests.clear();
+    config.parameter_request_interval = 0ms;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.parameter_request_interval = 1000ms;
+    config.parameter_timeout = 0ms;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
@@ -1170,6 +1252,198 @@ TEST(Px4LinkTest, CancelPendingCommandsDropsQueuedCommand) {
                   MAVLINK_MSG_ID_COMMAND_LONG, 50ms, nullptr),
               false);
     link.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 7：PX4 电池参数读取（BAT_LOW_THR / COM_LOW_BAT_ACT）
+// ---------------------------------------------------------------------------
+
+std::vector<std::string> DecodeParamRequestIds(
+    const std::vector<mavlink_message_t>& requests) {
+    std::vector<std::string> ids;
+    for (const auto& message : requests) {
+        mavlink_param_request_read_t request{};
+        mavlink_msg_param_request_read_decode(&message, &request);
+        EXPECT_EQ(request.target_system, 1);
+        EXPECT_EQ(request.target_component, MAV_COMP_ID_AUTOPILOT1);
+        EXPECT_EQ(request.param_index, -1);
+        ids.emplace_back(request.param_id,
+                         ::strnlen(request.param_id, sizeof(request.param_id)));
+    }
+    return ids;
+}
+
+TEST(Px4LinkTest, RequestsBatteryParametersAfterHeartbeat) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    config.parameter_request_interval = 200ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    std::vector<mavlink_message_t> requests;
+    ASSERT_TRUE(terminal.CollectMessages(
+        MAVLINK_MSG_ID_PARAM_REQUEST_READ, 2, 500ms, &requests));
+    const auto ids = DecodeParamRequestIds(requests);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "BAT_LOW_THR"), ids.end());
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "COM_LOW_BAT_ACT"), ids.end());
+    link.Stop();
+}
+
+TEST(Px4LinkTest, BatteryParameterValuesUpdateSnapshot) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    auto subscription = link.StateOutput().Subscribe(64);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    std::vector<uint8_t> bytes = EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
+    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 15.f);
+    AppendParamValue(px4_encoder, &bytes, "COM_LOW_BAT_ACT", 0.f);
+    ASSERT_TRUE(terminal.Write(bytes));
+
+    ASSERT_TRUE(WaitUntil([&] {
+        const auto state = link.LatestState();
+        return state.battery_low_threshold_valid && state.low_battery_action_valid;
+    }, 500ms));
+
+    const auto state = link.LatestState();
+    EXPECT_TRUE(state.battery_low_threshold_valid);
+    EXPECT_FLOAT_EQ(state.battery_low_threshold_pct, 15.f);
+    EXPECT_TRUE(state.low_battery_action_valid);
+    EXPECT_EQ(state.low_battery_action, 0u);
+    EXPECT_GT(state.battery_parameter_time_ms, 0u);
+    // 参数回包属于旁路读取，不得占用命令 ACK 通道或污染 ACK 快照。
+    EXPECT_EQ(link.AckMatchCount(), 0u);
+    EXPECT_EQ(link.AckTimeoutCount(), 0u);
+    EXPECT_EQ(state.last_ack_command, 0);
+
+    common::FlightStateSnapshot snapshot;
+    bool found = false;
+    while (auto message = subscription.WaitTakeFor(50ms)) {
+        if ((*message)->battery_low_threshold_valid &&
+            (*message)->low_battery_action_valid) {
+            snapshot = **message;
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+    EXPECT_FLOAT_EQ(snapshot.battery_low_threshold_pct, 15.f);
+    EXPECT_EQ(snapshot.low_battery_action, 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, BatteryParameterTimeoutKeepsInvalid) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 1000ms;
+    config.parameter_request_interval = 20ms;
+    config.parameter_timeout = 50ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    std::this_thread::sleep_for(200ms);
+    const auto state = link.LatestState();
+    EXPECT_TRUE(state.connected);
+    EXPECT_FALSE(state.battery_low_threshold_valid);
+    EXPECT_FALSE(state.low_battery_action_valid);
+    // 超时后保持无效，不得用 0 冒充真实参数值。
+    EXPECT_FLOAT_EQ(state.battery_low_threshold_pct, 0.f);
+    EXPECT_EQ(state.battery_parameter_time_ms, 0u);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, UnknownParamValueDoesNotChangeBatteryConfiguration) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 500ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    std::vector<uint8_t> bytes = EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
+    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 15.f);
+    ASSERT_TRUE(terminal.Write(bytes));
+    ASSERT_TRUE(WaitUntil(
+        [&] { return link.LatestState().battery_low_threshold_valid; }, 500ms));
+
+    // 16 字节且无 NUL 结尾，前缀与 BAT_LOW_THR 相同：不得误匹配。
+    ASSERT_TRUE(terminal.Write(
+        EncodeParamValue(px4_encoder, "BAT_LOW_THRESHOL", 99.f)));
+    std::this_thread::sleep_for(80ms);
+
+    const auto state = link.LatestState();
+    EXPECT_TRUE(state.battery_low_threshold_valid);
+    EXPECT_FLOAT_EQ(state.battery_low_threshold_pct, 15.f);
+    EXPECT_FALSE(state.low_battery_action_valid);
+    EXPECT_EQ(state.last_ack_command, 0);
+    link.Stop();
+}
+
+TEST(Px4LinkTest, DisconnectClearsBatteryParametersAndReconnectRequestsAgain) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.heartbeat_timeout = 80ms;
+    config.parameter_request_interval = 50ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    MavlinkHandler px4_encoder;
+    std::vector<uint8_t> bytes = EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
+    AppendParamValue(px4_encoder, &bytes, "BAT_LOW_THR", 20.f);
+    AppendParamValue(px4_encoder, &bytes, "COM_LOW_BAT_ACT", 1.f);
+    ASSERT_TRUE(terminal.Write(bytes));
+    ASSERT_TRUE(WaitUntil([&] {
+        const auto state = link.LatestState();
+        return state.battery_low_threshold_valid && state.low_battery_action_valid;
+    }, 500ms));
+
+    // 不再发送心跳：心跳超时断连后参数有效性必须清除。
+    ASSERT_TRUE(WaitUntil([&link] { return !link.IsConnected(); }, 1000ms));
+    ASSERT_TRUE(WaitUntil([&] {
+        const auto state = link.LatestState();
+        return !state.battery_low_threshold_valid && !state.low_battery_action_valid;
+    }, 500ms));
+    terminal.Drain(100ms);
+
+    // 重连后重新发起参数请求。
+    ASSERT_TRUE(terminal.Write(EncodePx4Heartbeat(
+        px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0)));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 500ms));
+
+    std::vector<mavlink_message_t> requests;
+    ASSERT_TRUE(terminal.CollectMessages(
+        MAVLINK_MSG_ID_PARAM_REQUEST_READ, 2, 500ms, &requests));
+    const auto ids = DecodeParamRequestIds(requests);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "BAT_LOW_THR"), ids.end());
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "COM_LOW_BAT_ACT"), ids.end());
+    link.Stop();
+}
+
+TEST(Px4LinkTest, StubBatteryParametersAreInvalidByDefault) {
+    Px4LinkStub stub;
+    const auto state = stub.LatestState();
+    EXPECT_FALSE(state.battery_low_threshold_valid);
+    EXPECT_FALSE(state.low_battery_action_valid);
+    EXPECT_FLOAT_EQ(state.battery_low_threshold_pct, 0.f);
+    EXPECT_EQ(state.low_battery_action, 0u);
+    EXPECT_EQ(state.battery_parameter_time_ms, 0u);
 }
 
 }  // namespace
