@@ -147,6 +147,7 @@ target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
 # ---- state_machine 模块（任务状态机接口） ----
 add_library(drone_state_machine STATIC
+    src/state_machine/mission_assignment.cpp
     src/state_machine/mission_state_machine.cpp
     src/state_machine/net_actuator.cpp)
 target_include_directories(drone_state_machine PUBLIC
@@ -499,6 +500,23 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(net_actuator_test)
+
+        # 任务分配助手测试：接受/阶段迁移/一次上电/中止/目标过滤/result 重发
+        add_executable(mission_assignment_test
+            tests/state_machine/mission_assignment_test.cpp)
+        target_link_libraries(mission_assignment_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mission_assignment_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mission_assignment_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mission_assignment_test)
 
         # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
         add_executable(serial_port_test tests/communication/serial_port_test.cpp)
