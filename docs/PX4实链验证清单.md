@@ -252,4 +252,51 @@ echo "退出码=$?"
   重开；重连期间控制器授权链停发，重连成功后等待新心跳，进程不退出。该行为
   与台架工具“断链退出码 4”不同，需分别验证。
 
+### 7.4 多机任务分配与自动起飞门禁（2026-10-22 建立）
+
+设计/协议见 `docs/superpowers/specs/2026-10-22-多机任务分配与自动起飞-design.md`。
+机载已实现 65014/65015/65013 v2、`MissionAssignmentTracker`、S2→S3→S4→S5、
+`FlightController::kBootstrap` 与电池守卫；**以下实跑项均未执行，状态为待验收**。
+
+**SITL 专项**（255/190 模拟地面站，定向发送 65014，不依赖 RC）：
+
+| # | 场景 | 通过标准 | 状态 |
+|---:|---|---|---|
+| 1 | 正常自动起飞 | S2→S3→S4→S5；PX4 模式 6/0、armed、高度/位置达标；65015 accepted、65013 availability 依次 assigned/engaged | ⏳ |
+| 2 | 无分配 | 不起飞、不发 176/400 | ⏳ |
+| 3 | 地址错误/类型不匹配 | 静默忽略、不回 65015 | ⏳ |
+| 4 | 176 超时/ACK 拒绝、400 超时/ACK 拒绝 | 中止、保持地面/上锁、65015 aborted | ⏳ |
+| 5 | bootstrap 超时 | 控制器停流回 IDLE、状态机中止 | ⏳ |
+| 6 | 起飞前取消 / 起飞后取消 | 前者回 READY；后者 S12→S13→S14 | ⏳ 待实现（65014 `flags.bit1` 取消尚未在状态机落地） |
+| 7 | 目标等待超时 / 目标丢失超时 | S12 返航 | ⏳ 待实现（`target_wait_timeout`/`target_lost_timeout` 与 S5 `target_id` 过滤尚未接线） |
+| 8 | 低电 / 电池遥测失效 | S12，不走 PX4 RTL；遥测失效立即中止 | ⏳ |
+| 9 | 中止后清理 | 无残留 setpoint、无重试、无重复 ARM | ⏳ |
+| 10 | 回归 | G2/G3/stage4-return 仍 PASS | ⏳ |
+
+**台架（拆桨）**：PX4 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 读取成功/失败；
+176/400 命令与实际状态；`kBootstrap` 原点保持流；中止停流、DISARM；**无 RC
+自动流程**；65015/65013 v2 扩展字段。拆桨与机体固定要求同 §7.3。
+
+**G5 首飞**：单机低高度，先自动起飞/悬停，再验证分配目标与返航；有人持 RC
+作为测试保险，但 RC 不是软件门禁；证据归档。
+
+验收工具（不接入正式程序）：
+
+```bash
+# SITL：以 255/190 发送 65014，可选发送匹配 target_id 的 65010，并打印 65015/65013
+python3 tools/assignment_sitl.py --connection udpin:0.0.0.0:14550 \
+  --aircraft-system 1 --aircraft-component 25 \
+  --assignment-id 1 --target-id 7 --interceptor-type 25 \
+  --send-target --duration 30
+
+# 取消 / 不授权（负向）
+python3 tools/assignment_sitl.py --assignment-id 1 --cancel
+python3 tools/assignment_sitl.py --assignment-id 1 --no-grant
+```
+
+台架/实机经 HM30 时沿用地面站链路连接串（如
+`--connection udpout:192.168.144.12:19856`），仍须拆桨并满足 §7.3 安全要求。
+生产配置 `enable_control=false` 时 65014 应回 `rejected/control_disabled`，
+可用于先验证回执链路而不产生任何控制输出。
+
 G5 详细清单在设计稿 §5 G5 行标注"另行冻结"，建立时同步更新本节。

@@ -170,7 +170,9 @@ PX4/遥控”。
 落地（Task 5）；`FlightController::ControlAuthority::kBootstrap` 的原点保持
 流已在控制器侧实现（Task 6），PX4 参数读取（`BAT_LOW_THR`/
 `COM_LOW_BAT_ACT`）由 Px4Link 提供（Task 7），状态机侧电池门禁（S2 预检、
-availability、飞行中 S12）由 Task 8 接入；取消/目标丢失收口由后续任务接入。
+availability、飞行中 S12）由 Task 8 接入。**已知缺口**：65014 `flags.bit1`
+取消、S5 的 65010 `target_id` 过滤以及 `target_wait_timeout`/
+`target_lost_timeout` 收口尚未接线；当前 S5 对目标过期只置告警位。
 
 ## 接口与数据流
 

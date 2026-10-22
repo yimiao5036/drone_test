@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -101,12 +102,19 @@ public:
     /// 控制面装配诊断快照（阶段四装配门禁断言与排查用）。
     /// enable_control=false：控制器已创建并接入状态机意图（影子运行，
     /// 授权链因未注入 PX4 快照源恒不通过），但不绑定 Px4Setpoint、不注入命令接口；
-    /// enable_control=true：四个字段全 true。
+    /// enable_control=true：全部控制输出字段为 true。
+    /// 任务分配输入/回执与估计输入与 enable_control 无关，按组件是否装配接线。
     struct ControlAssemblySnapshot {
         bool flight_controller_created = false;    ///< 真实 FlightController 已创建
         bool intent_input_bound = false;           ///< 意图输入已接 MissionStateMachine::IntentOutput()
+        bool assignment_input_bound = false;       ///< 65014 已接 MissionStateMachine::SetAssignmentInput
+        bool assignment_ack_bound = false;         ///< 65015 已接 GroundStationLink::SetMissionAssignmentAckInput
+        bool estimation_inputs_bound = false;      ///< 估计/视觉/测距三主题已接 SetEstimationInputs
         bool px4_snapshot_source_injected = false; ///< SetPx4LinkSource 已注入（仅 enable_control=true）
         bool setpoint_bound_to_px4 = false;        ///< Px4Link::SetInput 已绑定（仅 enable_control=true）
+        bool command_sender_injected = false;      ///< 状态机命令接口已注入（仅 enable_control=true）
+        /// 控制器实际生效的 bootstrap 超时（来自 takeoff.bootstrap_timeout）。
+        std::chrono::milliseconds controller_bootstrap_timeout{0};
     };
     /// 装配完成后（构造返回后）的控制面接线快照。
     ControlAssemblySnapshot ControlAssembly() const { return control_assembly_; }

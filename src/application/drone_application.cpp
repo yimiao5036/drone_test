@@ -137,6 +137,11 @@ void DroneApplication::BuildComponents() {
         state_machine_config.actuator = config_.actuator;
         state_machine_config.interception = config_.interception;
         state_machine_config.return_home = config_.return_home;
+        // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
+        // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
+        state_machine_config.takeoff = config_.takeoff;
+        state_machine_config.expected_interceptor_type =
+            config_.ground_station.aircraft_component_id;
         mission_state_machine_ =
             std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
     }
@@ -146,9 +151,15 @@ void DroneApplication::BuildComponents() {
     // 但不注入 PX4 快照源（SetPx4LinkSource），授权链恒不通过、保持 IDLE 停发，
     // SetpointOutput 无消费者；enable_control=true 的绑定见 BindTopics 门禁分支。
     if (mission_state_machine_ != nullptr) {
+        // bootstrap 停流兜底时长由 takeoff 节注入（局部副本，不回写配置成员）：
+        // 状态机 S3 的模式/解锁超时是权威，控制器只负责防卡死兜底。
+        config::FlightControllerConfig flight_controller_config = config_.controller;
+        flight_controller_config.bootstrap_timeout = config_.takeoff.bootstrap_timeout;
         flight_controller_ =
-            std::make_unique<control::FlightController>(config_.controller);
+            std::make_unique<control::FlightController>(flight_controller_config);
         control_assembly_.flight_controller_created = true;
+        control_assembly_.controller_bootstrap_timeout =
+            flight_controller_config.bootstrap_timeout;
     }
 }
 
@@ -258,6 +269,28 @@ void DroneApplication::BindTopics() {
             mission_state_machine_->StatusOutput());
     }
 
+    // 多机任务分配：65014 解析结果 → 状态机；65015 回执 → 地面站链路。
+    // 分配输入/回执不依赖 enable_control：无控制装配时状态机仍接收 65014，
+    // 预检回 control_disabled，地面站可据此获知不可调度。
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_->SetAssignmentInput(
+            ground_station_link_->MissionAssignmentOutput());
+        ground_station_link_->SetMissionAssignmentAckInput(
+            mission_state_machine_->AssignmentAckOutput());
+        control_assembly_.assignment_input_bound = true;
+        control_assembly_.assignment_ack_bound = true;
+    }
+
+    // S5 位置引导输入：估计器/视觉稳定性/双目测距三者必须作为一组同时装配，
+    // 缺一不绑定（状态机保持影子行为，不会假装执行自动任务）。
+    if (mission_state_machine_ != nullptr && target_estimator_ != nullptr &&
+        visual_monitor_ != nullptr && stereo_ranger_ != nullptr) {
+        mission_state_machine_->SetEstimationInputs(
+            target_estimator_->EstimatedOutput(), visual_monitor_->StatusOutput(),
+            stereo_ranger_->DistanceOutput());
+        control_assembly_.estimation_inputs_bound = true;
+    }
+
     // 交接判据的创新门限读取估计器最近一次视觉创新（只读诊断接口）。
     // 未装配估计器时不注入：交接判据不评估（保持 GPS_APPROACH 影子行为）。
     if (mission_state_machine_ != nullptr && target_estimator_ != nullptr) {
@@ -283,6 +316,7 @@ void DroneApplication::BindTopics() {
         // 阶段四装配门禁分支（Task 6）内注入 PX4 命令窄接口（调用启用归 Task 7，
         // 仅 enable_control=true 可达；false 时命令接口物理缺席）。
         mission_state_machine_->SetCommandSender(px4_link_.get());
+        control_assembly_.command_sender_injected = true;
         control_assembly_.px4_snapshot_source_injected = true;
         control_assembly_.setpoint_bound_to_px4 = true;
         SPDLOG_WARN("正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint");

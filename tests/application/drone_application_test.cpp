@@ -10,6 +10,8 @@
  *
  * 真实摄像头/解码/推理/推流行为在香橙派实机验证，不在本测试范围。
  */
+#include <chrono>
+
 #include <gtest/gtest.h>
 
 #include "../common/log_capture.h"
@@ -97,24 +99,37 @@ config::AppConfig MakeControlAssemblyConfig(bool enable_control) {
 // 不注入命令接口，且无「正式控制输出已启用」WARN。
 TEST(DroneApplicationTest, EnableControlFalseDoesNotBindSetpoint) {
     test::LogCapture capture;
-    DroneApplication application(MakeControlAssemblyConfig(false));
+    auto config = MakeControlAssemblyConfig(false);
+    config.takeoff.bootstrap_timeout = std::chrono::milliseconds(9000);
+    DroneApplication application(std::move(config));
     const auto snapshot = application.ControlAssembly();
     EXPECT_TRUE(snapshot.flight_controller_created);
     EXPECT_TRUE(snapshot.intent_input_bound);
+    // 分配输入/回执与 enable_control 无关，装配即接线。
+    EXPECT_TRUE(snapshot.assignment_input_bound);
+    EXPECT_TRUE(snapshot.assignment_ack_bound);
+    EXPECT_FALSE(snapshot.estimation_inputs_bound);
     EXPECT_FALSE(snapshot.px4_snapshot_source_injected);
     EXPECT_FALSE(snapshot.setpoint_bound_to_px4);
+    EXPECT_FALSE(snapshot.command_sender_injected);
+    // bootstrap 兜底时长来自 takeoff 节，而非 controller 默认值。
+    EXPECT_EQ(snapshot.controller_bootstrap_timeout, std::chrono::milliseconds(9000));
     EXPECT_EQ(capture.Count("正式控制输出已启用"), 0);
 }
 
-// enable_control=true：完成 PX4 快照源注入与 Px4Setpoint 绑定
-// （状态机命令接口注入由 Task 7 落地，此处仅占位纪律）。
+// enable_control=true：完成 PX4 快照源注入、Px4Setpoint 绑定与命令接口注入；
+// bootstrap 超时同样取 takeoff 节。
 TEST(DroneApplicationTest, EnableControlTrueBindsSetpointAndCommandSender) {
-    DroneApplication application(MakeControlAssemblyConfig(true));
+    auto config = MakeControlAssemblyConfig(true);
+    config.takeoff.bootstrap_timeout = std::chrono::milliseconds(12000);
+    DroneApplication application(std::move(config));
     const auto snapshot = application.ControlAssembly();
     EXPECT_TRUE(snapshot.flight_controller_created);
     EXPECT_TRUE(snapshot.intent_input_bound);
     EXPECT_TRUE(snapshot.px4_snapshot_source_injected);
     EXPECT_TRUE(snapshot.setpoint_bound_to_px4);
+    EXPECT_TRUE(snapshot.command_sender_injected);
+    EXPECT_EQ(snapshot.controller_bootstrap_timeout, std::chrono::milliseconds(12000));
 }
 
 // enable_control=true：装配期打 WARN「正式控制输出已启用」（运行时显性标记）。
@@ -122,6 +137,30 @@ TEST(DroneApplicationTest, EnableControlTrueLogsWarnAtStart) {
     test::LogCapture capture;
     DroneApplication application(MakeControlAssemblyConfig(true));
     EXPECT_GE(capture.Count("正式控制输出已启用"), 1);
+}
+
+/// 估计输入全装配配置：视频+双目测距+视觉监控+目标估计+PX4+地面站同时开启，
+/// 验证 SetEstimationInputs 三主题成组接线。不启动线程、不触碰硬件。
+config::AppConfig MakeEstimationAssemblyConfig() {
+    auto config = MakeProbeLikeConfig();
+    config.runtime.enable_px4 = true;
+    config.runtime.enable_ground_station = true;
+    config.runtime.enable_target_estimator = true;
+    config.runtime.enable_visual_monitor = true;
+    config.runtime.enable_control = false;
+    return config;
+}
+
+// 估计器/视觉稳定性/双目测距三者同时装配时，S5 位置引导输入成组绑定；
+// 分配输入/回执同样接线；enable_control=false 仍不注入命令接口。
+TEST(DroneApplicationTest, EstimationInputsBoundWhenAllSourcesPresent) {
+    DroneApplication application(MakeEstimationAssemblyConfig());
+    const auto snapshot = application.ControlAssembly();
+    EXPECT_TRUE(snapshot.estimation_inputs_bound);
+    EXPECT_TRUE(snapshot.assignment_input_bound);
+    EXPECT_TRUE(snapshot.assignment_ack_bound);
+    EXPECT_FALSE(snapshot.command_sender_injected);
+    EXPECT_FALSE(snapshot.setpoint_bound_to_px4);
 }
 
 }  // namespace

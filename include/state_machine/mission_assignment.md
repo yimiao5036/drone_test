@@ -2,8 +2,9 @@
 
 > 对应实现：`include/state_machine/mission_assignment.h`、`src/state_machine/mission_assignment.cpp`
 > 使用方：`MissionStateMachine`（持有实例；接受 65014 时 `Accept`，S3/S4 推进，
-> S5 起用 `AllowsTarget` 过滤 65010，终态 `Terminal`；重复分配用
-> `WasHandled` 重发 65015）
+> 终态 `Terminal`；重复分配用 `WasHandled` 重发 65015）。
+> **接线状态（2026-10-22）**：`AllowsTarget` 已实现并有单测，但状态机 S5 的
+> 65010 目标过滤尚未接线，属已知缺口。
 
 ## 1. 功能边界
 
