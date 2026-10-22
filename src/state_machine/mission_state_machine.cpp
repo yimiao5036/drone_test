@@ -433,6 +433,9 @@ public:
         takeoff_disarm_sent_ = false;
         takeoff_ack_baseline_matched_ = 0;
         takeoff_unavailable_latched_ = false;
+        // 电池守卫复位（Task 8）：per-boot 语义，中止锁存与防抖计时清空。
+        battery_abort_latched_ = false;
+        battery_low_since_ms_.reset();
         // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
         return_climb_phase_ = true;
@@ -686,6 +689,10 @@ private:
         // 意图，不留下持续控制流。
         EvaluateTakeoffSequence(now_ms);
 
+        // 电池守卫（Task 8）：放在起飞时序之后、交接/拦截之前。飞行中低电/
+        // 遥测失效当拍中止到 S12，后续拦截入口（S7/S9/S10）不再有机会发射。
+        EvaluateBatteryGuard(now_ms);
+
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
         // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
         EvaluateHandover(now_ms);
@@ -729,6 +736,39 @@ private:
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
             PublishStatus(now_ms);
         }
+    }
+
+    /// PX4 低电参数是否可用于自动起飞门禁（设计 §9.2）：
+    /// BAT_LOW_THR 有效且落在 (0,100)，COM_LOW_BAT_ACT 有效且为 0
+    /// （Warning Only；其余动作由 PX4 自行执行，机载不再叠加处置）。
+    static bool BatteryParametersReady(
+        const common::FlightStateSnapshot& flight) {
+        return flight.battery_low_threshold_valid &&
+               flight.low_battery_action_valid &&
+               flight.battery_low_threshold_pct > 0.f &&
+               flight.battery_low_threshold_pct < 100.f &&
+               flight.low_battery_action == 0;
+    }
+
+    /// 电池遥测是否可用：电压/剩余量有效且百分比为有限值（不伪造 0）。
+    static bool BatteryTelemetryReady(
+        const common::FlightStateSnapshot& flight) {
+        return flight.battery_valid && flight.battery_remaining_valid &&
+               std::isfinite(flight.battery_remaining_pct);
+    }
+
+    /// 剩余电量是否严格高于 PX4 低电阈值。调用方须先确认参数与遥测有效。
+    static bool BatteryAboveThreshold(
+        const common::FlightStateSnapshot& flight) {
+        return BatteryTelemetryReady(flight) &&
+               flight.battery_remaining_pct > flight.battery_low_threshold_pct;
+    }
+
+    /// 自动分配/起飞的总电池门禁：参数可判定 + 遥测有效 + 高于阈值。
+    static bool BatteryGuardReady(const common::FlightStateSnapshot& flight) {
+        return BatteryParametersReady(flight) &&
+               BatteryTelemetryReady(flight) &&
+               BatteryAboveThreshold(flight);
     }
 
     /// 65014 分配字段预检（不改变任何状态）。返回 kNone 表示字段与当前
@@ -785,6 +825,18 @@ private:
         if (!flight.local_position_valid || !flight.attitude_valid ||
             !flight.home_valid) {
             return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        // 电池门禁（设计 §9.2，Task 8）：唯一来源是 PX4 BAT_LOW_THR /
+        // COM_LOW_BAT_ACT 参数与电池遥测；机载不设本地百分比阈值。
+        // 参数缺失/非法与遥测失效分开回执，便于地面站定位。
+        if (!BatteryParametersReady(flight)) {
+            return common::MissionAssignmentReason::kBatteryConfigUnknown;
+        }
+        if (!BatteryTelemetryReady(flight)) {
+            return common::MissionAssignmentReason::kBatteryTelemetryInvalid;
+        }
+        if (!BatteryAboveThreshold(flight)) {
+            return common::MissionAssignmentReason::kBatteryLow;
         }
         // 设备故障：任务故障终态或捕网执行器故障时不允许接受新分配。
         if (mission_faulted_ ||
@@ -866,6 +918,9 @@ private:
                 // 保存已接受的分配（id/target）：S3/S4 中止时 latest_assignment_
                 // 早已清空，65015 aborted 必须用这份副本。
                 accepted_assignment_ = assignment;
+                // 新任务重新武装电池守卫（地面低电中止后恢复再分配的路径）。
+                battery_abort_latched_ = false;
+                battery_low_since_ms_.reset();
                 // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致。
                 const auto& flight = *latest_flight_;
                 assignment_tracker_.BeginTakeoff(
@@ -974,6 +1029,105 @@ private:
         } else if (after == common::MissionState::kTakeoff) {
             PublishTakeoffIntent(takeoff_z_cmd_, now_ms);
         }
+    }
+
+    // ---- 飞行中电池守卫（Task 8，2026-10-22） ----
+
+    /// 电池守卫生效阶段：S3/S4 与 S5~S10。S11 起由拦截完成/返航链处置；
+    /// S12/S13/S14/S16 不重复触发（一次任务只中止一次）。
+    static bool BatteryGuardActiveState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kArming:
+            case common::MissionState::kTakeoff:
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 飞行中电池守卫（每决策拍）：遥测失效立即中止；电池有效且
+    /// pct <= BAT_LOW_THR 连续 `takeoff.battery_low_debounce` 后中止。
+    /// 恢复高于阈值即清零防抖计时。机载不设本地百分比阈值。
+    void EvaluateBatteryGuard(uint64_t now_ms) {
+        // 影子装配（未注入命令接口）没有真实任务与控制权：S5 影子验证
+        // 路径保持既有语义，电池守卫不中止/不迁移。
+        if (command_sender_ == nullptr) {
+            battery_low_since_ms_.reset();
+            return;
+        }
+        if (!BatteryGuardActiveState(CurrentState())) {
+            battery_low_since_ms_.reset();
+            return;
+        }
+        if (battery_abort_latched_) {
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            // 无飞行快照无法确认电池状态：按遥测失效处理（S3/S4 的断连
+            // 路径已先于本拍收口，这里主要覆盖 S5~S10）。
+            TriggerBatteryAbort(
+                common::MissionAssignmentReason::kBatteryTelemetryInvalid,
+                "飞行中缺少飞行状态快照");
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (!BatteryTelemetryReady(flight)) {
+            TriggerBatteryAbort(
+                common::MissionAssignmentReason::kBatteryTelemetryInvalid,
+                "电池遥测失效（电压/剩余量无效）");
+            return;
+        }
+        // 参数在飞行中不可判定时不做低电比较（避免把未知阈值当 0），
+        // 参数有效性由 S2 预检在起飞前保证。
+        const bool low = BatteryParametersReady(flight) &&
+                         flight.battery_remaining_pct <=
+                             flight.battery_low_threshold_pct;
+        if (!low) {
+            battery_low_since_ms_.reset();
+            return;
+        }
+        if (!battery_low_since_ms_.has_value()) {
+            battery_low_since_ms_ = now_ms;
+        }
+        if (ElapsedMs(now_ms, *battery_low_since_ms_) <
+            static_cast<uint64_t>(takeoff_.battery_low_debounce.count())) {
+            return;
+        }
+        TriggerBatteryAbort(common::MissionAssignmentReason::kBatteryLow,
+                            "电池剩余电量不高于 PX4 BAT_LOW_THR");
+    }
+
+    /// 电池中止统一处置（一次任务只执行一次）：
+    /// - S3/S4：复用 AbortTakeoff（已离地 → S12；地面 → 停流/必要时
+    ///   DISARM → READY）；
+    /// - S5~S10：tracker AbortAirborne + 65015 aborted → S12 机载位置返航；
+    ///   不走 PX4 RTL，不触发新的拦截/发射。
+    void TriggerBatteryAbort(common::MissionAssignmentReason reason,
+                             const char* detail) {
+        if (battery_abort_latched_) {
+            return;
+        }
+        battery_abort_latched_ = true;
+        battery_low_since_ms_.reset();
+        const auto state = CurrentState();
+        if (state == common::MissionState::kArming ||
+            state == common::MissionState::kTakeoff) {
+            AbortTakeoff(reason, detail);
+            return;
+        }
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(reason);
+        SPDLOG_WARN("飞行中电池中止: reason={} detail={} state={} → S12 返航",
+                    static_cast<int>(reason), detail, MissionStateName(state));
+        TransitionTo(common::MissionState::kReturnHome,
+                     "电池低电/遥测失效，中止任务并返航");
+        PublishTakeoffAbortAck(reason);
     }
 
     /// S3：每拍原点保持意图已由入口发布；等待 bootstrap_lead 后只发一次
@@ -1394,6 +1548,12 @@ private:
             return common::MissionAvailability::kUnavailable;
         }
         if (!latest_flight_.has_value() || !latest_flight_->connected) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        // 电池门禁（Task 8）：地面参数缺失/遥测失效/不高于 BAT_LOW_THR 时
+        // 不可调度。未执行空中任务，电量恢复且参数有效后自然回到 ready
+        // （不锁存为 terminal）。
+        if (!BatteryGuardReady(*latest_flight_)) {
             return common::MissionAvailability::kUnavailable;
         }
         return common::MissionAvailability::kReady;
@@ -2565,6 +2725,11 @@ private:
                                 : "发 AUTO.LAND（4/6）");
             } else if (next_state == common::MissionState::kDisarmed) {
                 mission_end_logged_ = false;
+                // 任务结束（Task 8）：分配进入 terminal，本次上电不再分配。
+                assignment_tracker_.Terminal();
+            } else if (next_state == common::MissionState::kFailsafe) {
+                // 故障终态同样不再分配（S16）。
+                assignment_tracker_.Terminal();
             }
             // 自动起飞时序入口（Task 5）：S3 记录 bootstrap/mode/arm 基准与
             // ACK 基线；S4 初始化逐拍爬升目标。中止迁移由统一挂点保证
@@ -2756,6 +2921,11 @@ private:
     /// 起飞中止后 PX4 状态不确定（断连/离地状态不明）：per-boot 锁存，
     /// availability=unavailable 且新分配回 not_ready，直到 Start() 复位。
     bool takeoff_unavailable_latched_ = false;
+    /// 飞行中电池中止锁存（Task 8）：一次任务只中止/回 65015 一次；
+    /// 接受新分配或 Start() 时复位。
+    bool battery_abort_latched_ = false;
+    /// 低电防抖起点（nullopt=当前不低电/不在守卫生效阶段）。
+    std::optional<uint64_t> battery_low_since_ms_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
     /// 任务故障（S16 FAILSAFE）：捕网执行器 ACK 超时/非 ACCEPTED/PX4 断连/

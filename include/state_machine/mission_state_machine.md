@@ -168,8 +168,9 @@ PX4/遥控”。
 
 完整自动任务链仍以`docs/状态机设计.md`为准。S3/S4 的算力板侧时序已由本模块
 落地（Task 5）；`FlightController::ControlAuthority::kBootstrap` 的原点保持
-流、PX4 参数/电池门禁与取消/目标丢失收口分别由后续任务接入，状态机不等待
-控制器实现即可在单测中按本文件语义验收。
+流已在控制器侧实现（Task 6），PX4 参数读取（`BAT_LOW_THR`/
+`COM_LOW_BAT_ACT`）由 Px4Link 提供（Task 7），状态机侧电池门禁（S2 预检、
+availability、飞行中 S12）由 Task 8 接入；取消/目标丢失收口由后续任务接入。
 
 ## 接口与数据流
 
@@ -278,8 +279,16 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   9. `latest_flight_`：连接在线、`landed_state_valid && landed`、`!armed`、
      局部位置/姿态/Home 有效；断连为 `px4_disconnected`，其余为
      `preflight_failed`；
-  10. 无任务故障/执行器故障，否则 `mission_fault`；
-  11. tracker 可接受（`kIdle` 且未消耗空中任务机会），否则 `already_assigned`。
+  10. 电池参数（Task 8，PX4 `BAT_LOW_THR`/`COM_LOW_BAT_ACT`）：
+     `battery_low_threshold_valid && low_battery_action_valid`、
+     `0 < battery_low_threshold_pct < 100`、`low_battery_action == 0`
+     （Warning Only），否则 `battery_config_unknown`；
+  11. 电池遥测：`battery_valid && battery_remaining_valid` 且百分比有限，
+     否则 `battery_telemetry_invalid`；
+  12. `battery_remaining_pct > BAT_LOW_THR`，否则 `battery_low`（机载不设
+     本地百分比阈值，不估算剩余飞行时间）；
+  13. 无任务故障/执行器故障，否则 `mission_fault`；
+  14. tracker 可接受（`kIdle` 且未消耗空中任务机会），否则 `already_assigned`。
   失败：回 `rejected` + reason、保持 S2、`RememberResult` 记录回执（重复 id
   可重发），不自动重试、不消耗任务机会；状态不确定（未连接/故障）时
   `availability=unavailable`。
@@ -288,10 +297,33 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   （reason「接受任务分配」）。S3 起每拍发布 `kTakeoff` 原点意图，176/400
   按 S3 时序各发一次（见上「S3 ARMING / S4 TAKEOFF」）。
 - **availability 映射**：未注入命令接口、任务故障/执行器故障、未连接、已消耗
-  空中任务机会或起飞中止后状态不确定（`takeoff_unavailable_latched_`）→
+  空中任务机会、起飞中止后状态不确定（`takeoff_unavailable_latched_`）或
+  **电池门禁不满足**（参数缺失/遥测失效/不高于 `BAT_LOW_THR`）→
   `unavailable`；有控制路径时用 tracker 阶段：`kIdle→ready`、
   `kAssigned/kTakingOff→assigned`、`kAirborne/kEngaged→engaged`、
   `kReturning→returning`、`kTerminal→terminal`。65015 与 65013 共用该映射。
+  地面低电/遥测失效**不锁存**：电量恢复且参数有效、未执行空中任务时自然回
+  `ready`；只有空中中止才按“一次上电一次任务”进入 terminal。
+- **飞行中电池守卫（Task 8，2026-10-22）**：`EvaluateBatteryGuard()` 在
+  `Evaluate` 中位于 `EvaluateTakeoffSequence` 之后、交接/拦截逻辑之前，
+  因此低电中止当拍即进入 S12，后续 S9/S10 入口与捕网触发没有机会执行。
+  - 生效阶段：S3/S4 与 S5~S10；S12/S13/S14/S16 不再触发；影子装配
+    （`command_sender_ == nullptr`）不生效（S5 影子验证语义保留）。
+  - **遥测失效**（`battery_valid=false`、`battery_remaining_valid=false`、
+    百分比非有限或无飞行快照）→ 立即中止，reason
+    `battery_telemetry_invalid`，不等防抖。
+  - **低电**：`pct <= BAT_LOW_THR` 连续 `takeoff.battery_low_debounce` 后
+    中止，reason `battery_low`；恢复高于阈值即清零计时。
+  - S3/S4 复用 `AbortTakeoff()`：地面 → 停流/必要时一次 DISARM → READY；
+    已离地 → `AbortAirborne()` → S12。
+  - S5~S10：`AbortAirborne()` + 65015 aborted → **S12 机载位置返航**；
+    不使用 PX4 自动 RTL、不空中 disarm、不触发新的拦截/发射。
+  - `battery_abort_latched_` 保证一次任务只中止/回 65015 一次；接受新分配
+    或 `Start()` 时复位。
+  - 空中中止后落地沿用现有 S14 路径 → tracker terminal，本次上电不再分配；
+    不新增自动恢复。
+  - PX4 自身低电动作导致离开 Offboard 时，现有 S12/S13 逻辑停发让权、
+    只监控，不争控。
 - **S3/S4 自动起飞（Task 5）**（`EvaluateTakeoffSequence` /
   `EvaluateArmingSequence` / `EvaluateClimbSequence` / `AbortTakeoff`）：
   - 调用位置：`Evaluate` 中在 `EvaluateAssignmentEntry` 之后、交接/目标/
@@ -672,6 +704,22 @@ ctest --test-dir build --output-on-failure
   - `TakeoffUncertainStateLatchesUnavailable`：中止时离地状态不明 →
     65015 aborted availability=unavailable，回 S2 后新分配被拒 not_ready、
     仍 unavailable，直到重启。
+- 电池守卫（Task 8，2026-10-22；夹具默认带 `BAT_LOW_THR=15%`、
+  `COM_LOW_BAT_ACT=0`、遥测有效且剩余 80%，用例只覆写单项）：
+  - `BatteryPreflightRejectsInvalidParameters`：阈值/动作未读到、动作非 0、
+    阈值 0/100 → `battery_config_unknown`、availability=unavailable、S2；
+  - `BatteryPreflightRejectsInvalidTelemetry`：`battery_valid=false`/
+    `remaining_valid=false`/百分比 NaN → `battery_telemetry_invalid`；
+  - `BatteryLowOnGroundUnavailableThenRecovers`：`pct == BAT_LOW_THR` →
+    `battery_low`、unavailable；恢复后新分配可接受（不锁存 terminal）；
+  - `BatteryLowInArmingAbortsOnGround`：S3 地面低电 → aborted/battery_low、
+    回 READY、无 176/400/187；
+  - `BatteryLowAirborneInTakeoffReturnsHome`：S4 空中低电 → aborted/
+    battery_low → S12，不 disarm、不触发 187；
+  - `BatteryLowInGpsApproachDebouncesThenReturnsHome`：S5 低电不足防抖不
+    中止；持续后 → S12，且 S12 不重复 aborted；
+  - `BatteryTelemetryLossInGpsApproachReturnsImmediately`：S5 遥测失效
+    → 立即 aborted/battery_telemetry_invalid → S12，不等防抖、无 187。
 - SITL 返航专项（2026-10-19，`tools/px4_link_smoke --sitl-stage4-return` +
   `config/px4_sitl_return.json`）：S7→S9→S10 发射→S12 算力板返航 Home→
   S13 AUTO.LAND→S14 DISARMED 全 PASS（状态机迁移 11 次、错误 0；最大高度
@@ -727,6 +775,21 @@ ctest --test-dir build --output-on-failure
   复位）再调度，不要绕过该标志。
 - **起飞中止后仍看到 S12 位置意图**：已离地中止按设计转 S12 返航（不是
   残余起飞意图）；S3/S4 自身的 kTakeoff 意图在中止当拍即停发。
+- **65014 回 `battery_config_unknown`**：PX4 `BAT_LOW_THR`/`COM_LOW_BAT_ACT`
+  尚未读到或非法（阈值不在 (0,100)、动作不是 0）。查 Px4Link 参数回包日志与
+  `battery_low_threshold_valid`/`low_battery_action_valid`；可先用 QGC 确认
+  PX4 侧参数，不要改机载阈值绕过。
+- **65014 回 `battery_telemetry_invalid`**：PX4 电池遥测无效（电压/剩余量
+  字段或新鲜度）。查电源模块接线、`SYS_STATUS`/`BATTERY_STATUS` 是否到达；
+  不得把无效值伪造为 0 继续调度。
+- **65014 回 `battery_low` / 地面 availability 一直 unavailable**：剩余电量
+  不高于 `BAT_LOW_THR`（含相等）。充电/换电后遥测恢复且未执行空中任务，
+  availability 自然回 ready，可重新分配（需新的 assignment_id）。
+- **飞行中突然转 S12 且 65015 aborted**：先看 reason：`battery_low`（持续
+  低电超过 `takeoff.battery_low_debounce`）或 `battery_telemetry_invalid`
+  （遥测立即失效）。这是设计内中止：S12 用机载位置设定值返航，不走 PX4
+  RTL、不空中 disarm；`battery_abort_latched_` 保证一次任务只回一次。
+  S12/S13 里再收到低电不会重复中止，属预期。
 
 - 如果地面站目标ACK已成功但状态机不进入`GPS_APPROACH`，先检查PX4快照是否满足`connected/gps_fix/global_position_valid/home_valid`（PX4 已到位后该组条件可实链成立，不再是"必然不满足"）。
 - 如果状态机没有状态回传，检查主程序是否启用了PX4和地面站链路，以及`GroundStationLink::TargetOutput()`是否已绑定到状态机。

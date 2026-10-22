@@ -47,6 +47,16 @@ common::FlightStateSnapshot MakeNavigationReadyFlight() {
     flight.home_lat_1e7 = 231200000;
     flight.home_lon_1e7 = 1131200000;
     flight.home_altitude_mm = 100000;
+    // 健康 PX4 电池基线（Task 8）：BAT_LOW_THR=15%、COM_LOW_BAT_ACT=0、
+    // 遥测有效且剩余 80%。飞行中电池守卫对所有派生夹具生效，避免旧用例
+    // 因“遥测缺失”被误判为电池失效。
+    flight.battery_valid = true;
+    flight.battery_remaining_valid = true;
+    flight.battery_remaining_pct = 80.f;
+    flight.battery_low_threshold_valid = true;
+    flight.battery_low_threshold_pct = 15.f;
+    flight.low_battery_action_valid = true;
+    flight.low_battery_action = 0;
     return flight;
 }
 
@@ -2089,6 +2099,15 @@ common::FlightStateSnapshot MakeGroundedFlight() {
     flight.local_y_m = -2.5f;
     flight.local_z_m = 0.1f;
     flight.attitude_valid = true;
+    // 电池门禁默认满足（Task 8）：PX4 BAT_LOW_THR=15%、COM_LOW_BAT_ACT=0、
+    // 遥测有效且剩余 80%。用例只按需覆写单项字段。
+    flight.battery_valid = true;
+    flight.battery_remaining_valid = true;
+    flight.battery_remaining_pct = 80.f;
+    flight.battery_low_threshold_valid = true;
+    flight.battery_low_threshold_pct = 15.f;
+    flight.low_battery_action_valid = true;
+    flight.low_battery_action = 0;
     return flight;
 }
 
@@ -2284,6 +2303,56 @@ struct AssignmentHarness {
             .accepted;
     }
 };
+
+/// 清空 65015 订阅积压（检查“无重复 aborted”前先丢掉中止前的回执）。
+void DrainAcks(
+    common::Topic<common::MissionAssignmentAck>::Subscription& subscription) {
+    while (auto message = subscription.TryTake()) {
+    }
+}
+
+/// 驱动夹具从 S2 经 S3/S4 到 S5（GPS_APPROACH）。要求 harness 使用
+/// MakeTakeoffTestConfig（height=0.5，原点 z=0.1 → 目标 z=-0.4）。
+bool DriveToGpsApproach(AssignmentHarness& harness, uint32_t assignment_id) {
+    if (!harness.Send(MakeAssignment(assignment_id))) {
+        return false;
+    }
+    if (!WaitForState(harness.status_subscription,
+                      common::MissionState::kArming)
+             .has_value()) {
+        return false;
+    }
+    if (!WaitForCallCount(harness.sender, 1)) {  // 176
+        return false;
+    }
+    if (!PublishFlight(harness.flight_topic,
+                       MakeOffboardFlight(/*armed=*/false, /*landed=*/true))) {
+        return false;
+    }
+    if (!WaitForCallCount(harness.sender, 2)) {  // 400
+        return false;
+    }
+    if (!PublishFlight(harness.flight_topic,
+                       MakeOffboardFlight(/*armed=*/true, /*landed=*/false))) {
+        return false;
+    }
+    if (!WaitForState(harness.status_subscription,
+                      common::MissionState::kTakeoff)
+             .has_value()) {
+        return false;
+    }
+    auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    arrived.local_x_m = kTakeoffOriginX;
+    arrived.local_y_m = kTakeoffOriginY;
+    arrived.local_z_m = kTakeoffOriginZ - 0.5f;
+    arrived.vz_mps = 0.f;
+    if (!PublishFlight(harness.flight_topic, arrived)) {
+        return false;
+    }
+    return WaitForState(harness.status_subscription,
+                        common::MissionState::kGpsApproach, 4000ms)
+        .has_value();
+}
 
 // 未注入命令接口（enable_control=false 影子装配）：分配必须拒绝
 // control_disabled，状态保持 S2，availability=unavailable（不可被调度）。
@@ -3102,6 +3171,337 @@ TEST(MissionStateMachineTest, TakeoffAckFailureAbortsImmediately) {
     ASSERT_TRUE(aborted.has_value());
     EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
     EXPECT_EQ(harness.sender.CallCount(), 1U);
+}
+
+// ---------------------------------------------------------------------------
+// 电池守卫：S2 预检、地面 availability、飞行中低电/遥测失效 S12（2026-10-22，Task 8）
+// ---------------------------------------------------------------------------
+
+// PX4 低电参数不可用（阈值/动作无效、动作非 0、阈值 0 或 100）→ S2 拒绝
+// battery_config_unknown，保持 READY。
+TEST(MissionStateMachineTest, BatteryPreflightRejectsInvalidParameters) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    struct Case {
+        bool threshold_valid;
+        float threshold_pct;
+        bool action_valid;
+        uint8_t action;
+    };
+    const Case cases[] = {
+        {false, 15.f, true, 0},   // BAT_LOW_THR 未读到
+        {true, 15.f, false, 0},   // COM_LOW_BAT_ACT 未读到
+        {true, 15.f, true, 1},    // 动作非 0（非 Warning Only）
+        {true, 0.f, true, 0},     // 阈值越界（0）
+        {true, 100.f, true, 0},   // 阈值越界（100）
+    };
+    uint32_t assignment_id = 201;
+    for (const auto& item : cases) {
+        auto flight = MakeGroundedFlight();
+        flight.battery_low_threshold_valid = item.threshold_valid;
+        flight.battery_low_threshold_pct = item.threshold_pct;
+        flight.low_battery_action_valid = item.action_valid;
+        flight.low_battery_action = item.action;
+        ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+        std::this_thread::sleep_for(150ms);
+
+        ASSERT_TRUE(harness.Send(MakeAssignment(assignment_id++)));
+        const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+        EXPECT_EQ(ack->reason,
+                  common::MissionAssignmentReason::kBatteryConfigUnknown);
+        EXPECT_EQ(ack->availability,
+                  common::MissionAvailability::kUnavailable);
+        EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    }
+}
+
+// 电池遥测无效（battery_valid=false / remaining_valid=false / 百分比非有限）
+// → S2 拒绝 battery_telemetry_invalid。
+TEST(MissionStateMachineTest, BatteryPreflightRejectsInvalidTelemetry) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    std::vector<common::FlightStateSnapshot> cases;
+    {
+        auto flight = MakeGroundedFlight();
+        flight.battery_valid = false;
+        cases.push_back(flight);
+    }
+    {
+        auto flight = MakeGroundedFlight();
+        flight.battery_remaining_valid = false;
+        cases.push_back(flight);
+    }
+    {
+        auto flight = MakeGroundedFlight();
+        flight.battery_remaining_pct =
+            std::numeric_limits<float>::quiet_NaN();
+        cases.push_back(flight);
+    }
+    uint32_t assignment_id = 211;
+    for (const auto& flight : cases) {
+        ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+        std::this_thread::sleep_for(150ms);
+        ASSERT_TRUE(harness.Send(MakeAssignment(assignment_id++)));
+        const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+        EXPECT_EQ(ack->reason,
+                  common::MissionAssignmentReason::kBatteryTelemetryInvalid);
+        EXPECT_EQ(ack->availability,
+                  common::MissionAvailability::kUnavailable);
+        EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    }
+}
+
+// 地面电量不高于阈值（pct == BAT_LOW_THR 也算低电）→ rejected battery_low、
+// availability=unavailable；恢复且未执行空中任务后自然回到 ready，可接受
+// 新分配（不锁存为 terminal）。
+TEST(MissionStateMachineTest, BatteryLowOnGroundUnavailableThenRecovers) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    auto low = MakeGroundedFlight();
+    low.battery_remaining_pct = 15.f;  // == BAT_LOW_THR，pct <= 阈值即低电
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    std::this_thread::sleep_for(150ms);
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(221)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_EQ(rejected->availability,
+              common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+
+    // 地面恢复（未执行空中任务）：availability 自然回 ready，可接受新分配。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, MakeGroundedFlight()));
+    std::this_thread::sleep_for(150ms);
+    ASSERT_TRUE(harness.Send(MakeAssignment(222)));
+    const auto accepted = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(accepted->result, common::MissionAssignmentResult::kAccepted);
+    EXPECT_EQ(accepted->availability,
+              common::MissionAvailability::kAssigned);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+}
+
+// S3 地面低电（持续防抖）→ 中止，65015 aborted battery_low，回 READY；
+// 不进入 S9/S10 发射（无 187），也不发 176/400（bootstrap_lead 未到）。
+TEST(MissionStateMachineTest, BatteryLowInArmingAbortsOnGround) {
+    auto config = MakeTakeoffTestConfig(/*lead=*/5000ms, 5000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(231)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+
+    auto low = MakeGroundedFlight();
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "低电中止不得再发 176/400";
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "低电不得触发发射";
+    }
+}
+
+// S4 已离地低电（持续防抖）→ 65015 aborted battery_low → S12 机载位置返航，
+// 不空中 disarm、不走 PX4 RTL、不触发 187。
+TEST(MissionStateMachineTest, BatteryLowAirborneInTakeoffReturnsHome) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 4000ms);
+    config.takeoff.battery_low_debounce = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(241)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    auto low = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // 空中中止不 disarm（400 只有 param1=1 的解锁命令），不触发 187。
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+        EXPECT_NE(call.command, 187U) << "低电不得触发发射";
+    }
+}
+
+// S5 低电：不足防抖不触发；持续超过防抖 → 65015 aborted battery_low → S12；
+// 之后不再重复 aborted（一次任务只中止一次），且无 187。
+TEST(MissionStateMachineTest, BatteryLowInGpsApproachDebouncesThenReturnsHome) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 800ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 251));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    auto low = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "不足 battery_low_debounce 不得中止";
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // S12 起不再重复触发/重复 65015。
+    DrainAcks(harness.ack_subscription);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    std::this_thread::sleep_for(500ms);
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "S12 不得重复 aborted";
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "低电不得触发发射";
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+    }
+}
+
+// S5 电池遥测失效 → 立即 65015 aborted battery_telemetry_invalid → S12，
+// 不等防抖、不触发 187。
+TEST(MissionStateMachineTest, BatteryTelemetryLossInGpsApproachReturnsImmediately) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 5000ms;  // 遥测失效不等防抖
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 261));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    auto lost = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    lost.battery_valid = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, lost));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 1500ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kBatteryTelemetryInvalid);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "遥测失效不得触发发射";
+    }
+}
+
+// 电池空中中止后落地：S12→S13→S14 沿用现有链路，tracker 进入 terminal，
+// 65013 availability=terminal，本次上电不再分配（新 65014 被拒）。
+TEST(MissionStateMachineTest, BatteryAbortLandsThenTerminal) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 271));
+
+    auto low = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    ASSERT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 3000ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // PX4 接管（离开 Offboard）→ S13；落地且 disarmed → S14。
+    auto takeover = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    takeover.flight_mode = 4;
+    takeover.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, takeover));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding)
+                    .has_value());
+
+    auto landed = MakeOffboardFlight(/*armed=*/false, /*landed=*/true);
+    landed.flight_mode = 4;
+    landed.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, landed));
+    const auto disarmed = WaitForState(harness.status_subscription,
+                                       common::MissionState::kDisarmed,
+                                       2000ms);
+    ASSERT_TRUE(disarmed.has_value());
+    EXPECT_EQ(disarmed->availability,
+              common::MissionAvailability::kTerminal);
+
+    // terminal：新分配不再接受（状态非 READY 与 tracker terminal 双重拒绝）。
+    ASSERT_TRUE(harness.Send(MakeAssignment(272)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason,
+              common::MissionAssignmentReason::kAlreadyAssigned);
+    EXPECT_EQ(rejected->availability,
+              common::MissionAvailability::kTerminal);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
 }
 
 }  // namespace
