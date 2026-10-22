@@ -1,0 +1,58 @@
+[INFO] 连接: /tmp/gcs_test
+[INFO] 地面站来源 255/190，目标飞机=1/25，65014 类型=65014，ACK=65015，状态=65013，不直接发送控制
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[STAT] 65013 v2 seq=211 state=S14 control_source=0 task_phase=14 assignment_id=2 target_id=7 availability=TERMINAL interceptor_type=25 aircraft=1/25
+[STAT] 65013 v2 seq=3 state=S2 control_source=0 task_phase=2 assignment_id=0 target_id=0 availability=READY interceptor_type=0 aircraft=1/25
+[STAT] 65013 v2 seq=29 state=S3 control_source=0 task_phase=3 assignment_id=3 target_id=7 availability=ASSIGNED interceptor_type=25 aircraft=1/25
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S2 availability=ASSIGNED aircraft=1/25
+[STAT] 65013 v2 seq=32 state=S4 control_source=0 task_phase=4 assignment_id=3 target_id=7 availability=ASSIGNED interceptor_type=25 aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S4 availability=ASSIGNED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S4 availability=ASSIGNED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S4 availability=ASSIGNED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S4 availability=ASSIGNED aircraft=1/25
+[STAT] 65013 v2 seq=49 state=S5 control_source=0 task_phase=5 assignment_id=3 target_id=7 availability=ENGAGED interceptor_type=25 aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S5 availability=ENGAGED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S5 availability=ENGAGED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S5 availability=ENGAGED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S5 availability=ENGAGED aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=ACCEPTED reason=NONE mission_state=S5 availability=ENGAGED aircraft=1/25
+[STAT] 65013 v2 seq=69 state=S12 control_source=0 task_phase=12 assignment_id=3 target_id=7 availability=RETURNING interceptor_type=25 aircraft=1/25
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S12 availability=RETURNING aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S12 availability=RETURNING aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S12 availability=RETURNING aircraft=1/25
+[STAT] 65013 v2 seq=76 state=S13 control_source=0 task_phase=13 assignment_id=3 target_id=7 availability=RETURNING interceptor_type=25 aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S13 availability=RETURNING aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S13 availability=RETURNING aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S13 availability=RETURNING aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S13 availability=RETURNING aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S13 availability=RETURNING aircraft=1/25
+[STAT] 65013 v2 seq=96 state=S14 control_source=0 task_phase=14 assignment_id=3 target_id=7 availability=TERMINAL interceptor_type=25 aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S14 availability=TERMINAL aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S14 availability=TERMINAL aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S14 availability=TERMINAL aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S14 availability=TERMINAL aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S14 availability=TERMINAL aircraft=1/25
+[INFO] TX 65014 ASSIGN assignment_id=3 target_id=7 interceptor_type=25 flags=0x01 valid_for_ms=5000 address=1/25 mavlink_payload_len=60
+[ACK ] 65015 assignment_id=3 target_id=7 result=CANCELLED_OR_ABORTED reason=TARGET_WAIT_TIMEOUT mission_state=S14 availability=TERMINAL aircraft=1/25
+[INFO] 完成：65014 发送 23 次，TIMESYNC 响应 49 次
