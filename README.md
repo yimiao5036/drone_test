@@ -89,7 +89,7 @@ CMake 会把 `config/` 和 `models/` 同步到构建目录。配置查找顺序�
 | `src/`、`include/`、`main.cpp` | 正式工程（镜像结构，模块一一对应） |
 | `tests/` | Google Test，结构与 `src/` 对应 |
 | `config/`、`models/` | 生产配置/标定与 RKNN 模型 |
-| `tools/` | 探针、PX4 冒烟/SITL、标定、Web 地面站 |
+| `tools/` | 探针、PX4 冒烟/SITL 分级测试、**SITL 验收装置 `sitl_harness.sh`**、标定、Web 地面站 |
 | `docs/` | 当前文档入口 + `archive/` + `superpowers/` 历史材料 |
 | `target_tracker/`、`visual_track_control/`、`stereo_depth/` | 独立子工程，不接入主应用 |
 | `videoPart/`、`yolo_pt/` | 历史验证原型 / 模型训练导出 |

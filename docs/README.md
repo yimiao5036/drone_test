@@ -50,6 +50,12 @@
 - [`PX4实链验证清单.md`](PX4实链验证清单.md)：实链验证、G4/G5 门禁与证据
 - [`开发进度.md`](开发进度.md)、[`开发历史.md`](开发历史.md)：当前状态与历史时间线
 
+### 工具（`tools/`）
+
+- [`../tools/sitl_harness.md`](../tools/sitl_harness.md)：**SITL 验收装置**（PX4 SITL + PTY 桥 + GCS 心跳 + 生产程序；`stack`/`app`/`smoke`/`stop`/`status`）
+- [`../tools/px4_link_smoke.md`](../tools/px4_link_smoke.md)：PX4 串口冒烟/SITL 分级测试（G1~G3、G4 台架）
+- [`../tools/PX4_SITL分级测试.md`](../tools/PX4_SITL分级测试.md)：分级测试实测记录
+
 ### 历史/归档
 
 - [`archive/`](archive/README.md)：早期设计、性能核查、历史计划

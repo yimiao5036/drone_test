@@ -14,6 +14,10 @@
 
 ## 运行方式（可复现）
 
+> 装置已固化：`bash tools/sitl_harness.sh stack` 等价于下面第 1~3 步（PX4 SITL +
+> PTY 桥 + GCS 心跳 + 生产程序），`smoke`/`app`/`stop`/`status` 见
+> `tools/sitl_harness.md`。下列手工步骤保留为原始复现记录。
+
 ```bash
 # 1. 桥 + PX4 SITL + GCS 心跳 + 生产程序（干净重启）
 python3 tools/sitl_pty_bridge.py &            # /tmp/gcs_app（机载串口）、/tmp/gcs_test（工具）

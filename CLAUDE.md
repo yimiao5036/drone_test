@@ -39,7 +39,7 @@ cmake -S visual_track_control -B build_vtc -DBUILD_TESTING=OFF && cmake --build 
 cd tools/web平台 && npm run dev
 ```
 
-工具：`px4_link_smoke`（PX4 串口冒烟/SITL 分级测试；G4 台架 `--bench-stage4-controller --bench-ack-props-off`，仅串口、必须拆桨）、`video_latency_probe`（视频链路延迟探针）、`tools/*.py`（地面站 TIMESYNC/目标发送测试）、`test.py`（pymavlink SITL 飞行流程模拟）。
+工具：`tools/sitl_harness.sh`（**SITL 验收装置**：PX4 SITL + PTY 桥 + GCS 心跳 + 生产程序，子命令 `stack`/`app`/`smoke`/`stop`/`status`；文档 `tools/sitl_harness.md`）、`px4_link_smoke`（PX4 串口冒烟/SITL 分级测试；G4 台架 `--bench-stage4-controller --bench-ack-props-off`，仅串口、必须拆桨）、`video_latency_probe`（视频链路延迟探针）、`tools/*.py`（地面站 TIMESYNC/目标发送测试、`assignment_sitl.py` 任务分配验收）、`test.py`（pymavlink SITL 飞行流程模拟）。
 
 ## 架构要点
 
