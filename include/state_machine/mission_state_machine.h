@@ -49,6 +49,14 @@ namespace drone::state_machine {
 
 /// MissionStateMachine 配置（阶段四新增）。全部字段可选，缺席回退默认值。
 struct MissionStateMachineConfig {
+    /// 自动起飞时序（takeoff 配置节同源注入，2026-10-22）。S3 解锁/Offboard、
+    /// S4 爬升、目标等待/丢失与电池防抖的阈值全部取自此节；构造期
+    /// `TakeoffConfig::Validate()` 兜底（程序化构造非法值 fail-fast）。
+    config::TakeoffConfig takeoff;
+    /// 本机拦截功能类别（地面站链路 `ground_station.aircraft_component_id`
+    /// 同源注入）：65014 的 `interceptor_type` 必须等于该值，25=捕网、26=火箭。
+    /// 装配层未显式设置时保持捕网默认值。
+    uint8_t expected_interceptor_type = 25;
     /// 控制意图有效期（valid_for_ms 与 valid_until_ms 基准）。必须与
     /// FlightController 的 controller.intent_timeout 对齐，由装配层从同一来源传入。
     std::chrono::milliseconds intent_valid_for{300};
@@ -112,6 +120,10 @@ public:
         common::Topic<common::StereoTargetDistance>& distance) = 0;
     /// 注入 PX4 命令窄接口（仅 enable_control=true 装配期调用）。
     virtual void SetCommandSender(communication::IPx4CommandSender* sender) = 0;
+    /// 绑定任务分配输入主题（65014，GroundStationLink 解析后发布）。
+    /// 必须在 Start 前调用；未绑定时状态机不处理分配（保持原有影子行为）。
+    virtual void SetAssignmentInput(
+        common::Topic<common::MissionAssignment>& assignment) = 0;
     /// 注入目标估计器诊断接口：交接判据的创新门限读取
     /// `ITargetEstimator::LastVisualInnovationM()`（最近一次视觉观测与卡尔曼预测的
     /// 水平距离）。必须在 Start 前调用；未注入时交接判据不评估（保持 S5 影子行为，
@@ -124,6 +136,10 @@ public:
     virtual common::Topic<common::ControlIntent>& IntentOutput() = 0;
     /// 任务状态回传输出主题：common::MissionStatus（供地面站回传）。
     virtual common::Topic<common::MissionStatus>& StatusOutput() = 0;
+    /// 任务分配回执输出主题：common::MissionAssignmentAck（65015，供
+    /// GroundStationLink 发往地面站）。每次处理 65014（含重复 id 重发）
+    /// 发布一条；未绑定时仍可订阅。
+    virtual common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() = 0;
 
     // ---- 状态查询 ----
     /// 当前任务状态（S0~S16，见 common::MissionState）。
@@ -173,11 +189,14 @@ public:
         common::Topic<common::VisualTargetStatus>& visual_status,
         common::Topic<common::StereoTargetDistance>& distance) override;
     void SetCommandSender(communication::IPx4CommandSender* sender) override;
+    void SetAssignmentInput(
+        common::Topic<common::MissionAssignment>& assignment) override;
     void SetEstimationDiagnostics(
         const perception::ITargetEstimator* estimator) override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
+    common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
 
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
@@ -223,11 +242,14 @@ public:
         common::Topic<common::VisualTargetStatus>& visual_status,
         common::Topic<common::StereoTargetDistance>& distance) override;
     void SetCommandSender(communication::IPx4CommandSender* sender) override;
+    void SetAssignmentInput(
+        common::Topic<common::MissionAssignment>& assignment) override;
     void SetEstimationDiagnostics(
         const perception::ITargetEstimator* estimator) override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
+    common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
 
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
@@ -240,6 +262,7 @@ private:
     uint64_t error_count_ = 0;
     common::Topic<common::ControlIntent> intent_output_;
     common::Topic<common::MissionStatus> status_output_;
+    common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
 };
 
 }  // namespace drone::state_machine

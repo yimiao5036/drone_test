@@ -35,6 +35,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "control/line_of_sight.h"
 #include "control/staleness_checker.h"
@@ -42,6 +43,7 @@
 #include "control/tracking_types.h"
 #include "perception/geodetic_converter.h"
 #include "perception/target_estimator.h"
+#include "state_machine/mission_assignment.h"
 #include "state_machine/net_actuator.h"
 
 namespace drone::state_machine {
@@ -297,6 +299,8 @@ public:
           actuator_config_(config.actuator),
           interception_(config.interception),
           return_home_(config.return_home),
+          takeoff_(config.takeoff),
+          expected_interceptor_type_(config.expected_interceptor_type),
           test_hooks_enabled_(config.test_hooks_enabled),
           azimuth_converter_(config.tracking.camera.fx_px,
                              config.tracking.camera.cx_px),
@@ -310,6 +314,9 @@ public:
         // 拦截入口与返航配置构造期兜底（程序化构造非法值 fail-fast）。
         config.interception.Validate();
         config.return_home.Validate();
+        // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
+        // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
+        config.takeoff.Validate();
         if (config.interception.enabled && !config.return_home.enabled) {
             throw std::invalid_argument(
                 "interception.enabled=true 时 return_home.enabled 必须为 true"
@@ -378,6 +385,11 @@ public:
             ground_target_subscription_ = ground_target_topic_->Subscribe(4);
             flight_subscription_ = flight_topic_->Subscribe(2);
             health_subscription_ = health_topic_->Subscribe(2);
+            // 任务分配输入可选：未绑定时不订阅（保持既有影子行为，
+            // 不影响任何既有测试/装配）。
+            if (assignment_topic_ != nullptr) {
+                assignment_subscription_ = assignment_topic_->Subscribe(4);
+            }
             if (all_estimation_bound) {
                 estimated_subscription_ = estimated_topic_->Subscribe(2);
                 visual_status_subscription_ = visual_status_topic_->Subscribe(2);
@@ -404,6 +416,13 @@ public:
         // 任务故障标志复位：重启后不得沿用上一轮 S16 记忆（执行器本体若已
         // 处于终态故障仍由执行器自身拒绝动作，需人工/维护处置）。
         mission_faulted_ = false;
+        // 任务分配状态复位：一次上电一次空中任务语义以 Start 为界，
+        // 重启后重新允许分配（分配历史与原点不得沿用上一轮）。
+        assignment_tracker_ = MissionAssignmentTracker{};
+        latest_assignment_.reset();
+        assignment_receive_count_ = 0;
+        assignment_reject_count_ = 0;
+        assignment_duplicate_count_ = 0;
         // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
         return_climb_phase_ = true;
@@ -436,6 +455,7 @@ public:
         ground_target_subscription_.Reset();
         flight_subscription_.Reset();
         health_subscription_.Reset();
+        assignment_subscription_.Reset();
         estimated_subscription_.Reset();
         visual_status_subscription_.Reset();
         distance_subscription_.Reset();
@@ -491,6 +511,16 @@ public:
                     net_actuator_ ? net_actuator_->Type() : "disabled");
     }
 
+    /// 绑定任务分配输入 Topic（65014）。必须在 Start 前调用；未绑定时
+    /// 不订阅、不处理分配，既有影子行为保持不变。
+    void SetAssignmentInput(common::Topic<common::MissionAssignment>& assignment) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定任务分配输入Topic");
+            return;
+        }
+        assignment_topic_ = &assignment;
+    }
+
     /// 注入目标估计器诊断接口（交接创新门限的数据来源）。必须在Start前调用；
     /// 未注入时交接判据不评估（保持影子 S5 行为）。
     void SetEstimationDiagnostics(const perception::ITargetEstimator* estimator) {
@@ -505,6 +535,9 @@ public:
 
     common::Topic<common::ControlIntent>& IntentOutput() { return intent_output_; }
     common::Topic<common::MissionStatus>& StatusOutput() { return status_output_; }
+    common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() {
+        return assignment_ack_output_;
+    }
 
     /// 测试入口：强制提交一次状态迁移（与生产路径共用 TransitionTo 统一挂点；
     /// 进入/离开动作由决策线程在 Evaluate 末段评估）。
@@ -578,6 +611,21 @@ private:
         while (auto message = distance_subscription_.TryTake()) {
             latest_distance_ = **message;
         }
+        // 任务分配（65014）：队列里只保留最新一条，由 EvaluateAssignmentEntry
+        // 在 S2 处理一次后清空（每条消息只回一条 65015，不按决策周期重发）。
+        while (auto message = assignment_subscription_.TryTake()) {
+            latest_assignment_ = **message;
+            const uint64_t count = ++assignment_receive_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_INFO("状态机收到任务分配: assignment_id={} target_id={} "
+                            "type={} flags=0x{:02x} valid_for_ms={} count={}",
+                            latest_assignment_->assignment_id,
+                            latest_assignment_->target_id,
+                            latest_assignment_->interceptor_type,
+                            latest_assignment_->flags,
+                            latest_assignment_->valid_for_ms, count);
+            }
+        }
     }
 
     /// 根据当前状态、飞行快照和目标新鲜度推进影子状态，并周期发布MissionStatus。
@@ -604,8 +652,10 @@ private:
         if (state == common::MissionState::kSelfCheck && HasNavigationForGps()) {
             TransitionTo(common::MissionState::kReady, "PX4导航快照满足GPS引导前置条件");
         } else if (state == common::MissionState::kReady && target_fresh &&
-                   HasNavigationForGps()) {
-            // 安全影子阶段只验证GPS目标进入状态链路；不执行ARMING/TAKEOFF，不输出控制。
+                   HasNavigationForGps() && command_sender_ == nullptr) {
+            // 安全影子阶段（未注入命令接口）只验证GPS目标进入状态链路；
+            // 不执行ARMING/TAKEOFF，不输出控制。注入命令接口后 65010 目标
+            // 不得单独把 S2 推到 S5：必须由 65014 分配经 S2 预检进入 S3。
             TransitionTo(common::MissionState::kGpsApproach,
                          "收到有效地面站目标，进入GPS_APPROACH影子验证");
         } else if (state == common::MissionState::kGpsApproach && !target_fresh) {
@@ -615,6 +665,10 @@ private:
                 SPDLOG_WARN("GPS_APPROACH影子状态目标过期: count={}", count);
             }
         }
+
+        // S2 READY → S3 分配入口（2026-10-22）：只在 kReady 处理 65014。
+        // 迁移当拍即生效，后续交接/意图评估按新状态（ARMING）执行（Task 5 接入）。
+        EvaluateAssignmentEntry(now_ms);
 
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
         // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
@@ -659,6 +713,227 @@ private:
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
             PublishStatus(now_ms);
         }
+    }
+
+    /// 65014 分配字段预检（不改变任何状态）。返回 kNone 表示字段与当前
+    /// 预检条件全部通过；否则返回 65015 的具体 reason（设计 §5.4/§7.2）。
+    /// 注意：调用方必须先处理重复 assignment_id（WasHandled），再做本检查。
+    common::MissionAssignmentReason ValidateAssignment(
+        const common::MissionAssignment& assignment, uint64_t now_ms) const {
+        // 协议版本：当前固定 1。
+        if (assignment.protocol_version !=
+            communication::kMissionAssignmentProtocolVersion) {
+            return common::MissionAssignmentReason::kUnsupportedVersion;
+        }
+        // flags：只允许已知位，且必须带 bit0（授权自动起飞）。
+        if ((assignment.flags &
+             static_cast<uint8_t>(~communication::kMissionAssignKnownFlagsMask)) !=
+            0U) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        if ((assignment.flags & communication::kMissionAssignFlagAuthorized) == 0U) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        if (assignment.target_id == 0U) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        // 拦截功能类别必须与本机一致（25=捕网，26=火箭）。
+        if (assignment.interceptor_type != expected_interceptor_type_) {
+            return common::MissionAssignmentReason::kUnsupportedInterceptorType;
+        }
+        // 分配有效期：按本机收到时刻 + valid_for_ms 判定；0 或已过期均非法。
+        if (assignment.valid_for_ms == 0U || assignment.received_ms == 0U ||
+            now_ms > assignment.received_ms + assignment.valid_for_ms) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        // 控制路径：未注入命令接口（影子装配）或估计输入未绑定时不得起飞。
+        if (command_sender_ == nullptr) {
+            return common::MissionAssignmentReason::kControlDisabled;
+        }
+        if (!estimation_inputs_active_) {
+            return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        // PX4 连接与地面/未 armed/导航前置条件（设计 §7.2）。
+        if (!latest_flight_.has_value() || !latest_flight_->connected) {
+            return common::MissionAssignmentReason::kPx4Disconnected;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.landed_state_valid || !flight.landed || flight.armed) {
+            return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        if (!flight.local_position_valid || !flight.attitude_valid ||
+            !flight.home_valid) {
+            return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        // 设备故障：任务故障终态或捕网执行器故障时不允许接受新分配。
+        if (mission_faulted_ ||
+            (net_actuator_ != nullptr && net_actuator_->Faulted())) {
+            return common::MissionAssignmentReason::kMissionFault;
+        }
+        return common::MissionAssignmentReason::kNone;
+    }
+
+    /// 任务分配入口（2026-10-22）。
+    /// 每条 65014 只消费一次（DrainInputs 保存最新一条，处理前清空，避免按
+    /// 决策周期重复回 65015）。重复 assignment_id 在任何阶段都重发原 65015；
+    /// 新分配只在 S2 预检，非 S2 一律拒绝且不重试。
+    void EvaluateAssignmentEntry(uint64_t now_ms) {
+        if (!latest_assignment_.has_value()) {
+            return;
+        }
+        const common::MissionAssignment assignment = *latest_assignment_;
+        latest_assignment_.reset();
+
+        // 重复 assignment_id：只重发原 65015，不再预检/迁移（幂等）。
+        common::MissionAssignmentResult prior_result =
+            common::MissionAssignmentResult::kRejected;
+        common::MissionAssignmentReason prior_reason =
+            common::MissionAssignmentReason::kNone;
+        bool duplicate = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            duplicate = assignment_tracker_.WasHandled(
+                assignment.assignment_id, &prior_result, &prior_reason);
+        }
+        if (duplicate) {
+            PublishAssignmentAck(assignment, prior_result, prior_reason);
+            const uint64_t count = ++assignment_duplicate_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_INFO("重复任务分配只重发65015: assignment_id={} result={} "
+                            "reason={} count={}",
+                            assignment.assignment_id,
+                            static_cast<int>(prior_result),
+                            static_cast<int>(prior_reason), count);
+            }
+            return;
+        }
+
+        // 任务已开始（S3~S16）时收到新 assignment_id：拒绝并记录结果，
+        // 不打断当前任务；重复 id 已在上面重发原回执。
+        if (CurrentState() != common::MissionState::kReady) {
+            const auto reason = common::MissionAssignmentReason::kAlreadyAssigned;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                assignment_tracker_.RememberResult(
+                    assignment.assignment_id,
+                    common::MissionAssignmentResult::kRejected, reason);
+            }
+            PublishAssignmentAck(assignment,
+                                 common::MissionAssignmentResult::kRejected,
+                                 reason);
+            const uint64_t count = ++assignment_reject_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("任务执行中拒绝新分配: assignment_id={} state={} count={}",
+                            assignment.assignment_id,
+                            MissionStateName(CurrentState()), count);
+            }
+            return;
+        }
+
+        auto reason = ValidateAssignment(assignment, now_ms);
+        bool accepted = false;
+        if (reason == common::MissionAssignmentReason::kNone) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            // 一次上电一次空中任务：非 kIdle 或已消耗机会时拒绝。
+            if (!assignment_tracker_.Accept(assignment, now_ms)) {
+                reason = common::MissionAssignmentReason::kAlreadyAssigned;
+            } else {
+                assignment_tracker_.RememberResult(
+                    assignment.assignment_id,
+                    common::MissionAssignmentResult::kAccepted,
+                    common::MissionAssignmentReason::kNone);
+                // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致；
+                // 本任务不发送 176/400、不进入 S4（Task 5 完成）。
+                const auto& flight = *latest_flight_;
+                assignment_tracker_.BeginTakeoff(
+                    flight.local_x_m, flight.local_y_m, flight.local_z_m, now_ms);
+                accepted = true;
+            }
+        }
+
+        if (!accepted) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                assignment_tracker_.RememberResult(
+                    assignment.assignment_id,
+                    common::MissionAssignmentResult::kRejected, reason);
+            }
+            PublishAssignmentAck(assignment,
+                                 common::MissionAssignmentResult::kRejected,
+                                 reason);
+            const uint64_t count = ++assignment_reject_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("任务分配被拒绝: assignment_id={} target_id={} "
+                            "reason={} state={} count={}",
+                            assignment.assignment_id, assignment.target_id,
+                            static_cast<int>(reason),
+                            MissionStateName(CurrentState()), count);
+            }
+            return;  // 保持 S2；不自动重试、不消耗任务机会
+        }
+
+        // 成功：先回 accepted（tracker 已进入 kAssigned/kTakingOff，
+        // availability=assigned），再迁移 S3。S3 入口动作（176/400、
+        // 每拍 kTakeoff 原点意图）由 Task 5 实现。
+        PublishAssignmentAck(assignment,
+                             common::MissionAssignmentResult::kAccepted,
+                             common::MissionAssignmentReason::kNone);
+        SPDLOG_INFO("任务分配已接受: assignment_id={} target_id={} origin=({:.2f},"
+                    "{:.2f},{:.2f}) → S3 ARMING",
+                    assignment.assignment_id, assignment.target_id,
+                    static_cast<double>(assignment_tracker_.OriginX()),
+                    static_cast<double>(assignment_tracker_.OriginY()),
+                    static_cast<double>(assignment_tracker_.OriginZ()));
+        TransitionTo(common::MissionState::kArming, "接受任务分配");
+    }
+
+    /// 计算 65013/65015 的 availability。影子模式（未注入命令接口）固定
+    /// unavailable：不可被调度；有控制路径时用 tracker 阶段映射。
+    /// 调用方必须已持有 state_mutex_。
+    common::MissionAvailability ComputeAvailabilityLocked() const {
+        if (command_sender_ == nullptr || mission_faulted_ ||
+            (net_actuator_ != nullptr && net_actuator_->Faulted())) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        if (assignment_tracker_.Phase() != AssignmentPhase::kIdle) {
+            return assignment_tracker_.Availability();
+        }
+        // 已消耗空中任务机会但阶段已清空：本次上电不可再调度。
+        if (assignment_tracker_.ConsumedAirborneMission()) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        if (!latest_flight_.has_value() || !latest_flight_->connected) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        return common::MissionAvailability::kReady;
+    }
+
+    common::MissionAvailability ComputeAvailability() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return ComputeAvailabilityLocked();
+    }
+
+    /// 发布 65015 任务分配回执（assignment_id/target_id/result/reason/
+    /// 当前状态/availability）。低速率控制面消息，每条 65014 一条。
+    void PublishAssignmentAck(const common::MissionAssignment& assignment,
+                              common::MissionAssignmentResult result,
+                              common::MissionAssignmentReason reason) {
+        const uint64_t now_ms = MonotonicMs();
+        common::MissionAssignmentAck ack;
+        ack.header.sequence = ++assignment_ack_sequence_;
+        ack.header.source_time_ms = now_ms;
+        ack.header.receive_time_ms = now_ms;
+        ack.header.valid_for_ms = kStatusValidForMs;
+        ack.header.source_id = 1;
+        ack.header.health = 1;
+        ack.assignment_id = assignment.assignment_id;
+        ack.target_id = assignment.target_id;
+        ack.result = result;
+        ack.reason = reason;
+        ack.mission_state = CurrentState();
+        ack.availability = ComputeAvailability();
+        (void)assignment_ack_output_.Publish(
+            std::make_shared<const common::MissionAssignmentAck>(ack));
     }
 
     /// S9/S10 入口判据（interception 配置节，2026-10-19）。
@@ -1818,6 +2093,12 @@ private:
             status.state_entered_ms = state_entered_ms_;
             status.task_phase = TaskPhase(state_);
             status.active_warning_bits = active_warning_bits_;
+            // 65013 v2（2026-10-22）：分配编号/目标/功能类别与可用状态。
+            // 无分配时 id 为 0；影子模式 availability 固定 unavailable。
+            status.assignment_id = assignment_tracker_.AssignmentId();
+            status.target_id = assignment_tracker_.TargetId();
+            status.interceptor_type = assignment_tracker_.InterceptorType();
+            status.availability = ComputeAvailabilityLocked();
         }
         status.header.source_time_ms = now_ms;
         status.header.receive_time_ms = now_ms;
@@ -1848,6 +2129,8 @@ private:
     common::Topic<common::TargetState>* estimated_topic_ = nullptr;
     common::Topic<common::VisualTargetStatus>* visual_status_topic_ = nullptr;
     common::Topic<common::StereoTargetDistance>* distance_topic_ = nullptr;
+    /// 任务分配输入（65014，可选绑定；未绑定时不订阅、不处理）。
+    common::Topic<common::MissionAssignment>* assignment_topic_ = nullptr;
     /// PX4 命令窄接口（仅 enable_control=true 装配期注入）。当前消费点：
     /// S13 AUTO.LAND / S14 DISARM；未注入时零调用。
     communication::IPx4CommandSender* command_sender_ = nullptr;
@@ -1863,6 +2146,7 @@ private:
     common::Topic<common::TargetState>::Subscription estimated_subscription_;
     common::Topic<common::VisualTargetStatus>::Subscription visual_status_subscription_;
     common::Topic<common::StereoTargetDistance>::Subscription distance_subscription_;
+    common::Topic<common::MissionAssignment>::Subscription assignment_subscription_;
 
     std::optional<common::GroundStationTarget> latest_ground_target_;
     std::optional<common::FlightStateSnapshot> latest_flight_;
@@ -1870,6 +2154,8 @@ private:
     std::optional<common::TargetState> latest_estimated_;
     std::optional<common::VisualTargetStatus> latest_visual_status_;
     std::optional<common::StereoTargetDistance> latest_distance_;
+    /// 最新一条 65014（DrainInputs 写入，EvaluateAssignmentEntry 处理后清空）。
+    std::optional<common::MissionAssignment> latest_assignment_;
 
     std::atomic<bool> running_{false};
     std::thread worker_;
@@ -1883,6 +2169,10 @@ private:
     uint32_t active_warning_bits_ = 0;
     uint64_t target_receive_count_ = 0;
     uint64_t target_stale_count_ = 0;
+    uint64_t assignment_receive_count_ = 0;
+    uint64_t assignment_reject_count_ = 0;
+    uint64_t assignment_duplicate_count_ = 0;
+    uint64_t assignment_ack_sequence_ = 0;
 
     /// 控制意图有效期（构造注入，与 controller.intent_timeout 对齐）。
     const uint64_t intent_valid_for_ms_;
@@ -1935,6 +2225,14 @@ private:
     /// 拦截入口/授权与返航配置（构造注入；JSON interception/return_home 节）。
     const config::InterceptionConfig interception_;
     const config::ReturnHomeConfig return_home_;
+    /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
+    /// S3 时序/S4 爬升在 Task 5 使用）。
+    const config::TakeoffConfig takeoff_;
+    /// 本机拦截功能类别（ground_station.aircraft_component_id 同源）。
+    const uint8_t expected_interceptor_type_;
+    /// 任务分配生命周期助手（一次上电一次任务、重复 id 回执、原点记录）。
+    /// 只由决策线程访问；状态发布读取时受 state_mutex_ 保护。
+    MissionAssignmentTracker assignment_tracker_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
     /// 任务故障（S16 FAILSAFE）：捕网执行器 ACK 超时/非 ACCEPTED/PX4 断连/
@@ -1964,6 +2262,7 @@ private:
 
     common::Topic<common::ControlIntent> intent_output_;
     common::Topic<common::MissionStatus> status_output_;
+    common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
 };
 
 MissionStateMachine::MissionStateMachine(MissionStateMachineConfig config)
@@ -1986,6 +2285,10 @@ void MissionStateMachine::SetEstimationInputs(
 void MissionStateMachine::SetCommandSender(communication::IPx4CommandSender* sender) {
     impl_->SetCommandSender(sender);
 }
+void MissionStateMachine::SetAssignmentInput(
+    common::Topic<common::MissionAssignment>& assignment) {
+    impl_->SetAssignmentInput(assignment);
+}
 void MissionStateMachine::SetEstimationDiagnostics(
     const perception::ITargetEstimator* estimator) {
     impl_->SetEstimationDiagnostics(estimator);
@@ -1995,6 +2298,10 @@ common::Topic<common::ControlIntent>& MissionStateMachine::IntentOutput() {
 }
 common::Topic<common::MissionStatus>& MissionStateMachine::StatusOutput() {
     return impl_->StatusOutput();
+}
+common::Topic<common::MissionAssignmentAck>&
+MissionStateMachine::AssignmentAckOutput() {
+    return impl_->AssignmentAckOutput();
 }
 common::MissionState MissionStateMachine::CurrentState() const {
     return impl_->CurrentState();
@@ -2052,6 +2359,11 @@ void MissionStateMachineStub::SetCommandSender(
     // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
 }
 
+void MissionStateMachineStub::SetAssignmentInput(
+    common::Topic<common::MissionAssignment>& /*assignment*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
 void MissionStateMachineStub::SetEstimationDiagnostics(
     const perception::ITargetEstimator* /*estimator*/) {
     // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
@@ -2063,6 +2375,11 @@ common::Topic<common::ControlIntent>& MissionStateMachineStub::IntentOutput() {
 
 common::Topic<common::MissionStatus>& MissionStateMachineStub::StatusOutput() {
     return status_output_;
+}
+
+common::Topic<common::MissionAssignmentAck>&
+MissionStateMachineStub::AssignmentAckOutput() {
+    return assignment_ack_output_;
 }
 
 common::MissionState MissionStateMachineStub::CurrentState() const {

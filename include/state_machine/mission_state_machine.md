@@ -100,6 +100,23 @@ PX4/遥控”。
 - S7 无姿态超龄退出路径（边界声明）：姿态超龄由控制律降级停发 → FlightController
   授权链收口（姿态异常同时意味着 PX4 数据链异常，由控制器门禁裁决）。
 
+**多机任务分配入口（Task 4，2026-10-22）**：新增`SetAssignmentInput()`（65014
+`MissionAssignment`）与`AssignmentAckOutput()`（65015 `MissionAssignmentAck`）。
+状态机只在 **S2 READY** 处理分配：字段与整机预检全部通过才记录
+`MissionAssignmentTracker`、回 `accepted` 并迁移 **S3 ARMING**；任一失败回
+`rejected` + 具体 reason 并保持 S2（预检拒绝不消耗任务机会）。Task 4 只做入口
+与预检，**不发送 176/400、不进入 S4**（S3 解锁/Offboard 与 S4 爬升由 Task 5
+实现）。`MissionAssignmentTracker` 负责一次上电一次空中任务、重复
+`assignment_id` 只重发原 65015、起飞原点记录。`PublishStatus` 的 65013 v2
+字段（`assignment_id/target_id/availability/interceptor_type`）同步填写。
+
+**影子兼容（关键）**：未注入命令接口（`enable_control=false` 装配）时，
+65014 一律回 `control_disabled`，`availability=unavailable`（影子模式不可被调度）；
+既有“新鲜 65010 目标 + 导航就绪 → S2→S5 影子验证”路径**原样保留**。注入命令
+接口后，65010 目标不得单独把 S2 推到 S5——必须由 65014 分配经预检进入 S3。
+此分叉只在 Evaluate 的 S2→S5 分支增加 `command_sender_ == nullptr` 条件，
+不删除任何影子测试路径。
+
 完整自动任务链仍以`docs/状态机设计.md`为准；当前跳过`ARMING/TAKEOFF`只用于无控制输出的地面站目标接入验证，后续接入控制门禁后需要恢复完整状态推进。
 
 ## 接口与数据流
@@ -114,6 +131,8 @@ struct MissionStateMachineConfig {
     std::chrono::milliseconds visual_stale{200};      // 视觉状态超龄（visual_tracking.control.visual_stale_ms 同源）
     std::chrono::milliseconds distance_stale{500};    // 测距超龄（distance_stale_ms 同源）
     config::ActuatorConfig actuator;                  // 捕网执行器（actuator 配置节同源，Task 10）
+    config::TakeoffConfig takeoff;                    // 自动起飞时序（takeoff 配置节同源，2026-10-22）
+    uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
 class MissionStateMachine final : public IMissionStateMachine {
@@ -126,9 +145,11 @@ public:
                              Topic<VisualTargetStatus>& visual_status,
                              Topic<StereoTargetDistance>& distance) override;
     void SetCommandSender(communication::IPx4CommandSender* sender) override;
+    void SetAssignmentInput(Topic<MissionAssignment>& assignment) override;   // 65014（可选绑定）
     void SetEstimationDiagnostics(const perception::ITargetEstimator* estimator) override;
     Topic<ControlIntent>& IntentOutput() override;
-    Topic<MissionStatus>& StatusOutput() override;
+    Topic<MissionStatus>& StatusOutput() override;                            // 65013 v2
+    Topic<MissionAssignmentAck>& AssignmentAckOutput() override;              // 65015
 
     // ---- 测试入口（生产装配不得调用） ----
     void ForceStateForTest(common::MissionState state);  // 强制迁移（需 test_hooks_enabled=true）
@@ -147,10 +168,12 @@ VisualTargetMonitor::StatusOutput() ─┼─► SetEstimationInputs(...)（阶�
 StereoRanger::DistanceOutput() ──────┘
 
 TargetEstimator（ITargetEstimator）─► SetEstimationDiagnostics(...)（装配估计器即注入，只读诊断）
+GroundStationLink::MissionAssignmentOutput() ─► SetAssignmentInput(...)（65014，可选绑定）
 MissionStateMachine::IntentOutput() ─► FlightController::SetInput(...)
-MissionStateMachine::StatusOutput() ─► GroundStationLink::SetMissionStatusInput(...)
+MissionStateMachine::StatusOutput() ─► GroundStationLink::SetMissionStatusInput(...)（65013 v2）
+MissionStateMachine::AssignmentAckOutput() ─► GroundStationLink::SetMissionAssignmentAckInput(...)（65015）
 Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=true 装配分支；
-                             当前唯一消费点=捕网执行器触发/复位，Task 10）
+                             当前消费点=捕网执行器触发/复位，Task 10）
 ```
 
 配置注入：`intent_valid_for`由`DroneApplication`从`config_.controller.intent_timeout`
@@ -182,7 +205,42 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   心跳 → GPS fix → Home 顺序排查（见`docs/故障排查手册.md`），不要改条件绕过。
   **室内提示**：室内可能无 GPS fix/Home，停留自检属预期、不是通信问题
   （判据是「PX4 心跳已连接」是否出现）；分阶段验证见`docs/PX4实链验证清单.md`。
-- `READY`阶段等待有效地面站目标；目标有效且导航仍有效时，进入`GPS_APPROACH`影子状态。
+- `READY`阶段等待有效地面站目标；**未注入命令接口时**，目标有效且导航仍有效
+  即进入`GPS_APPROACH`影子状态（既有语义，保留）。
+- **S2 分配预检（Task 4，2026-10-22）**：只在`CurrentState()==kReady`处理
+  最新一条 65014，且每条消息只处理一次（处理即清空`latest_assignment_`，
+  不按 100ms 决策周期重复回 65015）。检查顺序：
+  1. 重复`assignment_id`：`MissionAssignmentTracker::WasHandled` 命中 → 只重发
+     原 65015（result/reason 不变），不再预检、不迁移；
+  2. `protocol_version == 1`，否则 `unsupported_version`；
+  3. `flags` 只允许已知位（bit0 授权、bit1 取消），且必须带 bit0，否则
+     `invalid_message`；
+  4. `target_id != 0`，否则 `invalid_message`；
+  5. `interceptor_type == expected_interceptor_type`（默认 25 捕网），否则
+     `unsupported_interceptor_type`；
+  6. `valid_for_ms > 0` 且 `now <= received_ms + valid_for_ms`，否则
+     `invalid_message`（按本机单调时钟；0 视为非法）；
+  7. `command_sender_ != nullptr`，否则 `control_disabled`（影子装配）；
+  8. `estimation_inputs_active_`（估计/视觉/测距三输入已绑定），否则
+     `preflight_failed`；
+  9. `latest_flight_`：连接在线、`landed_state_valid && landed`、`!armed`、
+     局部位置/姿态/Home 有效；断连为 `px4_disconnected`，其余为
+     `preflight_failed`；
+  10. 无任务故障/执行器故障，否则 `mission_fault`；
+  11. tracker 可接受（`kIdle` 且未消耗空中任务机会），否则 `already_assigned`。
+  失败：回 `rejected` + reason、保持 S2、`RememberResult` 记录回执（重复 id
+  可重发），不自动重试、不消耗任务机会；状态不确定（未连接/故障）时
+  `availability=unavailable`。
+  成功：tracker `Accept` → 记 accepted 回执 → `BeginTakeoff(local_x,local_y,
+  local_z)` 记录原点 → 回 accepted（`availability=assigned`）→ 迁移 S3
+  （reason「接受任务分配」）。**Task 4 不发送 176/400、不进入 S4**。
+- **availability 映射**：未注入命令接口、任务故障/执行器故障、未连接或已消耗
+  空中任务机会 → `unavailable`；有控制路径时用 tracker 阶段：`kIdle→ready`、
+  `kAssigned/kTakingOff→assigned`、`kAirborne/kEngaged→engaged`、
+  `kReturning→returning`、`kTerminal→terminal`。65015 与 65013 共用该映射。
+- **控制路径下 65010 不再单独进入 S5**：S2→S5 分支增加
+  `command_sender_ == nullptr` 条件；注入命令接口后必须由 65014 分配进入 S3
+  （Task 5 再推进 S4/S5）。
 - `GPS_APPROACH`阶段维护目标新鲜度和状态回传；估计输入已绑定且估计新鲜有效时
   （`TargetState.valid=true` 且 `receive_time_ms + valid_for_ms` 未过期），
   发布`kPositionGuide`意图：`target_x/y/z = pos_x/y/z_m`（`pos_z_m`为 NaN 时原样
@@ -354,12 +412,15 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   "交接冻结位置意图续发"、"位置引导意图停止: 视觉伺服接续"、交接段收口）；
   S7 视觉伺服意图启动（带首拍 vx/vy/vz/yaw_rate 摘要）；PX4 命令接口与估计器
   诊断接口注入；首次/节流接收地面站目标；**返航开始/爬升完成/降落阶段/
-  AUTO.LAND 入队/DISARM 入队/任务结束（S14）**（S11~S14，2026-10-19）。
+  AUTO.LAND 入队/DISARM 入队/任务结束（S14）**（S11~S14，2026-10-19）；
+  **接收任务分配（节流）/分配已接受（含 assignment_id/target_id/起飞原点）/
+  重复分配只重发 65015**（2026-10-22）。
 - WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
   S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）；
   **捕网执行器触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
   捕网命令入队失败（节流，下拍重试）；**单发发射超时/返航超时/Home 或锚点无效/
-  PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）。
+  PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）；
+  **任务分配被拒绝（节流，带 assignment_id/target_id/reason/当前状态）**。
 - ERROR：订阅或线程启动异常；运行中重绑输入/注入接口；估计输入部分绑定；
   估计输入已绑定但未注入估计器诊断（交接不评估）。
 - 高频周期（100ms 决策、10Hz 意图重发、S7 逐拍伺服计算）不打印日志；
@@ -482,6 +543,27 @@ ctest --test-dir build --output-on-failure
 - 配置（`interception`/`return_home` 节）：默认值、显式解析、非法窗口/
   返航高度拒绝、`interception.enabled=true` 且 `return_home.enabled=false`
   拒绝（发射后必须有返航收口）。
+- 任务分配入口（Task 4，2026-10-22；`AssignmentHarness` 装配 65014/65015
+  Topic、命令接口与估计输入，`MakeGroundedFlight` 提供地面/未 armed/导航有效
+  快照）：
+  - `AssignmentRejectedWithoutCommandSender`：影子装配 → `control_disabled`、
+    S2、availability=unavailable；
+  - `AssignmentRejectedWithoutEstimationInputs`：有命令接口但未绑估计 →
+    `preflight_failed`、S2；
+  - `AssignmentInvalidFieldsRejected`：版本 2、未知 flags、未授权、target_id=0、
+    类型 26、valid_for=0、已过期 → 分别 `unsupported_version`/
+    `invalid_message`/`unsupported_interceptor_type`，全部保持 S2；
+  - `AssignmentAcceptedEntersArming`：合法分配 → accepted、
+    availability=assigned、S2→S3、65013 写入 assignment/target/availability/
+    interceptor_type，且命令接口零调用（Task 4 不发 176/400）；
+  - `DuplicateAssignmentResendsAckWithoutReentry`：先以 armed 快照拒绝；
+    重复 id（含恢复地面状态后）只重发原拒绝回执、不进入 S3；换新 id 才接受；
+  - `GroundTargetDoesNotEnterGpsApproachWithControl`：注入命令接口后 65010
+    目标不单独进入 S5；
+  - `ShadowGroundTargetStillEntersGpsApproach`：绑定分配输入但未注入命令
+    接口时，既有 S2→S5 影子路径保持。
+- S3/S4 的解锁、Offboard、176/400 与爬升时序（Task 5）尚未实现；Task 4 只
+  验证入口与状态一致性（tracker `BeginTakeoff` + S3）。
 - SITL 返航专项（2026-10-19，`tools/px4_link_smoke --sitl-stage4-return` +
   `config/px4_sitl_return.json`）：S7→S9→S10 发射→S12 算力板返航 Home→
   S13 AUTO.LAND→S14 DISARMED 全 PASS（状态机迁移 11 次、错误 0；最大高度
@@ -503,6 +585,21 @@ ctest --test-dir build --output-on-failure
   接管时状态机按设计不再发 176，只等 landed/disarmed。
 - **S13 已落地但不到 S14**：通常为仍 armed 且 DISARM 未 accepted；查 400 命令
   入队/ACK 与 PX4 disarmed 状态。
+- **65014 发送后没有 65015**：确认 `SetAssignmentInput` 已绑定且
+  `GroundStationLink::MissionAssignmentOutput()` 已接到该 Topic；地址/来源
+  不匹配的 65014 由 GroundStationLink 丢弃（设计上不回 65015），不是状态机问题。
+- **65014 回 `control_disabled`**：影子装配（未注入命令接口）属预期；正式
+  自动起飞必须在 `enable_control=true` 装配分支下注入 `SetCommandSender`。
+- **65014 回 `preflight_failed`**：按顺序查：估计/视觉/测距三输入是否成组
+  绑定；飞行快照是否 `landed_state_valid && landed && !armed`；局部位置/
+  姿态/Home 是否有效。回 `px4_disconnected` 时查 PX4 心跳。
+- **65014 回 `unsupported_interceptor_type`**：`MissionStateMachineConfig::
+  expected_interceptor_type`（生产应取 `ground_station.aircraft_component_id`）
+  与地面站填写的 `interceptor_type` 不一致（25 捕网/26 火箭）。
+- **65014 回 `invalid_message`**：检查版本=1、flags 只置已知位且 bit0=1、
+  target_id=0 非法、`valid_for_ms>0` 且未过期（按本机收到时刻起算）。
+- **重复发送同一 assignment_id 一直回原拒绝**：这是幂等语义（只重发原
+  65015，不再预检）；地面站需换新的 assignment_id 才能重新分配。
 
 - 如果地面站目标ACK已成功但状态机不进入`GPS_APPROACH`，先检查PX4快照是否满足`connected/gps_fix/global_position_valid/home_valid`（PX4 已到位后该组条件可实链成立，不再是"必然不满足"）。
 - 如果状态机没有状态回传，检查主程序是否启用了PX4和地面站链路，以及`GroundStationLink::TargetOutput()`是否已绑定到状态机。

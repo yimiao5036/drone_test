@@ -2073,4 +2073,364 @@ TEST(MissionStateMachineTest, InterceptEntryRejectsDistanceOutsideWindow) {
     machine.Stop();
 }
 
+// ---------------------------------------------------------------------------
+// 多机任务分配：65014 输入、S2 预检与 65015 回执（2026-10-22，Task 4）
+// ---------------------------------------------------------------------------
+
+/// 地面待飞快照：导航就绪 + 落地状态有效且已落地 + 未 armed + 局部位置/姿态
+/// 有效。S2 分配预检要求这些前置条件全部成立。
+common::FlightStateSnapshot MakeGroundedFlight() {
+    common::FlightStateSnapshot flight = MakeNavigationReadyFlight();
+    flight.landed_state_valid = true;
+    flight.landed = true;
+    flight.armed = false;
+    flight.local_position_valid = true;
+    flight.local_x_m = 1.5f;
+    flight.local_y_m = -2.5f;
+    flight.local_z_m = 0.1f;
+    flight.attitude_valid = true;
+    return flight;
+}
+
+/// 65014 分配消息（默认字段全部合法：授权、目标 7、捕网 25、有效期 5s）。
+common::MissionAssignment MakeAssignment(uint32_t assignment_id) {
+    common::MissionAssignment assignment;
+    assignment.header.sequence = assignment_id;
+    assignment.header.source_time_ms = TestMonotonicMs();
+    assignment.header.receive_time_ms = TestMonotonicMs();
+    assignment.header.valid_for_ms = 5000;
+    assignment.header.source_id = 255;
+    assignment.header.health = 1;
+    assignment.protocol_version = 1;
+    assignment.assignment_id = assignment_id;
+    assignment.target_id = 7;
+    assignment.interceptor_type = 25;
+    assignment.flags = 1;  // bit0=授权自动起飞
+    assignment.valid_for_ms = 5000;
+    assignment.received_ms = TestMonotonicMs();
+    return assignment;
+}
+
+std::optional<common::MissionAssignmentAck> WaitForAssignmentAck(
+    common::Topic<common::MissionAssignmentAck>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        return **message;
+    }
+    return std::nullopt;
+}
+
+/// 分配用例夹具：统一装配输入/分配 Topic、命令接口与估计输入，并驱动到 S2。
+struct AssignmentHarness {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    common::Topic<common::MissionAssignment> assignment_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine;
+    common::Topic<common::MissionStatus>::Subscription status_subscription;
+    common::Topic<common::MissionAssignmentAck>::Subscription ack_subscription;
+
+    AssignmentHarness()
+        : machine(state_machine::MissionStateMachineConfig{}) {
+        machine.SetInputs(ground_topic, flight_topic, health_topic);
+        machine.SetAssignmentInput(assignment_topic);
+        status_subscription = machine.StatusOutput().Subscribe(32);
+        ack_subscription = machine.AssignmentAckOutput().Subscribe(32);
+    }
+
+    /// 装配并启动；with_control=false 模拟影子装配（不注入命令接口）。
+    bool Start(bool with_control, bool with_estimation,
+               common::FlightStateSnapshot flight = MakeGroundedFlight()) {
+        if (with_estimation) {
+            machine.SetEstimationInputs(estimated_topic, visual_topic,
+                                        distance_topic);
+        }
+        if (with_control) {
+            machine.SetCommandSender(&sender);
+        }
+        if (!machine.Start()) {
+            return false;
+        }
+        if (!flight_topic
+                 .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                     flight))
+                 .accepted) {
+            return false;
+        }
+        return WaitForState(status_subscription, common::MissionState::kReady)
+            .has_value();
+    }
+
+    bool Send(const common::MissionAssignment& assignment) {
+        return assignment_topic
+            .Publish(std::make_shared<const common::MissionAssignment>(
+                assignment))
+            .accepted;
+    }
+};
+
+// 未注入命令接口（enable_control=false 影子装配）：分配必须拒绝
+// control_disabled，状态保持 S2，availability=unavailable（不可被调度）。
+TEST(MissionStateMachineTest, AssignmentRejectedWithoutCommandSender) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(1)));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->assignment_id, 1U);
+    EXPECT_EQ(ack->target_id, 7U);
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kControlDisabled);
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(ack->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+}
+
+// 有命令接口但未绑定估计输入：控制链不完整，拒绝 preflight_failed，保持 S2。
+TEST(MissionStateMachineTest, AssignmentRejectedWithoutEstimationInputs) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/false));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(2)));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kPreflightFailed);
+    EXPECT_EQ(ack->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+// 字段级校验：版本/未知 flags/未授权/target 0/类型不匹配/有效期非法或过期
+// 全部 rejected，且保持 S2（预检拒绝不消耗任务机会）。
+TEST(MissionStateMachineTest, AssignmentInvalidFieldsRejected) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    struct Case {
+        common::MissionAssignment assignment;
+        common::MissionAssignmentReason expected_reason;
+    };
+    std::vector<Case> cases;
+    {
+        auto assignment = MakeAssignment(10);
+        assignment.protocol_version = 2;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kUnsupportedVersion});
+    }
+    {
+        auto assignment = MakeAssignment(11);
+        assignment.flags = 1U | 0x80U;  // 未知位
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(12);
+        assignment.flags = 0;  // 未授权 bit0
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(13);
+        assignment.target_id = 0;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(14);
+        assignment.interceptor_type = 26;  // 火箭类，与本机捕网 25 不匹配
+        cases.push_back({assignment,
+                         common::MissionAssignmentReason::kUnsupportedInterceptorType});
+    }
+    {
+        auto assignment = MakeAssignment(15);
+        assignment.valid_for_ms = 0;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(16);
+        assignment.received_ms = TestMonotonicMs() - 5000;  // 已过期
+        assignment.valid_for_ms = 1000;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+
+    for (const auto& test_case : cases) {
+        ASSERT_TRUE(harness.Send(test_case.assignment));
+        const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_EQ(ack->assignment_id, test_case.assignment.assignment_id);
+        EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+        EXPECT_EQ(ack->reason, test_case.expected_reason);
+        EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    }
+}
+
+// 合法分配 + 地面/未 armed/导航有效 → accepted、65015 availability=assigned、
+// S2→S3；65013 写入 assignment_id/target_id/availability/interceptor_type。
+// Task 4 不发送 176/400：命令接口调用数必须为 0。
+TEST(MissionStateMachineTest, AssignmentAcceptedEntersArming) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    const uint64_t transitions_before = harness.machine.TransitionCount();
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(42)));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->assignment_id, 42U);
+    EXPECT_EQ(ack->target_id, 7U);
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kNone);
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(ack->availability, common::MissionAvailability::kAssigned);
+
+    const auto status = WaitForState(harness.status_subscription,
+                                     common::MissionState::kArming);
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->assignment_id, 42U);
+    EXPECT_EQ(status->target_id, 7U);
+    EXPECT_EQ(status->availability, common::MissionAvailability::kAssigned);
+    EXPECT_EQ(status->interceptor_type, 25U);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+    EXPECT_EQ(harness.machine.TransitionCount(), transitions_before + 1);
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "Task 4 只做 S2 预检与 S3 迁移，不得发送 176/400";
+}
+
+// 重复 assignment_id：只重发原 65015，不再预检/迁移。先用“已 armed”
+// 让首次分配被拒绝（保持 S2），恢复地面状态后重发同一 id 仍必须重发原
+// 拒绝回执且不进入 S3；换新 id 才允许接受。
+// 已 accepted 后、S3 执行期间再次收到同一 assignment_id：必须重发 accepted
+// 回执，不重新预检、不重复迁移；新的 assignment_id 则拒绝。
+TEST(MissionStateMachineTest, AcceptedAssignmentDuplicateWhileArmingResendsAck) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(43)));
+    const auto first = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    const uint64_t transitions_after_accept = harness.machine.TransitionCount();
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(43)));
+    const auto duplicate = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(duplicate.has_value());
+    EXPECT_EQ(duplicate->assignment_id, 43U);
+    EXPECT_EQ(duplicate->result, common::MissionAssignmentResult::kAccepted);
+    EXPECT_EQ(duplicate->availability, common::MissionAvailability::kAssigned);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+    EXPECT_EQ(harness.machine.TransitionCount(), transitions_after_accept);
+
+    // 任务执行中的新分配必须拒绝，不打断当前任务。
+    ASSERT_TRUE(harness.Send(MakeAssignment(44)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->assignment_id, 44U);
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason,
+              common::MissionAssignmentReason::kAlreadyAssigned);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+}
+
+TEST(MissionStateMachineTest, DuplicateAssignmentResendsAckWithoutReentry) {
+    AssignmentHarness harness;
+    auto armed_flight = MakeGroundedFlight();
+    armed_flight.armed = true;  // 地面未上锁前置不满足
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, armed_flight));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(7)));
+    auto first = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(first->reason, common::MissionAssignmentReason::kPreflightFailed);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 重复 id：同一条 65015 重发，不重复预检。
+    ASSERT_TRUE(harness.Send(MakeAssignment(7)));
+    auto second = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(second->reason, common::MissionAssignmentReason::kPreflightFailed);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 恢复地面状态后重发同一 id：WasHandled 命中，仍只重发原回执。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeGroundedFlight()))
+                    .accepted);
+    std::this_thread::sleep_for(300ms);
+    ASSERT_TRUE(harness.Send(MakeAssignment(7)));
+    auto third = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(third.has_value());
+    EXPECT_EQ(third->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(third->reason, common::MissionAssignmentReason::kPreflightFailed);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "重复 assignment_id 不得重新进入 S3";
+
+    // 新 id 才允许接受（预检拒绝不消耗任务机会）。
+    ASSERT_TRUE(harness.Send(MakeAssignment(8)));
+    auto fourth = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(fourth.has_value());
+    EXPECT_EQ(fourth->result, common::MissionAssignmentResult::kAccepted);
+    // 65015 先于状态迁移发布：以状态 Topic 的 S3 为准（避免测试线程抢在
+    // TransitionTo 之前读取 CurrentState 的竞态）。
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+}
+
+// 注入命令接口后，65010 地面站目标不得单独把 S2 推到 S5；必须由 65014
+// 分配进入 S3（生产控制路径语义）。
+TEST(MissionStateMachineTest, GroundTargetDoesNotEnterGpsApproachWithControl) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    const uint64_t transitions_before = harness.machine.TransitionCount();
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(500ms);
+
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "有控制路径时 65010 目标不得单独进入 GPS_APPROACH";
+    EXPECT_EQ(harness.machine.TransitionCount(), transitions_before);
+}
+
+// 影子兼容：绑定分配输入但未注入命令接口时，既有 S2→S5 影子路径原样保留。
+TEST(MissionStateMachineTest, ShadowGroundTargetStillEntersGpsApproach) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/false));
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+}
+
 }  // namespace
