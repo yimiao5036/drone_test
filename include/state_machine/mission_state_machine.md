@@ -89,7 +89,7 @@ PX4/遥控”。
 
 本阶段仍不做以下事情：
 
-- 不发送解锁、起飞或外部 setpoint（`SetCommandSender` 当前消费点：S10 捕网触发/复位、S13 AUTO.LAND、S14 前 DISARM；ARM/起飞仍待后续任务）。
+- 不发送外部 setpoint（控制输出仍由 FlightController 产生）。`SetCommandSender` 当前消费点：S3 的 176/400（Task 5）、S10 捕网触发/复位、S13 AUTO.LAND、S14 前 DISARM；`FlightController::kBootstrap`（原点保持流）由 Task 6 接入，本模块只保证 kTakeoff 意图持续发布。
 - S9/S10 入口判据与自动授权已落地（上段），但**默认 `interception.enabled=false`**；地面站确认授权协议尚未实现（`auto_authorize=false` 时只等超时返航），执行机构就绪仍以命令接口注入 + 未触发且 `Ready()`（无在途触发/复位时序）为代理，未接硬件状态反馈。
 - 不把地面站目标透传为PX4航点。
 - 不实现设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量（依赖
@@ -104,11 +104,60 @@ PX4/遥控”。
 `MissionAssignment`）与`AssignmentAckOutput()`（65015 `MissionAssignmentAck`）。
 状态机只在 **S2 READY** 处理分配：字段与整机预检全部通过才记录
 `MissionAssignmentTracker`、回 `accepted` 并迁移 **S3 ARMING**；任一失败回
-`rejected` + 具体 reason 并保持 S2（预检拒绝不消耗任务机会）。Task 4 只做入口
-与预检，**不发送 176/400、不进入 S4**（S3 解锁/Offboard 与 S4 爬升由 Task 5
-实现）。`MissionAssignmentTracker` 负责一次上电一次空中任务、重复
+`rejected` + 具体 reason 并保持 S2（预检拒绝不消耗任务机会）。
+`MissionAssignmentTracker` 负责一次上电一次空中任务、重复
 `assignment_id` 只重发原 65015、起飞原点记录。`PublishStatus` 的 65013 v2
 字段（`assignment_id/target_id/availability/interceptor_type`）同步填写。
+
+**S3 ARMING / S4 TAKEOFF 自动起飞（Task 5，2026-10-22）**：由
+`EvaluateTakeoffSequence()` 每决策拍推进（放在分配入口之后、交接/目标/拦截
+逻辑之前；S3/S4 期间后者按状态判定均不参与）。
+
+- **S3 进入**：接受分配时 `MissionAssignmentTracker::BeginTakeoff()` 已记录
+  起飞原点 `x0/y0/z0`（局部 NED，D 向上为负）。S3 每拍发布 **`type=kTakeoff`**
+  控制意图（**不用 `kPositionGuide` 代替**）：目标 `x0/y0/z0`，`reason_code =
+  bit31 | 7`（控制权请求 + 地面站任务），`valid_until_ms = now +
+  intent_valid_for`；坐标系局部 NED（frame_id=3）。
+- **176**：S3 驻留满 `takeoff.bootstrap_lead` 后发送**一次**
+  `MAV_CMD_DO_SET_MODE(176)`：`param1=1`（CUSTOM_MODE_ENABLED）、`param2=6`
+  （PX4 main mode Offboard）、`param3=0`；之后任何情况下都不重发。
+- **实际模式**：等待 `flight_mode==6 && flight_sub_mode==0`（ACK 只作过程
+  反馈）；超时 `takeoff.mode_timeout` → 中止。
+- **400**：实际 6/0 后发送**一次** `MAV_CMD_COMPONENT_ARM_DISARM(400)`
+  `param1=1.0`；等待实际 `armed==true`；超时 `takeoff.arm_timeout` → 中止。
+- **ACK**：176/400 的最近 ACK 若 `last_command` 匹配且 `last_result` 非 0
+  （ACCEPTED）且非 5（IN_PROGRESS）→ 立即中止（176 记 mode_timeout，400 记
+  arm_timeout）。ACK 匹配计数基线在 S3 入口记录，上一次任务/命令的陈旧 ACK
+  不误伤本次起飞；实际模式/armed 仍是最终判据。
+- **入队失败**：`SendCommand()` 返回 false 同样中止、不重试（176 失败记
+  bootstrap_timeout，400 失败记 arm_timeout）。
+- **成功**：实际 `armed && Offboard(6/0)` → S4。实际 `armed && !landed` 时
+  每拍调用 `MissionAssignmentTracker::MarkAirborne()`（幂等；消耗一次上电
+  一次空中任务机会，但不推进 tracker 阶段）。
+- **S4**：水平保持 `x0/y0`；z 目标 `z_target = z0 - takeoff.height_m`，
+  每拍按 `climb_rate_mps * dt` 向目标推进（**不阶跃**）；意图继续带 bit31，
+  `yaw_deg` 尽量取当前姿态 yaw。到达判据同时满足并保持 `stable_time`：
+  `|z-z_target| ≤ z_tolerance_m`、水平误差 `≤ xy_tolerance_m`、
+  `|vz| ≤ max_vz_mps`；满足后 `TakeoffComplete()` + `BeginEngage()` → **S5**
+  （availability=engaged）。
+- **S4 空中超时**（`height_timeout`）：PX4 仍在 Offboard → 转 **S13**，由现有
+  `EvaluateLandingAndDisarm` 发 AUTO.LAND(4/6)；PX4 已离开 Offboard → 设置
+  让权标志，转 **S13 仅监控**，不再发 AUTO.LAND、不再争控。
+- **地面超时/条件失败**：停止发布 kTakeoff/位置意图；若 `armed && landed`
+  只发一次 DISARM（400 param1=0）；`AbortOnGround()`；回 S2 READY（状态
+  不明时 availability=unavailable）。
+- **已离地后任何中止**（armed && !landed）：`AbortAirborne()` → **S12**；
+  **不空中 disarm**（返航/降落链接管，最终由 S13/S14 解锁）。
+- **65015 aborted**：`result=kCancelledOrAborted`，reason 为
+  mode_timeout/arm_timeout/bootstrap_timeout/takeoff_timeout/
+  px4_disconnected/mission_fault。回执使用接受分配时保存的
+  `accepted_assignment_`（此时 `latest_assignment_` 早已清空）；同时
+  `RememberResult` 更新为 aborted，重复 `assignment_id` 重发最新结果。
+- **状态不确定**（PX4 断连/离地状态不明/无快照）：置 per-boot 不可调度标志
+  `takeoff_unavailable_latched_`，`availability=unavailable`，新分配回
+  `not_ready`；直到进程重启（`Start()` 复位），**不错误回到 ready**。
+- **不重试**：176/400 各只发一次；中止后不原地循环重发，中止当拍起停止
+  发布起飞意图（空中中止由 S12 返航链按设计接管）。
 
 **影子兼容（关键）**：未注入命令接口（`enable_control=false` 装配）时，
 65014 一律回 `control_disabled`，`availability=unavailable`（影子模式不可被调度）；
@@ -117,7 +166,10 @@ PX4/遥控”。
 此分叉只在 Evaluate 的 S2→S5 分支增加 `command_sender_ == nullptr` 条件，
 不删除任何影子测试路径。
 
-完整自动任务链仍以`docs/状态机设计.md`为准；当前跳过`ARMING/TAKEOFF`只用于无控制输出的地面站目标接入验证，后续接入控制门禁后需要恢复完整状态推进。
+完整自动任务链仍以`docs/状态机设计.md`为准。S3/S4 的算力板侧时序已由本模块
+落地（Task 5）；`FlightController::ControlAuthority::kBootstrap` 的原点保持
+流、PX4 参数/电池门禁与取消/目标丢失收口分别由后续任务接入，状态机不等待
+控制器实现即可在单测中按本文件语义验收。
 
 ## 接口与数据流
 
@@ -233,11 +285,33 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `availability=unavailable`。
   成功：tracker `Accept` → 记 accepted 回执 → `BeginTakeoff(local_x,local_y,
   local_z)` 记录原点 → 回 accepted（`availability=assigned`）→ 迁移 S3
-  （reason「接受任务分配」）。**Task 4 不发送 176/400、不进入 S4**。
-- **availability 映射**：未注入命令接口、任务故障/执行器故障、未连接或已消耗
-  空中任务机会 → `unavailable`；有控制路径时用 tracker 阶段：`kIdle→ready`、
+  （reason「接受任务分配」）。S3 起每拍发布 `kTakeoff` 原点意图，176/400
+  按 S3 时序各发一次（见上「S3 ARMING / S4 TAKEOFF」）。
+- **availability 映射**：未注入命令接口、任务故障/执行器故障、未连接、已消耗
+  空中任务机会或起飞中止后状态不确定（`takeoff_unavailable_latched_`）→
+  `unavailable`；有控制路径时用 tracker 阶段：`kIdle→ready`、
   `kAssigned/kTakingOff→assigned`、`kAirborne/kEngaged→engaged`、
   `kReturning→returning`、`kTerminal→terminal`。65015 与 65013 共用该映射。
+- **S3/S4 自动起飞（Task 5）**（`EvaluateTakeoffSequence` /
+  `EvaluateArmingSequence` / `EvaluateClimbSequence` / `AbortTakeoff`）：
+  - 调用位置：`Evaluate` 中在 `EvaluateAssignmentEntry` 之后、交接/目标/
+    拦截逻辑之前；S3/S4 状态不满足 S5/S6/S7/S9/S10 的分支条件，因此不会
+    进入交接/拦截。
+  - S3 阶段机：`kOriginHold`（原点保持意图，等 bootstrap_lead）→
+    `kWaitOffboard`（176 已发，等实际 6/0）→ `kWaitArmed`（400 已发，等实际
+    armed）。176/400 由阶段迁移保证各一次；`SendCommand` 入队失败立即中止。
+  - 起飞意图每拍直接发布（10Hz，不走内容节流/重发上限）：控制器需要持续的
+    原点保持/爬升流；`type=kTakeoff`、`frame_id=3`、`reason=bit31|7`。
+  - S4 爬升：`takeoff_z_cmd_` 从原点 z 逐拍按 `climb_rate*dt` 推进到
+    `z0-height_m`，到达判据看**实际** z/xy/vz（不是指令值），保持
+    `stable_time` 后 `TakeoffComplete()+BeginEngage()` → S5。
+  - 中止统一入口 `AbortTakeoff()`：已离地 → S12 不 disarm；地面且
+    `armed+landed` → 一次 DISARM(400 param1=0) → S2；不确定 → 置
+    `takeoff_unavailable_latched_` → S2 且 unavailable。S4 空中超时单独走
+    S13（仍 Offboard 发 AUTO.LAND；已让权则仅监控）。
+  - 任务故障（S16 路径）若发生在 S3/S4：`AbortTakeoffForMissionFault()` 先
+    按实际离地状态收口 tracker 并回 65015 aborted(mission_fault)，再进入
+    S16。
 - **控制路径下 65010 不再单独进入 S5**：S2→S5 分支增加
   `command_sender_ == nullptr` 条件；注入命令接口后必须由 65014 分配进入 S3
   （Task 5 再推进 S4/S5）。
@@ -414,13 +488,18 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   诊断接口注入；首次/节流接收地面站目标；**返航开始/爬升完成/降落阶段/
   AUTO.LAND 入队/DISARM 入队/任务结束（S14）**（S11~S14，2026-10-19）；
   **接收任务分配（节流）/分配已接受（含 assignment_id/target_id/起飞原点）/
-  重复分配只重发 65015**（2026-10-22）。
+  重复分配只重发 65015**（2026-10-22）；**S3 自动起飞开始（原点/lead/超时）/
+  176 DO_SET_MODE 已入队 / 400 ARM_DISARM 已入队 / S4 自动爬升开始（高度/
+  爬升率/到达判据）/ 到达任务高度 / 地面中止 DISARM 已入队**（Task 5），
+  均为状态变化级、每次起飞最多一条。
 - WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
   S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）；
   **捕网执行器触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
   捕网命令入队失败（节流，下拍重试）；**单发发射超时/返航超时/Home 或锚点无效/
   PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）；
-  **任务分配被拒绝（节流，带 assignment_id/target_id/reason/当前状态）**。
+  **任务分配被拒绝（节流，带 assignment_id/target_id/reason/当前状态）**；
+  **自动起飞中止（带 reason/detail/airborne/uncertain，每次中止一条）/
+  地面中止 DISARM 入队失败（不重试）**（Task 5）。
 - ERROR：订阅或线程启动异常；运行中重绑输入/注入接口；估计输入部分绑定；
   估计输入已绑定但未注入估计器诊断（交接不评估）。
 - 高频周期（100ms 决策、10Hz 意图重发、S7 逐拍伺服计算）不打印日志；
@@ -562,8 +641,37 @@ ctest --test-dir build --output-on-failure
     目标不单独进入 S5；
   - `ShadowGroundTargetStillEntersGpsApproach`：绑定分配输入但未注入命令
     接口时，既有 S2→S5 影子路径保持。
-- S3/S4 的解锁、Offboard、176/400 与爬升时序（Task 5）尚未实现；Task 4 只
-  验证入口与状态一致性（tracker `BeginTakeoff` + S3）。
+- S3/S4 自动起飞（Task 5，`AssignmentHarness` 可注入缩短的
+  `MissionStateMachineConfig`；分配类用例默认放宽 bootstrap/mode/arm 超时，
+  避免不驱动 PX4 的 Task 4 用例被 S3 超时打断）：
+  - `TakeoffArmingPublishesIntentAndSendsModeOnce`：S3 发布 kTakeoff 意图
+    （原点/bit31/frame=3/有效期）；bootstrap_lead 内零命令，之后恰好一次
+    176（p1=1/p2=6/p3=0），停留不重复；
+  - `TakeoffOffboardThenArmEntersS4AndReachesS5`：6/0 前不发 400；实际 6/0 后
+    恰好一次 400（p1=1）；armed 后进 S4；到达判据满足后进 S5 且
+    availability=engaged；
+  - `TakeoffModeTimeoutAbortsWithoutRetry`：176 超时 → 65015
+    aborted/mode_timeout、回 S2 READY、不重发、无残余意图；重复 assignment_id
+    重发最新 aborted 结果；
+  - `TakeoffArmTimeoutAbortsWithoutRetry`：400 超时 → aborted/arm_timeout、
+    未 armed 不 DISARM、不重发；
+  - `TakeoffGroundArmedAbortSendsDisarmOnce`：地面 armed 时 176 ACK 失败 →
+    aborted/mode_timeout，只发一次 DISARM(param1=0)；
+  - `TakeoffAirborneAbortReturnsHomeWithoutDisarm`：已离地 PX4 断连 →
+    aborted/px4_disconnected、availability=unavailable、转 S12 且不 DISARM；
+  - `TakeoffClimbRampsZTargetAndReachesS5`：S4 z 目标逐拍推进（不阶跃），
+    到达后 S5；
+  - `TakeoffClimbGroundTimeoutDisarmsAndReturnsReady`：S4 地面超时 →
+    aborted/takeoff_timeout、一次 DISARM、回 S2 READY；
+  - `TakeoffClimbAirTimeoutLandsInPlace`：S4 空中超时且仍 Offboard → S13
+    发 AUTO.LAND(4/6)；
+  - `TakeoffClimbAirTimeoutYieldsWhenOffboardLost`：S4 空中超时且 PX4 已离开
+    Offboard → S13 仅监控，不发 AUTO.LAND；
+  - `TakeoffAckFailureAbortsImmediately`：176 ACK IN_PROGRESS(5) 不中止、
+    明确失败(4) 立即中止，不重发；
+  - `TakeoffUncertainStateLatchesUnavailable`：中止时离地状态不明 →
+    65015 aborted availability=unavailable，回 S2 后新分配被拒 not_ready、
+    仍 unavailable，直到重启。
 - SITL 返航专项（2026-10-19，`tools/px4_link_smoke --sitl-stage4-return` +
   `config/px4_sitl_return.json`）：S7→S9→S10 发射→S12 算力板返航 Home→
   S13 AUTO.LAND→S14 DISARMED 全 PASS（状态机迁移 11 次、错误 0；最大高度
@@ -598,8 +706,27 @@ ctest --test-dir build --output-on-failure
   与地面站填写的 `interceptor_type` 不一致（25 捕网/26 火箭）。
 - **65014 回 `invalid_message`**：检查版本=1、flags 只置已知位且 bit0=1、
   target_id=0 非法、`valid_for_ms>0` 且未过期（按本机收到时刻起算）。
-- **重复发送同一 assignment_id 一直回原拒绝**：这是幂等语义（只重发原
-  65015，不再预检）；地面站需换新的 assignment_id 才能重新分配。
+- **重复发送同一 assignment_id 一直回原拒绝/中止**：这是幂等语义（只重发
+  最新 65015，不再预检）；地面站需换新的 assignment_id 才能重新分配。
+- **S3 不发 176**：确认已注入命令接口（`enable_control=true` 装配分支）、
+  已进入 S3；176 在 `takeoff.bootstrap_lead` 之后才发，期间每拍只发
+  kTakeoff 原点意图。若日志有「176 入队失败」→ 命令链路/队列异常，按设计
+  中止（bootstrap_timeout），不重试。
+- **S3 超时回 READY**：看 65015 reason 与「自动起飞中止」WARN：mode_timeout
+  =未等到实际 6/0（查 PX4 Offboard 是否接受、遥控/模式开关、176 ACK），
+  arm_timeout=未等到实际 armed（查 PX4 解锁检查/ACK，PX4 拒绝 arm 表现为
+  超时），bootstrap_timeout=176 入队失败，px4_disconnected=心跳断。
+  **不重试 176/400**，需地面站用新 assignment_id 重新分配。
+- **S4 不爬升/不前进**：确认仍在 Offboard(6/0) 且 kTakeoff 意图的 target_z
+  在逐拍下降（10Hz 每次 `climb_rate*dt`，不是一步到目标）；高度/水平/速度
+  到达判据看实际快照，持续 `stable_time` 才进 S5。S4 空中超时仍 Offboard →
+  S13 发 AUTO.LAND；已离开 Offboard → S13 仅监控（不发 176）。
+- **起飞中止后 availability 一直 unavailable、新分配被拒 not_ready**：中止
+  时 PX4 状态不确定（断连/离地状态不明）置了 per-boot
+  `takeoff_unavailable_latched_`；确认飞机已安全落地/上锁后重启进程（`Start`
+  复位）再调度，不要绕过该标志。
+- **起飞中止后仍看到 S12 位置意图**：已离地中止按设计转 S12 返航（不是
+  残余起飞意图）；S3/S4 自身的 kTakeoff 意图在中止当拍即停发。
 
 - 如果地面站目标ACK已成功但状态机不进入`GPS_APPROACH`，先检查PX4快照是否满足`connected/gps_fix/global_position_valid/home_valid`（PX4 已到位后该组条件可实链成立，不再是"必然不满足"）。
 - 如果状态机没有状态回传，检查主程序是否启用了PX4和地面站链路，以及`GroundStationLink::TargetOutput()`是否已绑定到状态机。

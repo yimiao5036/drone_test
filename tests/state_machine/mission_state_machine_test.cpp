@@ -2125,6 +2125,109 @@ std::optional<common::MissionAssignmentAck> WaitForAssignmentAck(
     return std::nullopt;
 }
 
+/// 任务分配用例默认起飞时序：bootstrap/mode/arm 超时放宽到远大于 Task 4
+/// 用例时长，保证只验证“分配入口与 S2 预检”的用例不会被 S3 超时中止。
+/// S3/S4 用例显式传入 `MakeTakeoffTestConfig()`（缩短时序）。
+state_machine::MissionStateMachineConfig MakeAssignmentHarnessConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.takeoff.bootstrap_lead = 5000ms;
+    config.takeoff.mode_timeout = 5000ms;
+    config.takeoff.arm_timeout = 5000ms;
+    config.takeoff.bootstrap_timeout = 16000ms;
+    return config;
+}
+
+/// S3/S4 用例配置：缩短各超时以便在单测内驱动完整时序。
+/// bootstrap_timeout 必须严格大于 lead+mode+arm（TakeoffConfig::Validate）。
+state_machine::MissionStateMachineConfig MakeTakeoffTestConfig(
+    std::chrono::milliseconds lead = 100ms,
+    std::chrono::milliseconds mode_timeout = 1000ms,
+    std::chrono::milliseconds arm_timeout = 1000ms,
+    std::chrono::milliseconds height_timeout = 3000ms,
+    double height_m = 0.5, double climb_rate_mps = 0.5) {
+    state_machine::MissionStateMachineConfig config;
+    auto& takeoff = config.takeoff;
+    takeoff.bootstrap_lead = lead;
+    takeoff.mode_timeout = mode_timeout;
+    takeoff.arm_timeout = arm_timeout;
+    takeoff.bootstrap_timeout =
+        lead + mode_timeout + arm_timeout + 1000ms;
+    takeoff.height_timeout = height_timeout;
+    takeoff.height_m = height_m;
+    takeoff.climb_rate_mps = climb_rate_mps;
+    takeoff.stable_time = 100ms;
+    takeoff.z_tolerance_m = 0.2;
+    takeoff.xy_tolerance_m = 0.5;
+    takeoff.max_vz_mps = 0.3;
+    return config;
+}
+
+/// 等待指定结果的 65015（跳过队列里更早的回执，如 accepted）。
+std::optional<common::MissionAssignmentAck> WaitForAckWithResult(
+    common::Topic<common::MissionAssignmentAck>::Subscription& subscription,
+    common::MissionAssignmentResult result,
+    std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if ((*message)->result == result) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 等待满足条件的控制意图（跳过队列里更早的意图）。
+template <typename Predicate>
+std::optional<common::ControlIntent> WaitForIntent(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    Predicate predicate, std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if (predicate(**message)) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 清空意图订阅积压（中止后检查“无残留意图”前先丢掉中止前的意图）。
+void DrainIntents(
+    common::Topic<common::ControlIntent>::Subscription& subscription) {
+    while (auto message = subscription.TryTake()) {
+    }
+}
+
+bool PublishFlight(common::Topic<common::FlightStateSnapshot>& topic,
+                   const common::FlightStateSnapshot& flight) {
+    return topic
+        .Publish(std::make_shared<const common::FlightStateSnapshot>(flight))
+        .accepted;
+}
+
+/// Offboard(6/0) 快照：armed/landed 由参数指定（地面待飞或空中）。
+common::FlightStateSnapshot MakeOffboardFlight(bool armed, bool landed) {
+    common::FlightStateSnapshot flight = MakeGroundedFlight();
+    flight.armed = armed;
+    flight.landed = landed;
+    flight.landed_state_valid = true;
+    flight.flight_mode = 6;
+    flight.flight_sub_mode = 0;
+    return flight;
+}
+
+/// 起飞原点为 (1.5,-2.5,0.1)（MakeGroundedFlight），height=0.5 时目标 z=-0.4。
+constexpr float kTakeoffOriginX = 1.5f;
+constexpr float kTakeoffOriginY = -2.5f;
+constexpr float kTakeoffOriginZ = 0.1f;
+
 /// 分配用例夹具：统一装配输入/分配 Topic、命令接口与估计输入，并驱动到 S2。
 struct AssignmentHarness {
     common::Topic<common::GroundStationTarget> ground_topic;
@@ -2138,13 +2241,17 @@ struct AssignmentHarness {
     state_machine::MissionStateMachine machine;
     common::Topic<common::MissionStatus>::Subscription status_subscription;
     common::Topic<common::MissionAssignmentAck>::Subscription ack_subscription;
+    common::Topic<common::ControlIntent>::Subscription intent_subscription;
 
-    AssignmentHarness()
-        : machine(state_machine::MissionStateMachineConfig{}) {
+    AssignmentHarness() : AssignmentHarness(MakeAssignmentHarnessConfig()) {}
+
+    explicit AssignmentHarness(state_machine::MissionStateMachineConfig config)
+        : machine(config) {
         machine.SetInputs(ground_topic, flight_topic, health_topic);
         machine.SetAssignmentInput(assignment_topic);
         status_subscription = machine.StatusOutput().Subscribe(32);
         ack_subscription = machine.AssignmentAckOutput().Subscribe(32);
+        intent_subscription = machine.IntentOutput().Subscribe(64);
     }
 
     /// 装配并启动；with_control=false 模拟影子装配（不注入命令接口）。
@@ -2282,7 +2389,7 @@ TEST(MissionStateMachineTest, AssignmentInvalidFieldsRejected) {
 
 // 合法分配 + 地面/未 armed/导航有效 → accepted、65015 availability=assigned、
 // S2→S3；65013 写入 assignment_id/target_id/availability/interceptor_type。
-// Task 4 不发送 176/400：命令接口调用数必须为 0。
+// S3 入口动作（Task 5）：立即发布 kTakeoff 意图；176 必须等 bootstrap_lead。
 TEST(MissionStateMachineTest, AssignmentAcceptedEntersArming) {
     AssignmentHarness harness;
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
@@ -2308,8 +2415,18 @@ TEST(MissionStateMachineTest, AssignmentAcceptedEntersArming) {
     EXPECT_EQ(status->interceptor_type, 25U);
     EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
     EXPECT_EQ(harness.machine.TransitionCount(), transitions_before + 1);
+    // S3 每拍发布起飞意图（原点、bit31）；默认用例 bootstrap_lead=5s，
+    // 断言窗口内不得提前发 176/400。
+    const auto intent = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kTakeoff;
+        });
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_FLOAT_EQ(intent->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(intent->target_y, kTakeoffOriginY);
+    EXPECT_FLOAT_EQ(intent->target_z, kTakeoffOriginZ);
     EXPECT_EQ(harness.sender.CallCount(), 0U)
-        << "Task 4 只做 S2 预检与 S3 迁移，不得发送 176/400";
+        << "bootstrap_lead 内不得提前发 176/400";
 }
 
 // 重复 assignment_id：只重发原 65015，不再预检/迁移。先用“已 armed”
@@ -2431,6 +2548,560 @@ TEST(MissionStateMachineTest, ShadowGroundTargetStillEntersGpsApproach) {
     EXPECT_TRUE(WaitForState(harness.status_subscription,
                              common::MissionState::kGpsApproach)
                     .has_value());
+}
+
+// ---------------------------------------------------------------------------
+// S3 解锁/Offboard 与 S4 自动爬升（2026-10-22，Task 5）
+// ---------------------------------------------------------------------------
+
+// S3 入口每拍发布 kTakeoff 意图（原点、bit31、局部 NED）；bootstrap_lead
+// 之前不得发 176，满足后恰好发一次 176（p1=1/p2=6/p3=0），停留不重复。
+TEST(MissionStateMachineTest, TakeoffArmingPublishesIntentAndSendsModeOnce) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/500ms, 2000ms, 2000ms, 3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(101)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+
+    const auto intent = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kTakeoff;
+        });
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_FLOAT_EQ(intent->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(intent->target_y, kTakeoffOriginY);
+    EXPECT_FLOAT_EQ(intent->target_z, kTakeoffOriginZ);
+    EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
+    EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl,
+              0U);
+    EXPECT_GT(intent->valid_until_ms, intent->header.receive_time_ms);
+
+    // bootstrap_lead 内不得提前发 176（进入 S3 约 100ms）。
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 1U);
+    EXPECT_EQ(history[0].command, 176U);
+    EXPECT_FLOAT_EQ(history[0].params[0], 1.0f);
+    EXPECT_FLOAT_EQ(history[0].params[1], 6.0f);
+    EXPECT_FLOAT_EQ(history[0].params[2], 0.0f);
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.sender.CallCount(), 1U) << "176 只发一次，不重发";
+}
+
+// 实际 6/0 之前不发 400；实际进入 Offboard 后恰好发一次 400（p1=1）；
+// armed 且 Offboard → S4；到达任务高度后 → S5（availability=engaged）。
+TEST(MissionStateMachineTest, TakeoffOffboardThenArmEntersS4AndReachesS5) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    4000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(102)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // 未到 6/0：不得发 400。
+    std::this_thread::sleep_for(150ms);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    auto history = harness.sender.History();
+    ASSERT_GE(history.size(), 2U);
+    EXPECT_EQ(history[1].command, 400U);
+    EXPECT_FLOAT_EQ(history[1].params[0], 1.0f);
+
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "400 只发一次，不重发";
+
+    // 实际 armed 且 Offboard → S4。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    // 到达任务高度（z0 - height = -0.4，水平保持原点）→ S5。
+    auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    arrived.local_z_m = kTakeoffOriginZ - 0.5f;
+    arrived.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, arrived));
+    const auto approach = WaitForState(harness.status_subscription,
+                                       common::MissionState::kGpsApproach,
+                                       4000ms);
+    ASSERT_TRUE(approach.has_value());
+    EXPECT_EQ(approach->availability, common::MissionAvailability::kEngaged);
+}
+
+// 176 等待 Offboard 超时：65015 aborted mode_timeout、回 S2 READY、
+// 不重发 176、不留残余起飞/位置意图；重复 65014 重发最新 aborted 结果。
+TEST(MissionStateMachineTest, TakeoffModeTimeoutAbortsWithoutRetry) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/300ms,
+                              /*arm=*/2000ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(103)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->assignment_id, 103U);
+    EXPECT_EQ(aborted->target_id, 7U);
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 1U) << "失败不重发 176/400";
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+
+    // 中止后不得残留 takeoff/position 意图。
+    DrainIntents(harness.intent_subscription);
+    std::this_thread::sleep_for(250ms);
+    EXPECT_FALSE(WaitForIntent(harness.intent_subscription,
+                               [](const common::ControlIntent&) { return true; },
+                               50ms)
+                     .has_value())
+        << "中止后不得继续发布控制意图";
+
+    // 重复 assignment_id：重发最新结果（aborted，原因不变）。
+    ASSERT_TRUE(harness.Send(MakeAssignment(103)));
+    const auto duplicate = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(duplicate.has_value());
+    EXPECT_EQ(duplicate->assignment_id, 103U);
+    EXPECT_EQ(duplicate->reason, common::MissionAssignmentReason::kModeTimeout);
+}
+
+// 400 等待实际 armed 超时：65015 aborted arm_timeout、回 READY；未 armed
+// 不在地面发 DISARM；不重发 400。
+TEST(MissionStateMachineTest, TakeoffArmTimeoutAbortsWithoutRetry) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/2000ms,
+                              /*arm=*/300ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(104)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kArmTimeout);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 2U);
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "失败不重发 400";
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f)
+                << "未 armed 时地面中止不得发 DISARM";
+        }
+    }
+}
+
+// 地面中止时若 PX4 仍 armed+landed：只发一次 DISARM（param1=0），不重试。
+TEST(MissionStateMachineTest, TakeoffGroundArmedAbortSendsDisarmOnce) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(105)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // 地面 armed（未进入 Offboard），176 明确失败 → 中止。
+    auto armed_ground = MakeGroundedFlight();
+    armed_ground.armed = true;  // landed=true，模式保持 0/0
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, armed_ground));
+    harness.sender.SimulateAck(176U, 4U, TestMonotonicMs());  // MAV_RESULT_FAILED
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 2U);
+    EXPECT_EQ(history[1].command, 400U);
+    EXPECT_FLOAT_EQ(history[1].params[0], 0.0f) << "地面中止发 DISARM";
+
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "DISARM 只发一次";
+}
+
+// 已离地中止（PX4 断连）：不空中 disarm，tracker AbortAirborne → S12；
+// 状态不确定 → availability=unavailable（不错误回到 ready）。
+TEST(MissionStateMachineTest, TakeoffAirborneAbortReturnsHomeWithoutDisarm) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    4000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(106)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    auto disconnected = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    disconnected.connected = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, disconnected));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kPx4Disconnected);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // 已离地：不得发 DISARM（历史里只有 176 与 ARM 400）。
+    std::this_thread::sleep_for(400ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+    }
+}
+
+// S4 按 climb_rate 逐拍推进 z 目标（不阶跃）；到达判据满足并稳定后 S5。
+TEST(MissionStateMachineTest, TakeoffClimbRampsZTargetAndReachesS5) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms, /*height=*/0.5,
+                                                    /*climb=*/0.5));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(107)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    const float goal_z = kTakeoffOriginZ - 0.5f;
+    bool saw_intermediate = false;
+    float last_z = kTakeoffOriginZ;
+    const auto deadline =
+        std::chrono::steady_clock::now() + 700ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = harness.intent_subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& value = **message;
+        if (value.type != common::ControlIntentType::kTakeoff) {
+            continue;
+        }
+        EXPECT_LE(value.target_z, last_z + 1e-4f)
+            << "爬升目标不得反向/阶跃上升";
+        if (value.target_z < kTakeoffOriginZ - 1e-3f &&
+            value.target_z > goal_z + 1e-3f) {
+            saw_intermediate = true;
+        }
+        last_z = value.target_z;
+    }
+    EXPECT_TRUE(saw_intermediate) << "z 目标必须逐拍推进而非一步到目标";
+
+    auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    arrived.local_x_m = kTakeoffOriginX;
+    arrived.local_y_m = kTakeoffOriginY;
+    arrived.local_z_m = goal_z;
+    arrived.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, arrived));
+    const auto approach = WaitForState(harness.status_subscription,
+                                       common::MissionState::kGpsApproach,
+                                       4000ms);
+    ASSERT_TRUE(approach.has_value());
+    EXPECT_EQ(approach->availability, common::MissionAvailability::kEngaged);
+}
+
+// S4 地面超时：停流；armed+landed 只发一次 DISARM；回 S2 READY。
+TEST(MissionStateMachineTest, TakeoffClimbGroundTimeoutDisarmsAndReturnsReady) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/400ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(108)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    // 地面 armed + Offboard → 进入 S4；高度目标不可达 → 地面超时。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTakeoffTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 3));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 3U);
+    EXPECT_EQ(history[2].command, 400U);
+    EXPECT_FLOAT_EQ(history[2].params[0], 0.0f);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 3U) << "DISARM 只发一次";
+}
+
+// S4 空中超时且 PX4 仍在 Offboard：S13 由现有降落链发 AUTO.LAND(4/6)。
+TEST(MissionStateMachineTest, TakeoffClimbAirTimeoutLandsInPlace) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/400ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(109)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    // 空中 armed + Offboard → S4；高度目标不可达 → 空中超时。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 3000ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 3));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 3U);
+    EXPECT_EQ(history[2].command, 176U);
+    EXPECT_FLOAT_EQ(history[2].params[1], 4.0f);  // AUTO
+    EXPECT_FLOAT_EQ(history[2].params[2], 6.0f);  // AUTO.LAND
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTakeoffTimeout);
+}
+
+// S4 爬升中 PX4 离开 Offboard（非等到 height_timeout）：当拍停发让权，
+// 转 S13 仅监控，不发 AUTO.LAND，65015 aborted(mode_timeout)。
+TEST(MissionStateMachineTest, TakeoffClimbOffboardLossYieldsImmediately) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/3000ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(111)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    // PX4 人工/failsafe 接管：离开 Offboard，但仍在空中。
+    auto takeover = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    takeover.flight_mode = 4;
+    takeover.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, takeover));
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 1500ms)
+                    .has_value());
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kModeTimeout);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U)
+        << "离开 Offboard 后不得争控发 AUTO.LAND";
+}
+
+// S4 空中超时且 PX4 已离开 Offboard：停发让权，转 S13 仅监控，不发 AUTO.LAND。
+TEST(MissionStateMachineTest, TakeoffClimbAirTimeoutYieldsWhenOffboardLost) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/400ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(110)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    // PX4 已被接管（4/5），S4 超时后只监控。
+    auto takeover = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    takeover.flight_mode = 4;
+    takeover.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, takeover));
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 3000ms)
+                    .has_value());
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U)
+        << "PX4 已离开 Offboard 时不得争控发 AUTO.LAND";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kLanding);
+}
+
+// 中止时离地状态不明（landed_state_valid=false）：即使回到 S2 也锁存
+// unavailable，新分配回 not_ready，不错误回到 ready。
+TEST(MissionStateMachineTest, TakeoffUncertainStateLatchesUnavailable) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/300ms,
+                              /*arm=*/2000ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(112)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // 离地状态不明（未 armed、landed_state_valid=false）→ 模式超时中止后
+    // 不可判定是否仍在地面，置 per-boot 不可调度标志。
+    auto uncertain = MakeGroundedFlight();
+    uncertain.landed_state_valid = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, uncertain));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 1U) << "状态不明不得发 DISARM";
+
+    // 新分配被拒 not_ready（不是 ready），availability 仍 unavailable。
+    ASSERT_TRUE(harness.Send(MakeAssignment(113)));
+    const auto rejected = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kRejected);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->reason, common::MissionAssignmentReason::kNotReady);
+    EXPECT_EQ(rejected->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+}
+
+// 176 ACK IN_PROGRESS(5) 不中止；明确失败(4) 立即中止（不等 mode_timeout）。
+TEST(MissionStateMachineTest, TakeoffAckFailureAbortsImmediately) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 3000ms, 3000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(111)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    const auto accepted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(accepted.has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // IN_PROGRESS 只作过程反馈，不中止。
+    harness.sender.SimulateAck(176U, 5U, TestMonotonicMs());
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+    EXPECT_FALSE(WaitForAckWithResult(harness.ack_subscription,
+                                      common::MissionAssignmentResult::
+                                          kCancelledOrAborted,
+                                      100ms)
+                     .has_value());
+
+    // 明确失败立即中止（mode_timeout 原因、无重发）。
+    harness.sender.SimulateAck(176U, 4U, TestMonotonicMs());
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
 }
 
 }  // namespace

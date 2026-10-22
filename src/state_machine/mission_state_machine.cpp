@@ -420,9 +420,19 @@ public:
         // 重启后重新允许分配（分配历史与原点不得沿用上一轮）。
         assignment_tracker_ = MissionAssignmentTracker{};
         latest_assignment_.reset();
+        accepted_assignment_.reset();
         assignment_receive_count_ = 0;
         assignment_reject_count_ = 0;
         assignment_duplicate_count_ = 0;
+        // 自动起飞时序复位（Task 5）：per-boot 语义，重启后重新允许调度。
+        takeoff_stage_ = TakeoffStage::kNone;
+        takeoff_stage_ms_ = 0;
+        takeoff_last_tick_ms_ = 0;
+        takeoff_stable_since_ms_ = 0;
+        takeoff_z_cmd_ = 0.f;
+        takeoff_disarm_sent_ = false;
+        takeoff_ack_baseline_matched_ = 0;
+        takeoff_unavailable_latched_ = false;
         // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
         return_climb_phase_ = true;
@@ -667,8 +677,14 @@ private:
         }
 
         // S2 READY → S3 分配入口（2026-10-22）：只在 kReady 处理 65014。
-        // 迁移当拍即生效，后续交接/意图评估按新状态（ARMING）执行（Task 5 接入）。
+        // 迁移当拍即生效，后续交接/意图评估按新状态（ARMING）执行。
         EvaluateAssignmentEntry(now_ms);
+
+        // S3 解锁/Offboard 与 S4 自动爬升（Task 5，2026-10-22）：放在分配入口
+        // 之后、交接/目标/拦截逻辑之前。S3/S4 期间上述逻辑按状态判定均不参与
+        // （交接只认 S5/S6/S7，拦截只认 S7/S9/S10）；中止当拍即停止发布起飞
+        // 意图，不留下持续控制流。
+        EvaluateTakeoffSequence(now_ms);
 
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
         // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
@@ -752,6 +768,11 @@ private:
         }
         if (!estimation_inputs_active_) {
             return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        // 起飞中止后 PX4 状态不确定（断连/离地状态不明等）：置一次性
+        // 不可调度标志，新分配回 not_ready，不允许错误地回到 ready。
+        if (takeoff_unavailable_latched_) {
+            return common::MissionAssignmentReason::kNotReady;
         }
         // PX4 连接与地面/未 armed/导航前置条件（设计 §7.2）。
         if (!latest_flight_.has_value() || !latest_flight_->connected) {
@@ -842,8 +863,10 @@ private:
                     assignment.assignment_id,
                     common::MissionAssignmentResult::kAccepted,
                     common::MissionAssignmentReason::kNone);
-                // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致；
-                // 本任务不发送 176/400、不进入 S4（Task 5 完成）。
+                // 保存已接受的分配（id/target）：S3/S4 中止时 latest_assignment_
+                // 早已清空，65015 aborted 必须用这份副本。
+                accepted_assignment_ = assignment;
+                // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致。
                 const auto& flight = *latest_flight_;
                 assignment_tracker_.BeginTakeoff(
                     flight.local_x_m, flight.local_y_m, flight.local_z_m, now_ms);
@@ -887,12 +910,480 @@ private:
         TransitionTo(common::MissionState::kArming, "接受任务分配");
     }
 
+    // ---- S3 解锁/Offboard 与 S4 自动爬升（Task 5，2026-10-22） ----
+
+    /// 单调时钟差值（无符号回绕保护：刚迁移时 now 可能早于基准）。
+    static uint64_t ElapsedMs(uint64_t now_ms, uint64_t since_ms) {
+        return now_ms >= since_ms ? now_ms - since_ms : 0;
+    }
+
+    /// 是否处于 PX4 Offboard（6/0，实际心跳模式）。
+    static bool IsPx4Offboard(const common::FlightStateSnapshot& flight) {
+        return flight.flight_mode == kPx4FlightMainModeOffboard &&
+               flight.flight_sub_mode == kPx4FlightSubModeOffboard;
+    }
+
+    /// S3/S4 起飞时序入口：每决策拍调用一次（10Hz）。
+    ///
+    /// 节拍顺序：连接/快照检查 → 实际离地记录（MarkAirborne，幂等）→
+    /// S3 模式/解锁时序或 S4 爬升推进 → 仍在起飞段则发布 kTakeoff 意图。
+    /// 中止/迁移发生在意图发布之前：故障当拍不再发布任何起飞意图。
+    void EvaluateTakeoffSequence(uint64_t now_ms) {
+        const auto state = CurrentState();
+        if (state != common::MissionState::kArming &&
+            state != common::MissionState::kTakeoff) {
+            return;
+        }
+        if (command_sender_ == nullptr) {
+            // 分配预检已要求命令接口，但强制状态/装配异常仍需兜底：不得
+            // 在无命令通道时继续起飞，也不得空指针解引用。
+            AbortTakeoff(common::MissionAssignmentReason::kControlDisabled,
+                         "S3/S4 缺少 PX4 命令接口");
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            AbortTakeoff(common::MissionAssignmentReason::kPx4Disconnected,
+                         "S3/S4 缺少飞行状态快照");
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.connected) {
+            AbortTakeoff(common::MissionAssignmentReason::kPx4Disconnected,
+                         "S3/S4 期间 PX4 断连");
+            return;
+        }
+        // 实际离地即消耗本次上电唯一的空中任务机会（PX4 判定，不依赖
+        // 已进入 S5）。S3/S4 每拍调用，tracker 内部幂等。
+        if (flight.armed && !flight.landed) {
+            assignment_tracker_.MarkAirborne(now_ms);
+        }
+
+        if (state == common::MissionState::kArming) {
+            EvaluateArmingSequence(flight, now_ms);
+        } else {
+            EvaluateClimbSequence(flight, now_ms);
+        }
+
+        // 迁移（S3→S4、S4→S5）或中止后按当拍新状态决定是否继续发意图：
+        // - 仍在 S3：原点保持（z=z0）；
+        // - 已进入 S4：起飞意图目标 z 为逐拍推进的爬升值；
+        // - 已中止（S2/S12/S13）：停发，不留下持续控制流。
+        const auto after = CurrentState();
+        if (after == common::MissionState::kArming) {
+            PublishTakeoffIntent(assignment_tracker_.OriginZ(), now_ms);
+        } else if (after == common::MissionState::kTakeoff) {
+            PublishTakeoffIntent(takeoff_z_cmd_, now_ms);
+        }
+    }
+
+    /// S3：每拍原点保持意图已由入口发布；等待 bootstrap_lead 后只发一次
+    /// DO_SET_MODE(176)，等待实际 6/0 后只发一次 ARM_DISARM(400)，再等待
+    /// 实际 armed。超时/ACK 非 ACCEPTED/入队失败一律中止，不重试。
+    void EvaluateArmingSequence(const common::FlightStateSnapshot& flight,
+                                uint64_t now_ms) {
+        switch (takeoff_stage_) {
+            case TakeoffStage::kOriginHold: {
+                // 先让 FlightController 的 kBootstrap 有若干拍合法原点保持流
+                // （Task 6 线程侧实现；本任务只保证意图持续发布）。
+                const uint64_t held_ms = ElapsedMs(now_ms, state_entered_ms_);
+                if (held_ms <
+                    static_cast<uint64_t>(takeoff_.bootstrap_lead.count())) {
+                    return;
+                }
+                const bool queued = command_sender_->SendCommand(
+                    kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled,
+                    kPx4MainModeOffboard, kPx4SubModeOffboard, 0.f, 0.f, 0.f,
+                    0.f);
+                if (!queued) {
+                    // 命令入队失败同样中止，不重试（不原地循环重发）。
+                    AbortTakeoff(common::MissionAssignmentReason::kBootstrapTimeout,
+                                 "176 DO_SET_MODE 入队失败");
+                    return;
+                }
+                takeoff_stage_ = TakeoffStage::kWaitOffboard;
+                takeoff_stage_ms_ = now_ms;
+                SPDLOG_INFO("S3 起飞模式命令已入队: DO_SET_MODE(176) p1={} p2={} "
+                            "p3={}（本次起飞仅一次）",
+                            static_cast<double>(kMavModeFlagCustomModeEnabled),
+                            static_cast<double>(kPx4MainModeOffboard),
+                            static_cast<double>(kPx4SubModeOffboard));
+                return;
+            }
+            case TakeoffStage::kWaitOffboard: {
+                if (TakeoffAckRejected(kMavCmdDoSetMode)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "176 ACK 非 ACCEPTED");
+                    return;
+                }
+                if (IsPx4Offboard(flight)) {
+                    // 实际 6/0 才发解锁命令（ACK 只是过程反馈）。
+                    const bool queued = command_sender_->SendCommand(
+                        kMavCmdComponentArmDisarm, 1.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+                        0.f);
+                    if (!queued) {
+                        AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
+                                     "400 ARM_DISARM 入队失败");
+                        return;
+                    }
+                    takeoff_stage_ = TakeoffStage::kWaitArmed;
+                    takeoff_stage_ms_ = now_ms;
+                    SPDLOG_INFO("S3 已进入 Offboard(6/0)，解锁命令已入队: "
+                                "ARM_DISARM(400) p1=1（本次起飞仅一次）");
+                    return;
+                }
+                if (ElapsedMs(now_ms, takeoff_stage_ms_) >=
+                    static_cast<uint64_t>(takeoff_.mode_timeout.count())) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "等待实际 Offboard(6/0) 超时");
+                }
+                return;
+            }
+            case TakeoffStage::kWaitArmed: {
+                // ACK 非 ACCEPTED（0）且非 IN_PROGRESS（5）立即中止；
+                // 实际 armed 是最终判据。
+                if (TakeoffAckRejected(kMavCmdComponentArmDisarm)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
+                                 "400 ACK 非 ACCEPTED");
+                    return;
+                }
+                if (TakeoffAckRejected(kMavCmdDoSetMode)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "176 ACK 非 ACCEPTED（等待解锁期间）");
+                    return;
+                }
+                if (flight.armed && IsPx4Offboard(flight)) {
+                    // armed + Offboard 是 S3 的最终成功判据；S4 由
+                    // TransitionTo 初始化爬升时序。
+                    TransitionTo(common::MissionState::kTakeoff,
+                                 "PX4 已解锁且处于 Offboard");
+                    return;
+                }
+                if (!IsPx4Offboard(flight)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "等待解锁期间 PX4 离开 Offboard");
+                    return;
+                }
+                if (ElapsedMs(now_ms, takeoff_stage_ms_) >=
+                    static_cast<uint64_t>(takeoff_.arm_timeout.count())) {
+                    AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
+                                 "等待实际 armed 超时");
+                }
+                return;
+            }
+            case TakeoffStage::kClimb:
+            case TakeoffStage::kNone:
+                return;
+        }
+    }
+
+    /// S4：水平保持原点，z 目标按 climb_rate 逐拍推进到 z0-height（NED 向上
+    /// 为负），到达判据（z/xy/vz）持续 stable_time 后进 S5。
+    void EvaluateClimbSequence(const common::FlightStateSnapshot& flight,
+                               uint64_t now_ms) {
+        // S4 只在 PX4 仍 armed + Offboard 时继续爬升。离开 Offboard（人工/
+        // failsafe/RTL）或空中失锁必须当拍停止输出：空中转 S13 仅监控；
+        // 地面走统一地面中止。
+        if (!flight.armed || !IsPx4Offboard(flight)) {
+            if (!flight.landed) {
+                assignment_tracker_.AbortAirborne();
+                RememberTakeoffAbort(
+                    common::MissionAssignmentReason::kModeTimeout);
+                if (!flight.armed) {
+                    takeoff_unavailable_latched_ = true;
+                }
+                return_px4_takeover_ = true;
+                SPDLOG_WARN("S4 中 PX4 离开 Offboard 或失锁: mode={}/{} armed={} "
+                            "landed={}，停止爬升并让权（S13 仅监控）",
+                            flight.flight_mode, flight.flight_sub_mode,
+                            flight.armed, flight.landed);
+                TransitionTo(common::MissionState::kLanding,
+                             "S4 PX4 接管/离开 Offboard");
+                PublishTakeoffAbortAck(
+                    common::MissionAssignmentReason::kModeTimeout);
+            } else {
+                AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                             "S4 仍在地面但未 armed/Offboard");
+            }
+            return;
+        }
+        const double goal_z =
+            static_cast<double>(assignment_tracker_.OriginZ()) - takeoff_.height_m;
+        // 逐拍推进，不阶跃；首拍 dt=0。时间回绕/重启双保险钳到 0。
+        const uint64_t dt_ms =
+            now_ms >= takeoff_last_tick_ms_ ? now_ms - takeoff_last_tick_ms_ : 0;
+        takeoff_last_tick_ms_ = now_ms;
+        if (dt_ms > 0) {
+            const double step = takeoff_.climb_rate_mps *
+                                static_cast<double>(dt_ms) / 1000.0;
+            const double candidate = static_cast<double>(takeoff_z_cmd_) - step;
+            takeoff_z_cmd_ =
+                static_cast<float>(candidate <= goal_z ? goal_z : candidate);
+        }
+
+        // 空中超时：PX4 仍在 Offboard → S13 发 AUTO.LAND（现有
+        // EvaluateLandingAndDisarm）；已离开 Offboard → 停发让权，S13 仅监控。
+        // 地面超时：停流 + 必要时一次 DISARM + 回 S2（状态不明则 unavailable）。
+        if (ElapsedMs(now_ms, state_entered_ms_) >=
+            static_cast<uint64_t>(takeoff_.height_timeout.count())) {
+            HandleTakeoffHeightTimeout(flight);
+            return;
+        }
+
+        if (!flight.local_position_valid) {
+            takeoff_stable_since_ms_ = 0;
+            return;
+        }
+        const double z_error =
+            std::fabs(static_cast<double>(flight.local_z_m) - goal_z);
+        const double xy_error = std::hypot(
+            static_cast<double>(flight.local_x_m) -
+                static_cast<double>(assignment_tracker_.OriginX()),
+            static_cast<double>(flight.local_y_m) -
+                static_cast<double>(assignment_tracker_.OriginY()));
+        const double vertical_speed =
+            std::fabs(static_cast<double>(flight.vz_mps));
+        const bool inside = z_error <= takeoff_.z_tolerance_m &&
+                            xy_error <= takeoff_.xy_tolerance_m &&
+                            vertical_speed <= takeoff_.max_vz_mps;
+        if (!inside) {
+            takeoff_stable_since_ms_ = 0;
+            return;
+        }
+        if (takeoff_stable_since_ms_ == 0) {
+            takeoff_stable_since_ms_ = now_ms;
+        }
+        if (ElapsedMs(now_ms, takeoff_stable_since_ms_) <
+            static_cast<uint64_t>(takeoff_.stable_time.count())) {
+            return;
+        }
+        assignment_tracker_.TakeoffComplete();
+        assignment_tracker_.BeginEngage();
+        SPDLOG_INFO("起飞到达任务高度: z={:.2f}（原点 z0={:.2f}，高度 {:.2f}m），"
+                    "进入 GPS_APPROACH",
+                    static_cast<double>(flight.local_z_m),
+                    static_cast<double>(assignment_tracker_.OriginZ()),
+                    takeoff_.height_m);
+        TransitionTo(common::MissionState::kGpsApproach, "起飞到达任务高度");
+    }
+
+    /// S3/S4 期间任务故障（S16）的起飞收口：按实际是否离地推进 tracker，
+    /// 记 aborted(mission_fault) 并回执；状态迁移由 HandleMissionFault 统一
+    /// 进入 S16（故障终态，不可调度）。
+    void AbortTakeoffForMissionFault(const char* detail) {
+        const auto state = CurrentState();
+        if (state != common::MissionState::kArming &&
+            state != common::MissionState::kTakeoff) {
+            return;
+        }
+        if (!accepted_assignment_.has_value()) {
+            return;
+        }
+        const bool airborne = latest_flight_.has_value() &&
+                              latest_flight_->armed && !latest_flight_->landed;
+        if (airborne) {
+            assignment_tracker_.AbortAirborne();
+        } else {
+            assignment_tracker_.AbortOnGround();
+        }
+        takeoff_unavailable_latched_ = true;
+        RememberTakeoffAbort(common::MissionAssignmentReason::kMissionFault);
+        SPDLOG_WARN("起飞段任务故障，65015 aborted(mission_fault): {}", detail);
+        PublishTakeoffAbortAck(common::MissionAssignmentReason::kMissionFault);
+    }
+
+    /// S4 高度超时处置（空中：S13 / 地面：S2）。
+    void HandleTakeoffHeightTimeout(
+        const common::FlightStateSnapshot& flight) {
+        if (!(flight.armed && !flight.landed)) {
+            // 尚未实际离地：按地面中止收口（停流/必要时 DISARM/回 S2）。
+            AbortTakeoff(common::MissionAssignmentReason::kTakeoffTimeout,
+                         "S4 等待到达任务高度超时（仍在地面）");
+            return;
+        }
+        const bool offboard = IsPx4Offboard(flight);
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(common::MissionAssignmentReason::kTakeoffTimeout);
+        // S13 入口按 return_px4_takeover_ 决定发 AUTO.LAND 还是仅监控：
+        // PX4 已离开 Offboard 时停发让权，不再争控。
+        return_px4_takeover_ = !offboard;
+        SPDLOG_WARN("起飞爬升超时（height_timeout={}ms）：{}",
+                    takeoff_.height_timeout.count(),
+                    offboard ? "PX4 仍在 Offboard，进入 S13 发 AUTO.LAND"
+                             : "PX4 已离开 Offboard，停发让权并仅监控（S13）");
+        TransitionTo(common::MissionState::kLanding,
+                     offboard ? "起飞爬升超时，AUTO.LAND"
+                              : "起飞爬升超时，PX4 已接管");
+        PublishTakeoffAbortAck(common::MissionAssignmentReason::kTakeoffTimeout);
+    }
+
+    /// 176/400 的 ACK 是否明确失败。只认 S3 入口之后新到的 ACK
+    /// （matched_count 基线），避免上一次任务/命令的陈旧 ACK 误伤本次起飞。
+    /// MAV_RESULT：0=ACCEPTED，5=IN_PROGRESS，其余（含 4=FAILED）视为失败。
+    bool TakeoffAckRejected(uint16_t command) const {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        const auto ack = command_sender_->AckStatus();
+        if (ack.matched_count <= takeoff_ack_baseline_matched_) {
+            return false;
+        }
+        return ack.last_command == command && ack.last_result != 0 &&
+               ack.last_result != 5;
+    }
+
+    /// S3/S4 中止统一处置：
+    /// - 已实际离地（armed && !landed）：tracker AbortAirborne → S12，
+    ///   **不空中 disarm**；
+    /// - 地面：停发意图；若 armed+landed 只发一次 DISARM；tracker
+    ///   AbortOnGround → S2 READY；
+    /// - 状态不确定（无快照/断连/离地状态不明）：置 per-boot 不可调度标志，
+    ///   65013/65015 availability=unavailable，不错误回到 ready。
+    /// 65015 aborted 使用已保存的 accepted_assignment_（latest_assignment_
+    /// 在处理 65014 时已清空）。
+    void AbortTakeoff(common::MissionAssignmentReason reason,
+                      const char* detail) {
+        const bool have_flight = latest_flight_.has_value();
+        const bool armed = have_flight && latest_flight_->armed;
+        const bool landed = have_flight && latest_flight_->landed;
+        const bool landed_known = have_flight && latest_flight_->landed_state_valid;
+        const bool connected = have_flight && latest_flight_->connected;
+        const bool airborne = have_flight && armed && !landed;
+        const bool uncertain = !have_flight || !connected || !landed_known;
+
+        SPDLOG_WARN("自动起飞中止: reason={} detail={} airborne={} uncertain={}",
+                    static_cast<int>(reason), detail, airborne, uncertain);
+        if (uncertain) {
+            takeoff_unavailable_latched_ = true;
+        }
+        if (airborne) {
+            assignment_tracker_.AbortAirborne();
+            RememberTakeoffAbort(reason);
+            // 空中中止交返航链（S12），不在此处 disarm；回执按新状态发布。
+            TransitionTo(common::MissionState::kReturnHome,
+                         "起飞中止（已离地），进入返航");
+            PublishTakeoffAbortAck(reason);
+            return;
+        }
+        if (landed_known && landed && armed) {
+            SendTakeoffDisarmOnce();
+        }
+        assignment_tracker_.AbortOnGround();
+        RememberTakeoffAbort(reason);
+        TransitionTo(common::MissionState::kReady, "起飞中止（地面），回到 READY");
+        PublishTakeoffAbortAck(reason);
+    }
+
+    /// 地面中止的 DISARM：只尝试一次，不重试（本次飞行解锁流程已失败）。
+    void SendTakeoffDisarmOnce() {
+        if (takeoff_disarm_sent_ || command_sender_ == nullptr) {
+            return;
+        }
+        takeoff_disarm_sent_ = true;
+        const bool queued = command_sender_->SendCommand(
+            kMavCmdComponentArmDisarm, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            SPDLOG_INFO("地面中止 DISARM 命令已入队（仅一次）");
+        } else {
+            SPDLOG_WARN("地面中止 DISARM 入队失败（不重试，交 PX4/人工处置）");
+        }
+    }
+
+    /// 记录本次分配最终结果为 aborted（重复 65014 重发最新结果）。
+    void RememberTakeoffAbort(common::MissionAssignmentReason reason) {
+        if (!accepted_assignment_.has_value()) {
+            return;
+        }
+        assignment_tracker_.RememberResult(
+            accepted_assignment_->assignment_id,
+            common::MissionAssignmentResult::kCancelledOrAborted, reason);
+    }
+
+    /// 发布 65015 aborted（已接受分配的 id/target + 具体 reason）。
+    void PublishTakeoffAbortAck(common::MissionAssignmentReason reason) {
+        if (!accepted_assignment_.has_value()) {
+            return;
+        }
+        PublishAssignmentAck(*accepted_assignment_,
+                             common::MissionAssignmentResult::kCancelledOrAborted,
+                             reason);
+    }
+
+    /// 发布 S3/S4 起飞意图（type=kTakeoff，**不用 kPositionGuide 代替**）：
+    /// 目标 x/y=tracker 起飞原点，z 为 S3 原点值或 S4 逐拍爬升值；reason_code
+    /// 带 bit31 控制权请求位；航向尽量保持当前姿态 yaw。每决策拍发布，
+    /// 不走内容节流——控制器需要持续的原点保持/爬升流。
+    void PublishTakeoffIntent(float z_target, uint64_t now_ms) {
+        common::ControlIntent intent;
+        intent.header.sequence = ++intent_sequence_;
+        intent.header.source_time_ms = now_ms;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = intent_valid_for_ms_;
+        intent.header.source_id = 1;
+        intent.header.health = 1;
+        intent.header.frame_id = kFrameLocalNed;
+        intent.type = common::ControlIntentType::kTakeoff;
+        intent.control_source = 0;  // 位置链（自动起飞）
+        intent.target_x = assignment_tracker_.OriginX();
+        intent.target_y = assignment_tracker_.OriginY();
+        intent.target_z = z_target;
+        if (latest_flight_.has_value() && latest_flight_->attitude_valid) {
+            intent.yaw_deg = static_cast<float>(
+                static_cast<double>(latest_flight_->yaw_rad) * kRadToDeg);
+        }
+        // bit31 显式请求控制权（FlightController kBootstrap 必要条件）+
+        // 低位 7（地面站任务下发）。
+        intent.reason_code =
+            common::kControlIntentReasonRequestControl | kReasonGroundStationTask;
+        intent.valid_until_ms = now_ms + intent_valid_for_ms_;
+        (void)intent_output_.Publish(
+            std::make_shared<const common::ControlIntent>(intent));
+        last_intent_publish_ms_ = now_ms;
+    }
+
+    /// S3 入口初始化（TransitionTo 调用）：记录时序基准与 ACK 基线。
+    void BeginArmingSequence(uint64_t now_ms) {
+        takeoff_stage_ = TakeoffStage::kOriginHold;
+        takeoff_stage_ms_ = now_ms;
+        takeoff_last_tick_ms_ = now_ms;
+        takeoff_stable_since_ms_ = 0;
+        takeoff_z_cmd_ = assignment_tracker_.OriginZ();
+        takeoff_disarm_sent_ = false;
+        takeoff_ack_baseline_matched_ =
+            command_sender_ != nullptr ? command_sender_->AckStatus().matched_count
+                                       : 0;
+        SPDLOG_INFO("S3 自动起飞开始: origin=({:.2f},{:.2f},{:.2f}) "
+                    "bootstrap_lead={}ms mode_timeout={}ms arm_timeout={}ms",
+                    static_cast<double>(assignment_tracker_.OriginX()),
+                    static_cast<double>(assignment_tracker_.OriginY()),
+                    static_cast<double>(assignment_tracker_.OriginZ()),
+                    takeoff_.bootstrap_lead.count(),
+                    takeoff_.mode_timeout.count(), takeoff_.arm_timeout.count());
+    }
+
+    /// S4 入口初始化（TransitionTo 调用）：爬升目标从原点开始逐拍推进。
+    void BeginClimbSequence(uint64_t now_ms) {
+        takeoff_stage_ = TakeoffStage::kClimb;
+        takeoff_stage_ms_ = now_ms;
+        takeoff_last_tick_ms_ = now_ms;
+        takeoff_stable_since_ms_ = 0;
+        takeoff_z_cmd_ = assignment_tracker_.OriginZ();
+        SPDLOG_INFO("S4 自动爬升开始: 高度 {:.2f}m 爬升率 {:.2f}m/s "
+                    "到达判据 z±{:.2f}m xy±{:.2f}m vz≤{:.2f}m/s 稳定 {}ms",
+                    takeoff_.height_m, takeoff_.climb_rate_mps,
+                    takeoff_.z_tolerance_m, takeoff_.xy_tolerance_m,
+                    takeoff_.max_vz_mps, takeoff_.stable_time.count());
+    }
+
     /// 计算 65013/65015 的 availability。影子模式（未注入命令接口）固定
     /// unavailable：不可被调度；有控制路径时用 tracker 阶段映射。
     /// 调用方必须已持有 state_mutex_。
     common::MissionAvailability ComputeAvailabilityLocked() const {
         if (command_sender_ == nullptr || mission_faulted_ ||
-            (net_actuator_ != nullptr && net_actuator_->Faulted())) {
+            (net_actuator_ != nullptr && net_actuator_->Faulted()) ||
+            takeoff_unavailable_latched_) {
+            // takeoff_unavailable_latched_：起飞中止后 PX4 状态不确定
+            // （断连/armed/离地状态不明），per-boot 锁存直到重启，避免
+            // 错误回到 ready 被再次调度。
             return common::MissionAvailability::kUnavailable;
         }
         if (assignment_tracker_.Phase() != AssignmentPhase::kIdle) {
@@ -1729,6 +2220,9 @@ private:
             return;
         }
         mission_faulted_ = true;
+        // 起飞段（S3/S4）发生任务故障：先按实际是否离地收口 tracker 并回
+        // 65015 aborted(mission_fault)，再迁移 S16（故障为终态，控制意图停发）。
+        AbortTakeoffForMissionFault(reason);
         SetWarnings(kWarningActuatorFault);
         if (command_sender_ != nullptr) {
             command_sender_->CancelPendingCommands();
@@ -2072,6 +2566,14 @@ private:
             } else if (next_state == common::MissionState::kDisarmed) {
                 mission_end_logged_ = false;
             }
+            // 自动起飞时序入口（Task 5）：S3 记录 bootstrap/mode/arm 基准与
+            // ACK 基线；S4 初始化逐拍爬升目标。中止迁移由统一挂点保证
+            // 下一拍不再发布起飞意图。
+            if (next_state == common::MissionState::kArming) {
+                BeginArmingSequence(now_ms);
+            } else if (next_state == common::MissionState::kTakeoff) {
+                BeginClimbSequence(now_ms);
+            }
         }
         PublishStatus(now_ms);
     }
@@ -2156,6 +2658,9 @@ private:
     std::optional<common::StereoTargetDistance> latest_distance_;
     /// 最新一条 65014（DrainInputs 写入，EvaluateAssignmentEntry 处理后清空）。
     std::optional<common::MissionAssignment> latest_assignment_;
+    /// 已接受的分配副本（Task 5）：S3/S4 中止时 latest_assignment_ 已清空，
+    /// 65015 aborted 必须用这份 id/target。下一次接受时覆盖。
+    std::optional<common::MissionAssignment> accepted_assignment_;
 
     std::atomic<bool> running_{false};
     std::thread worker_;
@@ -2233,6 +2738,24 @@ private:
     /// 任务分配生命周期助手（一次上电一次任务、重复 id 回执、原点记录）。
     /// 只由决策线程访问；状态发布读取时受 state_mutex_ 保护。
     MissionAssignmentTracker assignment_tracker_;
+    /// 自动起飞（S3/S4）时序阶段。只由决策线程推进；仅在 S3/S4 状态内有效。
+    enum class TakeoffStage : uint8_t {
+        kNone,          ///< 未在起飞时序中
+        kOriginHold,    ///< S3：发布原点保持意图，等待 bootstrap_lead 后发 176
+        kWaitOffboard,  ///< S3：已发 176，等待实际 6/0
+        kWaitArmed,     ///< S3：已发 400，等待实际 armed
+        kClimb,         ///< S4：逐拍爬升到任务高度
+    };
+    TakeoffStage takeoff_stage_ = TakeoffStage::kNone;
+    uint64_t takeoff_stage_ms_ = 0;        ///< 当前阶段起点（mode/arm 超时基准）
+    uint64_t takeoff_last_tick_ms_ = 0;    ///< S4 爬升 dt 基准
+    uint64_t takeoff_stable_since_ms_ = 0; ///< S4 到达判据连续成立起点
+    float takeoff_z_cmd_ = 0.f;            ///< S4 逐拍推进的 z 目标（局部 NED）
+    bool takeoff_disarm_sent_ = false;     ///< 地面中止 DISARM 已尝试（仅一次）
+    uint64_t takeoff_ack_baseline_matched_ = 0;  ///< S3 入口 ACK 匹配计数基线
+    /// 起飞中止后 PX4 状态不确定（断连/离地状态不明）：per-boot 锁存，
+    /// availability=unavailable 且新分配回 not_ready，直到 Start() 复位。
+    bool takeoff_unavailable_latched_ = false;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
     /// 任务故障（S16 FAILSAFE）：捕网执行器 ACK 超时/非 ACCEPTED/PX4 断连/
