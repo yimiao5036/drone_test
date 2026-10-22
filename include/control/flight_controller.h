@@ -92,10 +92,16 @@ private:
     common::Topic<common::Px4Setpoint> setpoint_output_;
 };
 
-/// 控制权状态（spec §4；Task 5 已接入授权/降级转移）：
-/// IDLE 无控制权停发；ACTIVE Offboard 控制中；COAST 意图短期超龄刹车保持。
-/// 迁移全部由授权链周期核验驱动，迁移时打 WARN 级状态变化日志。
-enum class ControlAuthority : uint8_t { kIdle, kActive, kCoast };
+/// 控制权状态（spec §4；Task 5 接入授权/降级，Task 6 接入自动起飞预授权）：
+/// - IDLE：无控制权，停发任何设定值；
+/// - BOOTSTRAP：自动起飞预授权态（spec §8），在地面且未 armed 时发布
+///   起飞原点位置保持流，为 PX4 进入 Offboard 建立合法 setpoint 流；
+///   armed + Offboard(6/0) 后转 ACTIVE；条件失效/超时/意图撤销只回 IDLE，
+///   **不进入 COAST**；
+/// - ACTIVE：正常 Offboard 控制；
+/// - COAST：意图短期超龄时的零速刹车保持。
+/// 迁移全部由授权链/门禁周期核验驱动，迁移时打 WARN 级状态变化日志。
+enum class ControlAuthority : uint8_t { kIdle, kBootstrap, kActive, kCoast };
 
 /// 正式飞行控制器（spec §3 执行层）：固定周期消费 ControlIntent，
 /// 门禁链（有限性/超龄/控制权）+ 限幅流水线 + 无扰衔接后发布 Px4Setpoint。
@@ -111,6 +117,13 @@ enum class ControlAuthority : uint8_t { kIdle, kActive, kCoast };
 ///   未注入快照源时授权链恒不通过（影子运行，保持 IDLE 停发）；
 ///   ACTIVE/COAST 中门禁失效立即发布 valid=false 停发并转 IDLE；
 ///   意图超龄转 COAST 刹车保持，coast_timeout 超时转 IDLE 停发；
+/// - 自动起飞预授权（Task 6，spec §8）：IDLE 下最新意图为 kTakeoff + bit31
+///   且未超龄、PX4 connected + landed_state_valid&&landed + !armed +
+///   local_position/attitude/home 有效时进入 kBootstrap，每拍发布起飞原点
+///   位置保持流（kPosition、valid=true、无前馈），armed+Offboard(6/0) 后转
+///   ACTIVE；条件失效/意图撤销/超过 bootstrap_timeout 只回 IDLE 并停流。
+///   **门禁不读取任何 RC 字段**（rc_state_valid/rc_connected/
+///   manual_override_active）——RC 交由 PX4 自己管理；
 /// - Home 相对围栏（Task 5）：位置式意图水平模长超 max_radius_m 等比钳制、
 ///   相对高度超 max_altitude_m 钳制；home_valid=false 时位置式意图拒绝。
 class FlightController final : public IFlightController {

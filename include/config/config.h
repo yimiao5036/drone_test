@@ -77,6 +77,10 @@ struct FlightControllerConfig {
     std::chrono::milliseconds intent_timeout{300};   // 意图超龄阈值
     std::chrono::milliseconds coast_timeout{1000};   // COAST 最长保持
     std::chrono::milliseconds slew_transition{500};  // 无扰衔接斜坡时长
+    /// kBootstrap 预授权原点保持流最长时长（防卡死兜底）。状态机 S3 的
+    /// 模式/解锁超时是权威，本值须覆盖 bootstrap_lead + mode + arm；
+    /// 装配时由 DroneApplication 从 takeoff.bootstrap_timeout 注入。
+    std::chrono::milliseconds bootstrap_timeout{6000};
     void Validate() const;
 };
 

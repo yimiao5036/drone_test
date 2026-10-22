@@ -5,13 +5,17 @@
  * 骨架期仅保证生命周期可运行与装配验证；业务逻辑（控制意图 → PX4
  * 设定值转换、控制算法）在实现期接入。
  *
- * FlightController（阶段四控制接入 Task 3~5）：固定周期线程消费
+ * FlightController（阶段四控制接入 Task 3~6）：固定周期线程消费
  * ControlIntent，门禁链（有限性/超龄/控制权）通过后经限幅流水线
  * （速度幅值钳制 → slew 加速度限幅）与无扰衔接发布 Px4Setpoint。
  * 控制权三态（Task 5）：每拍核验 PX4 快照（connected+armed+Offboard 6/0）
  * 与状态机显式请求位（reason_code bit31）；失效立即停发（valid=false）
  * 转 IDLE；意图超龄转 COAST 刹车保持，coast_timeout 超时转 IDLE 停发；
  * 位置式意图经 Home 相对围栏钳制。
+ * 自动起飞预授权（Task 6，spec §8）：IDLE 下收到未超龄的 kTakeoff 意图
+ * （bit31）且 PX4 地面/未解锁/local/attitude/home 条件满足时进入 kBootstrap，
+ * 每拍发布起飞原点位置保持流；armed+Offboard(6/0) 后转 ACTIVE；条件失效/
+ * 意图撤销/超过 bootstrap_timeout 只回 IDLE 停流，绝不进入 COAST。
  */
 #include "control/flight_controller.h"
 
@@ -49,6 +53,8 @@ const char* AuthorityName(ControlAuthority authority) {
     switch (authority) {
         case ControlAuthority::kIdle:
             return "IDLE";
+        case ControlAuthority::kBootstrap:
+            return "BOOTSTRAP";
         case ControlAuthority::kActive:
             return "ACTIVE";
         case ControlAuthority::kCoast:
@@ -147,6 +153,10 @@ public:
         if (config_.period.count() <= 0) {
             throw std::invalid_argument("controller.period_ms 必须为正");
         }
+        // bootstrap 超时是防卡死兜底：非正值会让原点保持流永不超时。
+        if (config_.bootstrap_timeout.count() <= 0) {
+            throw std::invalid_argument("controller.bootstrap_timeout_ms 必须为正");
+        }
     }
 
     ~Impl() { Stop(); }
@@ -158,9 +168,10 @@ public:
         }
         worker_ = std::thread([this] { Run(); });
         SPDLOG_INFO("飞行控制器启动: period={}ms intent_timeout={}ms coast_timeout={}ms "
-                    "feedforward={} cap={:.2f}m/s",
+                    "bootstrap_timeout={}ms feedforward={} cap={:.2f}m/s",
                     config_.period.count(), config_.intent_timeout.count(),
                     config_.coast_timeout.count(),
+                    config_.bootstrap_timeout.count(),
                     config_.enable_position_velocity_feedforward ? "on" : "off",
                     config_.max_feedforward_mps);
         return true;
@@ -247,10 +258,26 @@ private:
         // 1) 排干意图队列，只留最新（入口门禁在排干时执行，拒绝即计数；
         //    最新通过门禁的意图同步刷新"状态机显式请求"锁存）
         DrainIntents(now_ms);
-        // 2) 控制权门禁：PX4 快照（connected+armed+Offboard 6/0）+
+        // 2) 自动起飞预授权（Task 6，spec §8）：先于常规授权门禁处理。
+        //    kTakeoff 意图由状态机 S3/S4 每拍重发；bootstrap 失败只回 IDLE，
+        //    不得走 COAST（COAST 是已获授权后的意图超龄刹车语义）。
+        ResetBootstrapAttempt(now_ms);
+        const ControlAuthority authority =
+            authority_.load(std::memory_order_acquire);
+        if (authority == ControlAuthority::kBootstrap) {
+            HandleBootstrapTick(now_ms);
+            return;
+        }
+        if (authority == ControlAuthority::kIdle &&
+            BootstrapEntryGateOpen(now_ms)) {
+            EnterBootstrap(now_ms);
+            PublishBootstrapHold(now_ms);  // 进入当拍即建立合法流，不留空档
+            return;                        // 本拍不走 ACTIVE 门禁
+        }
+        // 3) 控制权门禁：PX4 快照（connected+armed+Offboard 6/0）+
         //    状态机显式请求位，每拍核验（非一次性）
         const bool gate = AuthorityGateOpen();
-        switch (authority_.load(std::memory_order_acquire)) {
+        switch (authority) {
             case ControlAuthority::kIdle:
                 // IDLE→ACTIVE 须授权链全通且持有新鲜请求位意图：请求锁存
                 // 不随时间过期，陈旧请求不得事后激活授权（评审 fix round 2）。
@@ -259,6 +286,8 @@ private:
                 }
                 TransitionTo(ControlAuthority::kActive, "授权链全通");
                 break;
+            case ControlAuthority::kBootstrap:
+                return;  // 已在上方分流处理（防御，不可达）
             case ControlAuthority::kActive:
                 if (!gate) {
                     // 控制权失效（心跳断/非 Offboard/未 armed/请求撤销）：
@@ -318,6 +347,172 @@ private:
                               state.flight_mode == kPx4MainModeOffboard &&
                               state.flight_sub_mode == kPx4SubModeOffboard;
         return offboard && state_machine_requested_;
+    }
+
+    // ---- 自动起飞预授权（Task 6，spec §8） ----
+
+    /// 起飞请求窗口复位：IDLE 下最新意图已不是新鲜的 kTakeoff（状态机中止
+    /// 或转入其他任务）→ 清零窗口起点，下一轮起飞请求重新计时。
+    /// 注意：超时后若状态机仍每拍重发 kTakeoff，窗口保持，避免"超时→立刻
+    /// 重新进入"的无限重试。
+    void ResetBootstrapAttempt(uint64_t now_ms) {
+        if (authority_.load(std::memory_order_acquire) !=
+            ControlAuthority::kIdle) {
+            return;
+        }
+        if (bootstrap_started_ms_ != 0 &&
+            (!latest_intent_.has_value() ||
+             latest_intent_->type != common::ControlIntentType::kTakeoff ||
+             IntentStale(*latest_intent_, now_ms))) {
+            bootstrap_started_ms_ = 0;
+        }
+    }
+
+    /// bootstrap 超时兜底：以本轮起飞请求首次进入 kBootstrap 的时刻为起点；
+    /// 时钟回退用有符号差值（差值为负不判超时）。
+    bool BootstrapTimedOut(uint64_t now_ms) const {
+        return bootstrap_started_ms_ != 0 &&
+               static_cast<int64_t>(now_ms) -
+                       static_cast<int64_t>(bootstrap_started_ms_) >
+                   config_.bootstrap_timeout.count();
+    }
+
+    /// bootstrap 进入门禁（spec §8.2），全部条件同时满足：
+    /// 最新意图 kTakeoff + reason_code bit31 + 未超龄；快照源已注入、
+    /// connected、landed_state_valid && landed、!armed、local_position_valid、
+    /// attitude_valid、home_valid；本轮请求未超 bootstrap_timeout。
+    ///
+    /// **不读取任何 RC 字段**（rc_state_valid/rc_connected/
+    /// manual_override_active）：RC 在线/接管由 PX4 自己管理，机载不做 RC
+    /// 门禁——无 RC 也必须能自动起飞。
+    bool BootstrapEntryGateOpen(uint64_t now_ms) const {
+        if (px4_link_ == nullptr) {
+            return false;  // 影子运行/未装配：永无 bootstrap 流
+        }
+        if (!latest_intent_.has_value()) {
+            return false;
+        }
+        const auto& intent = *latest_intent_;
+        if (intent.type != common::ControlIntentType::kTakeoff) {
+            return false;
+        }
+        if ((intent.reason_code & common::kControlIntentReasonRequestControl) ==
+            0) {
+            return false;
+        }
+        if (IntentStale(intent, now_ms)) {
+            return false;
+        }
+        if (BootstrapTimedOut(now_ms)) {
+            return false;  // 同一轮起飞请求只给一个兜底窗口
+        }
+        const auto state = px4_link_->LatestState();
+        return state.connected && state.landed_state_valid && state.landed &&
+               !state.armed && state.local_position_valid &&
+               state.attitude_valid && state.home_valid;
+    }
+
+    /// 进入 kBootstrap：记录起飞原点（最新 kTakeoff 意图 target，局部 NED）
+    /// 与航向；窗口起点只在首次进入时记录（失败重试不续期）。
+    void EnterBootstrap(uint64_t now_ms) {
+        const auto& intent = *latest_intent_;
+        bootstrap_origin_x_ = intent.target_x;
+        bootstrap_origin_y_ = intent.target_y;
+        bootstrap_origin_z_ = intent.target_z;
+        bootstrap_origin_yaw_deg_ = intent.yaw_deg;
+        if (bootstrap_started_ms_ == 0) {
+            bootstrap_started_ms_ = now_ms;
+        }
+        TransitionTo(ControlAuthority::kBootstrap, "起飞预授权门禁全通");
+    }
+
+    /// kBootstrap 每拍处理：失败收口优先（只回 IDLE，不进入 COAST）；
+    /// armed+Offboard(6/0) 转 ACTIVE，但本拍仍发布原点保持，避免空档。
+    void HandleBootstrapTick(uint64_t now_ms) {
+        if (const char* reason = BootstrapFailureReason(now_ms)) {
+            TransitionTo(ControlAuthority::kIdle, reason);
+            PublishInvalidStop(now_ms);
+            return;
+        }
+        const auto state = px4_link_->LatestState();
+        const bool armed_offboard =
+            state.connected && state.armed &&
+            state.flight_mode == kPx4MainModeOffboard &&
+            state.flight_sub_mode == kPx4SubModeOffboard;
+        if (armed_offboard) {
+            // 移交 ACTIVE：本拍继续发布原点保持（valid=true），下一拍起走
+            // ACTIVE 门禁与正常发布路径。
+            TransitionTo(ControlAuthority::kActive,
+                         "armed+Offboard，bootstrap 完成");
+        }
+        PublishBootstrapHold(now_ms);
+    }
+
+    /// kBootstrap 保持条件核验：返回失效原因串，全部满足返回 nullptr。
+    /// armed 是例外——armed+Offboard 是成功移交条件（由调用方处理），
+    /// armed 但未进入 Offboard 视为外部打断（条件失效）。
+    const char* BootstrapFailureReason(uint64_t now_ms) const {
+        if (px4_link_ == nullptr) {
+            return "PX4 快照源缺失";
+        }
+        if (!latest_intent_.has_value()) {
+            return "起飞意图缺失";
+        }
+        const auto& intent = *latest_intent_;
+        if (intent.type != common::ControlIntentType::kTakeoff) {
+            return "意图类型不再是 kTakeoff";
+        }
+        if ((intent.reason_code & common::kControlIntentReasonRequestControl) ==
+            0) {
+            return "状态机撤销控制权请求";
+        }
+        if (IntentStale(intent, now_ms)) {
+            return "起飞意图超龄";
+        }
+        if (BootstrapTimedOut(now_ms)) {
+            return "bootstrap 超时";
+        }
+        const auto state = px4_link_->LatestState();
+        if (!state.connected) {
+            return "PX4 链路断开";
+        }
+        if (state.armed) {
+            const bool offboard =
+                state.flight_mode == kPx4MainModeOffboard &&
+                state.flight_sub_mode == kPx4SubModeOffboard;
+            return offboard ? nullptr : "已 armed 但未进入 Offboard";
+        }
+        if (!state.landed_state_valid || !state.landed) {
+            return "落地状态失效";
+        }
+        if (!state.local_position_valid) {
+            return "本地位置无效";
+        }
+        if (!state.attitude_valid) {
+            return "姿态无效";
+        }
+        if (!state.home_valid) {
+            return "Home 无效";
+        }
+        return nullptr;
+    }
+
+    /// 发布原点保持设定值（kBootstrap 每拍）：位置式、valid=true、坐标
+    /// frame_id 由 Publish 统一填 3（局部 NED），不带速度前馈；航向保持
+    /// 进入 bootstrap 时的意图航向（约定 yaw_deg==0 表示不指定）。
+    void PublishBootstrapHold(uint64_t now_ms) {
+        common::Px4Setpoint setpoint;
+        setpoint.type = common::SetpointType::kPosition;
+        setpoint.x = bootstrap_origin_x_;
+        setpoint.y = bootstrap_origin_y_;
+        setpoint.z = bootstrap_origin_z_;
+        setpoint.use_yaw = bootstrap_origin_yaw_deg_ != 0.f;
+        setpoint.yaw_deg = bootstrap_origin_yaw_deg_;
+        setpoint.valid = true;
+        last_source_ = 0;  // 位置链（自动起飞），与状态机 S3 意图一致
+        last_type_ = common::ControlIntentType::kTakeoff;
+        last_output_ = setpoint;
+        Publish(std::move(setpoint), now_ms);
     }
 
     /// 控制权迁移：WARN 级状态变化日志；进入 IDLE 时清零"状态机显式请求"
@@ -451,10 +646,14 @@ private:
                 PublishBrake(now_ms);
                 return;
             case common::ControlIntentType::kPositionGuide:
+            case common::ControlIntentType::kTakeoff:
+                // ACTIVE 下的起飞意图与位置引导同语义：S3 用 kTakeoff 建立
+                // bootstrap 流，S4 继续用 kTakeoff 逐拍抬高目标；控制器在
+                // armed+Offboard 后按位置设定值发布，不能落入 unsupported。
                 PublishPosition(intent, now_ms);
                 return;
             default: {
-                // 起飞/降落/返航/人工接管等类型暂不支持，拒绝计数。
+                // 降落/返航/人工接管等类型暂不支持，拒绝计数。
                 const uint64_t count = ++error_count_;
                 if (ShouldLogThrottled(count)) {
                     SPDLOG_WARN("飞行控制器暂不支持的意图类型: type={} 累计={}",
@@ -684,6 +883,13 @@ private:
     uint64_t setpoint_sequence_ = 0;
     bool state_machine_requested_ = false;  ///< 状态机显式请求锁存（reason_code bit31）
     uint64_t coast_since_ms_ = 0;           ///< 本次 COAST 进入时刻
+    // bootstrap（Task 6）：窗口起点 0=当前无起飞请求；原点为局部 NED，
+    // 取本轮首次进入 kBootstrap 时最新 kTakeoff 意图的 target。
+    uint64_t bootstrap_started_ms_ = 0;
+    float bootstrap_origin_x_ = 0.f;
+    float bootstrap_origin_y_ = 0.f;
+    float bootstrap_origin_z_ = 0.f;
+    float bootstrap_origin_yaw_deg_ = 0.f;
     std::atomic<ControlAuthority> authority_{ControlAuthority::kIdle};
     std::atomic<uint64_t> setpoint_count_{0};
     std::atomic<uint64_t> rejected_intent_count_{0};

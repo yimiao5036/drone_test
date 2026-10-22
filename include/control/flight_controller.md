@@ -24,6 +24,11 @@
 - **Home 相对围栏已接入（Task 5）**：位置式意图水平模长超 `max_radius_m`
   等比钳制、相对高度超 `max_altitude_m` 钳制；`home_valid=false` 时
   位置式意图拒绝（无基准不可围栏）。
+- **自动起飞预授权已接入（Task 6，spec §8）**：控制权增加 `kBootstrap`；
+  地面/未解锁且收到未超龄的 `kTakeoff` 意图（bit31）时发布起飞原点
+  位置保持流，为 PX4 进入 Offboard 建立合法 setpoint 流；`armed+Offboard`
+  后转 ACTIVE；条件失效/意图撤销/超过 `bootstrap_timeout` 只回 IDLE 停流，
+  **不进入 COAST**。门禁**不读取任何 RC 字段**。
 - **坐标边界（Task 9 明确）**：`kVelocityHeading` 意图的速度三分量约定为
   **局部 NED（北/东/地）**——机体系→NED 旋转由意图生产方在输出端完成
   （S7 视觉伺服在 `TrackingControlLaw` 内部按快照航向角旋转，状态机意图以
@@ -37,6 +42,7 @@
 common::Topic<ControlIntent>（状态机，kControlIntent）
     ──► FlightController（固定周期线程 Tick）
         │ 门禁链：排干队列只留最新 → 有限性 → 超龄（valid_until + intent_timeout）
+        │        → bootstrap 分流（kTakeoff+bit31 → kBootstrap 原点保持）
         │        → 控制权门禁（快照 connected+armed+Offboard 6/0 + 请求位，
         │          每拍核验）→ 持有期再超龄 → COAST 刹车
         │ 限幅流水线：未知来源安全降级 → 速度幅值等比钳制
@@ -68,7 +74,10 @@ common::Topic<Px4Setpoint> ──► IPx4Link（PX4 通信线程）
   一拍（须在未 Start 状态调用；**运行时守卫**：Start 后调用直接忽略并
   节流 WARN，防止与周期线程并发访问 Tick 内部无锁状态）。
 
-## 控制权状态机（spec §4，Task 5 接入）
+## 控制权状态机（spec §4，Task 5/6 接入）
+
+四态：`IDLE` / `BOOTSTRAP` / `ACTIVE` / `COAST`。`BOOTSTRAP` 的进入/退出
+门禁见下节「自动起飞预授权 kBootstrap」。
 
 授权链（本控制器侧部分，部署/健康门禁归装配层与健康管理）：
 
@@ -92,8 +101,11 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
 
 | 当前态 | 条件 | 下一态 | 动作 |
 |---|---|---|---|
+| IDLE | bootstrap 门禁全通（kTakeoff + bit31 + 地面/未解锁等） | BOOTSTRAP | 记录起飞原点，发布原点保持位置流 |
 | IDLE | 授权链全通且持有新鲜请求位意图 | ACTIVE | 无（随后走正常发布路径） |
 | IDLE | 授权链不通或请求意图已超龄 | IDLE | 停发（不发布任何 setpoint） |
+| BOOTSTRAP | `armed && Offboard(6/0)` | ACTIVE | 当拍仍发布原点保持，下一拍起走正常路径 |
+| BOOTSTRAP | 条件失效/意图撤销或超龄/超过 `bootstrap_timeout` | IDLE | 发布 `valid=false` 停流（**不进入 COAST**） |
 | ACTIVE | 授权链断开（心跳断/非 Offboard/未 armed/请求撤销） | IDLE | 发布 `valid=false` 停发 |
 | ACTIVE | 无意图或持有期超龄 | COAST | 记录 `coast_since`，发布零速刹车 |
 | COAST | 授权链断开 | IDLE | 发布 `valid=false` 停发 |
@@ -110,6 +122,48 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
   超龄判定沿用 `StalenessChecker`（`now < sample` 视为不可信直接判超龄）。
 - 停发/刹车发布时 slew 状态归零、`last_output_` 重置：恢复授权后速度式
   输出从 0 斜坡起步（延续 S6 首条指令突变抑制语义）。
+
+## 自动起飞预授权 kBootstrap（Task 6，spec §8）
+
+PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发布
+`kTakeoff` 意图（目标 = 起飞原点 `x0/y0/z0`，`reason_code` bit31），控制器
+在 `kIdle` 下据此进入 `kBootstrap`，先建立合法的原点保持流，随后状态机再发
+`176`（Offboard）/`400`（arm）。
+
+**进入门禁**（同时满足，每拍重估）：
+
+```text
+最新意图 type == kTakeoff && reason_code bit31 && 未超龄
+  && 快照源已注入 && connected
+  && landed_state_valid && landed && !armed
+  && local_position_valid && attitude_valid && home_valid
+  && 本轮起飞请求未超过 bootstrap_timeout
+```
+
+- **不读取任何 RC 字段**（`rc_state_valid` / `rc_connected` /
+  `manual_override_active`）：机载不做 RC 在线/接管门禁，RC 由 PX4 自己管理；
+  无 RC 也必须能自动起飞。
+- `bootstrap_timeout`（`controller.bootstrap_timeout_ms`，默认 6000ms）是
+  **防卡死兜底**：状态机 S3 的 `mode_timeout`/`arm_timeout` 才是权威。
+  装配时由 `DroneApplication` 从 `takeoff.bootstrap_timeout` 注入。
+- 同一轮起飞请求的兜底窗口以**首次进入 kBootstrap 的时刻**为起点，失败重试
+  不续期；状态机中止（意图不再是新鲜 `kTakeoff`）后才复位窗口。
+
+**输出**（每拍，进入当拍即开始）：
+
+- `SetpointType::kPosition`，`x/y/z` = 进入时最新 `kTakeoff` 意图的
+  `target_x/y/z`（局部 NED 起飞原点），`valid=true`；
+- 航向保持进入时意图的 `yaw_deg`（按 `use_yaw = yaw_deg != 0` 约定透传）；
+- 不带速度前馈（掩码 0）；`header.frame_id` 由 `Publish()` 统一填 3。
+
+**迁移**：
+
+- `armed && connected && Offboard(6/0)` → `kActive`；迁移当拍仍发布
+  `valid=true` 的原点保持，避免空档（下一拍起走 ACTIVE 正常路径）；
+- 条件失效 / 意图撤销或超龄 / 超时 → `kIdle` + `PublishInvalidStop`
+  （`valid=false`），**绝不进入 `kCoast`**——COAST 是"已获授权后意图超龄
+  刹车"的语义，bootstrap 未获授权不能刹车保持；
+- 进入 `kIdle` 时沿用既有行为清零状态机显式请求锁存。
 
 ## Home 相对围栏（Task 5）
 
@@ -237,7 +291,11 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
   2. 超龄：`now >= valid_until_ms`（含到达即超龄）或
      `StalenessChecker::IsStale(receive_time_ms, now, intent_timeout)`。
 - **控制权门禁**：每拍执行 `AuthorityGateOpen()`（快照核验 + 请求位），
-  按三态迁移表驱动状态机；详见上节「控制权状态机」。
+  按四态迁移表驱动状态机；详见上节「控制权状态机」。
+- **bootstrap 分流顺序**：`DrainIntents()` 之后、常规授权门禁之前先处理——
+  `kBootstrap` 每拍走 `HandleBootstrapTick()`；`kIdle` 先试
+  `BootstrapEntryGateOpen()`，进入当拍直接发布原点保持并 `return`
+  （不落入 IDLE→ACTIVE 分支）。
 - **持有期再超龄**（ACTIVE 路径）：意图在消费间隔内过期 → 拒绝计数 +
   转 COAST 并发布零速刹停设定值（`SetpointType::kVelocity`，三分量 0，
   `valid=true`）；COAST 中超时/门禁失效转 IDLE 并发布 `valid=false` 停发
@@ -286,10 +344,11 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
 
 ## 日志行为
 
-- INFO：创建、启动（带 period/intent_timeout/coast_timeout）、停止
-  （带 setpoint/拒绝计数汇总）。
-- WARN：**控制权状态迁移**（IDLE/ACTIVE/COAST 进出，含原因串，每次迁移
-  一条）；拒绝意图（非有限/超龄/无 Home 基准位置意图）、不支持的意图
+- INFO：创建、启动（带 period/intent_timeout/coast_timeout/
+  bootstrap_timeout）、停止（带 setpoint/拒绝计数汇总）。
+- WARN：**控制权状态迁移**（IDLE/BOOTSTRAP/ACTIVE/COAST 进出，含原因串，
+  每次迁移一条；bootstrap 失败原因如"bootstrap 超时"/"起飞意图超龄"/
+  "已 armed 但未进入 Offboard"）；拒绝意图（非有限/超龄/无 Home 基准位置意图）、不支持的意图
   类型、速度幅值限幅触发、围栏钳制触发、未定义控制来源降级、TestTick
   运行态误调用——节流打印（第 1 次与每满 100 次），控制周期热路径禁日志。
 
@@ -344,6 +403,23 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
   - `FenceClampsPositionIntent`：位置意图超 `max_radius_m`/`max_altitude_m`
     → 钳制到边界 + `ClampedCount` 计数；`home_valid=false` → 位置式意图
     拒绝输出并计 `RejectedIntentCount`。
+- 自动起飞预授权用例（`FlightControllerBootstrapTest` 夹具：地面/未解锁
+  MockPx4Link 快照 + 合成时间轴，`bootstrap_timeout=200ms`）：
+  - `EntersBootstrapAndHoldsOriginWithoutRc`：kTakeoff(bit31) + 地面条件
+    → `kBootstrap`，输出 `kPosition` 原点、`valid=true`、frame=3、无前馈；
+    快照 RC 字段全为 false/invalid 不影响进入；
+  - `EntryRequiresGroundConditions`：`armed`/落地状态无效/未落地/本地位置/
+    姿态/Home 无效/未连接任一失效 → 保持 IDLE 且无 setpoint；
+  - `ArmedOffboardTransitionsToActive`：`armed+Offboard` 当拍转 ACTIVE，
+    该拍仍发布 `valid=true` 原点保持；
+  - `TimeoutReturnsIdleWithoutCoast`：超过 `bootstrap_timeout` → IDLE +
+    `valid=false`，不是 COAST；状态机重发也不立刻重新进入；
+  - `StopsBootstrapWhenIntentRevoked` / `StopsBootstrapWhenIntentTypeChanges`
+    / `StopsBootstrapWhenGroundConditionsLost`：请求位撤销、类型变化、
+    外部打断（armed 但非 Offboard）→ IDLE 停流；
+  - `DoesNotEnterWithoutValidTakeoffRequest`：无意图/非 kTakeoff/无 bit31
+    均不进入；
+  - `DoesNotEnterWithStaleTakeoffIntent`：到达即超龄 → 拒绝计数、不进入。
 
 ```bash
 ctest --test-dir build -R FlightController --output-on-failure
@@ -358,6 +434,12 @@ ctest --test-dir build -R FlightController --output-on-failure
   会抑制非刹停意图。
 - 控制权反复 IDLE：看 WARN 迁移日志原因串（"授权链断开"/"COAST 超时"）；
   模式抖动场景每拍核验，离开 Offboard 当拍即撤属预期（人工接管语义）。
+- 自动起飞停在 IDLE、没有 bootstrap 流：查迁移日志——`IDLE -> BOOTSTRAP`
+  从未出现时核对 kTakeoff 意图（类型/bit31/未超龄）与快照
+  `connected/landed_state_valid&&landed/!armed/local/attitude/home`；
+  **不要查 RC**（门禁不读 RC）。出现 `BOOTSTRAP -> IDLE` 时看原因串
+  （"bootstrap 超时"/"起飞意图超龄"/"已 armed 但未进入 Offboard"）；
+  bootstrap 失败后 `SetpointOutput()` 会收到一条 `valid=false` 停流。
 - 位置意图被钳小/被拒：查 `ClampedCount()` 是否递增（围栏生效）与
   `max_radius_m`/`max_altitude_m` 配置；`home_valid=false` 时位置式意图
   一律拒绝（无基准不可围栏）——先查 PX4 Home 上报链路。

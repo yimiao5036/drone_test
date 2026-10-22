@@ -501,6 +501,8 @@ void FlightControllerConfig::Validate() const {
         throw std::invalid_argument("controller.coast_timeout_ms 必须大于 intent_timeout_ms");
     if (slew_transition.count() <= 0)
         throw std::invalid_argument("controller.slew_transition_ms 必须为正");
+    if (bootstrap_timeout.count() <= 0)
+        throw std::invalid_argument("controller.bootstrap_timeout_ms 必须为正");
 }
 
 void HandoverConfig::Validate() const {

@@ -4321,6 +4321,8 @@ private:
         switch (authority) {
             case drone::control::ControlAuthority::kIdle:
                 return "IDLE";
+            case drone::control::ControlAuthority::kBootstrap:
+                return "BOOTSTRAP";
             case drone::control::ControlAuthority::kActive:
                 return "ACTIVE";
             case drone::control::ControlAuthority::kCoast:
@@ -4878,6 +4880,8 @@ public:
         switch (authority) {
             case drone::control::ControlAuthority::kIdle:
                 return "IDLE";
+            case drone::control::ControlAuthority::kBootstrap:
+                return "BOOTSTRAP";
             case drone::control::ControlAuthority::kActive:
                 return "ACTIVE";
             case drone::control::ControlAuthority::kCoast:
