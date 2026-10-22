@@ -22,7 +22,6 @@ BASELINE_RE = re.compile(r"当前基线：(\d+/\d+)")
 
 # 当前基线必须一致的位置（docs/README.md 是唯一源，不在此列表内）。
 BASELINE_TARGETS = [
-    "CLAUDE.md",
     "README.md",
     "docs/模块索引.md",
     "docs/项目总览与数据流.md",
@@ -37,7 +36,6 @@ BASELINE_TARGETS = [
 # 检查相对链接的当前文档；archive/ 与 superpowers/ 属历史材料，不纳入日常链接门禁。
 LINK_TARGETS = [
     "README.md",
-    "CLAUDE.md",
     "AGENTS.md",
     "docs/README.md",
     "docs/开发进度.md",

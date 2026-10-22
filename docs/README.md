@@ -49,6 +49,7 @@
 
 - [`PX4实链验证清单.md`](PX4实链验证清单.md)：实链验证、G4/G5 门禁与证据
 - [`开发进度.md`](开发进度.md)、[`开发历史.md`](开发历史.md)：当前状态与历史时间线
+- [`硬件资料/README.md`](硬件资料/README.md)：厂商 PDF 索引（HM30 手册、双目规格书；PDF 本地保留不入库）
 
 ### 工具（`tools/`）
 
@@ -90,7 +91,7 @@
 | `src/control/` | `include/control/*.md`、[`物理追踪思路.md`](物理追踪思路.md)、[`开发进度.md`](开发进度.md) |
 | `src/config/` | `include/config/配置管理.md`、`config/config.json` 注释、[`部署与打包.md`](部署与打包.md)、[`开发进度.md`](开发进度.md) |
 | `src/application/` | `include/application/主程序集成.md`、[`项目总览与数据流.md`](项目总览与数据流.md)、[`开发进度.md`](开发进度.md) |
-| `tests/` 用例数变化 | 本文件「当前基线」+ 下方 10 处基线位置 |
+| `tests/` 用例数变化 | 本文件「当前基线」+ 下方 9 处基线位置 |
 | `tools/` | 对应 `tools/*.md`；涉及部署/接入时加 [`部署与打包.md`](部署与打包.md)、[`新增设备接入指南.md`](新增设备接入指南.md) |
 
 **里程碑/行为变化**：更新 [`开发进度.md`](开发进度.md) 的当前状态，并在
@@ -108,23 +109,22 @@ python3 tools/check_docs.py --changed # 按 git 改动列出应检查的文档
 1. 更新 [`开发进度.md`](开发进度.md)（当前状态/门禁/最近变更）；
 2. 如属里程碑，在 [`开发历史.md`](开发历史.md) 顶部追加一条；
 3. 按第 4 节矩阵更新模块文档、数据接口、故障排查；
-4. 测试数量变化时，更新本文件「当前基线」和下面 10 处；
+4. 测试数量变化时，更新本文件「当前基线」和下面 9 处；
 5. 在 WSL2 Ubuntu 24.04 编译并跑 `ctest`。
 
 ## 6. 测试基线数字位置
 
 单一源为本文「当前基线」行；以下位置必须与它一致：
 
-1. `CLAUDE.md` 构建命令注释
-2. `README.md` 当前状态段
-3. `docs/模块索引.md` 顶部与测试索引
-4. `docs/项目总览与数据流.md` §15
-5. `docs/开发进度.md` 当前验证基线
-6. `docs/部署与打包.md` 头部与 §9.4
-7. `docs/故障排查手册.md` §3
-8. `docs/archive/历史计划/主程序集成与数据链路实施计划.md` §0（历史计划，保留当前数字）
-9. `include/perception/stereo_ranger.md` 测试方式
-10. `docs/superpowers/specs/2026-10-13-阶段四控制接入路径-design.md` G0 行
+1. `README.md` 当前状态段
+2. `docs/模块索引.md` 顶部与测试索引
+3. `docs/项目总览与数据流.md` §15
+4. `docs/开发进度.md` 当前验证基线
+5. `docs/部署与打包.md` 头部与 §9.4
+6. `docs/故障排查手册.md` §3
+7. `docs/archive/历史计划/主程序集成与数据链路实施计划.md` §0（历史计划，保留当前数字）
+8. `include/perception/stereo_ranger.md` 测试方式
+9. `docs/superpowers/specs/2026-10-13-阶段四控制接入路径-design.md` G0 行
 
 `tools/check_docs.py` 会检查这些位置的数字与本文一致；历史日期条目里的旧数字不要改。
 

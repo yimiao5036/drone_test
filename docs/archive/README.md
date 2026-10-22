@@ -29,5 +29,8 @@
 
 ## 其他历史材料
 
+- [`rtsp_yolo_stream.tar.gz`](rtsp_yolo_stream.tar.gz)：2026-08-05 早期视频链路原型快照
+  （`rtsp_yolo_stream/`：CMakeLists + main.cpp + rtsp_decoder/encoder + 头文件，共 11 个文件），
+  已被 `videoPart/` 与正式视频模块取代，仅留档。
 - [`docs/superpowers/`](../superpowers/)：历史设计稿、实施计划与阶段任务记录，只读保留。
 - [`docs/开发历史.md`](../开发历史.md)：开发进度时间线（原 `开发进度.md` 的历史内容）。
