@@ -8,12 +8,10 @@ build_vtc/
 /logs/
 /HM30_用户手册_v1_7_1294f55e.pdf
 /tools/web平台
+# yolo_pt/：模型训练与 PT→RKNN 工作区，整目录本地维护（父仓库不跟踪；
+# 需要版本管理时在 yolo_pt/ 内单独 git，见 yolo_pt/README.md）
 yolo_pt/
 23H1628889HV1规格书(中英).pdf
-
-yolo_pt/模型导出与转换说明.md
-yolo_pt/export_rknn_candidates.py
-yolo_pt/pt_rknn.py
 .claude/
 
 # 双目探测脚本输出（板上/本地运行产物，不入库）
