@@ -436,6 +436,12 @@ public:
         // 电池守卫复位（Task 8）：per-boot 语义，中止锁存与防抖计时清空。
         battery_abort_latched_ = false;
         battery_low_since_ms_.reset();
+        // 目标等待/丢失看门狗与地面站取消（Task 10）：per-boot 复位。
+        mission_abort_latched_ = false;
+        target_wait_started_ms_ = 0;
+        assigned_target_acquired_ = false;
+        target_lost_since_ms_.reset();
+        last_cancel_action_ms_.reset();
         // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
         return_climb_phase_ = true;
@@ -693,6 +699,10 @@ private:
         // 遥测失效当拍中止到 S12，后续拦截入口（S7/S9/S10）不再有机会发射。
         EvaluateBatteryGuard(now_ms);
 
+        // S5 目标等待/丢失看门狗（Task 10，设计 §7.5）：只在控制任务 S5 生效。
+        // 超时当拍中止到 S12 并停发位置引导；后续状态判定自然跳过交接/拦截。
+        EvaluateTargetWatchdog(now_ms);
+
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
         // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
         EvaluateHandover(now_ms);
@@ -857,6 +867,14 @@ private:
         const common::MissionAssignment assignment = *latest_assignment_;
         latest_assignment_.reset();
 
+        // 取消当前分配（flags.bit1，设计 §5.1/§7.5）：必须先于重复/普通预检
+        // 处理——取消消息不要求 bit0，且活动分配在 tracker 中已记住 accepted，
+        // 若先走 WasHandled 会把取消误当作重复分配重发 accepted。
+        if ((assignment.flags & communication::kMissionAssignFlagCancel) != 0U) {
+            HandleAssignmentCancel(assignment, now_ms);
+            return;
+        }
+
         // 重复 assignment_id：只重发原 65015，不再预检/迁移（幂等）。
         common::MissionAssignmentResult prior_result =
             common::MissionAssignmentResult::kRejected;
@@ -921,6 +939,11 @@ private:
                 // 新任务重新武装电池守卫（地面低电中止后恢复再分配的路径）。
                 battery_abort_latched_ = false;
                 battery_low_since_ms_.reset();
+                // 目标看门狗与中止锁存按任务复位（一次任务只中止一次）。
+                mission_abort_latched_ = false;
+                target_wait_started_ms_ = 0;
+                assigned_target_acquired_ = false;
+                target_lost_since_ms_.reset();
                 // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致。
                 const auto& flight = *latest_flight_;
                 assignment_tracker_.BeginTakeoff(
@@ -963,6 +986,200 @@ private:
                     static_cast<double>(assignment_tracker_.OriginY()),
                     static_cast<double>(assignment_tracker_.OriginZ()));
         TransitionTo(common::MissionState::kArming, "接受任务分配");
+    }
+
+    // ---- 65014 取消（flags.bit1，Task 10，设计 §5.1/§7.5） ----
+
+    /// 取消动作最小间隔：同一取消在 500ms 内不重复下发命令（幂等重发回执）。
+    static constexpr uint64_t kCancelCommandMinIntervalMs = 500;
+
+    /// 任务执行阶段（已离地）：S5~S13。S14/S16 为终态，不再重启返航链。
+    static bool IsAirborneMissionState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+            case common::MissionState::kPostIntercept:
+            case common::MissionState::kReturnHome:
+            case common::MissionState::kLanding:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 本机是否已实际离地：tracker 已消耗本次空中任务机会，或当前飞行快照
+    /// armed && !landed。取消处置以此决定"地面中止"还是"空中返航"。
+    bool AssignmentAirborne() const {
+        if (assignment_tracker_.ConsumedAirborneMission()) {
+            return true;
+        }
+        return latest_flight_.has_value() && latest_flight_->armed &&
+               !latest_flight_->landed;
+    }
+
+    /// 取消消息被拒绝：记住结果（重复取消重发同一拒绝回执）并发布 65015。
+    void RejectAssignmentCancel(const common::MissionAssignment& assignment,
+                                common::MissionAssignmentReason reason) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            assignment_tracker_.RememberResult(
+                assignment.assignment_id,
+                common::MissionAssignmentResult::kRejected, reason);
+        }
+        PublishAssignmentAck(assignment,
+                             common::MissionAssignmentResult::kRejected, reason);
+        const uint64_t count = ++assignment_reject_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("任务取消被拒绝: assignment_id={} reason={} state={} "
+                        "count={}",
+                        assignment.assignment_id, static_cast<int>(reason),
+                        MissionStateName(CurrentState()), count);
+        }
+    }
+
+    /// 处理 65014 flags.bit1。协议字段只做版本/未知位校验（取消不要求 bit0）：
+    /// - 活动分配 id 匹配：地面 → AbortTakeoff/AbortOnGround 回 READY；空中 →
+    ///   AbortAirborne + S12，65015 cancelled/aborted(cancelled_by_gcs)；
+    /// - 重复取消：重发最近结果（cancelled 结果不被 accepted 覆盖）；
+    /// - 无活动分配且 id 从未处理：rejected(not_ready)；
+    /// - 活动分配是其他 id：rejected(already_assigned)。
+    /// 取消不重启已进入 S12/S13 的返航/降落链，只记录并回执。
+    void HandleAssignmentCancel(const common::MissionAssignment& assignment,
+                                uint64_t now_ms) {
+        if (assignment.protocol_version !=
+            communication::kMissionAssignmentProtocolVersion) {
+            RejectAssignmentCancel(
+                assignment,
+                common::MissionAssignmentReason::kUnsupportedVersion);
+            return;
+        }
+        if ((assignment.flags &
+             static_cast<uint8_t>(~communication::kMissionAssignKnownFlagsMask)) !=
+            0U) {
+            RejectAssignmentCancel(
+                assignment,
+                common::MissionAssignmentReason::kInvalidMessage);
+            return;
+        }
+
+        common::MissionAssignmentResult prior_result =
+            common::MissionAssignmentResult::kRejected;
+        common::MissionAssignmentReason prior_reason =
+            common::MissionAssignmentReason::kNone;
+        bool handled = false;
+        bool has_active = false;
+        bool active_id_match = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            handled = assignment_tracker_.WasHandled(
+                assignment.assignment_id, &prior_result, &prior_reason);
+            has_active = assignment_tracker_.HasActiveAssignment();
+            active_id_match = has_active &&
+                assignment_tracker_.AssignmentId() == assignment.assignment_id;
+        }
+
+        if (active_id_match) {
+            // 该分配的取消已生效（空中取消后 tracker 仍 kReturning）：直接
+            // 重发最近结果，不再迁移/下发命令。
+            if (handled &&
+                prior_result != common::MissionAssignmentResult::kAccepted) {
+                PublishAssignmentAck(assignment, prior_result, prior_reason);
+                return;
+            }
+            // 500ms 内已执行过取消动作：不重复下发命令（含 DISARM），重发
+            // 当前取消结论。
+            if (last_cancel_action_ms_.has_value() &&
+                ElapsedMs(now_ms, *last_cancel_action_ms_) <
+                    kCancelCommandMinIntervalMs) {
+                PublishAssignmentAck(
+                    assignment,
+                    common::MissionAssignmentResult::kCancelledOrAborted,
+                    common::MissionAssignmentReason::kCancelledByGcs);
+                return;
+            }
+            last_cancel_action_ms_ = now_ms;
+            ExecuteAssignmentCancel(assignment);
+            return;
+        }
+
+        if (handled) {
+            // 已处理过：重发最终结果。已被接受但已不在活动阶段（S14/S16
+            // 终态）的分配按协议回 rejected(not_ready)（§5.5）。
+            if (prior_result != common::MissionAssignmentResult::kAccepted) {
+                PublishAssignmentAck(assignment, prior_result, prior_reason);
+                return;
+            }
+            RejectAssignmentCancel(
+                assignment, common::MissionAssignmentReason::kNotReady);
+            return;
+        }
+
+        // 未匹配当前活动分配：有活动分配说明是其他 id（already_assigned），
+        // 否则无分配/终态（not_ready）。
+        RejectAssignmentCancel(
+            assignment, has_active
+                            ? common::MissionAssignmentReason::kAlreadyAssigned
+                            : common::MissionAssignmentReason::kNotReady);
+    }
+
+    /// 执行已匹配活动分配的取消（调用方已确认 id 匹配并记录 500ms 动作时刻）。
+    void ExecuteAssignmentCancel(const common::MissionAssignment& assignment) {
+        const auto state = CurrentState();
+        const bool airborne =
+            AssignmentAirborne() || IsAirborneMissionState(state);
+
+        if (airborne) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                assignment_tracker_.AbortAirborne();
+            }
+            RememberTakeoffAbort(
+                common::MissionAssignmentReason::kCancelledByGcs);
+            SPDLOG_WARN("地面站取消任务（已离地）: assignment_id={} state={} → "
+                        "中止任务并返航",
+                        assignment.assignment_id, MissionStateName(state));
+            // 已在返航/降落链（S12~S14）：只记录并回执，不把 S13 重置回 S12。
+            if (state == common::MissionState::kReturnHome ||
+                state == common::MissionState::kLanding ||
+                state == common::MissionState::kDisarmed) {
+                PublishTakeoffAbortAck(
+                    common::MissionAssignmentReason::kCancelledByGcs);
+                return;
+            }
+            // 中止当拍停发位置引导，S12 在本拍后续接管返航意图。
+            StopPositionIntent("地面站取消任务（已离地）");
+            TransitionTo(common::MissionState::kReturnHome,
+                         "地面站取消（已离地），进入返航");
+            PublishTakeoffAbortAck(
+                common::MissionAssignmentReason::kCancelledByGcs);
+            return;
+        }
+
+        if (state == common::MissionState::kArming ||
+            state == common::MissionState::kTakeoff) {
+            // 地面 S3/S4：复用统一起飞中止（停流、必要时一次 DISARM、
+            // tracker AbortOnGround、回 READY、65015 cancelled/aborted）。
+            AbortTakeoff(common::MissionAssignmentReason::kCancelledByGcs,
+                         "地面站取消");
+            return;
+        }
+
+        // 防御路径：S2 已接受但尚未进入 S3（正常路径接受当拍即迁移 S3）。
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            assignment_tracker_.AbortOnGround();
+        }
+        RememberTakeoffAbort(
+            common::MissionAssignmentReason::kCancelledByGcs);
+        SPDLOG_WARN("地面站取消任务（地面）: assignment_id={} state={} → 保持 "
+                    "READY",
+                    assignment.assignment_id, MissionStateName(state));
+        PublishTakeoffAbortAck(
+            common::MissionAssignmentReason::kCancelledByGcs);
     }
 
     // ---- S3 解锁/Offboard 与 S4 自动爬升（Task 5，2026-10-22） ----
@@ -1127,6 +1344,85 @@ private:
                     static_cast<int>(reason), detail, MissionStateName(state));
         TransitionTo(common::MissionState::kReturnHome,
                      "电池低电/遥测失效，中止任务并返航");
+        PublishTakeoffAbortAck(reason);
+    }
+
+    // ---- S5 目标等待/丢失看门狗（Task 10，设计 §7.5） ----
+
+    /// S5 入口初始化（TransitionTo 调用）：仅在控制任务下启用（影子模式
+    /// 保持既有 S5 行为，不因目标缺失自动中止）。
+    void BeginTargetWatchdog(uint64_t now_ms) {
+        target_lost_since_ms_.reset();
+        if (command_sender_ == nullptr) {
+            target_wait_started_ms_ = 0;
+            assigned_target_acquired_ = false;
+            return;
+        }
+        target_wait_started_ms_ = now_ms;
+        assigned_target_acquired_ = false;
+        SPDLOG_INFO("S5 目标看门狗启动: target_id={} wait_timeout={}ms "
+                    "lost_timeout={}ms",
+                    assignment_tracker_.TargetId(),
+                    takeoff_.target_wait_timeout.count(),
+                    takeoff_.target_lost_timeout.count());
+    }
+
+    /// 每决策拍（仅 S5、仅控制任务）：未获得匹配目标超过 target_wait_timeout，
+    /// 或已获得后匹配目标持续失效超过 target_lost_timeout → 中止分配、S12 返航、
+    /// 65015 aborted(target_wait_timeout/target_lost)。一次任务只中止一次。
+    /// S6/S7 的交接/视觉丢失逻辑不受本函数影响。
+    void EvaluateTargetWatchdog(uint64_t now_ms) {
+        if (command_sender_ == nullptr) {
+            return;  // 影子模式不启用
+        }
+        if (CurrentState() != common::MissionState::kGpsApproach) {
+            return;
+        }
+        if (mission_abort_latched_) {
+            return;
+        }
+        if (HasFreshAssignedTarget(now_ms)) {
+            assigned_target_acquired_ = true;
+            target_lost_since_ms_.reset();
+            return;
+        }
+        if (!assigned_target_acquired_) {
+            if (ElapsedMs(now_ms, target_wait_started_ms_) >=
+                static_cast<uint64_t>(
+                    takeoff_.target_wait_timeout.count())) {
+                AbortForTargetWatchdog(
+                    common::MissionAssignmentReason::kTargetWaitTimeout,
+                    "起飞后等待分配目标超时");
+            }
+            return;
+        }
+        if (!target_lost_since_ms_.has_value()) {
+            target_lost_since_ms_ = now_ms;
+        }
+        if (ElapsedMs(now_ms, *target_lost_since_ms_) >=
+            static_cast<uint64_t>(takeoff_.target_lost_timeout.count())) {
+            AbortForTargetWatchdog(
+                common::MissionAssignmentReason::kTargetLost,
+                "已获得目标持续失效超时");
+        }
+    }
+
+    /// 目标看门狗中止统一处置：停发位置引导（S12 当拍接管返航意图）、
+    /// tracker AbortAirborne、65015 aborted → S12；不触发拦截/187。
+    void AbortForTargetWatchdog(common::MissionAssignmentReason reason,
+                                const char* detail) {
+        if (mission_abort_latched_) {
+            return;
+        }
+        mission_abort_latched_ = true;
+        target_lost_since_ms_.reset();
+        StopPositionIntent("目标等待/丢失超时中止任务");
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(reason);
+        SPDLOG_WARN("S5 目标看门狗中止: reason={} detail={} → S12 返航",
+                    static_cast<int>(reason), detail);
+        TransitionTo(common::MissionState::kReturnHome,
+                     "目标等待/丢失超时，中止任务并返航");
         PublishTakeoffAbortAck(reason);
     }
 
@@ -2024,7 +2320,25 @@ private:
         return in;
     }
 
+    /// 控制任务下是否按当前分配的 target_id 过滤目标（设计 §7.5）。
+    /// 影子装配（未注入命令接口）保持既有行为，不过滤。
+    bool AssignmentTargetFilterActive() const {
+        return command_sender_ != nullptr &&
+               assignment_tracker_.HasActiveAssignment();
+    }
+
+    /// 目标编号是否允许进入本机任务链。无过滤条件时全部放行；控制任务下
+    /// 只允许 `target_id == assignment.target_id`（0 永远不匹配）。
+    bool TargetMatchesAssignment(uint32_t target_id) const {
+        if (!AssignmentTargetFilterActive()) {
+            return true;
+        }
+        return assignment_tracker_.AllowsTarget(target_id);
+    }
+
     /// 估计目标是否新鲜有效（valid 标志 + 剩余有效期，与 TargetEstimator 输出语义一致）。
+    /// 控制任务下非本分配 target_id 的估计一律视为不可用（不进入 S5 引导、
+    /// 不参与交接、不满足目标看门狗）。
     bool HasFreshEstimate(uint64_t now_ms) const {
         if (!latest_estimated_) {
             return false;
@@ -2033,10 +2347,22 @@ private:
         if (!target.valid) {
             return false;
         }
+        if (!TargetMatchesAssignment(target.target_id)) {
+            return false;
+        }
         if (target.header.receive_time_ms == 0 || target.header.valid_for_ms == 0) {
             return false;
         }
         return now_ms <= target.header.receive_time_ms + target.header.valid_for_ms;
+    }
+
+    /// S5 目标看门狗判据：只看匹配当前分配的估计目标。65010 只是上游位置
+    /// 输入，S5 的位置引导实际消耗 TargetEstimator 输出；若地面站持续发
+    /// 65010 但估计器不出目标，不能把“已收到 65010”误当成可执行目标，
+    /// 否则 S5 会无引导地悬停且 target_wait_timeout 永不触发。
+    /// 控制路径的 target_id 过滤在 HasFreshEstimate 内生效。
+    bool HasFreshAssignedTarget(uint64_t now_ms) const {
+        return HasFreshEstimate(now_ms);
     }
 
     /// 位置型意图的组装输入（S5 估计引导 / S6 冻结续发共用）。
@@ -2681,6 +3007,11 @@ private:
             return false;
         }
         const auto& target = *latest_ground_target_;
+        // 控制任务下非本分配 target_id 的 65010 直接忽略（GroundStationLink
+        // 仍可照常做链路 ACK，状态机不进入任务链/不更新引导）。
+        if (!TargetMatchesAssignment(target.target_id)) {
+            return false;
+        }
         if (target.header.receive_time_ms == 0 || target.header.valid_for_ms == 0) {
             return false;
         }
@@ -2738,6 +3069,9 @@ private:
                 BeginArmingSequence(now_ms);
             } else if (next_state == common::MissionState::kTakeoff) {
                 BeginClimbSequence(now_ms);
+            } else if (next_state == common::MissionState::kGpsApproach) {
+                // S5 目标等待计时从进入任务高度起算（仅控制任务）。
+                BeginTargetWatchdog(now_ms);
             }
         }
         PublishStatus(now_ms);
@@ -2926,6 +3260,13 @@ private:
     bool battery_abort_latched_ = false;
     /// 低电防抖起点（nullopt=当前不低电/不在守卫生效阶段）。
     std::optional<uint64_t> battery_low_since_ms_;
+    /// 目标看门狗（Task 10）：一次任务只中止一次；Accept/Start 复位。
+    bool mission_abort_latched_ = false;
+    uint64_t target_wait_started_ms_ = 0;  ///< S5 入口时刻（等待目标基准）
+    bool assigned_target_acquired_ = false;  ///< 本次 S5 是否已获得匹配目标
+    std::optional<uint64_t> target_lost_since_ms_;  ///< 目标持续失效起点
+    /// 最近一次执行的取消动作时刻（500ms 内不重复下发命令）。
+    std::optional<uint64_t> last_cancel_action_ms_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
     /// 任务故障（S16 FAILSAFE）：捕网执行器 ACK 超时/非 ACCEPTED/PX4 断连/

@@ -109,6 +109,39 @@ PX4/遥控”。
 `assignment_id` 只重发原 65015、起飞原点记录。`PublishStatus` 的 65013 v2
 字段（`assignment_id/target_id/availability/interceptor_type`）同步填写。
 
+**65014 取消、S5 target_id 过滤与目标等待/丢失（Task 10，2026-10-22，设计
+§5.1/§7.5）**：
+
+- **取消（`flags.bit1`）**：在 `EvaluateAssignmentEntry` 的重复/普通预检
+  **之前**处理；取消消息只校验协议版本与未知 flags 位，**不要求 bit0**。
+  `assignment_id` 必须匹配当前活动分配：
+  - 未离地（tracker 未消耗空中任务机会且飞行快照非 armed 空中）：S3/S4 复用
+    `AbortTakeoff(kCancelledByGcs, "地面站取消")`（停流、必要时一次 DISARM、
+    回 READY、65015 cancelled/aborted）；S2 已接受未进 S3 的防御路径
+    `AbortOnGround()` 后保持 READY；
+  - 已离地（tracker 已消耗任务机会或 S5~S13）：`AbortAirborne()` → **S12**，
+    65015 cancelled/aborted（`cancelled_by_gcs`），不空中 disarm、不触发 187。
+    已处于 S12/S13/S14 时只记录并回执，不把降落链重置回 S12；
+  - 幂等：重复同一 `assignment_id` 的取消重发最近 cancelled 结果；500ms 内
+    不重复执行取消动作（含 DISARM）；无活动分配且该 id 从未处理 →
+    rejected(`not_ready`)；活动分配是其他 id → rejected(`already_assigned`)；
+  - 被取消的分配不可恢复（重复 65014 重发 cancelled）；地面取消后回到 READY，
+    可用**新的** `assignment_id` 重新分配（不自动重试）。
+- **S5 target_id 过滤**：仅控制任务（`command_sender_ != nullptr` 且 tracker
+  持有活动分配）下，`HasFreshGroundTarget`/`HasFreshEstimate` 对
+  `target_id != assignment.target_id` 返回 false——非匹配 65010/估计不进入 S5、
+  不更新位置引导、不参与交接；`GroundStationLink` 仍可照常做链路 ACK。
+  影子模式（未注入命令接口）保持既有 S5 行为，不过滤。
+- **S5 目标看门狗**：S5 入口（`TransitionTo(kGpsApproach)`）在控制任务下记录
+  `target_wait_started_ms_`；每拍 `EvaluateTargetWatchdog()`：
+  - 未获得匹配目标（估计或 65010 任一新鲜即视为获得）超过
+    `takeoff.target_wait_timeout` → 65015 aborted(`target_wait_timeout`) → S12；
+  - 已获得后匹配目标持续失效超过 `takeoff.target_lost_timeout` →
+    65015 aborted(`target_lost`) → S12；恢复即清零丢失计时；
+  - 中止当拍停发位置引导（S12 接管返航意图），不触发拦截/187；
+    `mission_abort_latched_` 保证一次任务只中止一次（接受新分配/`Start()` 复位）；
+  - 仅在 S5 生效，不改变 S6/S7 既有交接/视觉丢失逻辑；影子模式不启用。
+
 **S3 ARMING / S4 TAKEOFF 自动起飞（Task 5，2026-10-22）**：由
 `EvaluateTakeoffSequence()` 每决策拍推进（放在分配入口之后、交接/目标/拦截
 逻辑之前；S3/S4 期间后者按状态判定均不参与）。
@@ -170,9 +203,9 @@ PX4/遥控”。
 落地（Task 5）；`FlightController::ControlAuthority::kBootstrap` 的原点保持
 流已在控制器侧实现（Task 6），PX4 参数读取（`BAT_LOW_THR`/
 `COM_LOW_BAT_ACT`）由 Px4Link 提供（Task 7），状态机侧电池门禁（S2 预检、
-availability、飞行中 S12）由 Task 8 接入。**已知缺口**：65014 `flags.bit1`
-取消、S5 的 65010 `target_id` 过滤以及 `target_wait_timeout`/
-`target_lost_timeout` 收口尚未接线；当前 S5 对目标过期只置告警位。
+availability、飞行中 S12）由 Task 8 接入；65014 `flags.bit1` 取消、S5 的
+`target_id` 过滤与 `target_wait_timeout`/`target_lost_timeout` 收口由 Task 10
+接入（2026-10-22），原「已知缺口」已关闭。
 
 ## 接口与数据流
 
@@ -265,6 +298,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - **S2 分配预检（Task 4，2026-10-22）**：只在`CurrentState()==kReady`处理
   最新一条 65014，且每条消息只处理一次（处理即清空`latest_assignment_`，
   不按 100ms 决策周期重复回 65015）。检查顺序：
+  0. `flags.bit1` 取消：**先于**重复/普通预检处理（取消不要求 bit0；活动分配
+     在 tracker 中已记 accepted，若先查重复会把取消误当重复分配）；
   1. 重复`assignment_id`：`MissionAssignmentTracker::WasHandled` 命中 → 只重发
      原 65015（result/reason 不变），不再预检、不迁移；
   2. `protocol_version == 1`，否则 `unsupported_version`；
@@ -349,6 +384,26 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - **控制路径下 65010 不再单独进入 S5**：S2→S5 分支增加
   `command_sender_ == nullptr` 条件；注入命令接口后必须由 65014 分配进入 S3
   （Task 5 再推进 S4/S5）。
+- **65014 取消（Task 10）**：`HandleAssignmentCancel()` 位于
+  `EvaluateAssignmentEntry()` 最前。取消匹配活动分配后按 `AssignmentAirborne()`
+  （tracker `ConsumedAirborneMission()` 或飞行快照 `armed && !landed`）分叉：
+  地面 S3/S4 → `AbortTakeoff(cancelled_by_gcs)`；空中 → `AbortAirborne()` +
+  `TransitionTo(kReturnHome)` + 65015 aborted。S12/S13/S14 收到取消只
+  `RememberResult`/回执，不重置降落链。500ms 内不重复执行取消动作；
+  重复 id 重发最近结果。取消不触发拦截，`AbortAirborne()` 后消费机会已存在，
+  后续 `Terminal()` 由 S14 完成。
+- **S5 target_id 过滤（Task 10）**：控制任务下 `TargetMatchesAssignment()`
+  使用 `MissionAssignmentTracker::AllowsTarget()`（`target_id != 0` 且等于
+  `assignment.target_id`），在 `HasFreshGroundTarget`/`HasFreshEstimate` 内
+  统一生效，因此 S5 引导、交接判据、热备份与看门狗看到的是同一口径；
+  非匹配 65010 不影响状态机（GroundStationLink 的链路 ACK 不受影响）。
+- **S5 目标等待/丢失看门狗（Task 10）**：`Evaluate()` 中位于
+  `EvaluateBatteryGuard()` 之后、`EvaluateHandover()` 之前；只在
+  `command_sender_ != nullptr` 且状态为 S5 时评估。`HasFreshAssignedTarget()`
+  将“匹配分配的估计或 65010 任一新鲜”视为已获得目标；等待/丢失超时统一走
+  `AbortForTargetWatchdog()`（`StopPositionIntent` + `AbortAirborne` +
+  65015 aborted + S12），`mission_abort_latched_` 防止重复中止。S6/S7 的
+  交接与视觉丢失逻辑不变。
 - `GPS_APPROACH`阶段维护目标新鲜度和状态回传；估计输入已绑定且估计新鲜有效时
   （`TargetState.valid=true` 且 `receive_time_ms + valid_for_ms` 未过期），
   发布`kPositionGuide`意图：`target_x/y/z = pos_x/y/z_m`（`pos_z_m`为 NaN 时原样
@@ -533,7 +588,10 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）；
   **任务分配被拒绝（节流，带 assignment_id/target_id/reason/当前状态）**；
   **自动起飞中止（带 reason/detail/airborne/uncertain，每次中止一条）/
-  地面中止 DISARM 入队失败（不重试）**（Task 5）。
+  地面中止 DISARM 入队失败（不重试）**（Task 5）；
+  **任务取消被拒绝（节流）/地面站取消任务（地面/已离地，状态变化级每条）/
+  S5 目标看门狗中止（带 reason/detail）**（Task 10）。
+- INFO（Task 10）：**S5 目标看门狗启动**（target_id/wait_timeout/lost_timeout）。
 - ERROR：订阅或线程启动异常；运行中重绑输入/注入接口；估计输入部分绑定；
   估计输入已绑定但未注入估计器诊断（交接不评估）。
 - 高频周期（100ms 决策、10Hz 意图重发、S7 逐拍伺服计算）不打印日志；
@@ -722,6 +780,26 @@ ctest --test-dir build --output-on-failure
     中止；持续后 → S12，且 S12 不重复 aborted；
   - `BatteryTelemetryLossInGpsApproachReturnsImmediately`：S5 遥测失效
     → 立即 aborted/battery_telemetry_invalid → S12，不等防抖、无 187。
+- 取消/目标过滤/看门狗（Task 10，2026-10-22）：
+  - `CancelOnGroundInArmingReturnsReady`：S3 地面取消（无 bit0）→ 65015
+    cancelled/cancelled_by_gcs、回 READY、零 176/400/187；重复取消重发结果；
+  - `CancelGroundArmedSendsDisarmOnce`：地面 armed 取消 → 一次 DISARM
+    (param1=0)，重复取消不重发命令；
+  - `CancelAirborneInTakeoffReturnsHomeWithoutDisarm`：S4 空中取消 → S12、
+    availability=returning、不 disarm、无 187；
+  - `CancelAirborneInGpsApproachReturnsHome`：S5 取消 → S12、不 disarm、无 187；
+  - `CancelWithoutActiveAssignmentRejected`：无活动分配取消 →
+    rejected/not_ready、保持 S2；
+  - `S5TargetIdFilterIgnoresNonMatchingTargets`：控制任务 S5 下 target_id=99 的
+    65010/估计不产生位置意图；匹配 target_id=7 后恢复引导；
+  - `S5TargetWaitTimeoutReturnsHome`：S5 无匹配目标超过
+    `target_wait_timeout=300ms` → aborted/target_wait_timeout → S12，不重复
+    aborted、无 187；
+  - `S5TargetLostTimeoutWithRecovery`：S5 短暂丢失（200ms < 400ms）并恢复不
+    中止；再次持续失效超过 `target_lost_timeout=400ms` → aborted/target_lost
+    → S12，无 187；
+  - `ShadowS5IgnoresFilterAndWaitTimeout`：影子 S5 不按 target_id 过滤，
+    `target_wait_timeout` 不生效（既有影子行为保持）。
 - SITL 返航专项（2026-10-19，`tools/px4_link_smoke --sitl-stage4-return` +
   `config/px4_sitl_return.json`）：S7→S9→S10 发射→S12 算力板返航 Home→
   S13 AUTO.LAND→S14 DISARMED 全 PASS（状态机迁移 11 次、错误 0；最大高度
@@ -758,6 +836,16 @@ ctest --test-dir build --output-on-failure
   target_id=0 非法、`valid_for_ms>0` 且未过期（按本机收到时刻起算）。
 - **重复发送同一 assignment_id 一直回原拒绝/中止**：这是幂等语义（只重发
   最新 65015，不再预检）；地面站需换新的 assignment_id 才能重新分配。
+- **65014 取消回 rejected(not_ready)**：没有活动分配（S2 未分配，或已
+  cancel/terminal）；取消必须携带当前活动分配的 assignment_id。地面取消后
+  机载回 READY，可用**新** id 重新分配；空中取消后 tracker 保持
+  returning/terminal，本次上电不再分配。
+- **S5 无目标自动返航 / 目标丢失自动返航**：查 65015 reason
+  `target_wait_timeout`（从未获得匹配目标）或 `target_lost`（获得后持续失效）；
+  阈值取 `takeoff.target_wait_timeout`/`target_lost_timeout`。常见原因是
+  65010 与估计器的 `target_id` 与 `assignment.target_id` 不一致（控制任务下
+  非匹配目标被过滤，不会更新 S5 引导）、估计器断流（`valid=false`/超龄）或
+  65010 过期。
 - **S3 不发 176**：确认已注入命令接口（`enable_control=true` 装配分支）、
   已进入 S3；176 在 `takeoff.bootstrap_lead` 之后才发，期间每拍只发
   kTakeoff 原点意图。若日志有「176 入队失败」→ 命令链路/队列异常，按设计

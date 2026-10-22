@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "config/config.h"
 #include "perception/target_estimator.h"
@@ -2130,6 +2131,13 @@ common::MissionAssignment MakeAssignment(uint32_t assignment_id) {
     return assignment;
 }
 
+/// 65014 取消当前分配（flags.bit1；取消不要求 bit0 授权位）。
+common::MissionAssignment MakeCancel(uint32_t assignment_id) {
+    common::MissionAssignment assignment = MakeAssignment(assignment_id);
+    assignment.flags = communication::kMissionAssignFlagCancel;
+    return assignment;
+}
+
 std::optional<common::MissionAssignmentAck> WaitForAssignmentAck(
     common::Topic<common::MissionAssignmentAck>::Subscription& subscription,
     std::chrono::milliseconds timeout = 1500ms) {
@@ -3502,6 +3510,393 @@ TEST(MissionStateMachineTest, BatteryAbortLandsThenTerminal) {
     EXPECT_EQ(rejected->availability,
               common::MissionAvailability::kTerminal);
     EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+}
+
+// ---------------------------------------------------------------------------
+// 65014 取消、S5 target_id 过滤与目标等待/丢失收口（2026-10-22，Task 10）
+// ---------------------------------------------------------------------------
+
+// 地面 S3（未 armed）取消：65015 cancelled(cancelled_by_gcs)、回 READY、
+// 不产生 176/400（bootstrap_lead 未到）、无 187；重复取消重发同一结果。
+TEST(MissionStateMachineTest, CancelOnGroundInArmingReturnsReady) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(/*lead=*/5000ms, 5000ms,
+                                                    5000ms, 5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(301)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+
+    ASSERT_TRUE(harness.Send(MakeCancel(301)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->assignment_id, 301U);
+    EXPECT_EQ(cancelled->target_id, 7U);
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(cancelled->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "bootstrap_lead 内地面取消不得发 176/400";
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U);
+    }
+
+    // 重复取消：同一 assignment_id 重发最近 cancelled 结果，不再迁移/发命令。
+    DrainAcks(harness.ack_subscription);
+    ASSERT_TRUE(harness.Send(MakeCancel(301)));
+    const auto duplicate = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(duplicate.has_value());
+    EXPECT_EQ(duplicate->assignment_id, 301U);
+    EXPECT_EQ(duplicate->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(duplicate->availability, common::MissionAvailability::kReady);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+// 地面取消且 PX4 仍 armed+landed：只发一次 DISARM(param1=0)，不重试；
+// 重复取消不重复下发命令。
+TEST(MissionStateMachineTest, CancelGroundArmedSendsDisarmOnce) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 3000ms, 3000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(302)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));  // 176
+
+    // 地面 armed（landed=true，模式仍 0/0）→ 取消按地面中止处置。
+    auto armed_ground = MakeGroundedFlight();
+    armed_ground.armed = true;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, armed_ground));
+
+    ASSERT_TRUE(harness.Send(MakeCancel(302)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    auto history = harness.sender.History();
+    ASSERT_GE(history.size(), 2U);
+    EXPECT_EQ(history[1].command, 400U);
+    EXPECT_FLOAT_EQ(history[1].params[0], 0.0f) << "地面取消发 DISARM";
+
+    // 重复取消：只重发结果，不再发 DISARM。
+    DrainAcks(harness.ack_subscription);
+    ASSERT_TRUE(harness.Send(MakeCancel(302)));
+    ASSERT_TRUE(WaitForAckWithResult(harness.ack_subscription,
+                                     common::MissionAssignmentResult::
+                                         kCancelledOrAborted,
+                                     2000ms)
+                    .has_value());
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "DISARM 只发一次";
+}
+
+// 已离地（S4）取消：tracker AbortAirborne → S12，65015 cancelled；不空中
+// disarm、不触发 187。
+TEST(MissionStateMachineTest, CancelAirborneInTakeoffReturnsHomeWithoutDisarm) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(303)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    ASSERT_TRUE(harness.Send(MakeCancel(303)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->assignment_id, 303U);
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReturnHome);
+    EXPECT_EQ(cancelled->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中取消不得 disarm";
+        }
+        EXPECT_NE(call.command, 187U) << "取消不得触发发射";
+    }
+}
+
+// 已离地（S5）取消：中止分配 → S12；停发任务位置引导，无 disarm/187。
+TEST(MissionStateMachineTest, CancelAirborneInGpsApproachReturnsHome) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 304));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    ASSERT_TRUE(harness.Send(MakeCancel(304)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReturnHome);
+    EXPECT_EQ(cancelled->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中取消不得 disarm";
+        }
+        EXPECT_NE(call.command, 187U) << "取消不得触发发射";
+    }
+}
+
+// 无活动分配且 assignment_id 从未处理：取消回 rejected(not_ready)，保持 S2。
+TEST(MissionStateMachineTest, CancelWithoutActiveAssignmentRejected) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.Send(MakeCancel(401)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->assignment_id, 401U);
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason, common::MissionAssignmentReason::kNotReady);
+    EXPECT_EQ(rejected->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+}
+
+// 控制任务 S5：非本分配 target_id 的 65010/估计不得更新位置引导，也不进入
+// 交接；匹配 target_id 后才发布位置意图。
+TEST(MissionStateMachineTest, S5TargetIdFilterIgnoresNonMatchingTargets) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 305));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+    DrainIntents(harness.intent_subscription);
+
+    // 非匹配 65010（target_id=99）与估计：状态机忽略，不发布位置意图。
+    auto foreign_ground = MakeFreshGroundTarget();
+    foreign_ground.target_id = 99;
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        foreign_ground))
+                    .accepted);
+    auto foreign_estimate = MakeValidEstimatedTarget();
+    foreign_estimate.target_id = 99;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        foreign_estimate))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+    EXPECT_FALSE(WaitForIntent(
+                     harness.intent_subscription,
+                     [](const common::ControlIntent& value) {
+                         return value.type ==
+                                common::ControlIntentType::kPositionGuide;
+                     },
+                     100ms)
+                     .has_value())
+        << "非匹配 target_id 不得产生位置引导";
+
+    // 匹配 target_id=7 的估计 → S5 位置意图恢复。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    const auto intent = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kPositionGuide;
+        });
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_FLOAT_EQ(intent->target_x, 12.5f);
+    EXPECT_FLOAT_EQ(intent->target_y, -3.0f);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// 控制任务 S5 无匹配目标：超过 target_wait_timeout → 65015
+// aborted(target_wait_timeout)，tracker 转 returning，S12 返航；无 187。
+TEST(MissionStateMachineTest, S5TargetWaitTimeoutReturnsHome) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 306));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->assignment_id, 306U);
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTargetWaitTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReturnHome);
+    EXPECT_EQ(aborted->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "目标等待超时不得触发发射";
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+    }
+
+    // 一次任务只中止一次：S12 后不再重复 65015 aborted。
+    DrainAcks(harness.ack_subscription);
+    std::this_thread::sleep_for(500ms);
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "S12 不得重复 aborted";
+}
+
+// 控制任务 S5：已获得匹配目标后失效，短暂丢失不触发；恢复后计时清零；
+// 再次持续失效超过 target_lost_timeout → 65015 aborted(target_lost) + S12。
+TEST(MissionStateMachineTest, S5TargetLostTimeoutWithRecovery) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 400ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 307));
+
+    // 先获得匹配目标（位置意图出现即说明已进入引导）。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return value.type ==
+                               common::ControlIntentType::kPositionGuide;
+                    })
+                    .has_value());
+
+    // 短暂丢失（200ms < 400ms）后恢复：不得中止，丢失计时清零。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "短暂丢失并恢复不得中止任务";
+
+    // 再次持续失效超过 400ms → 中止返航。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kTargetLost);
+    EXPECT_EQ(aborted->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "目标丢失中止不得触发发射";
+    }
+}
+
+// 影子兼容：未注入命令接口时 S5 保持既有行为——不按 target_id 过滤，
+// target_wait_timeout 不生效（不自动中止）。
+TEST(MissionStateMachineTest, ShadowS5IgnoresFilterAndWaitTimeout) {
+    auto config = MakeAssignmentHarnessConfig();
+    config.takeoff.target_wait_timeout = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 影子不过滤：target_id=99 的估计仍发布位置意图（既有行为）。
+    auto foreign_estimate = MakeValidEstimatedTarget();
+    foreign_estimate.target_id = 99;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        foreign_estimate))
+                    .accepted);
+    EXPECT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return value.type ==
+                               common::ControlIntentType::kPositionGuide;
+                    })
+                    .has_value())
+        << "影子模式不得按 target_id 过滤";
+
+    // 影子不启用目标看门狗：超过 200ms 仍停在 S5。
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
 }
 
 }  // namespace
