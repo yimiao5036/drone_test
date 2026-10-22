@@ -26,10 +26,8 @@ constexpr uint16_t kMissionAssignMessageType = 65014;
 constexpr uint16_t kMissionAssignAckMessageType = 65015;
 constexpr uint8_t kMissionAssignmentProtocolVersion = 1;
 constexpr uint8_t kTrackTargetProtocolVersion = 1;
-/// 65012 与 65013 的版本号已拆分：65013 v2 才携带 assignment/availability。
-/// kStatusProtocolVersion 为 65012/65013 旧共享常量，暂保留给现有编码路径，
-/// 65013 编码切换到 kMissionStatusProtocolVersion 在后续任务完成。
-constexpr uint8_t kStatusProtocolVersion = 1;
+/// 65012 与 65013 的协议版本独立：65013 v2 才携带 assignment/availability，
+/// 65012 保持 v1；两者不再共用版本常量。
 constexpr uint8_t kHealthStatusProtocolVersion = 1;
 constexpr uint8_t kMissionStatusProtocolVersion = 2;
 constexpr uint8_t kMissionAssignFlagAuthorized = 1U << 0U;  ///< bit0=授权自动起飞
@@ -153,6 +151,13 @@ public:
     /// 目标协议当前预留；协议确定前真实实现不会发布伪造目标。
     virtual common::Topic<common::GroundStationTarget>& TargetOutput() = 0;
 
+    /// 65014 任务分配解析结果。地址双字段匹配本机后才发布；
+    /// 版本/标记/拦截类型等语义校验由状态机负责。
+    virtual common::Topic<common::MissionAssignment>& MissionAssignmentOutput() = 0;
+    /// 绑定 65015 任务分配回执输入。收到一条回执即按协议编码发送给 255/190。
+    virtual void SetMissionAssignmentAckInput(
+        common::Topic<common::MissionAssignmentAck>& ack) = 0;
+
     /// 绑定 PX4 飞行状态快照。必须在 Start 前调用。
     virtual void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) = 0;
@@ -183,6 +188,9 @@ public:
     GroundStationTimeSyncStatus GetTimeSyncStatus() const override;
 
     common::Topic<common::GroundStationTarget>& TargetOutput() override;
+    common::Topic<common::MissionAssignment>& MissionAssignmentOutput() override;
+    void SetMissionAssignmentAckInput(
+        common::Topic<common::MissionAssignmentAck>& ack) override;
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -214,6 +222,9 @@ public:
     GroundStationTimeSyncStatus GetTimeSyncStatus() const override;
 
     common::Topic<common::GroundStationTarget>& TargetOutput() override;
+    common::Topic<common::MissionAssignment>& MissionAssignmentOutput() override;
+    void SetMissionAssignmentAckInput(
+        common::Topic<common::MissionAssignmentAck>& ack) override;
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -230,6 +241,7 @@ private:
     uint64_t receive_count_ = 0;
     uint64_t error_count_ = 0;
     common::Topic<common::GroundStationTarget> target_output_;
+    common::Topic<common::MissionAssignment> mission_assignment_output_;
 };
 
 }  // namespace drone::communication

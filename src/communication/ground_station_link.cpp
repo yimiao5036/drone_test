@@ -143,6 +143,15 @@ bool ShouldLogThrottled(uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+// 65012/65013/65014/65015 均使用 MAVLink2 短帧：
+// V2_EXTENSION 固定头 5 字节 + 协议有效数据 55 字节，payload_len=60；
+// 协议 offset 54 固定写入 1，避免尾部零字节被 MAVLink2 截断。
+constexpr uint16_t kV2ExtensionFixedHeaderLength = 5;
+constexpr uint16_t kStatusShortFramePayloadLength = 55;
+constexpr uint16_t kStatusShortFrameLength =
+    kV2ExtensionFixedHeaderLength + kStatusShortFramePayloadLength;
+constexpr uint8_t kFrameLengthMarker = 1;
+
 // 把浮点物理量乘 scale 换算成 MAVLink 整数字段，跳过非有限值并夹逼到 [min,max]。
 template <typename T>
 T ClampRounded(float value, float scale, T minimum, T maximum) {
@@ -313,6 +322,12 @@ public:
                 health_subscription_ = health_topic_->Subscribe(
                     2, common::Topic<common::HealthStatus>::OverflowPolicy::kDropOldest);
             }
+            if (mission_assignment_ack_topic_ != nullptr) {
+                mission_assignment_ack_subscription_ =
+                    mission_assignment_ack_topic_->Subscribe(
+                        8, common::Topic<common::MissionAssignmentAck>::OverflowPolicy::
+                               kDropOldest);
+            }
             latest_state_.reset();
             latest_health_.reset();
             latest_mission_status_.reset();
@@ -327,6 +342,7 @@ public:
             running_.store(false, std::memory_order_release);
             connected_.store(false, std::memory_order_release);
             flight_state_subscription_.Reset();
+            mission_assignment_ack_subscription_.Reset();
             serial_.Close();
             RecordError((std::string("地面站通信启动失败: ") + error.what()).c_str());
             return false;
@@ -348,6 +364,7 @@ public:
         flight_state_subscription_.Reset();
         mission_status_subscription_.Reset();
         health_subscription_.Reset();
+        mission_assignment_ack_subscription_.Reset();
         latest_state_.reset();
         latest_health_.reset();
         latest_mission_status_.reset();
@@ -366,6 +383,20 @@ public:
     }
 
     common::Topic<common::GroundStationTarget>& TargetOutput() { return target_output_; }
+
+    common::Topic<common::MissionAssignment>& MissionAssignmentOutput() {
+        return mission_assignment_output_;
+    }
+
+    // 绑定 65015 回执输入。必须在 Start 前调用，运行中不允许改绑。
+    void SetMissionAssignmentAckInput(common::Topic<common::MissionAssignmentAck>& topic) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("地面站 MissionAssignmentAck Topic 必须在 Start 前绑定");
+            return;
+        }
+        mission_assignment_ack_topic_ = &topic;
+    }
 
     // 绑定飞行状态输入。必须在 Start 前调用，运行中不允许改绑。
     void SetFlightStateInput(common::Topic<common::FlightStateSnapshot>& topic) {
@@ -408,6 +439,8 @@ private:
         common::Topic<common::FlightStateSnapshot>::Subscription;
     using HealthSubscription = common::Topic<common::HealthStatus>::Subscription;
     using MissionSubscription = common::Topic<common::MissionStatus>::Subscription;
+    using AssignmentAckSubscription =
+        common::Topic<common::MissionAssignmentAck>::Subscription;
 
     struct Deadlines {
         std::chrono::steady_clock::time_point heartbeat;
@@ -447,6 +480,7 @@ private:
             // 把各输入队列里最新的状态捞出，并判断是否有“事件”需要立即下行。
             DrainFlightState();
             DrainStatusInputs();
+            DrainMissionAssignmentAcks();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
             CheckTimeSyncTimeout(current_ms);
@@ -562,11 +596,23 @@ private:
                                next.task_phase != latest_mission_status_->task_phase ||
                                next.active_warning_bits != latest_mission_status_->active_warning_bits ||
                                next.interception_authorized != latest_mission_status_->interception_authorized ||
-                               next.power_status_bits != latest_mission_status_->power_status_bits;
+                               next.power_status_bits != latest_mission_status_->power_status_bits ||
+                               // v2 分配字段变化同样立即下行，调度器据此更新可用状态。
+                               next.assignment_id != latest_mission_status_->assignment_id ||
+                               next.target_id != latest_mission_status_->target_id ||
+                               next.availability != latest_mission_status_->availability ||
+                               next.interceptor_type != latest_mission_status_->interceptor_type;
             latest_mission_status_ = next;
             if (event) {
                 (void)SendMissionStatus(next);
             }
+        }
+    }
+
+    // 逐条消费 65015 回执输入。分配回执是事件消息，不能只保留最新一条。
+    void DrainMissionAssignmentAcks() {
+        while (auto message = mission_assignment_ack_subscription_.TryTake()) {
+            (void)SendMissionAssignmentAck(**message);
         }
     }
 
@@ -654,7 +700,7 @@ private:
         uint8_t alt_reference = 0;
     };
 
-    // 处理 V2_EXTENSION：只收地面站来源，识别目标协议 message_type 并转入更新处理。
+    // 处理 V2_EXTENSION：只收地面站来源，按 message_type 分发目标更新或任务分配。
     void HandleV2Extension(const mavlink_message_t& message) {
         if (message.sysid != config_.ground_system_id ||
             message.compid != config_.ground_component_id) {
@@ -668,10 +714,119 @@ private:
                         extension.message_type, extension.target_system,
                         extension.target_component, count);
         }
+        if (extension.message_type == kMissionAssignMessageType) {
+            HandleMissionAssignment(message, extension);
+            return;
+        }
         if (extension.message_type != kTrackTargetUpdateMessageType) {
             return;
         }
         HandleTrackTargetUpdate(extension);
+    }
+
+    // 65014 任务分配 payload 的链路层镜像（小端，协议有效 55 字节）。
+    struct MissionAssignPayload {
+        uint8_t protocol_version = 0;
+        uint32_t assignment_id = 0;
+        uint32_t target_id = 0;
+        uint8_t interceptor_type = 0;
+        uint8_t flags = 0;
+        uint32_t valid_for_ms = 0;
+        uint8_t target_system = 0;
+        uint8_t target_component = 0;
+        uint8_t frame_length_marker = 0;
+    };
+
+    // 处理 MISSION_ASSIGN(65014)：来源已在 HandleV2Extension 过滤；这里只做帧长与
+    // 地址双字段校验，地址匹配后原样发布，版本/flags/类型/target_id 语义留给状态机。
+    // 地址不匹配必须静默丢弃并禁止回 65015，避免广播分配触发任何飞机动作。
+    void HandleMissionAssignment(const mavlink_message_t& message,
+                                 const mavlink_v2_extension_t& extension) {
+        const uint64_t receive_count = ++mission_assign_receive_count_;
+        if (ShouldLogThrottled(receive_count)) {
+            SPDLOG_INFO("收到任务分配: target={}/{} len={} count={}",
+                        extension.target_system, extension.target_component,
+                        message.len, receive_count);
+        }
+        // 短帧/截断帧不解析，避免把零填充的地址字段误判为本机地址。
+        if (message.len < kStatusShortFrameLength) {
+            const uint64_t invalid_count = ++mission_assign_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("任务分配帧长不足: len={} required={} count={}",
+                            message.len, kStatusShortFrameLength, invalid_count);
+            }
+            return;
+        }
+
+        const MissionAssignPayload payload = DecodeMissionAssignment(extension.payload);
+        // 帧头与 payload 的双字段地址必须同时匹配本机。
+        if (extension.target_system != config_.aircraft_system_id ||
+            extension.target_component != config_.aircraft_component_id ||
+            payload.target_system != config_.aircraft_system_id ||
+            payload.target_component != config_.aircraft_component_id) {
+            const uint64_t mismatch_count = ++mission_assign_address_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN(
+                    "任务分配地址不匹配: header={}/{} payload={}/{} local={}/{} count={}",
+                    extension.target_system, extension.target_component,
+                    payload.target_system, payload.target_component,
+                    config_.aircraft_system_id, config_.aircraft_component_id,
+                    mismatch_count);
+            }
+            return;
+        }
+        // 短帧长度标记必须为 1；缺失说明对端未按 55 字节协议编码。
+        if (payload.frame_length_marker != kFrameLengthMarker) {
+            const uint64_t invalid_count = ++mission_assign_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("任务分配帧长度标记非法: marker={} count={}",
+                            payload.frame_length_marker, invalid_count);
+            }
+            return;
+        }
+
+        const uint64_t receive_time_ms = MonotonicMs();
+        common::MissionAssignment assignment;
+        assignment.header.sequence = receive_count;
+        // 65014 不携带地面站生成时刻，source_time_ms 保持 0。
+        assignment.header.receive_time_ms = receive_time_ms;
+        assignment.header.valid_for_ms = payload.valid_for_ms;
+        assignment.header.source_id = config_.ground_system_id;
+        assignment.header.health = 1;
+        // 任务分配不携带空间数据，frame_id 不指向任何坐标系。
+        assignment.header.frame_id = 0;
+        assignment.protocol_version = payload.protocol_version;
+        assignment.assignment_id = payload.assignment_id;
+        assignment.target_id = payload.target_id;
+        assignment.interceptor_type = payload.interceptor_type;
+        assignment.flags = payload.flags;
+        assignment.valid_for_ms = payload.valid_for_ms;
+        assignment.received_ms = receive_time_ms;
+        (void)mission_assignment_output_.Publish(
+            std::make_shared<const common::MissionAssignment>(assignment));
+        const uint64_t publish_count = ++mission_assign_publish_count_;
+        if (ShouldLogThrottled(publish_count)) {
+            SPDLOG_INFO(
+                "任务分配已发布: version={} assignment_id={} target_id={} type={} flags={} valid_for_ms={} count={}",
+                assignment.protocol_version, assignment.assignment_id,
+                assignment.target_id, assignment.interceptor_type,
+                assignment.flags, assignment.valid_for_ms, publish_count);
+        }
+    }
+
+    // 逐字段小端解码 65014 payload；调用方已保证帧长不少于 55 字节。
+    MissionAssignPayload DecodeMissionAssignment(const uint8_t* data) const {
+        MissionAssignPayload payload;
+        payload.protocol_version = ReadLe<uint8_t>(data, 0);
+        payload.assignment_id = ReadLe<uint32_t>(data, 1);
+        payload.target_id = ReadLe<uint32_t>(data, 5);
+        payload.interceptor_type = ReadLe<uint8_t>(data, 9);
+        payload.flags = ReadLe<uint8_t>(data, 10);
+        payload.valid_for_ms = ReadLe<uint32_t>(data, 11);
+        payload.target_system = ReadLe<uint8_t>(data, 50);
+        payload.target_component = ReadLe<uint8_t>(data, 51);
+        payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
+        return payload;
     }
 
     // 处理 TRACK_TARGET_UPDATE：依次做地址匹配、协议版本、坐标、身份、时间同步、
@@ -976,10 +1131,37 @@ private:
         });
     }
 
+    // 发送 65015 任务分配回执：以本机身份发往 255/190，不要求地面站再回 ACK。
+    bool SendMissionAssignmentAck(const common::MissionAssignmentAck& ack) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, kMissionAssignmentProtocolVersion);
+        WriteLe<uint32_t>(payload, 1, ack.assignment_id);
+        WriteLe<uint32_t>(payload, 5, ack.target_id);
+        WriteLe<uint8_t>(payload, 9, static_cast<uint8_t>(ack.result));
+        WriteLe<uint8_t>(payload, 10, static_cast<uint8_t>(ack.reason));
+        WriteLe<uint8_t>(payload, 11, static_cast<uint8_t>(ack.mission_state));
+        WriteLe<uint8_t>(payload, 12, static_cast<uint8_t>(ack.availability));
+        WriteLe<uint8_t>(payload, 26, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 27, config_.aircraft_component_id);
+        // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
+        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
+        const bool sent = SendStatusExtension(kMissionAssignAckMessageType, payload);
+        const uint64_t count = ++mission_assign_ack_send_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO(
+                "任务分配ACK发送{}: assignment_id={} target_id={} result={} reason={} state={} availability={} count={}",
+                sent ? "成功" : "失败", ack.assignment_id, ack.target_id,
+                static_cast<uint8_t>(ack.result), static_cast<uint8_t>(ack.reason),
+                static_cast<uint8_t>(ack.mission_state),
+                static_cast<uint8_t>(ack.availability), count);
+        }
+        return sent;
+    }
+
     bool SendHealthStatus(const common::HealthStatus& health) {
         std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
         const bool cpu_load_valid = std::isfinite(health.cpu_load_pct);
-        WriteLe<uint8_t>(payload, 0, kStatusProtocolVersion);
+        WriteLe<uint8_t>(payload, 0, kHealthStatusProtocolVersion);
         WriteLe<uint32_t>(payload, 1, static_cast<uint32_t>(health.header.sequence));
         WriteLe<uint32_t>(payload, 5, health.link_health_bits);
         WriteLe<uint32_t>(payload, 9, health.device_health_bits);
@@ -998,7 +1180,7 @@ private:
 
     bool SendMissionStatus(const common::MissionStatus& mission) {
         std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
-        WriteLe<uint8_t>(payload, 0, kStatusProtocolVersion);
+        WriteLe<uint8_t>(payload, 0, kMissionStatusProtocolVersion);
         WriteLe<uint32_t>(payload, 1, static_cast<uint32_t>(mission.header.sequence));
         WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(mission.state));
         WriteLe<uint8_t>(payload, 6, mission.control_source);
@@ -1011,8 +1193,13 @@ private:
         WriteLe<uint8_t>(payload, 26, config_.aircraft_system_id);
         WriteLe<uint8_t>(payload, 27, config_.aircraft_component_id);
         WriteLe<uint64_t>(payload, 32, mission.header.receive_time_ms);
+        // 65013 v2 扩展字段复用原保留区，offset 0~39 与 v1 完全一致。
+        WriteLe<uint32_t>(payload, 40, mission.assignment_id);
+        WriteLe<uint32_t>(payload, 44, mission.target_id);
+        WriteLe<uint8_t>(payload, 48, static_cast<uint8_t>(mission.availability));
+        WriteLe<uint8_t>(payload, 49, mission.interceptor_type);
         // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
-        WriteLe<uint8_t>(payload, 54, 1);
+        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
         return SendStatusExtension(kMissionStatusMessageType, payload);
     }
 
@@ -1512,13 +1699,16 @@ private:
     common::Topic<common::FlightStateSnapshot>* flight_state_topic_ = nullptr;
     common::Topic<common::MissionStatus>* mission_status_topic_ = nullptr;
     common::Topic<common::HealthStatus>* health_topic_ = nullptr;
+    common::Topic<common::MissionAssignmentAck>* mission_assignment_ack_topic_ = nullptr;
     FlightSubscription flight_state_subscription_;
     HealthSubscription health_subscription_;
     MissionSubscription mission_status_subscription_;
+    AssignmentAckSubscription mission_assignment_ack_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     std::optional<common::HealthStatus> latest_health_;
     std::optional<common::MissionStatus> latest_mission_status_;
     common::Topic<common::GroundStationTarget> target_output_;
+    common::Topic<common::MissionAssignment> mission_assignment_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;
     uint64_t target_v2_extension_count_ = 0;
@@ -1526,6 +1716,11 @@ private:
     uint64_t target_update_address_mismatch_count_ = 0;
     uint64_t target_publish_count_ = 0;
     uint64_t target_ack_send_count_ = 0;
+    uint64_t mission_assign_receive_count_ = 0;
+    uint64_t mission_assign_address_mismatch_count_ = 0;
+    uint64_t mission_assign_invalid_count_ = 0;
+    uint64_t mission_assign_publish_count_ = 0;
+    uint64_t mission_assign_ack_send_count_ = 0;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 
@@ -1561,6 +1756,14 @@ GroundStationTimeSyncStatus GroundStationLink::GetTimeSyncStatus() const {
 }
 common::Topic<common::GroundStationTarget>& GroundStationLink::TargetOutput() {
     return impl_->TargetOutput();
+}
+common::Topic<common::MissionAssignment>&
+GroundStationLink::MissionAssignmentOutput() {
+    return impl_->MissionAssignmentOutput();
+}
+void GroundStationLink::SetMissionAssignmentAckInput(
+    common::Topic<common::MissionAssignmentAck>& topic) {
+    impl_->SetMissionAssignmentAckInput(topic);
 }
 void GroundStationLink::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>& topic) {
@@ -1603,6 +1806,12 @@ GroundStationTimeSyncStatus GroundStationLinkStub::GetTimeSyncStatus() const {
 common::Topic<common::GroundStationTarget>& GroundStationLinkStub::TargetOutput() {
     return target_output_;
 }
+common::Topic<common::MissionAssignment>&
+GroundStationLinkStub::MissionAssignmentOutput() {
+    return mission_assignment_output_;
+}
+void GroundStationLinkStub::SetMissionAssignmentAckInput(
+    common::Topic<common::MissionAssignmentAck>&) {}
 void GroundStationLinkStub::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>&) {}
 void GroundStationLinkStub::SetMissionStatusInput(

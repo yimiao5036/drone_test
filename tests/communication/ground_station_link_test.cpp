@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -219,6 +220,73 @@ struct TargetUpdateFixture {
     uint8_t protocol_version = kTrackTargetProtocolVersion;
     uint8_t alt_reference = 1;
 };
+
+// 65014 MISSION_ASSIGN 测试编码参数；默认是发给本机 1/25 的合法授权。
+struct MissionAssignFixture {
+    uint8_t protocol_version = kMissionAssignmentProtocolVersion;
+    uint32_t assignment_id = 1001;
+    uint32_t target_id = 7;
+    uint8_t interceptor_type = kNetCaptureAircraftComponentId;
+    uint8_t flags = kMissionAssignFlagAuthorized;
+    uint32_t valid_for_ms = 5000;
+    uint8_t target_system = 1;
+    uint8_t target_component = kNetCaptureAircraftComponentId;
+    uint8_t frame_length_marker = 1;
+};
+
+// protocol_length 用于构造截断短帧：超出该长度的协议字节全部清零，
+// MAVLink2 尾部零字节截断后 message.len 会小于 60。
+std::vector<uint8_t> EncodeMissionAssign(
+    const MissionAssignFixture& assignment, std::size_t protocol_length = 55,
+    uint8_t header_system = 1,
+    uint8_t header_component = kNetCaptureAircraftComponentId) {
+    std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+    WriteLe<uint8_t>(payload, 0, assignment.protocol_version);
+    WriteLe<uint32_t>(payload, 1, assignment.assignment_id);
+    WriteLe<uint32_t>(payload, 5, assignment.target_id);
+    WriteLe<uint8_t>(payload, 9, assignment.interceptor_type);
+    WriteLe<uint8_t>(payload, 10, assignment.flags);
+    WriteLe<uint32_t>(payload, 11, assignment.valid_for_ms);
+    WriteLe<uint8_t>(payload, 50, assignment.target_system);
+    WriteLe<uint8_t>(payload, 51, assignment.target_component);
+    WriteLe<uint8_t>(payload, 54, assignment.frame_length_marker);
+    if (protocol_length < payload.size()) {
+        std::fill(payload.begin() + protocol_length, payload.end(), 0);
+    }
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    return encoder.Encode([&payload, header_system, header_component](
+                              mavlink_status_t* status, mavlink_message_t* message) {
+        return mavlink_msg_v2_extension_pack_status(
+            kGroundStationSystemId, kGroundStationComponentId, status, message, 0,
+            header_system, header_component, kMissionAssignMessageType,
+            payload.data());
+    });
+}
+
+struct MissionAssignAckMessage {
+    mavlink_message_t message{};
+    mavlink_v2_extension_t extension{};
+};
+
+std::optional<MissionAssignAckMessage> ReadMissionAssignAck(
+    PseudoTerminal& terminal) {
+    mavlink_message_t ack{};
+    if (!terminal.WaitFor(
+            [](const mavlink_message_t& message) {
+                if (message.msgid != MAVLINK_MSG_ID_V2_EXTENSION) {
+                    return false;
+                }
+                mavlink_v2_extension_t extension{};
+                mavlink_msg_v2_extension_decode(&message, &extension);
+                return extension.message_type == kMissionAssignAckMessageType;
+            }, 300ms, &ack)) {
+        return std::nullopt;
+    }
+    MissionAssignAckMessage result;
+    result.message = ack;
+    mavlink_msg_v2_extension_decode(&ack, &result.extension);
+    return result;
+}
 
 std::vector<uint8_t> EncodeTrackTargetUpdate(const TargetUpdateFixture& update) {
     std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
@@ -538,7 +606,8 @@ TEST(GroundStationLinkTest, EncodesHealthAndMissionStatusExtensions) {
     EXPECT_EQ(health_message.len, 60);
     EXPECT_EQ(health_message.sysid, 1);
     EXPECT_EQ(health_message.compid, kNetCaptureAircraftComponentId);
-    EXPECT_EQ(ReadLe<uint8_t>(health_extension.payload, 0), kStatusProtocolVersion);
+    // 65012 保持 v1，版本源与 65013 独立。
+    EXPECT_EQ(ReadLe<uint8_t>(health_extension.payload, 0), kHealthStatusProtocolVersion);
     EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 1), 42U);
     EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 5), 0x13U);
     EXPECT_EQ(ReadLe<uint32_t>(health_extension.payload, 9), 0x03U);
@@ -580,6 +649,10 @@ TEST(GroundStationLinkTest, EncodesHealthAndMissionStatusExtensions) {
     mission.front_distance_m = 12.345f;
     mission.interception_authorized = true;
     mission.power_status_bits = 0x03;
+    mission.assignment_id = 1001;
+    mission.target_id = 7;
+    mission.availability = common::MissionAvailability::kAssigned;
+    mission.interceptor_type = kNetCaptureAircraftComponentId;
     ASSERT_TRUE(mission_status.Publish(
         std::make_shared<const common::MissionStatus>(mission)).accepted);
 
@@ -596,7 +669,9 @@ TEST(GroundStationLinkTest, EncodesHealthAndMissionStatusExtensions) {
     mavlink_v2_extension_t mission_extension{};
     mavlink_msg_v2_extension_decode(&mission_message, &mission_extension);
     EXPECT_EQ(mission_message.len, 60);
-    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 0), kStatusProtocolVersion);
+    // 65013 升级到 v2：旧字段 offset 0~39 不变，扩展字段复用原保留区。
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 0),
+              kMissionStatusProtocolVersion);
     EXPECT_EQ(ReadLe<uint32_t>(mission_extension.payload, 1), 9U);
     EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 5),
               static_cast<uint8_t>(common::MissionState::kGpsApproach));
@@ -608,7 +683,178 @@ TEST(GroundStationLinkTest, EncodesHealthAndMissionStatusExtensions) {
     EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 24), 1U);
     EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 25), 3U);
     EXPECT_EQ(ReadLe<uint64_t>(mission_extension.payload, 32), 234567U);
+    EXPECT_EQ(ReadLe<uint32_t>(mission_extension.payload, 40), 1001U);
+    EXPECT_EQ(ReadLe<uint32_t>(mission_extension.payload, 44), 7U);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 48),
+              static_cast<uint8_t>(common::MissionAvailability::kAssigned));
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 49),
+              kNetCaptureAircraftComponentId);
+    EXPECT_EQ(ReadLe<uint8_t>(mission_extension.payload, 54), 1U);
 
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, PublishesMissionAssignmentForMatchingAddress) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto assignment_subscription =
+        link.MissionAssignmentOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    MissionAssignFixture assignment;
+    ASSERT_TRUE(terminal.Write(EncodeMissionAssign(assignment)));
+
+    auto message = assignment_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(message.has_value());
+    const auto& received = **message;
+    EXPECT_EQ(received.protocol_version, kMissionAssignmentProtocolVersion);
+    EXPECT_EQ(received.assignment_id, assignment.assignment_id);
+    EXPECT_EQ(received.target_id, assignment.target_id);
+    EXPECT_EQ(received.interceptor_type, assignment.interceptor_type);
+    EXPECT_EQ(received.flags, assignment.flags);
+    EXPECT_EQ(received.valid_for_ms, assignment.valid_for_ms);
+    EXPECT_EQ(received.header.source_id, kGroundStationSystemId);
+    EXPECT_EQ(received.header.valid_for_ms, assignment.valid_for_ms);
+    EXPECT_GT(received.header.receive_time_ms, 0u);
+    EXPECT_EQ(received.received_ms, received.header.receive_time_ms);
+    EXPECT_GT(received.header.sequence, 0u);
+
+    // 链路层不自动回 65015；必须由状态机通过 ACK Topic 触发。
+    EXPECT_FALSE(ReadMissionAssignAck(terminal).has_value());
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, MissionAssignmentHeaderAddressMismatchIsIgnored) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto assignment_subscription =
+        link.MissionAssignmentOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    MissionAssignFixture assignment;
+    // payload 指向本机 1/25，但 V2_EXTENSION 帧头指向 2/25。
+    ASSERT_TRUE(terminal.Write(EncodeMissionAssign(assignment, 55, 2,
+                                                   kNetCaptureAircraftComponentId)));
+
+    EXPECT_FALSE(assignment_subscription.WaitTakeFor(100ms).has_value());
+    EXPECT_FALSE(ReadMissionAssignAck(terminal).has_value());
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, MissionAssignmentPayloadAddressMismatchIsIgnored) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto assignment_subscription =
+        link.MissionAssignmentOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    MissionAssignFixture assignment;
+    // 帧头指向本机 1/25，但 payload 地址指向 2/25。
+    assignment.target_system = 2;
+    ASSERT_TRUE(terminal.Write(EncodeMissionAssign(assignment)));
+
+    EXPECT_FALSE(assignment_subscription.WaitTakeFor(100ms).has_value());
+    EXPECT_FALSE(ReadMissionAssignAck(terminal).has_value());
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, MissionAssignmentPublishesSemanticFieldsUnchanged) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto assignment_subscription =
+        link.MissionAssignmentOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    // 地址匹配后，版本/拦截类型/flags/target_id 的语义校验属于状态机；
+    // 链路层必须原样发布，不能自行丢弃。
+    MissionAssignFixture assignment;
+    assignment.protocol_version = 9;
+    assignment.target_id = 0;
+    assignment.interceptor_type = 99;
+    assignment.flags = 0x80;
+    ASSERT_TRUE(terminal.Write(EncodeMissionAssign(assignment)));
+
+    auto message = assignment_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(message.has_value());
+    EXPECT_EQ((**message).protocol_version, 9U);
+    EXPECT_EQ((**message).target_id, 0U);
+    EXPECT_EQ((**message).interceptor_type, 99U);
+    EXPECT_EQ((**message).flags, 0x80U);
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, TruncatedMissionAssignmentIsIgnored) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto assignment_subscription =
+        link.MissionAssignmentOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    // 只编码前 12 字节，MAVLink2 截断后 message.len < 60，不得解析或崩溃。
+    MissionAssignFixture assignment;
+    ASSERT_TRUE(terminal.Write(EncodeMissionAssign(assignment, 12)));
+
+    EXPECT_FALSE(assignment_subscription.WaitTakeFor(100ms).has_value());
+    EXPECT_FALSE(ReadMissionAssignAck(terminal).has_value());
+
+    // 畸形短帧之后仍能正常处理合法分配。
+    ASSERT_TRUE(terminal.Write(EncodeMissionAssign(assignment)));
+    EXPECT_TRUE(assignment_subscription.WaitTakeFor(300ms).has_value());
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, SendsMissionAssignmentAckToGroundStation) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    common::Topic<common::MissionAssignmentAck> ack_input;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    link.SetMissionAssignmentAckInput(ack_input);
+    ASSERT_TRUE(link.Start());
+
+    common::MissionAssignmentAck ack;
+    ack.assignment_id = 1001;
+    ack.target_id = 7;
+    ack.result = common::MissionAssignmentResult::kAccepted;
+    ack.reason = common::MissionAssignmentReason::kNone;
+    ack.mission_state = common::MissionState::kArming;
+    ack.availability = common::MissionAvailability::kAssigned;
+    ASSERT_TRUE(ack_input.Publish(
+        std::make_shared<const common::MissionAssignmentAck>(ack)).accepted);
+
+    const auto sent = ReadMissionAssignAck(terminal);
+    ASSERT_TRUE(sent.has_value());
+    EXPECT_EQ(sent->message.len, 60);
+    EXPECT_EQ(sent->message.sysid, 1);
+    EXPECT_EQ(sent->message.compid, kNetCaptureAircraftComponentId);
+    EXPECT_EQ(sent->extension.target_system, kGroundStationSystemId);
+    EXPECT_EQ(sent->extension.target_component, kGroundStationComponentId);
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 0),
+              kMissionAssignmentProtocolVersion);
+    EXPECT_EQ(ReadLe<uint32_t>(sent->extension.payload, 1), 1001U);
+    EXPECT_EQ(ReadLe<uint32_t>(sent->extension.payload, 5), 7U);
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 9),
+              static_cast<uint8_t>(common::MissionAssignmentResult::kAccepted));
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 10),
+              static_cast<uint8_t>(common::MissionAssignmentReason::kNone));
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 11),
+              static_cast<uint8_t>(common::MissionState::kArming));
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 12),
+              static_cast<uint8_t>(common::MissionAvailability::kAssigned));
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 26), 1U);
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 27),
+              kNetCaptureAircraftComponentId);
+    EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 54), 1U);
     link.Stop();
 }
 

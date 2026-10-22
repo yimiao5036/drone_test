@@ -4,7 +4,7 @@
 
 `GroundStationLink`通过独立串口与自研地面站进行MAVLink 2通信。它订阅`Px4Link::StateOutput()`发布的`FlightStateSnapshot`，按配置频率重新编码为标准MAVLink遥测消息发送给地面站；同时接收并识别`MAV_TYPE_GCS`心跳，维护地面站在线状态，并通过标准`TIMESYNC`估算地面站单调时钟相对飞机时钟的offset、RTT和jitter。
 
-本模块不是PX4原始字节透传器，不允许地面站绕过状态机直接控制PX4。目标位置与时间同步总体协议见`docs/地面站目标位置与时间同步协议.md`；当前已实现TIMESYNC第一阶段，并通过MAVLink `V2_EXTENSION.message_type=65010/65011`实现`TRACK_TARGET_UPDATE/ACK`最小闭环：合法目标发布`GroundStationTarget`，非法本机目标返回拒绝ACK，错误地址静默忽略。状态回传已通过`V2_EXTENSION.message_type=65012/65013`实现：`HEALTH_STATUS`和`MISSION_STATUS`使用MAVLink2短帧`payload_len=60`，不要求ACK。
+本模块不是PX4原始字节透传器，不允许地面站绕过状态机直接控制PX4。目标位置与时间同步总体协议见`docs/地面站目标位置与时间同步协议.md`；当前已实现TIMESYNC第一阶段，并通过MAVLink `V2_EXTENSION.message_type=65010/65011`实现`TRACK_TARGET_UPDATE/ACK`最小闭环：合法目标发布`GroundStationTarget`，非法本机目标返回拒绝ACK，错误地址静默忽略。状态回传通过`V2_EXTENSION.message_type=65012/65013`实现（`HEALTH_STATUS` v1、`MISSION_STATUS` v2）。任务分配通过`65014/65015`实现：`MISSION_ASSIGN`地址双字段匹配本机后发布`MissionAssignment`，`MISSION_ASSIGN_ACK`由状态机 Topic 驱动发送。四类自定义消息均使用MAVLink2短帧`payload_len=60`；65012/65013/65015不要求ACK。
 
 ## 接口与数据流
 
@@ -13,9 +13,11 @@ struct GroundStationLinkConfig;
 class GroundStationLink final : public IGroundStationLink;
 
 void SetFlightStateInput(Topic<FlightStateSnapshot>&);
-void SetMissionStatusInput(Topic<MissionStatus>&); // V2_EXTENSION 65013
-void SetHealthInput(Topic<HealthStatus>&);          // V2_EXTENSION 65012
+void SetMissionStatusInput(Topic<MissionStatus>&); // V2_EXTENSION 65013 v2
+void SetHealthInput(Topic<HealthStatus>&);          // V2_EXTENSION 65012 v1
+void SetMissionAssignmentAckInput(Topic<MissionAssignmentAck>&); // 65015 回执输入
 Topic<GroundStationTarget>& TargetOutput();         // 合法TRACK_TARGET_UPDATE发布到此Topic
+Topic<MissionAssignment>& MissionAssignmentOutput(); // 地址匹配的65014发布到此Topic
 GroundStationTimeSyncStatus GetTimeSyncStatus() const;
 
 struct GroundStationLinkConfig {
@@ -63,9 +65,17 @@ Px4Link::StateOutput()
 | 总电压、电流和剩余电量 | `SYS_STATUS` | 1000ms |
 | 电池电流和剩余电量 | `BATTERY_STATUS` | 1000ms |
 | Home点 | `HOME_POSITION` | 1000ms |
-| 健康状态 | `V2_EXTENSION(65012)` | 1000ms，状态变化立即发送 |
-| 任务状态 | `V2_EXTENSION(65013)` | 500ms，状态变化立即发送 |
+| 健康状态 v1 | `V2_EXTENSION(65012)` | 1000ms，状态变化立即发送 |
+| 任务状态 v2 | `V2_EXTENSION(65013)` | 500ms，状态/分配字段变化立即发送 |
+| 任务分配回执 | `V2_EXTENSION(65015)` | 事件驱动：每收到一条 ACK Topic 即发送 |
 | 单调时钟同步 | `TIMESYNC` | 获取期200ms，稳定后1000ms |
+
+上行接收：
+
+| 内容 | MAVLink消息 | 处理 |
+|---|---|---|
+| 目标位置 | `V2_EXTENSION(65010)` | 地址/时效校验后发布 `GroundStationTarget`，回 65011 |
+| 任务分配 | `V2_EXTENSION(65014)` | 帧长与地址双字段匹配后发布 `MissionAssignment`，链路层不回 65015 |
 
 遥测周期均在`ground_station.send_interval_ms`配置，TIMESYNC参数在`ground_station.time_sync`配置。状态首次到达及连接、armed、模式、landed、GPS、电池或Home有效性变化时，会立即发送关键状态，减少事件显示延迟。
 
@@ -77,8 +87,10 @@ Px4Link::StateOutput()
 - `FlightStateSnapshot`只有动力电池总压，没有单体电压，因此总压放在`SYS_STATUS.voltage_battery`；`BATTERY_STATUS.voltages[]`保持未知，禁止把总压误当成首节电芯电压。
 - `GLOBAL_POSITION_INT.relative_alt`仅在Home有效时由MSL高度差计算；Home无效时为0，地面站应结合Home有效消息判断。
 - 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。实链验证中状态和`TRACK_TARGET_UPDATE`均采用MAVLink2短帧承载：`V2_EXTENSION`头部5字节加协议有效55字节，`mavlink_payload_len=60`，不要求发送满长扩展payload。
-- `HEALTH_STATUS`使用私有`message_type=65012`，`MISSION_STATUS`使用私有`message_type=65013`；两者均为飞机→地面站单向状态消息，不返回ACK。状态变化由输入Topic事件触发立即发送，未变化时按JSON周期发送。
+- `HEALTH_STATUS`使用私有`message_type=65012`（版本1），`MISSION_STATUS`使用私有`message_type=65013`（版本2）；两者均为飞机→地面站单向状态消息，不返回ACK。状态变化由输入Topic事件触发立即发送，未变化时按JSON周期发送。65013 v2 在 offset 40/44/48/49 写入`assignment_id/target_id/availability/interceptor_type`，offset 0~39 与 v1 不变；`kHealthStatusProtocolVersion`与`kMissionStatusProtocolVersion`独立，不再共用版本常量。
 - 健康状态字段布局见`docs/地面站目标位置与时间同步协议.md` §13；任务状态中的距离使用毫米整数，未知值为`INT32_MIN`，CPU负载使用百分之一整数。
+- 65014 `MISSION_ASSIGN`只接受地面站来源`255/190`。先校验`message.len >= 60`，再要求`V2_EXTENSION.target_system/target_component`与payload offset 50/51同时等于本机二元身份、offset 54=1；任一不满足即计数并按第1次及每满100次WARN丢弃，不发布、不回65015。地址匹配后链路层原样发布`MissionAssignment`（含protocol_version/flags/target_id），语义拒绝由状态机负责。
+- 65015 `MISSION_ASSIGN_ACK`订阅状态机的`Topic<MissionAssignmentAck>`，逐条编码：offset 0 版本、1 assignment_id、5 target_id、9 result、10 reason、11 mission_state、12 availability、26/27 本机身份、54=1；以本机身份发往`255/190`。链路层不生成回执、不重发，发送失败只记账并节流日志。
 - 飞机在收到合法GCS心跳后主动发送定向TIMESYNC请求；请求`tc1=0`、`ts1=飞机单调纳秒`、target=`255/190`。
 - 响应必须来自`255/190`，target必须匹配本机二元身份，`ts1`必须匹配尚未完成的请求。offset按`地面站tc1-(请求ts1+接收时刻)/2`计算。
 - 样本窗口优先选择低RTT样本，对offset和RTT取中位数；达到最小样本数后进入`SYNCHRONIZED`。高RTT、错误target和无匹配请求计入拒绝样本。捕网-01 HM30实链第一版门限为`max_rtt_ms=300`、`max_offset_jump_ms=100`。
@@ -88,8 +100,8 @@ Px4Link::StateOutput()
 
 ## 日志行为
 
-- INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果。
-- WARN：地面站心跳超时、时间同步超时、连续offset突变导致降级；目标地址不匹配按第1条及每100条节流警告。
+- INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果；任务分配在第1条及每100条打印65014接收/发布和65015发送结果。
+- WARN：地面站心跳超时、时间同步超时、连续offset突变导致降级；目标/任务分配地址不匹配、65014帧长不足或长度标记非法，均按第1条及每100条节流警告。
 - ERROR：配置/启动/绑定时序错误和发送失败；错误按第1次及每100次节流。
 - 不逐条记录遥测消息，不在高频发送路径打印成功日志。
 
@@ -104,7 +116,7 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、健康/任务状态`V2_EXTENSION`字段与短帧长度、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启。硬件阶段已在香橙派/HM30/Web闭环确认基础链路；TIMESYNC已使用`tools/ground_station_time_sync_responder.py`完成捕网-01实机采样，RTT中位数约78ms，历史最大约203ms，offset jitter常见约20～50ms，主动测量偶发超时率低于1%，忽略包为0。
+`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、健康/任务状态`V2_EXTENSION`字段与短帧长度（65012 v1、65013 v2 扩展字段）、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启；65014 地址双字段匹配发布、帧头/payload 地址不匹配静默丢弃、语义字段原样发布、截断短帧安全丢弃，以及65015字段/版本/身份编码。硬件阶段已在香橙派/HM30/Web闭环确认基础链路；TIMESYNC已使用`tools/ground_station_time_sync_responder.py`完成捕网-01实机采样，RTT中位数约78ms，历史最大约203ms，offset jitter常见约20～50ms，主动测量偶发超时率低于1%，忽略包为0。
 
 ## 排查与修改要点
 
@@ -115,4 +127,6 @@ ctest --test-dir build --output-on-failure
 - 模式显示：读取机载心跳中的`base_mode/custom_mode`，其中`custom_mode`保持PX4原始编码。
 - 修改发送频率只改JSON；不得在工作循环写死新周期。
 - 修改目标协议时，必须同步更新V2_EXTENSION payload布局、ACK语义、测试、地面站工具和协议文档；禁止在通信层直接生成PX4命令。若实链出现`TIMESYNC`正常但`TRACK_TARGET_UPDATE`无ACK，优先检查地面站工具是否发送短帧（debug中`mavlink_payload_len=60`），以及日志中是否出现`收到地面站V2_EXTENSION`。
+- 65014 已解析但不产生65015：先看日志`任务分配地址不匹配`（核对帧头与payload offset 50/51）和`任务分配帧长不足`（必须是短帧60字节）。地址匹配后无65015属于状态机未投递`MissionAssignmentAck`，不是链路丢弃。
+- 65013 地面站仍按v1解析时，检查offset 0 是否为2；旧解析器读到版本2应只读取offset 0~39。
 - 增加任务/健康自定义消息时同步更新dialect、Vue3解析器、测试和本文档。
