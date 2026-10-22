@@ -20,8 +20,22 @@ constexpr uint16_t kTrackTargetUpdateMessageType = 65010;
 constexpr uint16_t kTrackTargetAckMessageType = 65011;
 constexpr uint16_t kHealthStatusMessageType = 65012;
 constexpr uint16_t kMissionStatusMessageType = 65013;
+/// 任务分配（65014）与分配回执（65015），见
+/// docs/superpowers/specs/2026-10-22-多机任务分配与自动起飞-design.md §5。
+constexpr uint16_t kMissionAssignMessageType = 65014;
+constexpr uint16_t kMissionAssignAckMessageType = 65015;
+constexpr uint8_t kMissionAssignmentProtocolVersion = 1;
 constexpr uint8_t kTrackTargetProtocolVersion = 1;
+/// 65012 与 65013 的版本号已拆分：65013 v2 才携带 assignment/availability。
+/// kStatusProtocolVersion 为 65012/65013 旧共享常量，暂保留给现有编码路径，
+/// 65013 编码切换到 kMissionStatusProtocolVersion 在后续任务完成。
 constexpr uint8_t kStatusProtocolVersion = 1;
+constexpr uint8_t kHealthStatusProtocolVersion = 1;
+constexpr uint8_t kMissionStatusProtocolVersion = 2;
+constexpr uint8_t kMissionAssignFlagAuthorized = 1U << 0U;  ///< bit0=授权自动起飞
+constexpr uint8_t kMissionAssignFlagCancel = 1U << 1U;      ///< bit1=取消当前分配
+constexpr uint8_t kMissionAssignKnownFlagsMask =
+    kMissionAssignFlagAuthorized | kMissionAssignFlagCancel;
 constexpr uint8_t kTrackTargetCoordinateFrameWgs84 = 1;
 constexpr uint16_t kTrackTargetKnownFlagsMask = 0x007F;
 

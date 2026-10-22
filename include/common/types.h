@@ -407,6 +407,73 @@ struct HealthStatus {
     uint32_t timeout_event_count = 0;  ///< 累计进入超时状态的事件次数
 };
 
+/// 任务分配的可用状态（65013 v2 回传与 65015 回执共用）。
+/// 0~5 与地面站协议一致；只有 ready 表示可被调度。
+enum class MissionAvailability : uint8_t {
+    kUnavailable = 0,  ///< 未就绪/故障/状态不确定
+    kReady = 1,        ///< S2，未执行任务，可分配
+    kAssigned = 2,     ///< 已接受分配，S3/S4
+    kEngaged = 3,      ///< S5~S10 任务中
+    kReturning = 4,    ///< S11~S13 返航/降落
+    kTerminal = 5,     ///< S14/S16 或空中任务已结束
+};
+
+/// 65015 任务分配回执结果。
+enum class MissionAssignmentResult : uint8_t {
+    kAccepted = 0,
+    kRejected = 1,
+    kCancelledOrAborted = 2,
+};
+
+/// 65015 任务分配回执原因码（与设计规格 §5.4 一致）。
+enum class MissionAssignmentReason : uint8_t {
+    kNone = 0,
+    kInvalidMessage = 1,
+    kUnsupportedVersion = 2,
+    kUnsupportedInterceptorType = 3,
+    kNotReady = 4,
+    kAlreadyAssigned = 5,
+    kPreflightFailed = 6,
+    kControlDisabled = 7,
+    kModeTimeout = 8,
+    kArmTimeout = 9,
+    kBootstrapTimeout = 10,
+    kTakeoffTimeout = 11,
+    kCancelledByGcs = 12,
+    kTargetWaitTimeout = 13,
+    kTargetLost = 14,
+    kBatteryLow = 15,
+    kBatteryTelemetryInvalid = 16,
+    kBatteryConfigUnknown = 17,
+    kPx4Disconnected = 18,
+    kMissionFault = 19,
+    kInternalError = 20,
+};
+
+/// 任务分配（地面站 65014 → 状态机）。
+/// valid_for_ms 只约束起飞开始，不约束空中任务时长；目标位置仍由 65010 提供。
+struct MissionAssignment {
+    MessageHeader header;
+    uint8_t protocol_version = 1;  ///< 分配协议版本，当前固定 1
+    uint32_t assignment_id = 0;    ///< 地面站生成的分配编号
+    uint32_t target_id = 0;        ///< 指定目标编号；0 非法
+    uint8_t interceptor_type = 0;  ///< 25=捕网 26=火箭，必须等于本机 component
+    uint8_t flags = 0;             ///< bit0=授权自动起飞 bit1=取消当前分配
+    uint32_t valid_for_ms = 0;     ///< 分配有效期（毫秒）
+    uint64_t received_ms = 0;      ///< 本机收到消息的单调时钟时间
+};
+
+/// 任务分配回执（状态机 → 地面站 65015）。
+struct MissionAssignmentAck {
+    MessageHeader header;
+    uint32_t assignment_id = 0;
+    uint32_t target_id = 0;
+    MissionAssignmentResult result = MissionAssignmentResult::kRejected;
+    MissionAssignmentReason reason = MissionAssignmentReason::kNone;
+    MissionState mission_state = MissionState::kBoot;
+    MissionAvailability availability = MissionAvailability::kUnavailable;
+};
+
 /// 任务与拦截状态回传（状态机 → 地面站）。
 struct MissionStatus {
     MessageHeader header;
@@ -418,6 +485,11 @@ struct MissionStatus {
     float front_distance_m = std::numeric_limits<float>::quiet_NaN();  ///< 前向障碍距离；无效为 NaN
     bool interception_authorized = false;      ///< 拦截授权
     uint8_t power_status_bits = 0;             ///< 兼容保留；当前电量统一使用PX4动力电池状态
+    /// 65013 v2 扩展字段（2026-10-22，多机任务分配）：无分配时 id 为 0。
+    uint32_t assignment_id = 0;                ///< 当前分配编号
+    uint32_t target_id = 0;                    ///< 当前目标编号
+    MissionAvailability availability = MissionAvailability::kUnavailable;  ///< 可用状态
+    uint8_t interceptor_type = 0;              ///< 25=捕网 26=火箭；未知为 0
 };
 
 /// 目标估计状态（感知融合/目标估计 → 状态机与控制）。
@@ -457,6 +529,8 @@ inline constexpr char kFlightState[] = "flight_state";        ///< FlightStateSn
 inline constexpr char kControlIntent[] = "control_intent";    ///< ControlIntent
 inline constexpr char kPx4Setpoint[] = "px4_setpoint";        ///< Px4Setpoint
 inline constexpr char kMissionStatus[] = "mission_status";    ///< MissionStatus
+inline constexpr char kMissionAssignment[] = "mission_assignment";        ///< MissionAssignment（65014）
+inline constexpr char kMissionAssignmentAck[] = "mission_assignment_ack"; ///< MissionAssignmentAck（65015）
 inline constexpr char kHealthStatus[] = "health_status";      ///< HealthStatus
 inline constexpr char kAnnotatedFrame[] = "annotated_frame";  ///< video::FrameHandle
 }  // namespace topics

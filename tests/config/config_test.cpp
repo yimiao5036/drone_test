@@ -1019,4 +1019,31 @@ TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
     std::filesystem::remove(path);
 }
 
+// 自动起飞（takeoff 节，2026-10-22）：默认值与生产配置解析；
+// 低电门限不使用本地电量百分比。
+TEST(ConfigTest, TakeoffDefaultsAndParse) {
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_DOUBLE_EQ(config.takeoff.height_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.takeoff.climb_rate_mps, 0.5);
+    EXPECT_EQ(config.takeoff.bootstrap_lead.count(), 300);
+    EXPECT_EQ(config.takeoff.mode_timeout.count(), 2000);
+    EXPECT_EQ(config.takeoff.arm_timeout.count(), 3000);
+    EXPECT_EQ(config.takeoff.bootstrap_timeout.count(), 6000);
+}
+
+TEST(ConfigTest, RejectsBadTakeoffTimeouts) {
+    json value = ReadSourceConfig();
+    value["takeoff"]["bootstrap_timeout_ms"] = 4000;
+    const auto path = WriteTemporaryConfig(value, "drone_config_takeoff_bad.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, NoLocalTakeoffBatteryPercent) {
+    json value = ReadSourceConfig();
+    EXPECT_FALSE(value["takeoff"].contains("min_battery_percent"));
+}
+
 }  // namespace

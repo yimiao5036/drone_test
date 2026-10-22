@@ -156,6 +156,22 @@
         "fire_timeout_ms": 3000,
         "command_retry_ms": 1000
     },
+    "takeoff": {
+        "height_m": 2.0,
+        "climb_rate_mps": 0.5,
+        "bootstrap_lead_ms": 300,
+        "mode_timeout_ms": 2000,
+        "arm_timeout_ms": 3000,
+        "bootstrap_timeout_ms": 6000,
+        "height_timeout_ms": 15000,
+        "stable_time_ms": 1000,
+        "z_tolerance_m": 0.2,
+        "xy_tolerance_m": 0.5,
+        "max_vz_mps": 0.3,
+        "target_wait_timeout_ms": 10000,
+        "target_lost_timeout_ms": 10000,
+        "battery_low_debounce_ms": 1000
+    },
     "visual_monitor": {
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,

@@ -158,6 +158,28 @@ struct ReturnHomeConfig {
     void Validate() const;
 };
 
+/// 自动起飞（takeoff 节，2026-10-22 多机任务分配与自动起飞）。
+/// 约束 S3 解锁/Offboard 与 S4 爬升的时序、到达判据和目标丢失收口；
+/// 电池门限不使用本地百分比，唯一来源为 PX4 `BAT_LOW_THR`（后续任务接入）。
+/// 全部字段可选，缺席回退默认值；Validate 做范围与跨字段校验。
+struct TakeoffConfig {
+    double height_m = 2.0;                         ///< 相对起飞点爬升高度
+    double climb_rate_mps = 0.5;                   ///< S4 爬升速度
+    std::chrono::milliseconds bootstrap_lead{300}; ///< 起飞意图到 176 的前置保持
+    std::chrono::milliseconds mode_timeout{2000};  ///< 等待 Offboard(6/0) 的超时
+    std::chrono::milliseconds arm_timeout{3000};   ///< 等待解锁的超时
+    std::chrono::milliseconds bootstrap_timeout{6000};  ///< Bootstrap 原点保持流最长时长
+    std::chrono::milliseconds height_timeout{15000};    ///< S4 到达任务高度的超时
+    std::chrono::milliseconds stable_time{1000};   ///< 到达判据持续时长
+    double z_tolerance_m = 0.2;                    ///< 到达判据：垂直误差
+    double xy_tolerance_m = 0.5;                   ///< 到达判据：水平误差
+    double max_vz_mps = 0.3;                       ///< 到达判据：垂直速度
+    std::chrono::milliseconds target_wait_timeout{10000};  ///< 等待目标位置超时
+    std::chrono::milliseconds target_lost_timeout{10000};  ///< 目标丢失收口超时
+    std::chrono::milliseconds battery_low_debounce{1000};  ///< 低电防抖时长
+    void Validate() const;
+};
+
 struct AppConfig {
     LogConfig log;
     RuntimeConfig runtime;
@@ -185,6 +207,7 @@ struct AppConfig {
     ActuatorConfig actuator;            ///< 捕网执行器（阶段四控制接入 Task 10）
     InterceptionConfig interception;    ///< S9/S10 入口判据与授权（2026-10-19）
     ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
+    TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

@@ -68,6 +68,19 @@ std::chrono::milliseconds ReadPositiveMilliseconds(const json& object,
     return std::chrono::milliseconds(value);
 }
 
+// 允许为零的毫秒时长（bootstrap_lead、低电防抖等），显式提供时不得为负。
+std::chrono::milliseconds ReadOptionalNonNegativeMilliseconds(
+    const json& object, const char* key, std::chrono::milliseconds default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const int64_t value = object.at(key).get<int64_t>();
+    if (value < 0) {
+        throw std::invalid_argument(std::string(key) + " 必须 >= 0");
+    }
+    return std::chrono::milliseconds(value);
+}
+
 // 健康阈值允许整个 health 配置节缺省，但只要显式提供字段就必须为正数。
 std::chrono::milliseconds ReadOptionalPositiveMilliseconds(
     const json& object, const char* key, std::chrono::milliseconds default_value) {
@@ -549,6 +562,61 @@ void ReturnHomeConfig::Validate() const {
     }
 }
 
+void TakeoffConfig::Validate() const {
+    if (!std::isfinite(height_m) || height_m <= 0.0) {
+        throw std::invalid_argument("takeoff.height_m 必须为有限正数");
+    }
+    if (!std::isfinite(climb_rate_mps) || climb_rate_mps <= 0.0) {
+        throw std::invalid_argument("takeoff.climb_rate_mps 必须为有限正数");
+    }
+    // bootstrap_lead 允许为 0（起飞意图后立即发 176），其余超时必须为正。
+    if (bootstrap_lead.count() < 0) {
+        throw std::invalid_argument("takeoff.bootstrap_lead_ms 必须 >= 0");
+    }
+    if (mode_timeout.count() <= 0) {
+        throw std::invalid_argument("takeoff.mode_timeout_ms 必须为正");
+    }
+    if (arm_timeout.count() <= 0) {
+        throw std::invalid_argument("takeoff.arm_timeout_ms 必须为正");
+    }
+    if (bootstrap_timeout.count() <= 0) {
+        throw std::invalid_argument("takeoff.bootstrap_timeout_ms 必须为正");
+    }
+    // Bootstrap 必须先于 Offboard/解锁命令超时结束，否则原点保持流会在
+    // 模式/解锁流程尚未完成时失效。
+    if (bootstrap_timeout.count() <= bootstrap_lead.count() +
+                                        mode_timeout.count() +
+                                        arm_timeout.count()) {
+        throw std::invalid_argument(
+            "takeoff.bootstrap_timeout_ms 必须大于 "
+            "bootstrap_lead_ms+mode_timeout_ms+arm_timeout_ms");
+    }
+    if (height_timeout.count() <= 0) {
+        throw std::invalid_argument("takeoff.height_timeout_ms 必须为正");
+    }
+    if (stable_time.count() <= 0) {
+        throw std::invalid_argument("takeoff.stable_time_ms 必须为正");
+    }
+    if (!std::isfinite(z_tolerance_m) || z_tolerance_m < 0.0) {
+        throw std::invalid_argument("takeoff.z_tolerance_m 必须为有限非负数");
+    }
+    if (!std::isfinite(xy_tolerance_m) || xy_tolerance_m < 0.0) {
+        throw std::invalid_argument("takeoff.xy_tolerance_m 必须为有限非负数");
+    }
+    if (!std::isfinite(max_vz_mps) || max_vz_mps < 0.0) {
+        throw std::invalid_argument("takeoff.max_vz_mps 必须为有限非负数");
+    }
+    if (target_wait_timeout.count() <= 0) {
+        throw std::invalid_argument("takeoff.target_wait_timeout_ms 必须为正");
+    }
+    if (target_lost_timeout.count() <= 0) {
+        throw std::invalid_argument("takeoff.target_lost_timeout_ms 必须为正");
+    }
+    if (battery_low_debounce.count() < 0) {
+        throw std::invalid_argument("takeoff.battery_low_debounce_ms 必须 >= 0");
+    }
+}
+
 void ActuatorConfig::Validate() const {
     if (type != "single_pwm")
         throw std::invalid_argument(
@@ -851,6 +919,41 @@ AppConfig LoadAppConfig(const std::string& path,
             "interception.enabled=true 时 return_home.enabled 必须为 true"
             "（发射后必须有返航收口）");
     }
+
+    // 自动起飞（takeoff 节，2026-10-22）：S3/S4 时序、到达判据与目标收口；
+    // 全部可选，缺席回退默认值。低电门限不使用本地电量百分比，唯一来源是
+    // PX4 BAT_LOW_THR（后续任务接入），因此本节点没有 min_battery_percent。
+    const json takeoff = root.value("takeoff", json::object());
+    config.takeoff.height_m = ReadOptionalPositiveDouble(
+        takeoff, "height_m", config.takeoff.height_m);
+    config.takeoff.climb_rate_mps = ReadOptionalPositiveDouble(
+        takeoff, "climb_rate_mps", config.takeoff.climb_rate_mps);
+    config.takeoff.bootstrap_lead = ReadOptionalNonNegativeMilliseconds(
+        takeoff, "bootstrap_lead_ms", config.takeoff.bootstrap_lead);
+    config.takeoff.mode_timeout = ReadOptionalPositiveMilliseconds(
+        takeoff, "mode_timeout_ms", config.takeoff.mode_timeout);
+    config.takeoff.arm_timeout = ReadOptionalPositiveMilliseconds(
+        takeoff, "arm_timeout_ms", config.takeoff.arm_timeout);
+    config.takeoff.bootstrap_timeout = ReadOptionalPositiveMilliseconds(
+        takeoff, "bootstrap_timeout_ms", config.takeoff.bootstrap_timeout);
+    config.takeoff.height_timeout = ReadOptionalPositiveMilliseconds(
+        takeoff, "height_timeout_ms", config.takeoff.height_timeout);
+    config.takeoff.stable_time = ReadOptionalPositiveMilliseconds(
+        takeoff, "stable_time_ms", config.takeoff.stable_time);
+    config.takeoff.z_tolerance_m = ReadOptionalNonNegativeDouble(
+        takeoff, "z_tolerance_m", config.takeoff.z_tolerance_m);
+    config.takeoff.xy_tolerance_m = ReadOptionalNonNegativeDouble(
+        takeoff, "xy_tolerance_m", config.takeoff.xy_tolerance_m);
+    config.takeoff.max_vz_mps = ReadOptionalNonNegativeDouble(
+        takeoff, "max_vz_mps", config.takeoff.max_vz_mps);
+    config.takeoff.target_wait_timeout = ReadOptionalPositiveMilliseconds(
+        takeoff, "target_wait_timeout_ms", config.takeoff.target_wait_timeout);
+    config.takeoff.target_lost_timeout = ReadOptionalPositiveMilliseconds(
+        takeoff, "target_lost_timeout_ms", config.takeoff.target_lost_timeout);
+    config.takeoff.battery_low_debounce = ReadOptionalNonNegativeMilliseconds(
+        takeoff, "battery_low_debounce_ms",
+        config.takeoff.battery_low_debounce);
+    config.takeoff.Validate();
 
     // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：机载只保存
     // Actuator Set N 与归一化控制量；PWM 输出功能/区间/舵机行程在 PX4 侧配置。
