@@ -75,7 +75,7 @@
 PWM 微秒或输出区间，避免与 PX4 参数重复维护。接口与工厂见
 `include/state_machine/net_actuator.h` / `.md`。
 
-**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（占位值，待实机射程冻结）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、执行器未触发且 `Ready()`（触发保持/复位/稳定途中不重入）、未进入故障。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
+**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（上限 2026-10-23 冻结为双目测距极限 8m，下限仍占位）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、执行器未触发且 `Ready()`（触发保持/复位/稳定途中不重入）、未进入故障。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
 
 阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
 
@@ -554,7 +554,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - **S9/S10 入口判据（2026-10-19）**：`EvaluateInterceptSequence` 在 S7 每拍评估
   `InterceptEntrySatisfied`——`interception.enabled`、视觉新鲜且 `LOCKED`、
   `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
-  `[min_range_m,max_range_m]`、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
+  `[min_range_m,max_range_m]`（**上限 2026-10-23 冻结 = 双目测距极限 8m**，
+  下限 2.0 仍占位）、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
   `net_actuator_` 非空且未触发、`Ready()`、未故障、任务未进入 S16；可选
   `min_battery_percent>0` 时还要求电池遥测有效且剩余电量达标（**当前生产保持 0，
   实机后冻结**）。满足→S9；
@@ -586,7 +587,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     默认 `enabled=true`；`interception`/`return_home` 两节已接入 JSON 加载）。
     捕网执行器隔离用例显式 `enabled=false`。
   - **依赖**：状态机为 Home 换算链接 `drone_perception`（纯函数 `GeodeticToLocalNed`）。
-  - **边界**：S9/S10 入口已配置化（`interception` 节，默认关闭；射程占位待实机）；
+  - **边界**：S9/S10 入口已配置化（`interception` 节，默认关闭；射程上限 2026-10-23
+    冻结为双目测距极限 8m，下限仍占位）；
     V1 返航段可通过测试钩子/测试用例或显式开启配置驱动。多发命中判据/再交战策略
     V2 立项；`MissionStatus` 结果字段暂不新增（用状态+日志）。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。

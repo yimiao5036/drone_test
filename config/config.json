@@ -141,7 +141,7 @@
         "auto_authorize": true,
         "lock_frames": 10,
         "min_range_m": 2.0,
-        "max_range_m": 10.0,
+        "max_range_m": 8.0,
         "min_battery_percent": 0.0,
         "authorization_timeout_ms": 1000
     },

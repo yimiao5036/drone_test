@@ -93,14 +93,17 @@ class INetActuator {
 | `actuator.reset_settle` | `0ms` | 复位 ACK 后的稳定时间（`reset_settle_ms`） |
 
 捕网枪说明书要求发射保持 1~2s：`single_pwm` 的 `reset_delay` 超出
-[1000, 2000]ms 时 `CreateNetActuator()` 打一条启动 WARN，但不阻止启动；
-最终行程以 G4-3 台架实测冻结。
+[1000, 2000]ms 时 `CreateNetActuator()` 打一条启动 WARN，但不阻止启动。
+**2026-10-23 维护者确认**：机构为舵机、纯 PWM 驱动，保持 **1500ms** 即生产冻结值
+（不再存在“待 G4-3 冻结”的占位）；行程由归一化量→PWM 映射决定，发射方向与机头
+一致，有效射程 = 双目测距极限 ≤8m。
 
 ## 5. PX4 / 机载边界
 
 - **PX4/QGC**：把物理输出的 Output Function 设为 `Peripheral via Actuator Set N`，
   设置该输出通道的 PWM 映射区间（MAIN 输出为 `PWM_MAIN_MINn/MAXn`，AUX 输出为
-  `PWM_AUX_MINn/MAXn`，标准 1000/2000µs），核对舵机行程/方向；
+  `PWM_AUX_MINn/MAXn`，标准 1000/2000µs）；舵机行程与发射方向由该映射和机构
+  安装决定（2026-10-23 确认：发射方向与机头一致）；
 - **当前装机（2026-10-21 确认）**：捕网接 **MAIN5**，Output Function =
   `Peripheral via Actuator Set 1`，PWM 已配置；因此机载 `net_channel=1`。
   **注意 `net_channel` 是 Actuator Set 编号，不是物理通道号 5**；

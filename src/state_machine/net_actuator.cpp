@@ -25,8 +25,8 @@ constexpr uint16_t kMavCmdDoSetActuator = 187;
 constexpr uint8_t kMavResultAccepted = 0;    // MAV_RESULT_ACCEPTED
 constexpr uint8_t kMavResultInProgress = 5;  // MAV_RESULT_IN_PROGRESS
 
-/// 说明书要求发射后保持 1~2s 再复位；超出范围只告警，不阻止启动
-/// （实际行程仍以 G4-3 台架实测冻结）。
+/// 说明书要求发射后保持 1~2s 再复位（2026-10-23 维护者确认：舵机式机构，
+/// PWM 驱动，保持 1.5s 即生产冻结值）；超出范围只告警，不阻止启动。
 void WarnIfResetDelayOutsideManualRange(const config::ActuatorConfig& config) {
     if (config.type != "single_pwm") {
         return;
@@ -34,7 +34,7 @@ void WarnIfResetDelayOutsideManualRange(const config::ActuatorConfig& config) {
     if (config.reset_delay < std::chrono::milliseconds(1000) ||
         config.reset_delay > std::chrono::milliseconds(2000)) {
         SPDLOG_WARN("当前捕网枪说明书要求发射保持 1~2s: reset_delay_ms={}，"
-                    "请以 G4-3 实测行程冻结",
+                    "生产冻结值为 1500ms，请核对该值",
                     config.reset_delay.count());
     }
 }

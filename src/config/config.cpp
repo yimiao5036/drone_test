@@ -876,8 +876,9 @@ AppConfig LoadAppConfig(const std::string& path,
         handover, "distance_lost_ms", config.handover.distance_lost_ms);
     config.handover.Validate();
 
-    // 拦截入口/授权（interception 节，2026-10-19）：默认关闭；射程为占位值，
-    // 必须按捕网有效射程与授权策略实机冻结后才能在生产本地副本开启。
+    // 拦截入口/授权（interception 节，2026-10-19）：默认关闭；射程上限已按
+    // 双目测距极限冻结为 8m（2026-10-23），下限仍占位；现场本地副本开启前
+    // 还须确认授权策略。
     const json interception = root.value("interception", json::object());
     config.interception.enabled =
         interception.value("enabled", config.interception.enabled);

@@ -131,9 +131,11 @@ struct InterceptionConfig {
     bool auto_authorize = true;
     /// 连续 LOCKED 帧门限（拦截质量，与 handover.lock_frames 独立）。
     uint32_t lock_frames = 10;
-    /// 允许发射的测距窗口（米）；默认值为占位，必须按捕网有效射程实机冻结。
+    /// 允许发射的测距窗口（米）。上限已按双目测距极限冻结为 8m（2026-10-23，
+    /// 维护者确认：测距极限 8m 即有效射程，进入 ≤8m 才算有效）；下限 2.0 仍为
+    /// 占位，待实机最小可用距离确认。
     double min_range_m = 2.0;
-    double max_range_m = 10.0;
+    double max_range_m = 8.0;
     /// 动力电池最低剩余百分比；0=不启用（当前尚无冻结门限，按需配置）。
     double min_battery_percent = 0.0;
     /// S9 等待授权的超时；超时按设计返航。

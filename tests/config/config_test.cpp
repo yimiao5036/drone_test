@@ -731,7 +731,7 @@ TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
     EXPECT_TRUE(config.interception.auto_authorize);
     EXPECT_EQ(config.interception.lock_frames, 10u);
     EXPECT_DOUBLE_EQ(config.interception.min_range_m, 2.0);
-    EXPECT_DOUBLE_EQ(config.interception.max_range_m, 10.0);
+    EXPECT_DOUBLE_EQ(config.interception.max_range_m, 8.0);
     EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 0.0);
     EXPECT_TRUE(config.return_home.enabled);
     EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 5.0);
