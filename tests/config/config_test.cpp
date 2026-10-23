@@ -766,6 +766,39 @@ TEST(ConfigTest, RejectsHandoverExitNotGreaterThanEnter) {
     std::filesystem::remove(path);
 }
 
+TEST(ConfigTest, GcsNetFireDefaultsDisabled) {
+    // 直控发射（65016）默认关闭：生产配置不声明 gcs_fire 字段时必须回退默认值，
+    // 避免"装配即生效"把捕网通道挂到地面站任意帧上。
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_FALSE(config.actuator.gcs_fire_enabled);
+    EXPECT_EQ(config.actuator.gcs_fire_cooldown, std::chrono::milliseconds(3000));
+}
+
+TEST(ConfigTest, RejectsGcsFireWithInterceptionBothEnabled) {
+    // 直控发射与自动拦截共用同一执行器：同时开启必须在加载期 fail-fast。
+    json value = ReadSourceConfig();
+    value["actuator"]["gcs_fire_enabled"] = true;
+    value["interception"]["enabled"] = true;
+    const auto path = WriteTemporaryConfig(value, "drone_config_gcs_fire_mutex.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsGcsFireCooldownOutOfRange) {
+    // 冷却下限 100ms：低于下限等同关闭防连点保护 → 拒绝。
+    json value = ReadSourceConfig();
+    value["actuator"]["gcs_fire_enabled"] = true;
+    value["actuator"]["gcs_fire_cooldown_ms"] = 50;
+    const auto path = WriteTemporaryConfig(value, "drone_config_gcs_fire_cooldown.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsNonPositiveControllerLimits) {
     // max_speed_mps=0 → 拒绝
     json value = ReadSourceConfig();

@@ -17,6 +17,7 @@
 #include "perception/target_estimator.h"
 #include "perception/visual_target_monitor.h"
 #include "perception/yolo_detector.h"
+#include "state_machine/gcs_net_fire.h"
 #include "state_machine/mission_state_machine.h"
 #include "video/camera_receiver.h"
 #include "video/frame_compositor.h"
@@ -144,6 +145,18 @@ void DroneApplication::BuildComponents() {
             config_.ground_station.aircraft_component_id;
         mission_state_machine_ =
             std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
+    }
+
+    // 地面站直控发射服务（G4-4）：只在 gcs_fire_enabled=true 时装配，与自动拦截
+    // 链互斥（配置加载期 fail-fast）。它不接任务状态机，只消费 65016 指令、
+    // 门禁通过后占用捕网执行器，并把 65017 回执交回地面站链路。
+    if (config_.actuator.gcs_fire_enabled &&
+        px4_link_ != nullptr && ground_station_link_ != nullptr) {
+        gcs_net_fire_ = std::make_unique<state_machine::GcsNetFire>(
+            config_.actuator, px4_link_.get());
+        SPDLOG_WARN(
+            "地面站直控发射已装配（actuator.gcs_fire_enabled=true）：65016 → 捕网执行器，"
+            "仍要求落地且未解锁");
     }
 
     // 飞行控制器（阶段四正式实现）：状态机装配即创建，与 enable_control 无关——
@@ -279,6 +292,17 @@ void DroneApplication::BindTopics() {
             mission_state_machine_->AssignmentAckOutput());
         control_assembly_.assignment_input_bound = true;
         control_assembly_.assignment_ack_bound = true;
+    }
+
+    // 地面站直控发射接线（G4-4）：65016 指令 → GcsNetFire → 捕网执行器；
+    // 65017 回执 → 地面站链路。只在启用直控发射时接线，未装配时 65016 由链路
+    // 丢弃并记日志（不会触发任何动作）。
+    if (gcs_net_fire_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr) {
+        gcs_net_fire_->SetFlightStateInput(px4_link_->StateOutput());
+        gcs_net_fire_->SetCommandInput(
+            ground_station_link_->NetFireCommandOutput());
+        ground_station_link_->SetNetFireAckInput(gcs_net_fire_->AckOutput());
     }
 
     // S5 位置引导输入：估计器/视觉稳定性/双目测距三者必须作为一组同时装配，
@@ -437,6 +461,17 @@ bool DroneApplication::Start() {
         if (!mission_state_machine_->Start()) {
             degraded = true;
             SPDLOG_ERROR("主程序任务状态机启动失败，任务状态回传降级");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 直控发射服务消费 PX4 飞行状态与地面站指令，启动顺序在两者之前即可
+    // （订阅不依赖生产者先启动）；失败不阻断其他链路。
+    if (gcs_net_fire_ != nullptr) {
+        if (!gcs_net_fire_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序直控发射服务启动失败，捕网远程点火不可用");
         } else {
             any_started = true;
         }
@@ -636,6 +671,10 @@ void DroneApplication::Stop() {
     }
     if (target_estimator_ != nullptr) {
         target_estimator_->Stop();
+    }
+    // 直控发射服务是地面站指令的消费者、回执的生产者，先于地面站链路停止。
+    if (gcs_net_fire_ != nullptr) {
+        gcs_net_fire_->Stop();
     }
     if (ground_station_link_ != nullptr) {
         ground_station_link_->Stop();

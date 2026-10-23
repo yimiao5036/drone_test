@@ -192,6 +192,7 @@ v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前�
 | G4-1 | ARM/Offboard 流程（真实 PX4 + 机体，卸桨） | 台架 | 模式/上锁序列与 SITL 一致，电机仅怠速级响应 | ✅ 2026-10-21（自动序列通过；现场确认电机仅怠速） |
 | G4-2 | 电机输出方向（位置/速度意图小量激励） | 台架 | 方向正确、无反转 | ⏳ 四向设定值方向 ✅ 2026-10-21；电机/机体实际方向待人工判读（方法见 `tools/px4_link_smoke.md` §2.5） |
 | G4-3 | 捕网 PWM 行程/方向与 ACK/保持时序（DO_SET_ACTUATOR 触发/复位） | 台架 | 机构到位、方向正确；PX4 侧通道/功能/映射已确认（2026-10-21：MAIN5 = `Peripheral via Actuator Set 1`，`PWM_MAIN_MIN5/MAX5` 已配；机载 `net_channel=1`，只发归一化 -0.7/0.0）；**时序**：187 触发 ACK accepted → 保持 `reset_delay`（**2026-10-23 冻结 1.5s**）→ 自动发复位行程 → 复位 ACK accepted → `reset_settle` 后回 Ready；ACK 超时/断连时执行器进入故障（日志 ERROR、状态机 S16/bit4、取消待发命令、不补发复位） | ✅ 2026-10-23 机制与参数冻结（维护者裁决：舵机式机构、纯 PWM 驱动，行程由归一化量→PWM 映射决定，无需专项台架；发射方向与机头一致，有效射程 = 双目测距极限 ≤8m，`interception.max_range_m=8.0`）。**实物发射有效性**转为 G5 前实机观察项，不阻塞控制门禁；自动模式仍不得触发（`interception.enabled=false`） |
+| G4-5 | 地面站直控捕网发射（65016/65017）：本地副本 `gcs_fire_enabled=true` 启动正式程序，用 `tools/net_fire_tester.py` 发 65016 | 台架（**拆桨**） | 落地且未解锁时回 65017 `ACCEPTED→COMPLETED`；解锁/未落地/无确认位分别回 `ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`；同一 `command_id` 重发只受理一次；舵机行程正常 | 🟡 2026-10-23 代码/链路/单测完成（604/604），台架实跑待执行 |
 | G4-4 | 断链失控保护（拔串口/停 setpoint） | 台架 | 停发/上锁符合预期（机载侧：停意图/关串口/心跳停止/刷盘；PX4 failsafe 归飞控配置） | ✅ 2026-10-21 机载侧：停 setpoint 分支（COAST/IDLE、退出 Offboard 1972ms、DISARM）+ 拔串口分支（停意图/关串口/心跳停止/刷盘/退出码4）；PX4 failsafe 不在机载软件判定范围 |
 | G5-1 | 室外首飞（系留/低空低速、人工兜底） | 室外 | 另行冻结清单（含场地围栏参数、遥控兜底、天气条件） | ⏳ |
 

@@ -27,6 +27,7 @@ class VisualTargetMonitor;
 class YoloDetector;
 }
 namespace drone::state_machine {
+class GcsNetFire;
 class MissionStateMachine;
 }
 namespace drone::video {
@@ -143,6 +144,9 @@ private:
     std::unique_ptr<communication::GroundStationLink> ground_station_link_;
     std::unique_ptr<perception::TargetEstimator> target_estimator_;
     std::unique_ptr<state_machine::MissionStateMachine> mission_state_machine_;
+    /// 地面站直控发射服务（actuator.gcs_fire_enabled=true 才装配）；
+    /// 与自动拦截链互斥，不归属任务状态机，也不产生控制意图。
+    std::unique_ptr<state_machine::GcsNetFire> gcs_net_fire_;
     std::unique_ptr<control::FlightController> flight_controller_;  ///< 阶段四正式实现，影子/正式由 enable_control 门禁
     std::unique_ptr<health::HealthManager> health_manager_;
 

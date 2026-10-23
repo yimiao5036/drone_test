@@ -24,6 +24,13 @@ constexpr uint16_t kMissionStatusMessageType = 65013;
 /// docs/superpowers/specs/2026-10-22-多机任务分配与自动起飞-design.md §5。
 constexpr uint16_t kMissionAssignMessageType = 65014;
 constexpr uint16_t kMissionAssignAckMessageType = 65015;
+/// 捕网直控发射（65016，地面站 → 指定飞机）与发射回执（65017）。
+/// 只在 actuator.gcs_fire_enabled=true 时被 GcsNetFire 消费。
+constexpr uint16_t kNetFireMessageType = 65016;
+constexpr uint16_t kNetFireAckMessageType = 65017;
+constexpr uint8_t kNetFireProtocolVersion = 1;
+constexpr uint8_t kNetFireFlagConfirmed = 1U << 0U;  ///< bit0=确认发射
+constexpr uint8_t kNetFireKnownFlagsMask = kNetFireFlagConfirmed;
 constexpr uint8_t kMissionAssignmentProtocolVersion = 1;
 constexpr uint8_t kTrackTargetProtocolVersion = 1;
 /// 65012 与 65013 的协议版本独立：65013 v2 才携带 assignment/availability，
@@ -158,6 +165,12 @@ public:
     virtual void SetMissionAssignmentAckInput(
         common::Topic<common::MissionAssignmentAck>& ack) = 0;
 
+    /// 65016 捕网直控发射指令解析结果。地址双字段匹配本机后才发布；
+    /// 版本/flags/落地态等语义校验由 GcsNetFire 负责，链路层不产生动作。
+    virtual common::Topic<common::NetFireCommand>& NetFireCommandOutput() = 0;
+    /// 绑定 65017 发射回执输入。收到一条回执即按协议编码发送给 255/190。
+    virtual void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) = 0;
+
     /// 绑定 PX4 飞行状态快照。必须在 Start 前调用。
     virtual void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) = 0;
@@ -191,6 +204,8 @@ public:
     common::Topic<common::MissionAssignment>& MissionAssignmentOutput() override;
     void SetMissionAssignmentAckInput(
         common::Topic<common::MissionAssignmentAck>& ack) override;
+    common::Topic<common::NetFireCommand>& NetFireCommandOutput() override;
+    void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -225,6 +240,8 @@ public:
     common::Topic<common::MissionAssignment>& MissionAssignmentOutput() override;
     void SetMissionAssignmentAckInput(
         common::Topic<common::MissionAssignmentAck>& ack) override;
+    common::Topic<common::NetFireCommand>& NetFireCommandOutput() override;
+    void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -242,6 +259,7 @@ private:
     uint64_t error_count_ = 0;
     common::Topic<common::GroundStationTarget> target_output_;
     common::Topic<common::MissionAssignment> mission_assignment_output_;
+    common::Topic<common::NetFireCommand> net_fire_command_output_;
 };
 
 }  // namespace drone::communication

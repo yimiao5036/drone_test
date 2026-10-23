@@ -640,6 +640,9 @@ void ActuatorConfig::Validate() const {
         throw std::invalid_argument("actuator.reset_delay_ms 必须 >= 0");
     if (reset_settle.count() < 0)
         throw std::invalid_argument("actuator.reset_settle_ms 必须 >= 0");
+    if (gcs_fire_cooldown.count() < 100 || gcs_fire_cooldown.count() > 60000)
+        throw std::invalid_argument(
+            "actuator.gcs_fire_cooldown_ms 必须在 100~60000 之间");
 }
 
 // 解析配置文件路径：优先取调用方显式指定的路径，其次找可执行文件旁的
@@ -980,7 +983,19 @@ AppConfig LoadAppConfig(const std::string& path,
     config.actuator.reset_settle = std::chrono::milliseconds(
         actuator.value("reset_settle_ms",
                        static_cast<int>(config.actuator.reset_settle.count())));
+    config.actuator.gcs_fire_enabled =
+        actuator.value("gcs_fire_enabled", config.actuator.gcs_fire_enabled);
+    config.actuator.gcs_fire_cooldown = std::chrono::milliseconds(
+        actuator.value("gcs_fire_cooldown_ms",
+                       static_cast<int>(config.actuator.gcs_fire_cooldown.count())));
     config.actuator.Validate();
+    // 直控发射（65016）与自动拦截发射共用同一个执行器，两条路径不得同时开启：
+    // 装配期 fail-fast，避免地面站直控与状态机 S10 各建一个实例重复点火。
+    if (config.actuator.gcs_fire_enabled && config.interception.enabled) {
+        throw std::invalid_argument(
+            "actuator.gcs_fire_enabled 与 interception.enabled 不得同时为 true"
+            "（地面站直控发射与自动拦截发射互斥）");
+    }
 
     // 单目标视觉稳定性判定：帧级观测定节拍，门限为影子初值。
     const json visual_monitor = root.value("visual_monitor", json::object());

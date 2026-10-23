@@ -147,6 +147,7 @@ target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
 # ---- state_machine 模块（任务状态机接口） ----
 add_library(drone_state_machine STATIC
+    src/state_machine/gcs_net_fire.cpp
     src/state_machine/mission_assignment.cpp
     src/state_machine/mission_state_machine.cpp
     src/state_machine/net_actuator.cpp)
@@ -500,6 +501,23 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(net_actuator_test)
+
+        # 地面站直控发射服务：门禁拒绝、受理→完成回执、command_id 幂等与冷却
+        add_executable(gcs_net_fire_test
+            tests/state_machine/gcs_net_fire_test.cpp)
+        target_link_libraries(gcs_net_fire_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(gcs_net_fire_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(gcs_net_fire_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(gcs_net_fire_test)
 
         # 任务分配助手测试：接受/阶段迁移/一次上电/中止/目标过滤/result 重发
         add_executable(mission_assignment_test

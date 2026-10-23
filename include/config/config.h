@@ -106,6 +106,12 @@ struct ActuatorConfig {
     std::chrono::milliseconds reset_delay{1500};
     /// 复位 ACK ACCEPTED 后到 Ready 的稳定时间（多发用；单发默认 0）。
     std::chrono::milliseconds reset_settle{0};
+    /// 地面站直控发射（65016）开关，默认 false。与 `interception.enabled` 互斥：
+    /// 直控发射是拆桨台架/测试用途，不经过拦截授权链，装配期二者同时为 true
+    /// 直接 fail-fast（避免两条发射路径抢同一个执行器）。
+    bool gcs_fire_enabled = false;
+    /// 两次成功直控发射之间的最小间隔，防止地面站误连点。默认 3000ms。
+    std::chrono::milliseconds gcs_fire_cooldown{3000};
     void Validate() const;
 };
 

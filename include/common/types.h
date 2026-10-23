@@ -499,6 +499,55 @@ struct MissionStatus {
     uint8_t interceptor_type = 0;              ///< 25=捕网 26=火箭；未知为 0
 };
 
+/// 地面站捕网发射指令（65016，地面站 → 指定飞机；台架/测试用）。
+/// 只在 `actuator.gcs_fire_enabled=true` 且“已落地 + 未解锁”时执行，
+/// 与 `interception.enabled` 的自动拦截发射互斥（见 GcsNetFire）。
+struct NetFireCommand {
+    MessageHeader header;
+    uint8_t protocol_version = 1;   ///< 发射协议版本，当前固定 1
+    uint32_t command_id = 0;        ///< 地面站生成的指令编号；65017 原样带回
+    uint8_t flags = 0;              ///< bit0=确认发射（必须置位）
+    uint64_t received_ms = 0;       ///< 本机收到消息的单调时钟时间
+};
+
+/// 65017 捕网发射回执结果。
+enum class NetFireResult : uint8_t {
+    kAccepted = 0,   ///< 已入队，执行器开始触发/复位时序
+    kCompleted = 1,  ///< 触发-复位周期完成，执行器回到待机
+    kRejected = 2,   ///< 未执行，具体原因见 reason
+};
+
+/// 65017 捕网发射回执原因码。
+enum class NetFireReason : uint8_t {
+    kNone = 0,
+    kInvalidMessage = 1,        ///< 帧长/字段非法
+    kUnsupportedVersion = 2,    ///< 协议版本不支持
+    kConfirmationMissing = 3,   ///< flags 未置确认位
+    kDuplicateCommand = 4,      ///< 同一 command_id 已处理（回执重放）
+    kCommandStale = 5,          ///< 指令在队列中滞留过久
+    kDisabled = 6,              ///< actuator.gcs_fire_enabled=false
+    kFlightStateStale = 7,      ///< 无新鲜飞行状态，无法确认落地/未解锁
+    kArmed = 8,                 ///< 已解锁，拒绝发射
+    kNotLanded = 9,             ///< 未落地，拒绝发射
+    kActuatorUnavailable = 10,  ///< 未注入命令接口 / 执行器未创建
+    kActuatorFaulted = 11,      ///< 执行器终态故障
+    kActuatorBusy = 12,         ///< 执行器未回到 Ready
+    kCooldown = 13,             ///< 距上一次成功触发的间隔小于冷却时间
+    kNoRemainingShots = 14,     ///< 发数已耗尽（单发为 1）
+    kSendFailed = 15,           ///< 触发命令入队失败
+    kInternalError = 100,
+};
+
+/// 地面站捕网发射回执（飞机 → 地面站 65017）。
+struct NetFireAck {
+    MessageHeader header;
+    uint32_t command_id = 0;
+    NetFireResult result = NetFireResult::kRejected;
+    NetFireReason reason = NetFireReason::kNone;
+    /// 执行器状态快照：0=Ready 1=Busy（触发/复位时序中） 2=Faulted。
+    uint8_t actuator_state = 0;
+};
+
 /// 目标估计状态（感知融合/目标估计 → 状态机与控制）。
 struct TargetState {
     MessageHeader header;
@@ -538,6 +587,8 @@ inline constexpr char kPx4Setpoint[] = "px4_setpoint";        ///< Px4Setpoint
 inline constexpr char kMissionStatus[] = "mission_status";    ///< MissionStatus
 inline constexpr char kMissionAssignment[] = "mission_assignment";        ///< MissionAssignment（65014）
 inline constexpr char kMissionAssignmentAck[] = "mission_assignment_ack"; ///< MissionAssignmentAck（65015）
+inline constexpr char kNetFireCommand[] = "net_fire_command";             ///< NetFireCommand（65016）
+inline constexpr char kNetFireAck[] = "net_fire_ack";                     ///< NetFireAck（65017）
 inline constexpr char kHealthStatus[] = "health_status";      ///< HealthStatus
 inline constexpr char kAnnotatedFrame[] = "annotated_frame";  ///< video::FrameHandle
 }  // namespace topics

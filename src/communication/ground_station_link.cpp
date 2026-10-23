@@ -151,6 +151,9 @@ constexpr uint16_t kStatusShortFramePayloadLength = 55;
 constexpr uint16_t kStatusShortFrameLength =
     kV2ExtensionFixedHeaderLength + kStatusShortFramePayloadLength;
 constexpr uint8_t kFrameLengthMarker = 1;
+/// 65016 指令在机载队列中的最长有效期：超过该时长仍未处理即按“指令过期”拒绝，
+/// 避免串口积压后补发一次过期发射。
+constexpr uint32_t kNetFireCommandValidForMs = 2000;
 
 // 把浮点物理量乘 scale 换算成 MAVLink 整数字段，跳过非有限值并夹逼到 [min,max]。
 template <typename T>
@@ -328,6 +331,11 @@ public:
                         8, common::Topic<common::MissionAssignmentAck>::OverflowPolicy::
                                kDropOldest);
             }
+            if (net_fire_ack_topic_ != nullptr) {
+                net_fire_ack_subscription_ = net_fire_ack_topic_->Subscribe(
+                    8,
+                    common::Topic<common::NetFireAck>::OverflowPolicy::kDropOldest);
+            }
             latest_state_.reset();
             latest_health_.reset();
             latest_mission_status_.reset();
@@ -343,6 +351,7 @@ public:
             connected_.store(false, std::memory_order_release);
             flight_state_subscription_.Reset();
             mission_assignment_ack_subscription_.Reset();
+            net_fire_ack_subscription_.Reset();
             serial_.Close();
             RecordError((std::string("地面站通信启动失败: ") + error.what()).c_str());
             return false;
@@ -365,6 +374,7 @@ public:
         mission_status_subscription_.Reset();
         health_subscription_.Reset();
         mission_assignment_ack_subscription_.Reset();
+        net_fire_ack_subscription_.Reset();
         latest_state_.reset();
         latest_health_.reset();
         latest_mission_status_.reset();
@@ -396,6 +406,20 @@ public:
             return;
         }
         mission_assignment_ack_topic_ = &topic;
+    }
+
+    common::Topic<common::NetFireCommand>& NetFireCommandOutput() {
+        return net_fire_command_output_;
+    }
+
+    // 绑定 65017 发射回执输入。必须在 Start 前调用，运行中不允许改绑。
+    void SetNetFireAckInput(common::Topic<common::NetFireAck>& topic) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("地面站 NetFireAck Topic 必须在 Start 前绑定");
+            return;
+        }
+        net_fire_ack_topic_ = &topic;
     }
 
     // 绑定飞行状态输入。必须在 Start 前调用，运行中不允许改绑。
@@ -441,6 +465,7 @@ private:
     using MissionSubscription = common::Topic<common::MissionStatus>::Subscription;
     using AssignmentAckSubscription =
         common::Topic<common::MissionAssignmentAck>::Subscription;
+    using NetFireAckSubscription = common::Topic<common::NetFireAck>::Subscription;
 
     struct Deadlines {
         std::chrono::steady_clock::time_point heartbeat;
@@ -481,6 +506,7 @@ private:
             DrainFlightState();
             DrainStatusInputs();
             DrainMissionAssignmentAcks();
+            DrainNetFireAcks();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
             CheckTimeSyncTimeout(current_ms);
@@ -616,6 +642,13 @@ private:
         }
     }
 
+    // 逐条消费 65017 发射回执输入。发射回执同样是事件消息，不能只留最新一条。
+    void DrainNetFireAcks() {
+        while (auto message = net_fire_ack_subscription_.TryTake()) {
+            (void)SendNetFireAck(**message);
+        }
+    }
+
     // 分发已解析的 MAVLink 消息；目前只处理心跳、TIMESYNC 与 V2_EXTENSION 目标。
     void HandleMessage(const mavlink_message_t& message) {
         receive_count_.fetch_add(1, std::memory_order_relaxed);
@@ -716,6 +749,10 @@ private:
         }
         if (extension.message_type == kMissionAssignMessageType) {
             HandleMissionAssignment(message, extension);
+            return;
+        }
+        if (extension.message_type == kNetFireMessageType) {
+            HandleNetFireCommand(message, extension);
             return;
         }
         if (extension.message_type != kTrackTargetUpdateMessageType) {
@@ -828,6 +865,98 @@ private:
         payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
         return payload;
     }
+
+    // 65016 捕网直控发射 payload 的链路层镜像（小端，协议有效 55 字节）。
+    struct NetFirePayload {
+        uint8_t protocol_version = 0;
+        uint32_t command_id = 0;
+        uint8_t flags = 0;
+        uint8_t target_system = 0;
+        uint8_t target_component = 0;
+        uint8_t frame_length_marker = 0;
+    };
+
+    // 处理 NET_FIRE(65016)：来源已在 HandleV2Extension 过滤；地址双字段必须同时
+    // 匹配本机，不匹配静默丢弃——广播发射指令不得触发任何一架的动作。版本、
+    // 确认位、落地态等语义校验全部留给 GcsNetFire，链路层只做长度与地址校验。
+    void HandleNetFireCommand(const mavlink_message_t& message,
+                              const mavlink_v2_extension_t& extension) {
+        const uint64_t receive_count = ++net_fire_receive_count_;
+        if (ShouldLogThrottled(receive_count)) {
+            SPDLOG_INFO("收到捕网直控发射指令: target={}/{} flags={} count={}",
+                        extension.target_system, extension.target_component,
+                        ReadLe<uint8_t>(extension.payload, 5), receive_count);
+        }
+        if (message.len < kStatusShortFrameLength) {
+            const uint64_t invalid_count = ++net_fire_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("捕网发射指令帧长不足: len={} required={} count={}",
+                            message.len, kStatusShortFrameLength, invalid_count);
+            }
+            return;
+        }
+        const NetFirePayload payload = DecodeNetFireCommand(extension.payload);
+        if (extension.target_system != config_.aircraft_system_id ||
+            extension.target_component != config_.aircraft_component_id ||
+            payload.target_system != config_.aircraft_system_id ||
+            payload.target_component != config_.aircraft_component_id) {
+            const uint64_t mismatch_count = ++net_fire_address_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN(
+                    "捕网发射指令地址不匹配: header={}/{} payload={}/{} local={}/{} count={}",
+                    extension.target_system, extension.target_component,
+                    payload.target_system, payload.target_component,
+                    config_.aircraft_system_id, config_.aircraft_component_id,
+                    mismatch_count);
+            }
+            return;
+        }
+        if (payload.frame_length_marker != kFrameLengthMarker) {
+            const uint64_t invalid_count = ++net_fire_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("捕网发射指令帧长度标记非法: marker={} count={}",
+                            payload.frame_length_marker, invalid_count);
+            }
+            return;
+        }
+
+        const uint64_t receive_time_ms = MonotonicMs();
+        common::NetFireCommand command;
+        command.header.sequence = receive_count;
+        // 65016 不携带地面站生成时刻，source_time_ms 保持 0。
+        command.header.receive_time_ms = receive_time_ms;
+        command.header.valid_for_ms = kNetFireCommandValidForMs;
+        command.header.source_id = config_.ground_system_id;
+        command.header.health = 1;
+        // 发射指令不携带空间数据，frame_id 不指向任何坐标系。
+        command.header.frame_id = 0;
+        command.protocol_version = payload.protocol_version;
+        command.command_id = payload.command_id;
+        command.flags = payload.flags;
+        command.received_ms = receive_time_ms;
+        (void)net_fire_command_output_.Publish(
+            std::make_shared<const common::NetFireCommand>(command));
+        const uint64_t publish_count = ++net_fire_publish_count_;
+        if (ShouldLogThrottled(publish_count)) {
+            SPDLOG_INFO(
+                "捕网发射指令已发布: version={} command_id={} flags={} count={}",
+                command.protocol_version, command.command_id, command.flags,
+                publish_count);
+        }
+    }
+
+    // 逐字段小端解码 65016 payload；调用方已保证帧长不少于 60 字节。
+    NetFirePayload DecodeNetFireCommand(const uint8_t* data) const {
+        NetFirePayload payload;
+        payload.protocol_version = ReadLe<uint8_t>(data, 0);
+        payload.command_id = ReadLe<uint32_t>(data, 1);
+        payload.flags = ReadLe<uint8_t>(data, 5);
+        payload.target_system = ReadLe<uint8_t>(data, 50);
+        payload.target_component = ReadLe<uint8_t>(data, 51);
+        payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
+        return payload;
+    }
+
 
     // 处理 TRACK_TARGET_UPDATE：依次做地址匹配、协议版本、坐标、身份、时间同步、
     // 序号、字段范围与时效校验，全部通过后发布 GroundStationTarget 并回 ACCEPTED ACK；
@@ -1154,6 +1283,30 @@ private:
                 static_cast<uint8_t>(ack.result), static_cast<uint8_t>(ack.reason),
                 static_cast<uint8_t>(ack.mission_state),
                 static_cast<uint8_t>(ack.availability), count);
+        }
+        return sent;
+    }
+
+    // 发送 65017 捕网发射回执：以本机身份发往 255/190，不要求地面站再回 ACK。
+    bool SendNetFireAck(const common::NetFireAck& ack) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, kNetFireProtocolVersion);
+        WriteLe<uint32_t>(payload, 1, ack.command_id);
+        WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(ack.result));
+        WriteLe<uint8_t>(payload, 6, static_cast<uint8_t>(ack.reason));
+        WriteLe<uint8_t>(payload, 7, ack.actuator_state);
+        WriteLe<uint8_t>(payload, 50, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 51, config_.aircraft_component_id);
+        // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
+        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
+        const bool sent = SendStatusExtension(kNetFireAckMessageType, payload);
+        const uint64_t count = ++net_fire_ack_send_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO(
+                "捕网发射ACK发送{}: command_id={} result={} reason={} actuator_state={} count={}",
+                sent ? "成功" : "失败", ack.command_id,
+                static_cast<uint8_t>(ack.result), static_cast<uint8_t>(ack.reason),
+                ack.actuator_state, count);
         }
         return sent;
     }
@@ -1700,15 +1853,18 @@ private:
     common::Topic<common::MissionStatus>* mission_status_topic_ = nullptr;
     common::Topic<common::HealthStatus>* health_topic_ = nullptr;
     common::Topic<common::MissionAssignmentAck>* mission_assignment_ack_topic_ = nullptr;
+    common::Topic<common::NetFireAck>* net_fire_ack_topic_ = nullptr;
     FlightSubscription flight_state_subscription_;
     HealthSubscription health_subscription_;
     MissionSubscription mission_status_subscription_;
     AssignmentAckSubscription mission_assignment_ack_subscription_;
+    NetFireAckSubscription net_fire_ack_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     std::optional<common::HealthStatus> latest_health_;
     std::optional<common::MissionStatus> latest_mission_status_;
     common::Topic<common::GroundStationTarget> target_output_;
     common::Topic<common::MissionAssignment> mission_assignment_output_;
+    common::Topic<common::NetFireCommand> net_fire_command_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;
     uint64_t target_v2_extension_count_ = 0;
@@ -1721,6 +1877,11 @@ private:
     uint64_t mission_assign_invalid_count_ = 0;
     uint64_t mission_assign_publish_count_ = 0;
     uint64_t mission_assign_ack_send_count_ = 0;
+    uint64_t net_fire_receive_count_ = 0;
+    uint64_t net_fire_address_mismatch_count_ = 0;
+    uint64_t net_fire_invalid_count_ = 0;
+    uint64_t net_fire_publish_count_ = 0;
+    uint64_t net_fire_ack_send_count_ = 0;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 
@@ -1764,6 +1925,13 @@ GroundStationLink::MissionAssignmentOutput() {
 void GroundStationLink::SetMissionAssignmentAckInput(
     common::Topic<common::MissionAssignmentAck>& topic) {
     impl_->SetMissionAssignmentAckInput(topic);
+}
+common::Topic<common::NetFireCommand>& GroundStationLink::NetFireCommandOutput() {
+    return impl_->NetFireCommandOutput();
+}
+void GroundStationLink::SetNetFireAckInput(
+    common::Topic<common::NetFireAck>& topic) {
+    impl_->SetNetFireAckInput(topic);
 }
 void GroundStationLink::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>& topic) {
@@ -1812,6 +1980,11 @@ GroundStationLinkStub::MissionAssignmentOutput() {
 }
 void GroundStationLinkStub::SetMissionAssignmentAckInput(
     common::Topic<common::MissionAssignmentAck>&) {}
+common::Topic<common::NetFireCommand>&
+GroundStationLinkStub::NetFireCommandOutput() {
+    return net_fire_command_output_;
+}
+void GroundStationLinkStub::SetNetFireAckInput(common::Topic<common::NetFireAck>&) {}
 void GroundStationLinkStub::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>&) {}
 void GroundStationLinkStub::SetMissionStatusInput(
