@@ -422,6 +422,12 @@ public:
         net_fire_ack_topic_ = &topic;
     }
 
+    // 记录 65016 是否有人消费。装配层在 GcsNetFire 未创建时置 false，
+    // 让链路层能就“指令已发布但无人处理”给出可自证的 WARN。
+    void SetNetFireConsumerPresent(bool present) {
+        net_fire_consumer_present_ = present;
+    }
+
     // 绑定飞行状态输入。必须在 Start 前调用，运行中不允许改绑。
     void SetFlightStateInput(common::Topic<common::FlightStateSnapshot>& topic) {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -942,6 +948,18 @@ private:
                 "捕网发射指令已发布: version={} command_id={} flags={} count={}",
                 command.protocol_version, command.command_id, command.flags,
                 publish_count);
+        }
+        if (!net_fire_consumer_present_) {
+            // 开关关闭时 65016 会正常解码并发布，但无人消费、也不会回 65017；
+            // 这条 WARN 让“地面站发了却没反应”能直接从机载日志判断原因。
+            const uint64_t unconsumed_count = ++net_fire_unconsumed_count_;
+            if (ShouldLogThrottled(unconsumed_count)) {
+                SPDLOG_WARN(
+                    "捕网发射指令无人消费: command_id={} count={}"
+                    "（actuator.gcs_fire_enabled=false 时预期如此：执行器不动作，"
+                    "也不回 65017）",
+                    command.command_id, unconsumed_count);
+            }
         }
     }
 
@@ -1882,6 +1900,8 @@ private:
     uint64_t net_fire_invalid_count_ = 0;
     uint64_t net_fire_publish_count_ = 0;
     uint64_t net_fire_ack_send_count_ = 0;
+    uint64_t net_fire_unconsumed_count_ = 0;
+    bool net_fire_consumer_present_ = false;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 
@@ -1932,6 +1952,9 @@ common::Topic<common::NetFireCommand>& GroundStationLink::NetFireCommandOutput()
 void GroundStationLink::SetNetFireAckInput(
     common::Topic<common::NetFireAck>& topic) {
     impl_->SetNetFireAckInput(topic);
+}
+void GroundStationLink::SetNetFireConsumerPresent(bool present) {
+    impl_->SetNetFireConsumerPresent(present);
 }
 void GroundStationLink::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>& topic) {

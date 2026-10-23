@@ -304,6 +304,11 @@ void DroneApplication::BindTopics() {
             ground_station_link_->NetFireCommandOutput());
         ground_station_link_->SetNetFireAckInput(gcs_net_fire_->AckOutput());
     }
+    if (ground_station_link_ != nullptr) {
+        // 未装配 GcsNetFire（gcs_fire_enabled=false，生产默认）时告知链路层：
+        // 65016 仍会解码发布，但无人消费，需要打一条节流 WARN 便于现场判读。
+        ground_station_link_->SetNetFireConsumerPresent(gcs_net_fire_ != nullptr);
+    }
 
     // S5 位置引导输入：估计器/视觉稳定性/双目测距三者必须作为一组同时装配，
     // 缺一不绑定（状态机保持影子行为，不会假装执行自动任务）。
