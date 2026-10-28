@@ -3,7 +3,8 @@
 > 用途：PX4 已到位（2026-10-10：装机体 + GPS，可出 Home）后的实链验证，逐条打勾并记录日志。
 > 定位：主任务《主程序集成与数据链路实施计划》阶段四的前置验证；§7 收录阶段四
 > 控制接入门禁（G2/G3 已实跑通过；G4 串口台架自动部分与 G4-4 机载侧已于
-> 2026-10-21 实跑，G4-2 实际方向/G4-3 待完成；G5 线下清单）与
+> 2026-10-21 实跑；G4-2 于 2026-10-28 由遥控器飞行确认、G4-3/G4-5 于
+> 2026-10-28 台架校准与实跑通过；G5 线下清单）与
 > `enable_control` 打开前置清单。
 > **§0~§6 全程只读**：不绑定 `Px4Setpoint`、不发 ARM/模式切换/起飞/降落，
 > `enable_control` 保持 false。§7 G4 台架会在拆桨/固定/RC 接管条件下输出
@@ -169,7 +170,7 @@ v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前�
 
 | # | 条件 | 证据位置 | 状态 |
 |---|---|---|---|
-| 1 | G0~G4 全部通过 | 本文件 §7.1/§7.3 + `docs/开发进度.md` | ⏳ |
+| 1 | G0~G4 全部通过 | 本文件 §7.1/§7.3 + `docs/开发进度.md` | ✅ 2026-10-28（G0 单测 604/604；G1~G3 SITL 全 PASS；G4-1~G4-5 全绿） |
 | 2 | 双目测距卷尺级精度验收 + fxB 绝对精度对齐 | 独立测试工程结论回填 | ⏳ 室外 <8m 现场可用已验证（2026-10-20，近距有效占比 99.2%）；卷尺级/fxB 对齐仍待独立工程回填 |
 | 3 | 控制律参数整定完成（非占位值：heading.gain / vertical.vz_gain / distance PID） | SITL/回放整定记录 | ✅ 2026-10-14（SITL `--sitl-stage4-tune` 五轮整定，全指标达标；终值 heading.gain=0.9、vz_gain=0.1、distance 0.5/0.05/0.1；记录与证据见 `include/control/tracking_control_law.md` §7 + `tools/tune_evidence/`；遗留：d_exp=10m 冻结后须复跑复核零过冲） |
 | 4 | 相机安装外参标定（消除全 0 准直假设，`target_estimator.visual.mount_*`） | 标定参数入库 | ⏳ |
@@ -190,9 +191,9 @@ v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前�
 | 序 | 项 | 环境 | 通过标准 | 状态 |
 |---|---|---|---|---|
 | G4-1 | ARM/Offboard 流程（真实 PX4 + 机体，卸桨） | 台架 | 模式/上锁序列与 SITL 一致，电机仅怠速级响应 | ✅ 2026-10-21（自动序列通过；现场确认电机仅怠速） |
-| G4-2 | 电机输出方向（位置/速度意图小量激励） | 台架 | 方向正确、无反转 | ⏳ 四向设定值方向 ✅ 2026-10-21；电机/机体实际方向待人工判读（方法见 `tools/px4_link_smoke.md` §2.5） |
+| G4-2 | 电机输出方向（位置/速度意图小量激励） | 台架 | 方向正确、无反转 | ✅ 2026-10-28（维护者确认：**遥控器成功飞行**，电机转向/位置正确、无反转；2026-10-21 台架四向设定值方向全部正确）。判读方法见 `tools/px4_link_smoke.md` §2.5 |
 | G4-3 | 捕网 PWM 行程/方向与 ACK/保持时序（DO_SET_ACTUATOR 触发/复位） | 台架 | 机构到位、方向正确；PX4 侧通道/功能/映射已确认（2026-10-21：MAIN5 = `Peripheral via Actuator Set 1`，`PWM_MAIN_MIN5=1000` / `PWM_MAIN_MAX5=2000` / `PWM_MAIN_DIS5=1500`、`Rev Range=off`（2026-10-28 实测校准）；机载 `net_channel=1`，只发归一化 -0.7/0.0）；**时序**：187 触发 ACK accepted → 保持 `reset_delay`（**2026-10-23 冻结 1.5s**）→ 自动发复位行程 → 复位 ACK accepted → `reset_settle` 后回 Ready；ACK 超时/断连时执行器进入故障（日志 ERROR、状态机 S16/bit4、取消待发命令、不补发复位） | ✅ 2026-10-23 机制与参数冻结（维护者裁决：舵机式机构、纯 PWM 驱动，行程由归一化量→PWM 映射决定，无需专项台架；发射方向与机头一致，有效射程 = 双目测距极限 ≤8m，`interception.max_range_m=8.0`）。**实物发射有效性**转为 G5 前实机观察项，不阻塞控制门禁；自动模式仍不得触发（`interception.enabled=false`）。**2026-10-28 拆桨台架实测**：MAIN5 参数 `Minimum=1000 / Maximum=2000 / Disarmed=1500 / Rev Range=off`，地面站发 65016 后 `actuator_outputs` 实测 **1500→1150（保持 1.5s）→1500µs**、舵机行程到位；此前误配 `Minimum=1500 / Maximum=1150`（顺序反且非 1000/2000）时待机落 **1325**、触发只到 **1448**（约 15% 行程），机构不动 |
-| G4-5 | 地面站直控捕网发射（65016/65017）：本地副本 `gcs_fire_enabled=true` 启动正式程序，用 `tools/net_fire_tester.py` 发 65016 | 台架（**拆桨**） | 落地且未解锁时回 65017 `ACCEPTED→COMPLETED`；解锁/未落地/无确认位分别回 `ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`；同一 `command_id` 重发只受理一次；舵机行程正常 | ✅ 2026-10-28 拆桨台架实跑通过：地面站发 65016（落地、未解锁）→ 65017 `ACCEPTED` → 187 触发 `norm=-0.70` → 保持 1.5s → 复位 `norm=0.00` → `COMPLETED`；`actuator_outputs` 实测 1500→1150→1500、舵机到位。负向用例（`ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`/`DUPLICATE`/`NO_REMAINING_SHOTS`/`FLIGHT_STATE_STALE`）待补录 |
+| G4-5 | 地面站直控捕网发射（65016/65017）：本地副本 `gcs_fire_enabled=true` 启动正式程序，用 `tools/net_fire_tester.py` 发 65016 | 台架（**拆桨**） | 落地且未解锁时回 65017 `ACCEPTED→COMPLETED`；解锁/未落地/无确认位分别回 `ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`；同一 `command_id` 重发只受理一次；舵机行程正常 | ✅ 2026-10-28 拆桨台架实跑通过：地面站发 65016（落地、未解锁）→ 65017 `ACCEPTED` → 187 触发 `norm=-0.70` → 保持 1.5s → 复位 `norm=0.00` → `COMPLETED`；`actuator_outputs` 实测 1500→1150→1500、舵机到位。负向用例（`ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`/`DUPLICATE`/`NO_REMAINING_SHOTS`/`FLIGHT_STATE_STALE`）待补录。**证据日志 `0068_20261028_144754.log`**：65016 收帧 14:48:23.114 → 187 触发 ACK 14:48:23.141（27ms）→ 复位入队 14:48:24.651 → 复位 ACK 14:48:24.664 → `发射周期完成` 14:48:24.671（保持 1.510s）；会话 `accepted=1 rejected=0`，同日志 `飞行控制器停止: setpoint_count=0 rejected_intent_count=0` 证明全程零飞行控制输出（影子） |
 | G4-4 | 断链失控保护（拔串口/停 setpoint） | 台架 | 停发/上锁符合预期（机载侧：停意图/关串口/心跳停止/刷盘；PX4 failsafe 归飞控配置） | ✅ 2026-10-21 机载侧：停 setpoint 分支（COAST/IDLE、退出 Offboard 1972ms、DISARM）+ 拔串口分支（停意图/关串口/心跳停止/刷盘/退出码4）；PX4 failsafe 不在机载软件判定范围 |
 | G5-1 | 室外首飞（系留/低空低速、人工兜底） | 室外 | 另行冻结清单（含场地围栏参数、遥控兜底、天气条件） | ⏳ |
 
@@ -211,7 +212,8 @@ echo "退出码=$?"
 - PX4 默认 `COM_DISARM_PRFLT=10s`（解锁后未起飞自动上锁）。台架序列已压缩到
   解锁后约 7.5s；若需更长时间人工观察方向，先在 QGC 临时调到 ≥30s，测后恢复；
 - 自动流程覆盖 G4-1/2/4 的序列、ACK、四向设定值方向、停发 Offboard 退出与
-  DISARM；G4-1 电机怠速已人工确认；G4-2 电机/机体实际方向仍须人工判读；
+  DISARM；G4-1 电机怠速已人工确认；G4-2 电机/机体实际方向已于 2026-10-28
+  由遥控器成功飞行确认（转向/位置正确、无反转）；
 - G4-3 捕网执行器**不自动触发**：PX4 侧对应关系已确认（2026-10-21：MAIN5 =
   `Peripheral via Actuator Set 1`，`PWM_MAIN_MIN5=1000` / `PWM_MAIN_MAX5=2000` /
   `PWM_MAIN_DIS5=1500`、`Rev Range=off`（2026-10-28 实测校准：`0.0→1500µs`、
@@ -248,9 +250,10 @@ echo "退出码=$?"
   AUTO.LAND/DISARM。**按维护者裁决，PX4 是独立系统，其 `COM_OF_LOSS_T`/
   `COM_OBL_RC_ACT`、退出 Offboard/上锁行为由飞控自身负责，不属于机载软件
   门禁；需要时用 QGC 连接飞控另行核对，不阻塞本项目。**
-- **其余未完成**：G4-2 电机/机体实际方向判读（设定值方向已全部正确）、
-  捕网**实物发射有效性**观察（G4-3 机制/参数/时序已于 2026-10-23 冻结，
-  不再是门禁）。
+- **G4-2 已闭环（2026-10-28）**：维护者以遥控器成功飞行确认电机转向/位置
+  正确、无反转（台架四向设定值方向 2026-10-21 已全部正确）。
+- **其余未完成**：捕网**实物发射有效性**观察（G4-3 机制/参数/时序已于
+  2026-10-23 冻结，不再是门禁）。
   默认 `COM_DISARM_PRFLT=10s` 下解锁→DISARM 约 9s，余量仅约 1s，后续台架
   建议先临时调到 ≥30s。**生产 Px4Link 已实现串口断链自动重连（2026-10-21）**：
   连续读错误后关闭端口/置 disconnected、清命令与遥测、按 `reconnect_interval`
