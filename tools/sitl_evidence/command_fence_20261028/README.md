@@ -11,6 +11,10 @@ tools/sitl_harness.sh stop                      # 必须先停，避免上一段
 tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-command
 tools/sitl_harness.sh stop
 tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-fence
+tools/sitl_harness.sh stop
+tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-command-assigned
+tools/sitl_harness.sh stop
+tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-hold
 ```
 
 ## 文件
@@ -19,6 +23,8 @@ tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-
 |---|---|
 | `stage4_command_20261028_pass.log` | 65020 主动返航专项 **PASS** |
 | `stage4_fence_20261028_pass.log` | 65018 围栏专项 **PASS** |
+| `stage4_command_assigned_20261028_pass.log` | 65014+65020 中止回执专项 **PASS**（65015 必发） |
+| `stage4_fence_hold_20261028_pass.log` | 65018 动作 hold 保持专项 **PASS**（观察窗后 65020 收尾） |
 
 ## 判读要点
 
@@ -47,10 +53,34 @@ tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-
 | 设定值钳制 | 最大设定值模长 **18.98m ≤ 20m**（控制器按多边形内缩 1m 钳制） |
 | S12→S13→S14 | 越界中止 → 返航 → 降落 → 上锁，迁移 8 次、错误 0 |
 
+### 65014+65020（stage4-command-assigned）
+
+| 检查项 | 实测 |
+|---|---|
+| 预置已接受分配 | 测试钩子 `SeedAcceptedAssignmentForTest`（仅 `test_hooks_enabled` 生效） |
+| 65020 下发 / 65021 | `command_id=1`，`result=0`（accepted） |
+| **65015 cancelled_by_gcs** | 出现（`reason=12`）——这正是本场景存在的目的 |
+| 未进 S9/S10、S12→S14 | 全部符合；迁移 8 次、错误 0 |
+
+### 65018 动作 hold（stage4-fence-hold）
+
+| 检查项 | 实测 |
+|---|---|
+| 65018 下发 | `zone=21/1`、半径 20m、动作 `kHold` |
+| 65019 | `VIOLATED` 后 **观察窗 2500ms 内保持 `state=7`**，未提前返航 |
+| hold 设定点 | 停在区内（模长 ≤ 半径+2m）、不追目标（离 40m 目标最近 **21.03m**） |
+| 收尾 | 观察窗结束后工具下发 65020 → 65021 accepted → S12→S13→S14 |
+
+判据踩过的坑：hold 设定点以「越界瞬间位置」为锚，而该点在区域外，控制器会按
+`fence.boundary_margin_m` 把它拉回区内，于是「设定点 == 当前位置」恒不成立（实测
+偏差 6.88m，属正常）。判据改为「设定点在区内 + 不追目标」，偏差只作诊断输出。
+
 ## 教训
 
 - `sitl_harness.sh smoke` 之间必须 `stop` 并等待，否则上一段 PX4/PTY 残留会让
   下一段读到脏状态（2026-10-28 已踩过两次假失败，见 `tools/sitl_harness.md`）。
+- 需要 65015 的场景必须**先有已接受分配**：SITL 起飞由工具直接驱动 PX4、不走 S2 的
+  65014 入口，所以只能靠测试钩子预置；正式装配里钩子开关不置位，误调会记错误并拒绝。
 - 围栏场景的 20m 半径是刻意选的：S7 稳态在目标（北向 40m）后方约 10m 处，
   机体 N≈30m，注入即越界；主目标 40m 与 S5 接近窗 20m 之外的**更小**半径才能
   在视觉锁定后立刻触发，否则要等机体再飞出去。

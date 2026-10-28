@@ -653,6 +653,33 @@ public:
         TransitionTo(state, "测试入口强制迁移");
     }
 
+    void SeedAcceptedAssignmentForTest(
+        const common::MissionAssignment& assignment) {
+        if (!test_hooks_enabled_) {
+            RecordError(
+                "未启用测试钩子（MissionStateMachineConfig::test_hooks_enabled=false）："
+                "拒绝预置任务分配");
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!assignment_tracker_.Accept(assignment, MonotonicMs())) {
+            RecordError("预置任务分配被 tracker 拒绝（已存在有效分配）");
+            return;
+        }
+        assignment_tracker_.RememberResult(
+            assignment.assignment_id,
+            common::MissionAssignmentResult::kAccepted,
+            common::MissionAssignmentReason::kNone);
+        accepted_assignment_ = assignment;
+        if (latest_flight_.has_value()) {
+            const auto& flight = *latest_flight_;
+            assignment_tracker_.BeginTakeoff(flight.local_x_m, flight.local_y_m,
+                                            flight.local_z_m, MonotonicMs());
+        }
+        SPDLOG_INFO("测试钩子：已预置任务分配 id={} target={}（仅用于验证 65015 链路）",
+                    assignment.assignment_id, assignment.target_id);
+    }
+
     common::MissionState CurrentState() const {
         std::lock_guard<std::mutex> lock(state_mutex_);
         return state_;
@@ -4167,6 +4194,10 @@ uint64_t MissionStateMachine::TransitionCount() const {
 uint64_t MissionStateMachine::ErrorCount() const { return impl_->ErrorCount(); }
 void MissionStateMachine::ForceStateForTest(common::MissionState state) {
     impl_->ForceStateForTest(state);
+}
+void MissionStateMachine::SeedAcceptedAssignmentForTest(
+    const common::MissionAssignment& assignment) {
+    impl_->SeedAcceptedAssignmentForTest(assignment);
 }
 
 MissionStateMachineStub::MissionStateMachineStub() {

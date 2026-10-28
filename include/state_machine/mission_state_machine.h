@@ -241,6 +241,18 @@ public:
     /// 语义：`DroneApplication` 不置位）时**直接拒绝并记 ERROR，不产生任何迁移**。
     void ForceStateForTest(common::MissionState state);
 
+    /// **SITL 专用钩子**：预置一份「已接受」的任务分配（等价于 S2 收到 65014
+    /// 并接受后的状态），用于验证依赖 `accepted_assignment_` 的下游链路
+    /// （最典型是中止时补发的 65015 aborted）。
+    ///
+    /// 机载 SITL 工具的起飞由工具直接驱动 PX4，不经过 S2 的分配入口；没有本钩子
+    /// 就无法在仿真里覆盖「65014 已接受 + 65020 主动返航 → 65015 回执」这条组合。
+    ///
+    /// **风险与门控**：与 `ForceStateForTest` 同样要求
+    /// `MissionStateMachineConfig::test_hooks_enabled=true`（生产装配不置位），
+    /// 否则记 ERROR 并拒绝，不改变任何状态。
+    void SeedAcceptedAssignmentForTest(const common::MissionAssignment& assignment);
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

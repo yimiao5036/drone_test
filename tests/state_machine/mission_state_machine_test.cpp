@@ -4321,6 +4321,52 @@ TEST(MissionStateMachineTest, MissionCommandReturnHomeAbortsToReturnHome) {
                     .has_value());
 }
 
+/// 测试钩子：未启用 `test_hooks_enabled` 时拒绝预置任务分配（生产装配语义），
+/// 保证这个"让机载以为已接单"的入口不会被误开。
+TEST(MissionStateMachineTest, SeedAcceptedAssignmentRejectedWithoutTestHooks) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.test_hooks_enabled = false;  // 生产装配默认值
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    machine.SeedAcceptedAssignmentForTest(MakeAssignment(77));
+    EXPECT_GT(machine.ErrorCount(), 0U) << "未启用测试钩子时必须记错误并拒绝";
+    machine.Stop();
+}
+
+/// 测试钩子预置分配后，65020 主动返航应补发 65015 reason=cancelled_by_gcs
+/// （中止回执的前置门槛是 accepted_assignment_ 有值）。
+TEST(MissionStateMachineTest, SeededAssignmentThenCommandEmitsCancelledAck) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 78));
+    // 预置一份"已接受"的分配（SITL 的 command-assigned 场景走同一入口）。
+    harness.machine.SeedAcceptedAssignmentForTest(MakeAssignment(78));
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9101)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "应回 65021";
+    EXPECT_EQ(ack->command_id, 9101U);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value());
+    EXPECT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
+                    .has_value())
+        << "已接受分配 + 65020 必须补发 65015 cancelled_by_gcs";
+}
+
 /// 65020 重复 command_id：第二次必须被拒（防重放），且状态不再变化。
 TEST(MissionStateMachineTest, MissionCommandDuplicateIdRejected) {
     AssignmentHarness harness(MakeTakeoffTestConfig());

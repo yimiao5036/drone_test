@@ -281,6 +281,12 @@ public:
 
     // ---- 测试入口（生产装配不得调用） ----
     void ForceStateForTest(common::MissionState state);  // 强制迁移（需 test_hooks_enabled=true）
+
+    /// 预置一份「已接受的任务分配」（需 test_hooks_enabled=true）。
+    /// 用途：SITL 里起飞由工具直接驱动 PX4、不走 S2 的 65014 入口，而中止回执
+    /// 65015 的前置是 accepted_assignment_ 有值；没有它就无法覆盖「已分配 + 65020
+    /// → 65015 cancelled_by_gcs」组合。
+    void SeedAcceptedAssignmentForTest(const common::MissionAssignment& assignment);
 };
 ```
 
@@ -641,6 +647,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     V1 返航段可通过测试钩子/测试用例或显式开启配置驱动。多发命中判据/再交战策略
     V2 立项；`MissionStatus` 结果字段暂不新增（用状态+日志）。
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
+- `SeedAcceptedAssignmentForTest`（2026-10-28 增）为测试入口：把给定分配写进
+  `assignment_tracker_`/`RememberResult(kAccepted)`/`accepted_assignment_`，并在
+  飞行快照有效时 `BeginTakeoff(...)`；同样受 `test_hooks_enabled` 门控，未启用时
+  `RecordError` 拒绝。**它不是生产入口**：生产装配不置位，唯一的调用方是
+  `px4_link_smoke --sitl-stage4-command-assigned`。
 - `ForceStateForTest`为测试入口（**运行期门控**）：与生产路径共用`TransitionTo`
   统一迁移挂点，用于驱动拦截序列（S9/S10/S11）的进入/离开动作。**门控**：
   `MissionStateMachineConfig::test_hooks_enabled` 默认 false（生产装配语义，
@@ -798,7 +809,10 @@ ctest --test-dir build --output-on-failure
   - `NoCommandSenderNeverFires`：未注入命令接口 → 即使进入拦截态也零调用；
   - `ForceStateForTestRejectedWithoutTestHooks`：`test_hooks_enabled=false`（生产
     装配默认）时强制迁移被拒绝并记 ERROR、状态不变、已注入的命令接口零调用
-    （防"生产路径误触发射网"）。
+    （防"生产路径误触发射网"）；
+  - `SeedAcceptedAssignmentRejectedWithoutTestHooks` / `SeededAssignmentThenCommandEmitsCancelledAck`
+    （2026-10-28）：测试钩子门控 + 「已预置分配 + 65020」必须补发 65015
+    `cancelled_by_gcs`（SITL `--sitl-stage4-command-assigned` 共用同一入口）。
 - 拦截后返航（S11~S14，2026-10-19；`MakeReturnHomeTestConfig` 默认
   `return_home.enabled=true`，缩短到达保持/命令重试/发射超时便于测试）：
   - `InterceptionFiresThenReturnsHomeAndLands`：强制 S10 → 发射命令入队 →

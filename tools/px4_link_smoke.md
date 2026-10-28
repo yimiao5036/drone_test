@@ -383,6 +383,57 @@ bootstrap/Offboard/ARM/起飞 1m → 目标 40m → LOCKED → S6→S7（稳态�
   `−3.88015m`、持续 `901ms`、最大设定值模长 `18.9761m`，迁移 8 次；日志
   `tools/sitl_evidence/command_fence_20261028/stage4_fence_20261028_pass.log`。
 
+### 2.3.5 stage4-command-assigned 中止回执专项（`--sitl-stage4-command-assigned`，非门禁）
+
+stage4-command 的**带分配**版本：先让机载存在一份「已接受的任务分配」，再下发 65020，
+专门验证 `65015 reason=cancelled_by_gcs`（12）这条中止回执真的会发出去——这是
+2.3.3 覆盖不到的分支（那里没有 65014，`PublishTakeoffAbortAck()` 首行即返回）。
+
+```text
+bootstrap/Offboard/ARM/起飞 1m → 目标 40m → LOCKED → S6→S7
+→ SeedAcceptedAssignmentForTest（测试钩子预置已接受分配）
+→ 注入 65020（command_id=1）→ 65021 result=0 → 65015 reason=12
+→ S12（带航向）→ S13 AUTO.LAND → S14 DISARMED
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 150   --sitl-stage4-command-assigned
+```
+
+- 判据：65020 已下发、65021 `result=0`、**65015 `reason=cancelled_by_gcs` 必须出现**
+  （本场景是必需项，不是可选项）、状态序列含 S12/S13/S14、不进 S9/S10、返航设定值
+  带 `USE_YAW` 且指向 Home。
+- 前置是测试钩子 `MissionStateMachine::SeedAcceptedAssignmentForTest()`：只有
+  `MissionStateMachineConfig::test_hooks_enabled=true` 才生效（生产装配不置位，
+  误调会记错误并拒绝），语义等同「S2 已接受 65014」。
+- 2026-10-28 WSL2 实跑：**PASS**，`65021 接受=是`、`65015 cancelled=是`、迁移 8 次；
+  日志 `tools/sitl_evidence/command_fence_20261028/stage4_command_assigned_20261028_pass.log`。
+
+### 2.3.6 stage4-fence-hold 围栏保持专项（`--sitl-stage4-fence-hold`，非门禁）
+
+65018 动作取 `hold` 时的端到端验证：越界后**原地保持、不中止任务**，观察窗结束后再由
+工具下发 65020 收尾，顺带覆盖「hold + 人工指令」组合链。
+
+```text
+S7 稳定伺服 → 注入 65018(zone=21/1, 半径 20m, action=hold) → 65019 VIOLATED
+→ 观察窗 2500ms（状态必须仍是 S7、不得进 S12）→ 工具下发 65020
+→ S12 → S13 → S14
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 150   --sitl-stage4-fence-hold
+```
+
+- 判据：65019 `VIOLATED`、观察窗内**未进 S12**（`hold_premature_return_==false`）、
+  hold 期间位置设定点停在区域内（模长 ≤ 半径+2m）**且不追目标**（设定点到 40m 目标
+  最近距离 ≥10m）、随后 65021 `result=0`、S12/S13/S14 完成。
+- **判据为什么不是「设定点等于当前位置」**：hold 意图以越界瞬间位置为设定点，而该点
+  在区域外，控制器会按 `fence.boundary_margin_m` 把它拉回区内，两者天然有 5~7m 偏差。
+  实测该偏差 6.88m，属正常现象（报告里作为诊断输出，不作判据）。
+- 2026-10-28 WSL2 实跑：**PASS**，观察窗 2500ms 内保持 `state=7`，hold 区内设定点
+  38 帧、离目标最近 21.03m、最大设定值模长 18.97m；日志
+  `tools/sitl_evidence/command_fence_20261028/stage4_fence_hold_20261028_pass.log`。
+
 ### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
 
 ```bash
