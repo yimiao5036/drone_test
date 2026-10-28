@@ -359,6 +359,10 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `aborted reason=kCancelledByGcs(12)`。**不是 PX4 RTL**：返航轨迹仍由 S12 位置意图控制。
   - 回执：`PublishMissionCommandAck()` 走 `kMissionCommandAck`，字段含 result/reason/
     `mission_state`（回执时刻状态），地面站无需猜测机载处于哪一态。
+  - **65015 的既有门槛（2026-10-28 复核）**：`PublishTakeoffAbortAck()` 首行是
+    `if (!accepted_assignment_.has_value()) return;`，因此只有在先接受过 65014 分配的
+    任务里，中止才会同步 65015；影子/未分配场景（含 SITL `--sitl-stage4-command`）只看
+    65021 与状态迁移。判读现场日志时不要把它当回归。
 - **S12 返航机头朝向**：`return_home.heading_mode=1`（默认）时，S12 非爬升段按
   期望航向（指向 Home，`atan2(east, north)`）下发 `yaw_valid=true` 的位置意图，
   经角速度/角加速度二阶限幅（`heading_rate_limit_dps=30`、`heading_accel_limit_dps2=60`）；

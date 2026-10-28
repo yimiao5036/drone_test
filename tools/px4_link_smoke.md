@@ -334,6 +334,55 @@ bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ SEARCHIN
 - **非门禁**：不替代 G2/G3；`interception.enabled` 生产默认关闭，射程为
   占位值，需按实机捕网有效射程与授权策略冻结后再开启。
 
+### 2.3.3 stage4-command 主动返航专项（`--sitl-stage4-command`，非门禁）
+
+剧本与 stage4-return 同构，但**不进入拦截**：S7 稳定视觉伺服后由工具扮演地面站
+下发一次 65020 主动返航，验证「人工指令 → 状态机守卫 → S12 带航向返航 → 落地/上锁」：
+
+```text
+bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ LOCKED → S6→S7
+→ 注入 65020（command_id=1）→ 65021 result=0 state=12 → S12（位置设定值带 USE_YAW，
+航向指向 Home）→ S13 AUTO.LAND → S14 DISARMED
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 120   --sitl-stage4-command
+```
+
+- 判据：65021 `result=0`、状态序列含 S12/S13/S14、**不进 S9/S10**（工具断言
+  `!saw_intercept_executing_`）、S12 期间至少一帧位置设定值 `use_yaw=true` 且航向
+  与「当前机体位置 → Home」方位角相差 ≤30°（或反向，`NormalizeDeg` 归一化）；
+  返航/降落/上锁由状态机接管，工具不再补发 AUTO.LAND。
+- **65015 不会出现**：`PublishTakeoffAbortAck()` 首行即 `if (!accepted_assignment_.has_value()) return;`，
+  本场景没有 65014 分配，故按既有设计不发 65015（带分配路径由单测覆盖）。
+- 2026-10-28 WSL2 实跑：**PASS**，65021 `result=0 state=12`，返航航向样本 276 帧
+  全部指向 Home，迁移 8 次、错误 0；日志
+  `tools/sitl_evidence/command_fence_20261028/stage4_command_20261028_pass.log`。
+
+### 2.3.4 stage4-fence 围栏越界专项（`--sitl-stage4-fence`，非门禁）
+
+同样不进拦截，改为在 S7 稳定伺服后下发一份**半径 20m 的方形共享区域**（65018，
+动作 `return`、高度基准 Home），让飞机在区域外触发越界链：
+
+```text
+bootstrap/Offboard/ARM/起飞 1m → 目标 40m → LOCKED → S6→S7（稳态保持 d_exp=10m，
+此时水平位移约 22m，已在 20m 方形区域外）→ 注入 65018(zone=21/1, 半径 20m)
+→ 防抖 1.5s 后 65019 fence_state=VIOLATED（距边界 −3.88m）→ 控制器对位置设定值
+做多边形钳制（最大模长 18.98m ≤ 20m）→ S12 → S13 → S14
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 120   --sitl-stage4-fence
+```
+
+- 判据：65018 已下发、65019 出现 `VIOLATED`、**位置设定值模长始终 ≤ 半径+2m**
+  （钳制证据）、状态序列含 S12/S13/S14、返航由状态机接管。
+- 20m 半径是特意选的：小于主目标 40m，使 S7 一进入稳态就越界，不必额外飞远；
+  若半径大于当前位移，越界不会发生，场景会等到超时。
+- 2026-10-28 WSL2 实跑：**PASS**，注入时局部 `N=22.312m`、65019 距边界
+  `−3.88015m`、持续 `901ms`、最大设定值模长 `18.9761m`，迁移 8 次；日志
+  `tools/sitl_evidence/command_fence_20261028/stage4_fence_20261028_pass.log`。
+
 ### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
 
 ```bash

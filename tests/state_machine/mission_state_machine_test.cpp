@@ -1,6 +1,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -8,11 +9,14 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 #include <gtest/gtest.h>
 
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "config/config.h"
+#include "config/zone_store.h"
 #include "perception/target_estimator.h"
 #include "state_machine/mission_state_machine.h"
 
@@ -4224,6 +4228,43 @@ TEST(MissionStateMachineTest, FenceZoneMismatchRejectsAssignment) {
         harness.ack_subscription, common::MissionAssignmentResult::kAccepted);
     ASSERT_TRUE(legacy_ack.has_value());
     EXPECT_EQ(legacy_ack->assignment_id, 12U);
+}
+
+/// 重启装载：Start 时从 zone.json 缓存恢复区域，起飞前预检即可用。
+TEST(MissionStateMachineTest, FenceZoneCacheLoadedAtStart) {
+    namespace fs = std::filesystem;
+    const fs::path cache_path =
+        fs::temp_directory_path() /
+        ("drone_zone_cache_" + std::to_string(::getpid()) + ".json");
+    ASSERT_TRUE(config::ZoneStore::Save(
+        cache_path.string(),
+        MakeSquareZone(11, 4, common::FenceAction::kReturn, 100.0)));
+
+    state_machine::MissionStateMachineConfig config = MakeFenceTestConfig();
+    config.fence.zone_cache_path = cache_path.string();
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    std::this_thread::sleep_for(120ms);
+
+    // 缓存已转为 NED 多边形（zone_id/version 保留）。
+    const common::FencePolygonNed polygon = harness.machine.LatestFencePolygon();
+    EXPECT_TRUE(polygon.valid());
+    EXPECT_EQ(polygon.zone_id, 11U);
+    EXPECT_EQ(polygon.version, 4U);
+
+    // 缓存生效的证据：版本一致的分配通过预检。
+    common::MissionAssignment matched = MakeAssignment(21);
+    matched.zone_id = 11;
+    matched.zone_version = 4;
+    ASSERT_TRUE(harness.Send(matched));
+    const auto ack = WaitForAckWithResult(harness.ack_subscription,
+                                          common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->assignment_id, 21U);
+
+    std::error_code ignored;
+    fs::remove(cache_path, ignored);
 }
 
 /// 构造一条 65020 主动返航指令；默认版本/类型合法。

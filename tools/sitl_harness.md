@@ -63,6 +63,9 @@ bash tools/sitl_harness.sh app [--config config/px4_sitl_assignment.json]
 # 起 PX4+GCS 后运行 px4_link_smoke 场景（配置可换）
 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-mission
 bash tools/sitl_harness.sh smoke --config config/px4_sitl_return.json --duration 120 --sitl-stage4-return
+# 65020 主动返航 / 65018 围栏（2026-10-28 起，非门禁，用 px4_sitl.json 即可）
+bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-command
+bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-fence
 
 # 查看状态 / 停止
 bash tools/sitl_harness.sh status
