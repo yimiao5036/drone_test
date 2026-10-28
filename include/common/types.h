@@ -646,6 +646,53 @@ struct NetFireAck {
     uint8_t actuator_state = 0;
 };
 
+/// 地面站任务指令类型（65020 MISSION_COMMAND）。
+/// 与 65014 的区别：65014 是“分配任务”，65020 是“对已起飞任务的即时指令”。
+enum class MissionCommandType : uint8_t {
+    kReturnHome = 1,  ///< 主动返航：中止当前任务并返回 Home（当前唯一指令）
+};
+
+/// 65021 任务指令回执结果。
+enum class MissionCommandResult : uint8_t {
+    kAccepted = 0,   ///< 已受理，已开始执行（如已切到 S12 返航）
+    kCompleted = 1,  ///< 指令目标状态已达成（如本来就在返航/降落）
+    kRejected = 2,   ///< 未执行，原因见 reason
+};
+
+/// 65021 任务指令回执原因码。
+enum class MissionCommandReason : uint8_t {
+    kNone = 0,
+    kInvalidMessage = 1,       ///< 帧长/字段非法
+    kUnsupportedVersion = 2,   ///< 协议版本不支持
+    kUnsupportedCommand = 3,   ///< 指令类型不支持
+    kDuplicateCommand = 4,     ///< 同一 command_id 已处理（回执重放，不重复执行）
+    kNotAirborne = 5,          ///< 不在可执行的空中任务状态（未起飞/已落地/故障）
+    kAlreadyReturning = 6,     ///< 已在返航或降落流程
+    kMissionFault = 7,         ///< 执行器故障等任务级故障，交 PX4/人工处置
+    kInternalError = 20,
+};
+
+/// 地面站任务指令（65020，地面站 → 指定飞机）。
+/// 只对指定飞机点对点发送；机载按状态判定，空中任务态才会真正中止返航。
+struct MissionCommand {
+    MessageHeader header;
+    uint8_t protocol_version = 1;   ///< 指令协议版本，当前固定 1
+    uint32_t command_id = 0;        ///< 地面站生成的指令编号；65021 原样带回
+    MissionCommandType type = MissionCommandType::kReturnHome;  ///< 指令类型
+    uint64_t received_ms = 0;       ///< 本机收到消息的单调时钟时间
+};
+
+/// 任务指令回执（飞机 → 地面站 65021）。
+struct MissionCommandAck {
+    MessageHeader header;
+    uint8_t protocol_version = 1;
+    uint32_t command_id = 0;                                   ///< 回执对应指令
+    MissionCommandType type = MissionCommandType::kReturnHome; ///< 回执对应类型
+    MissionCommandResult result = MissionCommandResult::kRejected;
+    MissionCommandReason reason = MissionCommandReason::kNone;
+    MissionState mission_state = MissionState::kBoot;  ///< 处理后的任务状态
+};
+
 /// 目标估计状态（感知融合/目标估计 → 状态机与控制）。
 struct TargetState {
     MessageHeader header;
@@ -689,6 +736,8 @@ inline constexpr char kNetFireCommand[] = "net_fire_command";             ///< N
 inline constexpr char kNetFireAck[] = "net_fire_ack";                     ///< NetFireAck（65017）
 inline constexpr char kFenceZone[] = "fence_zone";                        ///< FenceZone（65018/缓存）
 inline constexpr char kFenceStatus[] = "fence_status";                    ///< FenceStatus（65019）
+inline constexpr char kMissionCommand[] = "mission_command";              ///< MissionCommand（65020）
+inline constexpr char kMissionCommandAck[] = "mission_command_ack";       ///< MissionCommandAck（65021）
 inline constexpr char kHealthStatus[] = "health_status";      ///< HealthStatus
 inline constexpr char kAnnotatedFrame[] = "annotated_frame";  ///< video::FrameHandle
 }  // namespace topics

@@ -343,6 +343,22 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     65015 `aborted`、转 S12 返航）；`kLand` → 直接转 S13 降落。
   - 只在**飞行相关状态**动作（`kArming`~`kPostIntercept`）：地面 S0~S2、S12/S13/S14
     与故障态只上报 65019，不触发中止链，避免地面就锁死任务。
+- **人工任务指令（2026-10-29，65020/65021）**：地面站可下发"主动返航"打断当前任务。
+  - 输入：`SetMissionCommandInput()` 绑定 `kMissionCommand`（Start 前）；`DrainInputs()`
+    每拍只保留最新一条（`latest_mission_command_`），`valid_for_ms=1000` 由链路层写入，
+    过期指令由状态机侧按时钟判定丢弃。
+  - 判定顺序（`EvaluateMissionCommand()`，排在电池守卫之后、围栏守卫之前——人工指令
+    优先于几何事件）：重复 `command_id` → `kDuplicateCommand`（不动作、不回退状态）；
+    版本不符 → `kUnsupportedVersion`；非 `kReturnHome` → `kUnsupportedCommand`；
+    `mission_faulted_` → `kMissionFault`；已在 `kReturnHome/kLanding` → `kCompleted`
+    + `kAlreadyReturning`（幂等，不重复发 65015）；`kArming/kTakeoff` →
+    `AbortTakeoff(kCancelledByGcs)`；其余飞行态 → 复用内部中止入口。
+  - 接受路径：`mission_abort_latched_=true`、`StopPositionIntent()`、`ResetTargetHold()`、
+    `assignment_tracker_.AbortAirborne()`、`RememberTakeoffAbort(kCancelledByGcs)`、
+    `TransitionTo(kReturnHome,"地面站主动返航指令，中止任务并返航")`，并发 65015
+    `aborted reason=kCancelledByGcs(12)`。**不是 PX4 RTL**：返航轨迹仍由 S12 位置意图控制。
+  - 回执：`PublishMissionCommandAck()` 走 `kMissionCommandAck`，字段含 result/reason/
+    `mission_state`（回执时刻状态），地面站无需猜测机载处于哪一态。
 - **S12 返航机头朝向**：`return_home.heading_mode=1`（默认）时，S12 非爬升段按
   期望航向（指向 Home，`atan2(east, north)`）下发 `yaw_valid=true` 的位置意图，
   经角速度/角加速度二阶限幅（`heading_rate_limit_dps=30`、`heading_accel_limit_dps2=60`）；
@@ -639,12 +655,23 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 ## 日志行为
 
 围栏相关（2026-10-29）：
+
 - INFO：`围栏区域已更新: zone=../.. 顶点=.. 动作=.. 高度带=[..,..]m 基准=..`（仅内容变化时）、
   `围栏区域缓存已装载/已保存`、`任务状态机围栏区域输入已绑定`。
 - WARN：`围栏非法区域已忽略`（节流，带累计计数）、`围栏区域缓存不可用`、
   `围栏越界保持: zone=../.. 距边界=..m`（节流）、`围栏越界中止: zone=../.. 距边界=..m 持续=..ms → S12 返航`。
 - 65019 由 `fence.status_period_ms` 控制上报节拍，本身不打日志（链路层有节流发送日志），
   否则 1Hz 状态会淹没热路径。
+
+人工指令相关（2026-10-29）：
+
+- INFO：`任务状态机任务指令输入已绑定（65020 主动返航）`（启动期一次）；
+  `任务指令回执已发布: command_id=.. type=.. result=.. reason=.. state=.. count=..`（节流，首条与每 100 条）；
+  `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航/降落流程，回执完成`、
+  `任务指令（主动返航）: 当前状态不可执行`。
+- WARN：`任务指令协议版本不支持`、`任务指令类型不支持`、
+  `任务指令（主动返航）: state=.. → S12 返航 command_id=..`（接受路径，关键动作不节流）、
+  `任务指令（主动返航）: 起飞阶段中止 returning=.. command_id=..`。
 
 
 - INFO：状态机创建、启动、停止、销毁；状态转移（含交接进入/验证通过/撤销/超时/

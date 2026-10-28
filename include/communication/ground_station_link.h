@@ -41,6 +41,13 @@ constexpr uint16_t kFenceZoneMessageType = 65018;
 constexpr uint16_t kFenceStatusMessageType = 65019;
 constexpr uint8_t kFenceZoneProtocolVersion = 1;
 constexpr uint8_t kFenceMaxVertices = 8;  ///< 单帧上限：顶点区 21~53（marker 在 54）
+/// 地面站任务指令（65020，地面站 → 指定飞机）与回执（65021，飞机 → 地面站）。
+/// 与 65014 的分工：65014 是"分配任务"，65020 是对已起飞任务的即时人工指令
+/// （当前只有主动返航 kReturnHome）；中止后的任务分配以 65015 aborted
+/// （reason=kCancelledByGcs）同步，因此两条回执各管一件事（2026-10-29）。
+constexpr uint16_t kMissionCommandMessageType = 65020;
+constexpr uint16_t kMissionCommandAckMessageType = 65021;
+constexpr uint8_t kMissionCommandProtocolVersion = 1;
 constexpr uint8_t kMissionAssignmentProtocolVersion = 1;
 constexpr uint8_t kTrackTargetProtocolVersion = 1;
 /// 65012 与 65013 的协议版本独立：65013 v2 才携带 assignment/availability，
@@ -187,6 +194,13 @@ public:
     /// 绑定 65019 围栏状态回传输入。按 V2_EXTENSION message_type=65019 编码发送。
     virtual void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) = 0;
 
+    /// 65020 任务指令（主动返航）解析结果（2026-10-29）。地址双字段匹配本机后
+    /// 才发布；协议版本/指令类型/状态合法性由状态机校验，链路层不产生动作。
+    virtual common::Topic<common::MissionCommand>& MissionCommandOutput() = 0;
+    /// 绑定 65021 任务指令回执输入。每条回执按 V2_EXTENSION message_type=65021 发送。
+    virtual void SetMissionCommandAckInput(
+        common::Topic<common::MissionCommandAck>& ack) = 0;
+
     /// 绑定 PX4 飞行状态快照。必须在 Start 前调用。
     virtual void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) = 0;
@@ -224,6 +238,9 @@ public:
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
     common::Topic<common::FenceZone>& FenceZoneOutput() override;
     void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) override;
+    common::Topic<common::MissionCommand>& MissionCommandOutput() override;
+    void SetMissionCommandAckInput(
+        common::Topic<common::MissionCommandAck>& ack) override;
     /// 标记 65016 是否存在消费者（GcsNetFire 是否装配）。只用于把“开关关闭导致指令
     /// 无人处理”变成一条可自证的节流 WARN，不改变任何发射语义；必须在 Start 前调用。
     void SetNetFireConsumerPresent(bool present);
@@ -265,6 +282,9 @@ public:
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
     common::Topic<common::FenceZone>& FenceZoneOutput() override;
     void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) override;
+    common::Topic<common::MissionCommand>& MissionCommandOutput() override;
+    void SetMissionCommandAckInput(
+        common::Topic<common::MissionCommandAck>& ack) override;
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -284,6 +304,7 @@ private:
     common::Topic<common::MissionAssignment> mission_assignment_output_;
     common::Topic<common::NetFireCommand> net_fire_command_output_;
     common::Topic<common::FenceZone> fence_zone_output_;
+    common::Topic<common::MissionCommand> mission_command_output_;
 };
 
 }  // namespace drone::communication

@@ -2048,6 +2048,12 @@ TEST(MissionStateMachineTest, InterceptEntryLockAndRangeThenFiresAndReturns) {
     auto status_subscription = machine.StatusOutput().Subscribe(32);
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
+    // 先投一拍飞行状态快照：电池守卫在中止态要求飞行中遥测有效，否则首拍即判
+    // 遥测失效并中止到 S12（本例直接 force 到 S7，必须先有快照）。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    std::this_thread::sleep_for(40ms);
     machine.ForceStateForTest(common::MissionState::kVisualTracking);
 
     bool saw_ready = false;
@@ -2129,6 +2135,11 @@ TEST(MissionStateMachineTest, InterceptEntryRejectsDistanceOutsideWindow) {
     machine.SetCommandSender(&sender);
     ASSERT_TRUE(machine.Start());
     ASSERT_TRUE(WaitForSelfCheck(machine));
+    // 先发布一帧健康飞行快照再强制迁移：电池守卫要求遥测新鲜，否则首拍即判
+    // "飞行中缺少飞行状态快照"并把状态打回 S12（与本用例意图无关）。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+        MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    std::this_thread::sleep_for(40ms);
     machine.ForceStateForTest(common::MissionState::kVisualTracking);
 
     // 测距 20m 超出 2~12m 窗口：LOCKED 再多也不得进入 S9/发射。
@@ -2331,12 +2342,15 @@ struct AssignmentHarness {
     common::Topic<common::StereoTargetDistance> distance_topic;
     common::Topic<common::MissionAssignment> assignment_topic;
     common::Topic<common::FenceZone> fence_topic;
+    common::Topic<common::MissionCommand> mission_command_topic;
     FakeCommandSender sender;
     state_machine::MissionStateMachine machine;
     common::Topic<common::MissionStatus>::Subscription status_subscription;
     common::Topic<common::MissionAssignmentAck>::Subscription ack_subscription;
     common::Topic<common::ControlIntent>::Subscription intent_subscription;
     common::Topic<common::FenceStatus>::Subscription fence_status_subscription;
+    common::Topic<common::MissionCommandAck>::Subscription
+        mission_command_ack_subscription;
 
     AssignmentHarness() : AssignmentHarness(MakeAssignmentHarnessConfig()) {}
 
@@ -2346,10 +2360,14 @@ struct AssignmentHarness {
         machine.SetAssignmentInput(assignment_topic);
         // 围栏输入始终绑定：fence.enabled=false 时状态机不消费该 Topic。
         machine.SetFenceInput(fence_topic);
+        // 人工指令输入同理始终绑定，用例按需发布 65020。
+        machine.SetMissionCommandInput(mission_command_topic);
         status_subscription = machine.StatusOutput().Subscribe(32);
         ack_subscription = machine.AssignmentAckOutput().Subscribe(32);
         intent_subscription = machine.IntentOutput().Subscribe(64);
         fence_status_subscription = machine.FenceStatusOutput().Subscribe(32);
+        mission_command_ack_subscription =
+            machine.MissionCommandAckOutput().Subscribe(32);
     }
 
     /// 装配并启动；with_control=false 模拟影子装配（不注入命令接口）。
@@ -4206,6 +4224,123 @@ TEST(MissionStateMachineTest, FenceZoneMismatchRejectsAssignment) {
         harness.ack_subscription, common::MissionAssignmentResult::kAccepted);
     ASSERT_TRUE(legacy_ack.has_value());
     EXPECT_EQ(legacy_ack->assignment_id, 12U);
+}
+
+/// 构造一条 65020 主动返航指令；默认版本/类型合法。
+common::MissionCommand MakeMissionCommand(uint32_t command_id) {
+    common::MissionCommand command;
+    command.protocol_version = 1;
+    command.command_id = command_id;
+    command.type = common::MissionCommandType::kReturnHome;
+    command.received_ms = 1;
+    return command;
+}
+
+/// 等待一条 65021 任务指令回执（超时返回空）。
+std::optional<common::MissionCommandAck> WaitForMissionCommandAck(
+    common::Topic<common::MissionCommandAck>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 65020 主动返航：S5 中收到指令 → 回执 accepted + 中止任务转 S12 + 65015 同步中止。
+TEST(MissionStateMachineTest, MissionCommandReturnHomeAbortsToReturnHome) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 41));
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9001)))
+                    .accepted);
+
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "应回 65021";
+    EXPECT_EQ(ack->command_id, 9001U);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "主动返航应转 S12";
+    // 任务分配同步中止（reason=kCancelledByGcs），地面站据此清任务卡片。
+    EXPECT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
+                    .has_value());
+}
+
+/// 65020 重复 command_id：第二次必须被拒（防重放），且状态不再变化。
+TEST(MissionStateMachineTest, MissionCommandDuplicateIdRejected) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 42));
+    const common::MissionCommand command = MakeMissionCommand(9002);
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(command))
+                    .accepted);
+    const auto first =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionCommandResult::kAccepted);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(command))
+                    .accepted);
+    const auto second =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(second->reason, common::MissionCommandReason::kDuplicateCommand);
+}
+
+/// 65020 版本不符：回执 unsupported_version，任务状态不变。
+TEST(MissionStateMachineTest, MissionCommandUnsupportedVersionRejected) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 43));
+    common::MissionCommand command = MakeMissionCommand(9003);
+    command.protocol_version = 9;
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(command))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kUnsupportedVersion);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "非法指令不得改变任务状态";
+}
+
+/// 65020 未起飞（S2 地面待命）：回执 not_airborne，不得推状态。
+TEST(MissionStateMachineTest, MissionCommandOnGroundRejected) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9004)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotAirborne);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
 }
 
 }  // namespace

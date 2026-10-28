@@ -107,6 +107,8 @@ constexpr uint32_t kReasonReturnHome = 8;
 constexpr uint32_t kReasonTargetHold = 9;
 /// 围栏越界中止位置意图低位原因码（10，紧接保持码；S12 返航时仍用 8）。
 constexpr uint32_t kReasonFenceViolation = 10;
+/// 地面站任务指令（65020）协议版本（与 GroundStationLink 同源约定）。
+constexpr uint8_t kMissionCommandProtocolVersion = 1;
 /// 目标恢复迟滞：连续 N 个决策拍看到新鲜估计才退出保持（防抖动来回切换；
 /// 100ms 决策周期下 N=3 即 300ms，与控制器的意图超龄门限同量级）。
 constexpr uint32_t kHoldReleaseFreshFrames = 3;
@@ -410,6 +412,10 @@ public:
             if (fence_topic_ != nullptr) {
                 fence_subscription_ = fence_topic_->Subscribe(2);
             }
+            // 地面站任务指令输入可选：未绑定时不处理 65020。
+            if (mission_command_topic_ != nullptr) {
+                mission_command_subscription_ = mission_command_topic_->Subscribe(2);
+            }
             if (all_estimation_bound) {
                 estimated_subscription_ = estimated_topic_->Subscribe(2);
                 visual_status_subscription_ = visual_status_topic_->Subscribe(2);
@@ -514,6 +520,7 @@ public:
         health_subscription_.Reset();
         assignment_subscription_.Reset();
         fence_subscription_.Reset();
+        mission_command_subscription_.Reset();
         estimated_subscription_.Reset();
         visual_status_subscription_.Reset();
         distance_subscription_.Reset();
@@ -591,6 +598,17 @@ public:
                     fence_.enabled, fence_.zone_cache_path);
     }
 
+    /// 绑定地面站任务指令输入 Topic（65020）。必须在 Start 前调用；未绑定时
+    /// 不处理任何任务指令。
+    void SetMissionCommandInput(common::Topic<common::MissionCommand>& command) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定任务指令输入Topic");
+            return;
+        }
+        mission_command_topic_ = &command;
+        SPDLOG_INFO("任务状态机任务指令输入已绑定（65020 主动返航）");
+    }
+
     /// 围栏多边形只读快照（FlightController 位置意图钳制用；线程安全）。
     common::FencePolygonNed LatestFencePolygon() const {
         std::lock_guard<std::mutex> lock(fence_mutex_);
@@ -616,6 +634,9 @@ public:
     }
     common::Topic<common::FenceStatus>& FenceStatusOutput() {
         return fence_status_output_;
+    }
+    common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() {
+        return mission_command_ack_output_;
     }
 
     /// 测试入口：强制提交一次状态迁移（与生产路径共用 TransitionTo 统一挂点；
@@ -710,6 +731,11 @@ private:
         while (auto message = fence_subscription_.TryTake()) {
             ApplyFenceZone(**message);
         }
+        // 地面站任务指令（65020，2026-10-29）：只保留最新一条，由
+        // EvaluateMissionCommand 处理一次并回 65021（每条指令一条回执）。
+        while (auto message = mission_command_subscription_.TryTake()) {
+            latest_mission_command_ = **message;
+        }
     }
 
     /// 根据当前状态、飞行快照和目标新鲜度推进影子状态，并周期发布MissionStatus。
@@ -770,6 +796,11 @@ private:
         // 电池守卫（Task 8）：放在起飞时序之后、交接/拦截之前。飞行中低电/
         // 遥测失效当拍中止到 S12，后续拦截入口（S7/S9/S10）不再有机会发射。
         EvaluateBatteryGuard(now_ms);
+
+        // 地面站任务指令（65020，2026-10-29 主动返航）：放在电池守卫之后、
+        // 围栏守卫之前——人工指令优先于几何事件，且中止后围栏守卫因状态已离开
+        // 任务态自然跳过。指令只对空中任务态生效（S3~S11）。
+        EvaluateMissionCommand(now_ms);
 
         // 围栏守卫（2026-10-29）：电池之后、目标看门狗之前——越界是几何安全
         // 事件，优先级低于电池中止、高于目标看门狗；当拍中止后后续判定自然跳过。
@@ -1529,6 +1560,147 @@ private:
             AbortForTargetWatchdog(
                 common::MissionAssignmentReason::kTargetLost,
                 "已获得目标持续失效超时");
+        }
+    }
+
+    /// 地面站任务指令（65020，2026-10-29）：当前只支持"主动返航"。
+    ///
+    /// 与自动通道的关系：到点判据超时返航、围栏越界返航、低电返航、目标丢失
+    /// 返航都是**自动策略**；本指令是**人工即时指令**。两者共用同一个中止入口
+    /// 语义（停位置流 → tracker AbortAirborne → 65015 aborted → S12），因此不
+    /// 重复：谁先触发谁生效，后续守卫看到状态已离开任务态自然跳过。
+    ///
+    /// 只对空中任务态（S3~S11）生效；地面与终态回拒绝，已在返航/降落回"已完成"。
+    /// 每条指令只回一条 65021（含拒绝与重复），同 command_id 重发不重复执行。
+    void EvaluateMissionCommand(uint64_t now_ms) {
+        if (!latest_mission_command_.has_value()) {
+            return;
+        }
+        const common::MissionCommand command = *latest_mission_command_;
+        latest_mission_command_.reset();
+        (void)now_ms;
+
+        // 同一条指令重发（地面站重试/链路重复）：只回执，不重复执行。
+        if (command.command_id != 0U &&
+            command.command_id == last_mission_command_id_) {
+            SPDLOG_INFO("任务指令重复已忽略: command_id={} state={}",
+                        command.command_id, static_cast<int>(CurrentState()));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kDuplicateCommand);
+            return;
+        }
+        if (command.protocol_version != kMissionCommandProtocolVersion) {
+            SPDLOG_WARN("任务指令协议版本不支持: version={}（期望 {}）",
+                        command.protocol_version, kMissionCommandProtocolVersion);
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kUnsupportedVersion);
+            return;
+        }
+        if (command.type != common::MissionCommandType::kReturnHome) {
+            SPDLOG_WARN("任务指令类型不支持: type={}",
+                        static_cast<int>(command.type));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kUnsupportedCommand);
+            return;
+        }
+        if (command.command_id != 0U) {
+            last_mission_command_id_ = command.command_id;
+        }
+
+        const common::MissionState state = CurrentState();
+        if (mission_faulted_) {
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kMissionFault);
+            return;
+        }
+        // 已在返航/降落：指令目标状态已达成（幂等），不重复中止。
+        if (state == common::MissionState::kReturnHome ||
+            state == common::MissionState::kLanding) {
+            SPDLOG_INFO("任务指令（主动返航）: 已在返航/降落流程，回执完成 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kCompleted,
+                                     common::MissionCommandReason::kAlreadyReturning);
+            return;
+        }
+        // S3/S4：复用起飞中止（已离地→S12；仍在地面→停流回 READY 并拒执）。
+        if (state == common::MissionState::kArming ||
+            state == common::MissionState::kTakeoff) {
+            AbortTakeoff(common::MissionAssignmentReason::kCancelledByGcs,
+                         "地面站主动返航指令");
+            const bool returning = CurrentState() == common::MissionState::kReturnHome;
+            SPDLOG_WARN("任务指令（主动返航）: 起飞阶段中止 returning={} command_id={}",
+                        returning, command.command_id);
+            PublishMissionCommandAck(
+                command,
+                returning ? common::MissionCommandResult::kAccepted
+                          : common::MissionCommandResult::kRejected,
+                returning ? common::MissionCommandReason::kNone
+                          : common::MissionCommandReason::kNotAirborne);
+            return;
+        }
+        // 空中任务态（S5~S11）：中止任务并进入 S12 返航。
+        if (MissionCommandAirborneState(state)) {
+            mission_abort_latched_ = true;
+            StopPositionIntent("地面站主动返航指令");
+            ResetTargetHold();
+            assignment_tracker_.AbortAirborne();
+            RememberTakeoffAbort(common::MissionAssignmentReason::kCancelledByGcs);
+            SPDLOG_WARN("任务指令（主动返航）: state={} → S12 返航 command_id={}",
+                        static_cast<int>(state), command.command_id);
+            TransitionTo(common::MissionState::kReturnHome,
+                         "地面站主动返航指令，中止任务并返航");
+            PublishTakeoffAbortAck(common::MissionAssignmentReason::kCancelledByGcs);
+            PublishMissionCommandAck(command, common::MissionCommandResult::kAccepted,
+                                     common::MissionCommandReason::kNone);
+            return;
+        }
+        // 地面态（BOOT/SELF_CHECK/READY/DISARMED）与人工/故障态：不可执行。
+        SPDLOG_INFO("任务指令（主动返航）: 当前状态不可执行 state={}",
+                    static_cast<int>(state));
+        PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                 common::MissionCommandReason::kNotAirborne);
+    }
+
+    /// 空中任务态（可被主动返航中止的状态集合）。
+    static bool MissionCommandAirborneState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+            case common::MissionState::kPostIntercept:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 发布 65021 任务指令回执（每条指令一条；assigned id 与状态供地面站判读）。
+    void PublishMissionCommandAck(const common::MissionCommand& command,
+                                  common::MissionCommandResult result,
+                                  common::MissionCommandReason reason) {
+        common::MissionCommandAck ack;
+        ack.header.sequence = ++mission_command_ack_count_;
+        ack.header.source_time_ms = command.received_ms;
+        ack.header.receive_time_ms = MonotonicMs();
+        ack.header.source_id = 1;
+        ack.header.valid_for_ms = kStatusValidForMs;
+        ack.protocol_version = kMissionCommandProtocolVersion;
+        ack.command_id = command.command_id;
+        ack.type = command.type;
+        ack.result = result;
+        ack.reason = reason;
+        ack.mission_state = CurrentState();
+        (void)mission_command_ack_output_.Publish(
+            std::make_shared<const common::MissionCommandAck>(ack));
+        const uint64_t count = ++mission_command_ack_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO("任务指令回执已发布: command_id={} type={} result={} reason={} state={} count={}",
+                        ack.command_id, static_cast<int>(ack.type),
+                        static_cast<int>(ack.result), static_cast<int>(ack.reason),
+                        static_cast<int>(ack.mission_state), count);
         }
     }
 
@@ -3737,6 +3909,15 @@ private:
     /// 围栏区域输入（65018，可选绑定；未绑定时只用本地缓存）。
     common::Topic<common::FenceZone>* fence_topic_ = nullptr;
     common::Topic<common::FenceZone>::Subscription fence_subscription_;
+    /// 任务指令输入（65020，可选绑定；未绑定时不处理任务指令）。
+    common::Topic<common::MissionCommand>* mission_command_topic_ = nullptr;
+    common::Topic<common::MissionCommand>::Subscription mission_command_subscription_;
+    /// 最新一条 65020（DrainInputs 写入，EvaluateMissionCommand 处理后清空）。
+    std::optional<common::MissionCommand> latest_mission_command_;
+    /// 最近处理过的指令编号（去重：同 id 重发只回执不重复执行）。
+    uint32_t last_mission_command_id_ = 0;
+    /// 65021 回执输出。
+    common::Topic<common::MissionCommandAck> mission_command_ack_output_;
 
     std::optional<common::GroundStationTarget> latest_ground_target_;
     std::optional<common::FlightStateSnapshot> latest_flight_;
@@ -3765,6 +3946,7 @@ private:
     double fence_distance_m_ = 0.0;        ///< 距边界带符号距离（内正外负）
     uint32_t fence_violation_ms_ = 0;      ///< 越界已持续时长（65019）
     uint64_t fence_invalid_count_ = 0;     ///< 非法区域帧累计（节流日志用）
+    uint64_t mission_command_ack_count_ = 0;  ///< 65021 回执累计（节流日志用）
     // 返航航向（S12 机头朝飞行方向）：二阶限幅状态。
     double return_heading_cmd_deg_ = 0.0;
     double return_heading_rate_dps_ = 0.0;
@@ -3952,6 +4134,10 @@ void MissionStateMachine::SetEstimationDiagnostics(
 void MissionStateMachine::SetFenceInput(common::Topic<common::FenceZone>& zone) {
     impl_->SetFenceInput(zone);
 }
+void MissionStateMachine::SetMissionCommandInput(
+    common::Topic<common::MissionCommand>& command) {
+    impl_->SetMissionCommandInput(command);
+}
 common::FencePolygonNed MissionStateMachine::LatestFencePolygon() const {
     return impl_->LatestFencePolygon();
 }
@@ -3967,6 +4153,10 @@ MissionStateMachine::AssignmentAckOutput() {
 }
 common::Topic<common::FenceStatus>& MissionStateMachine::FenceStatusOutput() {
     return impl_->FenceStatusOutput();
+}
+common::Topic<common::MissionCommandAck>&
+MissionStateMachine::MissionCommandAckOutput() {
+    return impl_->MissionCommandAckOutput();
 }
 common::MissionState MissionStateMachine::CurrentState() const {
     return impl_->CurrentState();
@@ -4039,6 +4229,11 @@ void MissionStateMachineStub::SetFenceInput(
     // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
 }
 
+void MissionStateMachineStub::SetMissionCommandInput(
+    common::Topic<common::MissionCommand>& /*command*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
 common::Topic<common::ControlIntent>& MissionStateMachineStub::IntentOutput() {
     return intent_output_;
 }
@@ -4055,6 +4250,11 @@ MissionStateMachineStub::AssignmentAckOutput() {
 common::Topic<common::FenceStatus>&
 MissionStateMachineStub::FenceStatusOutput() {
     return fence_status_output_;
+}
+
+common::Topic<common::MissionCommandAck>&
+MissionStateMachineStub::MissionCommandAckOutput() {
+    return mission_command_ack_output_;
 }
 
 common::MissionState MissionStateMachineStub::CurrentState() const {

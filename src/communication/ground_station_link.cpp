@@ -157,6 +157,9 @@ constexpr double kDegToRad = 0.017453292519943295;
 /// 65016 指令在机载队列中的最长有效期：超过该时长仍未处理即按“指令过期”拒绝，
 /// 避免串口积压后补发一次过期发射。
 constexpr uint32_t kNetFireCommandValidForMs = 2000;
+/// 65020 指令在机载队列中的最长有效期：人工返航指令允许 1s 的排队延迟，
+/// 超时仍未处理即按过期丢弃，避免串口积压后补执行一次迟到的返航。
+constexpr uint32_t kMissionCommandValidForMs = 1000;
 
 // 把浮点物理量乘 scale 换算成 MAVLink 整数字段，跳过非有限值并夹逼到 [min,max]。
 template <typename T>
@@ -343,6 +346,12 @@ public:
                 fence_status_subscription_ = fence_status_topic_->Subscribe(
                     2, common::Topic<common::FenceStatus>::OverflowPolicy::kDropOldest);
             }
+            if (mission_command_ack_topic_ != nullptr) {
+                mission_command_ack_subscription_ =
+                    mission_command_ack_topic_->Subscribe(
+                        4, common::Topic<common::MissionCommandAck>::OverflowPolicy::
+                               kDropOldest);
+            }
             latest_state_.reset();
             latest_health_.reset();
             latest_mission_status_.reset();
@@ -360,6 +369,7 @@ public:
             mission_assignment_ack_subscription_.Reset();
             net_fire_ack_subscription_.Reset();
             fence_status_subscription_.Reset();
+            mission_command_ack_subscription_.Reset();
             serial_.Close();
             RecordError((std::string("地面站通信启动失败: ") + error.what()).c_str());
             return false;
@@ -384,6 +394,7 @@ public:
         mission_assignment_ack_subscription_.Reset();
         net_fire_ack_subscription_.Reset();
         fence_status_subscription_.Reset();
+        mission_command_ack_subscription_.Reset();
         latest_state_.reset();
         latest_health_.reset();
         latest_mission_status_.reset();
@@ -451,6 +462,21 @@ public:
         fence_status_topic_ = &topic;
     }
 
+    // 65020 任务指令解析结果输出（地址双字段匹配本机后才发布）。
+    common::Topic<common::MissionCommand>& MissionCommandOutput() {
+        return mission_command_output_;
+    }
+
+    // 绑定 65021 任务指令回执输入。必须在 Start 前调用，运行中不允许改绑。
+    void SetMissionCommandAckInput(common::Topic<common::MissionCommandAck>& topic) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("地面站 MissionCommandAck Topic 必须在 Start 前绑定");
+            return;
+        }
+        mission_command_ack_topic_ = &topic;
+    }
+
     // 绑定飞行状态输入。必须在 Start 前调用，运行中不允许改绑。
     void SetFlightStateInput(common::Topic<common::FlightStateSnapshot>& topic) {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -496,6 +522,8 @@ private:
         common::Topic<common::MissionAssignmentAck>::Subscription;
     using NetFireAckSubscription = common::Topic<common::NetFireAck>::Subscription;
     using FenceStatusSubscription = common::Topic<common::FenceStatus>::Subscription;
+    using MissionCommandAckSubscription =
+        common::Topic<common::MissionCommandAck>::Subscription;
 
     struct Deadlines {
         std::chrono::steady_clock::time_point heartbeat;
@@ -538,6 +566,7 @@ private:
             DrainMissionAssignmentAcks();
             DrainNetFireAcks();
             DrainFenceStatuses();
+            DrainMissionCommandAcks();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
             CheckTimeSyncTimeout(current_ms);
@@ -691,6 +720,13 @@ private:
         }
     }
 
+    // 消费 65021 任务指令回执输入：每条都发（回执是一对一事件，不能合并）。
+    void DrainMissionCommandAcks() {
+        while (auto message = mission_command_ack_subscription_.TryTake()) {
+            (void)SendMissionCommandAck(**message);
+        }
+    }
+
     // 分发已解析的 MAVLink 消息；目前只处理心跳、TIMESYNC 与 V2_EXTENSION 目标。
     void HandleMessage(const mavlink_message_t& message) {
         receive_count_.fetch_add(1, std::memory_order_relaxed);
@@ -799,6 +835,10 @@ private:
         }
         if (extension.message_type == kFenceZoneMessageType) {
             HandleFenceZone(message, extension);
+            return;
+        }
+        if (extension.message_type == kMissionCommandMessageType) {
+            HandleMissionCommand(message, extension);
             return;
         }
         if (extension.message_type != kTrackTargetUpdateMessageType) {
@@ -1145,6 +1185,69 @@ private:
                 zone.protocol_version, zone.zone_id, zone.version,
                 zone.vertices.size(), static_cast<int>(zone.action),
                 publish_count);
+        }
+    }
+
+    // 处理 65020 任务指令（地面站主动返航）：帧长/地址双字段/marker 校验后发布。
+    // 协议版本、指令类型、状态合法性由状态机校验（链路层不产生动作）。
+    void HandleMissionCommand(const mavlink_message_t& message,
+                              const mavlink_v2_extension_t& extension) {
+        const uint64_t receive_count = ++mission_command_receive_count_;
+        if (ShouldLogThrottled(receive_count)) {
+            SPDLOG_INFO("收到任务指令: target={}/{} count={}",
+                        extension.target_system, extension.target_component,
+                        receive_count);
+        }
+        if (message.len < kStatusShortFrameLength) {
+            const uint64_t invalid_count = ++mission_command_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("任务指令帧长不足: len={} required={} count={}",
+                            message.len, kStatusShortFrameLength, invalid_count);
+            }
+            return;
+        }
+        if (extension.target_system != config_.aircraft_system_id ||
+            extension.target_component != config_.aircraft_component_id) {
+            const uint64_t mismatch_count = ++mission_command_address_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN("任务指令地址不匹配: header={}/{} local={}/{} count={}",
+                            extension.target_system, extension.target_component,
+                            config_.aircraft_system_id,
+                            config_.aircraft_component_id, mismatch_count);
+            }
+            return;
+        }
+        const uint8_t marker = ReadLe<uint8_t>(extension.payload, 54);
+        if (marker != kFrameLengthMarker) {
+            const uint64_t invalid_count = ++mission_command_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("任务指令帧长度标记非法: marker={} count={}",
+                            marker, invalid_count);
+            }
+            return;
+        }
+
+        const uint64_t receive_time_ms = MonotonicMs();
+        common::MissionCommand command;
+        command.header.sequence = receive_count;
+        command.header.receive_time_ms = receive_time_ms;
+        command.header.valid_for_ms = kMissionCommandValidForMs;
+        command.header.source_id = config_.ground_system_id;
+        command.header.health = 1;
+        command.header.frame_id = 0;
+        command.protocol_version = ReadLe<uint8_t>(extension.payload, 0);
+        command.command_id = ReadLe<uint32_t>(extension.payload, 1);
+        const uint8_t type = ReadLe<uint8_t>(extension.payload, 5);
+        // 未知类型保留原值（状态机按"不支持"拒绝并回执），不做静默丢弃。
+        command.type = static_cast<common::MissionCommandType>(type);
+        command.received_ms = receive_time_ms;
+        (void)mission_command_output_.Publish(
+            std::make_shared<const common::MissionCommand>(command));
+        const uint64_t publish_count = ++mission_command_publish_count_;
+        if (ShouldLogThrottled(publish_count)) {
+            SPDLOG_INFO("任务指令已发布: version={} command_id={} type={} count={}",
+                        command.protocol_version, command.command_id,
+                        static_cast<int>(command.type), publish_count);
         }
     }
 
@@ -1601,6 +1704,33 @@ private:
                 sent ? "成功" : "失败", status.zone_id, status.version,
                 static_cast<int>(status.state), status.distance_to_boundary_m,
                 status.violation_duration_ms, count);
+        }
+        return sent;
+    }
+
+    // 发送 65021 任务指令回执：以本机身份发往 255/190，command_id 原样带回，
+    // 地面站据此把"主动返航"按钮的结果落到具体指令上（2026-10-29）。
+    bool SendMissionCommandAck(const common::MissionCommandAck& ack) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, kMissionCommandProtocolVersion);
+        WriteLe<uint32_t>(payload, 1, ack.command_id);
+        WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(ack.type));
+        WriteLe<uint8_t>(payload, 6, static_cast<uint8_t>(ack.result));
+        WriteLe<uint8_t>(payload, 7, static_cast<uint8_t>(ack.reason));
+        WriteLe<uint8_t>(payload, 8, static_cast<uint8_t>(ack.mission_state));
+        WriteLe<uint8_t>(payload, 50, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 51, config_.aircraft_component_id);
+        // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
+        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
+        const bool sent = SendStatusExtension(kMissionCommandAckMessageType, payload);
+        const uint64_t count = ++mission_command_ack_send_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO(
+                "任务指令回执发送{}: command_id={} type={} result={} reason={} state={} count={}",
+                sent ? "成功" : "失败", ack.command_id,
+                static_cast<int>(ack.type), static_cast<int>(ack.result),
+                static_cast<int>(ack.reason), static_cast<int>(ack.mission_state),
+                count);
         }
         return sent;
     }
@@ -2104,12 +2234,14 @@ private:
     common::Topic<common::MissionAssignmentAck>* mission_assignment_ack_topic_ = nullptr;
     common::Topic<common::NetFireAck>* net_fire_ack_topic_ = nullptr;
     common::Topic<common::FenceStatus>* fence_status_topic_ = nullptr;
+    common::Topic<common::MissionCommandAck>* mission_command_ack_topic_ = nullptr;
     FlightSubscription flight_state_subscription_;
     HealthSubscription health_subscription_;
     MissionSubscription mission_status_subscription_;
     AssignmentAckSubscription mission_assignment_ack_subscription_;
     NetFireAckSubscription net_fire_ack_subscription_;
     FenceStatusSubscription fence_status_subscription_;
+    MissionCommandAckSubscription mission_command_ack_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     std::optional<common::HealthStatus> latest_health_;
     std::optional<common::MissionStatus> latest_mission_status_;
@@ -2117,6 +2249,7 @@ private:
     common::Topic<common::MissionAssignment> mission_assignment_output_;
     common::Topic<common::NetFireCommand> net_fire_command_output_;
     common::Topic<common::FenceZone> fence_zone_output_;
+    common::Topic<common::MissionCommand> mission_command_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;
     uint64_t target_v2_extension_count_ = 0;
@@ -2141,6 +2274,11 @@ private:
     uint64_t fence_invalid_count_ = 0;
     uint64_t fence_publish_count_ = 0;
     uint64_t fence_status_send_count_ = 0;
+    uint64_t mission_command_receive_count_ = 0;
+    uint64_t mission_command_invalid_count_ = 0;
+    uint64_t mission_command_address_mismatch_count_ = 0;
+    uint64_t mission_command_publish_count_ = 0;
+    uint64_t mission_command_ack_send_count_ = 0;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 
@@ -2202,6 +2340,13 @@ void GroundStationLink::SetFenceStatusInput(
     common::Topic<common::FenceStatus>& topic) {
     impl_->SetFenceStatusInput(topic);
 }
+common::Topic<common::MissionCommand>& GroundStationLink::MissionCommandOutput() {
+    return impl_->MissionCommandOutput();
+}
+void GroundStationLink::SetMissionCommandAckInput(
+    common::Topic<common::MissionCommandAck>& topic) {
+    impl_->SetMissionCommandAckInput(topic);
+}
 void GroundStationLink::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>& topic) {
     impl_->SetFlightStateInput(topic);
@@ -2259,6 +2404,12 @@ common::Topic<common::FenceZone>& GroundStationLinkStub::FenceZoneOutput() {
 }
 void GroundStationLinkStub::SetFenceStatusInput(
     common::Topic<common::FenceStatus>&) {}
+common::Topic<common::MissionCommand>&
+GroundStationLinkStub::MissionCommandOutput() {
+    return mission_command_output_;
+}
+void GroundStationLinkStub::SetMissionCommandAckInput(
+    common::Topic<common::MissionCommandAck>&) {}
 void GroundStationLinkStub::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>&) {}
 void GroundStationLinkStub::SetMissionStatusInput(

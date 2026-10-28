@@ -130,6 +130,10 @@ public:
     /// 绑定围栏区域输入主题（65018，GroundStationLink 解析后发布；2026-10-29）。
     /// 必须在 Start 前调用；未绑定时机载只使用本地缓存（config/zone.json）。
     virtual void SetFenceInput(common::Topic<common::FenceZone>& zone) = 0;
+    /// 绑定地面站任务指令输入主题（65020，GroundStationLink 解析后发布；2026-10-29）。
+    /// 必须在 Start 前调用；未绑定时不处理任何任务指令（保持原有行为）。
+    virtual void SetMissionCommandInput(
+        common::Topic<common::MissionCommand>& command) = 0;
     /// 注入目标估计器诊断接口：交接判据的创新门限读取
     /// `ITargetEstimator::LastVisualInnovationM()`（最近一次视觉观测与卡尔曼预测的
     /// 水平距离）。必须在 Start 前调用；未注入时交接判据不评估（保持 S5 影子行为，
@@ -149,6 +153,9 @@ public:
     /// 围栏状态输出主题：common::FenceStatus（65019，供 GroundStationLink 回传；
     /// 2026-10-29）。按 fence.status_period 周期发布，地面站据此绘制区域与越界。
     virtual common::Topic<common::FenceStatus>& FenceStatusOutput() = 0;
+    /// 任务指令回执输出主题：common::MissionCommandAck（65021，供 GroundStationLink
+    /// 发往地面站；2026-10-29）。每条 65020 回一条（含拒绝与重复）。
+    virtual common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() = 0;
 
     // ---- 状态查询 ----
     /// 当前任务状态（S0~S16，见 common::MissionState）。
@@ -204,6 +211,8 @@ public:
     void SetEstimationDiagnostics(
         const perception::ITargetEstimator* estimator) override;
     void SetFenceInput(common::Topic<common::FenceZone>& zone) override;
+    void SetMissionCommandInput(
+        common::Topic<common::MissionCommand>& command) override;
 
     /// 围栏多边形只读快照（供 FlightController 钳制位置意图；线程安全）。
     common::FencePolygonNed LatestFencePolygon() const override;
@@ -212,6 +221,7 @@ public:
     common::Topic<common::MissionStatus>& StatusOutput() override;
     common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
     common::Topic<common::FenceStatus>& FenceStatusOutput() override;
+    common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() override;
 
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
@@ -262,11 +272,14 @@ public:
     void SetEstimationDiagnostics(
         const perception::ITargetEstimator* estimator) override;
     void SetFenceInput(common::Topic<common::FenceZone>& zone) override;
+    void SetMissionCommandInput(
+        common::Topic<common::MissionCommand>& command) override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
     common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
     common::Topic<common::FenceStatus>& FenceStatusOutput() override;
+    common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() override;
 
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
@@ -280,6 +293,7 @@ private:
     common::Topic<common::ControlIntent> intent_output_;
     common::Topic<common::MissionStatus> status_output_;
     common::Topic<common::FenceStatus> fence_status_output_;
+    common::Topic<common::MissionCommandAck> mission_command_ack_output_;
     common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
 };
 

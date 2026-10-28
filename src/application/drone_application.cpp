@@ -296,6 +296,15 @@ void DroneApplication::BindTopics() {
         }
     }
 
+    // 人工任务指令（2026-10-29）：65020 主动返航 → 状态机；65021 回执 → 地面站。
+    // 与 65014 分工：65014 分配任务，65020 对已起飞任务下即时指令。
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_->SetMissionCommandInput(
+            ground_station_link_->MissionCommandOutput());
+        ground_station_link_->SetMissionCommandAckInput(
+            mission_state_machine_->MissionCommandAckOutput());
+    }
+
     // 多机任务分配：65014 解析结果 → 状态机；65015 回执 → 地面站链路。
     // 分配输入/回执不依赖 enable_control：无控制装配时状态机仍接收 65014，
     // 预检回 control_disabled，地面站可据此获知不可调度。

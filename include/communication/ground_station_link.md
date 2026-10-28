@@ -109,6 +109,23 @@ Px4Link::StateOutput()
 （65014 offset 15/17，65013 offset 28/30/50），老地面站忽略即兼容；`kFenceMaxVertices=8`
 （顶点区 21~53，marker 在 54）。帧长/字段非法一律丢弃并计数，不发布半成品。
 
+## 人工任务指令编解码（2026-10-29 增）
+
+| 方向 | 类型 | 处理 |
+|---|---|---|
+| 下行 | 65020 `MISSION_COMMAND` | `HandleMissionCommand()`：帧长、地址双字段、尾部 marker=1、版本、类型逐项校验后填 `MissionCommand`（`valid_for_ms = kMissionCommandValidForMs = 1000`）并发布；校验失败分别计数（`mission_command_invalid_count_` / `mission_command_address_mismatch_count_`）并节流 WARN |
+| 上行 | 65021 `MISSION_COMMAND_ACK` | `SetMissionCommandAckInput()` + 工作线程每拍 `DrainMissionCommandAcks()`（逐条发送，不合并）→ `SendMissionCommandAck()` 编码后定向发 255/190 |
+
+设计取舍：
+
+- **与 65014 分工**：65014 是"分配任务"（可重复、带 target/zone 版本）；65020 是"现在就做某件事"，
+  一次性、`command_id` 幂等、带 1s 有效期。串口积压导致迟到超过 1s 的指令会被丢弃，避免
+  "补执行"一个已经过期的返航动作。
+- **拒绝原因不复用 65015 的 reason 空间**：65021 有独立的 `MissionCommandReason`（0~7、20），
+  因为 65015 的原因码是任务分配语义，混用会让地面站无法区分"分配被拒"与"指令被拒"。
+- **状态由机载决定**：地面站只能"请求返航"，是否接受取决于当前状态（未起飞拒绝、已在返航回
+  `kCompleted`、故障拒绝）。回执里的 `mission_state` 让地面站不必猜机载在哪一态。
+
 ## 日志行为
 
 - INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果；任务分配在第1条及每100条打印65014接收/发布和65015发送结果。
@@ -118,7 +135,10 @@ Px4Link::StateOutput()
 
 ## 测试方式
 
-围栏往返编解码在 `ground_station_link_test` 覆盖（构造 65018/65019 payload → 分派 → 字段一致）。
+围栏往返编解码在 `ground_station_link_test` 覆盖（构造 65018/65019 payload → 分派 → 字段一致）；
+65020/65021 由状态机侧用例与链路编解码共同覆盖：`mission_state_machine_test` 的
+`*MissionCommand*` 四例验证回执语义（接受/重复/版本/地面拒绝），
+web 侧 `server/mission_command.test.ts` 用同一套偏移做编码往返校验。
 
 Ubuntu 24.04开发机：
 
