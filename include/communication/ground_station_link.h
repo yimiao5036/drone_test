@@ -31,6 +31,16 @@ constexpr uint16_t kNetFireAckMessageType = 65017;
 constexpr uint8_t kNetFireProtocolVersion = 1;
 constexpr uint8_t kNetFireFlagConfirmed = 1U << 0U;  ///< bit0=确认发射
 constexpr uint8_t kNetFireKnownFlagsMask = kNetFireFlagConfirmed;
+/// 围栏区域下发（65018，地面站 → 指定飞机）与围栏状态回传（65019，飞机 → 地面站）。
+/// 区域是"一群飞机共享的快照"：地面站按 zone_id/version 下发，机载缓存并自治执行，
+/// 起飞前用 65014 携带的 zone_id/version 做一致性预检（2026-10-29）。
+/// 65013/65014 的版本号**不变**（仍为 2/1）：围栏字段写在两帧的保留区
+/// （65013 offsets 28/30/50、65014 offsets 15/17），老地面站忽略即可，Web 与
+/// Python 工具无需同步升级；未填这些字段的老发送端按"未声明区域"处理。
+constexpr uint16_t kFenceZoneMessageType = 65018;
+constexpr uint16_t kFenceStatusMessageType = 65019;
+constexpr uint8_t kFenceZoneProtocolVersion = 1;
+constexpr uint8_t kFenceMaxVertices = 8;  ///< 单帧上限：顶点区 21~53（marker 在 54）
 constexpr uint8_t kMissionAssignmentProtocolVersion = 1;
 constexpr uint8_t kTrackTargetProtocolVersion = 1;
 /// 65012 与 65013 的协议版本独立：65013 v2 才携带 assignment/availability，
@@ -171,6 +181,12 @@ public:
     /// 绑定 65017 发射回执输入。收到一条回执即按协议编码发送给 255/190。
     virtual void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) = 0;
 
+    /// 65018 围栏区域下发解析结果（2026-10-29）。地址双字段匹配本机后才发布；
+    /// 多边形/高度带合法性由状态机校验（非法区域被忽略并记日志）。
+    virtual common::Topic<common::FenceZone>& FenceZoneOutput() = 0;
+    /// 绑定 65019 围栏状态回传输入。按 V2_EXTENSION message_type=65019 编码发送。
+    virtual void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) = 0;
+
     /// 绑定 PX4 飞行状态快照。必须在 Start 前调用。
     virtual void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) = 0;
@@ -206,6 +222,8 @@ public:
         common::Topic<common::MissionAssignmentAck>& ack) override;
     common::Topic<common::NetFireCommand>& NetFireCommandOutput() override;
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
+    common::Topic<common::FenceZone>& FenceZoneOutput() override;
+    void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) override;
     /// 标记 65016 是否存在消费者（GcsNetFire 是否装配）。只用于把“开关关闭导致指令
     /// 无人处理”变成一条可自证的节流 WARN，不改变任何发射语义；必须在 Start 前调用。
     void SetNetFireConsumerPresent(bool present);
@@ -245,6 +263,8 @@ public:
         common::Topic<common::MissionAssignmentAck>& ack) override;
     common::Topic<common::NetFireCommand>& NetFireCommandOutput() override;
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
+    common::Topic<common::FenceZone>& FenceZoneOutput() override;
+    void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) override;
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -263,6 +283,7 @@ private:
     common::Topic<common::GroundStationTarget> target_output_;
     common::Topic<common::MissionAssignment> mission_assignment_output_;
     common::Topic<common::NetFireCommand> net_fire_command_output_;
+    common::Topic<common::FenceZone> fence_zone_output_;
 };
 
 }  // namespace drone::communication

@@ -255,10 +255,12 @@ struct MissionStateMachineConfig {
     std::chrono::milliseconds distance_stale{500};    // 测距超龄（distance_stale_ms 同源）
     config::ActuatorConfig actuator;                  // 捕网执行器（actuator 配置节同源，Task 10）
     config::TakeoffConfig takeoff;                    // 自动起飞时序（takeoff 配置节同源，2026-10-22）
+    config::FenceConfig fence;                        // 多边形围栏（fence 配置节同源，2026-10-29）
     uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
-class MissionStateMachine final : public IMissionStateMachine {
+class MissionStateMachine final : public IMissionStateMachine,
+                                  public common::IFencePolygonSource {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});
     void SetInputs(Topic<GroundStationTarget>& ground_target,
@@ -269,6 +271,9 @@ public:
                              Topic<StereoTargetDistance>& distance) override;
     void SetCommandSender(communication::IPx4CommandSender* sender) override;
     void SetAssignmentInput(Topic<MissionAssignment>& assignment) override;   // 65014（可选绑定）
+    void SetFenceInput(Topic<common::FenceZone>& zone) override;              // 65018（可选绑定）
+    Topic<common::FenceStatus>& FenceStatusOutput() override;                 // 65019
+    common::FencePolygonNed LatestFencePolygon() const override;              // 供飞行控制器钳制
     void SetEstimationDiagnostics(const perception::ITargetEstimator* estimator) override;
     Topic<ControlIntent>& IntentOutput() override;
     Topic<MissionStatus>& StatusOutput() override;                            // 65013 v2
@@ -319,6 +324,30 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 
 ## 关键实现点
 
+- **多边形围栏（2026-10-29，P1/P2）**：地面站用 65018 下发多边形区域（zone_id/version
+  唯一标识，顶点为 WGS-84），机载自治执行。
+  - 输入：`SetFenceInput()` 绑定 `kFenceZone`（Start 前）；`Start()` 时若
+    `fence.enabled` 且 `zone_cache_path` 存在则先 `ZoneStore::Load()` 装载缓存，
+    作为首拍区域。在线帧与缓存都经 `ApplyFenceZone()` 做同一套合法性检查
+    （zone_id/version 非 0、顶点 ≥3），非法帧节流 WARN 后丢弃。
+  - 坐标换算：`RebuildFencePolygon()` 用当前 `FlightStateSnapshot` 的 EKF 锚点
+    （`ned_ref_lat_1e7/ned_ref_lon_1e7`）把每个顶点经 `perception::GeodeticToLocalNed()`
+    换成局部 NED；锚点变化后下一拍自动重建（区域只在 `fence_dirty_` 时重建）。
+  - 判定：`EvaluateFenceGuard()` 排在电池守卫之后、目标看门狗之前（几何安全事件：
+    优先级低于电池、高于任务）。用 `PointInPolygon()` 与 `SignedDistanceToBoundary()`
+    得出 `kNormal / kNearBoundary（距离 ≤ boundary_warn_m）/ kViolated（出区或超高度带）`，
+    越界持续到 `violation_debounce_ms` 才动作，避免单帧抖动触发中止链。
+  - 动作：`follow_zone_action=true` 时按区域声明的 action，否则按 `violation_action`。
+    `kHold` → 每拍把位置意图钉在当前局部位置（reason=10 `kReasonFenceViolation`），
+    任务状态不迁移；`kReturn` → `AbortForFence()`（停发位置意图、`assignment_tracker_.AbortAirborne()`、
+    65015 `aborted`、转 S12 返航）；`kLand` → 直接转 S13 降落。
+  - 只在**飞行相关状态**动作（`kArming`~`kPostIntercept`）：地面 S0~S2、S12/S13/S14
+    与故障态只上报 65019，不触发中止链，避免地面就锁死任务。
+- **S12 返航机头朝向**：`return_home.heading_mode=1`（默认）时，S12 非爬升段按
+  期望航向（指向 Home，`atan2(east, north)`）下发 `yaw_valid=true` 的位置意图，
+  经角速度/角加速度二阶限幅（`heading_rate_limit_dps=30`、`heading_accel_limit_dps2=60`）；
+  首拍直接对齐当前方位角，水平距离 <1m 时保持上一拍航向，避免在 Home 上方原地打转。
+  `heading_mode=0` 恢复旧行为（不指定航向，PX4 保持原机头平移）。
 - 状态机拥有独立工作线程，周期为100ms。
 - 输入通过`Topic`订阅队列获取：目标队列容量4，飞行/健康/估计/视觉/测距快照队列容量2。
 - 每个周期先抽干订阅队列，只保留最新不可变快照，再做状态判断，避免一次决策周期内读到不一致数据。
@@ -609,6 +638,15 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 
 ## 日志行为
 
+围栏相关（2026-10-29）：
+- INFO：`围栏区域已更新: zone=../.. 顶点=.. 动作=.. 高度带=[..,..]m 基准=..`（仅内容变化时）、
+  `围栏区域缓存已装载/已保存`、`任务状态机围栏区域输入已绑定`。
+- WARN：`围栏非法区域已忽略`（节流，带累计计数）、`围栏区域缓存不可用`、
+  `围栏越界保持: zone=../.. 距边界=..m`（节流）、`围栏越界中止: zone=../.. 距边界=..m 持续=..ms → S12 返航`。
+- 65019 由 `fence.status_period_ms` 控制上报节拍，本身不打日志（链路层有节流发送日志），
+  否则 1Hz 状态会淹没热路径。
+
+
 - INFO：状态机创建、启动、停止、销毁；状态转移（含交接进入/验证通过/撤销/超时/
   视觉断流退出/测距失效退出/退出迟滞回退/伺服未启动超时，一一对应中文 reason，
   便于事后区分是哪条退出路径生效）；位置引导意图启动/停止（含"交接冻结最后位置目标"、
@@ -847,6 +885,17 @@ ctest --test-dir build --output-on-failure
   非门禁，`interception.enabled` 生产默认关闭。
 
 ## 排查/修改要点
+
+- 65019 一直 `no_zone(3)`：先确认 `fence.enabled=true`、65018 在发、`config/zone.json`
+  是否存在；再确认 `SetFenceInput()` 已在 Start 前绑定（否则只吃缓存）。
+- 65019 是 `zone_invalid(4)`：顶点不足 3、zone_id/version 为 0，或 EKF 锚点无效
+  （`ned_ref_valid=false`，此时无法把经纬度换成 NED，多边形保持无效而不误判越界）。
+- 越界不动作：检查当前状态是否在 `kArming`~`kPostIntercept` 之间（地面态按设计不动作）、
+  `violation_debounce_ms` 是否过长、以及 65016 之外的 `action` 是否被 `follow_zone_action` 覆盖。
+- 起飞被 65015 `reason=21 zone_mismatch` 拒绝：地面站 65014 的 zone_id/zone_version 与
+  机载缓存不一致——先发 65018 对齐区域，或让地面站发 zone_id=0（未声明，靠机载缓存）。
+- 修改顶点/动作字段必须同步 `GroundStationLink::HandleFenceZone()` 与
+  `docs/数据接口文档.md` §3.2.3，并保持 65014 保持 v1、65013 保持 v2（新字段只占保留区）。
 
 - **S10 发射后不返航**：查 `MissionStateMachineConfig::return_home.enabled`
   （默认 true；捕网执行器隔离测试显式 false）、执行器 `Fired()`/发射超时日志；

@@ -2298,11 +2298,13 @@ struct AssignmentHarness {
     common::Topic<common::VisualTargetStatus> visual_topic;
     common::Topic<common::StereoTargetDistance> distance_topic;
     common::Topic<common::MissionAssignment> assignment_topic;
+    common::Topic<common::FenceZone> fence_topic;
     FakeCommandSender sender;
     state_machine::MissionStateMachine machine;
     common::Topic<common::MissionStatus>::Subscription status_subscription;
     common::Topic<common::MissionAssignmentAck>::Subscription ack_subscription;
     common::Topic<common::ControlIntent>::Subscription intent_subscription;
+    common::Topic<common::FenceStatus>::Subscription fence_status_subscription;
 
     AssignmentHarness() : AssignmentHarness(MakeAssignmentHarnessConfig()) {}
 
@@ -2310,9 +2312,12 @@ struct AssignmentHarness {
         : machine(config) {
         machine.SetInputs(ground_topic, flight_topic, health_topic);
         machine.SetAssignmentInput(assignment_topic);
+        // 围栏输入始终绑定：fence.enabled=false 时状态机不消费该 Topic。
+        machine.SetFenceInput(fence_topic);
         status_subscription = machine.StatusOutput().Subscribe(32);
         ack_subscription = machine.AssignmentAckOutput().Subscribe(32);
         intent_subscription = machine.IntentOutput().Subscribe(64);
+        fence_status_subscription = machine.FenceStatusOutput().Subscribe(32);
     }
 
     /// 装配并启动；with_control=false 模拟影子装配（不注入命令接口）。
@@ -3987,6 +3992,189 @@ uint32_t LowReasonCode(const common::ControlIntent& value) {
 
 constexpr uint32_t kLowReasonGroundTask = 7U;
 constexpr uint32_t kLowReasonTargetHold = 9U;
+
+// ---------------------------------------------------------------------------
+// 多边形围栏（2026-10-29）：区域输入、越界动作与起飞前版本一致性预检
+// ---------------------------------------------------------------------------
+
+/// 围栏用例的 EKF 局部锚点（与 MakeFenceFlight 的 ned_ref 一致）。
+constexpr int32_t kFenceAnchorLat1e7 = 231200000;
+constexpr int32_t kFenceAnchorLon1e7 = 1131200000;
+constexpr int32_t kFenceAnchorAltMm = 100000;
+
+/// 落地待飞快照 + EKF 局部锚点：多边形顶点按该锚点换算成局部 NED。
+common::FlightStateSnapshot MakeFenceFlight() {
+    common::FlightStateSnapshot flight = MakeGroundedFlight();
+    flight.ned_ref_valid = true;
+    flight.ned_ref_lat_1e7 = kFenceAnchorLat1e7;
+    flight.ned_ref_lon_1e7 = kFenceAnchorLon1e7;
+    flight.ned_ref_alt_mm = kFenceAnchorAltMm;
+    return flight;
+}
+
+/// 空中快照（Offboard）覆盖局部位置与锚点，用于制造越界/回界。
+common::FlightStateSnapshot MakeFenceOffboardFlight(float x_m, float y_m,
+                                                    float z_m) {
+    common::FlightStateSnapshot flight = MakeOffboardFlight(true, false);
+    flight.ned_ref_valid = true;
+    flight.ned_ref_lat_1e7 = kFenceAnchorLat1e7;
+    flight.ned_ref_lon_1e7 = kFenceAnchorLon1e7;
+    flight.ned_ref_alt_mm = kFenceAnchorAltMm;
+    flight.local_position_valid = true;
+    flight.local_x_m = x_m;
+    flight.local_y_m = y_m;
+    flight.local_z_m = z_m;
+    return flight;
+}
+
+/// 以锚点为心的方形区域（±radius_m），顶点按 23.12° 纬度做米→度近似换算。
+common::FenceZone MakeSquareZone(uint16_t zone_id, uint16_t version,
+                                 common::FenceAction action,
+                                 double radius_m) {
+    common::FenceZone zone;
+    zone.header.receive_time_ms = TestMonotonicMs();
+    zone.header.valid_for_ms = 0;  // 持久快照
+    zone.header.health = 1;
+    zone.protocol_version = 1;
+    zone.zone_id = zone_id;
+    zone.version = version;
+    zone.type = common::FenceZoneType::kPolygon;
+    zone.action = action;
+    zone.altitude_reference = 1;  // Home 相对高度
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 0.0;  // 不限制高度带
+    const double lat0 = static_cast<double>(kFenceAnchorLat1e7) * 1e-7;
+    const double lon0 = static_cast<double>(kFenceAnchorLon1e7) * 1e-7;
+    const double dlat = radius_m / 111320.0;
+    const double dlon = radius_m / (111320.0 * 0.91965);  // cos(23.12°)
+    zone.vertices = {
+        {lat0 - dlat, lon0 - dlon},
+        {lat0 + dlat, lon0 - dlon},
+        {lat0 + dlat, lon0 + dlon},
+        {lat0 - dlat, lon0 + dlon},
+    };
+    zone.received_ms = TestMonotonicMs();
+    return zone;
+}
+
+/// 围栏用例配置：缩短起飞时序 + 启用围栏（无防抖、快速上报状态）。
+state_machine::MissionStateMachineConfig MakeFenceTestConfig(
+    common::FenceAction violation_action = common::FenceAction::kReturn) {
+    state_machine::MissionStateMachineConfig config = MakeTakeoffTestConfig();
+    config.fence.enabled = true;
+    config.fence.violation_debounce = 0ms;
+    config.fence.boundary_margin_m = 1.0;
+    config.fence.boundary_warn_m = 10.0;
+    config.fence.follow_zone_action = true;
+    config.fence.violation_action = violation_action;
+    config.fence.status_period = 20ms;
+    // 清空缓存路径：用例只验证在线 65018 与越界逻辑，不落盘、不读历史缓存。
+    config.fence.zone_cache_path.clear();
+    return config;
+}
+
+/// 越界返回动作：S5 中被拖到区域外 → 65019 先报 violated，随后中止到 S12 返航。
+TEST(MissionStateMachineTest, FenceViolationAbortsToReturnHome) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(7, 3, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 区域外 500m：先看 65019 的 violated 上报，再看状态机中止。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(500.0f, 0.0f, -2.0f)))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated &&
+            (*status)->zone_id == 7U && (*status)->version == 3U) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "65019 应上报越界";
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "越界返回动作应转 S12";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 越界保持动作：不中止任务，只把位置意图钉在当前点（S5 保持不变）。
+TEST(MissionStateMachineTest, FenceHoldActionKeepsTaskRunning) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(9, 2, common::FenceAction::kHold, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 2));
+
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(400.0f, 0.0f, -2.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "hold 动作不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value());
+}
+
+/// 起飞前区域一致性：65014 携带的 zone_id/version 与机载缓存不一致 → 21。
+TEST(MissionStateMachineTest, FenceZoneMismatchRejectsAssignment) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(7, 3, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+
+    // 版本不一致（缓存 3，分配 9）→ rejected/zone_mismatch，保持 S2。
+    common::MissionAssignment mismatched = MakeAssignment(11);
+    mismatched.zone_id = 7;
+    mismatched.zone_version = 9;
+    ASSERT_TRUE(harness.Send(mismatched));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kZoneMismatch);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+
+    // zone_id=0（未声明区域的老地面站）按机载缓存放行，通过预检。
+    common::MissionAssignment legacy = MakeAssignment(12);
+    ASSERT_TRUE(harness.Send(legacy));
+    const auto legacy_ack = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(legacy_ack.has_value());
+    EXPECT_EQ(legacy_ack->assignment_id, 12U);
+}
 
 }  // namespace
 

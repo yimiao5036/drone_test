@@ -333,6 +333,10 @@ struct ControlIntent {
     float yaw_deg = 0.f;         ///< 绝对航向（度，NED；位置式航向通道）
     float yaw_rate_dps = 0.f;    ///< 偏航角速度指令（度/秒；速率式航向通道，
                                  ///< 2026-09-23 视觉跟踪移植新增，默认 0=不使用）
+    /// 航向角通道是否有效（2026-10-29 返航机头朝飞行方向）。历史约定用
+    /// `yaw_deg != 0` 判“是否指定航向”，无法表达正北 0°，故新增显式有效位。
+    /// false：不指定航向，PX4 保持原机头平移；true：按 yaw_deg 控制机头。
+    bool yaw_valid = false;
     float max_speed_mps = 0.f;   ///< 速度限制；0=不限制
     /// 位置型意图的速度前馈（局部 NED，m/s；2026-10-19 P3）。
     float feedforward_vx_mps = 0.f;
@@ -455,6 +459,7 @@ enum class MissionAssignmentReason : uint8_t {
     kPx4Disconnected = 18,
     kMissionFault = 19,
     kInternalError = 20,
+    kZoneMismatch = 21,  ///< 机载围栏区域版本与分配声明不一致（v3，2026-10-29）
 };
 
 /// 任务分配（地面站 65014 → 状态机）。
@@ -467,6 +472,10 @@ struct MissionAssignment {
     uint8_t interceptor_type = 0;  ///< 25=捕网 26=火箭，必须等于本机 component
     uint8_t flags = 0;             ///< bit0=授权自动起飞 bit1=取消当前分配
     uint32_t valid_for_ms = 0;     ///< 分配有效期（毫秒）
+    /// 65014 v3 扩展（2026-10-29 多边形围栏）：分配时地面站声明的区域编号/版本。
+    /// 与机载缓存不一致时按 kZoneMismatch 拒绝（起飞前必须确认同一份围栏）。
+    uint16_t zone_id = 0;
+    uint16_t zone_version = 0;
     uint64_t received_ms = 0;      ///< 本机收到消息的单调时钟时间
 };
 
@@ -497,6 +506,95 @@ struct MissionStatus {
     uint32_t target_id = 0;                    ///< 当前目标编号
     MissionAvailability availability = MissionAvailability::kUnavailable;  ///< 可用状态
     uint8_t interceptor_type = 0;              ///< 25=捕网 26=火箭；未知为 0
+    /// 65013 v3 扩展字段（2026-10-29，多边形围栏）：未装载区域时 id/version 为 0。
+    uint16_t zone_id = 0;                      ///< 当前生效围栏区域编号
+    uint16_t zone_version = 0;                 ///< 当前生效围栏区域版本
+    uint8_t fence_state = 0;                   ///< 见 FenceState；0=正常
+};
+
+/// 围栏区域类型（65018 下发）。
+enum class FenceZoneType : uint8_t {
+    kPolygon = 0,  ///< 多边形（当前唯一支持类型）
+};
+
+/// 围栏越界动作（地面站定义，机载执行）。
+/// 越界判定成立后由状态机执行对应中止动作，与电池守卫共用中止入口。
+enum class FenceAction : uint8_t {
+    kHold = 0,    ///< 原地悬停（不返航、不降落，等人工）
+    kReturn = 1,  ///< 中止任务并返航 Home（默认）
+    kLand = 2,    ///< 原地降落
+};
+
+/// 围栏几何状态（65019 回传，供地面站显示）。
+enum class FenceState : uint8_t {
+    kNormal = 0,      ///< 在区域内（含高度带内）
+    kNearBoundary = 1,///< 在区域内但接近边界（告警）
+    kViolated = 2,    ///< 已越界（判定成立，按 action 处置）
+    kNoZone = 3,      ///< 未装载区域（围栏未启用或缓存缺失）
+    kZoneInvalid = 4, ///< 区域数据非法（顶点不足/版本冲突）
+};
+
+/// 围栏多边形顶点（WGS84，65018 线格式与 zone.json 缓存共用）。
+struct FenceVertex {
+    double latitude_deg = 0.0;
+    double longitude_deg = 0.0;
+};
+
+/// 围栏区域（地面站 65018 → 状态机；机载缓存为 config/zone.json）。
+/// 顶点为 WGS84 经纬度，机载按当前 EKF 锚点转换为局部 NED 后做几何判定。
+struct FenceZone {
+    MessageHeader header;
+    uint8_t protocol_version = 1;    ///< 区域协议版本，当前固定 1
+    uint16_t zone_id = 0;            ///< 区域编号（0=非法）
+    uint16_t version = 0;            ///< 区域内容版本；内容变更即递增
+    FenceZoneType type = FenceZoneType::kPolygon;
+    FenceAction action = FenceAction::kReturn;  ///< 越界动作
+    uint8_t altitude_reference = 0;  ///< 0=AMSL 绝对高度 1=Home 相对高度
+    double alt_min_m = 0.0;          ///< 高度带下限（m）
+    double alt_max_m = 0.0;          ///< 高度带上限（m）；0=未限制，用配置默认
+    std::vector<FenceVertex> vertices;  ///< 多边形顶点（WGS84，≥3 个）
+    uint64_t received_ms = 0;        ///< 本机收到的单调时钟时间
+};
+
+/// 局部 NED 二维点（围栏几何用）。
+struct Vec2Ned {
+    double north_m = 0.0;
+    double east_m = 0.0;
+};
+
+/// 已转换为局部 NED 的围栏多边形快照（状态机 → 飞行控制器钳制）。
+/// 顶点顺序不限自交（不做凸性检查）；坐标系原点与位置意图一致（局部 NED）。
+struct FencePolygonNed {
+    uint16_t zone_id = 0;
+    uint16_t version = 0;
+    FenceAction action = FenceAction::kHold;
+    double alt_min_m = 0.0;  ///< 相对 Home 高度下限（m）
+    double alt_max_m = 0.0;  ///< 相对 Home 高度上限（m）；0=用配置默认
+    std::vector<Vec2Ned> vertices;
+    bool valid() const { return vertices.size() >= 3; }
+};
+
+/// 机载围栏多边形只读来源（状态机实现，飞行控制器注入消费）。
+/// 供飞行控制器把位置意图钳制到区域内；返回空/无效快照时回退圆形围栏。
+class IFencePolygonSource {
+public:
+    virtual ~IFencePolygonSource() = default;
+    /// 线程安全：可被控制周期线程与决策线程并发调用。
+    virtual FencePolygonNed LatestFencePolygon() const = 0;
+};
+
+/// 围栏状态回传（状态机 → 地面站 65019）。
+struct FenceStatus {
+    MessageHeader header;
+    uint16_t zone_id = 0;
+    uint16_t version = 0;
+    FenceState state = FenceState::kNoZone;
+    double distance_to_boundary_m = 0.0;  ///< 距最近边界距离；区域内为正，区域外为负
+    uint32_t violation_duration_ms = 0;   ///< 连续越界持续时长；0=未越界
+    double local_north_m = 0.0;           ///< 飞机当前局部 NED 位置
+    double local_east_m = 0.0;
+    double local_down_m = 0.0;
+    bool action_pending = false;          ///< 越界动作是否待执行（已中止任务）
 };
 
 /// 地面站捕网发射指令（65016，地面站 → 指定飞机；台架/测试用）。
@@ -589,6 +687,8 @@ inline constexpr char kMissionAssignment[] = "mission_assignment";        ///< M
 inline constexpr char kMissionAssignmentAck[] = "mission_assignment_ack"; ///< MissionAssignmentAck（65015）
 inline constexpr char kNetFireCommand[] = "net_fire_command";             ///< NetFireCommand（65016）
 inline constexpr char kNetFireAck[] = "net_fire_ack";                     ///< NetFireAck（65017）
+inline constexpr char kFenceZone[] = "fence_zone";                        ///< FenceZone（65018/缓存）
+inline constexpr char kFenceStatus[] = "fence_status";                    ///< FenceStatus（65019）
 inline constexpr char kHealthStatus[] = "health_status";      ///< HealthStatus
 inline constexpr char kAnnotatedFrame[] = "annotated_frame";  ///< video::FrameHandle
 }  // namespace topics

@@ -31,6 +31,7 @@
 
 #include "communication/px4_link.h"
 #include "config/config.h"
+#include "control/fence_geometry.h"
 #include "control/rate_limiter.h"
 #include "control/staleness_checker.h"
 
@@ -123,6 +124,11 @@ bool FlightControllerStub::IsRunning() const {
 void FlightControllerStub::SetInput(common::Topic<common::ControlIntent>& /*intent*/) {
 }
 
+// 骨架期无围栏钳制：忽略多边形来源注入。
+void FlightControllerStub::SetFencePolygonSource(
+    const common::IFencePolygonSource* /*source*/) {
+}
+
 common::Topic<common::Px4Setpoint>& FlightControllerStub::SetpointOutput() {
     return setpoint_output_;
 }
@@ -212,6 +218,12 @@ public:
     void SetPx4LinkSource(const communication::IPx4Link* link) {
         // 控制权门禁与 Home 围栏的只读快照源；只允许装配期（Start 前）注入。
         px4_link_ = link;
+    }
+
+    /// 注入多边形围栏只读来源（状态机实现）。原子指针：决策线程写、控制
+    /// 周期线程读；只在装配期（Start 前）注入一次，运行期不再改。
+    void SetFencePolygonSource(const common::IFencePolygonSource* source) {
+        fence_source_.store(source, std::memory_order_release);
     }
 
     /// 测试入口：强制控制权状态。授权链每拍重估，门禁不通时下一拍即撤到
@@ -745,7 +757,33 @@ private:
         double target_x = intent.target_x;
         double target_y = intent.target_y;
         double target_z = intent.target_z;
-        // 水平半径：模长超 max_radius_m 等比钳制（方向不变）
+        // 多边形围栏（2026-10-29）：地面站划定的区域优先于 Home 圆形围栏。
+        // 只在区域有效（≥3 顶点）时生效；无效/未注入回退下方圆形钳制。
+        const common::IFencePolygonSource* const fence_source =
+            fence_source_.load(std::memory_order_acquire);
+        const common::FencePolygonNed zone =
+            fence_source != nullptr ? fence_source->LatestFencePolygon()
+                                    : common::FencePolygonNed{};
+        const bool zone_active = zone.valid();
+        if (zone_active) {
+            const common::Vec2Ned point{target_x, target_y};
+            const common::Vec2Ned clamped =
+                fence::ClampIntoPolygon(zone.vertices, point, config_.fence_margin_m);
+            const double moved = std::hypot(clamped.north_m - target_x,
+                                            clamped.east_m - target_y);
+            if (moved > 1e-6) {
+                target_x = clamped.north_m;
+                target_y = clamped.east_m;
+                const uint64_t count = ++clamped_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN(
+                        "飞行控制器围栏多边形钳制: zone={}/{} 位移={:.2f}m 累计={}",
+                        zone.zone_id, zone.version, moved, count);
+                }
+            }
+        }
+        // 水平半径：模长超 max_radius_m 等比钳制（方向不变）。
+        // 多边形生效时该圆形围栏仍作为绝对兜底（两个上限取更严者）。
         const double radius = std::hypot(target_x, target_y);
         if (radius > config_.max_radius_m) {
             const double scale = config_.max_radius_m / radius;
@@ -757,14 +795,17 @@ private:
                             radius, config_.max_radius_m, count);
             }
         }
-        // 高度：NED z 向下为正，相对 Home 高度 = -z；超 max_altitude_m 钳制
+        // 高度：NED z 向下为正，相对 Home 高度 = -z；超上限钳制。
+        // 区域自带高度带时以区域上限为权威（更严者优先），否则用配置上限。
+        const double alt_limit =
+            (zone_active && zone.alt_max_m > 0.0) ? zone.alt_max_m : config_.max_altitude_m;
         const double altitude_m = -target_z;
-        if (altitude_m > config_.max_altitude_m) {
-            target_z = -config_.max_altitude_m;
+        if (altitude_m > alt_limit) {
+            target_z = -alt_limit;
             const uint64_t count = ++clamped_count_;
             if (ShouldLogThrottled(count)) {
                 SPDLOG_WARN("飞行控制器围栏高度钳制: h={:.2f} > max={:.2f} 累计={}",
-                            altitude_m, config_.max_altitude_m, count);
+                            altitude_m, alt_limit, count);
             }
         }
         // ---- 位置速度前馈（P3）：可选增强，开关关闭时完全忽略 ----
@@ -843,7 +884,9 @@ private:
         setpoint.feedforward_vz_mps = ff_vz;
         setpoint.feedforward_valid_mask = ff_mask;
         // 航向通道透传（互斥约束同速度式，沿用 Px4Link 现有校验）。
-        setpoint.use_yaw = intent.yaw_deg != 0.f;
+        // 2026-10-29：显式 yaw_valid 优先（可表达正北 0°），兼容历史
+        // "yaw_deg != 0 即指定航向"的约定（视觉/S6 冻结等旧路径仍按旧值填）。
+        setpoint.use_yaw = intent.yaw_valid || intent.yaw_deg != 0.f;
         setpoint.yaw_deg = intent.yaw_deg;
         setpoint.use_yaw_rate = intent.yaw_rate_dps != 0.f;
         setpoint.yaw_rate_dps = intent.yaw_rate_dps;
@@ -877,6 +920,8 @@ private:
     common::Topic<common::ControlIntent>::Subscription intent_subscription_;
     common::Topic<common::Px4Setpoint> setpoint_output_;
     const communication::IPx4Link* px4_link_ = nullptr;  // 只读门禁源（快照/围栏）
+    /// 多边形围栏只读来源（2026-10-29）：决策线程写一次、控制周期线程读。
+    std::atomic<const common::IFencePolygonSource*> fence_source_{nullptr};
 
     // 以下仅周期线程访问（诊断接口经原子量暴露）。
     std::optional<common::ControlIntent> latest_intent_;
@@ -923,6 +968,10 @@ bool FlightController::IsRunning() const { return impl_->IsRunning(); }
 
 void FlightController::SetInput(common::Topic<common::ControlIntent>& intent) {
     impl_->SetInput(intent);
+}
+
+void FlightController::SetFencePolygonSource(const common::IFencePolygonSource* source) {
+    impl_->SetFencePolygonSource(source);
 }
 
 common::Topic<common::Px4Setpoint>& FlightController::SetpointOutput() {

@@ -503,6 +503,8 @@ void FlightControllerConfig::Validate() const {
         throw std::invalid_argument("controller.slew_transition_ms 必须为正");
     if (bootstrap_timeout.count() <= 0)
         throw std::invalid_argument("controller.bootstrap_timeout_ms 必须为正");
+    if (!std::isfinite(fence_margin_m) || fence_margin_m < 0.0)
+        throw std::invalid_argument("controller.fence_margin_m 必须为有限非负数");
 }
 
 void HandoverConfig::Validate() const {
@@ -561,6 +563,42 @@ void ReturnHomeConfig::Validate() const {
     }
     if (command_retry.count() <= 0) {
         throw std::invalid_argument("return_home.command_retry_ms 必须为正");
+    }
+    // 返航机头模式（2026-10-29）：0=保持原机头 1=朝飞行方向；其它值拒绝。
+    if (heading_mode > 1) {
+        throw std::invalid_argument("return_home.heading_mode 必须为 0 或 1");
+    }
+    if (!std::isfinite(heading_rate_limit_dps) || heading_rate_limit_dps <= 0.0) {
+        throw std::invalid_argument("return_home.heading_rate_limit_dps 必须为有限正数");
+    }
+    if (!std::isfinite(heading_accel_limit_dps2) || heading_accel_limit_dps2 <= 0.0) {
+        throw std::invalid_argument("return_home.heading_accel_limit_dps2 必须为有限正数");
+    }
+}
+
+void FenceConfig::Validate() const {
+    if (zone_cache_path.empty()) {
+        throw std::invalid_argument("fence.zone_cache_path 不能为空");
+    }
+    if (violation_debounce.count() < 0) {
+        throw std::invalid_argument("fence.violation_debounce_ms 必须 >= 0");
+    }
+    if (!std::isfinite(boundary_margin_m) || boundary_margin_m < 0.0) {
+        throw std::invalid_argument("fence.boundary_margin_m 必须为有限非负数");
+    }
+    if (!std::isfinite(boundary_warn_m) || boundary_warn_m < 0.0) {
+        throw std::invalid_argument("fence.boundary_warn_m 必须为有限非负数");
+    }
+    if (boundary_warn_m < boundary_margin_m) {
+        throw std::invalid_argument(
+            "fence.boundary_warn_m 必须 >= fence.boundary_margin_m");
+    }
+    if (status_period.count() <= 0) {
+        throw std::invalid_argument("fence.status_period_ms 必须为正");
+    }
+    const auto action = static_cast<uint8_t>(violation_action);
+    if (action > static_cast<uint8_t>(common::FenceAction::kLand)) {
+        throw std::invalid_argument("fence.violation_action 必须为 0/1/2");
     }
 }
 
@@ -922,6 +960,16 @@ AppConfig LoadAppConfig(const std::string& path,
         return_home, "fire_timeout_ms", config.return_home.fire_timeout);
     config.return_home.command_retry = ReadOptionalPositiveMilliseconds(
         return_home, "command_retry_ms", config.return_home.command_retry);
+    // 返航机头朝飞行方向（2026-10-29）：模式 0=保持 1=朝速度方向，
+    // 并限制机头转速/角加速度（与视觉跟踪同量级，避免突转）。
+    config.return_home.heading_mode = static_cast<uint8_t>(
+        return_home.value("heading_mode", static_cast<int>(config.return_home.heading_mode)));
+    config.return_home.heading_rate_limit_dps = ReadOptionalPositiveDouble(
+        return_home, "heading_rate_limit_dps",
+        config.return_home.heading_rate_limit_dps);
+    config.return_home.heading_accel_limit_dps2 = ReadOptionalPositiveDouble(
+        return_home, "heading_accel_limit_dps2",
+        config.return_home.heading_accel_limit_dps2);
     config.return_home.Validate();
     if (config.interception.enabled && !config.return_home.enabled) {
         throw std::invalid_argument(
@@ -965,6 +1013,29 @@ AppConfig LoadAppConfig(const std::string& path,
         takeoff, "battery_low_debounce_ms",
         config.takeoff.battery_low_debounce);
     config.takeoff.Validate();
+
+    // 多边形围栏（fence 节，2026-10-29）：全部可选，缺省关闭并回退 Home 圆形围栏。
+    const json fence = root.value("fence", json::object());
+    config.fence.enabled = fence.value("enabled", config.fence.enabled);
+    config.fence.zone_cache_path =
+        fence.value("zone_cache_path", config.fence.zone_cache_path);
+    config.fence.violation_debounce = ReadOptionalNonNegativeMilliseconds(
+        fence, "violation_debounce_ms", config.fence.violation_debounce);
+    config.fence.boundary_margin_m = ReadOptionalNonNegativeDouble(
+        fence, "boundary_margin_m", config.fence.boundary_margin_m);
+    config.fence.boundary_warn_m = ReadOptionalNonNegativeDouble(
+        fence, "boundary_warn_m", config.fence.boundary_warn_m);
+    config.fence.follow_zone_action =
+        fence.value("follow_zone_action", config.fence.follow_zone_action);
+    config.fence.violation_action = static_cast<common::FenceAction>(
+        fence.value("violation_action",
+                    static_cast<int>(config.fence.violation_action)));
+    config.fence.status_period = ReadOptionalPositiveMilliseconds(
+        fence, "status_period_ms", config.fence.status_period);
+    config.fence.Validate();
+    // 控制器钳制余量与围栏配置保持单一真源：FlightController 不读 fence 节。
+    config.controller.fence_margin_m = config.fence.boundary_margin_m;
+    config.controller.Validate();
 
     // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：机载只保存
     // Actuator Set N 与归一化控制量；PWM 输出功能/区间/舵机行程在 PX4 侧配置。
@@ -1264,6 +1335,12 @@ AppConfig LoadAppConfig(const std::string& path,
             ConfigDirectoryOf(path), config.stereo_ranger.rectify_matrices_path);
         config.stereo_rectify =
             LoadStereoRectifyMatrices(config.stereo_ranger.rectify_matrices_path);
+    }
+    // 围栏区域缓存路径与 config.json 同目录解析（生产部署即 <exe>/config/）。
+    // 缓存缺失不阻塞启动：机载按 kNoZone 上报，等地面站 65018 下发落盘。
+    if (config.fence.enabled) {
+        config.fence.zone_cache_path =
+            ResolveAdjacentPath(ConfigDirectoryOf(path), config.fence.zone_cache_path);
     }
     // 视觉融合装配：enabled 由 runtime 开关写入；fxb_m_px 从校正矩阵拷贝
     //（深度系数单一真源，不进 JSON）；填充后复核 Validate（enabled 时要求

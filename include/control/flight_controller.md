@@ -165,6 +165,25 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   刹车"的语义，bootstrap 未获授权不能刹车保持；
 - 进入 `kIdle` 时沿用既有行为清零状态机显式请求锁存。
 
+## 多边形围栏钳制（2026-10-29）
+
+`SetFencePolygonSource(const common::IFencePolygonSource*)` 由装配层（`DroneApplication::BindTopics()`）
+在 Start 前注入，实现者是 `MissionStateMachine`。控制周期内用原子指针读取最新多边形快照，
+`PublishPosition()` 处理顺序：
+
+1. 读取 `LatestFencePolygon()`；`vertices.size() >= 3` 才视为生效（否则完全回退旧行为）。
+2. 位置设定值经 `fence::ClampIntoPolygon(vertices, {x,y}, controller.fence_margin_m)` 回拉，
+   位移 > 1e-6m 即计数 `clamped_count_` 并打节流 WARN（带 zone_id/version、位移、累计次数）。
+3. 圆形半径围栏（`controller.max_radius_m`）继续执行，作为**绝对兜底**：
+   多边形来源失效或顶点不足时，仍按 Home 半径保护。
+4. 高度上限：多边形生效且 `alt_max_m > 0` 时用区域高度带上限，否则用 `controller.max_altitude_m`。
+5. 航向：`setpoint.use_yaw = intent.yaw_valid || intent.yaw_deg != 0.f`——新增
+   `ControlIntent.yaw_valid` 解决“正北 0° 无法表达”的历史问题；S12 返航用它
+   请求机头朝飞行方向，其余位置意图不置位即保持原机头平移。
+
+取舍：钳制放在控制器而不是状态机，是为了让**任何来源**的位置意图（自动驾驶、视觉伺服、
+返航、测试钩子）都经过同一道几何闸门，避免某条路径忘记钳制。
+
 ## Home 相对围栏（Task 5）
 
 仅作用于位置式意图（`kPositionGuide`）；速度式意图受速度幅值上限约束，

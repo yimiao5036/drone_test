@@ -164,6 +164,7 @@ target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog drone_control_c
 
 # ---- control 模块（飞行控制接口+视觉跟踪控制律；库名加 _core 避免与可执行 drone_control 冲突） ----
 add_library(drone_control_core STATIC
+    src/control/fence_geometry.cpp
     src/control/flight_controller.cpp
     src/control/line_of_sight.cpp
     src/control/pid_controller.cpp
@@ -185,7 +186,8 @@ target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 
 # ---- config 模块（正式主程序强类型配置） ----
 add_library(drone_config STATIC
-    src/config/config.cpp)
+    src/config/config.cpp
+    src/config/zone_store.cpp)
 target_include_directories(drone_config PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_config PUBLIC cxx_std_17)
@@ -196,6 +198,9 @@ target_link_libraries(drone_config PUBLIC
     drone_video
     drone_perception
     drone_video_transmission)
+# 区域缓存（zone.json）读写需要日志（WARN/ERROR 定位缓存损坏）；config 主流程
+# 仍然只抛异常不打印，日志仅来自 ZoneStore。
+target_link_libraries(drone_config PRIVATE spdlog::spdlog)
 
 # ---- application 模块（正式主程序组件所有权、Topic 接线与生命周期） ----
 add_library(drone_application STATIC
@@ -414,7 +419,8 @@ if(BUILD_TESTING)
                 tracking_control_law_test
                 visual_tracking_shadow_test
                 flight_controller_test
-                flight_controller_link_contract_test)
+                flight_controller_link_contract_test
+                fence_geometry_test)
             add_executable(${control_test} tests/control/${control_test}.cpp)
             target_link_libraries(${control_test} PRIVATE
                 drone_common drone_control_core spdlog::spdlog GTest::gtest_main)

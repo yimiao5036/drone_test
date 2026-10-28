@@ -87,6 +87,9 @@ struct MissionStateMachineConfig {
     /// 拦截后返航（S11~S14，return_home 配置节）：单发发射结束→算力板位置
     /// 返航→AUTO.LAND→DISARM。默认启用；测试可关闭以隔离捕网执行器语义。
     config::ReturnHomeConfig return_home;
+    /// 多边形围栏（fence 配置节，2026-10-29）：机载自治围栏——区域缓存装载、
+    /// 越界判定与中止、位置意图钳制。默认关闭（回退 Home 圆形围栏）。
+    config::FenceConfig fence;
     /// 测试钩子开关（默认关闭）：只有显式置位后 `ForceStateForTest` 才生效。
     /// **生产装配（`DroneApplication`）必须保持默认 false** —— 该入口可强推到
     /// 拦截状态（S9/S10），在 `enable_control=true` 装配下会经命令窄接口发出
@@ -124,6 +127,9 @@ public:
     /// 必须在 Start 前调用；未绑定时状态机不处理分配（保持原有影子行为）。
     virtual void SetAssignmentInput(
         common::Topic<common::MissionAssignment>& assignment) = 0;
+    /// 绑定围栏区域输入主题（65018，GroundStationLink 解析后发布；2026-10-29）。
+    /// 必须在 Start 前调用；未绑定时机载只使用本地缓存（config/zone.json）。
+    virtual void SetFenceInput(common::Topic<common::FenceZone>& zone) = 0;
     /// 注入目标估计器诊断接口：交接判据的创新门限读取
     /// `ITargetEstimator::LastVisualInnovationM()`（最近一次视觉观测与卡尔曼预测的
     /// 水平距离）。必须在 Start 前调用；未注入时交接判据不评估（保持 S5 影子行为，
@@ -140,6 +146,9 @@ public:
     /// GroundStationLink 发往地面站）。每次处理 65014（含重复 id 重发）
     /// 发布一条；未绑定时仍可订阅。
     virtual common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() = 0;
+    /// 围栏状态输出主题：common::FenceStatus（65019，供 GroundStationLink 回传；
+    /// 2026-10-29）。按 fence.status_period 周期发布，地面站据此绘制区域与越界。
+    virtual common::Topic<common::FenceStatus>& FenceStatusOutput() = 0;
 
     // ---- 状态查询 ----
     /// 当前任务状态（S0~S16，见 common::MissionState）。
@@ -169,7 +178,8 @@ public:
 /// S12 算力板位置返航 Home → S13 AUTO.LAND → S14 DISARMED；正常返航不使用
 /// PX4 自动 RTL。执行器 ACK 超时/非 ACCEPTED/PX4 断连/入队超时 → S16
 /// FAILSAFE（bit4 告警、取消待发命令、停发意图，不重试/不补发复位）。
-class MissionStateMachine final : public IMissionStateMachine {
+class MissionStateMachine final : public IMissionStateMachine,
+                                  public common::IFencePolygonSource {
 public:
     explicit MissionStateMachine(MissionStateMachineConfig config = {});
     ~MissionStateMachine() override;
@@ -193,10 +203,15 @@ public:
         common::Topic<common::MissionAssignment>& assignment) override;
     void SetEstimationDiagnostics(
         const perception::ITargetEstimator* estimator) override;
+    void SetFenceInput(common::Topic<common::FenceZone>& zone) override;
+
+    /// 围栏多边形只读快照（供 FlightController 钳制位置意图；线程安全）。
+    common::FencePolygonNed LatestFencePolygon() const override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
     common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
+    common::Topic<common::FenceStatus>& FenceStatusOutput() override;
 
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
@@ -246,10 +261,12 @@ public:
         common::Topic<common::MissionAssignment>& assignment) override;
     void SetEstimationDiagnostics(
         const perception::ITargetEstimator* estimator) override;
+    void SetFenceInput(common::Topic<common::FenceZone>& zone) override;
 
     common::Topic<common::ControlIntent>& IntentOutput() override;
     common::Topic<common::MissionStatus>& StatusOutput() override;
     common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
+    common::Topic<common::FenceStatus>& FenceStatusOutput() override;
 
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
@@ -262,6 +279,7 @@ private:
     uint64_t error_count_ = 0;
     common::Topic<common::ControlIntent> intent_output_;
     common::Topic<common::MissionStatus> status_output_;
+    common::Topic<common::FenceStatus> fence_status_output_;
     common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
 };
 

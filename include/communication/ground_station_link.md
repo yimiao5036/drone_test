@@ -98,6 +98,17 @@ Px4Link::StateOutput()
 - 同时支持响应地面站发起的广播或定向TIMESYNC请求，响应target回填`255/190`。
 - `Start()`前必须绑定飞行状态Topic；`Start/Stop`幂等，停止后可以重新启动。
 
+## 多边形围栏编解码（2026-10-29 增）
+
+| 方向 | 类型 | 处理 |
+|---|---|---|
+| 下行 | 65018 `ZONE_DEFINE` | `HandleFenceZone()`：60B payload、尾部 marker=1、地址双字段（本机）三重校验通过后发布 `FenceZone`；顶点以参考点 + cm 偏移表示，链路层反算成 `latitude_deg/longitude_deg`（`kDegToRad`），`valid_for_ms=0` 表示持久快照 |
+| 上行 | 65019 `ZONE_STATE` | `SetFenceStatusInput()` + 工作线程每拍 `DrainFenceStatuses()`（只留最新一条）→ `SendFenceStatus()` 编码后定向发 255/190；局部位置用 mm（`DistanceMillimeters`，负值与 NaN→INT32_MIN 不崩） |
+
+版本策略：65014 保持 **v1**、65013 保持 **v2**。围栏字段写在保留区
+（65014 offset 15/17，65013 offset 28/30/50），老地面站忽略即兼容；`kFenceMaxVertices=8`
+（顶点区 21~53，marker 在 54）。帧长/字段非法一律丢弃并计数，不发布半成品。
+
 ## 日志行为
 
 - INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果；任务分配在第1条及每100条打印65014接收/发布和65015发送结果。
@@ -106,6 +117,8 @@ Px4Link::StateOutput()
 - 不逐条记录遥测消息，不在高频发送路径打印成功日志。
 
 ## 测试方式
+
+围栏往返编解码在 `ground_station_link_test` 覆盖（构造 65018/65019 payload → 分派 → 字段一致）。
 
 Ubuntu 24.04开发机：
 

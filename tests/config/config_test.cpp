@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include "config/config.h"
+#include "config/zone_store.h"
 
 namespace {
 
@@ -1100,6 +1101,129 @@ TEST(ConfigTest, TakeoffHoldMaxDefaultsWhenAbsent) {
 TEST(ConfigTest, NoLocalTakeoffBatteryPercent) {
     json value = ReadSourceConfig();
     EXPECT_FALSE(value["takeoff"].contains("min_battery_percent"));
+}
+
+// ---- 围栏与区域缓存（2026-10-29）----
+
+TEST(ConfigTest, FenceDefaultsApplyWhenSectionMissing) {
+    json value = ReadSourceConfig();
+    value.erase("fence");
+    const auto path = WriteTemporaryConfig(value, "drone_config_fence_default.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 段缺席时围栏默认关闭（安全基线不变），缓存路径按可执行目录解析。
+    EXPECT_FALSE(config.fence.enabled);
+    EXPECT_EQ(config.fence.violation_debounce.count(), 1500);
+    EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 1.0);
+    EXPECT_DOUBLE_EQ(config.fence.boundary_warn_m, 10.0);
+    EXPECT_TRUE(config.fence.follow_zone_action);
+    EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kReturn);
+    EXPECT_EQ(config.fence.status_period.count(), 1000);
+    // 控制器围栏边距由 fence 节拷贝（控制器不自读 fence 节）。
+    EXPECT_DOUBLE_EQ(config.controller.fence_margin_m, 1.0);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, FenceSectionOverridesDefaults) {
+    json value = ReadSourceConfig();
+    value["fence"]["enabled"] = true;
+    value["fence"]["violation_debounce_ms"] = 800;
+    value["fence"]["boundary_margin_m"] = 2.5;
+    value["fence"]["boundary_warn_m"] = 15.0;
+    value["fence"]["violation_action"] = 2;  // land
+    const auto path = WriteTemporaryConfig(value, "drone_config_fence_override.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.fence.enabled);
+    EXPECT_EQ(config.fence.violation_debounce.count(), 800);
+    EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 2.5);
+    EXPECT_DOUBLE_EQ(config.controller.fence_margin_m, 2.5);
+    EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kLand);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, FenceWarnDistanceBelowMarginRejected) {
+    json value = ReadSourceConfig();
+    value["fence"]["boundary_margin_m"] = 5.0;
+    value["fence"]["boundary_warn_m"] = 2.0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_fence_warn.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ReturnHomeHeadingModeValidated) {
+    json value = ReadSourceConfig();
+    value["return_home"]["heading_mode"] = 2;
+    const auto path = WriteTemporaryConfig(value, "drone_config_heading_mode.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ReturnHomeHeadingDefaultsToVelocityDirection) {
+    json value = ReadSourceConfig();
+    value["return_home"].erase("heading_mode");
+    const auto path = WriteTemporaryConfig(value, "drone_config_heading_default.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.return_home.heading_mode, 1U);
+    EXPECT_DOUBLE_EQ(config.return_home.heading_rate_limit_dps, 30.0);
+    EXPECT_DOUBLE_EQ(config.return_home.heading_accel_limit_dps2, 60.0);
+    std::filesystem::remove(path);
+}
+
+TEST(ZoneStoreTest, SaveThenLoadRoundTrips) {
+    const auto path =
+        std::filesystem::temp_directory_path() / "drone_zone_roundtrip.json";
+    std::filesystem::remove(path);
+
+    drone::common::FenceZone zone;
+    zone.protocol_version = 1;
+    zone.zone_id = 7;
+    zone.version = 3;
+    zone.type = drone::common::FenceZoneType::kPolygon;
+    zone.action = drone::common::FenceAction::kReturn;
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 100.0;
+    zone.vertices = {{28.8605, 105.4958},
+                     {28.8605, 105.4962},
+                     {28.8601, 105.4962},
+                     {28.8601, 105.4958}};
+    ASSERT_TRUE(drone::config::ZoneStore::Save(path.string(), zone));
+
+    const auto loaded = drone::config::ZoneStore::Load(path.string());
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->zone_id, 7U);
+    EXPECT_EQ(loaded->version, 3U);
+    EXPECT_EQ(loaded->action, drone::common::FenceAction::kReturn);
+    EXPECT_EQ(loaded->altitude_reference, 1U);
+    EXPECT_DOUBLE_EQ(loaded->alt_max_m, 100.0);
+    ASSERT_EQ(loaded->vertices.size(), 4U);
+    EXPECT_NEAR(loaded->vertices[0].latitude_deg, 28.8605, 1e-9);
+    EXPECT_NEAR(loaded->vertices[2].longitude_deg, 105.4962, 1e-9);
+    std::filesystem::remove(path);
+}
+
+TEST(ZoneStoreTest, MissingFileIsSilentNullopt) {
+    const auto path =
+        std::filesystem::temp_directory_path() / "drone_zone_absent.json";
+    std::filesystem::remove(path);
+    EXPECT_FALSE(drone::config::ZoneStore::Load(path.string()).has_value());
+}
+
+TEST(ZoneStoreTest, InvalidContentRejected) {
+    const auto path =
+        std::filesystem::temp_directory_path() / "drone_zone_invalid.json";
+    {
+        std::ofstream output(path);
+        output << R"({"schema":1,"zone_id":0,"version":1,"vertices":[]})";
+    }
+    EXPECT_FALSE(drone::config::ZoneStore::Load(path.string()).has_value());
+    {
+        std::ofstream output(path);
+        output << "not json";
+    }
+    EXPECT_FALSE(drone::config::ZoneStore::Load(path.string()).has_value());
+    std::filesystem::remove(path);
 }
 
 }  // namespace

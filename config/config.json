@@ -175,6 +175,16 @@
         "target_hold_max_ms": 60000,
         "battery_low_debounce_ms": 1000
     },
+    "fence": {
+        "enabled": false,
+        "zone_cache_path": "config/zone.json",
+        "violation_debounce_ms": 1500,
+        "boundary_margin_m": 1.0,
+        "boundary_warn_m": 10.0,
+        "follow_zone_action": true,
+        "violation_action": 1,
+        "status_period_ms": 1000
+    },
     "visual_monitor": {
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,

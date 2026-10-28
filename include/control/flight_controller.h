@@ -54,6 +54,11 @@ public:
     /// 须在 Start() 前调用（Start 后周期线程即开始消费订阅）。
     virtual void SetInput(common::Topic<common::ControlIntent>& intent) = 0;
 
+    /// 注入围栏多边形只读来源（MissionStateMachine 实现，2026-10-29）。
+    /// 注入后位置式意图按多边形钳制（含内缩余量）；未注入或区域无效
+    /// （顶点 < 3）时回退 Home 圆形围栏（max_radius_m/max_altitude_m）。
+    virtual void SetFencePolygonSource(const common::IFencePolygonSource* source) = 0;
+
     // ---- 输出 ----
     /// PX4 设定值输出主题：common::Px4Setpoint（供 IPx4Link 消费）。
     virtual common::Topic<common::Px4Setpoint>& SetpointOutput() = 0;
@@ -79,6 +84,8 @@ public:
     bool IsRunning() const override;
 
     void SetInput(common::Topic<common::ControlIntent>& intent) override;
+
+    void SetFencePolygonSource(const common::IFencePolygonSource* source) override;
 
     common::Topic<common::Px4Setpoint>& SetpointOutput() override;
 
@@ -141,6 +148,8 @@ public:
     bool IsRunning() const override;
 
     void SetInput(common::Topic<common::ControlIntent>& intent) override;
+
+    void SetFencePolygonSource(const common::IFencePolygonSource* source) override;
 
     common::Topic<common::Px4Setpoint>& SetpointOutput() override;
 

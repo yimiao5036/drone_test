@@ -151,6 +151,9 @@ constexpr uint16_t kStatusShortFramePayloadLength = 55;
 constexpr uint16_t kStatusShortFrameLength =
     kV2ExtensionFixedHeaderLength + kStatusShortFramePayloadLength;
 constexpr uint8_t kFrameLengthMarker = 1;
+// 65018 顶点相对参考点用 int16 厘米偏移（±327m，1cm 精度），每顶点 4 字节。
+// 纬度 1 度 ≈ 111320m；经度按参考纬度做 cos 缩放（场地尺度误差可忽略）。
+constexpr double kDegToRad = 0.017453292519943295;
 /// 65016 指令在机载队列中的最长有效期：超过该时长仍未处理即按“指令过期”拒绝，
 /// 避免串口积压后补发一次过期发射。
 constexpr uint32_t kNetFireCommandValidForMs = 2000;
@@ -336,6 +339,10 @@ public:
                     8,
                     common::Topic<common::NetFireAck>::OverflowPolicy::kDropOldest);
             }
+            if (fence_status_topic_ != nullptr) {
+                fence_status_subscription_ = fence_status_topic_->Subscribe(
+                    2, common::Topic<common::FenceStatus>::OverflowPolicy::kDropOldest);
+            }
             latest_state_.reset();
             latest_health_.reset();
             latest_mission_status_.reset();
@@ -352,6 +359,7 @@ public:
             flight_state_subscription_.Reset();
             mission_assignment_ack_subscription_.Reset();
             net_fire_ack_subscription_.Reset();
+            fence_status_subscription_.Reset();
             serial_.Close();
             RecordError((std::string("地面站通信启动失败: ") + error.what()).c_str());
             return false;
@@ -375,6 +383,7 @@ public:
         health_subscription_.Reset();
         mission_assignment_ack_subscription_.Reset();
         net_fire_ack_subscription_.Reset();
+        fence_status_subscription_.Reset();
         latest_state_.reset();
         latest_health_.reset();
         latest_mission_status_.reset();
@@ -428,6 +437,20 @@ public:
         net_fire_consumer_present_ = present;
     }
 
+    common::Topic<common::FenceZone>& FenceZoneOutput() {
+        return fence_zone_output_;
+    }
+
+    // 绑定 65019 围栏状态回传输入。必须在 Start 前调用，运行中不允许改绑。
+    void SetFenceStatusInput(common::Topic<common::FenceStatus>& topic) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("地面站 FenceStatus Topic 必须在 Start 前绑定");
+            return;
+        }
+        fence_status_topic_ = &topic;
+    }
+
     // 绑定飞行状态输入。必须在 Start 前调用，运行中不允许改绑。
     void SetFlightStateInput(common::Topic<common::FlightStateSnapshot>& topic) {
         std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -472,6 +495,7 @@ private:
     using AssignmentAckSubscription =
         common::Topic<common::MissionAssignmentAck>::Subscription;
     using NetFireAckSubscription = common::Topic<common::NetFireAck>::Subscription;
+    using FenceStatusSubscription = common::Topic<common::FenceStatus>::Subscription;
 
     struct Deadlines {
         std::chrono::steady_clock::time_point heartbeat;
@@ -513,6 +537,7 @@ private:
             DrainStatusInputs();
             DrainMissionAssignmentAcks();
             DrainNetFireAcks();
+            DrainFenceStatuses();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
             CheckTimeSyncTimeout(current_ms);
@@ -633,7 +658,11 @@ private:
                                next.assignment_id != latest_mission_status_->assignment_id ||
                                next.target_id != latest_mission_status_->target_id ||
                                next.availability != latest_mission_status_->availability ||
-                               next.interceptor_type != latest_mission_status_->interceptor_type;
+                               next.interceptor_type != latest_mission_status_->interceptor_type ||
+                               // v3 围栏字段变化同样立即下行（地面站据此更新图层与告警）。
+                               next.zone_id != latest_mission_status_->zone_id ||
+                               next.zone_version != latest_mission_status_->zone_version ||
+                               next.fence_state != latest_mission_status_->fence_state;
             latest_mission_status_ = next;
             if (event) {
                 (void)SendMissionStatus(next);
@@ -652,6 +681,13 @@ private:
     void DrainNetFireAcks() {
         while (auto message = net_fire_ack_subscription_.TryTake()) {
             (void)SendNetFireAck(**message);
+        }
+    }
+
+    // 消费 65019 围栏状态输入：只保留最新一条（状态是周期性快照，不是事件）。
+    void DrainFenceStatuses() {
+        while (auto message = fence_status_subscription_.TryTake()) {
+            (void)SendFenceStatus(**message);
         }
     }
 
@@ -761,6 +797,10 @@ private:
             HandleNetFireCommand(message, extension);
             return;
         }
+        if (extension.message_type == kFenceZoneMessageType) {
+            HandleFenceZone(message, extension);
+            return;
+        }
         if (extension.message_type != kTrackTargetUpdateMessageType) {
             return;
         }
@@ -778,6 +818,10 @@ private:
         uint8_t target_system = 0;
         uint8_t target_component = 0;
         uint8_t frame_length_marker = 0;
+        // 65014 v3（2026-10-29）：保留区 15~18 携带围栏区域标识，用于起飞前
+        // 一致性预检（与服务端下发区域/机载缓存不一致时回 zone_mismatch）。
+        uint16_t zone_id = 0;
+        uint16_t zone_version = 0;
     };
 
     // 处理 MISSION_ASSIGN(65014)：来源已在 HandleV2Extension 过滤；这里只做帧长与
@@ -845,6 +889,9 @@ private:
         assignment.flags = payload.flags;
         assignment.valid_for_ms = payload.valid_for_ms;
         assignment.received_ms = receive_time_ms;
+        // 65014 v3：围栏区域标识（v1/v2 发送方为 0，启用围栏时被状态机判不一致）。
+        assignment.zone_id = payload.zone_id;
+        assignment.zone_version = payload.zone_version;
         (void)mission_assignment_output_.Publish(
             std::make_shared<const common::MissionAssignment>(assignment));
         const uint64_t publish_count = ++mission_assign_publish_count_;
@@ -869,6 +916,10 @@ private:
         payload.target_system = ReadLe<uint8_t>(data, 50);
         payload.target_component = ReadLe<uint8_t>(data, 51);
         payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
+        // 65014 v3 围栏区域标识（保留区 15~18；v1/v2 发送方为零 → 与任意区域
+        // 都不一致，启用围栏时由状态机回 zone_mismatch，属预期行为）。
+        payload.zone_id = ReadLe<uint16_t>(data, 15);
+        payload.zone_version = ReadLe<uint16_t>(data, 17);
         return payload;
     }
 
@@ -971,6 +1022,146 @@ private:
         payload.flags = ReadLe<uint8_t>(data, 5);
         payload.target_system = ReadLe<uint8_t>(data, 50);
         payload.target_component = ReadLe<uint8_t>(data, 51);
+        payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
+        return payload;
+    }
+
+
+    // 65018 围栏区域 payload 的链路层镜像（小端，协议有效 55 字节）。
+    // 顶点用相对参考点的 int16 厘米偏移编码（每顶点 4B），首顶点之外全部相对
+    // 同一个参考点（参考点=首顶点，精度 1cm、范围 ±327m，足够现场场地）。
+    struct FenceZonePayload {
+        uint8_t protocol_version = 0;
+        uint16_t zone_id = 0;
+        uint16_t version = 0;
+        uint8_t type = 0;
+        uint8_t action = 0;
+        uint8_t altitude_reference = 0;
+        int16_t alt_min_dm = 0;   ///< 0.1m 分辨率
+        int16_t alt_max_dm = 0;   ///< 0=未限制
+        uint8_t vertex_count = 0;
+        int32_t ref_lat_1e7 = 0;
+        int32_t ref_lon_1e7 = 0;
+        uint8_t frame_length_marker = 0;
+    };
+
+    // 处理 ZONE_DEFINE(65018)：来源已在 HandleV2Extension 过滤；地址双字段必须
+    // 同时匹配本机（区域是共享快照，但广播帧不得让任意飞机改变自己的执行边界）。
+    // 区域语义（顶点数/高度带/动作）留给状态机校验，链路层只做长度与地址校验。
+    void HandleFenceZone(const mavlink_message_t& message,
+                         const mavlink_v2_extension_t& extension) {
+        const uint64_t receive_count = ++fence_receive_count_;
+        if (ShouldLogThrottled(receive_count)) {
+            SPDLOG_INFO("收到围栏区域: target={}/{} count={}",
+                        extension.target_system, extension.target_component,
+                        receive_count);
+        }
+        if (message.len < kStatusShortFrameLength) {
+            const uint64_t invalid_count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("围栏区域帧长不足: len={} required={} count={}",
+                            message.len, kStatusShortFrameLength, invalid_count);
+            }
+            return;
+        }
+        const FenceZonePayload payload = DecodeFenceZone(extension.payload);
+        if (extension.target_system != config_.aircraft_system_id ||
+            extension.target_component != config_.aircraft_component_id) {
+            const uint64_t mismatch_count = ++fence_address_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN(
+                    "围栏区域地址不匹配: header={}/{} local={}/{} count={}",
+                    extension.target_system, extension.target_component,
+                    config_.aircraft_system_id, config_.aircraft_component_id,
+                    mismatch_count);
+            }
+            return;
+        }
+        if (payload.frame_length_marker != kFrameLengthMarker) {
+            const uint64_t invalid_count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("围栏区域帧长度标记非法: marker={} count={}",
+                            payload.frame_length_marker, invalid_count);
+            }
+            return;
+        }
+        if (payload.vertex_count < 3U || payload.vertex_count > kFenceMaxVertices ||
+            payload.type != 0U) {
+            const uint64_t invalid_count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN(
+                    "围栏区域字段非法: type={} 顶点={}（支持 3~{}）count={}",
+                    payload.type, payload.vertex_count, kFenceMaxVertices,
+                    invalid_count);
+            }
+            return;
+        }
+
+        const uint64_t receive_time_ms = MonotonicMs();
+        common::FenceZone zone;
+        zone.header.sequence = receive_count;
+        // 65018 不携带地面站生成时刻，source_time_ms 保持 0。
+        zone.header.receive_time_ms = receive_time_ms;
+        zone.header.valid_for_ms = 0;  // 区域是持久快照，不按时效失效
+        zone.header.source_id = config_.ground_system_id;
+        zone.header.health = 1;
+        zone.header.frame_id = 0;
+        zone.protocol_version = payload.protocol_version;
+        zone.zone_id = payload.zone_id;
+        zone.version = payload.version;
+        zone.type = common::FenceZoneType::kPolygon;
+        zone.action = payload.action == 0U
+                          ? common::FenceAction::kHold
+                          : (payload.action == 2U ? common::FenceAction::kLand
+                                                  : common::FenceAction::kReturn);
+        zone.altitude_reference = payload.altitude_reference;
+        zone.alt_min_m = static_cast<double>(payload.alt_min_dm) * 0.1;
+        zone.alt_max_m = static_cast<double>(payload.alt_max_dm) * 0.1;
+        const double ref_lat = static_cast<double>(payload.ref_lat_1e7) * 1e-7;
+        const double ref_lon = static_cast<double>(payload.ref_lon_1e7) * 1e-7;
+        zone.vertices.reserve(payload.vertex_count);
+        for (uint8_t index = 0; index < payload.vertex_count; ++index) {
+            const int16_t north_cm =
+                ReadLe<int16_t>(extension.payload, 21U + index * 4U);
+            const int16_t east_cm =
+                ReadLe<int16_t>(extension.payload, 23U + index * 4U);
+            // 顶点 = 参考点 + 相对偏移（NED 近似：1cm 偏移对场地的经纬度换算误差
+            // 远小于 GPS 精度，且参考点经纬度由地面站给出，不做反向投影）。
+            common::FenceVertex vertex;
+            vertex.latitude_deg = ref_lat + static_cast<double>(north_cm) * 1e-2 / 111320.0;
+            vertex.longitude_deg =
+                ref_lon +
+                static_cast<double>(east_cm) * 1e-2 /
+                    (111320.0 * std::max(0.1, std::cos(ref_lat * kDegToRad)));
+            zone.vertices.push_back(vertex);
+        }
+        zone.received_ms = receive_time_ms;
+        (void)fence_zone_output_.Publish(
+            std::make_shared<const common::FenceZone>(zone));
+        const uint64_t publish_count = ++fence_publish_count_;
+        if (ShouldLogThrottled(publish_count)) {
+            SPDLOG_INFO(
+                "围栏区域已发布: version={} zone={}/{} 顶点={} 动作={} count={}",
+                zone.protocol_version, zone.zone_id, zone.version,
+                zone.vertices.size(), static_cast<int>(zone.action),
+                publish_count);
+        }
+    }
+
+    // 逐字段小端解码 65018 payload；调用方已保证帧长不少于 60 字节。
+    FenceZonePayload DecodeFenceZone(const uint8_t* data) const {
+        FenceZonePayload payload;
+        payload.protocol_version = ReadLe<uint8_t>(data, 0);
+        payload.zone_id = ReadLe<uint16_t>(data, 1);
+        payload.version = ReadLe<uint16_t>(data, 3);
+        payload.type = ReadLe<uint8_t>(data, 5);
+        payload.action = ReadLe<uint8_t>(data, 6);
+        payload.altitude_reference = ReadLe<uint8_t>(data, 7);
+        payload.alt_min_dm = ReadLe<int16_t>(data, 8);
+        payload.alt_max_dm = ReadLe<int16_t>(data, 10);
+        payload.vertex_count = ReadLe<uint8_t>(data, 12);
+        payload.ref_lat_1e7 = ReadLe<int32_t>(data, 13);
+        payload.ref_lon_1e7 = ReadLe<int32_t>(data, 17);
         payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
         return payload;
     }
@@ -1369,9 +1560,49 @@ private:
         WriteLe<uint32_t>(payload, 44, mission.target_id);
         WriteLe<uint8_t>(payload, 48, static_cast<uint8_t>(mission.availability));
         WriteLe<uint8_t>(payload, 49, mission.interceptor_type);
+        // 65013 v3（2026-10-29）：围栏区域与状态。offset 28~31 / 50 均为原保留区，
+        // 0~27 与 v1、40~49 与 v2 完全一致（v1/v2 对端读不到新字段即视为无区域）。
+        WriteLe<uint16_t>(payload, 28, mission.zone_id);
+        WriteLe<uint16_t>(payload, 30, mission.zone_version);
+        WriteLe<uint8_t>(payload, 50, mission.fence_state);
         // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
         WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
         return SendStatusExtension(kMissionStatusMessageType, payload);
+    }
+
+    // 发送 65019 围栏状态：以本机身份发往 255/190。状态是周期快照，地面站据此
+    // 绘制区域与越界告警；区域本身由地面站下发，机载只回报判定结果。
+    bool SendFenceStatus(const common::FenceStatus& status) {
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, kFenceZoneProtocolVersion);
+        WriteLe<uint16_t>(payload, 1, status.zone_id);
+        WriteLe<uint16_t>(payload, 3, status.version);
+        WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(status.state));
+        WriteLe<int32_t>(payload, 6, DistanceMillimeters(
+                                        static_cast<float>(status.distance_to_boundary_m)));
+        WriteLe<uint32_t>(payload, 10, status.violation_duration_ms);
+        // 局部位置用 mm 编码（与前端距离字段同一换算，NaN→INT32_MIN 表示无效）。
+        WriteLe<int32_t>(payload, 14,
+                         DistanceMillimeters(static_cast<float>(status.local_north_m)));
+        WriteLe<int32_t>(payload, 18,
+                         DistanceMillimeters(static_cast<float>(status.local_east_m)));
+        WriteLe<int32_t>(payload, 22,
+                         DistanceMillimeters(static_cast<float>(status.local_down_m)));
+        WriteLe<uint8_t>(payload, 26, status.action_pending ? 1 : 0);
+        WriteLe<uint8_t>(payload, 50, config_.aircraft_system_id);
+        WriteLe<uint8_t>(payload, 51, config_.aircraft_component_id);
+        // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
+        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
+        const bool sent = SendStatusExtension(kFenceStatusMessageType, payload);
+        const uint64_t count = ++fence_status_send_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO(
+                "围栏状态发送{}: zone={}/{} state={} 距边界={:.2f}m 越界={}ms count={}",
+                sent ? "成功" : "失败", status.zone_id, status.version,
+                static_cast<int>(status.state), status.distance_to_boundary_m,
+                status.violation_duration_ms, count);
+        }
+        return sent;
     }
 
     // 地面站心跳超时：超过配置时长则置离线并清空时间同步（同步依赖在线心跳）。
@@ -1872,17 +2103,20 @@ private:
     common::Topic<common::HealthStatus>* health_topic_ = nullptr;
     common::Topic<common::MissionAssignmentAck>* mission_assignment_ack_topic_ = nullptr;
     common::Topic<common::NetFireAck>* net_fire_ack_topic_ = nullptr;
+    common::Topic<common::FenceStatus>* fence_status_topic_ = nullptr;
     FlightSubscription flight_state_subscription_;
     HealthSubscription health_subscription_;
     MissionSubscription mission_status_subscription_;
     AssignmentAckSubscription mission_assignment_ack_subscription_;
     NetFireAckSubscription net_fire_ack_subscription_;
+    FenceStatusSubscription fence_status_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     std::optional<common::HealthStatus> latest_health_;
     std::optional<common::MissionStatus> latest_mission_status_;
     common::Topic<common::GroundStationTarget> target_output_;
     common::Topic<common::MissionAssignment> mission_assignment_output_;
     common::Topic<common::NetFireCommand> net_fire_command_output_;
+    common::Topic<common::FenceZone> fence_zone_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;
     uint64_t target_v2_extension_count_ = 0;
@@ -1902,6 +2136,11 @@ private:
     uint64_t net_fire_ack_send_count_ = 0;
     uint64_t net_fire_unconsumed_count_ = 0;
     bool net_fire_consumer_present_ = false;
+    uint64_t fence_receive_count_ = 0;
+    uint64_t fence_address_mismatch_count_ = 0;
+    uint64_t fence_invalid_count_ = 0;
+    uint64_t fence_publish_count_ = 0;
+    uint64_t fence_status_send_count_ = 0;
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 
@@ -1956,6 +2195,13 @@ void GroundStationLink::SetNetFireAckInput(
 void GroundStationLink::SetNetFireConsumerPresent(bool present) {
     impl_->SetNetFireConsumerPresent(present);
 }
+common::Topic<common::FenceZone>& GroundStationLink::FenceZoneOutput() {
+    return impl_->FenceZoneOutput();
+}
+void GroundStationLink::SetFenceStatusInput(
+    common::Topic<common::FenceStatus>& topic) {
+    impl_->SetFenceStatusInput(topic);
+}
 void GroundStationLink::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>& topic) {
     impl_->SetFlightStateInput(topic);
@@ -2008,6 +2254,11 @@ GroundStationLinkStub::NetFireCommandOutput() {
     return net_fire_command_output_;
 }
 void GroundStationLinkStub::SetNetFireAckInput(common::Topic<common::NetFireAck>&) {}
+common::Topic<common::FenceZone>& GroundStationLinkStub::FenceZoneOutput() {
+    return fence_zone_output_;
+}
+void GroundStationLinkStub::SetFenceStatusInput(
+    common::Topic<common::FenceStatus>&) {}
 void GroundStationLinkStub::SetFlightStateInput(
     common::Topic<common::FlightStateSnapshot>&) {}
 void GroundStationLinkStub::SetMissionStatusInput(

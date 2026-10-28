@@ -81,6 +81,9 @@ struct FlightControllerConfig {
     /// 模式/解锁超时是权威，本值须覆盖 bootstrap_lead + mode + arm；
     /// 装配时由 DroneApplication 从 takeoff.bootstrap_timeout 注入。
     std::chrono::milliseconds bootstrap_timeout{6000};
+    /// 多边形围栏钳制内缩余量（由 fence.boundary_margin_m 拷贝到此处，
+    /// 控制器不自读 fence 节；2026-10-29 多边形围栏）。
+    double fence_margin_m = 1.0;
     void Validate() const;
 };
 
@@ -167,6 +170,36 @@ struct ReturnHomeConfig {
     std::chrono::milliseconds fire_timeout{3000};
     /// AUTO.LAND / DISARM 命令重试间隔。
     std::chrono::milliseconds command_retry{1000};
+    /// 返航机头模式（2026-10-29）：0=不指定航向（保持原机头平移）；
+    /// 1=机头朝飞行方向（前视避障传感器需要，维护者 2026-10-29 确认）。
+    uint8_t heading_mode = 1;
+    /// 机头朝飞行方向时的偏航角速度/角加速度上限（与视觉跟踪同量级）。
+    double heading_rate_limit_dps = 30.0;
+    double heading_accel_limit_dps2 = 60.0;
+    void Validate() const;
+};
+
+/// 多边形围栏（fence 节，2026-10-29）。
+/// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
+/// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
+/// 默认关闭：关闭时完全回退旧的 Home 圆形围栏
+/// （`controller.max_radius_m` / `controller.max_altitude_m`）。
+struct FenceConfig {
+    bool enabled = false;
+    /// 区域缓存路径（相对可执行文件目录）；缺失/非法按 kNoZone 处理（不中止）。
+    std::string zone_cache_path = "config/zone.json";
+    /// 越界判定防抖：连续处于区域外达该时长才判定越界并执行动作。
+    std::chrono::milliseconds violation_debounce{1500};
+    /// 位置意图钳制内缩余量：钳制落点距边界至少这么多米（>0）。
+    double boundary_margin_m = 1.0;
+    /// 接近边界告警距离（m）：区域内但距边界小于该值报 kNearBoundary。
+    double boundary_warn_m = 10.0;
+    /// 越界动作：follow_zone_action=true 时以 65018 下发的动作为准，
+    /// 否则固定使用本字段。
+    bool follow_zone_action = true;
+    common::FenceAction violation_action = common::FenceAction::kReturn;
+    /// 围栏状态回传（65019）周期。
+    std::chrono::milliseconds status_period{1000};
     void Validate() const;
 };
 
@@ -224,6 +257,7 @@ struct AppConfig {
     InterceptionConfig interception;    ///< S9/S10 入口判据与授权（2026-10-19）
     ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
+    FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

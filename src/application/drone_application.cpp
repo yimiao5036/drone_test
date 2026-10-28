@@ -282,6 +282,20 @@ void DroneApplication::BindTopics() {
             mission_state_machine_->StatusOutput());
     }
 
+    // 多边形围栏（2026-10-29）：65018 区域 → 状态机（机载自治执行）；状态机
+    // 65019 状态 → 地面站链路；状态机同时作为 FlightController 的只读多边形源
+    // （位置意图钳制）。区域缓存 config/zone.json 由状态机启动时装载。
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_->SetFenceInput(
+            ground_station_link_->FenceZoneOutput());
+        ground_station_link_->SetFenceStatusInput(
+            mission_state_machine_->FenceStatusOutput());
+        if (flight_controller_ != nullptr) {
+            flight_controller_->SetFencePolygonSource(
+                mission_state_machine_.get());
+        }
+    }
+
     // 多机任务分配：65014 解析结果 → 状态机；65015 回执 → 地面站链路。
     // 分配输入/回执不依赖 enable_control：无控制装配时状态机仍接收 65014，
     // 预检回 control_disabled，地面站可据此获知不可调度。
