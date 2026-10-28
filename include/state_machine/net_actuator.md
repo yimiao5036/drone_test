@@ -104,13 +104,19 @@ class INetActuator {
   设置该输出通道的 PWM 映射区间（MAIN 输出为 `PWM_MAIN_MINn/MAXn`，AUX 输出为
   `PWM_AUX_MINn/MAXn`，标准 1000/2000µs）；舵机行程与发射方向由该映射和机构
   安装决定（2026-10-23 确认：发射方向与机头一致）；
-- **当前装机（2026-10-21 确认）**：捕网接 **MAIN5**，Output Function =
-  `Peripheral via Actuator Set 1`，PWM 已配置；因此机载 `net_channel=1`。
+- **当前装机（2026-10-21 确认，2026-10-28 实测校准）**：捕网接 **MAIN5**，
+  Output Function = `Peripheral via Actuator Set 1`，PWM 映射区间
+  **`PWM_MAIN_MIN5=1000` / `PWM_MAIN_MAX5=2000`µs**、`PWM_MAIN_DIS5=1500`、
+  `Rev Range=off`；因此机载 `net_channel=1`。
   **注意 `net_channel` 是 Actuator Set 编号，不是物理通道号 5**；
 - **机载**：只配置 `actuator.net_channel`（Actuator Set N）与归一化量；
   `MAV_CMD_DO_SET_ACTUATOR` 的 p1..p6 只有对应 Set 位填值，其余 NaN，p7=0；
-- 单发捕网：`-0.7` → 1150µs（发射），`0.0` → 1500µs（待机，按 1000/2000µs
-  标准映射计算；实际行程以 QGC 中 MAIN5 的 `PWM_MAIN_MIN5/MAX5` 为准）；
+- 单发捕网：`-0.7` → 1150µs（发射），`0.0` → 1500µs（待机）——按 1000/2000µs
+  标准映射计算，**2026-10-28 拆桨台架实测即此值**（`1500→1150（保持1.5s）→1500`，
+  舵机到位）。映射公式 `PWM = MIN + (v+1)/2 × (MAX−MIN)`：`v=0` 必落在量程中点，
+  而机载复位量就是 `0.0`，所以**中点必须等于待机位 1500**，即 MIN/MAX 必须关于
+  1500 对称（1000/2000）；填成非对称值（如误配 `Minimum=1500/Maximum=1150`）时
+  待机会落到中点 1325、触发只到 1448，机构不动（见 `docs/故障排查手册.md` §17.8）；
 - 机载不再保存 PWM 微秒/输出区间，避免与 PX4 参数重复维护。
 
 ## 6. 日志与排查

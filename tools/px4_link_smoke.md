@@ -451,9 +451,10 @@ echo "退出码=$?"
   按电机编号死记。每向只有 600ms，可录慢动作或看 QGC 波形；需要更长
   观察时间时先把 `COM_DISARM_PRFLT` 调到 ≥30s。**不要装桨。**
 - G4-3：捕网执行器行程/方向。本模式**不自动触发** `DO_SET_ACTUATOR`：
-  PX4 侧对应关系已确认（2026-10-21：MAIN5 = `Peripheral via Actuator Set 1`，
-  `PWM_MAIN_MIN5/MAX5` 已配；机载 `net_channel=1`，只发归一化 -0.7/0.0），
-  但机构行程/方向未验证，仍不得自动触发；按 G4-3 单独验证；
+  PX4 侧对应关系已确认（2026-10-21：MAIN5 = `Peripheral via Actuator Set 1`；
+  2026-10-28 实测校准 `PWM_MAIN_MIN5=1000`/`PWM_MAIN_MAX5=2000`/`DIS5=1500`、
+  `Rev Range=off`，`0.0→1500µs`、`-0.7→1150µs`；机载 `net_channel=1`，只发
+  归一化 -0.7/0.0），机构行程/方向已于 2026-10-28 台架实测到位，仍不得自动触发；
 - G4-4：本模式自动验证“停 setpoint”分支；拔串口分支已在 2026-10-21 由
   现场手动执行，工具检测断链后完成机载侧处置。PX4 的
   `COM_OF_LOSS_T`/`COM_OBL_RC_ACT` 与最终模式/上锁属于飞控自身配置，
