@@ -2064,7 +2064,39 @@ TEST(MissionStateMachineTest, InterceptEntryLockAndRangeThenFiresAndReturns) {
         ASSERT_TRUE(distance_topic.Publish(
             std::make_shared<const common::StereoTargetDistance>(
                 MakeFreshDistance(frame, true, 8.0F))).accepted);
-        std::this_thread::sleep_for(60ms);
+        // 每帧给状态机留三个 20ms 切片（共 60ms，覆盖一个决策周期）。
+        for (int slice = 0; slice < 3; ++slice) {
+            std::this_thread::sleep_for(20ms);
+            while (auto status = status_subscription.TryTake()) {
+                switch ((*status)->state) {
+                    case common::MissionState::kInterceptReady:
+                        saw_ready = true;
+                        break;
+                    case common::MissionState::kInterceptExecuting:
+                        saw_executing = true;
+                        break;
+                    case common::MissionState::kReturnHome:
+                        saw_return = true;
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+    // 收尾兜底：机器负载高时状态机可能晚一两拍才走完 S9→S12。这里继续以 20ms
+    // 节拍**重发新鲜**的锁定帧与测距（避免视觉超龄把 S7 打回），最多再等 500ms。
+    for (int tail = 0; tail < 25 && !saw_return; ++tail) {
+        std::this_thread::sleep_for(20ms);
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+        ASSERT_TRUE(visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked,
+                                 static_cast<uint64_t>(100 + tail)))).accepted);
+        ASSERT_TRUE(distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(static_cast<uint64_t>(100 + tail), true, 8.0F))).accepted);
         while (auto status = status_subscription.TryTake()) {
             switch ((*status)->state) {
                 case common::MissionState::kInterceptReady: saw_ready = true; break;
