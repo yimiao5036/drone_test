@@ -206,6 +206,9 @@ public:
         common::Topic<common::MissionAssignmentAck>& ack) override;
     common::Topic<common::NetFireCommand>& NetFireCommandOutput() override;
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
+    /// 标记 65016 是否存在消费者（GcsNetFire 是否装配）。只用于把“开关关闭导致指令
+    /// 无人处理”变成一条可自证的节流 WARN，不改变任何发射语义；必须在 Start 前调用。
+    void SetNetFireConsumerPresent(bool present);
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
@@ -242,9 +245,6 @@ public:
         common::Topic<common::MissionAssignmentAck>& ack) override;
     common::Topic<common::NetFireCommand>& NetFireCommandOutput() override;
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
-    /// 标记 65016 是否存在消费者（GcsNetFire 是否装配）。只用于把“开关关闭导致指令
-    /// 无人处理”变成一条可自证的节流 WARN，不改变任何发射语义；必须在 Start 前调用。
-    void SetNetFireConsumerPresent(bool present);
     void SetFlightStateInput(
         common::Topic<common::FlightStateSnapshot>& flight_state) override;
     void SetMissionStatusInput(
