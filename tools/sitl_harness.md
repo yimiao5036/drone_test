@@ -69,6 +69,12 @@ bash tools/sitl_harness.sh status
 bash tools/sitl_harness.sh stop
 ```
 
+> **场景之间必须 `stop` 并等待数秒**（2026-10-28 复现）：`smoke` 跑完会留下 SITL 进程与
+> 会话状态，紧接着再起下一段会带着上一段的初值起飞，表现为悬停窗口不达标
+> （相对高度 1.35m）、`[FAIL] 飞行未触发高度/漂移安全回收`，或视觉交接段 S7 启动后回退 S5
+> 导致 `[FAIL] S9/S10 进入`。这些是假失败，`stop` 后干净起始复跑即为 PASS；
+> 证据与判读见 `tools/sitl_evidence/g5_prep_20261028/README.md`。
+
 环境变量（可选）：`PX4_DIR`（默认 `$HOME/PX4-Autopilot`）、`REPO`（默认脚本上级
 目录）、`LOG_DIR`（默认 `/tmp/sitl_harness`）。
 
