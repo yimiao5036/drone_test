@@ -159,6 +159,8 @@ echo "退出码=$?"
 | 65020 主动返航专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-command` | S7 锁定后下发 65020 → 65021 `result=0`；不经 S9/S10；S12 位置设定值带 `USE_YAW` 且指向 Home；S12→S13→S14 | ✅ 2026-10-28（WSL2 全 PASS）：`command_id=1` → 65021 `result=0 reason=0 state=12`；返航航向样本 276 个（指向 Home）、迁移 8 次/错误 0；`65015 cancelled_by_gcs` 本场景按设计不发（无 65014 分配时 `PublishTakeoffAbortAck` 直接返回，该路径由单测覆盖）；证据 `tools/sitl_evidence/command_fence_20261028/` |
 | 65018 围栏专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 120 --sitl-stage4-fence` | 注入方形区域 → 65019 上报 `VIOLATED`；位置设定值被钳在区域半径内；S12→S13→S14 | ✅ 2026-10-28（WSL2 全 PASS）：区域 `zone=21/1` 半径 20m、注入时局部 N=22.31m，65019 `VIOLATED` 距边界 −3.88m 持续 901ms；最大设定值模长 18.98m ≤ 20m；迁移 8 次/错误 0；证据同上目录 |
 | 65014+65020 中止回执专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-command-assigned` | 预置「已接受分配」后下发 65020 → 65021 `result=0` **且 65015 `reason=12 cancelled_by_gcs` 必发**；S12→S13→S14；不经 S9/S10 | ✅ 2026-10-28（WSL2 全 PASS）：`command_id=1`，65021 接受=是、65015 cancelled=是，迁移 8 次/错误 0；证据 `tools/sitl_evidence/command_fence_20261028/stage4_command_assigned_20261028_pass.log` |
+| 65018 land 降落专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-land` | 注入 action=land 区域 → 65019 `VIOLATED` 后**直接进 S13**（不得经过 S12）→ S14 上锁 | ✅ 2026-10-28（WSL2 PASS）：首次越界 `距边界=-3.97m`，状态机 `7→13→14` 无 S12 停留，迁移 7 次/错误 0；证据 `tools/sitl_evidence/command_fence_20261028/stage4_fence_land_20261028_pass.log` |
+| 65018 高度带专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-altitude` | 水平距边界 76m（在区内）+ 相对高度 1.0m 低于下界 2m → 65019 `VIOLATED` → S12→S13→S14 | ✅ 2026-10-28（WSL2 PASS）：首次越界 `距边界=76.38m`、`高度=1.04m<2m`，爬升 5.02m 后顺利完成返航，迁移 8 次/错误 0；证据 `tools/sitl_evidence/command_fence_20261028/stage4_fence_altitude_20261028_pass.log` |
 | 65018 hold 保持专项（非门禁） | `./px4_link_smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-hold` | 注入 action=hold 区域 → 65019 `VIOLATED` 后**观察窗内不中止**、设定点停在区内且不追目标；随后 65020 收尾走 S12→S13→S14 | ✅ 2026-10-28（WSL2 全 PASS）：观察窗 2500ms 内 `state=7`，hold 区内设定点 38 帧、离目标最近 21.03m、最大设定值模长 18.97m；诊断偏差 6.88m（控制器按 margin 回拉，属正常）；证据同目录 |
 
 SITL 门禁运行环境（2026-10-14 建立）：本机 WSL2 Ubuntu 24.04（`~/PX4-Autopilot`
@@ -199,7 +201,7 @@ v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前�
 | G4-3 | 捕网 PWM 行程/方向与 ACK/保持时序（DO_SET_ACTUATOR 触发/复位） | 台架 | 机构到位、方向正确；PX4 侧通道/功能/映射已确认（2026-10-21：MAIN5 = `Peripheral via Actuator Set 1`，`PWM_MAIN_MIN5=1000` / `PWM_MAIN_MAX5=2000` / `PWM_MAIN_DIS5=1500`、`Rev Range=off`（2026-10-28 实测校准）；机载 `net_channel=1`，只发归一化 -0.7/0.0）；**时序**：187 触发 ACK accepted → 保持 `reset_delay`（**2026-10-23 冻结 1.5s**）→ 自动发复位行程 → 复位 ACK accepted → `reset_settle` 后回 Ready；ACK 超时/断连时执行器进入故障（日志 ERROR、状态机 S16/bit4、取消待发命令、不补发复位） | ✅ 2026-10-23 机制与参数冻结（维护者裁决：舵机式机构、纯 PWM 驱动，行程由归一化量→PWM 映射决定，无需专项台架；发射方向与机头一致，有效射程 = 双目测距极限 ≤8m，`interception.max_range_m=8.0`）。**实物发射有效性**转为 G5 前实机观察项，不阻塞控制门禁；自动模式仍不得触发（`interception.enabled=false`）。**2026-10-28 拆桨台架实测**：MAIN5 参数 `Minimum=1000 / Maximum=2000 / Disarmed=1500 / Rev Range=off`，地面站发 65016 后 `actuator_outputs` 实测 **1500→1150（保持 1.5s）→1500µs**、舵机行程到位；此前误配 `Minimum=1500 / Maximum=1150`（顺序反且非 1000/2000）时待机落 **1325**、触发只到 **1448**（约 15% 行程），机构不动 |
 | G4-5 | 地面站直控捕网发射（65016/65017）：本地副本 `gcs_fire_enabled=true` 启动正式程序，用 `tools/net_fire_tester.py` 发 65016 | 台架（**拆桨**） | 落地且未解锁时回 65017 `ACCEPTED→COMPLETED`；解锁/未落地/无确认位分别回 `ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`；同一 `command_id` 重发只受理一次；舵机行程正常 | ✅ 2026-10-28 拆桨台架实跑通过：地面站发 65016（落地、未解锁）→ 65017 `ACCEPTED` → 187 触发 `norm=-0.70` → 保持 1.5s → 复位 `norm=0.00` → `COMPLETED`；`actuator_outputs` 实测 1500→1150→1500、舵机到位。负向用例（`ARMED`/`NOT_LANDED`/`CONFIRMATION_MISSING`/`DUPLICATE`/`NO_REMAINING_SHOTS`/`FLIGHT_STATE_STALE`）待补录。**证据日志 `0068_20261028_144754.log`**：65016 收帧 14:48:23.114 → 187 触发 ACK 14:48:23.141（27ms）→ 复位入队 14:48:24.651 → 复位 ACK 14:48:24.664 → `发射周期完成` 14:48:24.671（保持 1.510s）；会话 `accepted=1 rejected=0`，同日志 `飞行控制器停止: setpoint_count=0 rejected_intent_count=0` 证明全程零飞行控制输出（影子） |
 | G4-4 | 断链失控保护（拔串口/停 setpoint） | 台架 | 停发/上锁符合预期（机载侧：停意图/关串口/心跳停止/刷盘；PX4 failsafe 归飞控配置） | ✅ 2026-10-21 机载侧：停 setpoint 分支（COAST/IDLE、退出 Offboard 1972ms、DISARM）+ 拔串口分支（停意图/关串口/心跳停止/刷盘/退出码4）；PX4 failsafe 不在机载软件判定范围 |
-| G5-1 | 室外首飞（系留/低空低速、人工兜底） | 室外 | 另行冻结清单（含场地围栏参数、遥控兜底、天气条件） | ⏳ |
+| G5-1 | 室外首飞（低空低速、RC 兜底） | 室外 | 科目与前置条件见 **§7.5**（P1~P7 前置 + G5-1a~1i 科目；a~d+f+g 全绿即通过） | 📋 2026-10-28 清单冻结，待执行 |
 
 **G4 串口台架入口（2026-10-20 落地）**：
 
@@ -356,4 +358,53 @@ python3 tools/assignment_sitl.py ... --send-target --stop-target-after-ms 15000
 生产配置 `enable_control=false` 时 65014 应回 `rejected/control_disabled`，
 可用于先验证回执链路而不产生任何控制输出。
 
-G5 详细清单在设计稿 §5 G5 行标注"另行冻结"，建立时同步更新本节。
+### 7.5 G5 室外首飞科目清单（2026-10-28 冻结）
+
+G5 是**第一次真机室外飞行**，目标不是打靶，而是回答三个问题：机载能不能安全地
+把飞机带上天、能不能听懂地面站指令、出问题时能不能自己回来。设计稿 §5/§14.4
+只给了原则（单机、低高度、RC 兜底、证据归档），本节把它拆成可逐条打勾的科目。
+
+**前置条件（缺一不飞）**
+
+| # | 项 | 要求 |
+|---:|---|---|
+| P1 | 机体与动力 | 桨已装、电机转向按 G4-2 结论、电池固定牢、机架无松动 |
+| P2 | 配置 | 本地副本 `enable_control=true`（**不入库**）；`interception.enabled=false`；`actuator.gcs_fire_enabled=false`；`fence.enabled=true` |
+| P3 | 围栏 | 地面站先划区并用 65018 下发，机载 `65019 fence_state=normal`；`config/zone.json` 已落盘；区域水平半径 ≥ 预期机动 3 倍、高度带覆盖首飞高度（建议 [0, 15m] Home 相对） |
+| P4 | PX4 | `SDLOG_MODE=2`（启动即记到关机）；`COM_DISARM_PRFLT` 默认 10s；PX4 自带栅栏不启用（由机载多边形围栏接管） |
+| P5 | 环境 | 净空半径 ≥50m、无人群/电线；风速 ≤5 m/s、无降水；GPS `fix=3D` 且卫星 ≥12、`eph ≤1.0m` |
+| P6 | 兜底 | 遥控器全程手持：模式开关可切 Position/Stabilized，Kill 开关可用；地面站与机载链路心跳正常 |
+| P7 | 证据 | 机载日志（`build/logs/`）、PX4 ulog、地面站事件日志三方时间对齐；每科目单独归档到 `tools/sitl_evidence/g5_<日期>/` |
+
+**科目**
+
+| 序 | 科目 | 操作 | 通过标准 |
+|---|---|---|---|
+| G5-1a | 地面自检 + 围栏缓存 | 上电启动正式程序（`--config` 指向本地副本） | `65013` 连接正常；`65019` 报 `zone_id/version` 与地面站一致、`fence_state=normal`；**重启进程后**日志出现「围栏区域缓存已装载」且 `zone_id/version` 不变 |
+| G5-1b | RC 手动起降（不接机载控制） | 遥控器手动起飞、悬停 30s、手动降落 | 姿态稳定、无异常振荡；地面站遥测连续；**确认这架机体本身能飞**（排除机体问题后再谈机载逻辑） |
+| G5-1c | 自动起飞 | `assignment_sitl.py` 同款流程发 65014（或地面站界面分配） | `S2→S3→S4→S5`；PX4 `6/0`、armed；高度到 `takeoff.height_m=2.0` 并稳定 5s；`65015 accepted`；`65013 availability=engaged` |
+| G5-1d | 悬停保持 + 目标缺失中止 | 起飞后**不发 65010** | 目标失效期 `65013` bit5 置位、PX4 不退出 Offboard；10s 后 `65015 aborted` → S12 爬升到 5m → 返航 → S13 `AUTO.LAND` → S14 上锁 |
+| G5-1e | 目标引导 | 持续推 65010（目标点距 Home 15~25m、高度 2m） | 飞机朝目标点直线飞行（位置设定值=目标点），无来回摆动；地面站可见目标与轨迹 |
+| G5-1f | 主动返航（65020） | 引导途中点地面站「主动返航」 | `65021 result=0`；`65015 reason=12 cancelled_by_gcs`（有已接受分配时）；S12 返航段**机头朝飞行方向**；S13→S14 |
+| G5-1g | 围栏越界（动作 hold / return 各一次） | 地面站把区域改小到机体现处区域外，下发 65018 | `65019 VIOLATED` 后按动作执行：hold=原地保持不中止；return=S12 返航；两种都不得进入 PX4 自身的 failsafe |
+| G5-1h | 遥控接管与中止 | 飞行中遥控切 Position 并人工接管；随后 Kill 或正常降落 | 机载在 `ManualOverride` 后停止争控（不再发 setpoint）；人工可完全接管；`65013 control_source` 变 manual |
+| G5-1i | 断链兜底 | 拔地面站电台（机载↔PX4 保持） | 机载继续飞（`enable_control` 下不依赖地面站）；PID/看门狗行为与本清单一致；重连后 65013/65019 恢复 |
+
+**通过判定**：`G5-1a ~ G5-1d + G5-1f + G5-1g` 全绿即视为「首飞通过」（能起飞、能听懂
+指令、能自己回来、能守区域）。`G5-1e`（目标引导）与 `G5-1h/1i` 建议同场次完成但可
+另立场次；**G5-1h 任一时刻不通过 → 立即停飞整改**。
+
+**G5-2（另立，不在首飞范围）**：视觉跟踪与拦截——双目锁定、S7 伺服到 `d_exp=10m`、
+S9 射程窗口、187 发射。需 `interception.enabled=true` + `net_actuator` 真机装配，
+且解决「`d_exp_m=10.0` 与 `interception.max_range_m=8.0` 稳态不重合」的设计缺口，
+再单独立清单。
+
+**安全红线**（与 §7.3 一致，首飞同样适用）：无桨不测；地面站看不到信号不起飞；
+RC 不在手不起飞；围栏未生效不起飞；第一场次必须低空（≤5m）且有人在旁可随时接管。
+
+**记录模板**（每科目一行，归档到 `tools/sitl_evidence/g5_<日期>/README.md`）：
+
+```text
+| 科目 | 时间 | 结果 | 关键证据（日志行/数值） | 备注 |
+| G5-1c 自动起飞 | 14:32:10 | PASS | S2→S3→S4→S5、65015 accepted、高度 2.02m | 风 3m/s |
+```

@@ -1,0 +1,102 @@
+PX4 链路冒烟测试
+  config: /mnt/e/dswj/无人机/香橙派的代码/drone_test/config/px4_sitl.json
+  transport: udp
+  device: /dev/ttyS1
+  baud: 115200
+  onboard: 1/191
+  target: 1/1
+  firmware: 1.17.0
+  duration: 120 秒
+  安全边界: SITL UDP 65018 围栏保持专项（非门禁）：注入动作=hold 的区域 → 65019 越界 → 原地保持不返航 → 65020 收尾 → S12/S13/S14
+
+  整定参数: heading.gain=0.9 vertical.vz_gain=0.1 distance kp=0.5 ki=0.05 kd=0.1 d_exp=10m；剧本 dwell=25/15s，接近窗口 ≤20m
+  注入几何自检: 相机系互逆偏差 0 m，地理反解互逆偏差 1.69606e-10 m
+  整定 CSV: /mnt/e/dswj/无人机/香橙派的代码/drone_test/build/logs/stage4_tune_20261028_224306.csv
+  整定: phase=bootstrap 状态机=1 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] 引导阶段开始：注入零速度引导流
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] Offboard 模式请求已入队
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] ARM 请求已入队
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] 起飞目标已锁定: N=0.0172132 E=0.00541975 D=-0.831005
+[SITL] 控制器已接管设定值流（授权链全通）
+[SITL] 接管完成，进入工具位置引导起飞段
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+[SITL] 悬停稳定完成，注入主目标（北向 40m），S5 位置引导接近至 20m 内
+[SITL] 状态机已接管意图流（S5 位置引导），工具停止注入引导意图
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+[SITL] 已进入射程（水平间隙 19.9093m），开始注入模拟视觉观测（SEARCHING → LOCKED）
+  整定: phase=visual_inject 状态机=5 目标N=40 E=0 up=1 射程=18.7005 控制权=ACTIVE
+[SITL] 下发 65018 围栏区域: zone=21/1 半径=20m 动作=kHold 基准=Home 相对；当前局部位置 N=22.6954 E=0.0250971
+  整定: phase=fence_hold_run 状态机=7 目标N=40 E=0 up=1 射程=16.2783 控制权=ACTIVE
+[SITL] 65019 围栏越界: zone=21/1 距边界=-4.20754m 持续=901ms
+  整定: phase=fence_hold_run 状态机=7 目标N=40 E=0 up=1 射程=15.3473 控制权=ACTIVE
+  整定: phase=fence_hold_run 状态机=7 目标N=40 E=0 up=1 射程=13.2017 控制权=ACTIVE
+  整定: phase=fence_hold_run 状态机=7 目标N=40 E=0 up=1 射程=15.659 控制权=ACTIVE
+[SITL] 围栏 hold 生效：越界后原地保持 2500ms 未中止任务（state=7，hold 区内设定点样本=38，离目标最近=21.0254m），现下发 65020 收尾
+[SITL] 下发 65020 主动返航指令: command_id=1（期望 65021 result=0、65015 reason=cancelled_by_gcs）
+[SITL] 65021 回执: command_id=1 result=0 reason=0 state=12
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=12 目标N=40 E=0 up=1 射程=16.0681 控制权=ACTIVE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+  整定: phase=mission_command_run 状态机=13 目标N=40 E=0 up=1 射程=16.0681 控制权=IDLE
+[SITL] 状态机接管返航/降落/上锁完成（S12→S13→S14）
+
+========== stage4-fence-hold 65018 围栏保持专项报告（非门禁）==========
+[PASS] 剧本走通（含过期停发链）
+[PASS] CSV 记录可写
+[PASS] 飞行未触发安全回收
+[PASS] 控制器无异常计数
+[PASS] AUTO.LAND landed + 主动 DISARM 确认
+[PASS] 65018 已下发（动作=hold）
+[PASS] 65019 上报 VIOLATED
+[PASS] 越界后原地保持（观察窗内未返航）
+[PASS] hold 期间设定点停在区内（未追目标）
+[PASS] 位置设定值被钳在区域半径内
+[PASS] 65020 收尾回执 result=accepted
+[PASS] S12 RETURN_HOME 进入
+[PASS] S13 AUTO.LAND 进入
+[PASS] S14 DISARMED 完成
+hold 诊断: hold 段位置设定点 38 帧，最大偏差 6.88196m，local_position_valid=是
+65018(hold) 实测: 区域半径 20m，最大设定值模长 18.9749m，hold 观察窗 2500ms（达成=是，提前返航=否，hold 区内设定点样本=38，离目标最近=21.0254m）；迁移 8 次
+包线: 最大相对高度 5.08176 m，最大北向 25.8393 m，最大东西 0.616812 m；状态机迁移 8 次，错误 0 次
+结果: 65018 围栏保持专项通过

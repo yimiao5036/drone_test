@@ -69,6 +69,8 @@ bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 120 --
 # 65014 已接受 + 65020（验证 65015 中止回执）/ 65018 action=hold（越界保持后再由 65020 收尾）
 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-command-assigned
 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-hold
+bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-land
+bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-altitude
 
 # 查看状态 / 停止
 bash tools/sitl_harness.sh status

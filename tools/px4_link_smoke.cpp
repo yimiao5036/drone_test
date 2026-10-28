@@ -87,6 +87,10 @@ struct Options {
     bool sitl_stage4_fence_hold = false;
     /// 65014 已接受 + 65020 组合专项：验证中止补发 65015 cancelled_by_gcs。
     bool sitl_stage4_command_assigned = false;
+    /// 65018 动作=land 专项：越界后直接降落（不经 S12 返航）。
+    bool sitl_stage4_fence_land = false;
+    /// 65018 高度带专项：仅高度越界（水平在区域内），验证高度带判定链路。
+    bool sitl_stage4_fence_altitude = false;
     /// G4 串口台架（真实 PX4 + 机体，卸桨）：只做零速/Offboard/ARM/小量
     /// 方向激励/停发失控保护，不执行起飞、降落航线或返航。
     bool bench_stage4_controller = false;
@@ -115,7 +119,8 @@ void PrintUsage(const char* program) {
               << "        | --sitl-stage4-feedforward [--feedforward]\n"
               << "        | --sitl-stage4-return]\n"
               << "        | --sitl-stage4-command | --sitl-stage4-fence]\n"
-              << "        | --sitl-stage4-fence-hold]\n"
+              << "        | --sitl-stage4-fence-hold | --sitl-stage4-fence-land\n"
+              << "        | --sitl-stage4-fence-altitude]\n"
               << "       | --bench-stage4-controller --bench-ack-props-off\n"
               << "SITL 参数仅允许 UDP；offboard-loss 起飞 1m 后主动停止 setpoint，\n"
               << "验证 PX4 退出 Offboard，再统一 AUTO.LAND 回收。\n"
@@ -137,6 +142,10 @@ void PrintUsage(const char* program) {
               << "  返航段 setpoint 带 USE_YAW 且偏航朝速度方向、187 全程未触发。\n"
               << "stage4-fence 围栏专项（非门禁）：S7 锁定后注入 65018 小区域，验收\n"
               << "  65019 报 VIOLATED、控制器 setpoint 被钳在边界内、S12 中止返航。\n"
+              << "stage4-fence-land 围栏降落专项（非门禁）：65018 动作=land，验收越界后\n"
+              << "  直接进 S13 发 AUTO.LAND（不经 S12 返航）→ S14 DISARM。\n"
+              << "stage4-fence-altitude 高度带专项（非门禁）：区域水平范围足够大，仅高度带\n"
+              << "  （相对 Home 上限 0.5m）越界，验收 65019 VIOLATED + S12 中止返航。\n"
               << "bench-stage4-controller G4 串口台架（仅 serial）：零速引导 → Offboard\n"
               << "  → ARM → 零速保持 → 北/东/南/西小量速度脉冲 → 停发验证 PX4 退出\n"
               << "  Offboard → DISARM；不发送起飞/降落/返航指令。必须同时给\n"
@@ -235,6 +244,16 @@ Options ParseOptions(int argc, char** argv) {
             options.tune_script = "return_command_assigned";
             continue;
         }
+        if (argument == "--sitl-stage4-fence-land") {
+            options.sitl_stage4_fence_land = true;
+            options.tune_script = "fence_land";
+            continue;
+        }
+        if (argument == "--sitl-stage4-fence-altitude") {
+            options.sitl_stage4_fence_altitude = true;
+            options.tune_script = "fence_altitude";
+            continue;
+        }
         if (argument == "--bench-stage4-controller") {
             options.bench_stage4_controller = true;
             continue;
@@ -328,6 +347,8 @@ Options ParseOptions(int argc, char** argv) {
                                  static_cast<int>(options.sitl_stage4_fence) +
                                  static_cast<int>(options.sitl_stage4_fence_hold) +
                                  static_cast<int>(options.sitl_stage4_command_assigned) +
+                                 static_cast<int>(options.sitl_stage4_fence_land) +
+                                 static_cast<int>(options.sitl_stage4_fence_altitude) +
                                  static_cast<int>(options.bench_stage4_controller);
     if (sitl_stage_count > 1) {
         throw std::invalid_argument("多个 SITL/台架阶段参数不能同时使用");
@@ -372,7 +393,8 @@ Options ParseOptions(int argc, char** argv) {
     if (options.sitl_stage4_tune || options.sitl_stage4_feedforward ||
         options.sitl_stage4_return || options.sitl_stage4_command ||
         options.sitl_stage4_fence || options.sitl_stage4_fence_hold ||
-        options.sitl_stage4_command_assigned) {
+        options.sitl_stage4_command_assigned || options.sitl_stage4_fence_land ||
+        options.sitl_stage4_fence_altitude) {
         if (options.tune_script != "static" && options.tune_script != "heading" &&
             options.tune_script != "distance" && options.tune_script != "vertical" &&
             options.tune_script != "full" && options.tune_script != "feedforward" &&
@@ -380,16 +402,19 @@ Options ParseOptions(int argc, char** argv) {
             options.tune_script != "return_command" &&
             options.tune_script != "fence_violation" &&
             options.tune_script != "fence_hold" &&
-            options.tune_script != "return_command_assigned") {
+            options.tune_script != "return_command_assigned" &&
+            options.tune_script != "fence_land" &&
+            options.tune_script != "fence_altitude") {
             throw std::invalid_argument(
                 "--tune-script 只支持 static|heading|distance|vertical|full|"
                 "feedforward|intercept_return|return_command|fence_violation|"
-                "fence_hold|return_command_assigned");
+                "fence_hold|return_command_assigned|fence_land|fence_altitude");
         }
         if (options.sitl_stage4_feedforward || options.sitl_stage4_return ||
             options.sitl_stage4_command || options.sitl_stage4_fence ||
             options.sitl_stage4_fence_hold ||
-            options.sitl_stage4_command_assigned) {
+            options.sitl_stage4_command_assigned ||
+            options.sitl_stage4_fence_land || options.sitl_stage4_fence_altitude) {
             if (options.duration < std::chrono::seconds(90)) {
                 throw std::invalid_argument("专项场景时长不能少于 90 秒");
             }
@@ -4622,6 +4647,8 @@ enum class TuneScript : uint8_t {
     kFenceViolation, ///< 65018：S7 后注入小区域→越界→钳制→S12→LAND/DISARM
     kFenceHold,      ///< 65018(hold)：越界后原地保持不返航，再由 65020 收回
     kReturnCommandAssigned, ///< 65014 已接受 + 65020：验证中止补发 65015
+    kFenceLand,      ///< 65018(land)：越界后直接降落（不经 S12）
+    kFenceAltitude,  ///< 65018 高度带：仅高度越界即中止返航
 };
 
 /// 解析 --tune-script 取值（无效值返回 false）。
@@ -4648,6 +4675,10 @@ bool ParseTuneScript(const std::string& text, TuneScript* out) {
         *out = TuneScript::kFenceHold;
     } else if (text == "return_command_assigned") {
         *out = TuneScript::kReturnCommandAssigned;
+    } else if (text == "fence_land") {
+        *out = TuneScript::kFenceLand;
+    } else if (text == "fence_altitude") {
+        *out = TuneScript::kFenceAltitude;
     } else {
         return false;
     }
@@ -4682,6 +4713,12 @@ constexpr uint64_t kTuneInterceptReturnTimeoutMs = 90000;  // S9~S14 专项上�
 // 使 S7 稳态（d_exp=10m → 约 30m）一进入区域即被判越界）。
 constexpr double kReturnYawToleranceDeg = 30.0;
 constexpr double kFenceZoneRadiusM = 20.0;
+/// 高度带专项：水平半径给足（远大于 S7 稳态位移），只让高度带触发越界。
+constexpr double kFenceAltitudeRadiusM = 100.0;
+/// 高度带专项的相对 Home 上限：1m 起飞高度即可越界，留 0.5m 余量。
+// 高度带下界 2m：机体现约 1m 高 → 注入即越界；返航需爬升到 5m（>=2m）
+// 不会被围栏挡住，因此 S12→S13 能走完。上界用 0（不限）。
+constexpr double kFenceAltitudeMinM = 2.0;
 /// 围栏保持剧本：越界后至少要观察这么久仍不返航，才判「hold 生效」。
 constexpr uint64_t kFenceHoldObserveMs = 2500;
 constexpr uint16_t kFenceZoneId = 21;
@@ -4831,6 +4868,8 @@ enum class TunePhase : uint8_t {
     kMissionCommandRun,///< 65020：S7 后注入人工返航→S12→S13→S14
     kFenceZoneRun,     ///< 65018：S7 后注入小区域→越界→S12→S13→S14
     kFenceHoldRun,     ///< 65018(hold)：越界后保持观察，再发 65020 收尾
+    kFenceLandRun,     ///< 65018(land)：越界后直接 S13 降落→S14
+    kFenceAltitudeRun, ///< 65018 高度带：仅高度越界→S12→S13→S14
     kDone,
 };
 
@@ -4852,6 +4891,8 @@ const char* TunePhaseName(TunePhase phase) {
         case TunePhase::kMissionCommandRun: return "mission_command_run";
         case TunePhase::kFenceZoneRun: return "fence_zone_run";
         case TunePhase::kFenceHoldRun: return "fence_hold_run";
+        case TunePhase::kFenceLandRun: return "fence_land_run";
+        case TunePhase::kFenceAltitudeRun: return "fence_altitude_run";
         case TunePhase::kDone: return "done";
     }
     return "unknown";
@@ -5005,6 +5046,8 @@ public:
         const bool fence_hold_scenario = script_ == TuneScript::kFenceHold;
         const bool assigned_scenario =
             script_ == TuneScript::kReturnCommandAssigned;
+        const bool fence_land_scenario = script_ == TuneScript::kFenceLand;
+        const bool fence_altitude_scenario = script_ == TuneScript::kFenceAltitude;
         const ActuatorAckTiming actuator_ack_timing = actuator_timing();
         // 65020 主动返航：机载必须回 65021 result=0、65015 reason=cancelled_by_gcs，
         // 且未经 S9/S10（人工中止不是拦截完成），返航段位置设定值带 USE_YAW 指向 Home。
@@ -5042,6 +5085,20 @@ public:
              saw_disarmed_ && state_machine_managed_return_ && landed_after_flight_ &&
              disarmed_confirmed_ && !saw_intercept_executing_ &&
              fence_max_radius_m_ <= kFenceZoneRadiusM + 2.0);
+        // 65018(land)：越界后机载直接进 S13 发 AUTO.LAND，**不得经过 S12 返航**。
+        const bool fence_land_ok =
+            !fence_land_scenario ||
+            (fence_zone_sent_ && fence_violated_seen_ && !saw_return_home_ &&
+             saw_landing_ && saw_disarmed_ && landed_after_flight_ &&
+             disarmed_confirmed_ && !saw_intercept_executing_ &&
+             fence_max_radius_m_ <= kFenceZoneRadiusM + 2.0);
+        // 65018 高度带：水平在区域内，仅高度越界也必须中止返航（S12 路径）。
+        const bool fence_altitude_ok =
+            !fence_altitude_scenario ||
+            (fence_zone_sent_ && fence_violated_seen_ && saw_return_home_ &&
+             saw_landing_ && saw_disarmed_ && state_machine_managed_return_ &&
+             landed_after_flight_ && disarmed_confirmed_ &&
+             !saw_intercept_executing_);
         const bool return_ok =
             !return_scenario ||
             (saw_intercept_ready_ && saw_intercept_executing_ &&
@@ -5052,7 +5109,8 @@ public:
                             !safety_violation_ && controller_.ErrorCount() == 0 &&
                             landed_after_flight_ && disarmed_confirmed_ &&
                             ff_ok && return_ok && command_ok && fence_ok &&
-                            fence_hold_ok && assigned_ok;
+                            fence_hold_ok && assigned_ok && fence_land_ok &&
+                            fence_altitude_ok;
         const char* report_title = "\n========== stage4-tune 整定场景报告 ==========";
         if (feedforward_scenario) {
             report_title =
@@ -5064,6 +5122,12 @@ public:
         } else if (command_scenario) {
             report_title =
                 "\n========== stage4-command 65020 主动返航专项报告（非门禁）==========";
+        } else if (fence_land_scenario) {
+            report_title =
+                "\n========== stage4-fence-land 65018 围栏降落专项报告（非门禁）==========";
+        } else if (fence_altitude_scenario) {
+            report_title =
+                "\n========== stage4-fence-altitude 65018 高度带专项报告（非门禁）==========";
         } else if (fence_hold_scenario) {
             report_title =
                 "\n========== stage4-fence-hold 65018 围栏保持专项报告（非门禁）==========";
@@ -5148,6 +5212,35 @@ public:
                       << "，hold 区内设定点样本=" << hold_setpoint_samples_
                       << "，离目标最近=" << hold_min_target_gap_m_
                       << "m）；迁移 " << machine_.TransitionCount() << " 次"
+                      << std::endl;
+        }
+        if (fence_land_scenario) {
+            PrintCheck("65018 已下发（动作=land）", fence_zone_sent_, true);
+            PrintCheck("65019 上报 VIOLATED", fence_violated_seen_, true);
+            PrintCheck("未经过 S12 RETURN_HOME（越界直接降落）", !saw_return_home_,
+                       true);
+            PrintCheck("S13 AUTO.LAND 进入", saw_landing_, true);
+            PrintCheck("S14 DISARMED 完成", saw_disarmed_, true);
+            // 动作=land 不进 S12，全程没有位置型设定值（S7 是速度意图），
+            // 因此这里不统计"设定值模长"，只报越界与迁移路径。
+            std::cout << "65018(land) 实测: 区域半径 " << kFenceZoneRadiusM
+                      << "m，越界距离=" << fence_violation_distance_m_
+                      << "m，越界上报=" << YesNo(fence_violated_seen_)
+                      << "，经 S12=" << YesNo(saw_return_home_) << "；迁移 "
+                      << machine_.TransitionCount() << " 次" << std::endl;
+        }
+        if (fence_altitude_scenario) {
+            PrintCheck("65018 已下发（高度带下界 2m）", fence_zone_sent_, true);
+            PrintCheck("65019 上报 VIOLATED（仅高度越界）", fence_violated_seen_,
+                       true);
+            PrintCheck("S12 RETURN_HOME 进入", saw_return_home_, true);
+            PrintCheck("S13 AUTO.LAND 进入", saw_landing_, true);
+            PrintCheck("S14 DISARMED 完成", saw_disarmed_, true);
+            std::cout << "65018(altitude) 实测: 水平半径 " << kFenceAltitudeRadiusM
+                      << "m（不触发），高度带下界 " << kFenceAltitudeMinM
+                      << "m，越界高度=" << fence_violation_altitude_m_
+                      << "m，越界上报=" << YesNo(fence_violated_seen_)
+                      << "；迁移 " << machine_.TransitionCount() << " 次"
                       << std::endl;
         }
         if (fence_scenario) {
@@ -5245,6 +5338,12 @@ public:
         } else if (command_scenario) {
             result_text = passed ? "结果: 65020 主动返航专项通过"
                                  : "结果: 65020 主动返航专项未通过";
+        } else if (fence_land_scenario) {
+            result_text = passed ? "结果: 65018 围栏降落专项通过"
+                                 : "结果: 65018 围栏降落专项未通过";
+        } else if (fence_altitude_scenario) {
+            result_text = passed ? "结果: 65018 高度带专项通过"
+                                 : "结果: 65018 高度带专项未通过";
         } else if (fence_hold_scenario) {
             result_text = passed ? "结果: 65018 围栏保持专项通过"
                                  : "结果: 65018 围栏保持专项未通过";
@@ -5335,7 +5434,9 @@ private:
                 }
             }
             if ((phase_ == TunePhase::kFenceZoneRun ||
-                 phase_ == TunePhase::kFenceHoldRun) &&
+                 phase_ == TunePhase::kFenceHoldRun ||
+                 phase_ == TunePhase::kFenceLandRun ||
+                 phase_ == TunePhase::kFenceAltitudeRun) &&
                 latest_setpoint_.type == common::SetpointType::kPosition) {
                 // 围栏钳制证据：区域内的设定点模长不应显著超过区域半径。
                 fence_max_radius_m_ = std::max(
@@ -5421,9 +5522,14 @@ private:
             const auto& status = **message;
             if (status.state == common::FenceState::kViolated) {
                 if (!fence_violated_seen_) {
+                    // 只记录**首次**越界帧的几何量：后续帧会随返航/降落变化，
+                    // 用最后一帧会把"越界那一刻"的距离和高度覆盖掉。
+                    fence_violation_distance_m_ = status.distance_to_boundary_m;
+                    fence_violation_altitude_m_ = -status.local_down_m;
                     std::cout << "[SITL] 65019 围栏越界: zone=" << status.zone_id
                               << '/' << status.version << " 距边界="
-                              << status.distance_to_boundary_m << "m 持续="
+                              << status.distance_to_boundary_m << "m 高度="
+                              << (-status.local_down_m) << "m 持续="
                               << status.violation_duration_ms << "ms" << std::endl;
                 }
                 fence_violated_seen_ = true;
@@ -5438,7 +5544,9 @@ private:
                script_ == TuneScript::kReturnCommand ||
                script_ == TuneScript::kFenceViolation ||
                script_ == TuneScript::kFenceHold ||
-               script_ == TuneScript::kReturnCommandAssigned;
+               script_ == TuneScript::kReturnCommandAssigned ||
+               script_ == TuneScript::kFenceLand ||
+               script_ == TuneScript::kFenceAltitude;
     }
 
     /// 角度归一化到 (-180, 180]。
@@ -5839,6 +5947,23 @@ private:
                 phase_start_ms_ = now_ms;
                 return;
             }
+            if (script_ == TuneScript::kFenceLand) {
+                // 动作=land：越界后机载直接进 S13 发 AUTO.LAND，不经 S12。
+                SendFenceZone(now_ms, common::FenceAction::kLand);
+                phase_ = TunePhase::kFenceLandRun;
+                phase_start_ms_ = now_ms;
+                return;
+            }
+            if (script_ == TuneScript::kFenceAltitude) {
+                // 高度带专项：水平范围给足（100m），高度带下界 2m（相对 Home）。
+                // 机体现在约 1m 高，注入即"水平在区域内、仅高度越界"；
+                // 返航爬升到 5m 满足下界，不会被围栏挡住，S12→S13 能走完。
+                SendFenceZone(now_ms, common::FenceAction::kReturn,
+                              kFenceAltitudeRadiusM, kFenceAltitudeMinM, 0.0);
+                phase_ = TunePhase::kFenceAltitudeRun;
+                phase_start_ms_ = now_ms;
+                return;
+            }
             if (script_ == TuneScript::kFenceViolation) {
                 // 65018：以 Home 为心注入小区域。此刻机体已越过 20m（S7 稳态
                 // 距 40m 目标约 10m），注入即应判越界，用于验收检测/钳制/中止。
@@ -5906,16 +6031,17 @@ private:
     /// 以 EKF 锚点为心注入方形 65018 区域（Home 相对高度，不限制高度带）。
     /// 边长取 2×kFenceZoneRadiusM：此刻机体在区域外，注入即应触发越界。
     void SendFenceZone(uint64_t now_ms,
-                       common::FenceAction action = common::FenceAction::kReturn) {
+                       common::FenceAction action = common::FenceAction::kReturn,
+                       double radius_m = kFenceZoneRadiusM, double alt_min_m = 0.0,
+                       double alt_max_m = 0.0) {
         if (!have_snapshot_ || !latest_.ned_ref_valid) {
             Abort("注入 65018 失败：飞行快照缺少 EKF 锚点（ned_ref_valid=false）");
             return;
         }
         const double lat0 = static_cast<double>(latest_.ned_ref_lat_1e7) * 1e-7;
         const double lon0 = static_cast<double>(latest_.ned_ref_lon_1e7) * 1e-7;
-        const double dlat = kFenceZoneRadiusM / 111320.0;
-        const double dlon =
-            kFenceZoneRadiusM / (111320.0 * std::cos(lat0 * M_PI / 180.0));
+        const double dlat = radius_m / 111320.0;
+        const double dlon = radius_m / (111320.0 * std::cos(lat0 * M_PI / 180.0));
         common::FenceZone zone;
         zone.header.sequence = 1;
         zone.header.source_time_ms = now_ms;
@@ -5929,8 +6055,9 @@ private:
         zone.type = common::FenceZoneType::kPolygon;
         zone.action = action;
         zone.altitude_reference = 1;  // 相对 Home
-        zone.alt_min_m = 0.0;
-        zone.alt_max_m = 0.0;  // 0=不限高度带，只测水平越界
+        zone.alt_min_m = alt_min_m;
+        // 0=该轴不限制；高度带专项用 0.5m 上限制造"水平在区域内、仅高度越界"。
+        zone.alt_max_m = alt_max_m;
         zone.vertices = {
             {lat0 - dlat, lon0 - dlon},
             {lat0 - dlat, lon0 + dlon},
@@ -5940,10 +6067,14 @@ private:
         zone.received_ms = now_ms;
         fence_zone_sent_ = true;
         (void)fence_zone_topic_.Publish(std::make_shared<const common::FenceZone>(zone));
+        const char* action_text =
+            action == common::FenceAction::kHold
+                ? "kHold"
+                : (action == common::FenceAction::kLand ? "kLand" : "kReturn");
         std::cout << "[SITL] 下发 65018 围栏区域: zone=" << zone.zone_id << '/'
-                  << static_cast<int>(zone.version) << " 半径=" << kFenceZoneRadiusM
-                  << "m 动作="
-                  << (action == common::FenceAction::kHold ? "kHold" : "kReturn")
+                  << static_cast<int>(zone.version) << " 半径=" << radius_m
+                  << "m 高度带=[" << alt_min_m << ',' << alt_max_m << "]m 动作="
+                  << action_text
                   << " 基准=Home 相对；当前局部位置 N="
                   << latest_.local_x_m << " E=" << latest_.local_y_m << std::endl;
     }
@@ -6262,6 +6393,8 @@ private:
                 return;
             case TunePhase::kMissionCommandRun:
             case TunePhase::kFenceZoneRun:
+            case TunePhase::kFenceLandRun:
+            case TunePhase::kFenceAltitudeRun:
                 AdvanceInterceptReturn(now_ms);
                 return;
             case TunePhase::kLand:
@@ -6441,6 +6574,8 @@ private:
     drone::common::Topic<drone::common::ControlIntent>::Subscription intent_subscription_;
     drone::common::Topic<drone::common::Px4Setpoint>::Subscription setpoint_subscription_;
     Stage4InjectionRig rig_;
+    drone::common::Topic<drone::common::MissionCommand>& mission_command_topic_;
+    drone::common::Topic<drone::common::FenceZone>& fence_zone_topic_;
     TuneCsvLogger csv_;
     const bool feedforward_enabled_ = false;  // P3 专项：controller 前馈开关快照
 
@@ -6476,8 +6611,7 @@ private:
     bool actuator_extra_acks_ = false;
     bool actuator_timeout_ = false;
     // ---- 65020 人工返航专项观测 ----
-    drone::common::Topic<drone::common::MissionCommand>& mission_command_topic_;
-    drone::common::Topic<drone::common::FenceZone>& fence_zone_topic_;
+    // 注意：这两个引用必须排在 csv_ 之前声明，与构造初始化列表顺序一致。
     drone::common::Topic<drone::common::MissionCommandAck>::Subscription
         command_ack_subscription_;
     drone::common::Topic<drone::common::MissionAssignmentAck>::Subscription
@@ -6504,6 +6638,12 @@ private:
     double hold_min_target_gap_m_ = 1e9;
     bool fence_clamped_seen_ = false;
     double fence_max_radius_m_ = 0.0;
+    // 越界瞬间的距离（负值=已在区域外多少米），land 剧本没有位置设定值时用
+    // 它代替"设定值模长"作为判读依据。
+    double fence_violation_distance_m_ = 0.0;
+    // 越界瞬间相对 Home 的高度（由 65019 的 local_down_m 反算），高度带
+    // 越界时用它说明"越界在高度而不是水平"。
+    double fence_violation_altitude_m_ = 0.0;
     uint64_t yaw_setpoint_samples_ = 0;
     bool return_yaw_toward_home_ = false;
     // ---- P3 前馈专项观测（2026-10-19）----
@@ -6644,7 +6784,9 @@ int RunStage4Tune(drone::communication::Px4Link& link, const std::string& config
     // 围栏：65018 专项必须显式启用，且不落盘（只验证在线下发与钳制）；其余剧本关闭。
     mission_config.fence = app.fence;
     if (tune_script == TuneScript::kFenceViolation ||
-        tune_script == TuneScript::kFenceHold) {
+        tune_script == TuneScript::kFenceHold ||
+        tune_script == TuneScript::kFenceLand ||
+        tune_script == TuneScript::kFenceAltitude) {
         mission_config.fence.enabled = true;
         mission_config.fence.zone_cache_path.clear();
     } else {
@@ -6658,7 +6800,9 @@ int RunStage4Tune(drone::communication::Px4Link& link, const std::string& config
     controller.SetInput(machine.IntentOutput());
     controller.SetPx4LinkSource(&link);
     if (tune_script == TuneScript::kFenceViolation ||
-        tune_script == TuneScript::kFenceHold) {
+        tune_script == TuneScript::kFenceHold ||
+        tune_script == TuneScript::kFenceLand ||
+        tune_script == TuneScript::kFenceAltitude) {
         // 多边形钳制来源：状态机把 65018 转成 NED 多边形，控制器据此钳制。
         controller.SetFencePolygonSource(&machine);
     }
@@ -7308,7 +7452,8 @@ int main(int argc, char** argv) {
              options.sitl_stage4_feedforward || options.sitl_stage4_return ||
              options.sitl_stage4_command || options.sitl_stage4_fence ||
              options.sitl_stage4_fence_hold ||
-             options.sitl_stage4_command_assigned) &&
+             options.sitl_stage4_command_assigned ||
+             options.sitl_stage4_fence_land || options.sitl_stage4_fence_altitude) &&
             config.transport != "udp") {
             throw std::invalid_argument("SITL 设定值参数只允许 transport=udp，禁止在真实串口运行");
         }
@@ -7407,7 +7552,9 @@ int main(int argc, char** argv) {
         if (options.sitl_stage4_tune || options.sitl_stage4_feedforward ||
             options.sitl_stage4_return || options.sitl_stage4_command ||
             options.sitl_stage4_fence || options.sitl_stage4_fence_hold ||
-            options.sitl_stage4_command_assigned) {
+            options.sitl_stage4_command_assigned ||
+            options.sitl_stage4_fence_land ||
+            options.sitl_stage4_fence_altitude) {
             // stage4-tune 控制律整定 / P3 前馈 / S9~S14 返航 / 65020 主动返航 /
             // 65018 围栏：装配与 G3 同构，剧本分别按长驻留+阶跃、匀速目标、
             // 拦截后返航、人工返航指令、区域越界中止；逐拍落 CSV。

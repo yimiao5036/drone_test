@@ -15,6 +15,10 @@ tools/sitl_harness.sh stop
 tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-command-assigned
 tools/sitl_harness.sh stop
 tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-hold
+tools/sitl_harness.sh stop
+tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-land
+tools/sitl_harness.sh stop
+tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-altitude
 ```
 
 ## 文件
@@ -25,6 +29,8 @@ tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-
 | `stage4_fence_20261028_pass.log` | 65018 围栏专项 **PASS** |
 | `stage4_command_assigned_20261028_pass.log` | 65014+65020 中止回执专项 **PASS**（65015 必发） |
 | `stage4_fence_hold_20261028_pass.log` | 65018 动作 hold 保持专项 **PASS**（观察窗后 65020 收尾） |
+| `stage4_fence_land_20261028_pass.log` | 65018 动作 land 专项 **PASS**（越界直接 S13，未经 S12） |
+| `stage4_fence_altitude_20261028_pass.log` | 65018 高度带专项 **PASS**（水平在区内、仅高度越界 → S12） |
 
 ## 判读要点
 

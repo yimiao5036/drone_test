@@ -434,6 +434,52 @@ S7 稳定伺服 → 注入 65018(zone=21/1, 半径 20m, action=hold) → 65019 V
   38 帧、离目标最近 21.03m、最大设定值模长 18.97m；日志
   `tools/sitl_evidence/command_fence_20261028/stage4_fence_hold_20261028_pass.log`。
 
+### 2.3.7 stage4-fence-land 围栏降落专项（`--sitl-stage4-fence-land`，非门禁）
+
+65018 动作取 `land` 时的端到端验证：越界后**直接进 S13 发 AUTO.LAND，不得经过 S12 返航**。
+
+```text
+S7 稳定伺服 → 注入 65018(zone=21/1, 半径 20m, action=land) → 65019 VIOLATED
+→ S13 AUTO.LAND（跳 S12）→ S14 DISARMED
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 150   --sitl-stage4-fence-land
+```
+
+- 判据：65018 已下发、65019 `VIOLATED`、**未出现 S12**（`saw_return_home_==false`）、
+  S13 进入、S14 上锁完成、全程未进 S9/S10。
+- 2026-10-28 WSL2 实跑：**PASS**，注入后局部位置 `N=22.34`（区域外），首次越界帧
+  `距边界=-3.97m`，状态机直接 `7 → 13`（无 S12 停留）、随后 `13 → 14`；包线最大相对
+  高度 1.08m、最大北向 24.79m；迁移 7 次、错误 0；日志
+  `tools/sitl_evidence/command_fence_20261028/stage4_fence_land_20261028_pass.log`。
+- 报告里不再打印「设定值模长」：S7 阶段机载发的是速度型意图，而 land 路径不进 S12，
+  全程没有位置型设定值，该指标恒 0、不具判读价值，改用「越界距离」。
+
+### 2.3.8 stage4-fence-altitude 高度带专项（`--sitl-stage4-fence-altitude`，非门禁）
+
+只验证**高度带**：水平方向在区域内，仅高度越界也必须中止并返航。
+
+```text
+S7 稳定伺服 → 注入 65018(zone=21/1, 半径 100m, 高度带 [2m, 不限], 基准=Home 相对)
+→ 水平距边界 ≈76m（在区内）+ 当前相对高度 ≈1.04m < 下界 2m → 65019 VIOLATED
+→ S12 → S13 → S14
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl.json --duration 150   --sitl-stage4-fence-altitude
+```
+
+- 判据：65018 已下发、65019 `VIOLATED`、S12 进入、S13/S14 完成、未进 S9/S10。
+- **为什么用下界 2m 而不是上界 0.5m**：返航要求爬升到 `return_home.altitude_m=5.0`，
+  若高度带上界只有 0.5m，控制器的高度钳制会把爬升设定值压在 0.5m，S12 的
+  「先爬升到 5m 再飞 Home」永远判不稳，会一直停在 S12 直到 90s 超时（已实测复现）。
+  用下界 2m：注入即越界（机体现在约 1m），而返航爬升到 5m 满足下界、不被围挡。
+- 2026-10-28 WSL2 实跑：**PASS**，首次越界帧 `距边界=76.38m`（水平在区内）、
+  `高度=1.04m`（低于下界 2m），S12→S13→S14；包线最大相对高度 5.02m（爬升到返航
+  高度）、最大北向 25.77m；迁移 8 次、错误 0；日志
+  `tools/sitl_evidence/command_fence_20261028/stage4_fence_altitude_20261028_pass.log`。
+
 ### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
 
 ```bash
