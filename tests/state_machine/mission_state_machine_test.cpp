@@ -4883,4 +4883,39 @@ TEST(MissionStateMachineTest, S5HoldMaxDoesNotAbortWhileGuiding) {
               common::MissionState::kReturnHome);
 }
 
+
+// 默认区域（2026-10-29）：围栏启用、无缓存、未收到 65018 时，机载应以 Home 为中心
+// 生成默认方形区域，保证"开机即有围栏"，并把 zone_id/版本落成配置里的默认值。
+TEST(MissionStateMachineTest, FenceDefaultZoneGeneratedFromHome) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.zone_cache_path.clear();  // 不写盘，避免污染工作目录
+    config.fence.default_half_side_m = 50.0;
+    config.fence.default_zone_id = 7;
+    config.fence.default_version = 3;
+
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true, /*with_estimation=*/true,
+                              MakeFenceFlight()));
+
+    common::FencePolygonNed polygon;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        polygon = harness.machine.LatestFencePolygon();
+        if (polygon.valid()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(polygon.valid());
+    EXPECT_EQ(polygon.zone_id, 7U);
+    EXPECT_EQ(polygon.version, 3U);
+    EXPECT_EQ(polygon.vertices.size(), 4U);
+    double min_north = polygon.vertices.front().north_m;
+    double max_north = polygon.vertices.front().north_m;
+    for (const auto& vertex : polygon.vertices) {
+        min_north = std::min(min_north, vertex.north_m);
+        max_north = std::max(max_north, vertex.north_m);
+    }
+    EXPECT_NEAR(max_north - min_north, 100.0, 2.0);
+}
+
 }  // namespace

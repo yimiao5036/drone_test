@@ -39,6 +39,9 @@ constexpr uint8_t kNetFireKnownFlagsMask = kNetFireFlagConfirmed;
 /// Python 工具无需同步升级；未填这些字段的老发送端按"未声明区域"处理。
 constexpr uint16_t kFenceZoneMessageType = 65018;
 constexpr uint16_t kFenceStatusMessageType = 65019;
+/// 围栏区域回读（机载 → 地面站，2026-10-29）：与 65018 完全同构，
+/// 把机载当前生效的区域原样回传，供地面站比对"本地定义 vs 机载实况"。
+constexpr uint16_t kFenceZoneReportMessageType = 65022;
 constexpr uint8_t kFenceZoneProtocolVersion = 1;
 constexpr uint8_t kFenceMaxVertices = 8;  ///< 单帧上限：顶点区 21~53（marker 在 54）
 /// 地面站任务指令（65020，地面站 → 指定飞机）与回执（65021，飞机 → 地面站）。
@@ -193,6 +196,8 @@ public:
     virtual common::Topic<common::FenceZone>& FenceZoneOutput() = 0;
     /// 绑定 65019 围栏状态回传输入。按 V2_EXTENSION message_type=65019 编码发送。
     virtual void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) = 0;
+    /// 绑定 65022 围栏区域回读输入（状态机输出的当前生效区域）。
+    virtual void SetFenceZoneReportInput(common::Topic<common::FenceZone>& zone) = 0;
 
     /// 65020 任务指令（主动返航）解析结果（2026-10-29）。地址双字段匹配本机后
     /// 才发布；协议版本/指令类型/状态合法性由状态机校验，链路层不产生动作。
@@ -238,6 +243,7 @@ public:
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
     common::Topic<common::FenceZone>& FenceZoneOutput() override;
     void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) override;
+    void SetFenceZoneReportInput(common::Topic<common::FenceZone>& zone) override;
     common::Topic<common::MissionCommand>& MissionCommandOutput() override;
     void SetMissionCommandAckInput(
         common::Topic<common::MissionCommandAck>& ack) override;
@@ -282,6 +288,7 @@ public:
     void SetNetFireAckInput(common::Topic<common::NetFireAck>& ack) override;
     common::Topic<common::FenceZone>& FenceZoneOutput() override;
     void SetFenceStatusInput(common::Topic<common::FenceStatus>& state) override;
+    void SetFenceZoneReportInput(common::Topic<common::FenceZone>& zone) override;
     common::Topic<common::MissionCommand>& MissionCommandOutput() override;
     void SetMissionCommandAckInput(
         common::Topic<common::MissionCommandAck>& ack) override;

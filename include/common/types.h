@@ -554,6 +554,10 @@ struct FenceZone {
     double alt_max_m = 0.0;          ///< 高度带上限（m）；0=未限制，用配置默认
     std::vector<FenceVertex> vertices;  ///< 多边形顶点（WGS84，≥3 个）
     uint64_t received_ms = 0;        ///< 本机收到的单调时钟时间
+    /// 顶点量化参考点（1e7 度）。机载原样保存并随 65022 回传，使地面站能与
+    /// 自己下发的定义逐字节比对，避免"反投影再投影"带来的漂移。
+    int32_t ref_lat_1e7 = 0;
+    int32_t ref_lon_1e7 = 0;
 };
 
 /// 局部 NED 二维点（围栏几何用）。
@@ -735,7 +739,9 @@ inline constexpr char kMissionAssignmentAck[] = "mission_assignment_ack"; ///< M
 inline constexpr char kNetFireCommand[] = "net_fire_command";             ///< NetFireCommand（65016）
 inline constexpr char kNetFireAck[] = "net_fire_ack";                     ///< NetFireAck（65017）
 inline constexpr char kFenceZone[] = "fence_zone";                        ///< FenceZone（65018/缓存）
-inline constexpr char kFenceStatus[] = "fence_status";                    ///< FenceStatus（65019）
+inline constexpr char kFenceStatus[] = "fence_status";
+/// 围栏区域回读（状态机 → 地面站链接，编码为 65022）。
+inline constexpr char kFenceZoneReport[] = "fence_zone_report";                    ///< FenceStatus（65019）
 inline constexpr char kMissionCommand[] = "mission_command";              ///< MissionCommand（65020）
 inline constexpr char kMissionCommandAck[] = "mission_command_ack";       ///< MissionCommandAck（65021）
 inline constexpr char kHealthStatus[] = "health_status";      ///< HealthStatus

@@ -153,6 +153,8 @@ public:
     /// 围栏状态输出主题：common::FenceStatus（65019，供 GroundStationLink 回传；
     /// 2026-10-29）。按 fence.status_period 周期发布，地面站据此绘制区域与越界。
     virtual common::Topic<common::FenceStatus>& FenceStatusOutput() = 0;
+    /// 65022 区域回读输出：机载当前生效的区域（地面站比对用）。
+    virtual common::Topic<common::FenceZone>& FenceZoneReportOutput() = 0;
     /// 任务指令回执输出主题：common::MissionCommandAck（65021，供 GroundStationLink
     /// 发往地面站；2026-10-29）。每条 65020 回一条（含拒绝与重复）。
     virtual common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() = 0;
@@ -221,6 +223,7 @@ public:
     common::Topic<common::MissionStatus>& StatusOutput() override;
     common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
     common::Topic<common::FenceStatus>& FenceStatusOutput() override;
+    common::Topic<common::FenceZone>& FenceZoneReportOutput() override;
     common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() override;
 
     common::MissionState CurrentState() const override;
@@ -291,6 +294,7 @@ public:
     common::Topic<common::MissionStatus>& StatusOutput() override;
     common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() override;
     common::Topic<common::FenceStatus>& FenceStatusOutput() override;
+    common::Topic<common::FenceZone>& FenceZoneReportOutput() override;
     common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() override;
 
     common::MissionState CurrentState() const override;
@@ -305,6 +309,7 @@ private:
     common::Topic<common::ControlIntent> intent_output_;
     common::Topic<common::MissionStatus> status_output_;
     common::Topic<common::FenceStatus> fence_status_output_;
+    common::Topic<common::FenceZone> fence_zone_report_output_;
     common::Topic<common::MissionCommandAck> mission_command_ack_output_;
     common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
 };

@@ -635,6 +635,11 @@ public:
     common::Topic<common::FenceStatus>& FenceStatusOutput() {
         return fence_status_output_;
     }
+
+    // 65022 区域回读输出（地面站比对本地定义与机载实况）。
+    common::Topic<common::FenceZone>& FenceZoneReportOutput() {
+        return fence_zone_report_output_;
+    }
     common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() {
         return mission_command_ack_output_;
     }
@@ -1769,6 +1774,7 @@ private:
                              fence_zone_->version != zone.version;
         fence_zone_ = zone;
         fence_dirty_ = true;
+        fence_report_pending_ = true;
         if (!changed) {
             return;
         }
@@ -1831,7 +1837,80 @@ private:
         return -static_cast<double>(flight.local_z_m);
     }
 
+    // 无缓存、也还没收到 65018 时，用 Home 生成默认方形区域并落盘（只做一次）。
+    // 目的：避免"无区域 = 不限制"的空窗；区域随项目部署走，地面站可随时覆盖。
+    void EnsureDefaultFenceZone(uint64_t now_ms) {
+        // 只在围栏启用时生成：默认关闭时不应凭空写盘（也会干扰单元测试的
+        // 工作目录），且"未启用"本身就是地面站需要看到的信号。
+        if (!fence_.enabled || fence_zone_.has_value() || !latest_flight_.has_value()) {
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.home_valid || fence_.default_half_side_m <= 0.0 ||
+            fence_.default_zone_id == 0U || fence_.default_version == 0U) {
+            return;
+        }
+        const double lat0 = static_cast<double>(flight.home_lat_1e7) * 1e-7;
+        const double lon0 = static_cast<double>(flight.home_lon_1e7) * 1e-7;
+        if (lat0 == 0.0 && lon0 == 0.0) {
+            return;
+        }
+        const double dlat = fence_.default_half_side_m / 111320.0;
+        const double dlon =
+            fence_.default_half_side_m /
+            (111320.0 * std::max(0.1, std::cos(lat0 * 0.017453292519943295)));
+        common::FenceZone zone;
+        zone.header.sequence = 0;
+        zone.header.receive_time_ms = now_ms;
+        zone.header.valid_for_ms = 0;  // 持久快照
+        zone.header.source_id = 0;     // 0=机载默认区域（非地面站下发）
+        zone.header.health = 1;
+        zone.protocol_version = 1;
+        zone.zone_id = fence_.default_zone_id;
+        zone.version = fence_.default_version;
+        zone.type = common::FenceZoneType::kPolygon;
+        zone.action = fence_.default_action;
+        zone.altitude_reference = 1;  // 相对 Home：默认区域跟随起飞点
+        zone.alt_min_m = fence_.default_alt_min_m;
+        zone.alt_max_m = fence_.default_alt_max_m;
+        zone.ref_lat_1e7 = flight.home_lat_1e7;
+        zone.ref_lon_1e7 = flight.home_lon_1e7;
+        zone.vertices = {{lat0 - dlat, lon0 - dlon},
+                         {lat0 - dlat, lon0 + dlon},
+                         {lat0 + dlat, lon0 + dlon},
+                         {lat0 + dlat, lon0 - dlon}};
+        zone.received_ms = now_ms;
+        SPDLOG_INFO(
+            "围栏默认区域已生成: zone={}/{} 半边长={:.1f}m 高度带=[{:.1f},{:.1f}]m "
+            "动作={}（地面站可覆盖）",
+            zone.zone_id, zone.version, fence_.default_half_side_m, zone.alt_min_m,
+            zone.alt_max_m, static_cast<int>(zone.action));
+        ApplyFenceZone(zone);
+    }
+
+    // 65022 区域回读：新区域立即发一次，其后按 fence.report_period 周期重发，
+    // 使地面站刷新/重连后无需额外请求即可恢复图层与一致性比对。
+    void PublishFenceZoneReport(uint64_t now_ms) {
+        if (!fence_zone_.has_value()) {
+            return;
+        }
+        const uint64_t period_ms =
+            static_cast<uint64_t>(fence_.report_period.count());
+        const bool due =
+            fence_report_pending_ || fence_report_last_ms_ == 0 ||
+            (period_ms > 0U && now_ms - fence_report_last_ms_ >= period_ms);
+        if (!due) {
+            return;
+        }
+        (void)fence_zone_report_output_.Publish(
+            std::make_shared<const common::FenceZone>(*fence_zone_));
+        fence_report_pending_ = false;
+        fence_report_last_ms_ = now_ms;
+    }
+
     void EvaluateFenceGuard(uint64_t now_ms) {
+        EnsureDefaultFenceZone(now_ms);
+        PublishFenceZoneReport(now_ms);
         // 判定与动作分离：即使 fence.enabled=false（默认配置），也照常计算状态并
         // 每拍上报 65019，让地面站能确认“区域是否已装载、形状与高度带是否合理”，
         // 否则地面站只能看到 state=3(no_zone) 而无从判断。越界**动作**（保持/返航/
@@ -4148,6 +4227,9 @@ private:
     common::Topic<common::MissionStatus> status_output_;
     common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
     common::Topic<common::FenceStatus> fence_status_output_;
+    common::Topic<common::FenceZone> fence_zone_report_output_;
+    uint64_t fence_report_last_ms_ = 0;
+    bool fence_report_pending_ = false;
     uint64_t fence_status_sequence_ = 0;
     uint64_t last_fence_status_publish_ms_ = 0;
 };
@@ -4200,6 +4282,10 @@ common::Topic<common::MissionAssignmentAck>&
 MissionStateMachine::AssignmentAckOutput() {
     return impl_->AssignmentAckOutput();
 }
+common::Topic<common::FenceZone>& MissionStateMachine::FenceZoneReportOutput() {
+    return impl_->FenceZoneReportOutput();
+}
+
 common::Topic<common::FenceStatus>& MissionStateMachine::FenceStatusOutput() {
     return impl_->FenceStatusOutput();
 }
@@ -4303,6 +4389,11 @@ MissionStateMachineStub::AssignmentAckOutput() {
 common::Topic<common::FenceStatus>&
 MissionStateMachineStub::FenceStatusOutput() {
     return fence_status_output_;
+}
+
+common::Topic<common::FenceZone>&
+MissionStateMachineStub::FenceZoneReportOutput() {
+    return fence_zone_report_output_;
 }
 
 common::Topic<common::MissionCommandAck>&

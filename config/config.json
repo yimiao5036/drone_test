@@ -178,6 +178,13 @@
     "fence": {
         "enabled": false,
         "zone_cache_path": "config/zone.json",
+        "report_period_ms": 5000,
+        "default_half_side_m": 100.0,
+        "default_alt_min_m": 0.0,
+        "default_alt_max_m": 30.0,
+        "default_zone_id": 1,
+        "default_version": 1,
+        "default_action": 1,
         "violation_debounce_ms": 1500,
         "boundary_margin_m": 1.0,
         "boundary_warn_m": 10.0,

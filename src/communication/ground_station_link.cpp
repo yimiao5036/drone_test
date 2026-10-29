@@ -346,6 +346,10 @@ public:
                 fence_status_subscription_ = fence_status_topic_->Subscribe(
                     2, common::Topic<common::FenceStatus>::OverflowPolicy::kDropOldest);
             }
+            if (fence_zone_report_topic_ != nullptr) {
+                fence_zone_report_subscription_ = fence_zone_report_topic_->Subscribe(
+                    4, common::Topic<common::FenceZone>::OverflowPolicy::kDropOldest);
+            }
             if (mission_command_ack_topic_ != nullptr) {
                 mission_command_ack_subscription_ =
                     mission_command_ack_topic_->Subscribe(
@@ -369,6 +373,7 @@ public:
             mission_assignment_ack_subscription_.Reset();
             net_fire_ack_subscription_.Reset();
             fence_status_subscription_.Reset();
+            fence_zone_report_subscription_.Reset();
             mission_command_ack_subscription_.Reset();
             serial_.Close();
             RecordError((std::string("地面站通信启动失败: ") + error.what()).c_str());
@@ -394,6 +399,7 @@ public:
         mission_assignment_ack_subscription_.Reset();
         net_fire_ack_subscription_.Reset();
         fence_status_subscription_.Reset();
+        fence_zone_report_subscription_.Reset();
         mission_command_ack_subscription_.Reset();
         latest_state_.reset();
         latest_health_.reset();
@@ -462,6 +468,16 @@ public:
         fence_status_topic_ = &topic;
     }
 
+    // 绑定 65022 围栏区域回读输入。必须在 Start 前调用，运行中不允许改绑。
+    void SetFenceZoneReportInput(common::Topic<common::FenceZone>& topic) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("地面站 FenceZone Report Topic 必须在 Start 前绑定");
+            return;
+        }
+        fence_zone_report_topic_ = &topic;
+    }
+
     // 65020 任务指令解析结果输出（地址双字段匹配本机后才发布）。
     common::Topic<common::MissionCommand>& MissionCommandOutput() {
         return mission_command_output_;
@@ -522,6 +538,7 @@ private:
         common::Topic<common::MissionAssignmentAck>::Subscription;
     using NetFireAckSubscription = common::Topic<common::NetFireAck>::Subscription;
     using FenceStatusSubscription = common::Topic<common::FenceStatus>::Subscription;
+    using FenceZoneReportSubscription = common::Topic<common::FenceZone>::Subscription;
     using MissionCommandAckSubscription =
         common::Topic<common::MissionCommandAck>::Subscription;
 
@@ -566,6 +583,7 @@ private:
             DrainMissionAssignmentAcks();
             DrainNetFireAcks();
             DrainFenceStatuses();
+            DrainFenceZoneReports();
             DrainMissionCommandAcks();
             const uint64_t current_ms = MonotonicMs();
             CheckHeartbeatTimeout(current_ms);
@@ -717,6 +735,13 @@ private:
     void DrainFenceStatuses() {
         while (auto message = fence_status_subscription_.TryTake()) {
             (void)SendFenceStatus(**message);
+        }
+    }
+
+    // 消费 65022 区域回读输入：区域是持久快照，只发最新一份。
+    void DrainFenceZoneReports() {
+        while (auto message = fence_zone_report_subscription_.TryTake()) {
+            (void)SendFenceZoneReport(**message);
         }
     }
 
@@ -1175,6 +1200,8 @@ private:
                     (111320.0 * std::max(0.1, std::cos(ref_lat * kDegToRad)));
             zone.vertices.push_back(vertex);
         }
+        zone.ref_lat_1e7 = payload.ref_lat_1e7;
+        zone.ref_lon_1e7 = payload.ref_lon_1e7;
         zone.received_ms = receive_time_ms;
         (void)fence_zone_output_.Publish(
             std::make_shared<const common::FenceZone>(zone));
@@ -1671,6 +1698,59 @@ private:
         // 保留尾字节非零，确保 MAVLink V2_EXTENSION 短帧 payload_len 固定为60。
         WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
         return SendStatusExtension(kMissionStatusMessageType, payload);
+    }
+
+    // 发送 65022 围栏区域回读：与 65018 完全同构，把机载生效区域原样回传。
+    // 地面站据此判断"本地定义是否等于机载实况"，并在重连后恢复图层显示。
+    bool SendFenceZoneReport(const common::FenceZone& zone) {
+        if (zone.vertices.size() < 3U || zone.vertices.size() > kFenceMaxVertices) {
+            return false;
+        }
+        // 参考点优先用下发时保存的原值；默认区域（本机生成）无原值时取首顶点。
+        int32_t ref_lat_1e7 = zone.ref_lat_1e7;
+        int32_t ref_lon_1e7 = zone.ref_lon_1e7;
+        if (ref_lat_1e7 == 0 && ref_lon_1e7 == 0) {
+            ref_lat_1e7 =
+                static_cast<int32_t>(std::llround(zone.vertices.front().latitude_deg * 1e7));
+            ref_lon_1e7 =
+                static_cast<int32_t>(std::llround(zone.vertices.front().longitude_deg * 1e7));
+        }
+        const double ref_lat = static_cast<double>(ref_lat_1e7) * 1e-7;
+        const double ref_lon = static_cast<double>(ref_lon_1e7) * 1e-7;
+        const double lon_scale =
+            111320.0 * std::max(0.1, std::cos(ref_lat * kDegToRad));
+        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+        WriteLe<uint8_t>(payload, 0, zone.protocol_version);
+        WriteLe<uint16_t>(payload, 1, zone.zone_id);
+        WriteLe<uint16_t>(payload, 3, zone.version);
+        WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(zone.type));
+        WriteLe<uint8_t>(payload, 6, static_cast<uint8_t>(zone.action));
+        WriteLe<uint8_t>(payload, 7, zone.altitude_reference);
+        WriteLe<int16_t>(payload, 8,
+                         static_cast<int16_t>(std::llround(zone.alt_min_m * 10.0)));
+        WriteLe<int16_t>(payload, 10,
+                         static_cast<int16_t>(std::llround(zone.alt_max_m * 10.0)));
+        WriteLe<uint8_t>(payload, 12, static_cast<uint8_t>(zone.vertices.size()));
+        WriteLe<int32_t>(payload, 13, ref_lat_1e7);
+        WriteLe<int32_t>(payload, 17, ref_lon_1e7);
+        for (size_t index = 0; index < zone.vertices.size(); ++index) {
+            const double north_m =
+                (zone.vertices[index].latitude_deg - ref_lat) * 111320.0;
+            const double east_m = (zone.vertices[index].longitude_deg - ref_lon) * lon_scale;
+            WriteLe<int16_t>(payload, static_cast<size_t>(21U + index * 4U),
+                             static_cast<int16_t>(std::llround(north_m * 100.0)));
+            WriteLe<int16_t>(payload, static_cast<size_t>(23U + index * 4U),
+                             static_cast<int16_t>(std::llround(east_m * 100.0)));
+        }
+        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
+        const bool sent = SendStatusExtension(kFenceZoneReportMessageType, payload);
+        const uint64_t count = ++fence_report_send_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO("围栏区域回读发送{}: zone={}/{} 顶点={} 动作={} count={}",
+                        sent ? "" : "失败", zone.zone_id, zone.version,
+                        zone.vertices.size(), static_cast<int>(zone.action), count);
+        }
+        return sent;
     }
 
     // 发送 65019 围栏状态：以本机身份发往 255/190。状态是周期快照，地面站据此
@@ -2243,12 +2323,15 @@ private:
     common::Topic<common::NetFireAck>* net_fire_ack_topic_ = nullptr;
     common::Topic<common::FenceStatus>* fence_status_topic_ = nullptr;
     common::Topic<common::MissionCommandAck>* mission_command_ack_topic_ = nullptr;
+    common::Topic<common::FenceZone>* fence_zone_report_topic_ = nullptr;
     FlightSubscription flight_state_subscription_;
     HealthSubscription health_subscription_;
     MissionSubscription mission_status_subscription_;
     AssignmentAckSubscription mission_assignment_ack_subscription_;
     NetFireAckSubscription net_fire_ack_subscription_;
     FenceStatusSubscription fence_status_subscription_;
+    FenceZoneReportSubscription fence_zone_report_subscription_;
+    uint64_t fence_report_send_count_ = 0;
     MissionCommandAckSubscription mission_command_ack_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     std::optional<common::HealthStatus> latest_health_;
@@ -2258,6 +2341,7 @@ private:
     common::Topic<common::NetFireCommand> net_fire_command_output_;
     common::Topic<common::FenceZone> fence_zone_output_;
     common::Topic<common::MissionCommand> mission_command_output_;
+    common::Topic<common::FenceZone> fence_zone_report_output_;
     uint32_t last_ground_station_boot_id_ = 0;
     uint32_t last_target_update_seq_ = 0;
     uint64_t target_v2_extension_count_ = 0;
@@ -2351,6 +2435,10 @@ void GroundStationLink::SetFenceStatusInput(
     common::Topic<common::FenceStatus>& topic) {
     impl_->SetFenceStatusInput(topic);
 }
+void GroundStationLink::SetFenceZoneReportInput(
+    common::Topic<common::FenceZone>& topic) {
+    impl_->SetFenceZoneReportInput(topic);
+}
 common::Topic<common::MissionCommand>& GroundStationLink::MissionCommandOutput() {
     return impl_->MissionCommandOutput();
 }
@@ -2415,6 +2503,8 @@ common::Topic<common::FenceZone>& GroundStationLinkStub::FenceZoneOutput() {
 }
 void GroundStationLinkStub::SetFenceStatusInput(
     common::Topic<common::FenceStatus>&) {}
+void GroundStationLinkStub::SetFenceZoneReportInput(
+    common::Topic<common::FenceZone>&) {}
 common::Topic<common::MissionCommand>&
 GroundStationLinkStub::MissionCommandOutput() {
     return mission_command_output_;

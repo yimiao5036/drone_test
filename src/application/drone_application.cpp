@@ -290,6 +290,9 @@ void DroneApplication::BindTopics() {
             ground_station_link_->FenceZoneOutput());
         ground_station_link_->SetFenceStatusInput(
             mission_state_machine_->FenceStatusOutput());
+        // 65022 区域回读：机载当前生效区域 → 地面站（比对 + 重连后恢复图层）。
+        ground_station_link_->SetFenceZoneReportInput(
+            mission_state_machine_->FenceZoneReportOutput());
         if (flight_controller_ != nullptr) {
             flight_controller_->SetFencePolygonSource(
                 mission_state_machine_.get());

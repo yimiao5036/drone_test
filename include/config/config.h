@@ -200,6 +200,19 @@ struct FenceConfig {
     common::FenceAction violation_action = common::FenceAction::kReturn;
     /// 围栏状态回传（65019）周期。
     std::chrono::milliseconds status_period{1000};
+    /// 65022 区域回读周期（机载 → 地面站）：地面站据此比对本地定义与机载实况，
+    /// 并在刷新/重连后恢复图层。5s 一次、约 56B，对串口负担可忽略。
+    std::chrono::milliseconds report_period{5000};
+
+    // 机载初始区域（2026-10-29）：既没有 zone.json 缓存、也还没收到 65018 时，
+    // 以 Home 为中心生成该方形区域并立即落盘，保证"开机即有围栏"，避免出现
+    // "无区域则不限制"的空窗。地面站连上后可比对并整体覆盖。
+    double default_half_side_m = 100.0;
+    double default_alt_min_m = 0.0;
+    double default_alt_max_m = 30.0;
+    uint16_t default_zone_id = 1;
+    uint16_t default_version = 1;
+    common::FenceAction default_action = common::FenceAction::kReturn;
     void Validate() const;
 };
 

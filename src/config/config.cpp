@@ -1032,6 +1032,20 @@ AppConfig LoadAppConfig(const std::string& path,
                     static_cast<int>(config.fence.violation_action)));
     config.fence.status_period = ReadOptionalPositiveMilliseconds(
         fence, "status_period_ms", config.fence.status_period);
+    config.fence.report_period = ReadOptionalPositiveMilliseconds(
+        fence, "report_period_ms", config.fence.report_period);
+    config.fence.default_half_side_m = ReadOptionalNonNegativeDouble(
+        fence, "default_half_side_m", config.fence.default_half_side_m);
+    config.fence.default_alt_min_m = ReadOptionalNonNegativeDouble(
+        fence, "default_alt_min_m", config.fence.default_alt_min_m);
+    config.fence.default_alt_max_m = ReadOptionalNonNegativeDouble(
+        fence, "default_alt_max_m", config.fence.default_alt_max_m);
+    config.fence.default_zone_id = static_cast<uint16_t>(
+        fence.value("default_zone_id", static_cast<int>(config.fence.default_zone_id)));
+    config.fence.default_version = static_cast<uint16_t>(
+        fence.value("default_version", static_cast<int>(config.fence.default_version)));
+    config.fence.default_action = static_cast<common::FenceAction>(
+        fence.value("default_action", static_cast<int>(config.fence.default_action)));
     config.fence.Validate();
     // 控制器钳制余量与围栏配置保持单一真源：FlightController 不读 fence 节。
     config.controller.fence_margin_m = config.fence.boundary_margin_m;
