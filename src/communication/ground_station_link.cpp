@@ -1698,7 +1698,15 @@ private:
         WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
         const bool sent = SendStatusExtension(kFenceStatusMessageType, payload);
         const uint64_t count = ++fence_status_send_count_;
-        if (ShouldLogThrottled(count)) {
+        // 1Hz 常态上报，只在“状态变化 / 首条 / 每 300 条”打日志：围栏状态是持续流，
+        // 逐条 INFO 会在长时间飞行中把日志刷满。
+        const bool state_changed = status.state != last_fence_state_ ||
+                                   status.zone_id != last_fence_zone_id_ ||
+                                   status.version != last_fence_version_;
+        last_fence_state_ = status.state;
+        last_fence_zone_id_ = status.zone_id;
+        last_fence_version_ = status.version;
+        if (state_changed || count == 1U || count % 300U == 0U) {
             SPDLOG_INFO(
                 "围栏状态发送{}: zone={}/{} state={} 距边界={:.2f}m 越界={}ms count={}",
                 sent ? "成功" : "失败", status.zone_id, status.version,
@@ -2274,6 +2282,9 @@ private:
     uint64_t fence_invalid_count_ = 0;
     uint64_t fence_publish_count_ = 0;
     uint64_t fence_status_send_count_ = 0;
+    common::FenceState last_fence_state_ = common::FenceState::kNoZone;
+    uint16_t last_fence_zone_id_ = 0;
+    uint16_t last_fence_version_ = 0;
     uint64_t mission_command_receive_count_ = 0;
     uint64_t mission_command_invalid_count_ = 0;
     uint64_t mission_command_address_mismatch_count_ = 0;

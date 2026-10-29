@@ -1812,10 +1812,31 @@ private:
     /// 后按区域动作处置：hold=原地保持（不中止任务）、return=中止到 S12 返航、
     /// land=转 S13 降落。每拍在电池守卫之后、目标看门狗之前评估；动作只在地面/
     /// 空中任务态生效（见 FenceActionActiveState），65019 状态始终上报。
+    /// 高度带判据使用的高度（米）。
+    /// - altitude_reference=0：AMSL = EKF 锚点高度 + 相对锚点高度(−local_z)
+    /// - altitude_reference=1：相对 Home = AMSL − Home 高度
+    /// **不能直接用 −local_z 当“相对 Home”**：EKF 锚点常比地面高数米（现场日志
+    /// 出现过地面静止时 local_z≈+6.2m），直接用会让高度带整体偏移，没起飞就判越界。
+    /// 无 Home 快照时退回相对锚点，并保持与旧行为一致（仅兜底）。
+    double AltitudeForFence(uint8_t altitude_reference,
+                            const common::FlightStateSnapshot& flight) const {
+        const double altitude_amsl = static_cast<double>(flight.ned_ref_alt_mm) * 1e-3 -
+                                     static_cast<double>(flight.local_z_m);
+        if (altitude_reference != 1U && flight.ned_ref_valid) {
+            return altitude_amsl;
+        }
+        if (flight.home_valid) {
+            return altitude_amsl - static_cast<double>(flight.home_altitude_mm) * 1e-3;
+        }
+        return -static_cast<double>(flight.local_z_m);
+    }
+
     void EvaluateFenceGuard(uint64_t now_ms) {
-        if (!fence_.enabled) {
-            return;
-        }        // 区域/锚点变化后重建 NED 多边形（锚点未就绪时降级 no_zone，不盲算）。
+        // 判定与动作分离：即使 fence.enabled=false（默认配置），也照常计算状态并
+        // 每拍上报 65019，让地面站能确认“区域是否已装载、形状与高度带是否合理”，
+        // 否则地面站只能看到 state=3(no_zone) 而无从判断。越界**动作**（保持/返航/
+        // 降落）仍受 enabled 门控，默认配置下不会产生任何中止或降落。
+        // 区域/锚点变化后重建 NED 多边形（锚点未就绪时降级 no_zone，不盲算）。
         if (fence_dirty_) {
             RebuildFencePolygon();
             fence_dirty_ = false;
@@ -1838,16 +1859,11 @@ private:
             const bool inside = control::fence::PointInPolygon(polygon.vertices, point);
             distance_m =
                 control::fence::SignedDistanceToBoundary(polygon.vertices, point);
-            // 高度带：altitude_reference=1 按相对 Home（-local_z）；0 按 EKF
-            // 锚点 AMSL（锚点高度 - local_z）。上限 0 表示该轴不限制。
+            // 高度带：altitude_reference=1 相对 Home、0 相对 AMSL。上限 0 表示不限制。
             const double altitude_m =
                 polygon.alt_max_m <= 0.0 && polygon.alt_min_m <= 0.0
                     ? 0.0
-                    : (fence_zone_->altitude_reference == 1U ||
-                               !latest_flight_->ned_ref_valid
-                           ? -static_cast<double>(flight.local_z_m)
-                           : static_cast<double>(flight.ned_ref_alt_mm) * 1e-3 -
-                                 static_cast<double>(flight.local_z_m));
+                    : AltitudeForFence(fence_zone_->altitude_reference, flight);
             const bool altitude_ok =
                 (polygon.alt_max_m <= 0.0 || altitude_m <= polygon.alt_max_m) &&
                 (polygon.alt_min_m <= 0.0 || altitude_m >= polygon.alt_min_m);
@@ -1877,6 +1893,10 @@ private:
         fence_violation_ms_ = violation_ms;
         fence_hold_active_ = false;
 
+        if (!fence_.enabled) {
+            // 判定照常上报（见函数开头），但默认配置不执行任何越界动作。
+            return;
+        }
         if (!violated || fence_abort_latched_) {
             return;
         }
@@ -3883,7 +3903,9 @@ private:
         status.header.health = 1;
         status.zone_id = fence_zone_.has_value() ? fence_zone_->zone_id : 0U;
         status.version = fence_zone_.has_value() ? fence_zone_->version : 0U;
-        status.state = fence_.enabled ? fence_state_ : common::FenceState::kNoZone;
+        // 状态始终上报真实判定结果（enabled=false 时动作被门控，但几何状态仍要可见：
+        // 否则地面站只能看到 no_zone，无法判断区域是否装载、形状是否合理）。
+        status.state = fence_state_;
         status.distance_to_boundary_m = fence_distance_m_;
         status.violation_duration_ms = fence_violation_ms_;
         status.action_pending = fence_hold_active_ || fence_abort_latched_;

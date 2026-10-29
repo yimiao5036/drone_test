@@ -4128,6 +4128,94 @@ state_machine::MissionStateMachineConfig MakeFenceTestConfig(
 }
 
 /// 越界返回动作：S5 中被拖到区域外 → 65019 先报 violated，随后中止到 S12 返航。
+/// 默认配置（fence.enabled=false）下也应当照常计算并上报 65019：
+/// 否则地面站只能看到 state=3(no_zone)，无法判断“区域是否已装载、形状是否合理”。
+TEST(MissionStateMachineTest, FenceStateReportedEvenWhenDisabled) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 默认生产配置
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(7, 3, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(500.0f, 0.0f, -2.0f)))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "enabled=false 时仍应上报真实围栏状态";
+    // 但不得产生动作：状态机应留在 S5，不转 S12。
+    std::this_thread::sleep_for(200ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "enabled=false 不得触发越界动作";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 高度带“相对 Home”必须减掉 Home 高度，不能直接用 −local_z：
+/// EKF 锚点常比地面高数米（现场日志地面静止时 local_z≈+6.2m）。
+TEST(MissionStateMachineTest, FenceAltitudeUsesHomeReference) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    // 构造“锚点比 Home 高 6m”的现场情形（现场日志里锚点常高于地面数米）：
+    //   EKF 锚点 106m、Home 100m、机体相对锚点向下 2m → AMSL=108m → 相对 Home=8m。
+    //   旧实现直接用 −local_z=2m，会把“相对 Home 8m”算成 2m。
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    // 面积给足（±100m），高度带 [0,10]m 相对 Home：起飞前 8m 合规。
+    auto zone = MakeSquareZone(5, 2, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 位置留在区域内，抬高到相对锚点 8m（AMSL=114m，相对 Home=14m > 上限 10m）：
+    // 正确的 Home 相对高度应判越界；旧实现算成 −local_z=8m，会误判为“合规”。
+    auto high = MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f);
+    high.ned_ref_alt_mm = 106000;
+    high.home_valid = true;
+    high.home_altitude_mm = 100000;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(high))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated)
+        << "相对 Home 高度 14m 超上限 10m，应判越界（旧的 −local_z 会误算成 8m 合规）";
+    DrainAcks(harness.ack_subscription);
+}
+
 TEST(MissionStateMachineTest, FenceViolationAbortsToReturnHome) {
     AssignmentHarness harness(MakeFenceTestConfig());
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
