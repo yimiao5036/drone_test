@@ -13,11 +13,26 @@
  */
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "common/types.h"
 
 namespace drone::control::fence {
+
+/// 区域几何/高度带合法性校验（65018 接受前的唯一闸口）：
+/// - zone_id/version 非 0，altitude_reference ∈ {0=AMSL, 1=Home}；
+/// - 高度带有限，允许 alt_min_m <= 0（相对 Home 表示低于起飞点，地面站 UI
+///   允许 -1000m；下限只受协议 i16 0.1m 范围约束，最低 -3276.8m），
+///   允许 alt_max_m == 0（不限高），否则要求 alt_min_m <= alt_max_m；
+/// - 顶点坐标有限且在经纬度范围内，顶点数 >= 3；
+/// - 任意一边长 >= 0.5m（拒绝重复点/共线堆积造成的退化边）；
+/// - 任意两条不相邻边不相交（射线法对自交多边形无意义）；
+/// - 投影面积 >= 1m²（拒绝面积 0 的退化多边形）。
+///
+/// 校验在"顶点均值"为参考的局部等距平面上完成（只用于几何判定，不参与
+/// 实际换算）。失败时返回 false 并写入中文原因（reason 可为 nullptr）。
+bool ValidateZone(const common::FenceZone& zone, std::string* reason);
 
 /// 点是否位于多边形内部（射线法；恰落在边上按"内部"处理）。
 /// 顶点少于 3 个时返回 false。

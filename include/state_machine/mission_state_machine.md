@@ -335,7 +335,15 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 输入：`SetFenceInput()` 绑定 `kFenceZone`（Start 前）；`Start()` 时若
     `fence.enabled` 且 `zone_cache_path` 存在则先 `ZoneStore::Load()` 装载缓存，
     作为首拍区域。在线帧与缓存都经 `ApplyFenceZone()` 做同一套合法性检查
-    （zone_id/version 非 0、顶点 ≥3），非法帧节流 WARN 后丢弃。
+    （zone_id/version 非 0、顶点 3~256、经纬度数值合法、边长 ≥0.5m、面积 ≥1m²、
+    多边形不自交、`altitude_reference∈{0,1}`、高度带不倒挂
+    `alt_max>0 && alt_min>alt_max`），非法帧节流 WARN 后丢弃并保留上一份可用区域；
+    几何/拓扑校验统一由 `control::fence::ValidateZone()` 实现（2026-10-30 审查修复：
+    旧实现只查 zone_id/version/顶点数，共线、自交、重复点、面积 0 的区域会被接受并
+    参与判内/钳制，地面站一次误配置就让围栏永久失效）。区域是否"变化"按**内容**
+    比较（id/version + 类型/动作/高度基准与上下限 + 顶点），同 id/version 改几何也会
+    落盘 `zone.json` 并回读（旧实现只比 id/version：地面站忘递增版本号时只在内存生效，
+    飞机重启后回滚到缓存里的旧区域）。
   - 坐标换算：`RebuildFencePolygon()` 用当前 `FlightStateSnapshot` 的 EKF 锚点
     （`ned_ref_lat_1e7/ned_ref_lon_1e7`）把每个顶点经 `perception::GeodeticToLocalNed()`
     换成局部 NED；锚点变化后下一拍自动重建（区域只在 `fence_dirty_` 时重建）。
@@ -355,7 +363,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 动作：`follow_zone_action=true` 时按区域声明的 action，否则按 `violation_action`。
     `kHold` → 每拍把位置意图钉在当前局部位置（reason=10 `kReasonFenceViolation`），
     任务状态不迁移；`kReturn` → `AbortForFence()`（停发位置意图、`assignment_tracker_.AbortAirborne()`、
-    65015 `aborted`、转 S12 返航）；`kLand` → 直接转 S13 降落。
+    65015 `aborted`、转 S12 返航）；`kLand` → 同一 `AbortForFence()` 入口、转 S13 降落
+    （2026-10-30 审查修复：旧实现只 `TransitionTo(kLanding)`，不发 65015、不
+    `AbortAirborne`，S12/S13 入口语义与返航不一致）。中止锁 `fence_abort_latched_`
+    与 `mission_abort_latched_` 同语义：per-boot 复位、新分配被接受时复位，
+    同一次越界不重复触发中止链/重复回执。
   - 只在**飞行相关状态**动作（`kArming`~`kPostIntercept`）：地面 S0~S2、S12/S13/S14
     与故障态只上报 65019，不触发中止链，避免地面就锁死任务。
 - **人工任务指令（2026-10-29，65020/65021）**：地面站可下发"主动返航"打断当前任务。
@@ -373,7 +385,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `TransitionTo(kReturnHome,"地面站主动返航指令，中止任务并返航")`，并发 65015
     `aborted reason=kCancelledByGcs(12)`。**不是 PX4 RTL**：返航轨迹仍由 S12 位置意图控制。
   - 回执：`PublishMissionCommandAck()` 走 `kMissionCommandAck`，字段含 result/reason/
-    `mission_state`（回执时刻状态），地面站无需猜测机载处于哪一态。
+    `mission_state`（回执时刻状态），地面站无需猜测机载处于哪一态；`header.sequence`
+    每条回执只自增一次（2026-10-30 审查修复：旧实现同一条回执自增两次、序号跳 2，
+    地面站按序号做去重/丢包统计会误判）。
   - **65015 的既有门槛（2026-10-28 复核）**：`PublishTakeoffAbortAck()` 首行是
     `if (!accepted_assignment_.has_value()) return;`，因此只有在先接受过 65014 分配的
     任务里，中止才会同步 65015；影子/未分配场景（含 SITL `--sitl-stage4-command`）只看
@@ -624,7 +638,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `min_battery_percent>0` 时还要求电池遥测有效且剩余电量达标（**当前生产保持 0，
   实机后冻结**）。满足→S9；
   S9 条件失效→S7；`auto_authorize=true`→S10；false 时等
-  `authorization_timeout_ms` 超时→S12。S9/S10 仍走 `EvaluateVisualServoIntent`
+  `authorization_timeout_ms` 超时→按任务中止收口转 S12（2026-10-30 审查修复：
+  停发视觉伺服意图、`ResetTargetHold()`、`AbortAirborne()`、`RememberTakeoffAbort()`、
+  65015 `aborted reason=target_wait_timeout`——旧实现只 `TransitionTo(kReturnHome)`，
+  S12 起没有任何意图发布，控制器在 `intent_timeout` 后刹车保持、到点不返航）。
+  S9/S10 仍走 `EvaluateVisualServoIntent`
   保持伺服/瞄准，不因状态切换产生意图空窗。默认关闭（生产安全）。
 - **拦截后返航（S11~S14，2026-10-19 V1 单发口径）**：
   - **完成判据**：S10 内执行器 `Fired()`（触发命令成功入队，不等 ACK）→ S11；
@@ -843,6 +861,15 @@ ctest --test-dir build --output-on-failure
     捕网 187 入队 → S11/S12；
   - `InterceptEntryRejectsDistanceOutsideWindow`：测距 20m（>12m）→ 停在 S7、
     不发射（0 次命令）。
+  - `InterceptAuthorizationTimeoutAbortsAndReturns`（2026-10-30 审查修复回归）：
+    `auto_authorize=false` + `authorization_timeout=150ms`，S9 条件持续满足到超时 →
+    转 S12、65015 `aborted reason=target_wait_timeout`、停发视觉伺服、零发射命令。
+- 围栏回归（2026-10-30 审查修复）：`FenceLandActionAbortsToLanding`（land 动作
+  走 `AbortForFence()`：转 S13 + 65015 aborted + 零 187）、
+  `FenceRejectsDegenerateZoneAndKeepsPrevious`（自交/共线/重复点/高度带倒挂/
+  非法高度基准均拒收并保留上一份可用区域）、
+  `FenceSameIdVersionGeometryChangeRewritesCache`（同 id/version 改几何也落盘）；
+  `MissionCommandAckSequenceIncrementsOnce`（65021 序号逐条 +1）。
 - 配置（`interception`/`return_home` 节）：默认值、显式解析、非法窗口/
   返航高度拒绝、`interception.enabled=true` 且 `return_home.enabled=false`
   拒绝（发射后必须有返航收口）。

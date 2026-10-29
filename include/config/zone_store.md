@@ -42,7 +42,14 @@ JSON 键（`schema=1`）：
   同分区 rename 是原子操作，掉电不会留下半个文件。写失败记 ERROR 但不中断任务。
 - **读取宽松**：文件不存在 → 静默返回 `nullopt`（首次部署正常情况）；解析异常、
   字段缺失/类型错、`zone_id==0`、`version==0`、`vertices<3` → WARN 并返回 `nullopt`，
-  让状态机按 `kNoZone` 处理（不越界、不拦起飞）。
+  让状态机按 `kNoZone` 处理（不越界、不拦起飞）。缓存只做**结构**校验（字段/类型/
+  顶点数）；几何合法性（自交、零面积、重复点、高度带倒挂、非法 `altitude_reference`）
+  由 `MissionStateMachine::ApplyFenceZone()` 调 `control::fence::ValidateZone()` 拒收
+  （2026-10-30 审查修复：此前缓存里的退化区域会被直接采用）。
+- **写盘时机以内容为准**：`ApplyFenceZone()` 用 `FenceZoneContentChanged()` 比较
+  `zone_id/version/type/action/altitude_reference/alt_min/alt_max/顶点集`，同
+  `zone_id+version` 但内容变化也会重写缓存（旧实现只比 id/version，地面站修
+  顶点却不升版本时缓存与内存不一致，重启后回滚旧几何）。
 - 路径由 `fence.zone_cache_path` 配置；`config.cpp` 里用 `ResolveAdjacentPath(ConfigDirectoryOf(path), ...)` 
   解析，与 `config/` 同级部署，不受当前工作目录影响。
 - 不保存 `received_ms` 的真实时间语义：`Load()` 返回的 `received_ms` 用“加载时刻”填充，

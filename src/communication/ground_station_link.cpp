@@ -143,6 +143,23 @@ bool ShouldLogThrottled(uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+// 串口读错误重连：连续读失败达到阈值即判定设备丢失（单次 EIO/EINTR 不触发），
+// 关闭端口后按固定间隔重开。GroundStationLinkConfig 没有重连字段（配置解析在
+// drone_config 模块），这里用模块内常量，阈值语义与 px4_link 保持一致。
+constexpr uint32_t kSerialReadErrorReconnectThreshold = 3;
+constexpr std::chrono::milliseconds kSerialReconnectInterval{500};
+// 重连等待期间工作线程的睡眠，避免串口关闭后忙轮询占满一个核。
+constexpr std::chrono::milliseconds kSerialReconnectWorkerPause{100};
+// 遥测发送失败后的短退避：失败不推进正常周期，只按该退避重试（避免瞬态失败
+// 把一帧推迟整个周期，也避免写失败时空转）。
+constexpr std::chrono::milliseconds kSendRetryBackoff{100};
+// 时间同步状态的低频发布周期：读超时 20ms 时每轮发布会造成 ~50Hz 的
+// shared_ptr + 互斥量开销，无状态变化时降到 1Hz。
+constexpr std::chrono::milliseconds kTimeSyncStatusPublishInterval{1000};
+/// 65010 TRACK_TARGET_UPDATE 的协议有效数据最小长度：offset 54 的 alt_reference
+/// 允许被 MAVLink2 截尾（为 0），因此最小总长度是 5 + 54 = 59，而不是 60。
+constexpr uint16_t kTrackTargetUpdateMinimumPayloadLength = 54;
+
 // 65012/65013/65014/65015 均使用 MAVLink2 短帧：
 // V2_EXTENSION 固定头 5 字节 + 协议有效数据 55 字节，payload_len=60；
 // 协议 offset 54 固定写入 1，避免尾部零字节被 MAVLink2 截断。
@@ -168,6 +185,18 @@ T ClampRounded(float value, float scale, T minimum, T maximum) {
         return minimum;
     }
     const double scaled = std::round(static_cast<double>(value) * scale);
+    return static_cast<T>(std::clamp(scaled, static_cast<double>(minimum),
+                                     static_cast<double>(maximum)));
+}
+
+// double 版本，用于围栏回读的高度/顶点偏移换算：非有限值（NaN）返回 0，超量程
+// 夹逼到 int16 边界，避免 static_cast<int16_t> 在越界时发生实现定义的回绕。
+template <typename T>
+T ClampRoundedDouble(double value, double scale, T minimum, T maximum) {
+    if (!std::isfinite(value)) {
+        return static_cast<T>(0);
+    }
+    const double scaled = std::round(value * scale);
     return static_cast<T>(std::clamp(scaled, static_cast<double>(minimum),
                                      static_cast<double>(maximum)));
 }
@@ -362,6 +391,12 @@ public:
             last_ground_station_boot_id_ = 0;
             last_target_update_seq_ = 0;
             last_gcs_heartbeat_ms_ = 0;
+            // 串口重连状态必须随启动复位，否则上一次 Stop 时的待重连标志会
+            // 让新线程一进来就跳过读循环。
+            serial_reconnect_pending_ = false;
+            serial_read_error_streak_ = 0;
+            serial_reconnect_attempts_ = 0;
+            next_serial_reconnect_ms_ = 0;
             ResetTimeSync(true);
             connected_.store(false, std::memory_order_release);
             running_.store(true, std::memory_order_release);
@@ -405,6 +440,9 @@ public:
         latest_health_.reset();
         latest_mission_status_.reset();
         serial_.Close();
+        serial_reconnect_pending_ = false;
+        serial_read_error_streak_ = 0;
+        next_serial_reconnect_ms_ = 0;
         connected_.store(false, std::memory_order_release);
         ResetTimeSync(false);
         SPDLOG_INFO("地面站通信停止: serial={}", config_.serial.device);
@@ -557,6 +595,67 @@ private:
         std::chrono::steady_clock::time_point home;
     };
 
+    // 进入串口重连：关闭端口、摘掉连接状态并准备按间隔重开。
+    // 只在 WorkerLoop 调用。重连后必须彻底清掉半包缓冲与对端身份相关状态，
+    // 否则旧的 boot_id/序号/半包数据会污染新链路（协议 §6）。
+    void EnterSerialReconnect(const char* reason, uint64_t now_ms) {
+        if (serial_reconnect_pending_) {
+            return;
+        }
+        serial_reconnect_pending_ = true;
+        serial_read_error_streak_ = 0;
+        serial_reconnect_attempts_ = 0;
+        next_serial_reconnect_ms_ =
+            now_ms + static_cast<uint64_t>(kSerialReconnectInterval.count());
+        connected_.store(false, std::memory_order_release);
+        serial_.Close();
+        mavlink_.Reset();
+        latest_state_.reset();
+        latest_health_.reset();
+        latest_mission_status_.reset();
+        last_ground_station_boot_id_ = 0;
+        last_target_update_seq_ = 0;
+        last_gcs_heartbeat_ms_ = 0;
+        ResetTimeSync(false);
+        const uint64_t count = ++serial_reconnect_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("地面站串口链路中断，进入重连: reason={} device={} "
+                        "重试间隔={}ms 累计 {}",
+                        reason, config_.serial.device, kSerialReconnectInterval.count(),
+                        count);
+        }
+    }
+
+    // 按固定间隔尝试重开串口；成功后重置解析器并等待地面站心跳，失败继续退避。
+    // 只在 WorkerLoop 调用。
+    void TrySerialReconnect(uint64_t now_ms) {
+        if (!serial_reconnect_pending_ || now_ms < next_serial_reconnect_ms_) {
+            return;
+        }
+        const uint64_t attempts = ++serial_reconnect_attempts_;
+        try {
+            serial_.Open();
+            serial_.Flush();
+            mavlink_.Reset();
+            serial_reconnect_pending_ = false;
+            serial_read_error_streak_ = 0;
+            serial_reconnect_attempts_ = 0;
+            connected_.store(false, std::memory_order_release);
+            SPDLOG_INFO("地面站串口重连成功: device={} 尝试={} 次，等待地面站心跳",
+                        config_.serial.device, attempts);
+        } catch (const std::exception& error) {
+            next_serial_reconnect_ms_ =
+                now_ms + static_cast<uint64_t>(kSerialReconnectInterval.count());
+            const uint64_t count = ++serial_reconnect_failure_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("地面站串口重连失败: device={} 尝试={} 次 error={}"
+                            "（{}ms 后重试）累计 {}",
+                            config_.serial.device, attempts, error.what(),
+                            kSerialReconnectInterval.count(), count);
+            }
+        }
+    }
+
     // 工作线程主循环：阻塞读串口 → 增量解析 MAVLink → 消费飞行快照 →
     // 心跳/时间同步超时检查 → 各类遥测按各自截止时间发送。
     void WorkerLoop() {
@@ -565,16 +664,41 @@ private:
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
+            // 串口待重连：端口已关闭，按固定间隔重试打开；期间只维护超时判断，
+            // 不读不写，避免对无效 fd 反复系统调用。
+            if (serial_reconnect_pending_) {
+                const uint64_t reconnect_ms = MonotonicMs();
+                TrySerialReconnect(reconnect_ms);
+                CheckHeartbeatTimeout(reconnect_ms);
+                CheckTimeSyncTimeout(reconnect_ms);
+                std::this_thread::sleep_for(kSerialReconnectWorkerPause);
+                continue;
+            }
             // 一次读取尽可能多的串口字节并交给 MavlinkHandler 增量解析。
             const std::ptrdiff_t count = serial_.Read(read_buffer.data(), read_buffer.size());
             if (count > 0) {
+                serial_read_error_streak_ = 0;
                 mavlink_.Feed(read_buffer.data(), static_cast<std::size_t>(count),
                               [this](const mavlink_message_t& message) {
                                   HandleMessage(message);
                               });
             } else if (count < 0) {
-                error_count_.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t error_count =
+                    error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+                // 只计数 + sleep 会让链路永久失效：设备被拔出/波特率失配后
+                // Read 会一直返回 -1。连续达到阈值即关闭端口进入重连状态机。
+                if (++serial_read_error_streak_ >= kSerialReadErrorReconnectThreshold) {
+                    if (ShouldLogThrottled(error_count)) {
+                        SPDLOG_WARN("地面站串口连续读取错误: device={} 连续={}，累计 {}",
+                                    config_.serial.device, serial_read_error_streak_,
+                                    error_count);
+                    }
+                    EnterSerialReconnect("连续串口读取错误", MonotonicMs());
+                    continue;
+                }
                 std::this_thread::sleep_for(config_.serial.read_timeout);
+            } else {
+                serial_read_error_streak_ = 0;
             }
 
             // 把各输入队列里最新的状态捞出，并判断是否有“事件”需要立即下行。
@@ -637,6 +761,9 @@ private:
     }
 
     // 到期的遥测发送；每类维护各自 deadline，按 JSON 周期限频。
+    // 发送失败（编码为空或写串口失败）不推进正常周期，只按短退避重试：
+    // 一次瞬态失败不应该把该帧推迟一整个周期，失败本身由 EncodeAndWrite 计入
+    // ErrorCount 并被上层可观测。
     template <typename Sender>
     void SendIfDue(const std::chrono::steady_clock::time_point& now,
                    std::chrono::steady_clock::time_point& deadline,
@@ -644,7 +771,10 @@ private:
         if (now < deadline) {
             return;
         }
-        (void)sender();
+        if (!sender()) {
+            deadline = now + std::min(interval, kSendRetryBackoff);
+            return;
+        }
         deadline = now + interval;
     }
 
@@ -869,7 +999,14 @@ private:
         if (extension.message_type != kTrackTargetUpdateMessageType) {
             return;
         }
-        HandleTrackTargetUpdate(extension);
+        // 65010 的协议有效数据到 offset 54（alt_reference），MAVLink2 允许截掉
+        // 尾部零字节，因此不能直接沿用 60 字节的短帧门槛；把实际 payload 长度
+        // 交给处理器按最小长度 54 校验（A-05）。
+        const uint16_t payload_length =
+            message.len > kV2ExtensionFixedHeaderLength
+                ? static_cast<uint16_t>(message.len - kV2ExtensionFixedHeaderLength)
+                : 0U;
+        HandleTrackTargetUpdate(extension, payload_length);
     }
 
     // 65014 任务分配 payload 的链路层镜像（小端，协议有效 55 字节）。
@@ -1150,13 +1287,20 @@ private:
             }
             return;
         }
+        // 字段级校验：动作码只允许 0/1/2（保持/返航/降落）。越界值必须显式拒收，
+        // 不能静默映射成返航——地面站/干扰帧给出非法动作时不应改变执行边界。
+        // 高度带必须满足 alt_min <= alt_max；alt_max=0 表示"未限制"，此时不比较。
+        const bool altitude_band_invalid =
+            payload.alt_max_dm != 0 && payload.alt_min_dm > payload.alt_max_dm;
         if (payload.vertex_count < 3U || payload.vertex_count > kFenceMaxVertices ||
-            payload.type != 0U) {
+            payload.type != 0U || payload.action > 2U || altitude_band_invalid) {
             const uint64_t invalid_count = ++fence_invalid_count_;
             if (ShouldLogThrottled(invalid_count)) {
                 SPDLOG_WARN(
-                    "围栏区域字段非法: type={} 顶点={}（支持 3~{}）count={}",
+                    "围栏区域字段非法: type={} 顶点={}（支持 3~{}）action={} "
+                    "高度带={}~{}dm count={}",
                     payload.type, payload.vertex_count, kFenceMaxVertices,
+                    payload.action, payload.alt_min_dm, payload.alt_max_dm,
                     invalid_count);
             }
             return;
@@ -1175,10 +1319,21 @@ private:
         zone.zone_id = payload.zone_id;
         zone.version = payload.version;
         zone.type = common::FenceZoneType::kPolygon;
-        zone.action = payload.action == 0U
-                          ? common::FenceAction::kHold
-                          : (payload.action == 2U ? common::FenceAction::kLand
-                                                  : common::FenceAction::kReturn);
+        // 动作码已在上面校验为 0/1/2，这里用显式分支保留语义（不再有 3~255 的兜底）。
+        switch (payload.action) {
+            case 0U:
+                zone.action = common::FenceAction::kHold;
+                break;
+            case 1U:
+                zone.action = common::FenceAction::kReturn;
+                break;
+            case 2U:
+                zone.action = common::FenceAction::kLand;
+                break;
+            default:
+                // 不可达：非法动作在字段校验处已整帧拒收。
+                return;
+        }
         zone.altitude_reference = payload.altitude_reference;
         zone.alt_min_m = static_cast<double>(payload.alt_min_dm) * 0.1;
         zone.alt_max_m = static_cast<double>(payload.alt_max_dm) * 0.1;
@@ -1297,15 +1452,30 @@ private:
     }
 
 
-    // 处理 TRACK_TARGET_UPDATE：依次做地址匹配、协议版本、坐标、身份、时间同步、
+    // 处理 TRACK_TARGET_UPDATE：依次做帧长、地址匹配、协议版本、坐标、身份、时间同步、
     // 序号、字段范围与时效校验，全部通过后发布 GroundStationTarget 并回 ACCEPTED ACK；
     // 任一失败按语义回对应拒绝 ACK。
-    void HandleTrackTargetUpdate(const mavlink_v2_extension_t& extension) {
+    // @param payload_length V2_EXTENSION payload 的协议有效长度（message.len - 5）。
+    void HandleTrackTargetUpdate(const mavlink_v2_extension_t& extension,
+                                 uint16_t payload_length) {
         const uint64_t receive_count = ++target_update_receive_count_;
         if (ShouldLogThrottled(receive_count)) {
-            SPDLOG_INFO("收到目标UPDATE: target={}/{} count={}",
+            SPDLOG_INFO("收到目标UPDATE: target={}/{} len={} count={}",
                         extension.target_system, extension.target_component,
-                        receive_count);
+                        payload_length, receive_count);
+        }
+        // 帧长不足时字段可能已被 MAVLink2 截尾成 0，直接按非法字段拒收；
+        // 此时连 boot_id/seq 都不可信，ACK 用零值告知地面站帧被截断。
+        if (payload_length < kTrackTargetUpdateMinimumPayloadLength) {
+            const uint64_t invalid_count = ++target_update_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("目标UPDATE帧长不足: len={} required={} count={}",
+                            payload_length, kTrackTargetUpdateMinimumPayloadLength,
+                            invalid_count);
+            }
+            SendTrackTargetAck(0, 0, 0, 0, TrackTargetAckResult::kRejectedInvalidField,
+                               TrackTargetAckReason::kInternalError);
+            return;
         }
         if (extension.target_system != config_.aircraft_system_id ||
             extension.target_component != config_.aircraft_component_id) {
@@ -1319,13 +1489,7 @@ private:
             return;
         }
 
-        const auto payload = DecodeTrackTargetUpdate(extension.payload);
-        if (!payload) {
-            SendTrackTargetAck(0, 0, 0, 0, TrackTargetAckResult::kRejectedInvalidField,
-                               TrackTargetAckReason::kInternalError);
-            return;
-        }
-        const auto& update = *payload;
+        const TrackTargetUpdatePayload update = DecodeTrackTargetUpdate(extension.payload);
         if (update.target_system != config_.aircraft_system_id ||
             update.target_component != config_.aircraft_component_id) {
             const uint64_t mismatch_count = ++target_update_address_mismatch_count_;
@@ -1505,8 +1669,9 @@ private:
     }
 
     // 逐字段小端解码 TRACK_TARGET_UPDATE payload（前 55 字节）。
-    std::optional<TrackTargetUpdatePayload> DecodeTrackTargetUpdate(
-        const uint8_t* data) const {
+    // 调用方必须先按 kTrackTargetUpdateMinimumPayloadLength 校验长度，因此这里
+    // 不再返回 optional：字段解码本身不会失败，长度不足属帧级错误。
+    TrackTargetUpdatePayload DecodeTrackTargetUpdate(const uint8_t* data) const {
         TrackTargetUpdatePayload payload;
         payload.source_time_ms = ReadLe<uint64_t>(data, 0);
         payload.ground_station_boot_id = ReadLe<uint32_t>(data, 8);
@@ -1588,6 +1753,9 @@ private:
         uint16_t message_type,
         const std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN>& payload) {
         if (config_.mavlink_version != 2) {
+            // v1 无法承载 V2_EXTENSION：显式记录而不是静默丢帧，
+            // 否则地面站看到的只是"遥测停止"而链路错误计数毫无线索。
+            RecordError("地面站扩展帧需要 MAVLink 2，当前配置无法发送");
             return false;
         }
         return EncodeAndWrite([this, message_type, &payload](mavlink_status_t* status,
@@ -1703,7 +1871,16 @@ private:
     // 发送 65022 围栏区域回读：与 65018 完全同构，把机载生效区域原样回传。
     // 地面站据此判断"本地定义是否等于机载实况"，并在重连后恢复图层显示。
     bool SendFenceZoneReport(const common::FenceZone& zone) {
+        // 顶点数越界属上游数据缺陷（区域加载/回填错误），显式失败并节流告警，
+        // 不能静默 return false —— 否则地面站永远收不到回读也查不到原因。
         if (zone.vertices.size() < 3U || zone.vertices.size() > kFenceMaxVertices) {
+            const uint64_t invalid_count = ++fence_report_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("围栏区域回读顶点数非法: 顶点={} 支持 3~{} zone={}/{} "
+                            "count={}",
+                            zone.vertices.size(), kFenceMaxVertices, zone.zone_id,
+                            zone.version, invalid_count);
+            }
             return false;
         }
         // 参考点优先用下发时保存的原值；默认区域（本机生成）无原值时取首顶点。
@@ -1726,10 +1903,16 @@ private:
         WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(zone.type));
         WriteLe<uint8_t>(payload, 6, static_cast<uint8_t>(zone.action));
         WriteLe<uint8_t>(payload, 7, zone.altitude_reference);
+        // 高度带与顶点偏移用 clamp 转换：超量程夹逼到 int16 边界，NaN 走
+        // ClampRoundedDouble 的非有限分支（→0），避免实现定义回绕。
+        constexpr int16_t kInt16Min = std::numeric_limits<int16_t>::min();
+        constexpr int16_t kInt16Max = std::numeric_limits<int16_t>::max();
         WriteLe<int16_t>(payload, 8,
-                         static_cast<int16_t>(std::llround(zone.alt_min_m * 10.0)));
+                         ClampRoundedDouble<int16_t>(zone.alt_min_m, 10.0, kInt16Min,
+                                                     kInt16Max));
         WriteLe<int16_t>(payload, 10,
-                         static_cast<int16_t>(std::llround(zone.alt_max_m * 10.0)));
+                         ClampRoundedDouble<int16_t>(zone.alt_max_m, 10.0, kInt16Min,
+                                                     kInt16Max));
         WriteLe<uint8_t>(payload, 12, static_cast<uint8_t>(zone.vertices.size()));
         WriteLe<int32_t>(payload, 13, ref_lat_1e7);
         WriteLe<int32_t>(payload, 17, ref_lon_1e7);
@@ -1738,9 +1921,11 @@ private:
                 (zone.vertices[index].latitude_deg - ref_lat) * 111320.0;
             const double east_m = (zone.vertices[index].longitude_deg - ref_lon) * lon_scale;
             WriteLe<int16_t>(payload, static_cast<size_t>(21U + index * 4U),
-                             static_cast<int16_t>(std::llround(north_m * 100.0)));
+                             ClampRoundedDouble<int16_t>(north_m, 100.0, kInt16Min,
+                                                         kInt16Max));
             WriteLe<int16_t>(payload, static_cast<size_t>(23U + index * 4U),
-                             static_cast<int16_t>(std::llround(east_m * 100.0)));
+                             ClampRoundedDouble<int16_t>(east_m, 100.0, kInt16Min,
+                                                         kInt16Max));
         }
         WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
         const bool sent = SendStatusExtension(kFenceZoneReportMessageType, payload);
@@ -2022,11 +2207,14 @@ private:
         const uint64_t max_jitter_ns =
             static_cast<uint64_t>(config_.time_sync_max_offset_jump.count()) *
             1000000ULL;
+        bool state_changed = false;
         if (time_sync_samples_.size() >= config_.time_sync_minimum_samples &&
             jitter_ns <= max_jitter_ns) {
             const auto previous_state = time_sync_state_;
             time_sync_state_ = GroundStationTimeSyncState::kSynchronized;
-            if (previous_state != time_sync_state_) {
+            state_changed =
+                previous_state != GroundStationTimeSyncState::kSynchronized;
+            if (state_changed) {
                 SPDLOG_INFO(
                     "地面站时间同步建立: offset_ms={:.3f} rtt_ms={:.3f} jitter_ms={:.3f} samples={}",
                     static_cast<double>(time_sync_offset_ns_) / 1000000.0,
@@ -2034,8 +2222,29 @@ private:
                     static_cast<double>(time_sync_jitter_ns_) / 1000000.0,
                     time_sync_samples_.size());
             }
+        } else if (time_sync_state_ == GroundStationTimeSyncState::kSynchronized) {
+            // 已同步后如果抖动恶化（例如链路拥塞导致 RTT 抖动放大），必须降级
+            // 而不是继续用不可信的 offset（协议 §5：DEGRADED 覆盖 RTT/offset 跳变）。
+            time_sync_state_ = GroundStationTimeSyncState::kDegraded;
+            state_changed = true;
+            const uint64_t degraded_count = ++time_sync_degraded_count_;
+            if (ShouldLogThrottled(degraded_count)) {
+                SPDLOG_WARN(
+                    "地面站时间同步降级: jitter_ms={:.3f} 门限_ms={} rtt_ms={:.3f} "
+                    "samples={} 累计 {}",
+                    static_cast<double>(time_sync_jitter_ns_) / 1000000.0,
+                    config_.time_sync_max_offset_jump.count(),
+                    static_cast<double>(time_sync_round_trip_time_ns_) / 1000000.0,
+                    time_sync_samples_.size(), degraded_count);
+            }
         }
-        PublishTimeSyncStatus(now_ns);
+        // 状态跃迁立即发布；估计值的小幅变化按 1Hz 低频发布，
+        // 避免每收到一条 TIMESYNC 响应都加锁刷新状态快照。
+        if (state_changed) {
+            PublishTimeSyncStatus(now_ns);
+        } else {
+            PublishTimeSyncStatusIfDue(now_ns);
+        }
     }
 
     // 同步样本老化超时：超过 time_sync_timeout 即退回未同步。
@@ -2043,14 +2252,15 @@ private:
         const int64_t now_ns = static_cast<int64_t>(now_ms) * 1000000LL;
         PrunePendingTimeSyncRequests(now_ns);
         if (last_time_sync_sample_ns_ == 0 || now_ns < last_time_sync_sample_ns_) {
-            PublishTimeSyncStatus(now_ns);
+            PublishTimeSyncStatusIfDue(now_ns);
             return;
         }
         const uint64_t sample_age_ms =
             static_cast<uint64_t>(now_ns - last_time_sync_sample_ns_) / 1000000ULL;
         if (sample_age_ms <=
             static_cast<uint64_t>(config_.time_sync_timeout.count())) {
-            PublishTimeSyncStatus(now_ns);
+            // 无状态变化：按 1Hz 低频发布，避免读超时 20ms 时每轮都加锁分配。
+            PublishTimeSyncStatusIfDue(now_ns);
             return;
         }
 
@@ -2082,8 +2292,21 @@ private:
         PublishTimeSyncStatus(MonotonicNs());
     }
 
+    // 低频发布：距上次发布未满 kTimeSyncStatusPublishInterval 时跳过，
+    // 用于"无状态变化"的轮询路径（CheckTimeSyncTimeout）。状态跃迁仍走强制发布。
+    void PublishTimeSyncStatusIfDue(int64_t now_ns) {
+        if (last_time_sync_publish_ns_ != 0 && now_ns >= last_time_sync_publish_ns_ &&
+            static_cast<uint64_t>(now_ns - last_time_sync_publish_ns_) <
+                static_cast<uint64_t>(kTimeSyncStatusPublishInterval.count()) *
+                    1000000ULL) {
+            return;
+        }
+        PublishTimeSyncStatus(now_ns);
+    }
+
     // 把当前时间同步快照发布到 status（带锁复制，供诊断线程查询）。
     void PublishTimeSyncStatus(int64_t now_ns) {
+        last_time_sync_publish_ns_ = now_ns;
         GroundStationTimeSyncStatus status;
         status.state = time_sync_state_;
         status.offset_ns = time_sync_offset_ns_;
@@ -2111,6 +2334,9 @@ private:
             RecordError("地面站 MAVLink 帧发送失败");
             return false;
         }
+        // 发送统计只在帧真正写进串口后累加：Encode 本身不再记账，
+        // 否则"编码成功但写失败"会虚增 SentMessageCount（A-10）。
+        mavlink_.RecordSentFrame(frame.size());
         send_count_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -2332,6 +2558,7 @@ private:
     FenceStatusSubscription fence_status_subscription_;
     FenceZoneReportSubscription fence_zone_report_subscription_;
     uint64_t fence_report_send_count_ = 0;
+    uint64_t fence_report_invalid_count_ = 0;
     MissionCommandAckSubscription mission_command_ack_subscription_;
     std::optional<common::FlightStateSnapshot> latest_state_;
     std::optional<common::HealthStatus> latest_health_;
@@ -2347,6 +2574,7 @@ private:
     uint64_t target_v2_extension_count_ = 0;
     uint64_t target_update_receive_count_ = 0;
     uint64_t target_update_address_mismatch_count_ = 0;
+    uint64_t target_update_invalid_count_ = 0;
     uint64_t target_publish_count_ = 0;
     uint64_t target_ack_send_count_ = 0;
     uint64_t mission_assign_receive_count_ = 0;
@@ -2377,6 +2605,14 @@ private:
 
     uint64_t last_gcs_heartbeat_ms_ = 0;
 
+    // 串口重连状态机（A-01）：读错误累计 → 阈值触发 → 关闭端口 → 定时重开。
+    bool serial_reconnect_pending_ = false;
+    uint32_t serial_read_error_streak_ = 0;
+    uint64_t serial_reconnect_attempts_ = 0;
+    uint64_t next_serial_reconnect_ms_ = 0;
+    uint64_t serial_reconnect_count_ = 0;
+    uint64_t serial_reconnect_failure_count_ = 0;
+
     GroundStationTimeSyncState time_sync_state_ =
         GroundStationTimeSyncState::kUnsynchronized;
     std::vector<TimeSyncSample> time_sync_samples_;
@@ -2389,6 +2625,8 @@ private:
     uint64_t time_sync_response_count_ = 0;
     uint64_t time_sync_rejected_sample_count_ = 0;
     uint64_t time_sync_request_timeout_count_ = 0;
+    uint64_t time_sync_degraded_count_ = 0;
+    int64_t last_time_sync_publish_ns_ = 0;
     mutable std::mutex time_sync_status_mutex_;
     GroundStationTimeSyncStatus time_sync_status_;
 

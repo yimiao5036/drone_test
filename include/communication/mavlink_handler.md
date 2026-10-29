@@ -33,6 +33,9 @@ public:
     template <typename Packer>
     std::vector<uint8_t> Encode(Packer&& packer);
 
+    // 业务链路在物理发送成功后调用，用于统计真正的下线帧数/字节数
+    void RecordSentFrame(std::size_t frame_bytes);
+
     void SetOutputVersion(MavlinkVersion version);
     MavlinkVersion OutputVersion() const;
     void Reset();
@@ -97,6 +100,16 @@ auto frame = handler.Encode(
 - `DroppedPacketCount()` 是 MAVLink 序号诊断数据，不直接作为飞行控制故障判据；链路健康仍以
   心跳和关键遥测新鲜度为准。
 
+### 3.5 发送统计口径（2026-10-30 修正）
+
+- `Encode()` **只编码，不计数**：它返回的帧还可能在 `Transport::Write()` 处失败（串口断链、
+  UDP 目的不可达…），若在编码处记账会把"发失败"算成"已发送"。
+- 业务链路在写成功之后调用 `RecordSentFrame(frame.size())`，`SentMessageCount()`/
+  `SentByteCount()` 才反映真正下线的流量。PX4 与地面站链路的所有写点（心跳、设定值、
+  参数请求、命令、标准遥测、扩展帧）都遵循这一顺序。
+- 排查"计数正常但地面站收不到"时先确认计数来自 `RecordSentFrame` 而非旧版本 `Encode`
+  内部记账；`Reset()` 仍会把收/发统计清零。
+
 ## 4. 线程与日志行为
 
 `MavlinkHandler` 本身不加锁，单个实例只能由对应链路线程独占调用。解析属于高频热路径，模块
@@ -115,6 +128,7 @@ auto frame = handler.Encode(
 - CRC 错误拒绝与下一帧恢复；
 - 两个处理器实例的半包状态隔离；
 - 重置解析状态和统计；
+- `Encode()` 不改变发送统计，只有 `RecordSentFrame()` 才累加（编码失败/写失败不计入 SentXXX）；
 - 空输入安全忽略。
 
 运行：

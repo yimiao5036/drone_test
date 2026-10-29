@@ -42,6 +42,8 @@ public:
     ///
     /// Packer 签名应为：uint16_t(mavlink_status_t*, mavlink_message_t*)。
     /// 使用实例私有 tx_status_ 维护发送序号，避免多条链路共享全局 channel 状态。
+    /// 注意：本函数不统计发送量——帧只在业务层真正写入串口/网络后才调用
+    /// RecordSentFrame()，避免"编码成功但写失败"污染 SentMessageCount()。
     template <typename Packer>
     std::vector<uint8_t> Encode(Packer&& packer) {
         mavlink_message_t message{};
@@ -58,9 +60,14 @@ public:
             return {};
         }
 
-        ++sent_message_count_;
-        sent_byte_count_ += frame_length;
         return std::vector<uint8_t>(buffer.begin(), buffer.begin() + frame_length);
+    }
+
+    /// 记录一帧已成功写入物理链路的编码结果（字节数 + 1 条消息）。
+    /// 只在 Encode() 返回非空且底层 Write() 成功后调用。
+    void RecordSentFrame(std::size_t frame_bytes) {
+        ++sent_message_count_;
+        sent_byte_count_ += frame_bytes;
     }
 
     /// 设置后续输出帧版本；不影响接收端同时解析 MAVLink 1/2。

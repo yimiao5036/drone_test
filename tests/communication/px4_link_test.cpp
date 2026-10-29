@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1446,6 +1450,141 @@ TEST(Px4LinkTest, StubBatteryParametersAreInvalidByDefault) {
     EXPECT_FLOAT_EQ(state.battery_low_threshold_pct, 0.f);
     EXPECT_EQ(state.low_battery_action, 0u);
     EXPECT_EQ(state.battery_parameter_time_ms, 0u);
+}
+
+// UDP 对端配成广播地址且传输层未开 SO_BROADCAST：sendto 必然失败（EACCES），
+// 用来构造"命令已出队但写失败"的确定性场景，验证命令不丢、按退避重试（A-02）。
+TEST(Px4LinkTest, CommandSendRetriesAndKeepsCommandWhenWriteFails) {
+    Px4LinkConfig config;
+    config.transport = "udp";
+    config.udp.bind_address = "127.0.0.1";
+    config.udp.bind_port = static_cast<uint16_t>(30000 + (::getpid() % 10000));
+    config.udp.remote_address = "255.255.255.255";
+    config.udp.remote_port = 14550;
+    config.udp.read_timeout = 5ms;
+    config.udp.write_timeout = 20ms;
+    config.onboard_system_id = 1;
+    config.onboard_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;
+    config.target_system_id = 1;
+    config.target_component_id = MAV_COMP_ID_AUTOPILOT1;
+    config.mavlink_version = 2;
+    config.heartbeat_send_interval = 1000ms;
+    config.heartbeat_timeout = 3000ms;
+    config.state_publish_interval = 20ms;
+    config.command_ack_timeout = 100ms;
+    config.setpoint_send_interval = 200ms;
+    config.parameter_request_interval = 2000ms;
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    // 从本机 socket 发 PX4 心跳，让链路进入 connected（接收方向与发送方向互不影响）。
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &local.sin_addr), 1);
+    ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    sockaddr_in peer{};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(config.udp.bind_port);
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr), 1);
+
+    MavlinkHandler px4_encoder;
+    const auto heartbeat =
+        EncodePx4Heartbeat(px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
+    ASSERT_EQ(::sendto(fd, heartbeat.data(), heartbeat.size(), 0,
+                       reinterpret_cast<sockaddr*>(&peer), sizeof(peer)),
+              static_cast<ssize_t>(heartbeat.size()));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 1000ms));
+
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_COMPONENT_ARM_DISARM, 1.f, 0.f, 0.f, 0.f,
+                                 0.f, 0.f, 0.f));
+    // 首次尝试失败后命令放回队首；之后每 50ms 退避重试一次。
+    std::this_thread::sleep_for(150ms);
+    const uint64_t before = link.ErrorCount();
+    std::this_thread::sleep_for(300ms);
+    const uint64_t after = link.ErrorCount();
+    // 旧实现：写出失败即丢弃命令，之后不再有该命令的写失败（窗口内只剩心跳等偶发）。
+    EXPECT_GE(after - before, 3u);
+    // 命令从未真正写进链路，不得进入在途状态，因此不应产生 ACK 超时。
+    EXPECT_EQ(link.AckTimeoutCount(), 0u);
+
+    ::close(fd);
+    link.Stop();
+}
+
+// A-02 语义修正：命令按语义分三类——关键单次命令（保序重试）、内部遥测请求
+// （可重放，写失败直接丢弃）、流式设定值（最新值缓存，不重放旧值）。本测试验证
+// 内部遥测请求写失败后不再重试、也不占用关键命令的退避窗口；关键命令仍按
+// 50ms 退避重试。
+TEST(Px4LinkTest, TelemetryRequestDroppedWithoutRetryWhileCriticalCommandRetries) {
+    Px4LinkConfig config;
+    config.transport = "udp";
+    config.udp.bind_address = "127.0.0.1";
+    config.udp.bind_port = static_cast<uint16_t>(31000 + (::getpid() % 10000));
+    config.udp.remote_address = "255.255.255.255";
+    config.udp.remote_port = 14550;
+    config.udp.read_timeout = 5ms;
+    config.udp.write_timeout = 20ms;
+    config.onboard_system_id = 1;
+    config.onboard_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;
+    config.target_system_id = 1;
+    config.target_component_id = MAV_COMP_ID_AUTOPILOT1;
+    config.mavlink_version = 2;
+    config.heartbeat_send_interval = 1000ms;
+    config.heartbeat_timeout = 3000ms;
+    config.state_publish_interval = 20ms;
+    config.command_ack_timeout = 100ms;
+    config.setpoint_send_interval = 200ms;
+    // 拉长电池参数请求周期，避免两条参数直写干扰错误计数；只保留一条内部遥测请求。
+    config.parameter_request_interval = 60000ms;
+    config.parameter_timeout = 120000ms;
+    config.one_shot_message_requests = {0U};
+    config.message_interval_requests.clear();
+
+    Px4Link link(config);
+    ASSERT_TRUE(link.Start());
+
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &local.sin_addr), 1);
+    ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    sockaddr_in peer{};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(config.udp.bind_port);
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr), 1);
+
+    MavlinkHandler px4_encoder;
+    const auto heartbeat =
+        EncodePx4Heartbeat(px4_encoder, 1, MAV_COMP_ID_AUTOPILOT1, false, 3, 0);
+    ASSERT_EQ(::sendto(fd, heartbeat.data(), heartbeat.size(), 0,
+                       reinterpret_cast<sockaddr*>(&peer), sizeof(peer)),
+              static_cast<ssize_t>(heartbeat.size()));
+    ASSERT_TRUE(WaitUntil([&link] { return link.IsConnected(); }, 1000ms));
+
+    // 首轮（遥测请求 + 连接瞬间的电池参数直写）先跑完，再对稳态窗口计数：
+    // 新实现窗口内只有心跳失败；旧实现每条遥测请求会再重试约 10 次。
+    std::this_thread::sleep_for(150ms);
+    const uint64_t before = link.ErrorCount();
+    std::this_thread::sleep_for(400ms);
+    const uint64_t after = link.ErrorCount();
+    EXPECT_LE(after - before, 4u);
+
+    // 关键命令仍按 50ms 退避重试，且不会被遥测请求堵住。
+    ASSERT_TRUE(link.SendCommand(MAV_CMD_COMPONENT_ARM_DISARM, 1.f, 0.f, 0.f, 0.f,
+                                 0.f, 0.f, 0.f));
+    const uint64_t before_command = link.ErrorCount();
+    std::this_thread::sleep_for(300ms);
+    EXPECT_GE(link.ErrorCount() - before_command, 3u);
+    // 写失败的命令未进入在途状态，不产生 ACK 超时。
+    EXPECT_EQ(link.AckTimeoutCount(), 0u);
+
+    ::close(fd);
+    link.Stop();
 }
 
 }  // namespace

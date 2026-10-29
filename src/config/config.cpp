@@ -11,6 +11,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "common/logger.h"
+
 namespace drone::config {
 namespace {
 
@@ -114,6 +116,47 @@ double ReadOptionalNonNegativeDouble(const json& object, const char* key,
         throw std::invalid_argument(std::string(key) + " 必须为有限非负数");
     }
     return value;
+}
+
+// 围栏 default_* 配置的质量兜底（2026-10-30 审查修复）：
+// 这些字段决定"首次启动/无缓存"时自动生成的默认区域，非法值会让默认区域
+// 退化——half_side=0 时默认区域面积 0（越界判定恒为界内，围栏失效）；
+// alt_min > alt_max 时高度门禁恒判超限（每次越界都触发）。与其它必填配置
+// 不同，这里回退安全默认并 WARN，不阻塞起飞流程。
+void NormalizeFenceDefaults(FenceConfig& fence) {
+    if (fence.default_zone_id == 0U) {
+        SPDLOG_WARN("fence.default_zone_id 为 0，回退默认值 1");
+        fence.default_zone_id = 1U;
+    }
+    if (fence.default_version == 0U) {
+        SPDLOG_WARN("fence.default_version 为 0，回退默认值 1");
+        fence.default_version = 1U;
+    }
+    if (!std::isfinite(fence.default_half_side_m) ||
+        fence.default_half_side_m <= 0.0) {
+        SPDLOG_WARN("fence.default_half_side_m={} 非法，回退默认值 100m",
+                    fence.default_half_side_m);
+        fence.default_half_side_m = 100.0;
+    }
+    if (!std::isfinite(fence.default_alt_min_m) ||
+        !std::isfinite(fence.default_alt_max_m)) {
+        SPDLOG_WARN("fence.default_alt_min_m/default_alt_max_m 非有限数，"
+                    "回退默认高度带 [0,30]m");
+        fence.default_alt_min_m = 0.0;
+        fence.default_alt_max_m = 30.0;
+    } else if (fence.default_alt_max_m > 0.0 &&
+               fence.default_alt_min_m > fence.default_alt_max_m) {
+        SPDLOG_WARN("fence.default_alt_min_m={} 大于 default_alt_max_m={}，"
+                    "下限回退 0",
+                    fence.default_alt_min_m, fence.default_alt_max_m);
+        fence.default_alt_min_m = 0.0;
+    }
+    if (static_cast<int>(fence.default_action) >
+        static_cast<int>(common::FenceAction::kLand)) {
+        SPDLOG_WARN("fence.default_action={} 越界，回退 return(1)",
+                    static_cast<int>(fence.default_action));
+        fence.default_action = common::FenceAction::kReturn;
+    }
 }
 
 std::size_t ReadOptionalPositiveSize(const json& object, const char* key,
@@ -1040,6 +1083,7 @@ AppConfig LoadAppConfig(const std::string& path,
         fence.value("default_version", static_cast<int>(config.fence.default_version)));
     config.fence.default_action = static_cast<common::FenceAction>(
         fence.value("default_action", static_cast<int>(config.fence.default_action)));
+    NormalizeFenceDefaults(config.fence);
     config.fence.Validate();
     // 控制器钳制余量与围栏配置保持单一真源：FlightController 不读 fence 节。
     config.controller.fence_margin_m = config.fence.boundary_margin_m;

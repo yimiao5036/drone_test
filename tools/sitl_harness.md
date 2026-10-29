@@ -135,7 +135,8 @@ python3 tools/assignment_sitl.py --connection /tmp/gcs_test \
 | `drone_control 未进入 READY` | 看 `$LOG_DIR/app.log` 与机载日志：PX4 心跳/UDP 端口占用、`ground_station.serial.device` 是否 `/tmp/gcs_app`、桥是否先于 app 启动 |
 | 65014 无 65015 回执 | 地址双字段是否 `1/25`、地面站来源是否 `255/190`；`enable_control=true` 且命令接口已注入 |
 | PX4 拒绝解锁 | GCS 心跳是否在线（`gcs.log`）；`COM_LOW_BAT_ACT=0`；S5 引导速度受 `MPC_XY_VEL_MAX` 约束（`smoke` 已设 2.0） |
-| 手工清理进程时 shell 自杀 | 不要用 `pkill -f "gz sim"`（会匹配到自己的命令行）；用括号转义 `pkill -f "[g]z sim"`（本装置已按此处理） |
+| 手工清理进程时 shell 自杀 | 不要用 `pkill -f "gz sim"`（会匹配到自己的命令行）；用括号转义 `pkill -f "[g]z sim"`（本装置已按此处理）。**注意**：若同一条命令里既有 `harness stop` 又出现 `gz sim`/`sitl_pty_bridge`/`sitl_gcs` 字样，括号转义仍会命中，导致 shell 被 SIGTERM；杀桥请改用 `tmux kill-session -t bridge` |
+| 围栏恒越界 / 65014 恒被拒 21 | `config/zone.json` 是运行时缓存：换场地或换 SITL 前删除 `config/zone.json` 与 `build/config/zone.json`（旧坐标区域与当前 Home 相距过远会恒越界；机载启动无缓存时会生成 Home 中心 100m 默认区域 1/1，地面站需声明 1/1 或 `--zone-id 0` 不声明） |
 | 场景间状态残留 | 用 `stack`/`smoke` 干净重启；`app` 只重启机载，PX4 侧位置/模式状态保留 |
 
 ## 7. 安全边界

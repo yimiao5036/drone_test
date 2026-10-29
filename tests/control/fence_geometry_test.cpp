@@ -124,4 +124,108 @@ TEST(FenceGeometryTest, CentroidOfSquareIsOrigin) {
     EXPECT_NEAR(empty.east_m, 0.0, 1e-9);
 }
 
+// ---- 区域定义合法性（2026-10-30 审查修复：65018/zone.json 退化几何拒收）----
+
+namespace {
+
+// 以 23.12N/113.12E 为中心、半边长约 100m 的方形区域。
+common::FenceZone MakeSquareZone() {
+    common::FenceZone zone;
+    zone.protocol_version = 1;
+    zone.zone_id = 5;
+    zone.version = 1;
+    zone.type = common::FenceZoneType::kPolygon;
+    zone.action = common::FenceAction::kReturn;
+    zone.altitude_reference = 1;  // Home 相对
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 30.0;
+    zone.vertices = {{23.1191, 113.1190},
+                     {23.1209, 113.1190},
+                     {23.1209, 113.1210},
+                     {23.1191, 113.1210}};
+    return zone;
+}
+
+}  // namespace
+
+TEST(FenceGeometryTest, ValidateZoneAcceptsWellFormedZone) {
+    std::string reason;
+    EXPECT_TRUE(ValidateZone(MakeSquareZone(), &reason)) << reason;
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsMissingIds) {
+    auto zone = MakeSquareZone();
+    zone.zone_id = 0;
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+    zone = MakeSquareZone();
+    zone.version = 0;
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsTooFewOrTooManyVertices) {
+    auto zone = MakeSquareZone();
+    zone.vertices = {{23.1191, 113.1190}, {23.1209, 113.1209}};
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+    zone = MakeSquareZone();
+    zone.vertices.assign(257, common::FenceVertex{23.1200, 113.1200});
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsDuplicateVertex) {
+    auto zone = MakeSquareZone();
+    zone.vertices = {{23.1191, 113.1190},
+                     {23.1191, 113.1190},
+                     {23.1209, 113.1190},
+                     {23.1191, 113.1210}};
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsCollinearZeroArea) {
+    auto zone = MakeSquareZone();
+    zone.vertices = {{23.1200, 113.1190},
+                     {23.1200, 113.1195},
+                     {23.1200, 113.1200},
+                     {23.1200, 113.1205}};
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsSelfIntersection) {
+    auto zone = MakeSquareZone();
+    const common::FenceVertex keep = zone.vertices[1];
+    zone.vertices[1] = zone.vertices[2];
+    zone.vertices[2] = keep;
+    std::string reason;
+    EXPECT_FALSE(ValidateZone(zone, &reason));
+    EXPECT_FALSE(reason.empty());
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsInvertedAltitudeBand) {
+    auto zone = MakeSquareZone();
+    zone.alt_min_m = 20.0;
+    zone.alt_max_m = 10.0;
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+    // alt_max=0 表示不限高度，min 再大也合法。
+    zone.alt_max_m = 0.0;
+    EXPECT_TRUE(ValidateZone(zone, nullptr));
+}
+
+TEST(FenceGeometryTest, ValidateZoneRejectsUnknownAltitudeReference) {
+    auto zone = MakeSquareZone();
+    zone.altitude_reference = 2;
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+}
+
+// 高度带下限允许为负（相对 Home 低于起飞点）：地面站 UI/校验允许 -1000m，
+// 机载不能把这种合法区域判为非法，否则地面站定义后永远无法生效。
+TEST(FenceGeometryTest, ValidateZoneAcceptsNegativeAltMin) {
+    auto zone = MakeSquareZone();
+    zone.alt_min_m = -50.0;
+    zone.alt_max_m = 30.0;
+    std::string reason;
+    EXPECT_TRUE(ValidateZone(zone, &reason)) << reason;
+    // 协议为 i16 0.1m，最低可编码 -3276.8m；再低就超出可下发范围。
+    zone.alt_min_m = -4000.0;
+    EXPECT_FALSE(ValidateZone(zone, nullptr));
+}
+
 }  // namespace drone::control::fence

@@ -4355,6 +4355,249 @@ TEST(MissionStateMachineTest, FenceZoneCacheLoadedAtStart) {
     fs::remove(cache_path, ignored);
 }
 
+// ---------------------------------------------------------------------------
+// 2026-10-30 审查修复回归：围栏退化几何/内容版本、围栏降落动作、S9 授权超时
+// ---------------------------------------------------------------------------
+
+/// 轮询等待围栏区域生效（65018 在机载决策拍消费，固定 sleep 易抖动）。
+bool WaitForFenceZone(state_machine::MissionStateMachine& machine,
+                      uint16_t zone_id,
+                      std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (machine.LatestFencePolygon().zone_id == zone_id) {
+            return true;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+/// 围栏 land 动作（2026-10-30 审查修复）：必须与 return 走同一中止入口——
+/// 停发位置引导、tracker 收口、发 65015 aborted、转 S13 降落；旧实现直接
+/// 转 S12，而 S12 入口无任何意图发布，飞机会在界外刹车保持、到点不降落。
+TEST(MissionStateMachineTest, FenceLandActionAbortsToLanding) {
+    AssignmentHarness harness(MakeFenceTestConfig(common::FenceAction::kLand));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    // 在线下发区域（action=land）后进入 S5。
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(8, 2, common::FenceAction::kLand, 100.0)))
+                    .accepted);
+    ASSERT_TRUE(WaitForFenceZone(harness.machine, 8));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 3));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 把飞机拖到区域外 500m（Offboard 空中快照）→ 立刻判定越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(500.0f, 0.0f, -2.0f)))
+                    .accepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 3000ms)
+                    .has_value())
+        << "land 动作应直接转 S13 降落（旧实现转 S12 并卡住）";
+    // 中止回执：与 return 动作同一入口，必须补发 65015 aborted。
+    EXPECT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
+                    .has_value())
+        << "围栏中止必须发 65015 aborted";
+    // 越界中止不得触发发射（187）。
+    std::this_thread::sleep_for(200ms);
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "围栏中止不得触发发射";
+    }
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 区域几何/高度带非法必须拒绝并保留上一份可用区域（A-03）：自交、共线零
+/// 面积、重复点（零长边）、高度带倒挂、非法高度基准都不得进入越界判定。
+TEST(MissionStateMachineTest, FenceRejectsDegenerateZoneAndKeepsPrevious) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    const double lat0 = static_cast<double>(kFenceAnchorLat1e7) * 1e-7;
+    const double lon0 = static_cast<double>(kFenceAnchorLon1e7) * 1e-7;
+
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(21, 1, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    ASSERT_TRUE(WaitForFenceZone(harness.machine, 21));
+
+    auto expect_rejected = [&](const common::FenceZone& zone) {
+        EXPECT_TRUE(harness.fence_topic
+                        .Publish(std::make_shared<const common::FenceZone>(zone))
+                        .accepted);
+        // 决策拍 100ms：等两拍，给拒绝日志/区域替换留出窗口。
+        std::this_thread::sleep_for(300ms);
+        EXPECT_EQ(harness.machine.LatestFencePolygon().zone_id, 21U)
+            << "非法区域 zone=" << zone.zone_id << " 必须被拒绝并保留旧区域";
+    };
+
+    // 自交（蝴蝶结）：交换两顶点使边 0 与边 2 交叉。
+    auto bowtie = MakeSquareZone(99, 2, common::FenceAction::kReturn, 100.0);
+    const common::FenceVertex keep = bowtie.vertices[1];
+    bowtie.vertices[1] = bowtie.vertices[2];
+    bowtie.vertices[2] = keep;
+    expect_rejected(bowtie);
+
+    // 共线零面积。
+    auto collinear = MakeSquareZone(98, 2, common::FenceAction::kReturn, 100.0);
+    collinear.vertices = {{lat0, lon0},
+                          {lat0, lon0 + 0.002},
+                          {lat0, lon0 + 0.003},
+                          {lat0, lon0 + 0.004}};
+    expect_rejected(collinear);
+
+    // 重复点（零长边）。
+    auto duplicate = MakeSquareZone(97, 2, common::FenceAction::kReturn, 100.0);
+    duplicate.vertices = {{lat0, lon0},
+                          {lat0, lon0},
+                          {lat0 + 0.001, lon0},
+                          {lat0, lon0 + 0.001}};
+    expect_rejected(duplicate);
+
+    // 高度带倒挂（min > max > 0）。
+    auto inverted = MakeSquareZone(96, 2, common::FenceAction::kReturn, 100.0);
+    inverted.alt_min_m = 20.0;
+    inverted.alt_max_m = 10.0;
+    expect_rejected(inverted);
+
+    // 非法高度基准（只允许 0=AMSL / 1=Home）。
+    auto bad_reference = MakeSquareZone(95, 2, common::FenceAction::kReturn, 100.0);
+    bad_reference.altitude_reference = 2;
+    expect_rejected(bad_reference);
+
+    // 合法区域仍须更新：拒绝逻辑不得把好区域一起挡掉。
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(22, 1, common::FenceAction::kReturn, 120.0)))
+                    .accepted);
+    EXPECT_TRUE(WaitForFenceZone(harness.machine, 22));
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 同 zone_id/version 但内容变化也必须落盘（A-02）：地面站改了形状却忘递增
+/// 版本号时，旧实现只在内存生效，重启后回滚到 zone.json 里的旧区域——
+/// 飞机按旧（可能完全错位的）区域飞行。
+TEST(MissionStateMachineTest, FenceSameIdVersionGeometryChangeRewritesCache) {
+    namespace fs = std::filesystem;
+    const fs::path cache_path =
+        fs::temp_directory_path() /
+        ("drone_zone_content_" + std::to_string(::getpid()) + ".json");
+
+    state_machine::MissionStateMachineConfig config = MakeFenceTestConfig();
+    config.fence.zone_cache_path = cache_path.string();
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(31, 2, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    ASSERT_TRUE(WaitForFenceZone(harness.machine, 31));
+    // 同 id/version，只改几何（半边长 100m → 300m）。
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(31, 2, common::FenceAction::kReturn, 300.0)))
+                    .accepted);
+    // 内容变化检测在建帧后落盘，多等几拍再读缓存。
+    std::this_thread::sleep_for(300ms);
+
+    const auto loaded = config::ZoneStore::Load(cache_path.string());
+    ASSERT_TRUE(loaded.has_value()) << "区域缓存应已落盘";
+    ASSERT_EQ(loaded->vertices.size(), 4U);
+    const double lat0 = static_cast<double>(kFenceAnchorLat1e7) * 1e-7;
+    const double expected_dlat = 300.0 / 111320.0;
+    EXPECT_NEAR(loaded->vertices[0].latitude_deg, lat0 - expected_dlat, 2e-6)
+        << "同 id/version 的几何变化必须写入缓存（否则重启回滚旧区域）";
+
+    std::error_code ignored;
+    fs::remove(cache_path, ignored);
+}
+
+/// S9 授权超时按任务中止收口（2026-10-30 审查修复）：停发视觉伺服、
+/// tracker AbortAirborne、发 65015 reason=target_wait_timeout、转 S12。
+/// 旧实现只做 TransitionTo，S12 起无任何意图发布 → 到点不返航。
+TEST(MissionStateMachineTest, InterceptAuthorizationTimeoutAbortsAndReturns) {
+    auto config = MakeInterceptEntryTestConfig();
+    config.interception.auto_authorize = false;
+    config.interception.authorization_timeout = 150ms;
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_topic, distance_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(64);
+    auto ack_subscription = machine.AssignmentAckOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    std::this_thread::sleep_for(40ms);
+    machine.SeedAcceptedAssignmentForTest(MakeAssignment(88));
+    machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    auto feed = [&](uint64_t frame) {
+        (void)flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f)));
+        (void)visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)));
+        (void)distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 8.0F)));
+        std::this_thread::sleep_for(20ms);
+    };
+
+    bool saw_ready = false;
+    for (uint64_t frame = 1; frame <= 30 && !saw_ready; ++frame) {
+        feed(frame);
+        while (auto status = status_subscription.TryTake()) {
+            if ((*status)->state == common::MissionState::kInterceptReady) {
+                saw_ready = true;
+            }
+        }
+    }
+    ASSERT_TRUE(saw_ready) << "LOCKED+测距满足后应进入 S9";
+
+    // 持续喂新鲜输入保持 S9 入口条件，等待授权超时（150ms）→ S12。
+    bool saw_return = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    uint64_t frame = 100;
+    while (std::chrono::steady_clock::now() < deadline && !saw_return) {
+        feed(frame++);
+        while (auto status = status_subscription.TryTake()) {
+            if ((*status)->state == common::MissionState::kReturnHome) {
+                saw_return = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_return) << "授权超时应中止到 S12（旧实现只转状态，无中止回执）";
+    const auto ack = WaitForAckWithResult(
+        ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted,
+        2000ms);
+    ASSERT_TRUE(ack.has_value()) << "授权超时必须补发 65015 aborted";
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kTargetWaitTimeout);
+    for (const auto& call : sender.History()) {
+        EXPECT_NE(call.command, 187U) << "授权超时前不得发射";
+    }
+    machine.Stop();
+}
+
 /// 构造一条 65020 主动返航指令；默认版本/类型合法。
 common::MissionCommand MakeMissionCommand(uint32_t command_id) {
     common::MissionCommand command;
@@ -4516,6 +4759,36 @@ TEST(MissionStateMachineTest, MissionCommandOnGroundRejected) {
     EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
     EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotAirborne);
     EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+/// 65021 回执 header.sequence 逐条递增 1（2026-10-30 审查修复）：旧实现
+/// 同一条回执把 mission_command_ack_count_ 自增两次，地面站看到序号跳 2。
+TEST(MissionStateMachineTest, MissionCommandAckSequenceIncrementsOnce) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 地面待命收到两条 65020 都被拒绝（not_airborne），但仍须逐条回 65021。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9200)))
+                    .accepted);
+    const auto first =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionCommandResult::kRejected);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9201)))
+                    .accepted);
+    const auto second =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(first->header.sequence + 1U, second->header.sequence)
+        << "65021 序号必须逐条递增 1";
 }
 
 }  // namespace

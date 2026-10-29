@@ -49,6 +49,10 @@ class SerialPort {
 - **非阻塞 fd**：使用 `O_NONBLOCK | O_CLOEXEC` 打开，避免读写永久阻塞或 fd 泄漏到子进程。
 - **精确超时**：`VMIN=0`、`VTIME=0`，读写均使用 `poll()` 和单调时钟控制毫秒级超时；
   `EINTR` 在剩余超时时间内继续等待。
+- **超时参数必须为正**（2026-10-30 修正）：`read_timeout`/`write_timeout` 为 0 时
+  `poll()` 立即返回、`Read()` 立刻返回 0，上层通信线程会变成满核空转，因此在
+  `SerialPortConfig::Validate()` 中直接抛 `std::invalid_argument`（`<= 0` 一律拒绝），
+  不允许用 0 表示"无限等待"——无限等待会让断链检测失效。
 - **全量写**：`write` 可能部分写入，循环直到整帧完成；超过 `write_timeout` 返回失败，
   禁止把半条协议帧当作发送成功。
 - **链路异常**：`POLLERR/POLLHUP/POLLNVAL` 作为运行时错误返回，由上层链路模块决定重连。
@@ -66,7 +70,8 @@ class SerialPort {
 - **配置校验**：`tests/skeleton/stub_smoke_test.cpp` 的 `SerialPortConfigValidation`
   （非法波特率/校验位/数据位抛异常）。
 - **自动化伪终端测试**：`tests/communication/serial_port_test.cpp` 使用 Linux PTY 验证幂等启停、
-  双向收发、毫秒级读取超时、关闭后重启及写入超时参数校验，不依赖真实硬件。
+  双向收发、毫秒级读取超时、关闭后重启、写入超时参数校验，以及
+  `read_timeout/write_timeout = 0` 时 `Validate()` 抛异常（防止通信线程忙等），不依赖真实硬件。
 - **真实读写**：香橙派上仍需使用 Pixhawk/电台实机验证设备名、波特率、引脚电平和长期稳定性。
 
 ## 6. 排查/修改要点

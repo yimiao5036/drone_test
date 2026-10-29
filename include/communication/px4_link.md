@@ -294,6 +294,36 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 - 队列满、未运行或未连接时拒绝外部命令；
 - 心跳断开和 Stop 清空排队/在途命令，禁止重连后恢复旧命令。
 
+发送失败按指令语义分别处理（2026-10-30 修正，A-02，含参数读取）：
+
+命令/请求按语义分流——三条命令通道 + 一类直写请求，失败策略不同，避免"可重放的
+遥测请求堵住关键命令"或"重放过期设定值"：
+
+1. **关键单次命令**（`internal=false`：ARM/DISARM/LAND/`DO_SET_ACTUATOR` 等）
+   - 出队后编码为空或 `transport_->Write()` 失败时，命令**放回队首**（`command_queue_.push_front`），
+     保持先入先出顺序；
+   - 放回后按 `kCommandSendRetryBackoffMs=50` 退避再试；
+   - 同一条命令连续失败达到 `kMaxCommandSendAttempts=10` 次才丢弃，丢弃打 **ERROR**
+     （不再是静默 WARN），防止坏链路永久堵住队头；
+2. **内部遥测请求**（`internal=true`：`REQUEST_MESSAGE`/`SET_MESSAGE_INTERVAL`）
+   - 独立 `telemetry_command_queue_`，只在关键命令队列为空时发送，**不占用关键命令名额**；
+   - 写失败**直接丢弃**：不重试、不设置退避窗口，下一轮循环立即继续；为避免首次建链时
+     `SET_MESSAGE_INTERVAL` 偶发丢失导致遥测流永不开启，丢弃后按 `kTelemetryRequestRetryMs=1000`
+     低频重新排队（只重排遥测批次，仍不占关键命令队列、不进关键命令退避窗口）；
+3. **流式设定值**（`SET_POSITION_TARGET_LOCAL_NED`）
+   - 不进命令队列，走 `cached_setpoint_` 最新值缓存；写失败只跳过本周期，下一周期发送
+     **最新值**，绝不重放旧设定值（过期由 `setpoint_timeout` 丢弃）。
+4. **参数读取请求**（`PARAM_REQUEST_READ`：`BAT_LOW_THR`/`COM_LOW_BAT_ACT`）
+   - 消息类型不是 `COMMAND_LONG`，**不入命令队列、不占 ACK 通道**，直接写 `transport_`；
+   - 属可重放内部请求：写失败**不重试**，由 `parameter_request_interval`（默认 1s）自然重排；
+   - 失败打节流 WARN（首次 + 每 100 次，含参数名与累计次数）；连接后超过 `parameter_timeout`
+     仍读不到时另有"电池参数读取超时"WARN，参数保持无效（不以 0 冒充阈值）。
+
+只有**写成功**才把命令置为 `in_flight_command_` 并开始 ACK 超时计时——写失败的命令
+既不算在途也不产生 ACK 超时，`AckTimeoutCount()` 语义保持"已发出但没等到 ACK"。
+失败均节流日志（首次 + 每 100 次），含 command ID/参数名、尝试次数与累计失败数；
+`ClearCommands()`（断链/Stop/取消）同时清空两个队列并复位尝试计数与退避时间。
+
 `AckStatus()` 与原有 `AckMatchCount()/AckTimeoutCount()` 口径一致（计数单调递增、
 重启不归零）；`last_*` 字段用于状态机判断最近一条命令是否被接受。
 
@@ -375,7 +405,7 @@ false）。
 | 等级 | 场景 |
 |---|---|
 | INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、电池参数读取完成（每连接一次）、命令 ACK、固件版本、正常停止 |
-| WARN | 心跳超时、串口断链/重连失败、电池参数读取超时（首次 + 每 100 次）、固件不一致、命令队列满、ACK 超时、非法/过期设定值（均节流） |
+| WARN | 心跳超时、串口断链/重连失败、电池参数读取超时（首次 + 每 100 次）、固件不一致、命令队列满、命令发送失败（首次 + 每 100 次）、ACK 超时、非法/过期设定值（均节流） |
 | ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
 
 不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
@@ -404,6 +434,12 @@ false）。
 - 187 专用 ACK 计数/终态在后续其它命令 ACK 到达后保持不变；
 - `CancelPendingCommands()` 清掉排队命令，在途命令超时后不得发出；
 - ACK 超时计数后继续队列；
+- 命令发送失败时放回队首并退避重试（`CommandSendRetriesAndKeepsCommandWhenWriteFails`，
+  用不可用的 UDP 目的地址构造确定性写失败，断言错误计数在重试窗口内持续增长且
+  `AckTimeoutCount()` 不增加）；
+- 内部遥测请求写失败只丢弃不重试、不占用关键命令退避窗口
+  （`TelemetryRequestDroppedWithoutRetryWhileCriticalCommandRetries`：错误计数在
+  遥测请求丢弃后的稳态窗口内不随重试增长，随后的 ARM 命令仍按 50ms 退避重试）；
 - 首次心跳后按顺序发送单次消息请求和消息频率请求；
 - 首次心跳后发送 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 两条 `PARAM_REQUEST_READ`
   （index=-1，target 身份正确）；

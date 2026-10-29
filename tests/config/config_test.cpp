@@ -1141,6 +1141,31 @@ TEST(ConfigTest, FenceSectionOverridesDefaults) {
     std::filesystem::remove(path);
 }
 
+// 2026-10-30 审查修复：fence.default_* 的 0/越界/倒挂值归一化。旧实现里
+// default_zone_id/default_version=0 会让 EnsureDefaultFenceZone 永不生成区域
+// （开机无围栏、也不落盘），半边长<=0 会让默认区域退化成空多边形，
+// 高度带倒挂则把默认区域整段判为越界。
+TEST(ConfigTest, FenceInvalidDefaultsNormalized) {
+    json value = ReadSourceConfig();
+    value["fence"]["default_zone_id"] = 0;
+    value["fence"]["default_version"] = 0;
+    value["fence"]["default_half_side_m"] = 0.0;
+    value["fence"]["default_alt_min_m"] = 40.0;
+    value["fence"]["default_alt_max_m"] = 10.0;
+    value["fence"]["default_action"] = 9;  // 越界枚举（> kLand）
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_fence_invalid_defaults.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.fence.default_zone_id, 1);
+    EXPECT_EQ(config.fence.default_version, 1);
+    EXPECT_DOUBLE_EQ(config.fence.default_half_side_m, 100.0);
+    // 高度带倒挂（min=40 > max=10）时下限回退 0、保留操作者给的上限 10。
+    EXPECT_DOUBLE_EQ(config.fence.default_alt_min_m, 0.0);
+    EXPECT_DOUBLE_EQ(config.fence.default_alt_max_m, 10.0);
+    EXPECT_EQ(config.fence.default_action, drone::common::FenceAction::kReturn);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, FenceWarnDistanceBelowMarginRejected) {
     json value = ReadSourceConfig();
     value["fence"]["boundary_margin_m"] = 5.0;

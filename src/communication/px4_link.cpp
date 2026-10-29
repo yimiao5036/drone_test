@@ -44,6 +44,13 @@ namespace {
 /// 串口连续读错误达到该次数即判定设备/链路丢失，进入重连。
 /// 单次 EIO/EINTR 不触发，避免把瞬时错误当成拔线。
 constexpr uint32_t kSerialReadErrorReconnectThreshold = 3;
+/// 命令发送失败后的重试退避：避免写失败时在同一轮循环里死循环重试同一条命令。
+constexpr uint64_t kCommandSendRetryBackoffMs = 50;
+// 内部遥测请求写失败被丢弃后的重新排队周期：低频重排，既不堵关键命令，又保证
+// 首次建链时 SET_MESSAGE_INTERVAL 偶发丢失后能自愈（否则遥测流永不开启）。
+constexpr uint64_t kTelemetryRequestRetryMs = 1000;
+/// 同一条队首命令连续发送失败上限；超过即丢弃，避免坏链路永久堵住命令队列。
+constexpr uint32_t kMaxCommandSendAttempts = 10;
 /// 重连失败日志：首次 + 每 10 次，避免设备长期不在时刷屏。
 bool ShouldLogReconnectAttempt(uint64_t attempts) {
     return attempts == 1 || attempts % 10 == 0;
@@ -331,18 +338,21 @@ private:
         uint64_t accepted_time_ms = 0;
     };
 
-    // 命令入队（有界队列）。队列满时拒绝并记录 WARN（节流）。
+    // 命令入队（有界队列）：外部单次命令进关键队列，内部遥测请求（可重放、
+    // 非控制指令）进独立的遥测队列，避免遥测请求挤占关键命令名额或堵住队头。
     bool EnqueueCommand(CommandRequest request) {
         std::lock_guard<std::mutex> lock(command_mutex_);
-        if (command_queue_.size() >= config_.command_queue_capacity) {
+        auto& queue = request.internal ? telemetry_command_queue_ : command_queue_;
+        if (queue.size() >= config_.command_queue_capacity) {
             const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (ShouldLogThrottled(count)) {
-                SPDLOG_WARN("PX4 命令队列已满: capacity={} command={}，累计错误 {}",
-                            config_.command_queue_capacity, request.command, count);
+                SPDLOG_WARN("PX4 命令队列已满: capacity={} command={} internal={}，累计错误 {}",
+                            config_.command_queue_capacity, request.command,
+                            request.internal, count);
             }
             return false;
         }
-        command_queue_.push_back(std::move(request));
+        queue.push_back(std::move(request));
         return true;
     }
 
@@ -350,7 +360,11 @@ private:
     void ClearCommands() {
         std::lock_guard<std::mutex> lock(command_mutex_);
         command_queue_.clear();
+        telemetry_command_queue_.clear();
         in_flight_command_.reset();
+        // 重试状态一并复位：否则重连后仍会继承上一次链路的退避与失败计数。
+        command_send_attempts_ = 0;
+        next_command_send_ms_ = 0;
     }
 
     // 首次建立心跳后，按 JSON 自动排队单次请求与频率请求（internal 命令）。
@@ -507,6 +521,13 @@ private:
                 ClearCommands();
             }
             SendNextCommand(now_ms);       // 发送下一条排队命令
+            // 遥测请求写失败被丢弃后低频重排（不影响关键命令队列与退避）。
+            if (connected_.load(std::memory_order_acquire) &&
+                !telemetry_requests_queued_ && now_ms >= next_telemetry_retry_ms_) {
+                telemetry_requests_queued_ = true;
+                next_telemetry_retry_ms_ = now_ms + kTelemetryRequestRetryMs;
+                QueueTelemetryRequests();
+            }
 
             if (now >= next_setpoint_send) {
                 SendSetpointIfDue(now_ms);
@@ -712,6 +733,7 @@ private:
             error_count_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        mavlink_.RecordSentFrame(frame.size());
         setpoint_send_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -806,6 +828,7 @@ private:
                         state_.flight_sub_mode, state_.armed);
             if (!telemetry_requests_queued_) {
                 telemetry_requests_queued_ = true;
+                next_telemetry_retry_ms_ = now_ms + kTelemetryRequestRetryMs;
                 QueueTelemetryRequests();
             }
         }
@@ -1134,22 +1157,42 @@ private:
         }
     }
 
-    // 取出队首命令编码为 COMMAND_LONG 发送，并记录为在途命令等待 ACK。
+    // 发送路径按语义分三类，失败处理各不相同：
+    // - 关键单次命令（internal=false，ARM/DISARM/LAND/DO_SET_ACTUATOR 等）：
+    //   保序、写失败放回队首并按 50ms 退避重试，连续失败达上限才丢弃（丢弃打 ERROR）；
+    // - 内部遥测请求（internal=true，REQUEST_MESSAGE/SET_MESSAGE_INTERVAL）：
+    //   可重放且非控制指令，写失败直接丢弃、不重试、不占退避窗口，避免堵住队头
+    //   延迟关键命令；下次建链会自动重新排队；
+    // - 流式设定值不走本队列：它是最新值缓存（cached_setpoint_），写失败只跳过本
+    //   周期，下一周期发送最新值，绝不重放旧值。
+    // 只有写成功才置 in_flight 并开始 ACK 超时计时。
     void SendNextCommand(uint64_t now_ms) {
         if (in_flight_command_ || !connected_.load(std::memory_order_acquire)) {
             return;
         }
 
         CommandRequest request;
+        bool telemetry = false;
         {
             std::lock_guard<std::mutex> lock(command_mutex_);
-            if (command_queue_.empty()) {
+            if (!command_queue_.empty()) {
+                // 关键命令优先；退避窗口未到时不抢占遥测队列，保持关键命令队头语义。
+                if (now_ms < next_command_send_ms_) {
+                    return;
+                }
+                request = std::move(command_queue_.front());
+                command_queue_.pop_front();
+            } else if (!telemetry_command_queue_.empty()) {
+                request = std::move(telemetry_command_queue_.front());
+                telemetry_command_queue_.pop_front();
+                telemetry = true;
+            } else {
+                command_send_attempts_ = 0;
                 return;
             }
-            request = std::move(command_queue_.front());
-            command_queue_.pop_front();
         }
 
+        const uint16_t command = request.command;
         const auto frame = mavlink_.Encode(
             [this, &request](mavlink_status_t* status, mavlink_message_t* message) {
                 return mavlink_msg_command_long_pack_status(
@@ -1162,9 +1205,48 @@ private:
             });
         if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
             error_count_.fetch_add(1, std::memory_order_relaxed);
+            if (telemetry) {
+                // 内部遥测请求直接丢弃：不重试、不设置退避，避免队头阻塞关键命令；
+                // 标记待重新排队，由 WorkerLoop 以 kTelemetryRequestRetryMs 低频重排，
+                // 保证 SET_MESSAGE_INTERVAL 偶发丢失后遥测流仍能自愈。
+                telemetry_requests_queued_ = false;
+                next_telemetry_retry_ms_ = now_ms + kTelemetryRequestRetryMs;
+                const uint64_t drop_count = ++telemetry_drop_count_;
+                if (ShouldLogThrottled(drop_count)) {
+                    SPDLOG_WARN("PX4 遥测请求发送失败，已丢弃（{} ms 后重排）: command={} 累计 {}",
+                                kTelemetryRequestRetryMs, command, drop_count);
+                }
+                return;
+            }
+            const uint64_t failure_count = ++command_send_failure_count_;
+            const uint32_t attempts = ++command_send_attempts_;
+            const bool dropped = attempts >= kMaxCommandSendAttempts;
+            if (dropped) {
+                // 丢弃后复位尝试计数，后续命令不再被这条坏命令阻塞。
+                command_send_attempts_ = 0;
+                SPDLOG_ERROR("PX4 关键命令发送连续失败，已达上限丢弃: command={} "
+                             "attempts={} 累计失败 {}",
+                             command, attempts, failure_count);
+            } else {
+                // 保序重试：放回队首，后续命令不得越过它，保证命令先后语义不变。
+                std::lock_guard<std::mutex> lock(command_mutex_);
+                command_queue_.push_front(std::move(request));
+            }
+            next_command_send_ms_ = now_ms + kCommandSendRetryBackoffMs;
+            if (ShouldLogThrottled(failure_count)) {
+                SPDLOG_WARN("PX4 命令发送失败{}: command={} attempts={} backoff_ms={} "
+                            "累计 {}",
+                            dropped ? "（已达重试上限，丢弃）" : "，已放回队首重试",
+                            command, attempts, kCommandSendRetryBackoffMs,
+                            failure_count);
+            }
             return;
         }
 
+        mavlink_.RecordSentFrame(frame.size());
+        if (!telemetry) {
+            command_send_attempts_ = 0;
+        }
         in_flight_command_ = InFlightCommand{std::move(request), now_ms};
     }
 
@@ -1286,8 +1368,17 @@ private:
             });
         if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
             error_count_.fetch_add(1, std::memory_order_relaxed);
+            // 参数读取属于"可重放内部请求"：不入命令队列、失败不重试，由下一次
+            // parameter_request_interval 自然重排；补一条节流日志让失败可见，避免静默。
+            const uint64_t failure_count = ++parameter_send_failure_count_;
+            if (ShouldLogThrottled(failure_count)) {
+                SPDLOG_WARN("PX4 参数读取请求发送失败（{} ms 后自然重排）: param={} 累计 {}",
+                            config_.parameter_request_interval.count(), param_id,
+                            failure_count);
+            }
             return false;
         }
+        mavlink_.RecordSentFrame(frame.size());
         return true;
     }
 
@@ -1343,7 +1434,9 @@ private:
             });
         if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
             error_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
+        mavlink_.RecordSentFrame(frame.size());
     }
 
     // 发布飞行状态快照：先刷新 valid，再填充快照头（序列号/时间/源/健康/坐标）。
@@ -1404,6 +1497,7 @@ private:
     uint64_t last_parameter_request_ms_ = 0;
     uint64_t connected_since_ms_ = 0;
     uint64_t parameter_timeout_count_ = 0;
+    uint64_t parameter_send_failure_count_ = 0;
     bool parameter_read_logged_ = false;
 
     // 串口重连（仅 WorkerLoop 访问）：读错误连续计数、待重连标志与重试时刻。
@@ -1413,8 +1507,16 @@ private:
     uint64_t reconnect_attempts_ = 0;
 
     std::mutex command_mutex_;
-    std::deque<CommandRequest> command_queue_;
+    std::deque<CommandRequest> command_queue_;            // 关键单次命令（保序重试）
+    std::deque<CommandRequest> telemetry_command_queue_;  // 内部遥测请求（可丢弃）
     std::optional<InFlightCommand> in_flight_command_;
+    // 命令发送失败重试：退避截止时刻、队首命令连续失败次数与累计失败计数。
+    uint64_t next_command_send_ms_ = 0;
+    uint32_t command_send_attempts_ = 0;
+    uint64_t command_send_failure_count_ = 0;
+    uint64_t telemetry_drop_count_ = 0;
+    // 内部遥测请求被丢弃后的重新排队时刻（仅通信线程访问）。
+    uint64_t next_telemetry_retry_ms_ = 0;
     std::atomic<uint64_t> next_command_sequence_{1};
     mutable std::mutex ack_status_mutex_;
     common::CommandAckStatus ack_status_;

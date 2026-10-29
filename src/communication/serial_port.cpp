@@ -112,11 +112,13 @@ void SerialPortConfig::Validate() const {
     if (parity != 'N' && parity != 'E' && parity != 'O') {
         throw std::invalid_argument("串口校验位必须是 N/E/O");
     }
-    if (read_timeout.count() < 0) {
-        throw std::invalid_argument("串口读取超时不能为负");
+    // 超时必须严格为正：wait_event 在 timeout<=0 时会立即返回 0，
+    // 读循环会把"超时"当成"无数据"空转，整条链路线程满核轮询。
+    if (read_timeout.count() <= 0) {
+        throw std::invalid_argument("串口读取超时必须为正数（毫秒）");
     }
-    if (write_timeout.count() < 0) {
-        throw std::invalid_argument("串口写入超时不能为负");
+    if (write_timeout.count() <= 0) {
+        throw std::invalid_argument("串口写入超时必须为正数（毫秒）");
     }
 }
 

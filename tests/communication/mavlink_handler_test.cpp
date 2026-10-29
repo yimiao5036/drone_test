@@ -49,6 +49,10 @@ TEST(MavlinkHandlerTest, EncodesAndDecodesMavlink2Heartbeat) {
     EXPECT_EQ(decoder.ReceivedMessageCount(), 1u);
     EXPECT_EQ(decoder.ReceivedByteCount(), frame.size());
     EXPECT_EQ(decoder.ParseErrorCount(), 0u);
+    // Encode 只做编码，不再累加发送统计；发送量由链路层写串口成功后记账。
+    EXPECT_EQ(encoder.SentMessageCount(), 0u);
+    EXPECT_EQ(encoder.SentByteCount(), 0u);
+    encoder.RecordSentFrame(frame.size());
     EXPECT_EQ(encoder.SentMessageCount(), 1u);
     EXPECT_EQ(encoder.SentByteCount(), frame.size());
 }

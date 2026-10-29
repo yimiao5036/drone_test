@@ -63,6 +63,15 @@ public:
                static_cast<ssize_t>(data.size());
     }
 
+    // 主动关闭主端：从端（链路打开的 /dev/pts/N）随后的读操作会返回错误，
+    // 用于模拟串口断线并验证链路的重连状态机。
+    void CloseMaster() {
+        if (master_fd_ >= 0) {
+            ::close(master_fd_);
+            master_fd_ = -1;
+        }
+    }
+
     bool WaitFor(const std::function<bool(const mavlink_message_t&)>& predicate,
                  std::chrono::milliseconds timeout,
                  mavlink_message_t* output = nullptr) const {
@@ -288,7 +297,10 @@ std::optional<MissionAssignAckMessage> ReadMissionAssignAck(
     return result;
 }
 
-std::vector<uint8_t> EncodeTrackTargetUpdate(const TargetUpdateFixture& update) {
+// protocol_length 用于构造截断短帧：超出该长度的协议字节全部清零，
+// MAVLink2 尾部零字节截断后 message.len 会小于协议要求的最小帧长。
+std::vector<uint8_t> EncodeTrackTargetUpdate(const TargetUpdateFixture& update,
+                                             std::size_t protocol_length = 55) {
     std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
     WriteLe<uint64_t>(payload, 0, update.source_time_ms);
     WriteLe<uint32_t>(payload, 8, update.boot_id);
@@ -310,6 +322,10 @@ std::vector<uint8_t> EncodeTrackTargetUpdate(const TargetUpdateFixture& update) 
     WriteLe<uint8_t>(payload, 52, update.coordinate_frame);
     WriteLe<uint8_t>(payload, 53, update.protocol_version);
     WriteLe<uint8_t>(payload, 54, update.alt_reference);
+    if (protocol_length < payload.size()) {
+        std::fill(payload.begin() + static_cast<std::ptrdiff_t>(protocol_length),
+                  payload.end(), 0);
+    }
     MavlinkHandler encoder(MavlinkVersion::kV2);
     return encoder.Encode([&payload, &update](mavlink_status_t* status,
                                               mavlink_message_t* message) {
@@ -317,6 +333,53 @@ std::vector<uint8_t> EncodeTrackTargetUpdate(const TargetUpdateFixture& update) 
             kGroundStationSystemId, kGroundStationComponentId, status, message, 0,
             update.target_system, update.target_component,
             kTrackTargetUpdateMessageType, payload.data());
+    });
+}
+
+// 65018 FENCE_ZONE 测试编码参数；默认是发给本机 1/25 的合法多边形区域。
+struct FenceZoneFixture {
+    uint8_t protocol_version = kFenceZoneProtocolVersion;
+    uint16_t zone_id = 3;
+    uint16_t version = 1;
+    uint8_t type = 0;
+    uint8_t action = 1;
+    uint8_t altitude_reference = 1;
+    int16_t alt_min_dm = 100;
+    int16_t alt_max_dm = 500;
+    uint8_t vertex_count = 4;
+    int32_t ref_lat_1e7 = 231230000;
+    int32_t ref_lon_1e7 = 1131230000;
+    uint8_t frame_length_marker = 1;
+};
+
+std::vector<uint8_t> EncodeFenceZone(
+    const FenceZoneFixture& zone, uint8_t header_system = 1,
+    uint8_t header_component = kNetCaptureAircraftComponentId) {
+    std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+    WriteLe<uint8_t>(payload, 0, zone.protocol_version);
+    WriteLe<uint16_t>(payload, 1, zone.zone_id);
+    WriteLe<uint16_t>(payload, 3, zone.version);
+    WriteLe<uint8_t>(payload, 5, zone.type);
+    WriteLe<uint8_t>(payload, 6, zone.action);
+    WriteLe<uint8_t>(payload, 7, zone.altitude_reference);
+    WriteLe<int16_t>(payload, 8, zone.alt_min_dm);
+    WriteLe<int16_t>(payload, 10, zone.alt_max_dm);
+    WriteLe<uint8_t>(payload, 12, zone.vertex_count);
+    WriteLe<int32_t>(payload, 13, zone.ref_lat_1e7);
+    WriteLe<int32_t>(payload, 17, zone.ref_lon_1e7);
+    // 顶点偏移全部取 0：全部落在参考点上，便于断言区域已被接受。
+    for (std::size_t index = 0; index < zone.vertex_count; ++index) {
+        WriteLe<int16_t>(payload, 21U + index * 4U, 0);
+        WriteLe<int16_t>(payload, 23U + index * 4U, 0);
+    }
+    WriteLe<uint8_t>(payload, 54, zone.frame_length_marker);
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    return encoder.Encode([&payload, header_system, header_component](
+                              mavlink_status_t* status, mavlink_message_t* message) {
+        return mavlink_msg_v2_extension_pack_status(
+            kGroundStationSystemId, kGroundStationComponentId, status, message, 0,
+            header_system, header_component, kFenceZoneMessageType,
+            payload.data());
     });
 }
 
@@ -1226,6 +1289,301 @@ TEST(GroundStationLinkTest, StopAndRestartAreIdempotent) {
     EXPECT_FALSE(link.IsRunning());
     EXPECT_TRUE(link.Start());
     EXPECT_TRUE(link.IsRunning());
+    link.Stop();
+}
+
+// A-01：连续串口读错误必须关闭端口并自动重开，而不是永久停在"计数+sleep"。
+TEST(GroundStationLinkTest, RecoversSerialLinkAfterReadErrors) {
+    const std::string link_path =
+        "/tmp/gs_link_reconnect_" + std::to_string(::getpid());
+    ::unlink(link_path.c_str());
+    PseudoTerminal first;
+    ASSERT_EQ(::symlink(first.SlaveName().c_str(), link_path.c_str()), 0);
+
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(link_path));
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    ASSERT_TRUE(first.Write(EncodeGcsHeartbeat()));
+    ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 300ms));
+
+    // 关闭主端：从端读取立即失败，连续错误达阈值后链路应关闭端口并置未连接。
+    first.CloseMaster();
+    ASSERT_TRUE(WaitUntil([&] { return !link.IsConnected(); }, 1000ms));
+
+    // 换上新的伪终端：重连成功后仍要重新等到地面站心跳才算连接建立。
+    PseudoTerminal second;
+    ASSERT_EQ(::unlink(link_path.c_str()), 0);
+    ASSERT_EQ(::symlink(second.SlaveName().c_str(), link_path.c_str()), 0);
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            second.Write(EncodeGcsHeartbeat());
+            return link.IsConnected();
+        }, 3000ms));
+
+    ::unlink(link_path.c_str());
+    link.Stop();
+}
+
+// A-03：动作码只允许 0/1/2；越界值必须显式拒收整帧，不能静默当返航执行。
+TEST(GroundStationLinkTest, FenceZoneRejectsInvalidActionAndAltitudeBand) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto zone_subscription = link.FenceZoneOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    FenceZoneFixture zone;
+    zone.action = 3;
+    ASSERT_TRUE(terminal.Write(EncodeFenceZone(zone)));
+    EXPECT_FALSE(zone_subscription.WaitTakeFor(150ms).has_value());
+
+    // 高度带上下限倒置同样应拒收（alt_max_dm=0 表示不限制，不在此列）。
+    zone.action = 1;
+    zone.alt_min_dm = 500;
+    zone.alt_max_dm = 100;
+    ASSERT_TRUE(terminal.Write(EncodeFenceZone(zone)));
+    EXPECT_FALSE(zone_subscription.WaitTakeFor(150ms).has_value());
+
+    zone.alt_min_dm = 100;
+    zone.alt_max_dm = 500;
+    zone.action = 2;
+    ASSERT_TRUE(terminal.Write(EncodeFenceZone(zone)));
+    auto published = zone_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ((**published).action, common::FenceAction::kLand);
+    EXPECT_EQ((**published).vertices.size(), 4u);
+
+    link.Stop();
+}
+
+// A-05a：65010 允许尾部零字节截断，最小合法总长 59 字节（alt_reference 可缺省为 0）。
+TEST(GroundStationLinkTest, TrackTargetAcceptsTruncatedAltReference) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto target_subscription = link.TargetOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+    EstablishTimeSync(terminal, link);
+
+    TargetUpdateFixture update;
+    update.alt_reference = 0;
+    update.source_time_ms =
+        MonotonicMs() + link.GetTimeSyncStatus().offset_ns / 1000000LL;
+    ASSERT_TRUE(terminal.Write(EncodeTrackTargetUpdate(update)));
+
+    auto target = target_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((**target).alt_reference, 0);
+    const auto ack = ReadTrackTargetAck(terminal);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(std::get<0>(*ack), TrackTargetAckResult::kAccepted);
+    link.Stop();
+}
+
+// A-05b：帧长不足 59 字节（payload 缺 alt_reference 之外的必需字段）必须拒收并回 ACK。
+TEST(GroundStationLinkTest, TrackTargetUpdateRejectsTruncatedFrame) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto target_subscription = link.TargetOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+    EstablishTimeSync(terminal, link);
+
+    TargetUpdateFixture update;
+    update.source_time_ms =
+        MonotonicMs() + link.GetTimeSyncStatus().offset_ns / 1000000LL;
+    // 从 target_component 起截断：payload 只剩 50 字节。
+    ASSERT_TRUE(terminal.Write(EncodeTrackTargetUpdate(update, 50)));
+
+    EXPECT_FALSE(target_subscription.WaitTakeFor(150ms).has_value());
+    const auto ack = ReadTrackTargetAck(terminal);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(std::get<0>(*ack), TrackTargetAckResult::kRejectedInvalidField);
+    EXPECT_EQ(std::get<1>(*ack), TrackTargetAckReason::kInternalError);
+    link.Stop();
+}
+
+// A-07：周期遥测发送失败时不能推进正常周期，而应按短退避重试（否则要等一整个周期）。
+TEST(GroundStationLinkTest, TelemetrySendFailureRetriesWithBackoff) {
+    PseudoTerminal terminal;
+    // mavlink 1 下扩展帧恒编码失败，用来构造确定性的周期发送失败。
+    auto config = MakeConfig(terminal.SlaveName());
+    config.mavlink_version = 1;
+    config.enable_time_sync = false;
+    config.health_status_send_interval = 5000ms;
+    config.mission_status_send_interval = 5000ms;
+
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    common::Topic<common::HealthStatus> health_status;
+    common::Topic<common::MissionStatus> mission_status;
+    GroundStationLink link(config);
+    link.SetFlightStateInput(flight_state);
+    link.SetHealthInput(health_status);
+    link.SetMissionStatusInput(mission_status);
+    ASSERT_TRUE(link.Start());
+
+    common::HealthStatus health;
+    health.header.sequence = 5;
+    health.cpu_load_pct = 12.f;
+    ASSERT_TRUE(health_status.Publish(
+        std::make_shared<const common::HealthStatus>(health)).accepted);
+    common::MissionStatus mission;
+    mission.header.sequence = 9;
+    ASSERT_TRUE(mission_status.Publish(
+        std::make_shared<const common::MissionStatus>(mission)).accepted);
+
+    std::this_thread::sleep_for(150ms);
+    const uint64_t before = link.ErrorCount();
+    std::this_thread::sleep_for(300ms);
+    const uint64_t after = link.ErrorCount();
+    // 旧实现把 deadline 推到 5s 之后：窗口内只有 1~2 次失败。
+    // 新实现按 100ms 退避重试：两路遥测各约 3 次。
+    EXPECT_GE(after - before, 4u);
+    link.Stop();
+}
+
+// A-04：已同步后抖动恶化必须降级（协议 §5 DEGRADED 覆盖 RTT/offset 抖动）。
+TEST(GroundStationLinkTest, TimeSyncDegradesWhenJitterExceedsThreshold) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.serial.read_timeout = 1ms;
+    config.time_sync_minimum_samples = 5;
+    config.time_sync_window_capacity = 5;
+    config.time_sync_max_rtt = 200ms;
+    config.time_sync_max_offset_jump = 30ms;
+    config.time_sync_timeout = 5000ms;
+    config.time_sync_acquire_interval = 10ms;
+    config.time_sync_steady_interval = 10ms;
+
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(config);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+    ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat()));
+    ASSERT_TRUE(WaitUntil([&] { return link.IsConnected(); }, 200ms));
+
+    // 前 5 个样本用 0 与 -24ms 建立同步（跨度 24ms ≤ 30ms 门限）；
+    // 之后 3 个 27ms 样本逐步把中位数推到 27ms，跨度扩大到约 51ms 触发降级，
+    // 而逐样本跳跃始终 ≤ 30ms，不会走"offset 突变"分支。
+    const std::array<int64_t, 8> offsets_ms{0, 0, 0, 0, -24, 27, 27, 27};
+    for (const int64_t offset_ms : offsets_ms) {
+        mavlink_message_t request{};
+        ASSERT_TRUE(terminal.WaitFor(
+            [](const mavlink_message_t& message) {
+                return message.msgid == MAVLINK_MSG_ID_TIMESYNC;
+            }, 500ms, &request));
+        ASSERT_TRUE(terminal.Write(
+            EncodeTimeSyncResponse(request, offset_ms * 1000000LL)));
+    }
+
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            return link.GetTimeSyncStatus().state ==
+                   GroundStationTimeSyncState::kDegraded;
+        }, 1000ms));
+    link.Stop();
+}
+
+// A-08：无状态变化时不逐次发布时间同步状态（否则 20ms 采样即 ~50Hz 刷新）。
+TEST(GroundStationLinkTest, TimeSyncStatusPublishIsLowFrequency) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+    EstablishTimeSync(terminal, link);
+
+    const auto before = link.GetTimeSyncStatus();
+    std::this_thread::sleep_for(150ms);
+    const auto after = link.GetTimeSyncStatus();
+    // 快照只在状态跃迁或 1Hz 到期时刷新，样本年龄应保持不变。
+    EXPECT_EQ(before.sample_age_ms, after.sample_age_ms);
+    link.Stop();
+}
+
+// A-09：65022 回读时高度带与顶点偏移必须做量程钳制与 NaN 保护，不能回绕。
+TEST(GroundStationLinkTest, FenceZoneReportClampsOutOfRangeValues) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    common::Topic<common::FenceZone> report_input;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    link.SetFenceZoneReportInput(report_input);
+    ASSERT_TRUE(link.Start());
+
+    common::FenceZone zone;
+    zone.zone_id = 4;
+    zone.version = 2;
+    zone.action = common::FenceAction::kReturn;
+    zone.alt_min_m = std::numeric_limits<double>::quiet_NaN();
+    zone.alt_max_m = 1.0e6;
+    zone.ref_lat_1e7 = 231230000;
+    zone.ref_lon_1e7 = 1131230000;
+    zone.vertices.push_back({23.123, 113.123});
+    zone.vertices.push_back({23.133, 113.123});  // 约 +1113m，远超 ±327.67m
+    zone.vertices.push_back({23.123, 113.133});
+    ASSERT_TRUE(report_input.Publish(
+        std::make_shared<const common::FenceZone>(zone)).accepted);
+
+    mavlink_message_t report{};
+    ASSERT_TRUE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            if (message.msgid != MAVLINK_MSG_ID_V2_EXTENSION) {
+                return false;
+            }
+            mavlink_v2_extension_t extension{};
+            mavlink_msg_v2_extension_decode(&message, &extension);
+            return extension.message_type == kFenceZoneReportMessageType;
+        }, 500ms, &report));
+    mavlink_v2_extension_t extension{};
+    mavlink_msg_v2_extension_decode(&report, &extension);
+    // NaN 高度下限按 0 处理；超量程上限钳到 int16 最大值。
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 8), 0);
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 10),
+              std::numeric_limits<int16_t>::max());
+    // 顶点 0 落在参考点；顶点 1 的北向偏移约 +1113m（厘米量纲 111300）应钳到上限。
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 21), 0);
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 23), 0);
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 25),
+              std::numeric_limits<int16_t>::max());
+    link.Stop();
+}
+
+// A-11：顶点数超过协议上限时回读必须显式失败（计告警），不能静默丢弃。
+TEST(GroundStationLinkTest, FenceZoneReportRejectsTooManyVertices) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    common::Topic<common::FenceZone> report_input;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    link.SetFlightStateInput(flight_state);
+    link.SetFenceZoneReportInput(report_input);
+    ASSERT_TRUE(link.Start());
+
+    common::FenceZone zone;
+    zone.zone_id = 5;
+    zone.version = 1;
+    zone.ref_lat_1e7 = 231230000;
+    zone.ref_lon_1e7 = 1131230000;
+    for (int index = 0; index < 9; ++index) {
+        zone.vertices.push_back({23.123 + 0.0001 * index, 113.123});
+    }
+    ASSERT_TRUE(report_input.Publish(
+        std::make_shared<const common::FenceZone>(zone)).accepted);
+
+    EXPECT_FALSE(terminal.WaitFor(
+        [](const mavlink_message_t& message) {
+            if (message.msgid != MAVLINK_MSG_ID_V2_EXTENSION) {
+                return false;
+            }
+            mavlink_v2_extension_t extension{};
+            mavlink_msg_v2_extension_decode(&message, &extension);
+            return extension.message_type == kFenceZoneReportMessageType;
+        }, 300ms));
     link.Stop();
 }
 

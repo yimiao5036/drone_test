@@ -481,6 +481,8 @@ public:
         battery_low_since_ms_.reset();
         // 目标等待/丢失看门狗与地面站取消（Task 10）：per-boot 复位。
         mission_abort_latched_ = false;
+        // 围栏越界中止锁存（per-boot）：重启后重新允许一次越界中止。
+        fence_abort_latched_ = false;
         target_wait_started_ms_ = 0;
         assigned_target_acquired_ = false;
         target_lost_since_ms_.reset();
@@ -1101,6 +1103,9 @@ private:
                 battery_low_since_ms_.reset();
                 // 目标看门狗与中止锁存按任务复位（一次任务只中止一次）。
                 mission_abort_latched_ = false;
+                // 围栏中止锁存同样按任务复位：上一任务的越界中止不得让新区域
+                // 在新任务中失去效力（A-09）。
+                fence_abort_latched_ = false;
                 target_wait_started_ms_ = 0;
                 assigned_target_acquired_ = false;
                 target_lost_since_ms_.reset();
@@ -1714,7 +1719,10 @@ private:
                                   common::MissionCommandResult result,
                                   common::MissionCommandReason reason) {
         common::MissionCommandAck ack;
-        ack.header.sequence = ++mission_command_ack_count_;
+        // 回执序号与节流日志共用同一累计值：只递增一次，否则 65021 序号出现
+        // 空洞（地面站按序号判读时会误以为丢包）。
+        const uint64_t count = ++mission_command_ack_count_;
+        ack.header.sequence = count;
         ack.header.source_time_ms = command.received_ms;
         ack.header.receive_time_ms = MonotonicMs();
         ack.header.source_id = 1;
@@ -1727,7 +1735,6 @@ private:
         ack.mission_state = CurrentState();
         (void)mission_command_ack_output_.Publish(
             std::make_shared<const common::MissionCommandAck>(ack));
-        const uint64_t count = ++mission_command_ack_count_;
         if (ShouldLogThrottled(count)) {
             SPDLOG_INFO("任务指令回执已发布: command_id={} type={} result={} reason={} state={} count={}",
                         ack.command_id, static_cast<int>(ack.type),
@@ -1759,19 +1766,23 @@ private:
     /// 地面站围栏区域更新（65018）：校验 + 快照 + 落盘缓存。
     /// 区域是"一群飞机共享的快照"，不做逐条回执；只有内容变化才写缓存与日志。
     void ApplyFenceZone(const common::FenceZone& zone) {
-        if (zone.zone_id == 0U || zone.version == 0U ||
-            zone.vertices.size() < 3U) {
+        // 退化/自交几何与非法高度带会让越界判定"恒真/恒假"，必须在接受当拍
+        // 拒绝并保留上一份可用区域（2026-10-30 审查 A-03）。
+        std::string invalid_reason;
+        if (!control::fence::ValidateZone(zone, &invalid_reason)) {
             const uint64_t count = ++fence_invalid_count_;
             if (ShouldLogThrottled(count)) {
-                SPDLOG_WARN("围栏区域非法已忽略: zone={} version={} 顶点={} count={}",
-                            zone.zone_id, zone.version, zone.vertices.size(),
-                            count);
+                SPDLOG_WARN(
+                    "围栏区域非法已忽略: zone={}/{} 顶点={} 原因={} count={}",
+                    zone.zone_id, zone.version, zone.vertices.size(),
+                    invalid_reason, count);
             }
             return;
         }
-        const bool changed = !fence_zone_.has_value() ||
-                             fence_zone_->zone_id != zone.zone_id ||
-                             fence_zone_->version != zone.version;
+        // 内容比较不能只看 id/version：同 id/version 但几何/动作/高度带变化的
+        // 区域也必须落盘并重置越界计时，否则重启后回滚到旧区域（A-02）。
+        const bool changed =
+            !fence_zone_.has_value() || FenceZoneContentChanged(*fence_zone_, zone);
         fence_zone_ = zone;
         fence_dirty_ = true;
         fence_report_pending_ = true;
@@ -1791,6 +1802,37 @@ private:
         }
         // 越界计时按新区域重新起算（区域刚切换时不得沿用旧判定）。
         fence_violation_since_ms_.reset();
+    }
+
+    /// 65018 区域内容是否变化：id/version 之外还要比较几何（顶点位置，容差
+    /// 0.5m 吸收地面站量化误差）、越界动作、高度基准与高度带。
+    static bool FenceZoneContentChanged(const common::FenceZone& lhs,
+                                        const common::FenceZone& rhs) {
+        constexpr double kVertexToleranceM = 0.5;
+        constexpr double kMetersPerDegreeLat = 111320.0;
+        constexpr double kDegToRad = 0.017453292519943295;
+        if (lhs.zone_id != rhs.zone_id || lhs.version != rhs.version ||
+            lhs.type != rhs.type || lhs.action != rhs.action ||
+            lhs.altitude_reference != rhs.altitude_reference ||
+            std::abs(lhs.alt_min_m - rhs.alt_min_m) > 1e-6 ||
+            std::abs(lhs.alt_max_m - rhs.alt_max_m) > 1e-6 ||
+            lhs.vertices.size() != rhs.vertices.size()) {
+            return true;
+        }
+        for (std::size_t i = 0; i < lhs.vertices.size(); ++i) {
+            const double mean_lat_deg =
+                0.5 * (lhs.vertices[i].latitude_deg + rhs.vertices[i].latitude_deg);
+            const double dn = (lhs.vertices[i].latitude_deg -
+                               rhs.vertices[i].latitude_deg) *
+                              kMetersPerDegreeLat;
+            const double de = (lhs.vertices[i].longitude_deg -
+                               rhs.vertices[i].longitude_deg) *
+                              kMetersPerDegreeLat * std::cos(mean_lat_deg * kDegToRad);
+            if (std::hypot(dn, de) > kVertexToleranceM) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// 围栏守卫/动作允许的状态：起飞/任务/拦截链（含 S11 收口拍）。地面 S0~S2、
@@ -2001,14 +2043,12 @@ private:
                             violation_ms);
                 return;
             case common::FenceAction::kLand:
-                fence_abort_latched_ = true;
-                StopPositionIntent("围栏越界中止（降落）");
-                ResetTargetHold();
-                SPDLOG_WARN("围栏越界降落: zone={}/{} 距边界={:.2f}m 持续={}ms",
-                            polygon.zone_id, polygon.version, distance_m,
-                            violation_ms);
-                TransitionTo(common::MissionState::kLanding,
-                             "围栏越界，进入降落");
+                // 降落与返航同一中止入口（2026-10-30 审查修复）：停发位置
+                // 引导、tracker AbortAirborne、65015 aborted、中止锁存。
+                // S13 若由 S9/S10 转入，会因"未见过 Offboard"立即转 S14 →
+                // S15，不会卡在 S13 反复发送 Offboard 降落。
+                AbortForFence(polygon, distance_m, violation_ms,
+                              common::FenceAction::kLand);
                 return;
             case common::FenceAction::kReturn:
             default:
@@ -2021,8 +2061,9 @@ private:
     /// 停发位置引导、tracker AbortAirborne、65015 aborted → S12 返航。
     /// 不触发拦截/187；S9/S10 期间越界同样先中止（拦截不得在区域外执行）。
     void AbortForFence(const common::FencePolygonNed& polygon, double distance_m,
-                       uint32_t violation_ms) {
-        if (mission_abort_latched_) {
+                       uint32_t violation_ms,
+                       common::FenceAction action = common::FenceAction::kReturn) {
+        if (mission_abort_latched_ || fence_abort_latched_) {
             return;
         }
         mission_abort_latched_ = true;
@@ -2031,10 +2072,16 @@ private:
         ResetTargetHold();
         assignment_tracker_.AbortAirborne();
         RememberTakeoffAbort(common::MissionAssignmentReason::kTargetLost);
-        SPDLOG_WARN("围栏越界中止: zone={}/{} 距边界={:.2f}m 持续={}ms → S12 返航",
-                    polygon.zone_id, polygon.version, distance_m, violation_ms);
-        TransitionTo(common::MissionState::kReturnHome,
-                     "围栏越界，中止任务并返航");
+        const bool land = action == common::FenceAction::kLand;
+        const common::MissionState target_state =
+            land ? common::MissionState::kLanding
+                 : common::MissionState::kReturnHome;
+        SPDLOG_WARN(
+            "围栏越界中止: zone={}/{} 距边界={:.2f}m 持续={}ms 动作={} → {}",
+            polygon.zone_id, polygon.version, distance_m, violation_ms,
+            land ? "land" : "return", land ? "S13 降落" : "S12 返航");
+        TransitionTo(target_state, land ? "围栏越界，中止任务并降落"
+                                        : "围栏越界，中止任务并返航");
         PublishTakeoffAbortAck(common::MissionAssignmentReason::kTargetLost);
     }
 
@@ -2655,9 +2702,23 @@ private:
                 now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
             if (wait_ms >= static_cast<uint64_t>(
                                interception_.authorization_timeout.count())) {
-                SPDLOG_WARN("拦截授权超时，进入返航");
-                TransitionTo(common::MissionState::kReturnHome,
-                             "拦截授权超时");
+                // 授权超时按任务中止收口（2026-10-30 审查修复）：停发视觉
+                // 伺服意图、tracker 收口、65015 记录原因。否则 S12 起不再有
+                // 任何意图发布，控制器在 intent_timeout 后刹车保持，到点不
+                // 返航（飞行安全缺陷）。
+                if (!mission_abort_latched_) {
+                    mission_abort_latched_ = true;
+                    StopPositionIntent("拦截授权超时中止任务");
+                    ResetTargetHold();
+                    assignment_tracker_.AbortAirborne();
+                    RememberTakeoffAbort(
+                        common::MissionAssignmentReason::kTargetWaitTimeout);
+                    SPDLOG_WARN("拦截授权超时，中止任务 → S12 返航");
+                    TransitionTo(common::MissionState::kReturnHome,
+                                 "拦截授权超时，中止任务并返航");
+                    PublishTakeoffAbortAck(
+                        common::MissionAssignmentReason::kTargetWaitTimeout);
+                }
             }
         }
     }

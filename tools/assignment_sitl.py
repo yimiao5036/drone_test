@@ -100,6 +100,7 @@ MISSION_ASSIGN_REASON_NAMES = {
     18: "PX4_DISCONNECTED",
     19: "MISSION_FAULT",
     20: "INTERNAL_ERROR",
+    21: "ZONE_MISMATCH",
 }
 
 AVAILABILITY_NAMES = {
@@ -236,7 +237,14 @@ def build_assignment_payload(args, flags):
         int(flags),
         int(args.valid_for_ms),
     )
-    # offset 15~49 reserved=0；50/51 为 payload 内地址双字段；54 为短帧标记。
+    # offset 15/17：围栏区域号与版本（2026-10-29 增，落在 v1 保留区；0=未声明）。
+    # 机载用它与本地 zone.json 缓存比对，不一致回 65015 reason=21(zone_mismatch)。
+    zone_id = getattr(args, "zone_id", 0)
+    zone_version = getattr(args, "zone_version", 0)
+    if not (0 <= zone_id <= 0xFFFF) or not (0 <= zone_version <= 0xFFFF):
+        raise ValueError("zone-id/zone-version 必须在 0~65535")
+    struct.pack_into("<HH", payload, 15, zone_id, zone_version)
+    # offset 19~49 reserved=0；50/51 为 payload 内地址双字段；54 为短帧标记。
     payload[50] = int(args.aircraft_system) & 0xFF
     payload[51] = int(args.aircraft_component) & 0xFF
     payload[54] = FRAME_LENGTH_MARKER
@@ -255,13 +263,15 @@ def send_assignment(master, args, flags):
     label = "CANCEL" if flags & FLAG_CANCEL else "ASSIGN"
     print(
         "[INFO] TX 65014 {} assignment_id={} target_id={} interceptor_type={} flags=0x{:02X} "
-        "valid_for_ms={} address={}/{} mavlink_payload_len={}".format(
+        "valid_for_ms={} zone={}/{} address={}/{} mavlink_payload_len={}".format(
             label,
             args.assignment_id,
             args.target_id,
             args.interceptor_type,
             flags,
             args.valid_for_ms,
+            args.zone_id,
+            args.zone_version,
             args.aircraft_system,
             args.aircraft_component,
             payload_len,
@@ -531,6 +541,10 @@ def parse_args():
                         help="运行N毫秒后把65014切为取消（起飞前/后取消场景）；0=不切换")
     parser.add_argument("--no-grant", action="store_true", help="不置flags.bit0（负向测试）")
     parser.add_argument("--valid-for-ms", type=int, default=5000, help="分配有效期")
+    parser.add_argument("--zone-id", type=int, default=0,
+                        help="65014 offset15 zone_id（0=未声明；非 0 时与机载缓存比对，见 docs/数据接口文档.md）")
+    parser.add_argument("--zone-version", type=int, default=0,
+                        help="65014 offset17 zone_version（0=未声明；与机载缓存不一致 → 65015 reason=21）")
     parser.add_argument("--duration", type=float, default=15.0, help="运行时长（秒）")
     parser.add_argument("--assignment-interval", type=float, default=2.0,
                         help="65014重发间隔；同一assignment_id重发是幂等的")

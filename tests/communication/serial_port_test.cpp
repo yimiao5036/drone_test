@@ -190,5 +190,20 @@ TEST(SerialPortTest, RejectsNegativeWriteTimeout) {
     EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
+TEST(SerialPortTest, RejectsZeroReadTimeoutToAvoidBusyPolling) {
+    // read_timeout==0 会让 poll 立即返回 0，上层读循环满核空转，必须在配置校验拦截。
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.read_timeout = std::chrono::milliseconds{0};
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+}
+
+TEST(SerialPortTest, RejectsZeroWriteTimeoutToAvoidBusyPolling) {
+    PseudoTerminal terminal;
+    auto config = MakeConfig(terminal.SlaveName());
+    config.write_timeout = std::chrono::milliseconds{0};
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace drone::communication
