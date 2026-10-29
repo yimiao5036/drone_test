@@ -152,7 +152,7 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
   （`OffsetToGeodetic` ↔ `perception::GeodeticToLocalNed`）必须互逆（阈值
   1e-6m / 0.01m），否则拒绝开跑——注入观测与卡尔曼航迹必须落在同一点，否则
   创新门限会误拒交接；
-- 注入目标/观测的几何：探针目标北向 150m（> `controller.max_radius_m`）、主目标
+- 注入目标/观测的几何：探针目标北向 150m（> 默认区域半边长 100m）、主目标
   北向 40m、目标高度 +1m（与悬停同高）；视觉像素与测距由"目标 NED − 自身 NED"
   经真实姿态/安装外参反变换生成（俯仰/偏航变化下仍一致）；
 - 注入目标高度基准 = Home（`alt_reference=1`，WGS-84 反解与 `GeodeticToLocalNed`
@@ -187,7 +187,7 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 | 1 | **[G2 补验]** 命令 AUTO.LOITER（切非 Offboard） | 首个非 Offboard 快照 → 控制器转 IDLE 实测 ≤200ms；停发后设定值额外发送 ≤2 条 |
 | 2 | 引导流重入 Offboard 并重新接管 | Offboard ACK accepted + 真实 6/0 + 控制器回 ACTIVE |
 | 3 | 工具位置引导意图起飞至相对 1m、稳定悬停 | 高度误差 ≤0.15m、水平漂移 ≤0.30m、垂速 ≤0.30m/s |
-| 4 | **[G2 补验]** 注入围栏外目标（150m） | `ClampedCount` 增长 ≥1 且控制器输出位置设定值水平模长 ≤ `max_radius_m`+0.5m |
+| 4 | **[G2 补验]** 注入围栏外目标（150m） | `ClampedCount` 增长 ≥1 且控制器输出位置设定值水平模长 ≤ 围栏半边长+0.5m（默认区域 100m；圆形兜底围栏已删除） |
 | 5 | 换注入近距目标（40m）→ 状态机接管意图流 | 出现 `reason` 低位=7 的位置引导意图（工具停止注入）；状态=S5 |
 | 6 | 注入 SEARCHING→LOCKED 帧 + 测距 | 迁移序列 S5→S6→S7；**交接缝无意图超龄**（末条 S5 位置意图 → 首条 S7 速度意图间隔 < `intent_timeout`，且交接窗口内控制器未跌入 COAST）；出现 `control_source=1` 速度意图 |
 | 7 | 短期 LOST（10 帧 < `exit_lost_frames`） | 状态保持 S7；出现零速刹车意图（reason 低位 102） |
@@ -197,7 +197,7 @@ Px4Link 真实遥测 → FlightStateSnapshot（导航门禁/Home/伺服姿态/�
 | 11 | AUTO.LAND → landed → 主动 DISARM | 同 stage4 收尾（未落地禁止空中 DISARM） |
 
 硬包线（armed 期间越界即安全回收 AUTO.LAND）：相对高度 0.50~1.30m（下限只对升空后
-生效）、北向 ≤ 主目标北向+6m、东西 ≤2m、水平半径 ≤ `max_radius_m`+0.5m；连接/位置/
+生效）、北向 ≤ 主目标北向+6m、东西 ≤2m、水平半径 ≤ 围栏半边长+0.5m（默认区域 100m）；连接/位置/
 姿态失效同样触发回收；非预期退出 Offboard（非步骤 1/10）计失败。
 
 退出码沿用第 5 节；无 SITL 时在 10 秒连接超时后中止脚本并报告 FAIL（退出码 3），

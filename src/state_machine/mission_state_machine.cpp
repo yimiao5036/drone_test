@@ -1917,8 +1917,10 @@ private:
         // 降落）仍受 enabled 门控，默认配置下不会产生任何中止或降落。
         // 区域/锚点变化后重建 NED 多边形（锚点未就绪时降级 no_zone，不盲算）。
         if (fence_dirty_) {
-            RebuildFencePolygon();
-            fence_dirty_ = false;
+            // 只有重建**成功**才清脏标记：锚点（ned_ref）在起飞早期可能尚未
+            // 就绪，若此时清标记，多边形会一直为空、控制器永不钳制
+            // （2026-10-29 SITL 实测：首版就是这样让"围栏钳制"偶发失效）。
+            fence_dirty_ = !RebuildFencePolygon();
         }
         const common::FencePolygonNed polygon = LatestFencePolygon();
         const bool zone_present = fence_zone_.has_value();
@@ -2054,7 +2056,7 @@ private:
 
     /// 区域→NED 多边形重建（锚点取 EKF 参考点，与 HomeLocalNed 同源）。
     /// 顶点经纬度到锚点的平面换算复用 perception::GeodeticToLocalNed。
-    void RebuildFencePolygon() {
+    bool RebuildFencePolygon() {
         common::FencePolygonNed polygon;
         bool ok = false;
         if (fence_zone_.has_value() && fence_zone_->vertices.size() >= 3U &&
@@ -2084,8 +2086,11 @@ private:
             }
             ok = polygon.valid();
         }
-        std::lock_guard<std::mutex> lock(fence_mutex_);
-        fence_polygon_ = ok ? polygon : common::FencePolygonNed{};
+        {
+            std::lock_guard<std::mutex> lock(fence_mutex_);
+            fence_polygon_ = ok ? polygon : common::FencePolygonNed{};
+        }
+        return ok;
     }
 
     /// 控制线程只读快照（FlightController 位置意图钳制用）。

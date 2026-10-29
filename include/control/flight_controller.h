@@ -55,8 +55,8 @@ public:
     virtual void SetInput(common::Topic<common::ControlIntent>& intent) = 0;
 
     /// 注入围栏多边形只读来源（MissionStateMachine 实现，2026-10-29）。
-    /// 注入后位置式意图按多边形钳制（含内缩余量）；未注入或区域无效
-    /// （顶点 < 3）时回退 Home 圆形围栏（max_radius_m/max_altitude_m）。
+    /// 注入后位置式意图按多边形钳制（含内缩余量）并按区域高度带钳制高度；
+    /// 未注入或区域无效（顶点 < 3）时不做钳制（圆形兜底围栏已删除）。
     virtual void SetFencePolygonSource(const common::IFencePolygonSource* source) = 0;
 
     // ---- 输出 ----
@@ -131,8 +131,10 @@ enum class ControlAuthority : uint8_t { kIdle, kBootstrap, kActive, kCoast };
 ///   ACTIVE；条件失效/意图撤销/超过 bootstrap_timeout 只回 IDLE 并停流。
 ///   **门禁不读取任何 RC 字段**（rc_state_valid/rc_connected/
 ///   manual_override_active）——RC 交由 PX4 自己管理；
-/// - Home 相对围栏（Task 5）：位置式意图水平模长超 max_radius_m 等比钳制、
-///   相对高度超 max_altitude_m 钳制；home_valid=false 时位置式意图拒绝。
+/// - 多边形围栏（2026-10-29）：位置式意图按地面站多边形钳制（内缩
+///   `fence_margin_m`）、高度按区域高度带上限钳制；home_valid=false 时
+///   位置式意图拒绝。圆形兜底围栏（原 Task 5 的 max_radius_m/max_altitude_m）
+///   已随维护者裁决删除，围栏只有多边形一种。
 class FlightController final : public IFlightController {
 public:
     /// 配置在 LoadAppConfig 加载期已 Validate() 校验（fail-fast）；

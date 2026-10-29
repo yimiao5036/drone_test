@@ -757,8 +757,10 @@ private:
         double target_x = intent.target_x;
         double target_y = intent.target_y;
         double target_z = intent.target_z;
-        // 多边形围栏（2026-10-29）：地面站划定的区域优先于 Home 圆形围栏。
-        // 只在区域有效（≥3 顶点）时生效；无效/未注入回退下方圆形钳制。
+        // 多边形围栏（2026-10-29）：围栏只有一种——地面站划定的多边形。
+        // 圆形兜底围栏（max_radius_m/max_altitude_m）已随维护者裁决删除：
+        // 区域无效（顶点 < 3）或未注入时不做水平/高度钳制，此时由状态机
+        // 的围栏守卫（无区域→kNoZone、无动作）与 PX4 侧参数作为最后防线。
         const common::IFencePolygonSource* const fence_source =
             fence_source_.load(std::memory_order_acquire);
         const common::FencePolygonNed zone =
@@ -782,30 +784,18 @@ private:
                 }
             }
         }
-        // 水平半径：模长超 max_radius_m 等比钳制（方向不变）。
-        // 多边形生效时该圆形围栏仍作为绝对兜底（两个上限取更严者）。
-        const double radius = std::hypot(target_x, target_y);
-        if (radius > config_.max_radius_m) {
-            const double scale = config_.max_radius_m / radius;
-            target_x *= scale;
-            target_y *= scale;
-            const uint64_t count = ++clamped_count_;
-            if (ShouldLogThrottled(count)) {
-                SPDLOG_WARN("飞行控制器围栏水平半径钳制: r={:.2f} > max={:.2f} 累计={}",
-                            radius, config_.max_radius_m, count);
-            }
-        }
-        // 高度：NED z 向下为正，相对 Home 高度 = -z；超上限钳制。
-        // 区域自带高度带时以区域上限为权威（更严者优先），否则用配置上限。
-        const double alt_limit =
-            (zone_active && zone.alt_max_m > 0.0) ? zone.alt_max_m : config_.max_altitude_m;
-        const double altitude_m = -target_z;
-        if (altitude_m > alt_limit) {
-            target_z = -alt_limit;
-            const uint64_t count = ++clamped_count_;
-            if (ShouldLogThrottled(count)) {
-                SPDLOG_WARN("飞行控制器围栏高度钳制: h={:.2f} > max={:.2f} 累计={}",
-                            altitude_m, alt_limit, count);
+        // 高度：NED z 向下为正，相对 Home 高度 = -z。
+        // 只有多边形自带高度带上限时才钳制：圆形围栏已随 2026-10-29 裁决删除，
+        // 高度保护统一由地面站区域高度带承担（无区域/无上限则不额外钳制）。
+        if (zone_active && zone.alt_max_m > 0.0) {
+            const double altitude_m = -target_z;
+            if (altitude_m > zone.alt_max_m) {
+                target_z = -zone.alt_max_m;
+                const uint64_t count = ++clamped_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN("飞行控制器围栏高度钳制: h={:.2f} > 区域上限={:.2f} 累计={}",
+                                altitude_m, zone.alt_max_m, count);
+                }
             }
         }
         // ---- 位置速度前馈（P3）：可选增强，开关关闭时完全忽略 ----

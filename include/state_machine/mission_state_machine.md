@@ -339,6 +339,15 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 坐标换算：`RebuildFencePolygon()` 用当前 `FlightStateSnapshot` 的 EKF 锚点
     （`ned_ref_lat_1e7/ned_ref_lon_1e7`）把每个顶点经 `perception::GeodeticToLocalNed()`
     换成局部 NED；锚点变化后下一拍自动重建（区域只在 `fence_dirty_` 时重建）。
+    **返回值语义（2026-10-29 修）**：函数返回 `bool`，只有重建成功才清 `fence_dirty_`
+    （`fence_dirty_ = !RebuildFencePolygon()`）。起飞早期 EKF 锚点可能尚未就绪，
+    若此时无条件清标记，多边形会一直为空、控制器永不钳制（SITL 实测症状：
+    `ClampedCount=0`、位置设定值跑到 149.99m）。
+  - 默认区域与回读（2026-10-29 增）：`EnsureDefaultFenceZone()` 在 `enabled` 为真、
+    无区域、`home_valid` 且 `default_half_side_m>0` 时以 Home 为中心生成方形默认区域
+    （`default_zone_id/version/action/alt_*`），落盘 `zone.json` 并回读；
+    `PublishFenceZoneReport()` 在区域变化或每 `report_period_ms`（默认 5s）发 65022
+    给地面站对拍。`fence.enabled` 默认已改为 `true`。
   - 判定：`EvaluateFenceGuard()` 排在电池守卫之后、目标看门狗之前（几何安全事件：
     优先级低于电池、高于任务）。用 `PointInPolygon()` 与 `SignedDistanceToBoundary()`
     得出 `kNormal / kNearBoundary（距离 ≤ boundary_warn_m）/ kViolated（出区或超高度带）`，

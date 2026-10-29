@@ -21,9 +21,11 @@
   IDLE 影子运行（不发布任何设定值）**。ACTIVE/COAST 中门禁失效立即发布
   `valid=false` 停发并转 IDLE；意图超龄转 COAST 零速刹车保持，
   `coast_timeout` 超时转 IDLE 停发。
-- **Home 相对围栏已接入（Task 5）**：位置式意图水平模长超 `max_radius_m`
-  等比钳制、相对高度超 `max_altitude_m` 钳制；`home_valid=false` 时
-  位置式意图拒绝（无基准不可围栏）。
+- **多边形围栏（2026-10-29 起唯一形态）**：位置设定值按地面站划定的多边形
+  （`IFencePolygonSource`）内缩 `fence_margin_m` 后钳制，高度按区域高度带上限
+  钳制；**圆形半径/高度兜底已在 2026-10-29 删除**，无多边形（未注入 / 顶点<3 /
+  EKF 锚点未就绪）时控制器不做水平或高度钳制，由状态机围栏守卫与 PX4 侧参数兜底。
+  `home_valid=false` 时位置式意图仍拒绝（无基准不可围栏）。
 - **自动起飞预授权已接入（Task 6，spec §8）**：控制权增加 `kBootstrap`；
   地面/未解锁且收到未超龄的 `kTakeoff` 意图（bit31）时发布起飞原点
   位置保持流，为 PX4 进入 Offboard 建立合法 setpoint 流；`armed+Offboard`
@@ -174,9 +176,10 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
 1. 读取 `LatestFencePolygon()`；`vertices.size() >= 3` 才视为生效（否则完全回退旧行为）。
 2. 位置设定值经 `fence::ClampIntoPolygon(vertices, {x,y}, controller.fence_margin_m)` 回拉，
    位移 > 1e-6m 即计数 `clamped_count_` 并打节流 WARN（带 zone_id/version、位移、累计次数）。
-3. 圆形半径围栏（`controller.max_radius_m`）继续执行，作为**绝对兜底**：
-   多边形来源失效或顶点不足时，仍按 Home 半径保护。
-4. 高度上限：多边形生效且 `alt_max_m > 0` 时用区域高度带上限，否则用 `controller.max_altitude_m`。
+3. **没有圆形兜底**（2026-10-29 删除）：多边形不生效时不做水平钳制——围栏
+   只有地面站划定的多边形这一种形态，缺区域即无围栏，靠状态机围栏守卫（65019
+   上报 `no_zone`）与 PX4 侧参数兜底。
+4. 高度上限：仅多边形生效且 `alt_max_m > 0` 时按区域高度带上限钳制；否则不设上限。
 5. 航向：`setpoint.use_yaw = intent.yaw_valid || intent.yaw_deg != 0.f`——新增
    `ControlIntent.yaw_valid` 解决“正北 0° 无法表达”的历史问题；S12 返航用它
    请求机头朝飞行方向，其余位置意图不置位即保持原机头平移。
@@ -194,9 +197,10 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   本身即 Home 相对量；`LatestState()` 快照的 `home_valid` 是该约定的
   可信基准门——`home_valid=false` 时位置式意图拒绝输出并计入
   `RejectedIntentCount`（无基准不可围栏）。
-- **水平半径**：`hypot(x, y) > max_radius_m` 时等比钳制到边界（方向不变）。
-- **高度**：NED z 向下为正，相对高度 = `-z`；超 `max_altitude_m` 钳制到
-  `z = -max_altitude_m`（不设下限，近地/贴地由任务层负责）。
+- **水平**：按多边形内缩 `fence_margin_m` 钳制（`fence::ClampIntoPolygon`），
+  不再有圆形半径；顶点不足 3 或多边形无效时**不钳制**。
+- **高度**：NED z 向下为正，相对高度 = `-z`；仅当区域 `alt_max_m > 0` 时超限钳制到
+  `z = -alt_max_m`（不设下限，近地/贴地由任务层负责）。
 - 每次钳制生效 `ClampedCount()+1` 并节流 WARN（第 1 次与每满 100 次）。
 
 ## 位置速度前馈（P3，2026-10-19）
@@ -419,7 +423,7 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
   - `StaleRequestDoesNotActivateAuthority`：请求位意图到达后长期 IDLE
     （无新意图），授权链事后就绪时陈旧请求不得激活 ACTIVE（评审
     fix round 2 回归）；补新鲜请求位意图后才转 ACTIVE；
-  - `FenceClampsPositionIntent`：位置意图超 `max_radius_m`/`max_altitude_m`
+  - `FenceClampsPositionIntent`：注入 100m/30m 正方形区域后
     → 钳制到边界 + `ClampedCount` 计数；`home_valid=false` → 位置式意图
     拒绝输出并计 `RejectedIntentCount`。
 - 自动起飞预授权用例（`FlightControllerBootstrapTest` 夹具：地面/未解锁
@@ -460,7 +464,7 @@ ctest --test-dir build -R FlightController --output-on-failure
   （"bootstrap 超时"/"起飞意图超龄"/"已 armed 但未进入 Offboard"）；
   bootstrap 失败后 `SetpointOutput()` 会收到一条 `valid=false` 停流。
 - 位置意图被钳小/被拒：查 `ClampedCount()` 是否递增（围栏生效）与
-  `max_radius_m`/`max_altitude_m` 配置；`home_valid=false` 时位置式意图
+  多边形区域配置；`home_valid=false` 时位置式意图
   一律拒绝（无基准不可围栏）——先查 PX4 Home 上报链路。
 - 输出被钳小/爬坡慢：查 `ClampedCount()` 是否递增（幅值限幅生效）与
   `max_speed_mps`/`max_accel_mps2` 配置；slew 单步上限 =

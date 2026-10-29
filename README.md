@@ -20,7 +20,7 @@
 ```bash
 cmake -S . -B build
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure     # 637/637
+ctest --test-dir build --output-on-failure     # 638/638
 python3 tools/check_docs.py                    # 文档基线/链接检查
 ./build/drone_control                          # 生成 logs/0001_xxx.log
 ```

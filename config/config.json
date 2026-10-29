@@ -176,7 +176,7 @@
         "battery_low_debounce_ms": 1000
     },
     "fence": {
-        "enabled": false,
+        "enabled": true,
         "zone_cache_path": "config/zone.json",
         "report_period_ms": 5000,
         "default_half_side_m": 100.0,

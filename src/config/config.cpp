@@ -491,8 +491,6 @@ void FlightControllerConfig::Validate() const {
     if (max_speed_mps <= 0.0) throw std::invalid_argument("controller.max_speed_mps 必须为正");
     if (max_accel_mps2 <= 0.0) throw std::invalid_argument("controller.max_accel_mps2 必须为正");
     if (max_jerk_mps3 < 0.0) throw std::invalid_argument("controller.max_jerk_mps3 不得为负");
-    if (max_altitude_m <= 0.0 || max_radius_m <= 0.0)
-        throw std::invalid_argument("controller 围栏参数必须为正");
     if (!std::isfinite(max_feedforward_mps) || max_feedforward_mps <= 0.0)
         throw std::invalid_argument("controller.max_feedforward_mps 必须为有限正数");
     if (intent_timeout.count() <= 0)
@@ -884,10 +882,6 @@ AppConfig LoadAppConfig(const std::string& path,
         controller, "max_accel_mps2", config.controller.max_accel_mps2);
     config.controller.max_jerk_mps3 =
         controller.value("max_jerk_mps3", config.controller.max_jerk_mps3);
-    config.controller.max_altitude_m = ReadOptionalPositiveDouble(
-        controller, "max_altitude_m", config.controller.max_altitude_m);
-    config.controller.max_radius_m = ReadOptionalPositiveDouble(
-        controller, "max_radius_m", config.controller.max_radius_m);
     config.controller.enable_position_velocity_feedforward =
         controller.value("enable_position_velocity_feedforward",
                          config.controller.enable_position_velocity_feedforward);

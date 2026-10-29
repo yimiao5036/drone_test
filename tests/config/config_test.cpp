@@ -1110,8 +1110,9 @@ TEST(ConfigTest, FenceDefaultsApplyWhenSectionMissing) {
     value.erase("fence");
     const auto path = WriteTemporaryConfig(value, "drone_config_fence_default.json");
     const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
-    // 段缺席时围栏默认关闭（安全基线不变），缓存路径按可执行目录解析。
-    EXPECT_FALSE(config.fence.enabled);
+    // 段缺席时围栏默认**开启**（2026-10-29 维护者裁决：围栏只有多边形一种，
+    // 开机按 fence.default_* 以 Home 为中心生成默认区域）。
+    EXPECT_TRUE(config.fence.enabled);
     EXPECT_EQ(config.fence.violation_debounce.count(), 1500);
     EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 1.0);
     EXPECT_DOUBLE_EQ(config.fence.boundary_warn_m, 10.0);

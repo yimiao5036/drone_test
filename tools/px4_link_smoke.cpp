@@ -602,10 +602,6 @@ drone::config::FlightControllerConfig LoadControllerConfig(const json& root) {
                                                       config.max_speed_mps);
     config.max_accel_mps2 = ReadOptionalPositiveDouble(
         controller, "max_accel_mps2", config.max_accel_mps2);
-    config.max_altitude_m = ReadOptionalPositiveDouble(
-        controller, "max_altitude_m", config.max_altitude_m);
-    config.max_radius_m =
-        ReadOptionalPositiveDouble(controller, "max_radius_m", config.max_radius_m);
     config.enable_position_velocity_feedforward =
         controller.value("enable_position_velocity_feedforward",
                          config.enable_position_velocity_feedforward);
@@ -2749,7 +2745,7 @@ int RunStage4(drone::communication::Px4Link& link, const json& root,
 //      随后引导流重入 Offboard 重新接管
 //   2) 工具位置引导意图起飞至相对 1m 并稳定悬停（此时未注入地面站目标，
 //      状态机停在 READY 静默，意图流唯一生产者仍是工具）
-//   3) [G2 补验] 注入围栏外目标（150m > controller.max_radius_m）→ 位置设定值
+//   3) [G2 补验] 注入围栏外目标（150m > 围栏半边长 100m）→ 位置设定值
 //      被钳制在围栏内（ClampedCount 增长 + 实测设定值水平模长 ≤ 围栏）
 //   4) 换注入近距目标（40m）→ S5（GPS_APPROACH）位置引导；随后注入
 //      SEARCHING → LOCKED 帧序列 + 测距 → S6（冻结位置意图续发）→ S7（视觉伺服）
@@ -2793,7 +2789,11 @@ constexpr float kMissionMinHeightM = 0.50f;        // armed 期间硬性高度�
 constexpr float kMissionMaxEastM = 2.0f;           // 全段东西向硬边界
 constexpr float kMissionNorthMarginM = 6.0f;       // 主目标北向包线余量
 constexpr double kMissionTargetNorthM = 40.0;      // 主目标北向距离（Home 相对）
-constexpr double kMissionFenceProbeNorthM = 150.0; // 围栏探针目标（须 > max_radius）
+/// 任务剧本的多边形围栏半边长（m）。圆形兜底围栏（controller.max_radius_m）
+/// 已于 2026-10-29 删除，本剧本改为装配期让状态机生成同尺寸默认区域，
+/// 由多边形钳制提供"围栏外目标被拉回"的证据。
+constexpr double kMissionFenceRadiusM = 100.0;
+constexpr double kMissionFenceProbeNorthM = 150.0; // 围栏探针目标（须 > 围栏半边长）
 constexpr double kMissionTargetUpM = 1.0;          // 目标高度（相对 Home，与悬停同高）
 constexpr uint64_t kMissionToolIntentValidMs = 500;  // 工具引导意图有效期（工具自用）
 constexpr uint64_t kMissionIntentPeriodMs = 100;   // 工具引导意图周期（10Hz）
@@ -3443,7 +3443,7 @@ public:
                                 hover_complete_ && !safety_violation_;
         const bool fence_ok = fence_clamp_seen_ && max_position_norm_m_ > 0.0 &&
                               max_position_norm_m_ <=
-                                  controller_config_.max_radius_m + kMissionFenceToleranceM;
+                                  kMissionFenceRadiusM + kMissionFenceToleranceM;
         const bool sm_takeover_ok = sm_intent_seen_;
         const bool migration_ok = SequenceContains({common::MissionState::kGpsApproach,
                                                     common::MissionState::kVisualHandover,
@@ -3477,7 +3477,7 @@ public:
                    mode_stop_ok, true);
         PrintCheck("切回 Offboard 重新接管(第二轮授权链全通)", rebootstrap_ok, true);
         PrintCheck("相对起飞 1m 稳定悬停完成", takeoff_ok, true);
-        PrintCheck("围栏钳制: 位置设定值未超 max_radius",
+        PrintCheck("围栏钳制: 位置设定值未超围栏半边长",
                    fence_ok, true);
         PrintCheck("状态机接管意图流(S5 位置引导 reason=7)",
                    sm_takeover_ok, true);
@@ -3513,7 +3513,7 @@ public:
                           : 0)
                   << " ms（上限 " << kMissionModeStopLimitMs << "，停发后额外发送 "
                   << sends_after_mode_stop << " 条），围栏探针最大设定值水平模长 "
-                  << max_position_norm_m_ << " m（围栏 " << controller_config_.max_radius_m
+                  << max_position_norm_m_ << " m（围栏 " << kMissionFenceRadiusM
                   << " m），速度设定值最大隐含加速度 " << max_slew << " m/s²（上限 "
                   << slew_limit << "），交接缝（末条S5位置→首条S7速度） "
                   << handover_seam_gap_ms_ << " ms（意图有效期 " << intent_valid_ms_
@@ -3994,8 +3994,20 @@ private:
         }
         if (hover_complete_) {
             std::cout << "[SITL] 悬停稳定完成，注入围栏外目标（北向 "
-                      << kMissionFenceProbeNorthM << "m > max_radius "
-                      << controller_config_.max_radius_m << "m）" << std::endl;
+                      << kMissionFenceProbeNorthM << "m > 围栏半边长 "
+                      << kMissionFenceRadiusM << "m）" << std::endl;
+            {
+                // 围栏诊断（一次性）：确认状态机已产出有效多边形，否则"未钳制"
+                // 不是控制器问题而是区域没生成（缺 Home/锚点/默认区域）。
+                const auto zone = machine_.LatestFencePolygon();
+                const bool zone_valid = zone.valid();
+                std::cout << "[SITL] 围栏多边形诊断: valid=" << (zone_valid ? 1 : 0)
+                          << " 顶点=" << zone.vertices.size()
+                          << " zone=" << zone.zone_id << "/" << zone.version
+                          << " 高度带上限=" << zone.alt_max_m
+                          << " 锚点有效=" << (latest_.ned_ref_valid ? 1 : 0)
+                          << " Home有效=" << (latest_.home_valid ? 1 : 0) << std::endl;
+            }
             rig_.SetTargetNed(kMissionFenceProbeNorthM, 0.0, kMissionTargetUpM);
             fence_probe_clamped_at_ = controller_.ClampedCount();
             phase_ = MissionPhase::kFenceProbe;
@@ -4007,7 +4019,7 @@ private:
         }
     }
 
-    /// 注入围栏外目标：位置引导意图指向 150m，控制器应钳制到 max_radius。
+    /// 注入围栏外目标：位置引导意图指向 150m，控制器应钳制到多边形边界。
     /// 验收证据：ClampedCount 增长 + 实测位置设定值水平模长 ≤ 围栏（+容差）。
     void AdvanceFenceProbe(uint64_t now_ms) {
         (void)rig_.PublishGroundTarget(kMissionTargetIdProbe, now_ms, SnapshotOrNull());
@@ -4027,7 +4039,7 @@ private:
             std::cout << "[SITL] 围栏钳制证据成立：ClampedCount +"
                       << controller_.ClampedCount() - fence_probe_clamped_at_
                       << "，最大位置设定值水平模长 " << max_position_norm_m_ << " m（围栏 "
-                      << controller_config_.max_radius_m << " m）；换注入近距目标（北向 "
+                      << kMissionFenceRadiusM << " m）；换注入近距目标（北向 "
                       << kMissionTargetNorthM << "m）" << std::endl;
             rig_.SetTargetNed(kMissionTargetNorthM, 0.0, kMissionTargetUpM);
             phase_ = MissionPhase::kApproach;
@@ -4297,7 +4309,7 @@ private:
         const bool horizontal_out =
             north_m > kMissionNorthMarginM + static_cast<float>(kMissionTargetNorthM) ||
             east_m > kMissionMaxEastM ||
-            radius > controller_config_.max_radius_m + kMissionFenceToleranceM;
+            radius > kMissionFenceRadiusM + kMissionFenceToleranceM;
         if (height_out || horizontal_out) {
             safety_violation_ = true;
             std::cout << "[SITL][安全回收] 高度/水平位移超包线: 相对高度 " << ascent_m
@@ -6233,7 +6245,7 @@ private:
             return;  // 段内不换
         }
         const double radius = std::hypot(north_m, east_m);
-        if (radius > controller_config_.max_radius_m - 10.0) {
+        if (radius > kMissionFenceRadiusM - 10.0) {
             Abort("整定阶跃目标越出围栏余量");
             return;
         }
@@ -7087,11 +7099,19 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
     mission_config.actuator = app.actuator;
     mission_config.interception = app.interception;
     mission_config.return_home = app.return_home;
+    // 围栏（2026-10-29）：圆形兜底删除后，G3 的"围栏外目标被钳制"证据改由
+    // 多边形承担——启用围栏并让状态机按 fence.default_* 以 Home 为中心生成
+    // kMissionFenceRadiusM 的默认方形区域，控制器据此钳制位置意图。
+    mission_config.fence = app.fence;
+    mission_config.fence.enabled = true;
+    mission_config.fence.zone_cache_path.clear();
+    mission_config.fence.default_half_side_m = kMissionFenceRadiusM;
     drone::state_machine::MissionStateMachine machine(mission_config);
 
     drone::control::FlightController controller(app.controller);
     controller.SetInput(machine.IntentOutput());
     controller.SetPx4LinkSource(&link);
+    controller.SetFencePolygonSource(&machine);
     link.SetInput(controller.SetpointOutput());
 
     machine.SetInputs(ground_target_topic, link.StateOutput(), health_topic);
@@ -7106,7 +7126,7 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
               << " intent_valid=" << app.controller.intent_timeout.count() << "ms"
               << std::endl;
     std::cout << "  注入几何: 探针目标北向 " << kMissionFenceProbeNorthM
-              << "m（> max_radius " << app.controller.max_radius_m
+              << "m（> 围栏半边长 " << kMissionFenceRadiusM
               << "m），主目标北向 " << kMissionTargetNorthM << "m，目标高度 +"
               << kMissionTargetUpM << "m；相机 " << app.visual_tracking.camera.image_width
               << "x" << app.visual_tracking.camera.image_height << " fx="

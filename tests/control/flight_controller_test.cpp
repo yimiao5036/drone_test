@@ -130,6 +130,28 @@ common::FlightStateSnapshot MakeLandedSnapshot() {
     return state;
 }
 
+/// 围栏多边形只读来源桩（2026-10-29）：圆形兜底围栏删除后，控制器的钳制
+/// 只来自多边形，用例用它注入一份固定的 NED 正方形区域。
+class StubFenceSource final : public common::IFencePolygonSource {
+public:
+    void SetSquare(double half_side_m, double alt_max_m) {
+        zone_ = common::FencePolygonNed{};
+        zone_.zone_id = 1;
+        zone_.version = 1;
+        zone_.action = common::FenceAction::kReturn;
+        zone_.alt_min_m = 0.0;
+        zone_.alt_max_m = alt_max_m;
+        zone_.vertices = {{-half_side_m, -half_side_m},
+                          {half_side_m, -half_side_m},
+                          {half_side_m, half_side_m},
+                          {-half_side_m, half_side_m}};
+    }
+    common::FencePolygonNed LatestFencePolygon() const override { return zone_; }
+
+private:
+    common::FencePolygonNed zone_;
+};
+
 }  // namespace
 
 TEST(FlightControllerTest, ConstructorRejectsNonPositivePeriod) {
@@ -460,7 +482,7 @@ TEST_F(FlightControllerPipelineTest, PositionToVelocitySlewStartsFromZero) {
 // =============================================================================
 // 控制权三态用例（Task 5）：MockPx4Link 注入快照 + 合成时间轴 TestTick 驱动。
 // 配置：period=20ms、intent_timeout=100ms、coast_timeout=400ms
-// （MakeControllerConfig），围栏 max_radius_m=100、max_altitude_m=30（默认）。
+// （MakeControllerConfig）；围栏只有多边形一种（圆形兜底已于 2026-10-29 删除）。
 // =============================================================================
 
 class FlightControllerAuthorityTest : public ::testing::Test {
@@ -470,6 +492,9 @@ protected:
         controller_.SetPx4LinkSource(&px4_link_);
         output_ = controller_.SetpointOutput().Subscribe(kOutputCapacity);
     }
+
+    /// 多边形围栏来源桩：仅在需要钳制的用例里显式注入。
+    StubFenceSource fence_source_;
 
     /// 发布一条带控制权显式请求位的意图（receive_time 由控制器补合成时刻）。
     void PublishIntent(common::ControlIntent intent) {
@@ -693,15 +718,18 @@ TEST_F(FlightControllerAuthorityTest, StaleRequestDoesNotActivateAuthority) {
 }
 
 TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
-    // 位置意图超过 max_radius_m / max_altitude_m（相对 Home）→ 钳制到边界 +
-    // 节流 WARN（ClampedCount 计数）
+    // 位置意图超出地面站多边形区域 → 钳制到边界（内缩 fence_margin_m）+ 高度按
+    // 区域高度带上限钳制 + 节流 WARN（ClampedCount 计数）。圆形兜底围栏已于
+    // 2026-10-29 删除，钳制只来自多边形。
+    fence_source_.SetSquare(100.0, 30.0);
+    controller_.SetFencePolygonSource(&fence_source_);
     px4_link_.SetState(MakeOffboardSnapshot());
     common::ControlIntent intent;
     intent.type = common::ControlIntentType::kPositionGuide;
     intent.control_source = 0;
-    intent.target_x = 150.f;  // 水平半径 150m > max_radius_m=100
+    intent.target_x = 150.f;  // 北向 150m > 区域半边长 100m
     intent.target_y = 0.f;
-    intent.target_z = -50.f;  // 相对高度 50m（NED z 向下为负）> max_altitude_m=30
+    intent.target_z = -50.f;  // 相对高度 50m > 区域高度带上限 30m
     PublishIntent(intent);
     Tick();
     ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
@@ -709,9 +737,9 @@ TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
     ASSERT_TRUE(out.has_value());
     EXPECT_TRUE(out->valid);
     EXPECT_EQ(out->type, common::SetpointType::kPosition);
-    EXPECT_NEAR(out->x, 100.f, 1e-3);  // 水平等比钳制到半径边界
+    EXPECT_NEAR(out->x, 99.f, 1e-3);  // 拉回边界并内缩 margin=1m
     EXPECT_NEAR(out->y, 0.f, 1e-6);
-    EXPECT_FLOAT_EQ(out->z, -30.f);  // 高度钳制到上限
+    EXPECT_FLOAT_EQ(out->z, -30.f);  // 高度钳制到区域上限
     EXPECT_EQ(controller_.ClampedCount(), 2u);  // 水平+高度各钳制一次
 
     // home_valid=false：无基准不可围栏 → 位置式意图拒绝输出并计数
@@ -727,6 +755,27 @@ TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
     Tick();
     EXPECT_FALSE(TakeOutput().has_value());
     EXPECT_GT(controller_.RejectedIntentCount(), 0u);
+}
+
+TEST_F(FlightControllerAuthorityTest, NoPolygonMeansNoClamp) {
+    // 圆形兜底围栏删除后的回归：没有注入多边形来源时，位置意图原样下发
+    // （不再按 max_radius_m/max_altitude_m 钳制），ClampedCount 不增长。
+    px4_link_.SetState(MakeOffboardSnapshot());
+    common::ControlIntent intent;
+    intent.type = common::ControlIntentType::kPositionGuide;
+    intent.control_source = 0;
+    intent.target_x = 150.f;
+    intent.target_y = 0.f;
+    intent.target_z = -50.f;
+    PublishIntent(intent);
+    Tick();
+    ASSERT_EQ(controller_.Authority(), ControlAuthority::kActive);
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->type, common::SetpointType::kPosition);
+    EXPECT_NEAR(out->x, 150.f, 1e-3);
+    EXPECT_FLOAT_EQ(out->z, -50.f);
+    EXPECT_EQ(controller_.ClampedCount(), 0u);
 }
 
 // =============================================================================

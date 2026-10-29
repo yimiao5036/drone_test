@@ -68,8 +68,6 @@ struct FlightControllerConfig {
     double max_speed_mps = 2.0;                  // 速度幅值上限
     double max_accel_mps2 = 2.0;                 // 加速度上限（slew）
     double max_jerk_mps3 = 0.0;                  // jerk 上限；0=不启用（v1 预留）
-    double max_altitude_m = 30.0;                // 围栏：相对 Home 最大高度
-    double max_radius_m = 100.0;                 // 围栏：相对 Home 最大水平半径
     // 位置型意图速度前馈（P3，2026-10-19）：开关默认关闭；上限独立于
     // max_speed_mps（后者只约束速度式意图），水平模长/垂直分量分别钳制。
     bool enable_position_velocity_feedforward = false;
@@ -182,10 +180,10 @@ struct ReturnHomeConfig {
 /// 多边形围栏（fence 节，2026-10-29）。
 /// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
 /// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
-/// 默认关闭：关闭时完全回退旧的 Home 圆形围栏
-/// （`controller.max_radius_m` / `controller.max_altitude_m`）。
+/// 默认**开启**（2026-10-29 维护者裁决）：开启后无区域时按 `default_*` 以 Home
+/// 为中心生成默认区域，因此没有"圆形兜底围栏"这一层——围栏只有多边形一种。
 struct FenceConfig {
-    bool enabled = false;
+    bool enabled = true;
     /// 区域缓存路径（相对可执行文件目录）；缺失/非法按 kNoZone 处理（不中止）。
     std::string zone_cache_path = "config/zone.json";
     /// 越界判定防抖：连续处于区域外达该时长才判定越界并执行动作。
