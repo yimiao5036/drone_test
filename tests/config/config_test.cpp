@@ -52,7 +52,9 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_TRUE(config.runtime.enable_ground_station);
     EXPECT_TRUE(config.runtime.enable_target_estimator);
     EXPECT_TRUE(config.runtime.enable_visual_monitor);
-    EXPECT_FALSE(config.runtime.enable_control);
+    // 2026-10-30 维护者决定：现场实测期仓库默认配置打开控制输出（G5 首飞前），
+    // 不再把 enable_control 锁死为 false；回影子只需改配置重启。
+    EXPECT_TRUE(config.runtime.enable_control);
     EXPECT_EQ(config.health.cpu_sample_period.count(), 1000);
     EXPECT_EQ(config.health.startup_grace_period.count(), 5000);
     EXPECT_EQ(config.health.camera_max_age.count(), 1000);
@@ -388,6 +390,9 @@ TEST(ConfigTest, RejectsGroundStationWithoutPx4StateSource) {
 
 TEST(ConfigTest, AllowsMissingGroundStationSectionWhenDisabled) {
     json value = ReadSourceConfig();
+    // 用例意图：地面站链路关闭时 ground_station 段可缺省。控制输出依赖地面站链路
+    // （装配门禁），因此这里同步关闭 enable_control，只验“配置段可缺省”。
+    value["runtime"]["enable_control"] = false;
     value["runtime"]["enable_ground_station"] = false;
     value["runtime"]["enable_target_estimator"] = false;
     // 视觉融合依赖目标估计器，一并关闭

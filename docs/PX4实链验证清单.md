@@ -189,8 +189,9 @@ v1.17.0 + Gazebo Harmonic 8.15 + `~/drone_test` 构建）；启动命令与前�
 > GS 侧心跳诊断已加入，待更长驻留定位；双目因无检测未复现 0%。详见 §4/§6 与
 > `docs/方案C锚点基准实施清单.md` §8。
 
-回滚通道：现场改回 `enable_control=false` 重启即回纯影子；`config.json` 中的
-`enable_control=true` 永不入库（打开只发生在现场部署目录本地副本）。
+回滚通道：把 `config/config.json` 的 `enable_control` 改回 `false` 重启即回纯影子。
+2026-10-30 起仓库默认已置 `true`（G5 首飞前由维护者打开）；`interception.enabled`、
+`actuator.gcs_fire_enabled` 保持 `false`。
 
 ### 7.3 G4/G5 线下执行清单（拆桨台架 / 室外首飞）
 
@@ -369,7 +370,7 @@ G5 是**第一次真机室外飞行**，目标不是打靶，而是回答三个�
 | # | 项 | 要求 |
 |---:|---|---|
 | P1 | 机体与动力 | 桨已装、电机转向按 G4-2 结论、电池固定牢、机架无松动 |
-| P2 | 配置 | 本地副本 `enable_control=true`（**不入库**）；`interception.enabled=false`；`actuator.gcs_fire_enabled=false`；`fence.enabled=true`。做法：`cp config/config.json config/config.g5_local.json` 后只改 `runtime.enable_control`（该文件名已列入 `.gitignore`），启动用 `--config config/config.g5_local.json`；仓库内 `config/config.json` 保持 `false` |
+| P2 | 配置 | `config/config.json`：`enable_control=true`（2026-10-30 起为仓库默认，回影子改回 `false`）；`interception.enabled=false`；`actuator.gcs_fire_enabled=false`；`fence.enabled=true` |
 | P3 | 围栏 | 地面站先划区并用 65018 下发，机载 `65019 fence_state=normal`；`config/zone.json` 已落盘；区域水平半径 ≥ 预期机动 3 倍、高度带覆盖首飞高度（建议 [0, 15m] Home 相对） |
 | P4 | PX4 | `SDLOG_MODE=2`（启动即记到关机）；`COM_DISARM_PRFLT` 默认 10s；PX4 自带栅栏不启用（由机载多边形围栏接管） |
 | P5 | 环境 | 净空半径 ≥50m、无人群/电线；风速 ≤5 m/s、无降水；GPS `fix=3D` 且卫星 ≥12、`eph ≤1.0m` |
@@ -380,7 +381,7 @@ G5 是**第一次真机室外飞行**，目标不是打靶，而是回答三个�
 
 | 序 | 科目 | 操作 | 通过标准 |
 |---|---|---|---|
-| G5-1a | 地面自检 + 围栏缓存 | 上电启动正式程序（`--config` 指向本地副本） | `65013` 连接正常；`65019` 报 `zone_id/version` 与地面站一致、`fence_state=normal`；**重启进程后**日志出现「围栏区域缓存已装载」且 `zone_id/version` 不变 |
+| G5-1a | 地面自检 + 围栏缓存 | 上电启动正式程序（默认配置或 `--config` 指定） | `65013` 连接正常；`65019` 报 `zone_id/version` 与地面站一致、`fence_state=normal`；**重启进程后**日志出现「围栏区域缓存已装载」且 `zone_id/version` 不变 |
 | G5-1b | RC 手动起降（不接机载控制） | 遥控器手动起飞、悬停 30s、手动降落 | 姿态稳定、无异常振荡；地面站遥测连续；**确认这架机体本身能飞**（排除机体问题后再谈机载逻辑） |
 | G5-1c | 自动起飞 | `assignment_sitl.py` 同款流程发 65014（或地面站界面分配） | `S2→S3→S4→S5`；PX4 `6/0`、armed；高度到 `takeoff.height_m=2.0` 并稳定 5s；`65015 accepted`；`65013 availability=engaged` |
 | G5-1d | 悬停保持 + 目标缺失中止 | 起飞后**不发 65010** | 目标失效期 `65013` bit5 置位、PX4 不退出 Offboard；10s 后 `65015 aborted` → S12 爬升到 5m → 返航 → S13 `AUTO.LAND` → S14 上锁 |

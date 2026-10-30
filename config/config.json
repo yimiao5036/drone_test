@@ -9,7 +9,7 @@
         "enable_ground_station": true,
         "enable_target_estimator": true,
         "enable_visual_monitor": true,
-        "enable_control": false,
+        "enable_control": true,
         "enable_visual_tracking": true,
         "enable_stereo_ranging": true,
         "enable_visual_position_fusion": true
