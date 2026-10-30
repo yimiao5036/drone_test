@@ -36,8 +36,10 @@ namespace drone::common {
 ///
 /// 线程安全约定：
 /// - Publish / Subscribe / Close / SubscriberCount 可在任意线程并发调用。
-/// - 每个 Subscription 是单消费者句柄（不可复制），仅允许一个消费者线程使用，
-///   其上的 Take 系列操作无需再加锁。
+/// - 每个 Subscription 是单消费者句柄（不可复制），仅允许一个消费者线程使用；
+///   但 Reset() 允许在另一线程（如 Stop()/析构）并发调用以唤醒阻塞的消费者，
+///   内部以 state_mutex_ 保护 state_ 的读写（2026-10-30 修复：此前 Reset 的
+///   std::move 与 TryTake/WaitTake 的读取构成 data race）。
 ///
 /// 使用示例见 include/common/topic.md。
 template <typename Message>
@@ -99,14 +101,25 @@ public:
         Subscription(const Subscription&) = delete;
         Subscription& operator=(const Subscription&) = delete;
 
-        Subscription(Subscription&& other) noexcept
-            : core_(std::move(other.core_)), state_(std::move(other.state_)) {}
+        Subscription(Subscription&& other) noexcept {
+            std::lock_guard<std::mutex> lock(other.state_mutex_);
+            core_ = std::move(other.core_);
+            state_ = std::move(other.state_);
+        }
 
         Subscription& operator=(Subscription&& other) noexcept {
             if (this != &other) {
+                std::weak_ptr<Core> incoming_core;
+                std::shared_ptr<SubscriberState> incoming_state;
+                {
+                    std::lock_guard<std::mutex> lock(other.state_mutex_);
+                    incoming_core = std::move(other.core_);
+                    incoming_state = std::move(other.state_);
+                }
                 Reset();
-                core_ = std::move(other.core_);
-                state_ = std::move(other.state_);
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                core_ = std::move(incoming_core);
+                state_ = std::move(incoming_state);
             }
             return *this;
         }
@@ -114,7 +127,7 @@ public:
         /// 非阻塞获取一条消息；队列为空时返回 std::nullopt。
         /// 适合在轮询循环中使用，例如控制线程的固定周期快照。
         [[nodiscard]] std::optional<MessagePtr> TryTake() {
-            const auto state = state_;
+            const auto state = SnapshotState();
             if (!state) {
                 return std::nullopt;
             }
@@ -133,7 +146,7 @@ public:
         /// 主题关闭后会先取完已经入队的消息，再返回 std::nullopt。
         /// 适合独占消费线程（如 PX4 串口线程读取命令队列）。
         [[nodiscard]] std::optional<MessagePtr> WaitTake() {
-            const auto state = state_;
+            const auto state = SnapshotState();
             if (!state) {
                 return std::nullopt;
             }
@@ -156,7 +169,7 @@ public:
         template <typename Rep, typename Period>
         [[nodiscard]] std::optional<MessagePtr> WaitTakeFor(
             const std::chrono::duration<Rep, Period>& timeout) {
-            const auto state = state_;
+            const auto state = SnapshotState();
             if (!state) {
                 return std::nullopt;
             }
@@ -176,7 +189,7 @@ public:
 
         /// 订阅是否仍然有效（未关闭）。默认构造的句柄返回 false。
         [[nodiscard]] bool IsOpen() const {
-            const auto state = state_;
+            const auto state = SnapshotState();
             if (!state) {
                 return false;
             }
@@ -187,7 +200,7 @@ public:
 
         /// 当前队列中待消费的消息数量。
         [[nodiscard]] std::size_t PendingCount() const {
-            const auto state = state_;
+            const auto state = SnapshotState();
             if (!state) {
                 return 0;
             }
@@ -198,7 +211,7 @@ public:
 
         /// 本订阅者因队列满累计丢弃的消息数量，用于监控慢消费者。
         [[nodiscard]] std::size_t DroppedCount() const {
-            const auto state = state_;
+            const auto state = SnapshotState();
             if (!state) {
                 return 0;
             }
@@ -209,8 +222,12 @@ public:
 
         /// 主动取消订阅；可以重复调用，幂等。清空队列并通知等待中的消费者。
         void Reset() noexcept {
-            auto state = std::move(state_);
-            core_.reset();
+            std::shared_ptr<SubscriberState> state;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                state = std::move(state_);
+                core_.reset();
+            }
             if (!state) {
                 return;
             }
@@ -229,8 +246,16 @@ public:
         Subscription(std::weak_ptr<Core> core, std::shared_ptr<SubscriberState> state)
             : core_(std::move(core)), state_(std::move(state)) {}
 
+        /// 读取当前订阅状态快照；与 Reset() 的并发调用由 state_mutex_ 串行化。
+        [[nodiscard]] std::shared_ptr<SubscriberState> SnapshotState() const {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            return state_;
+        }
+
         std::weak_ptr<Core> core_;
         std::shared_ptr<SubscriberState> state_;
+        /// 保护 state_：Reset() 在停机线程清空句柄，而消费线程同时读取快照。
+        mutable std::mutex state_mutex_;
     };
 
     Topic() : core_(std::make_shared<Core>()) {}

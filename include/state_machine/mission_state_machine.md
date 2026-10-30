@@ -363,7 +363,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 动作：`follow_zone_action=true` 时按区域声明的 action，否则按 `violation_action`。
     `kHold` → 每拍把位置意图钉在当前局部位置（reason=10 `kReasonFenceViolation`），
     任务状态不迁移；`kReturn` → `AbortForFence()`（停发位置意图、`assignment_tracker_.AbortAirborne()`、
-    65015 `aborted`、转 S12 返航）；`kLand` → 同一 `AbortForFence()` 入口、转 S13 降落
+    65015 `aborted reason=kFenceViolation(22)`、转 S12 返航；
+    2026-10-30 起不再误用 `kTargetLost(14)`（地面站可区分几何事件与目标丢失）；`kLand` → 同一 `AbortForFence()` 入口、转 S13 降落
     （2026-10-30 审查修复：旧实现只 `TransitionTo(kLanding)`，不发 65015、不
     `AbortAirborne`，S12/S13 入口语义与返航不一致）。中止锁 `fence_abort_latched_`
     与 `mission_abort_latched_` 同语义：per-boot 复位、新分配被接受时复位，
@@ -376,6 +377,10 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     过期指令由状态机侧按时钟判定丢弃。
   - 判定顺序（`EvaluateMissionCommand()`，排在电池守卫之后、围栏守卫之前——人工指令
     优先于几何事件）：重复 `command_id` → `kDuplicateCommand`（不动作、不回退状态）；
+    幂等槽位 `last_mission_command_id_` 只在**真正执行动作**的分支登记
+    （`RecordExecutedMissionCommandId()`：`kArming/kTakeoff` 中止、飞行态中止返航），
+    被版本/类型/状态守卫拒绝或「已在返航」早退的指令不占槽位——地面站修正后可用同一
+    `command_id` 重发（2026-10-30 修复：旧实现在校验前登记，被拒 id 再发被判重复）；
     版本不符 → `kUnsupportedVersion`；非 `kReturnHome` → `kUnsupportedCommand`；
     `mission_faulted_` → `kMissionFault`；已在 `kReturnHome/kLanding` → `kCompleted`
     + `kAlreadyReturning`（幂等，不重复发 65015）；`kArming/kTakeoff` →

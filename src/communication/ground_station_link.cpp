@@ -1388,12 +1388,22 @@ private:
             }
             return;
         }
+        // 地址双字段校验（帧长之后、marker 之前，与 65014/65016 一致）：
+        // 帧头 target_system/component 与 payload[50]/[51] 都必须指向本机，
+        // 任一不匹配即拒收且不回 65021（避免为发给别的机体的指令误回执）。
+        const uint8_t payload_target_system =
+            ReadLe<uint8_t>(extension.payload, 50);
+        const uint8_t payload_target_component =
+            ReadLe<uint8_t>(extension.payload, 51);
         if (extension.target_system != config_.aircraft_system_id ||
-            extension.target_component != config_.aircraft_component_id) {
+            extension.target_component != config_.aircraft_component_id ||
+            payload_target_system != config_.aircraft_system_id ||
+            payload_target_component != config_.aircraft_component_id) {
             const uint64_t mismatch_count = ++mission_command_address_mismatch_count_;
             if (ShouldLogThrottled(mismatch_count)) {
-                SPDLOG_WARN("任务指令地址不匹配: header={}/{} local={}/{} count={}",
+                SPDLOG_WARN("任务指令地址不匹配: header={}/{} payload={}/{} local={}/{} count={}",
                             extension.target_system, extension.target_component,
+                            payload_target_system, payload_target_component,
                             config_.aircraft_system_id,
                             config_.aircraft_component_id, mismatch_count);
             }

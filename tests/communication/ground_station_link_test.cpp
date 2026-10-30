@@ -272,6 +272,41 @@ std::vector<uint8_t> EncodeMissionAssign(
     });
 }
 
+/// 65020 任务指令（主动返航）编码器；header_*/payload_* 分开传，便于构造
+/// "帧头匹配但 payload 地址不符"的负例。
+struct MissionCommandFixture {
+    uint8_t protocol_version = 1;
+    uint32_t command_id = 0x0a0b0c0d;
+    uint8_t type = 1;
+    uint8_t frame_length_marker = 1;
+};
+
+std::vector<uint8_t> EncodeMissionCommand(
+    const MissionCommandFixture& command, std::size_t protocol_length = 55,
+    uint8_t header_system = 1,
+    uint8_t header_component = kNetCaptureAircraftComponentId,
+    uint8_t payload_system = 1,
+    uint8_t payload_component = kNetCaptureAircraftComponentId) {
+    std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+    WriteLe<uint8_t>(payload, 0, command.protocol_version);
+    WriteLe<uint32_t>(payload, 1, command.command_id);
+    WriteLe<uint8_t>(payload, 5, command.type);
+    WriteLe<uint8_t>(payload, 50, payload_system);
+    WriteLe<uint8_t>(payload, 51, payload_component);
+    WriteLe<uint8_t>(payload, 54, command.frame_length_marker);
+    if (protocol_length < payload.size()) {
+        std::fill(payload.begin() + protocol_length, payload.end(), 0);
+    }
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    return encoder.Encode([&payload, header_system, header_component](
+                              mavlink_status_t* status, mavlink_message_t* message) {
+        return mavlink_msg_v2_extension_pack_status(
+            kGroundStationSystemId, kGroundStationComponentId, status, message, 0,
+            header_system, header_component, kMissionCommandMessageType,
+            payload.data());
+    });
+}
+
 struct MissionAssignAckMessage {
     mavlink_message_t message{};
     mavlink_v2_extension_t extension{};
@@ -918,6 +953,59 @@ TEST(GroundStationLinkTest, SendsMissionAssignmentAckToGroundStation) {
     EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 27),
               kNetCaptureAircraftComponentId);
     EXPECT_EQ(ReadLe<uint8_t>(sent->extension.payload, 54), 1U);
+    link.Stop();
+}
+
+TEST(GroundStationLinkTest, PublishesMissionCommandForMatchingAddress) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto command_subscription = link.MissionCommandOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    MissionCommandFixture command;
+    ASSERT_TRUE(terminal.Write(EncodeMissionCommand(command)));
+
+    auto message = command_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(message.has_value());
+    const auto& received = **message;
+    EXPECT_EQ(received.protocol_version, command.protocol_version);
+    EXPECT_EQ(received.command_id, command.command_id);
+    EXPECT_EQ(static_cast<uint8_t>(received.type), command.type);
+    EXPECT_EQ(received.header.valid_for_ms, 1000u);  // kMissionCommandValidForMs
+    EXPECT_EQ(received.header.source_id, kGroundStationSystemId);
+    EXPECT_GT(received.header.receive_time_ms, 0u);
+    link.Stop();
+}
+
+/// 65020 payload[50]/[51] 地址双字段：帧头对本机但 payload 指向别机时必须丢帧
+/// （与 65014/65016 一致，且不回 65021）。
+TEST(GroundStationLinkTest, MissionCommandPayloadAddressMismatchIsIgnored) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto command_subscription = link.MissionCommandOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    MissionCommandFixture command;
+    // 帧头 1/25 正确，payload[50]=2 指向别机。
+    ASSERT_TRUE(terminal.Write(EncodeMissionCommand(
+        command, 55, 1, kNetCaptureAircraftComponentId, 2,
+        kNetCaptureAircraftComponentId)));
+    EXPECT_FALSE(command_subscription.WaitTakeFor(200ms).has_value())
+        << "payload 地址不匹配的 65020 必须被丢弃";
+
+    // payload[51] component 不符同样丢弃。
+    ASSERT_TRUE(terminal.Write(EncodeMissionCommand(
+        command, 55, 1, kNetCaptureAircraftComponentId, 1, 26)));
+    EXPECT_FALSE(command_subscription.WaitTakeFor(200ms).has_value())
+        << "payload component 不匹配的 65020 必须被丢弃";
+
+    // 地址全对的一条仍然正常发布，证明丢帧是地址判定而非链路故障。
+    ASSERT_TRUE(terminal.Write(EncodeMissionCommand(command)));
+    EXPECT_TRUE(command_subscription.WaitTakeFor(300ms).has_value());
     link.Stop();
 }
 

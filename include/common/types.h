@@ -460,6 +460,7 @@ enum class MissionAssignmentReason : uint8_t {
     kMissionFault = 19,
     kInternalError = 20,
     kZoneMismatch = 21,  ///< 机载围栏区域版本与分配声明不一致（v3，2026-10-29）
+    kFenceViolation = 22,  ///< 围栏越界触发的中止/降落（return/land 动作，2026-10-30）
 };
 
 /// 任务分配（地面站 65014 → 状态机）。

@@ -108,11 +108,12 @@ auto result = topic.Emplace(1);
 | `IsOpen()` | 订阅是否仍有效 | 停机检测 |
 | `PendingCount()` | 队列中待消费消息数 | 监控积压 |
 | `DroppedCount()` | 因队列满累计丢弃数 | 监控慢消费者 |
-| `Reset()` | 主动退订，幂等 | 提前结束订阅 |
+| `Reset()` | 主动退订，幂等；可与取消息方法并发调用（停机唤醒） | 提前结束订阅 |
 
 注意：
 
 - `Subscription` **不可复制**（避免多消费者竞争同一队列），可以**移动**给消费线程。
+- `Reset()` 与取消息方法可跨线程并发（见 §6）；但同一句柄的取消息方法仍需单线程。
 - 取到的是 `std::optional<MessagePtr>`，访问消息本体需要两次解引用：
   `**message`（或 `*message->get()`）。消息按 `const Message&` 使用，不可修改。
 
@@ -136,8 +137,15 @@ auto cmd_sub = topic.Subscribe(8, Topic<Command>::OverflowPolicy::kRejectNewest)
 ## 6. 线程安全与使用约定
 
 - 发布者：`Publish` / `Emplace` 可在任意线程并发调用。
-- 订阅者：**每个 `Subscription` 只能被一个消费者线程使用**。若确有多个线程需要
-  同一份数据，应为每个线程各自 `Subscribe`。
+- 订阅者：**每个 `Subscription` 的取消息方法（`TryTake`/`WaitTake`/`WaitTakeFor`）
+  只能被一个消费者线程使用**。若确有多个线程需要同一份数据，应为每个线程各自
+  `Subscribe`。
+- 停机路径：**`Reset()` 允许与取消息方法并发调用**（典型用法是各模块 `Stop()` 先
+  `Reset()` 唤醒阻塞在 `WaitTake` 的线程、再 `join()`）。`Subscription::state_`
+  由内部 `state_mutex_` 保护，取消息时先取快照再加队列锁，`Reset()` 在锁内移出
+  句柄（2026-10-30 修复：此前 `Reset()` 的 `std::move(state_)` 与并发的 `state_`
+  读取构成 data race，TSan 可复现，`TopicTest.ResetIsSafeWhileAnotherThreadConsumes`
+  回归覆盖）。
 - 主题生命周期：主题对象需比所有订阅者更长寿。订阅句柄持 `weak_ptr`，即使主题
   已析构，句柄上的读取操作也安全（返回空）。
 - 消息不可变：跨线程消息一律视为 `const`，确需修改时创建新的输出消息。

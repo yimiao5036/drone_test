@@ -1640,9 +1640,9 @@ private:
                                      common::MissionCommandReason::kUnsupportedCommand);
             return;
         }
-        if (command.command_id != 0U) {
-            last_mission_command_id_ = command.command_id;
-        }
+        // 幂等槽位不在此登记：后面还有状态守卫可能拒绝本条指令，被拒绝的 id 若
+        // 占槽会让地面站修正后在同一 id 下重发被误判 duplicate。登记只发生在真正
+        // 执行动作的分支里（RecordExecutedMissionCommandId）。
 
         const common::MissionState state = CurrentState();
         if (mission_faulted_) {
@@ -1662,6 +1662,7 @@ private:
         // S3/S4：复用起飞中止（已离地→S12；仍在地面→停流回 READY 并拒执）。
         if (state == common::MissionState::kArming ||
             state == common::MissionState::kTakeoff) {
+            RecordExecutedMissionCommandId(command.command_id);
             AbortTakeoff(common::MissionAssignmentReason::kCancelledByGcs,
                          "地面站主动返航指令");
             const bool returning = CurrentState() == common::MissionState::kReturnHome;
@@ -1677,6 +1678,7 @@ private:
         }
         // 空中任务态（S5~S11）：中止任务并进入 S12 返航。
         if (MissionCommandAirborneState(state)) {
+            RecordExecutedMissionCommandId(command.command_id);
             mission_abort_latched_ = true;
             StopPositionIntent("地面站主动返航指令");
             ResetTargetHold();
@@ -1711,6 +1713,14 @@ private:
                 return true;
             default:
                 return false;
+        }
+    }
+
+    /// 登记"真正执行过"的 65020 command_id：只在实际执行动作的分支调用，
+    /// 被版本/类型/状态守卫或"已在返航"早退的指令不占幂等槽位。
+    void RecordExecutedMissionCommandId(uint32_t command_id) {
+        if (command_id != 0U) {
+            last_mission_command_id_ = command_id;
         }
     }
 
@@ -2071,7 +2081,7 @@ private:
         StopPositionIntent("围栏越界中止任务");
         ResetTargetHold();
         assignment_tracker_.AbortAirborne();
-        RememberTakeoffAbort(common::MissionAssignmentReason::kTargetLost);
+        RememberTakeoffAbort(common::MissionAssignmentReason::kFenceViolation);
         const bool land = action == common::FenceAction::kLand;
         const common::MissionState target_state =
             land ? common::MissionState::kLanding
@@ -2082,7 +2092,7 @@ private:
             land ? "land" : "return", land ? "S13 降落" : "S12 返航");
         TransitionTo(target_state, land ? "围栏越界，中止任务并降落"
                                         : "围栏越界，中止任务并返航");
-        PublishTakeoffAbortAck(common::MissionAssignmentReason::kTargetLost);
+        PublishTakeoffAbortAck(common::MissionAssignmentReason::kFenceViolation);
     }
 
     /// 围栏保持意图：以 PX4 当前局部位置为设定点（原因码 10），无前馈。

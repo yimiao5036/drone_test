@@ -77,7 +77,7 @@ Px4Link::StateOutput()
 | 目标位置 | `V2_EXTENSION(65010)` | 帧长≥59、地址/时效校验后发布 `GroundStationTarget`，回 65011 |
 | 任务分配 | `V2_EXTENSION(65014)` | 帧长与地址双字段匹配后发布 `MissionAssignment`，链路层不回 65015 |
 | 围栏区域 | `V2_EXTENSION(65018)` | 帧长60、地址双字段、marker=1、动作码0/1/2、高度带合理性校验后发布 `FenceZone` |
-| 人工任务指令 | `V2_EXTENSION(65020)` | 帧长、地址双字段、marker=1 校验后发布 `MissionCommand` |
+| 人工任务指令 | `V2_EXTENSION(65020)` | 帧长、地址双字段（帧头 + payload[50]/[51]）、marker=1 校验后发布 `MissionCommand` |
 
 遥测周期均在`ground_station.send_interval_ms`配置，TIMESYNC参数在`ground_station.time_sync`配置。状态首次到达及连接、armed、模式、landed、GPS、电池或Home有效性变化时，会立即发送关键状态，减少事件显示延迟。
 
@@ -148,7 +148,7 @@ Px4Link::StateOutput()
 
 | 方向 | 类型 | 处理 |
 |---|---|---|
-| 下行 | 65020 `MISSION_COMMAND` | `HandleMissionCommand()`：帧长、地址双字段、尾部 marker=1、版本、类型逐项校验后填 `MissionCommand`（`valid_for_ms = kMissionCommandValidForMs = 1000`）并发布；校验失败分别计数（`mission_command_invalid_count_` / `mission_command_address_mismatch_count_`）并节流 WARN |
+| 下行 | 65020 `MISSION_COMMAND` | `HandleMissionCommand()`：帧长、地址双字段（帧头 `target_system/component` 与 payload[50]/[51] 都必须指向本机，2026-10-30 补齐 payload 校验；不符即丢帧、不回 65021）、尾部 marker=1、版本、类型逐项校验后填 `MissionCommand`（`valid_for_ms = kMissionCommandValidForMs = 1000`）并发布；校验失败分别计数（`mission_command_invalid_count_` / `mission_command_address_mismatch_count_`）并节流 WARN |
 | 上行 | 65021 `MISSION_COMMAND_ACK` | `SetMissionCommandAckInput()` + 工作线程每拍 `DrainMissionCommandAcks()`（逐条发送，不合并）→ `SendMissionCommandAck()` 编码后定向发 255/190 |
 
 设计取舍：

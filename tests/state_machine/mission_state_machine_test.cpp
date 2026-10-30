@@ -4256,6 +4256,12 @@ TEST(MissionStateMachineTest, FenceViolationAbortsToReturnHome) {
                              common::MissionState::kReturnHome, 3000ms)
                     .has_value())
         << "越界返回动作应转 S12";
+    // 2026-10-30：围栏中止回专用原因码 22（不再误报 target_lost=14）。
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(aborted.has_value()) << "围栏中止必须发 65015 aborted";
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kFenceViolation);
     DrainAcks(harness.ack_subscription);
 }
 
@@ -4721,6 +4727,45 @@ TEST(MissionStateMachineTest, MissionCommandDuplicateIdRejected) {
     ASSERT_TRUE(second.has_value());
     EXPECT_EQ(second->result, common::MissionCommandResult::kRejected);
     EXPECT_EQ(second->reason, common::MissionCommandReason::kDuplicateCommand);
+}
+
+/// 65020 幂等顺序（2026-10-30）：被状态守卫拒绝的 command_id 不得占用幂等槽位，
+/// 地面站修正后可用同一 id 重发并真正执行。
+TEST(MissionStateMachineTest, MissionCommandRejectedIdCanBeReusedAfterStateChanges) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 地面态下发 → 状态守卫拒绝（not_airborne）；旧实现此时已登记 id。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9501)))
+                    .accepted);
+    const auto rejected =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(rejected.has_value()) << "应回 65021";
+    EXPECT_EQ(rejected->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(rejected->reason, common::MissionCommandReason::kNotAirborne);
+
+    // 进入 S5 后同一 command_id 重发：必须执行而不是判 duplicate。
+    ASSERT_TRUE(DriveToGpsApproach(harness, 52));
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9501)))
+                    .accepted);
+    const auto accepted =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(accepted.has_value()) << "应回 65021";
+    EXPECT_NE(accepted->reason, common::MissionCommandReason::kDuplicateCommand)
+        << "被拒 id 不得占用幂等槽位";
+    EXPECT_EQ(accepted->result, common::MissionCommandResult::kAccepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "同一 id 修正状态后重发应真正执行返航";
 }
 
 /// 65020 版本不符：回执 unsupported_version，任务状态不变。
