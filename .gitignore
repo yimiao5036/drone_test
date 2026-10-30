@@ -26,3 +26,6 @@ tools/camera_test_ok
 # 运行时围栏区域缓存（机载自动生成 / 地面站下发后落盘），不入库
 config/zone.json
 build/config/zone.json
+
+# G5 首飞本地副本（enable_control=true，禁止入库）
+config/config.g5_local.json

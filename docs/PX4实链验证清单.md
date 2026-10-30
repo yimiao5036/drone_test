@@ -369,7 +369,7 @@ G5 是**第一次真机室外飞行**，目标不是打靶，而是回答三个�
 | # | 项 | 要求 |
 |---:|---|---|
 | P1 | 机体与动力 | 桨已装、电机转向按 G4-2 结论、电池固定牢、机架无松动 |
-| P2 | 配置 | 本地副本 `enable_control=true`（**不入库**）；`interception.enabled=false`；`actuator.gcs_fire_enabled=false`；`fence.enabled=true` |
+| P2 | 配置 | 本地副本 `enable_control=true`（**不入库**）；`interception.enabled=false`；`actuator.gcs_fire_enabled=false`；`fence.enabled=true`。做法：`cp config/config.json config/config.g5_local.json` 后只改 `runtime.enable_control`（该文件名已列入 `.gitignore`），启动用 `--config config/config.g5_local.json`；仓库内 `config/config.json` 保持 `false` |
 | P3 | 围栏 | 地面站先划区并用 65018 下发，机载 `65019 fence_state=normal`；`config/zone.json` 已落盘；区域水平半径 ≥ 预期机动 3 倍、高度带覆盖首飞高度（建议 [0, 15m] Home 相对） |
 | P4 | PX4 | `SDLOG_MODE=2`（启动即记到关机）；`COM_DISARM_PRFLT` 默认 10s；PX4 自带栅栏不启用（由机载多边形围栏接管） |
 | P5 | 环境 | 净空半径 ≥50m、无人群/电线；风速 ≤5 m/s、无降水；GPS `fix=3D` 且卫星 ≥12、`eph ≤1.0m` |
