@@ -91,7 +91,7 @@
 | `src/control/` | `include/control/*.md`、[`物理追踪思路.md`](物理追踪思路.md)、[`开发进度.md`](开发进度.md) |
 | `src/config/` | `include/config/配置管理.md`、`config/config.json` 注释、[`部署与打包.md`](部署与打包.md)、[`开发进度.md`](开发进度.md) |
 | `src/application/` | `include/application/主程序集成.md`、[`项目总览与数据流.md`](项目总览与数据流.md)、[`开发进度.md`](开发进度.md) |
-| `tests/` 用例数变化 | 本文件「当前基线」+ 下方 9 处基线位置 |
+| `tests/` 用例数变化 | 本文件「当前基线」+ 下方 7 处基线位置 |
 | `tools/` | 对应 `tools/*.md`；涉及部署/接入时加 [`部署与打包.md`](部署与打包.md)、[`新增设备接入指南.md`](新增设备接入指南.md) |
 
 **里程碑/行为变化**：更新 [`开发进度.md`](开发进度.md) 的当前状态，并在
@@ -109,12 +109,12 @@ python3 tools/check_docs.py --changed # 按 git 改动列出应检查的文档
 1. 更新 [`开发进度.md`](开发进度.md)（当前状态/门禁/最近变更）；
 2. 如属里程碑，在 [`开发历史.md`](开发历史.md) 顶部追加一条；
 3. 按第 4 节矩阵更新模块文档、数据接口、故障排查；
-4. 测试数量变化时，更新本文件「当前基线」和下面 9 处；
+4. 测试数量变化时，更新本文件「当前基线」和下面 7 处；
 5. 在 WSL2 Ubuntu 24.04 编译并跑 `ctest`。
 
 ## 6. 测试基线数字位置
 
-单一源为本文「当前基线」行；以下位置必须与它一致：
+单一源为本文「当前基线」行；以下 7 个文件必须与它一致：
 
 1. `README.md` 当前状态段
 2. `docs/模块索引.md` 顶部与测试索引
@@ -122,11 +122,11 @@ python3 tools/check_docs.py --changed # 按 git 改动列出应检查的文档
 4. `docs/开发进度.md` 当前验证基线
 5. `docs/部署与打包.md` 头部与 §9.4
 6. `docs/故障排查手册.md` §3
-7. `docs/archive/历史计划/主程序集成与数据链路实施计划.md` §0（历史计划，保留当前数字）
-8. `include/perception/stereo_ranger.md` 测试方式
-9. `docs/superpowers/specs/2026-10-13-阶段四控制接入路径-design.md` G0 行
+7. `include/perception/stereo_ranger.md` 测试方式
 
-`tools/check_docs.py` 会检查这些位置的数字与本文一致；历史日期条目里的旧数字不要改。
+`tools/check_docs.py` 只检查这 7 个文件。`docs/archive/` 与 `docs/superpowers/`
+属历史材料，**冻结、不参与基线同步**；这些文件里的日期条目只追加、不重排，
+新条目写当次数字即可。
 
 ## 7. 归档规则
 

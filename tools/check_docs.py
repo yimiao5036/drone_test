@@ -21,6 +21,8 @@ BASELINE_SOURCE = ROOT / "docs" / "README.md"
 BASELINE_RE = re.compile(r"当前基线：(\d+/\d+)")
 
 # 当前基线必须一致的位置（docs/README.md 是唯一源，不在此列表内）。
+# 只含日常维护的当前文档；docs/archive/ 与 docs/superpowers/ 属历史材料，
+# 已冻结、不参与基线同步（2026-10-30 决定：历史条目只追加，写当次数字即可）。
 BASELINE_TARGETS = [
     "README.md",
     "docs/模块索引.md",
@@ -28,9 +30,7 @@ BASELINE_TARGETS = [
     "docs/开发进度.md",
     "docs/部署与打包.md",
     "docs/故障排查手册.md",
-    "docs/archive/历史计划/主程序集成与数据链路实施计划.md",
     "include/perception/stereo_ranger.md",
-    "docs/superpowers/specs/2026-10-13-阶段四控制接入路径-design.md",
 ]
 
 # 检查相对链接的当前文档；archive/ 与 superpowers/ 属历史材料，不纳入日常链接门禁。

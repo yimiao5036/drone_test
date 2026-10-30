@@ -6,9 +6,10 @@
 > 2026-10-21 实跑；G4-2 于 2026-10-28 由遥控器飞行确认、G4-3/G4-5 于
 > 2026-10-28 台架校准与实跑通过；G5 线下清单）与
 > `enable_control` 打开前置清单。
-> **§0~§6 全程只读**：不绑定 `Px4Setpoint`、不发 ARM/模式切换/起飞/降落，
-> `enable_control` 保持 false。§7 G4 台架会在拆桨/固定/RC 接管条件下输出
-> 控制（台架工具），不属于只读段。
+> **§0~§6 为只读段**：不绑定 `Px4Setpoint`、不发 ARM/模式切换/起飞/降落，
+> 做该段时须用 `enable_control=false`（2026-10-30 起仓库默认 true，用 `false`
+> 副本或临时改回）。§7 G4 台架会在拆桨/固定/RC 接管条件下输出控制（台架工具），
+> 不属于只读段。
 > **现场条件：室内（2026-10-10）与室外（2026-10-15）只读验证均已完成；2026-10-19
 > 地面会话（0041/0043）完成方案 C 板上核对**——Home 漂移仅诊断、锚点 `收1` 恒定、
 > 目标链 0041 1→1800 / 0043 1→700（后端 5Hz 持续发送）；GS 心跳/时间同步在 0041
@@ -350,13 +351,13 @@ python3 tools/assignment_sitl.py ... --send-target --stop-target-after-ms 15000
 ```
 
 `sitl_restart.sh` 启动的机载使用 `config/px4_sitl_assignment.json`
-（`enable_control=true`，仅 SITL；地面站走 PTY）。`sitl_gcs.py` 以 255/190
+（`enable_control=true`，SITL 专用配置；地面站走 PTY）。`sitl_gcs.py` 以 255/190
 提供 PX4 GCS 心跳并打印 Home。直连串口设备时 `--connection` 直接传设备路径
 （pymavlink 默认 115200；不使用 `serial:` 前缀，该写法在 2.4.50 会被当作 UDP）。
 
 台架/实机经 HM30 时沿用地面站链路连接串（如
 `--connection udpout:192.168.144.12:19856`），仍须拆桨并满足 §7.3 安全要求。
-生产配置 `enable_control=false` 时 65014 应回 `rejected/control_disabled`，
+回影子配置（`enable_control=false`）时 65014 应回 `rejected/control_disabled`，
 可用于先验证回执链路而不产生任何控制输出。
 
 ### 7.5 G5 室外首飞科目清单（2026-10-28 冻结）

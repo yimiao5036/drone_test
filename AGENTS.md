@@ -11,7 +11,7 @@
 - **主要功能**：接收地面站目标位置 → YOLOv26 目标识别 → 轨迹预测 → 控制 PX4 无人机跟踪/反制
 - **通信协议**：MAVLink（与 PX4 飞控和地面站通信）
 
-**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定，G5 首飞前打开；要回纯影子把它改回 `false` 重启即可，`interception.enabled`/`actuator.gcs_fire_enabled` 仍为 `false`）；`interception.enabled` 默认保持 `false`（S9/S10 入口配置化后，生产不自动触发发射），返航/降落链只在 SITL 验收配置中显式启用。`MissionStateMachine`、`TargetEstimator`、`VisualTargetMonitor` 均为影子运行（跑真实算法但不产生控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home），依赖 PX4 的实链验证由此可开展；但安全基线不变——阶段四控制接入路径代码已全部落地（2026-10-14，Task 1~12：装配门禁 + 状态机 S5~S7 交接链 + 捕网执行器命令 + G2/G3 的 `px4_link_smoke` stage4 工具；`enable_control=true` 才绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口，false 时影子停发），正式控制输出要等 SITL/台架门禁（G2~G4，SITL 实跑为线下执行项；G1~G3 已通过、G4 串口台架自动部分 2026-10-21 已通过，G4-1 电机怠速已人工确认，G4-2 实际方向已由遥控器成功飞行确认（2026-10-28），G4-3 机制/参数/时序 2026-10-23 冻结，G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过）验证通过后才做实飞控制接入；2026-10-30 起仓库默认配置已打开 `enable_control`（见上，回影子改回 `false` 即可）。
+**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定）；要回纯影子把它改回 `false` 重启即可。两个发射闸门仍关：`interception.enabled=false`（S9/S10 自动拦截不可达）、`actuator.gcs_fire_enabled=false`（65016 直控不装配）。控制链由 `MissionStateMachine` 的 `kControlIntent` 经 `FlightController` → `Px4Setpoint` 下发 PX4；只有 `TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 仍是影子（跑真实算法、无控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home）；阶段四控制接入路径代码已全部落地，`enable_control=true` 时绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口，`false` 时影子停发。门禁 G1~G4 已完成（G4-1 电机怠速 2026-10-21 人工确认、G4-2 机体方向 2026-10-28 遥控器飞行确认、G4-3 机构/参数/时序 2026-10-23 冻结、G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过），下一步是 G5 首飞（科目见 [`docs/PX4实链验证清单.md`](docs/PX4实链验证清单.md) §7.5）。
 
 ## 开发与构建环境（强制规则）
 
@@ -25,7 +25,7 @@
   # 主工程
   cmake -S . -B build
   cmake --build build -j$(nproc)
-  ctest --test-dir build --output-on-failure     # 基线 638/638
+  ctest --test-dir build --output-on-failure     # 基线 673/673
   python3 tools/check_docs.py                    # 文档基线/链接/模块文档检查
   ./build/drone_control                          # 生成 logs/0001_xxx.log
   ./build/drone_control --config /路径/config.json
@@ -70,7 +70,7 @@
 | PX4 串口通信线程 | 与 PX4 飞控 MAVLink 双向通信 |
 | 电台数传线程 | 与地面站 MAVLink 双向通信 |
 | 双目深度线程 | 消费左右目帧与检测框，输出带质量/时间戳的稀疏 Census 距离（影子，无控制输出） |
-| 状态机与控制线程 | 消费各线程数据，状态机决策并生成控制意图；`enable_control=false` 时控制器影子停发 |
+| 状态机与控制线程 | 消费各线程数据，状态机决策并生成控制意图；装配门禁：`enable_control=true` 绑定 `Px4Setpoint` 下发，`false` 回影子停发 |
 
 ### 架构要点（装配、数据流与边界）
 
@@ -243,7 +243,7 @@ drone_test/
 
   前者校验基线数字、当前文档相对链接和模块实现文档是否存在；后者按 git 改动列出
   应核对的文档。测试数量变化时，先改 `docs/README.md` 的「当前基线」，再同步脚本列出的
-  9 处位置。
+  7 个文件（`docs/archive/` 与 `docs/superpowers/` 为历史材料，已冻结、不参与同步）。
 - 改动前先看 `docs/README.md` §4「改代码时至少更新哪些文档」；改动后按性质更新：
   行为/门禁变化 → `docs/开发进度.md`；里程碑 → `docs/开发历史.md` 顶部追加；
   消息/Topic 变化 → `docs/数据接口文档.md`；故障现象 → `docs/故障排查手册.md`；
