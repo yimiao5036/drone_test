@@ -1889,6 +1889,30 @@ private:
         return -static_cast<double>(flight.local_z_m);
     }
 
+    /// 高度带下限的有效值（米；<=0 表示不判下限）。
+    /// - 相对 Home（altitude_reference=1）：从地面起算，下限恒按 0（不判）。
+    ///   否则起飞必须穿过 0→alt_min，而 S3/S4 都在围栏动作生效态、防抖只有 1.5s，
+    ///   正常起飞会被自家围栏判越界（2026-10-30 现场日志 0078 实证：地面静止
+    ///   state=2“越界 19.51m”，实际水平仍在区域内 19.5m，越界的是高度带下限）。
+    /// - AMSL（altitude_reference=0）：绝对海拔下限对跨海拔场地仍有意义，保留；
+    ///   但起飞/爬升阶段（S0~S4）不判下限，避免起飞过程被误判。
+    static double FenceEffectiveAltMin(const common::FenceZone& zone,
+                                       common::MissionState state) {
+        if (zone.altitude_reference != 0U) {
+            return 0.0;
+        }
+        switch (state) {
+            case common::MissionState::kBoot:
+            case common::MissionState::kSelfCheck:
+            case common::MissionState::kReady:
+            case common::MissionState::kArming:
+            case common::MissionState::kTakeoff:
+                return 0.0;
+            default:
+                return zone.alt_min_m;
+        }
+    }
+
     // 无缓存、也还没收到 65018 时，用 Home 生成默认方形区域并落盘（只做一次）。
     // 目的：避免"无区域 = 不限制"的空窗；区域随项目部署走，地面站可随时覆盖。
     void EnsureDefaultFenceZone(uint64_t now_ms) {
@@ -1997,9 +2021,13 @@ private:
                 polygon.alt_max_m <= 0.0 && polygon.alt_min_m <= 0.0
                     ? 0.0
                     : AltitudeForFence(fence_zone_->altitude_reference, flight);
+            // 下限按有效下限（相对 Home 从地面起算、AMSL 保留绝对下限，见
+            // FenceEffectiveAltMin）；未起飞/爬升阶段一律不判下限。
+            const double alt_min_m =
+                FenceEffectiveAltMin(*fence_zone_, CurrentState());
             const bool altitude_ok =
                 (polygon.alt_max_m <= 0.0 || altitude_m <= polygon.alt_max_m) &&
-                (polygon.alt_min_m <= 0.0 || altitude_m >= polygon.alt_min_m);
+                (alt_min_m <= 0.0 || altitude_m >= alt_min_m);
             violated = !inside || !altitude_ok;
             if (violated) {
                 state = common::FenceState::kViolated;

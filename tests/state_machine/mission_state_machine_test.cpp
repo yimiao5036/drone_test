@@ -4216,6 +4216,131 @@ TEST(MissionStateMachineTest, FenceAltitudeUsesHomeReference) {
     DrainAcks(harness.ack_subscription);
 }
 
+/// 2026-10-30 现场日志 0078 回归：相对 Home 的高度带不设下限（从地面起算）。
+/// 地面静止时相对 Home≈0m，alt_min=10m 在旧实现下会报 violated，且解锁/爬升后
+/// 会触发越界中止（S3/S4 都在围栏动作生效态）。现在必须报非越界。
+TEST(MissionStateMachineTest, FenceHomeRelativeIgnoresAltMin) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(41, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;  // 相对 Home
+    zone.alt_min_m = 10.0;
+    zone.alt_max_m = 0.0;  // 上限不限
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    // 地面静止：相对 Home≈0.4m，水平在区域内 → 旧实现会报 0.4<10 越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(1.5f, -2.5f, -0.4f)))
+                    .accepted);
+
+    bool saw_any = false;
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status || (*status)->zone_id != 41U) {
+            continue;
+        }
+        saw_any = true;
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_TRUE(saw_any) << "65019 应按 status_period 上报";
+    EXPECT_FALSE(saw_violated)
+        << "相对 Home 的下限恒为 0，地面静止不应判越界（0078 现场日志）";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    DrainAcks(harness.ack_subscription);
+}
+
+/// AMSL 参考时绝对海拔下限仍生效：空中 AMSL≈100m 低于下限 150m → 越界并中止。
+TEST(MissionStateMachineTest, FenceAmslLowerBoundEnforcedWhenAirborne) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    auto zone = MakeSquareZone(42, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 0;  // AMSL
+    zone.alt_min_m = 150.0;
+    zone.alt_max_m = 0.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    // 空中 AMSL≈100.4m（Home 海拔 100m），低于 AMSL 下限 150m。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(1.5f, -2.5f, -0.4f)))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status || (*status)->zone_id != 42U) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "AMSL 下限 150m，空中 100m 应判越界";
+    const auto abort_deadline = std::chrono::steady_clock::now() + 2000ms;
+    bool returned = false;
+    while (std::chrono::steady_clock::now() < abort_deadline) {
+        if (harness.machine.CurrentState() == common::MissionState::kReturnHome) {
+            returned = true;
+            break;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(returned) << "AMSL 下限越界应中止并转 S12 返航";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 起飞前不判下限：AMSL 下限 150m 时，S3 地面静止（AMSL≈100m）不得中止；
+/// 否则解锁后就会被自家围栏打断，正常起飞无法开始。
+TEST(MissionStateMachineTest, FenceTakeoffIgnoresAmslLowerBound) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(43, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 0;  // AMSL
+    zone.alt_min_m = 150.0;
+    zone.alt_max_m = 0.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(1)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                            common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));  // 176
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    std::this_thread::sleep_for(200ms);
+
+    bool saw_violated = false;
+    while (auto status = harness.fence_status_subscription.TryTake()) {
+        if ((*status)->zone_id == 43U &&
+            (*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_FALSE(saw_violated) << "S3（未起飞）不得判 AMSL 高度带下限越界";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming)
+        << "起飞前不得因高度带下限中止";
+    DrainAcks(harness.ack_subscription);
+}
+
 TEST(MissionStateMachineTest, FenceViolationAbortsToReturnHome) {
     AssignmentHarness harness(MakeFenceTestConfig());
     ASSERT_TRUE(harness.Start(/*with_control=*/true,

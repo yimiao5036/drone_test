@@ -360,6 +360,13 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     优先级低于电池、高于任务）。用 `PointInPolygon()` 与 `SignedDistanceToBoundary()`
     得出 `kNormal / kNearBoundary（距离 ≤ boundary_warn_m）/ kViolated（出区或超高度带）`，
     越界持续到 `violation_debounce_ms` 才动作，避免单帧抖动触发中止链。
+  - 高度带语义（2026-10-30 现场日志 0078 修正）：`altitude_reference=1`（相对 Home）
+    一律**不判下限**（有效下限恒 0）——高度从地面起算，起飞必然穿过 0→设定值，而
+    S3/S4 在围栏动作生效态、防抖只有 `violation_debounce_ms`（1.5s），旧实现
+    （`alt_min=5m`）会让地面静止就被判 `kViolated`、解锁后立刻中止返航；地面站表单
+    对该基准把最低高度固定 0 并置灰。`altitude_reference=0`（AMSL）保留绝对海拔下限
+    （跨海拔场地仍有意义），但 S0~S4（未起飞/爬升）同样不判下限，S5 起才按绝对海拔
+    生效。实现为 `FenceEffectiveAltMin(zone, CurrentState())`，`alt_max≤0` 仍表示不限。
   - 动作：`follow_zone_action=true` 时按区域声明的 action，否则按 `violation_action`。
     `kHold` → 每拍把位置意图钉在当前局部位置（reason=10 `kReasonFenceViolation`），
     任务状态不迁移；`kReturn` → `AbortForFence()`（停发位置意图、`assignment_tracker_.AbortAirborne()`、
