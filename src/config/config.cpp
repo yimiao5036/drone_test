@@ -546,6 +546,19 @@ void FlightControllerConfig::Validate() const {
         throw std::invalid_argument("controller.bootstrap_timeout_ms 必须为正");
     if (!std::isfinite(fence_margin_m) || fence_margin_m < 0.0)
         throw std::invalid_argument("controller.fence_margin_m 必须为有限非负数");
+    if (!std::isfinite(position_guide_speed_mps) || position_guide_speed_mps <= 0.0)
+        throw std::invalid_argument("controller.position_guide_speed_mps 必须为有限正数");
+    if (!std::isfinite(position_guide_vz_mps) || position_guide_vz_mps <= 0.0)
+        throw std::invalid_argument("controller.position_guide_vz_mps 必须为有限正数");
+}
+
+void ApproachConfig::Validate() const {
+    if (!std::isfinite(speed_mps) || speed_mps <= 0.0)
+        throw std::invalid_argument("approach.speed_mps 必须为有限正数");
+    if (!std::isfinite(track_speed_margin_mps) || track_speed_margin_mps < 0.0)
+        throw std::invalid_argument("approach.track_speed_margin_mps 必须为有限非负数");
+    if (lead_time.count() < 0)
+        throw std::invalid_argument("approach.lead_time_ms 不得为负");
 }
 
 void HandoverConfig::Validate() const {
@@ -930,6 +943,13 @@ AppConfig LoadAppConfig(const std::string& path,
                          config.controller.enable_position_velocity_feedforward);
     config.controller.max_feedforward_mps = ReadOptionalPositiveDouble(
         controller, "max_feedforward_mps", config.controller.max_feedforward_mps);
+    // 位置引导速率上限（2026-11-02，P0-2）：位置型意图按该速率推进引导点。
+    config.controller.position_guide_speed_mps = ReadOptionalPositiveDouble(
+        controller, "position_guide_speed_mps",
+        config.controller.position_guide_speed_mps);
+    config.controller.position_guide_vz_mps = ReadOptionalPositiveDouble(
+        controller, "position_guide_vz_mps",
+        config.controller.position_guide_vz_mps);
     config.controller.intent_timeout = ReadOptionalPositiveMilliseconds(
         controller, "intent_timeout_ms", config.controller.intent_timeout);
     config.controller.coast_timeout = ReadOptionalPositiveMilliseconds(
@@ -1088,6 +1108,17 @@ AppConfig LoadAppConfig(const std::string& path,
     // 控制器钳制余量与围栏配置保持单一真源：FlightController 不读 fence 节。
     config.controller.fence_margin_m = config.fence.boundary_margin_m;
     config.controller.Validate();
+
+    // 接近段相位策略（approach 节，2026-11-02）：S5/S6 速率上限与预测提前量。
+    // 全部可选，缺席回退默认值；由 DroneApplication 注入状态机。
+    const json approach = root.value("approach", json::object());
+    config.approach.speed_mps = ReadOptionalPositiveDouble(
+        approach, "speed_mps", config.approach.speed_mps);
+    config.approach.track_speed_margin_mps = ReadOptionalNonNegativeDouble(
+        approach, "track_speed_margin_mps", config.approach.track_speed_margin_mps);
+    config.approach.lead_time = ReadOptionalNonNegativeMilliseconds(
+        approach, "lead_time_ms", config.approach.lead_time);
+    config.approach.Validate();
 
     // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：机载只保存
     // Actuator Set N 与归一化控制量；PWM 输出功能/区间/舵机行程在 PX4 侧配置。

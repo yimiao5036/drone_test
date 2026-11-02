@@ -723,14 +723,21 @@ TEST(ConfigTest, VisualTrackingStaleFieldsAreParsed) {
     std::filesystem::remove(path);
 }
 
-TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
-    // 生产配置尚未声明 controller/handover 节：两节缺席时必须回退默认值
+TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
+    // 生产配置（2026-11-02 起）已声明 controller/approach 节：逐项核对解析结果。
     const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
     EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
     EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
-    // P3：位置速度前馈默认关闭、独立上限 2.0 m/s；KF 速度门限 5 次。
-    EXPECT_FALSE(config.controller.enable_position_velocity_feedforward);
-    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
+    // P0-2：位置型意图按 position_guide_* 从当前位置推进（限制跳变速度）；
+    // 前馈与上限用于追运动目标。
+    EXPECT_TRUE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 6.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
+    // 接近段相位策略：静止目标 3.5 m/s、目标速度余量 1.0、预测 500ms。
+    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 3.5);
+    EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
+    EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
     EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 5u);
     // S9/S10 入口默认关闭；返航默认启用以保证发射后有收口。
     EXPECT_FALSE(config.interception.enabled);
@@ -746,6 +753,27 @@ TEST(ConfigTest, ControllerAndHandoverDefaultsParse) {
     EXPECT_EQ(config.handover.lock_frames, 10u);
     EXPECT_EQ(config.handover.exit_lost_frames, 30u);
     EXPECT_EQ(config.handover.distance_lost_ms, std::chrono::milliseconds(3000));
+}
+
+TEST(ConfigTest, ControllerAndApproachFallBackToDefaultsWhenAbsent) {
+    // controller/approach 两节缺席时必须回退保守默认值：前馈关闭、上限 2.0；
+    // 位置引导限速 6.0/1.5 与接近段 3.5/1.0/500ms（2026-11-02 P0/P1 默认）。
+    json value = ReadSourceConfig();
+    value.erase("controller");
+    value.erase("approach");
+    const auto path = WriteTemporaryConfig(value, "drone_config_no_controller.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
+    EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
+    EXPECT_FALSE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
+    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 3.5);
+    EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
+    EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
+    std::filesystem::remove(path);
 }
 
 TEST(ConfigTest, RejectsNonPositiveHandoverDistanceLost) {

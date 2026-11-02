@@ -618,6 +618,7 @@ private:
         vx_slew_.Reset(0.0);
         vy_slew_.Reset(0.0);
         vz_slew_.Reset(0.0);
+        guide_valid_ = false;  // 刹车后位置引导点失效，恢复时从实际位置起步
         last_output_ = setpoint;  // 零速也是速度式输出，供无扰衔接起点判定
         Publish(std::move(setpoint), now_ms);
     }
@@ -632,6 +633,7 @@ private:
         vx_slew_.Reset(0.0);
         vy_slew_.Reset(0.0);
         vz_slew_.Reset(0.0);
+        guide_valid_ = false;  // 位置引导点失效：下次恢复从实际位置重新起步
         last_output_ = setpoint;
         Publish(std::move(setpoint), now_ms);
     }
@@ -676,22 +678,38 @@ private:
         }
     }
 
+    /// 速度上限取小：意图相位上限（>0 且有限）与控制器硬上限。
+    /// 2026-11-02（P0-2）：相位策略由状态机下发（ControlIntent.max_speed_mps），
+    /// 控制器只做执行与兜底；意图未填时保持历史上的“只受硬上限约束”语义。
+    static double IntentSpeedCap(const common::ControlIntent& intent,
+                                 double hard_cap) {
+        const double requested = static_cast<double>(intent.max_speed_mps);
+        if (!std::isfinite(requested) || requested <= 0.0) {
+            return hard_cap;
+        }
+        return std::min(hard_cap, requested);
+    }
+
     /// 速度式限幅流水线（热路径零分配，限幅器为成员跨周期保持状态）：
     /// 速度幅值等比钳制 → 无扰衔接（来源/类型变化时斜坡起点=上一周期实际
     /// 输出）→ SlewRateLimiter 加速度限幅。
     void PublishVelocity(const common::ControlIntent& intent, uint64_t now_ms) {
         double vx = intent.target_x, vy = intent.target_y, vz = intent.target_z;
-        // ① 速度幅值限幅（等比钳制，方向不变）
+        // ① 速度幅值限幅（等比钳制，方向不变）。
+        // 2026-11-02（P0-2）：速度上限 = min(控制器硬上限, 意图相位上限)。
+        // 状态机按任务相位（S7 伺服 / S12 返航）填 max_speed_mps，控制器只执行；
+        // 意图未填（0/非有限）时回退硬上限，保持历史语义。
+        const double speed_cap = IntentSpeedCap(intent, config_.max_speed_mps);
         const double speed = std::sqrt(vx * vx + vy * vy + vz * vz);
-        if (speed > config_.max_speed_mps) {
-            const double scale = config_.max_speed_mps / speed;
+        if (speed > speed_cap) {
+            const double scale = speed_cap / speed;
             vx *= scale;
             vy *= scale;
             vz *= scale;
             const uint64_t count = ++clamped_count_;
             if (ShouldLogThrottled(count)) {
                 SPDLOG_WARN("飞行控制器速度幅值限幅: |v|={:.2f} > max={:.2f} 累计={}",
-                            speed, config_.max_speed_mps, count);
+                            speed, speed_cap, count);
             }
         }
         // ② 无扰衔接：来源/类型变化时斜坡起点=上一周期实际输出；上一输出
@@ -798,6 +816,78 @@ private:
                 }
             }
         }
+        // ---- 位置引导限速（2026-11-02，P0-2）----
+        // 仅当意图携带相位上限（max_speed_mps>0）时启用：引导点从当前实际
+        // 位置按 min(相位上限, 控制器硬上限) 逐拍推进到目标，避免目标点阶跃
+        // 时 PX4 用自己的 MPC_XY_VEL_MAX 冲过去（0082 实测 8 m/s）。
+        // 终端减速：接近目标时按 v=√(2·a·d) 收敛，防过冲。
+        if (std::isfinite(intent.max_speed_mps) && intent.max_speed_mps > 0.f) {
+            const double cap =
+                IntentSpeedCap(intent, config_.position_guide_speed_mps);
+            const double dt_s =
+                static_cast<double>(config_.period.count()) / 1000.0;
+            // 引导点初始化：首拍 / 来源类型变化 / 间隔过大（刹停后恢复）时
+            // 从 PX4 当前实际位置起步；无有效局部位置时直接从目标起步。
+            if (!guide_valid_ ||
+                intent.control_source != last_guide_source_ ||
+                intent.type != last_guide_type_ || now_ms <= last_guide_ms_ ||
+                now_ms - last_guide_ms_ >
+                    static_cast<uint64_t>(config_.coast_timeout.count())) {
+                if (state.local_position_valid) {
+                    guide_x_ = static_cast<double>(state.local_x_m);
+                    guide_y_ = static_cast<double>(state.local_y_m);
+                    guide_z_ = static_cast<double>(state.local_z_m);
+                    SPDLOG_INFO(
+                        "位置引导限速启动: cap={:.2f}m/s vz_cap={:.2f}m/s "
+                        "起点=({:.2f},{:.2f},{:.2f}) 目标=({:.2f},{:.2f},{:.2f})",
+                        cap, std::min(cap, config_.position_guide_vz_mps),
+                        guide_x_, guide_y_, guide_z_, target_x, target_y,
+                        target_z);
+                } else {
+                    // 无局部位置（门禁未通过时不该走到这里）：直通目标，
+                    // 下一拍有位置后重新从实际位置起步。
+                    guide_x_ = target_x;
+                    guide_y_ = target_y;
+                    guide_z_ = target_z;
+                }
+                guide_valid_ = true;
+            }
+            const double dx = target_x - guide_x_;
+            const double dy = target_y - guide_y_;
+            const double dz = target_z - guide_z_;
+            const double horiz = std::hypot(dx, dy);
+            const double horiz_step =
+                std::min(cap, std::sqrt(2.0 * config_.max_accel_mps2 * horiz)) *
+                dt_s;
+            if (horiz <= horiz_step || horiz < 1e-6) {
+                guide_x_ = target_x;
+                guide_y_ = target_y;
+            } else {
+                guide_x_ += dx / horiz * horiz_step;
+                guide_y_ += dy / horiz * horiz_step;
+            }
+            const double vz_cap =
+                std::min(cap, config_.position_guide_vz_mps);
+            const double vz_step =
+                std::min(vz_cap,
+                         std::sqrt(2.0 * config_.max_accel_mps2 *
+                                   std::fabs(dz))) *
+                dt_s;
+            if (std::fabs(dz) <= vz_step) {
+                guide_z_ = target_z;
+            } else {
+                guide_z_ += dz > 0.0 ? vz_step : -vz_step;
+            }
+            target_x = guide_x_;
+            target_y = guide_y_;
+            target_z = guide_z_;
+            last_guide_source_ = intent.control_source;
+            last_guide_type_ = intent.type;
+            last_guide_ms_ = now_ms;
+        } else {
+            guide_valid_ = false;  // 无限速语义：位置直通（历史行为）
+        }
+
         // ---- 位置速度前馈（P3）：可选增强，开关关闭时完全忽略 ----
         float ff_vx = 0.f;
         float ff_vy = 0.f;
@@ -915,6 +1005,15 @@ private:
 
     // 以下仅周期线程访问（诊断接口经原子量暴露）。
     std::optional<common::ControlIntent> latest_intent_;
+    /// 位置引导限速状态（2026-11-02 P0-2，仅周期线程）：引导点从实际位置
+    /// 按相位上限逐拍推进，替代位置目标直通。
+    double guide_x_ = 0.0;
+    double guide_y_ = 0.0;
+    double guide_z_ = 0.0;
+    bool guide_valid_ = false;
+    uint8_t last_guide_source_ = 0;
+    common::ControlIntentType last_guide_type_ = common::ControlIntentType::kNone;
+    uint64_t last_guide_ms_ = 0;
     uint64_t setpoint_sequence_ = 0;
     bool state_machine_requested_ = false;  ///< 状态机显式请求锁存（reason_code bit31）
     uint64_t coast_since_ms_ = 0;           ///< 本次 COAST 进入时刻

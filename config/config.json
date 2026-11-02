@@ -158,6 +158,22 @@
         "fire_timeout_ms": 3000,
         "command_retry_ms": 1000
     },
+    "controller": {
+        "_comment": "飞行控制器（阶段四）。max_speed_mps 只约束速度式意图；位置型意图按 position_guide_speed_mps 从当前位置向目标推进（2026-11-02 P0-2，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去）。",
+        "period_ms": 50,
+        "max_speed_mps": 2.0,
+        "max_accel_mps2": 2.0,
+        "max_feedforward_mps": 6.0,
+        "enable_position_velocity_feedforward": true,
+        "position_guide_speed_mps": 6.0,
+        "position_guide_vz_mps": 1.5
+    },
+    "approach": {
+        "_comment": "S5/S6 接近段相位策略：静态目标按 speed_mps；目标带速度位时 cap=max(speed_mps, |v|+track_speed_margin_mps)，预测点=pos+v×lead_time。维护者 2026-11-02 确认 3.5/1.0/500。",
+        "speed_mps": 3.5,
+        "track_speed_margin_mps": 1.0,
+        "lead_time_ms": 500
+    },
     "takeoff": {
         "height_m": 2.0,
         "climb_rate_mps": 0.5,

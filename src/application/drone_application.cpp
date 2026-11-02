@@ -141,6 +141,8 @@ void DroneApplication::BuildComponents() {
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;
+        // 接近段相位策略（approach 节）同源注入：S5/S6 速率上限与预测提前量。
+        state_machine_config.approach = config_.approach;
         state_machine_config.expected_interceptor_type =
             config_.ground_station.aircraft_component_id;
         mission_state_machine_ =
@@ -658,10 +660,10 @@ void DroneApplication::Stop() {
     }
 
     SPDLOG_INFO("主程序开始停止");
-    // 先停止PX4和视频等数据生产者，避免健康上报线程读取正在析构的组件。
-    if (px4_link_ != nullptr) {
-        px4_link_->Stop();
-    }
+    // 注意：PX4 链路是飞行快照与电池等遥测的生产者，必须在状态机/控制器
+    // （消费者）之后停止。若先停 PX4，状态机在停机窗口内会看到遥测陈旧，
+    // 触发“飞行中电池中止”并打 RETURN_HOME/LANDING 告警（2026-11-02 P1：
+    // 0082 实机 Ctrl+C 时复现，reason=16）。这里先停止视频等其余生产者。
     if (camera_ != nullptr) {
         camera_->Stop();
         decoder_->Stop();
@@ -709,6 +711,11 @@ void DroneApplication::Stop() {
     }
     if (ground_station_link_ != nullptr) {
         ground_station_link_->Stop();
+    }
+    // PX4 链路最后停止：它是遥测生产者，状态机/控制器/健康上报都已退出后
+    // 再关闭，停机窗口内不会再产生“遥测陈旧”推导出的中止（P1，2026-11-02）。
+    if (px4_link_ != nullptr) {
+        px4_link_->Stop();
     }
 
     running_ = false;

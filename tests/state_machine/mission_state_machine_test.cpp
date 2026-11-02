@@ -280,9 +280,10 @@ TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
     ASSERT_TRUE(intent.has_value());
     EXPECT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
     EXPECT_EQ(intent->control_source, 0U);
-    EXPECT_FLOAT_EQ(intent->target_x, 12.5f);
-    EXPECT_FLOAT_EQ(intent->target_y, -3.0f);
-    EXPECT_FLOAT_EQ(intent->target_z, -8.0f);
+    // 2026-11-02 P0-2：下发的是预测点 = 目标点 + 目标速度 × lead_time(500ms)。
+    EXPECT_FLOAT_EQ(intent->target_x, 12.5f + 2.5f * 0.5f);
+    EXPECT_FLOAT_EQ(intent->target_y, -3.0f + (-1.5f) * 0.5f);
+    EXPECT_FLOAT_EQ(intent->target_z, -8.0f + 0.5f * 0.5f);
     EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
     EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl, 0U);
     EXPECT_EQ(intent->header.valid_for_ms, 300U);
@@ -293,6 +294,61 @@ TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
     EXPECT_FLOAT_EQ(intent->feedforward_vx_mps, 2.5f);
     EXPECT_FLOAT_EQ(intent->feedforward_vy_mps, -1.5f);
     EXPECT_FLOAT_EQ(intent->feedforward_vz_mps, 0.5f);
+    // 相位速率上限 = max(3.5, |v_h| + 1.0)；本机无有效局部位置 → 不指定机头。
+    EXPECT_NEAR(intent->max_speed_mps, std::hypot(2.5f, 1.5f) + 1.0f, 1e-4f);
+    EXPECT_FALSE(intent->yaw_valid);
+
+    machine.Stop();
+}
+
+// 2026-11-02 P0-1：S5 起机头指向（预测后的）目标点——网枪固定朝前，机头必须
+// 朝目标；同时校验预测点与相位速率上限。
+TEST(MissionStateMachineTest, GpsApproachFacesPredictedTargetPosition) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+
+    // 本机在局部原点、朝向任意；让状态机拿到有效局部位置才能算机头。
+    auto flight = MakeNavigationReadyFlight();
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.local_position_valid = true;
+    flight.local_x_m = 0.f;
+    flight.local_y_m = 0.f;
+    flight.local_z_m = 0.f;
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight));
+
+    auto estimated = MakeValidEstimatedTarget();
+    estimated.velocity_valid_mask = common::kVelocityValidAll;
+    estimated.vel_x_mps = 2.5f;
+    estimated.vel_y_mps = -1.5f;
+    estimated.vel_z_mps = 0.f;
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    const float predicted_x = 12.5f + 2.5f * 0.5f;
+    const float predicted_y = -3.0f - 1.5f * 0.5f;
+    EXPECT_FLOAT_EQ(intent->target_x, predicted_x);
+    EXPECT_FLOAT_EQ(intent->target_y, predicted_y);
+    // 机头 = atan2(东, 北)（0=正北，顺时针为正）。
+    EXPECT_TRUE(intent->yaw_valid);
+    EXPECT_NEAR(intent->yaw_deg,
+                static_cast<float>(std::atan2(predicted_y, predicted_x) * 180.0 /
+                                   3.14159265358979323846),
+                1e-3f);
 
     machine.Stop();
 }
@@ -374,7 +430,9 @@ TEST(MissionStateMachineTest, GpsApproachRepublishesOnFeedforwardChange) {
         }
     }
     ASSERT_TRUE(updated.has_value());
-    EXPECT_FLOAT_EQ(updated->target_x, 12.5f);  // 位置未变
+    // 位置随前馈变化（预测点 = 12.5 + 2.0 × 0.5），E 轴未置位不叠加。
+    EXPECT_FLOAT_EQ(updated->target_x, 12.5f + 2.0f * 0.5f);
+    EXPECT_FLOAT_EQ(updated->target_y, -3.0f);
     EXPECT_EQ(updated->feedforward_valid_mask, common::kVelocityValidNorth);
 
     machine.Stop();

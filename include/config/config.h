@@ -68,10 +68,17 @@ struct FlightControllerConfig {
     double max_speed_mps = 2.0;                  // 速度幅值上限
     double max_accel_mps2 = 2.0;                 // 加速度上限（slew）
     double max_jerk_mps3 = 0.0;                  // jerk 上限；0=不启用（v1 预留）
-    // 位置型意图速度前馈（P3，2026-10-19）：开关默认关闭；上限独立于
-    // max_speed_mps（后者只约束速度式意图），水平模长/垂直分量分别钳制。
+    // 位置型意图速度前馈（P3，2026-10-19）：开关默认关闭（保守：未知速度
+    // 时不叠加前馈）；生产配置显式打开并给出上限。上限独立于 max_speed_mps
+    // （后者只约束速度式意图），水平模长/垂直分量分别钳制。
     bool enable_position_velocity_feedforward = false;
     double max_feedforward_mps = 2.0;
+    /// 位置引导速率上限（2026-11-02，P0-2）：位置型意图不再把目标点原样
+    /// 直通给 PX4，而是按本速率把引导点从当前位置向目标推进（避免目标跳变
+    /// 时 PX4 用自身 MPC_XY_VEL_MAX 冲过去）。仅当意图带 max_speed_mps>0
+    /// 时启用；实际速率取 min(本值, 意图 max_speed_mps)。垂直分量另限。
+    double position_guide_speed_mps = 6.0;
+    double position_guide_vz_mps = 1.5;
     std::chrono::milliseconds intent_timeout{300};   // 意图超龄阈值
     std::chrono::milliseconds coast_timeout{1000};   // COAST 最长保持
     std::chrono::milliseconds slew_transition{500};  // 无扰衔接斜坡时长
@@ -240,6 +247,17 @@ struct TakeoffConfig {
     void Validate() const;
 };
 
+/// 接近段相位策略（approach 节，2026-11-02）：
+/// S5/S6 由状态机填 `ControlIntent.max_speed_mps`（相位速率上限）与预测点
+/// （目标位置 + 目标速度 × lead_time）；控制器按 min(硬上限, 相位上限) 执行。
+/// 目标带速度位时 cap = max(speed_mps, |目标速度| + track_speed_margin_mps)。
+struct ApproachConfig {
+    double speed_mps = 3.5;                   ///< S5/S6 位置引导速率上限（静态目标）
+    double track_speed_margin_mps = 1.0;      ///< 目标有速度时的余量（追得上）
+    std::chrono::milliseconds lead_time{500}; ///< 预测提前量（pos + v × lead）
+    void Validate() const;
+};
+
 struct AppConfig {
     LogConfig log;
     RuntimeConfig runtime;
@@ -269,6 +287,7 @@ struct AppConfig {
     ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
     FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
+    ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）
 };
 
 /// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。

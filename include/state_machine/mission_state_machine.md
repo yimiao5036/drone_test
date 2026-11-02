@@ -8,6 +8,28 @@
 
 > **注（2026-10-16）**：S5 引导为"目标当前估计位置"的直接位置设定值，对持续运动目标**本质是尾追**（能否跟住取决于速度优势与提前量，不由刷新率决定）；时间前视、位置+速度前馈、S7 比例导引等改进路径见 `docs/S5运动目标追踪改进方案.md`（待排期）。
 
+**S5/S6 接近策略（P0-1/P0-2，2026-11-02 落地，取代上面的"纯尾追"）**：0082 实机暴露
+两个问题——机头不朝目标（捕网枪固定朝前，打偏）、目标点阶跃下发导致 PX4 用
+`MPC_XY_VEL_MAX=12m/s` 冲刺（实测 8m/s）。修复：
+
+- `ApplyApproachPolicy(PositionIntentTarget&, bool with_heading)`：在
+  `PublishEstimateGuidedIntent()`（S5，带机头）与 `PublishFrozenHandoverIntent()`
+  （S6 冻结段，带机头）里统一调用。
+  - **预测点**：有目标速度时目标点 = 估计位置 + v_h × `approach.lead_time_ms`
+    （默认 500ms），抵消纯尾追的稳态滞后；
+  - **相位限速**：`intent.max_speed_mps = max(approach.speed_mps,
+    |v_target| + approach.track_speed_margin_mps)`（默认 3.5 与 1.0）；无速度时就是
+    3.5m/s 上限。控制器按此上限逐拍推进引导点（见 `include/control/flight_controller.md`）；
+  - **机头**：`yaw = atan2(E_target, N_target)`（局部 NED 朝向目标方位），距目标
+    <0.5m 不转（避免目标脚下原地打转），无有效局部位置时不指定机头；S6 继续沿用。
+    S7 视觉伺服接管后机头由伺服律锁目标，S12 返航才朝飞行方向。
+- 配置：`approach` 节（`speed_mps`/`track_speed_margin_mps`/`lead_time_ms`），
+  字段见 `include/config/配置管理.md`；`ControlIntent.max_speed_mps` 是这条链传导
+  相位策略的唯一通道（历史上定义但未被消费，2026-11-02 起生效）。
+- 测试：`GpsApproachPublishesPositionIntent`（断言预测点与相位上限）、
+  `GpsApproachFacesPredictedTargetPosition`（机头朝向）、`GpsApproachRepublishesOnFeedforwardChange`。
+
+
 阶段四新增（Task 8）：经`SetEstimationDiagnostics`注入估计器诊断接口后，**交接判据**（`handover` 配置节）生效，状态在 S5→S6→S7 之间按下列判据推进/回退（`handover` 阈值全部来自配置，无代码字面量）：
 
 | 迁移 | 判据 |

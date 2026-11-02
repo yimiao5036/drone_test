@@ -318,6 +318,7 @@ public:
           return_home_(config.return_home),
           fence_(config.fence),
           takeoff_(config.takeoff),
+          approach_(config.approach),
           expected_interceptor_type_(config.expected_interceptor_type),
           test_hooks_enabled_(config.test_hooks_enabled),
           azimuth_converter_(config.tracking.camera.fx_px,
@@ -335,6 +336,8 @@ public:
         // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
         // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
         config.takeoff.Validate();
+        // 接近段相位策略兜底（approach 节，2026-11-02）。
+        config.approach.Validate();
         if (config.interception.enabled && !config.return_home.enabled) {
             throw std::invalid_argument(
                 "interception.enabled=true 时 return_home.enabled 必须为 true"
@@ -2926,6 +2929,8 @@ private:
         position_target.frame_id = frozen.header.frame_id;
         // P3 决策：S6 保持冻结语义，不带速度前馈（即使冻结快照有速度位）。
         // 交接后由 S7 速度伺服接管，避免固定位置目标 + 持续前馈造成越过冻结点。
+        // 仍沿用接近段策略的速率上限与机头（冻结点固定，预测量恒为 0）。
+        ApplyApproachPolicy(position_target, /*with_heading=*/true);
         PublishPositionIntent(position_target, now_ms);
     }
 
@@ -3253,7 +3258,72 @@ private:
         /// 顺时针为正）。历史 `yaw_deg != 0` 约定无法表达正北，必须走显式位。
         bool yaw_valid = false;
         float yaw_deg = 0.f;
+        /// 相位速率上限（2026-11-02 P0-2）：0 = 不限制（沿用控制器硬上限）。
+        /// FlightController 对位置型意图按此上限从当前位置向目标推进（位置
+        /// 引导限速），对速度型意图作为额外限幅。S5/S6 填接近段上限，S12
+        /// 不填（返航有自己的速度参数）。
+        float max_speed_mps = 0.f;
     };
+
+    /// 接近段相位策略（2026-11-02 P0-1/P0-2）：把状态机原始的“目标当前点”
+    /// 换算成“引导点 + 速率上限 + 机头方向”。
+    ///  1) 预测点 = 目标位置 + 目标速度 × approach.lead_time（仅有效轴），
+    ///     补偿链路延迟，避免追着落后点跑；
+    ///  2) 速率上限 = max(approach.speed_mps, |目标水平速度| +
+    ///     approach.track_speed_margin_mps)：静止目标按 3.5 m/s 推进，运动
+    ///     目标自动抬高上限（上限≠目标速度，控制器据此限速推进）；
+    ///  3) 机头 = 指向预测点的 NED 航向（0=正北，顺时针为正），目标与本机
+    ///     水平距离 < 0.5m 时不改机头（避免末端原地打转）。
+    /// with_heading=false 时不指定航向（保持原机头平移）。
+    void ApplyApproachPolicy(PositionIntentTarget& target, bool with_heading) const {
+        double px = static_cast<double>(target.x);
+        double py = static_cast<double>(target.y);
+        double pz = static_cast<double>(target.z);
+        const double lead_s =
+            static_cast<double>(approach_.lead_time.count()) / 1000.0;
+        const uint8_t mask = target.feedforward_valid_mask & common::kVelocityValidAll;
+        if ((mask & common::kVelocityValidNorth) != 0 &&
+            std::isfinite(target.feedforward_vx_mps)) {
+            px += static_cast<double>(target.feedforward_vx_mps) * lead_s;
+        }
+        if ((mask & common::kVelocityValidEast) != 0 &&
+            std::isfinite(target.feedforward_vy_mps)) {
+            py += static_cast<double>(target.feedforward_vy_mps) * lead_s;
+        }
+        if ((mask & common::kVelocityValidDown) != 0 &&
+            std::isfinite(target.feedforward_vz_mps)) {
+            pz += static_cast<double>(target.feedforward_vz_mps) * lead_s;
+        }
+        target.x = static_cast<float>(px);
+        target.y = static_cast<float>(py);
+        target.z = static_cast<float>(pz);
+
+        double cap = approach_.speed_mps;
+        const bool horizontal_velocity_valid =
+            (mask & (common::kVelocityValidNorth | common::kVelocityValidEast)) ==
+            (common::kVelocityValidNorth | common::kVelocityValidEast);
+        if (horizontal_velocity_valid && std::isfinite(target.feedforward_vx_mps) &&
+            std::isfinite(target.feedforward_vy_mps)) {
+            const double target_speed = std::hypot(
+                static_cast<double>(target.feedforward_vx_mps),
+                static_cast<double>(target.feedforward_vy_mps));
+            cap = std::max(cap, target_speed + approach_.track_speed_margin_mps);
+        }
+        target.max_speed_mps = static_cast<float>(cap);
+
+        if (!with_heading || !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            return;
+        }
+        const double dn = px - static_cast<double>(latest_flight_->local_x_m);
+        const double de = py - static_cast<double>(latest_flight_->local_y_m);
+        if (std::hypot(dn, de) < 0.5) {
+            return;  // 已到目标附近：保持现机头，避免末端抖动
+        }
+        target.yaw_valid = true;
+        target.yaw_deg = static_cast<float>(
+            std::atan2(de, dn) * 180.0 / 3.14159265358979323846);
+    }
 
     /// 发布 S5 估计引导位置意图。节流纪律：内容无变化按 10Hz 上限重发
     /// （意图是周期语义，FlightController 50ms 周期消费）；内容变化立即发。
@@ -3283,6 +3353,8 @@ private:
             position_target.feedforward_vz_mps = target.vel_z_mps;
             position_target.feedforward_valid_mask |= common::kVelocityValidDown;
         }
+        // 接近段策略：预测点 + 速率上限 + 机头朝目标（2026-11-02 P0-1/P0-2）。
+        ApplyApproachPolicy(position_target, /*with_heading=*/true);
 
         const bool content_changed = !last_intent_target_.has_value() ||
             !FloatContentEqual(last_intent_target_->pos_x_m, target.pos_x_m) ||
@@ -3346,6 +3418,8 @@ private:
         // 保持 use_yaw=false，PX4 按原机头平移。
         intent.yaw_valid = target.yaw_valid;
         intent.yaw_deg = target.yaw_deg;
+        // 相位速率上限（2026-11-02 P0-2）：0 = 不限制（S12 返航沿用历史行为）。
+        intent.max_speed_mps = target.max_speed_mps;
         // bit31 显式请求控制权（FlightController 授权链必要条件）+
         // 低位原因码（S5/S6=7 地面站任务；S12=8 返航）。
         intent.reason_code =
@@ -4257,6 +4331,8 @@ private:
     /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
     /// S3 时序/S4 爬升在 Task 5 使用）。
     const config::TakeoffConfig takeoff_;
+    /// 接近段相位策略（approach 节，2026-11-02）：S5/S6 速率上限、预测提前量。
+    const config::ApproachConfig approach_;
     /// 本机拦截功能类别（ground_station.aircraft_component_id 同源）。
     const uint8_t expected_interceptor_type_;
     /// 任务分配生命周期助手（一次上电一次任务、重复 id 回执、原点记录）。

@@ -234,6 +234,37 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   位置→速度从 0 起步、速度意图忽略前馈字段）；跨模块 PTY 契约
   `FlightControllerLinkContractTest.PositionWithFeedforwardReachesPx4LinkWire`。
 
+## 位置引导限速与相位速度上限（P0-2，2026-11-02）
+
+0082 实机（2026-11-02）暴露的问题：S5 把目标点（距起点 26m、高差 5m）**阶跃**下发，
+位置式设定值直通 PX4，PX4 按自己的 `MPC_XY_VEL_MAX=12m/s` 冲刺，实测 0.6s 内到
+4.6m/s、接管边界 8m/s，远超控制器 `max_speed_mps=2.0` 的意图。修复分两层：
+
+- **速度式意图**：`PublishVelocity()` 的幅值上限取 `IntentSpeedCap(intent, config_.max_speed_mps)`，
+  即 `min(控制器硬上限, 意图相位上限)`；意图未填（0/非有限）时回退硬上限，保持历史语义。
+- **位置式意图**：`PublishPosition()` 在围栏/高度钳制之后、前馈之前插入“位置引导限速”：
+  1. 仅当 `intent.max_speed_mps > 0` 时启用；否则位置直通（历史行为），
+     并把 `guide_valid_` 复位以免下次启用时沿用旧引导点；
+  2. 引导点初值取 PX4 当前实际位置（`state.local_*`），来源类型变化、间隔超过
+     `coast_timeout` 时重新起步（刹停/接管恢复后不跳变）；
+  3. 每拍步进 `min(cap, √(2·max_accel_mps2·d))·dt`，水平与垂直分别推进，
+     垂直另受 `position_guide_vz_mps` 限制；
+  4. cap 取 `min(意图上限, position_guide_speed_mps)`：状态机按相位下发，
+     控制器只执行与兜底，配置不会放大指令。
+- **终端减速**：`√(2·a·d)` 项在距目标近时自动收速，避免过冲后 PX4 反向追。
+- **日志**：启用时打一条 INFO「位置引导限速启动: cap/vz_cap/起点/目标」；
+  非热路径，不节流（每次来源切换一条）。
+- **配置**：`controller.position_guide_speed_mps`（默认 6.0）、
+  `controller.position_guide_vz_mps`（默认 1.5）；`controller.max_speed_mps`
+  仍是速度式意图与相位上限的硬边界。
+- **测试**：`FlightControllerPipelineTest.PositionGuideAdvancesAtPhaseSpeedCap`、
+  `PositionGuideSpeedClampedByControllerHardCap`、`VelocityIntentRespectsPhaseSpeedCap`。
+
+取舍：限速放在控制器而不是让状态机自己插值，是因为“任何来源的位置意图”都要经过
+同一道闸门（自动驾驶、视觉伺服、返航、测试钩子），且控制器持有 PX4 最新实际位置；
+状态机只负责“这一相位允许多快”（`ControlIntent.max_speed_mps`），保持相位策略与
+执行细节解耦。
+
 ## Home 漂移对控制的影响（2026-10-16 结论）
 
 控制链里 Home 只从三处进入。**速度型控制不受影响**（速度/角速度是平移不变量，

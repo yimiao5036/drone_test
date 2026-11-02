@@ -53,6 +53,10 @@ struct MissionStateMachineConfig {
     /// S4 爬升、目标等待/丢失与电池防抖的阈值全部取自此节；构造期
     /// `TakeoffConfig::Validate()` 兜底（程序化构造非法值 fail-fast）。
     config::TakeoffConfig takeoff;
+    /// S5/S6 接近段相位策略（approach 配置节同源注入，2026-11-02）：
+    /// 速率上限、目标速度余量与预测提前量；构造期 `ApproachConfig::Validate()`
+    /// 兜底。
+    config::ApproachConfig approach;
     /// 本机拦截功能类别（地面站链路 `ground_station.aircraft_component_id`
     /// 同源注入）：65014 的 `interceptor_type` 必须等于该值，25=捕网、26=火箭。
     /// 装配层未显式设置时保持捕网默认值。

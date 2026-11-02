@@ -458,8 +458,79 @@ TEST_F(FlightControllerPipelineTest, PositionFeedforwardIgnoredWhenSwitchOff) {
     EXPECT_EQ(controller_.FeedforwardDroppedCount(), 0u);
 }
 
-TEST_F(FlightControllerPipelineTest, PositionToVelocitySlewStartsFromZero) {
-    // 位置→速度类型切换：上一输出是位置量纲，速度斜坡须从 0 起步——
+// 2026-11-02 P0-2：位置型意图带相位上限时，控制器按上限把引导点从实际位置
+// 逐步推进，而不是把目标点直通给 PX4（0082 实测跳变 26m → 8m/s）。
+TEST_F(FlightControllerPipelineTest, PositionGuideAdvancesAtPhaseSpeedCap) {
+    common::ControlIntent intent;
+    intent.type = common::ControlIntentType::kPositionGuide;
+    intent.control_source = 0;
+    intent.target_x = 10.f;
+    intent.target_y = 0.f;
+    intent.target_z = 0.f;
+    intent.max_speed_mps = 3.5f;  // 状态机下发的相位上限
+    PublishIntent(intent);
+
+    Tick();
+    auto first = TakeOutput();
+    ASSERT_TRUE(first.has_value());
+    // 首拍起点为实际位置 0，步进 = 3.5m/s × 20ms = 0.07m，绝不到 10m。
+    EXPECT_NEAR(first->x, 3.5f * 0.02f, 1e-4f);
+    EXPECT_LT(first->x, 1.0f);
+
+    // 连续推进 0.5s：累计约 1.75m，仍远未到目标。
+    std::optional<common::Px4Setpoint> last = first;
+    for (int i = 0; i < 24; ++i) {
+        Tick();
+        auto out = TakeOutput();
+        if (out.has_value()) {
+            last = out;
+        }
+    }
+    ASSERT_TRUE(last.has_value());
+    EXPECT_NEAR(last->x, 3.5f * 0.5f, 0.15f);
+    EXPECT_LT(last->x, 3.0f);
+}
+
+// P0-2 兜底：相位上限大于控制器硬上限时取小（引导速率不会被配置放大）。
+TEST_F(FlightControllerPipelineTest, PositionGuideSpeedClampedByControllerHardCap) {
+    common::ControlIntent intent;
+    intent.type = common::ControlIntentType::kPositionGuide;
+    intent.control_source = 0;
+    intent.target_x = 10.f;
+    intent.target_z = 0.f;
+    intent.max_speed_mps = 20.f;  // 恶意/误配的大上限
+    PublishIntent(intent);
+
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    // 硬上限 position_guide_speed_mps=6.0 → 首拍 6.0 × 0.02 = 0.12m。
+    EXPECT_NEAR(out->x, 6.0f * 0.02f, 1e-4f);
+}
+
+// P0-2：速度型意图同样受相位上限约束（S7 伺服/返航按相位限速）。
+TEST_F(FlightControllerPipelineTest, VelocityIntentRespectsPhaseSpeedCap) {
+    auto intent = MakeVelocityIntent(10.0, 0.0, 0.0);
+    intent.control_source = 1;
+    intent.max_speed_mps = 1.0f;  // 相位上限小于硬上限 2.0
+    PublishIntent(intent);
+
+    std::optional<common::Px4Setpoint> last;
+    for (int i = 0; i < 200; ++i) {
+        Tick();
+        auto out = TakeOutput();
+        if (out.has_value()) {
+            last = out;
+        }
+    }
+    ASSERT_TRUE(last.has_value());
+    const double speed =
+        std::sqrt(last->x * last->x + last->y * last->y + last->z * last->z);
+    EXPECT_LE(speed, 1.0 + 1e-3);
+    EXPECT_GT(speed, 0.5);  // 确实在按 1.0 推进，而不是被压到 0
+}
+
+TEST_F(FlightControllerPipelineTest, PositionToVelocitySlewStartsFromZero) {    // 位置→速度类型切换：上一输出是位置量纲，速度斜坡须从 0 起步——
     // 若误以位置值作斜坡初值，首拍速度会跳变到位置量级（危险）
     common::ControlIntent position;
     position.type = common::ControlIntentType::kPositionGuide;
