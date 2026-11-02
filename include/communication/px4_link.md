@@ -411,6 +411,14 @@ false）。
 不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
 `Px4Link` 只累计链路级错误，不重复打印同一调用链错误。
 
+**设定值下发统计（2026-11-02 增，INFO，10s 一次）**：
+`PX4 设定值下发统计: 窗口=…ms 本次=… 速率=…Hz 累计=… 拒绝=… 写错误=…`。用于回答
+“设定值到底按多少赫兹下发”——0082 实飞 PX4 ULG 里相邻 `trajectory_setpoint` 间隔
+0.21s（≈4.8Hz）曾让人误判为下发太慢，机载计数证明真实下发是 **15.9~17.5Hz**，ULG 那
+是记录抽稀。测量同时暴露：通信线程按串口读超时（`px4.read.timeout_ms`，默认 20ms）
+阻塞唤醒，`setpoint_send_interval_ms=50` 会被量化成 60ms；配置改为 **40ms** 后 SITL 实测
+20.9~22.3Hz。若要改下发周期，注意它必须是读超时的整数倍。
+
 ## 5. 测试方式
 
 测试：`tests/communication/px4_link_test.cpp`，使用 Linux PTY 模拟 Pixhawk 串口，不依赖硬件。

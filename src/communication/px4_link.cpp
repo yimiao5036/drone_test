@@ -49,6 +49,10 @@ constexpr uint64_t kCommandSendRetryBackoffMs = 50;
 // 内部遥测请求写失败被丢弃后的重新排队周期：低频重排，既不堵关键命令，又保证
 // 首次建链时 SET_MESSAGE_INTERVAL 偶发丢失后能自愈（否则遥测流永不开启）。
 constexpr uint64_t kTelemetryRequestRetryMs = 1000;
+// 设定值下发速率统计周期（2026-11-02）：0082 实飞 ULG 里 PX4 记录到的位置设定值
+// 间隔中位数 0.21s（≈5Hz），与配置的 50ms 不符；需要机载侧自行计数对齐，判断是
+// “真的只发了 5Hz”还是“记录抽稀”。
+constexpr uint64_t kSetpointStatPeriodMs = 10000;
 /// 同一条队首命令连续发送失败上限；超过即丢弃，避免坏链路永久堵住命令队列。
 constexpr uint32_t kMaxCommandSendAttempts = 10;
 /// 重连失败日志：首次 + 每 10 次，避免设备长期不在时刷屏。
@@ -474,6 +478,7 @@ private:
         auto next_heartbeat = std::chrono::steady_clock::now();
         auto next_state_publish = next_heartbeat;
         auto next_setpoint_send = next_heartbeat;
+        last_setpoint_stat_ms_ = MonotonicMs();
         std::array<uint8_t, 512> read_buffer{};
 
         while (running_.load(std::memory_order_acquire)) {
@@ -532,6 +537,9 @@ private:
             if (now >= next_setpoint_send) {
                 SendSetpointIfDue(now_ms);
                 next_setpoint_send = now + config_.setpoint_send_interval;
+            }
+            if (now_ms - last_setpoint_stat_ms_ >= kSetpointStatPeriodMs) {
+                ReportSetpointRate(now_ms);
             }
             if (now >= next_heartbeat) {
                 SendHeartbeat();
@@ -677,6 +685,25 @@ private:
     }
 
     // 按周期重复发送当前缓存设定值；过期则停止并清缓存。只在心跳连接期间发送。
+    // 每 kSetpointStatPeriodMs 汇总一次设定值实际下发速率（只读计数，热路径无锁）。
+    void ReportSetpointRate(uint64_t now_ms) {
+        const uint64_t total = setpoint_send_count_.load(std::memory_order_relaxed);
+        const uint64_t rejects =
+            setpoint_reject_count_.load(std::memory_order_relaxed);
+        const uint64_t errors = error_count_.load(std::memory_order_relaxed);
+        const uint64_t window = now_ms - last_setpoint_stat_ms_;
+        const uint64_t sent = total - last_setpoint_stat_count_;
+        const double rate = window > 0 ? static_cast<double>(sent) * 1000.0 /
+                                            static_cast<double>(window)
+                                      : 0.0;
+        SPDLOG_INFO(
+            "PX4 设定值下发统计: 窗口={}ms 本次={} 速率={:.1f}Hz 累计={} 拒绝={} "
+            "写错误={}",
+            window, sent, rate, total, rejects, errors);
+        last_setpoint_stat_ms_ = now_ms;
+        last_setpoint_stat_count_ = total;
+    }
+
     void SendSetpointIfDue(uint64_t now_ms) {
         if (!connected_.load(std::memory_order_acquire) || !cached_setpoint_) {
             return;
@@ -1524,6 +1551,9 @@ private:
     std::optional<CachedSetpoint> cached_setpoint_;
 
     std::atomic<uint64_t> setpoint_send_count_{0};
+    // 设定值速率统计（仅通信线程访问，非原子）。
+    uint64_t last_setpoint_stat_ms_ = 0;
+    uint64_t last_setpoint_stat_count_ = 0;
     std::atomic<uint64_t> receive_count_{0};
     std::atomic<uint64_t> ack_match_count_{0};
     std::atomic<uint64_t> ack_timeout_count_{0};

@@ -183,6 +183,19 @@ int ReadOptionalPositiveInt(const json& object, const char* key,
     return static_cast<int>(value);
 }
 
+// 读取可选非负整数；缺席回退默认值，负数抛异常。
+int ReadOptionalNonNegativeInt(const json& object, const char* key,
+                               int default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const int64_t value = object.at(key).get<int64_t>();
+    if (value < 0 || value > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(std::string(key) + " 必须为非负整数");
+    }
+    return static_cast<int>(value);
+}
+
 // 读取 3×3 / 3×4 矩阵字段；形状不符抛异常。
 void ReadMatrixField(const json& node, const char* field, double* out, int rows,
                      int cols) {
@@ -559,6 +572,8 @@ void ApproachConfig::Validate() const {
         throw std::invalid_argument("approach.track_speed_margin_mps 必须为有限非负数");
     if (lead_time.count() < 0)
         throw std::invalid_argument("approach.lead_time_ms 不得为负");
+    if (guide_lowpass_ms < 0)
+        throw std::invalid_argument("approach.guide_lowpass_ms 不得为负");
 }
 
 void HandoverConfig::Validate() const {
@@ -1118,6 +1133,8 @@ AppConfig LoadAppConfig(const std::string& path,
         approach, "track_speed_margin_mps", config.approach.track_speed_margin_mps);
     config.approach.lead_time = ReadOptionalNonNegativeMilliseconds(
         approach, "lead_time_ms", config.approach.lead_time);
+    config.approach.guide_lowpass_ms = ReadOptionalNonNegativeInt(
+        approach, "guide_lowpass_ms", config.approach.guide_lowpass_ms);
     config.approach.Validate();
 
     // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：机载只保存

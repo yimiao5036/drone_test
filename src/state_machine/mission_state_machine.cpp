@@ -3265,6 +3265,35 @@ private:
         float max_speed_mps = 0.f;
     };
 
+    /// 引导点一阶低通（approach.guide_lowpass_ms）：地面站目标是 5Hz 离散观测，
+    /// 估计器每拍把位置修到新观测上，直接下发会让 PX4 逐拍执行台阶；这里按
+    /// alpha = dt/(tau+dt) 把台阶摊到多个决策周期。tau=0 时关闭并退化为直通。
+    void ApplyGuideLowpass(double& x, double& y, double& z, uint64_t now_ms) {
+        const int tau_ms = approach_.guide_lowpass_ms;
+        if (tau_ms <= 0) {
+            guide_filter_valid_ = false;
+            return;
+        }
+        if (!guide_filter_valid_) {
+            guide_filter_x_ = x;
+            guide_filter_y_ = y;
+            guide_filter_z_ = z;
+            guide_filter_valid_ = true;
+            guide_filter_ms_ = now_ms;
+            return;
+        }
+        const uint64_t dt = now_ms > guide_filter_ms_ ? now_ms - guide_filter_ms_ : 0;
+        const double alpha = static_cast<double>(dt) /
+                             (static_cast<double>(tau_ms) + static_cast<double>(dt));
+        guide_filter_x_ += (x - guide_filter_x_) * alpha;
+        guide_filter_y_ += (y - guide_filter_y_) * alpha;
+        guide_filter_z_ += (z - guide_filter_z_) * alpha;
+        guide_filter_ms_ = now_ms;
+        x = guide_filter_x_;
+        y = guide_filter_y_;
+        z = guide_filter_z_;
+    }
+
     /// 接近段相位策略（2026-11-02 P0-1/P0-2）：把状态机原始的“目标当前点”
     /// 换算成“引导点 + 速率上限 + 机头方向”。
     ///  1) 预测点 = 目标位置 + 目标速度 × approach.lead_time（仅有效轴），
@@ -3275,7 +3304,7 @@ private:
     ///  3) 机头 = 指向预测点的 NED 航向（0=正北，顺时针为正），目标与本机
     ///     水平距离 < 0.5m 时不改机头（避免末端原地打转）。
     /// with_heading=false 时不指定航向（保持原机头平移）。
-    void ApplyApproachPolicy(PositionIntentTarget& target, bool with_heading) const {
+    void ApplyApproachPolicy(PositionIntentTarget& target, bool with_heading) {
         double px = static_cast<double>(target.x);
         double py = static_cast<double>(target.y);
         double pz = static_cast<double>(target.z);
@@ -3294,6 +3323,9 @@ private:
             std::isfinite(target.feedforward_vz_mps)) {
             pz += static_cast<double>(target.feedforward_vz_mps) * lead_s;
         }
+        // 引导点低通：摊平 5Hz 目标观测带来的位置台阶（approach.guide_lowpass_ms）。
+        ApplyGuideLowpass(px, py, pz, MonotonicMs());
+
         target.x = static_cast<float>(px);
         target.y = static_cast<float>(py);
         target.z = static_cast<float>(pz);
@@ -4094,6 +4126,11 @@ private:
             } else if (next_state == common::MissionState::kGpsApproach) {
                 // S5 目标等待计时从进入任务高度起算（仅控制任务）。
                 BeginTargetWatchdog(now_ms);
+                // 新一段接近：引导点低通从当前目标重新对齐，避免沿用上段状态。
+                guide_filter_valid_ = false;
+            } else if (next_state == common::MissionState::kVisualHandover) {
+                // S6 冻结段必须精确保持交接点：低通重新对齐，不继承 S5 的滤波状态。
+                guide_filter_valid_ = false;
             }
         }
         PublishStatus(now_ms);
@@ -4401,6 +4438,12 @@ private:
     uint64_t intent_sequence_ = 0;
     uint64_t last_intent_publish_ms_ = 0;
     uint64_t intent_stale_count_ = 0;
+    // ---- 引导点一阶低通（approach.guide_lowpass_ms，2026-11-02）----
+    bool guide_filter_valid_ = false;   ///< 首次进入接近段时直接对齐目标
+    uint64_t guide_filter_ms_ = 0;      ///< 上一拍低通时刻（单调时钟）
+    double guide_filter_x_ = 0.0;       ///< 低通后的引导点（本地 NED）
+    double guide_filter_y_ = 0.0;
+    double guide_filter_z_ = 0.0;
     std::optional<common::TargetState> last_intent_target_;  ///< 上次发布意图对应的目标内容
 
     common::Topic<common::ControlIntent> intent_output_;

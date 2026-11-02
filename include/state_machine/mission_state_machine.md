@@ -23,7 +23,11 @@
   - **机头**：`yaw = atan2(E_target, N_target)`（局部 NED 朝向目标方位），距目标
     <0.5m 不转（避免目标脚下原地打转），无有效局部位置时不指定机头；S6 继续沿用。
     S7 视觉伺服接管后机头由伺服律锁目标，S12 返航才朝飞行方向。
-- 配置：`approach` 节（`speed_mps`/`track_speed_margin_mps`/`lead_time_ms`），
+  - **引导点低通**（`approach.guide_lowpass_ms`，默认 200，`0`=关闭）：地面站目标是
+    5Hz 离散观测，估计器每拍把位置修到新观测上；引导点按 `alpha = dt/(tau+dt)` 一阶
+    低通，把台阶摊到多个决策周期。进入 S5 时重新对齐，进入 S6（冻结段）时再重置一次，
+    保证冻结交接点被精确保持（不继承 S5 的滤波状态）。
+- 配置：`approach` 节（`speed_mps`/`track_speed_margin_mps`/`lead_time_ms`/`guide_lowpass_ms`），
   字段见 `include/config/配置管理.md`；`ControlIntent.max_speed_mps` 是这条链传导
   相位策略的唯一通道（历史上定义但未被消费，2026-11-02 起生效）。
 - 测试：`GpsApproachPublishesPositionIntent`（断言预测点与相位上限）、

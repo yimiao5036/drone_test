@@ -431,9 +431,72 @@ TEST(MissionStateMachineTest, GpsApproachRepublishesOnFeedforwardChange) {
     }
     ASSERT_TRUE(updated.has_value());
     // 位置随前馈变化（预测点 = 12.5 + 2.0 × 0.5），E 轴未置位不叠加。
-    EXPECT_FLOAT_EQ(updated->target_x, 12.5f + 2.0f * 0.5f);
-    EXPECT_FLOAT_EQ(updated->target_y, -3.0f);
+    // 引导点经过 approach.guide_lowpass_ms 一阶低通（默认 200ms），首拍不会直接
+    // 跳到 13.5：继续采集直到收敛（容差 0.05m），验证低通最终对齐预测点。
+    const float expected_x = 12.5f + 2.0f * 0.5f;
+    while (std::fabs(updated->target_x - expected_x) > 0.05f &&
+           std::chrono::steady_clock::now() < deadline) {
+        auto intent = intent_subscription.WaitTakeFor(50ms);
+        if (intent) {
+            updated = **intent;
+        }
+    }
+    EXPECT_NEAR(updated->target_x, expected_x, 0.05f);
+    EXPECT_NEAR(updated->target_y, -3.0f, 0.05f);
     EXPECT_EQ(updated->feedforward_valid_mask, common::kVelocityValidNorth);
+
+    machine.Stop();
+}
+
+// approach.guide_lowpass_ms：目标位置阶跃时引导点渐进逼近，不逐拍跳变。
+TEST(MissionStateMachineTest, GpsApproachSmoothsTargetPositionSteps) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    auto estimated = MakeValidEstimatedTarget();
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+    const auto baseline = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(baseline.has_value());
+    const float base_x = baseline->target_x;
+
+    // 目标向北阶跃 10m：引导点应被低通限制，单拍推进远小于 10m。
+    estimated.header.sequence += 1;
+    estimated.header.receive_time_ms = TestMonotonicMs();
+    estimated.pos_x_m += 10.0f;
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+    auto stepped = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(stepped.has_value());
+    EXPECT_GT(stepped->target_x, base_x);
+    EXPECT_LT(stepped->target_x - base_x, 5.0f);
+
+    // 继续采集：引导点在约 1 秒内收敛到新目标（容差 0.2m）。
+    // 每 50ms 重发一次同一估计，模拟地面站持续 5Hz 观测（否则估计超龄会停发）。
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::fabs(stepped->target_x - (base_x + 10.0f)) > 0.2f &&
+           std::chrono::steady_clock::now() < deadline) {
+        estimated.header.sequence += 1;
+        estimated.header.receive_time_ms = TestMonotonicMs();
+        (void)estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimated));
+        auto next = intent_subscription.WaitTakeFor(50ms);
+        if (next) {
+            stepped = **next;
+        }
+    }
+    EXPECT_NEAR(stepped->target_x, base_x + 10.0f, 0.2f);
 
     machine.Stop();
 }

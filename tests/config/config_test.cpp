@@ -738,6 +738,7 @@ TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
     EXPECT_DOUBLE_EQ(config.approach.speed_mps, 3.5);
     EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
     EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
+    EXPECT_EQ(config.approach.guide_lowpass_ms, 200);
     EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 5u);
     // S9/S10 入口默认关闭；返航默认启用以保证发射后有收口。
     EXPECT_FALSE(config.interception.enabled);
@@ -773,6 +774,7 @@ TEST(ConfigTest, ControllerAndApproachFallBackToDefaultsWhenAbsent) {
     EXPECT_DOUBLE_EQ(config.approach.speed_mps, 3.5);
     EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
     EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
+    EXPECT_EQ(config.approach.guide_lowpass_ms, 200);
     std::filesystem::remove(path);
 }
 
