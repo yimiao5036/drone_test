@@ -84,7 +84,12 @@ bash tools/sitl_harness.sh stop
 > 证据与判读见 `tools/sitl_evidence/g5_prep_20261028/README.md`。
 
 环境变量（可选）：`PX4_DIR`（默认 `$HOME/PX4-Autopilot`）、`REPO`（默认脚本上级
-目录）、`LOG_DIR`（默认 `/tmp/sitl_harness`）。
+目录）、`LOG_DIR`（默认 `/tmp/sitl_harness`）、`SITL_GUI=1`（拉起 Gazebo 3D 图形界面，
+WSLg 下窗口直接出现在 Windows 桌面；默认 0 无界面）。
+
+> `stack` 启动前会把 `build/config/zone.json` 移到 `$LOG_DIR` 备份：测试用例会把
+> 泸州测试区写进该缓存，与 SITL 的苏黎世 Home 冲突时会开机即判 `距边界=-8342817m`
+> 并瞬间中止任务（现象是 `围栏越界中止` + 65015 `FENCE_VIOLATION`）。
 
 验收工具用法（装置就绪后另开终端）：
 

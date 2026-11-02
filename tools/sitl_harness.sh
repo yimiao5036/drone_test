@@ -19,6 +19,7 @@
 #   PX4_DIR  PX4-Autopilot 源码目录（默认 $HOME/PX4-Autopilot）
 #   REPO     工程根目录（默认本脚本上级目录，一般无需设置）
 #   LOG_DIR  运行日志目录（默认 /tmp/sitl_harness）
+#   SITL_GUI 1=启动 Gazebo 图形界面（需 WSLg/显示器，默认 0 无界面）
 #
 # 安全边界：本脚本只面向 WSL2 内的 PX4 SITL（gz_x500 仿真），
 #          不连接任何真实飞控/串口；生产 `enable_control=false` 不受影响，
@@ -30,6 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PX4_DIR="${PX4_DIR:-$HOME/PX4-Autopilot}"
 LOG_DIR="${LOG_DIR:-/tmp/sitl_harness}"
+# SITL_GUI=1 时去掉 HEADLESS=1，让 Gazebo 拉起图形界面（WSLg 下可直接看到 3D）
+SITL_HEADLESS_ENV="HEADLESS=1"
+if [ "${SITL_GUI:-0}" = "1" ]; then SITL_HEADLESS_ENV=""; fi
 
 APP_BIN="$REPO/build/drone_control"
 SMOKE_BIN="$REPO/build/px4_link_smoke"
@@ -82,7 +86,7 @@ start_px4() {
     require_dir "$PX4_DIR"
     require_file "$PX4_DIR/build/px4_sitl_default/bin/px4"
     tmux new-session -d -s px4 \
-        "cd $PX4_DIR && HEADLESS=1 PX4_GZ_MODEL_POSE=0,0,0,0,0,1.5708 make px4_sitl gz_x500 2>&1 | tee $PX4_LOG"
+        "cd $PX4_DIR && $SITL_HEADLESS_ENV PX4_GZ_MODEL_POSE=0,0,0,0,0,1.5708 make px4_sitl gz_x500 2>&1 | tee $PX4_LOG"
     info "PX4 SITL 启动中（朝北出生，等待 home set）..."
     local i
     for i in $(seq 1 150); do
@@ -161,6 +165,13 @@ cmd_stack() {
     local cfg; cfg="$(parse_config "$@")"
     mkdir -p "$LOG_DIR"
     stop_all
+    # 清掉上一次测试/实机遗留的围栏缓存：测试用例会把泸州测试区写进
+    # build/config/zone.json，SITL 的 Home 在苏黎世，残留多边形会让
+    # 状态机开机即判"距边界=-8342817m"并立刻中止。
+    if [ -f "$REPO/build/config/zone.json" ]; then
+        mv "$REPO/build/config/zone.json" "$LOG_DIR/zone.json.bak-$(date +%s)"
+        info "已把 build/config/zone.json 备份移出（避免与 SITL Home 冲突）"
+    fi
     start_bridge
     start_px4
     set_common_params
