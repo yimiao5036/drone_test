@@ -252,7 +252,7 @@ struct TakeoffConfig {
 /// （目标位置 + 目标速度 × lead_time）；控制器按 min(硬上限, 相位上限) 执行。
 /// 目标带速度位时 cap = max(speed_mps, |目标速度| + track_speed_margin_mps)。
 struct ApproachConfig {
-    double speed_mps = 3.5;                   ///< S5/S6 位置引导速率上限（静态目标）
+    double speed_mps = 1.5;                   ///< S5/S6 位置引导速率上限（静态目标）
     double track_speed_margin_mps = 1.0;      ///< 目标有速度时的余量（追得上）
     std::chrono::milliseconds lead_time{500}; ///< 预测提前量（pos + v × lead）
     /// 引导点一阶低通时间常数（0=关闭）。地面站目标观测是 5Hz 离散点，KF 每拍把

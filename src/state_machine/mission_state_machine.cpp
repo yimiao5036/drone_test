@@ -3326,7 +3326,7 @@ private:
     ///  1) 预测点 = 目标位置 + 目标速度 × approach.lead_time（仅有效轴），
     ///     补偿链路延迟，避免追着落后点跑；
     ///  2) 速率上限 = max(approach.speed_mps, |目标水平速度| +
-    ///     approach.track_speed_margin_mps)：静止目标按 3.5 m/s 推进，运动
+    ///     approach.track_speed_margin_mps)：静止目标按 approach.speed_mps 推进，运动
     ///     目标自动抬高上限（上限≠目标速度，控制器据此限速推进）；
     ///  3) 机头 = 指向预测点的 NED 航向（0=正北，顺时针为正），目标与本机
     ///     水平距离 < 0.5m 时不改机头（避免末端原地打转）。

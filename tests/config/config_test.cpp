@@ -735,7 +735,7 @@ TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
     EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
     // 接近段相位策略：静止目标 3.5 m/s、目标速度余量 1.0、预测 500ms。
-    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 3.5);
+    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 1.5);
     EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
     EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
     EXPECT_EQ(config.approach.guide_lowpass_ms, 200);
@@ -771,7 +771,7 @@ TEST(ConfigTest, ControllerAndApproachFallBackToDefaultsWhenAbsent) {
     EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
-    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 3.5);
+    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 1.5);
     EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
     EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
     EXPECT_EQ(config.approach.guide_lowpass_ms, 200);

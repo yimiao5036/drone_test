@@ -18,8 +18,8 @@
   - **预测点**：有目标速度时目标点 = 估计位置 + v_h × `approach.lead_time_ms`
     （默认 500ms），抵消纯尾追的稳态滞后；
   - **相位限速**：`intent.max_speed_mps = max(approach.speed_mps,
-    |v_target| + approach.track_speed_margin_mps)`（默认 3.5 与 1.0）；无速度时就是
-    3.5m/s 上限。控制器按此上限逐拍推进引导点（见 `include/control/flight_controller.md`）；
+    |v_target| + approach.track_speed_margin_mps)`（默认 1.5 与 1.0）；无速度时就是
+    1.5m/s 上限。控制器按此上限逐拍推进引导点（见 `include/control/flight_controller.md`）；
   - **机头**：`yaw = atan2(E_target, N_target)`（局部 NED 朝向目标方位），距目标
     <0.5m 不转（避免目标脚下原地打转），无有效局部位置时不指定机头；S6 继续沿用。
     S7 视觉伺服接管后机头由伺服律锁目标，S12 返航才朝飞行方向。

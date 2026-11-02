@@ -169,8 +169,8 @@
         "position_guide_vz_mps": 1.5
     },
     "approach": {
-        "_comment": "S5/S6 接近段相位策略：静态目标按 speed_mps；目标带速度位时 cap=max(speed_mps, |v|+track_speed_margin_mps)，预测点=pos+v×lead_time。维护者 2026-11-02 确认 3.5/1.0/500。",
-        "speed_mps": 3.5,
+        "_comment": "S5/S6 接近段相位策略：静态目标按 speed_mps；目标带速度位时 cap=max(speed_mps, |v|+track_speed_margin_mps)，预测点=pos+v×lead_time。维护者 2026-11-02 先定 3.5，同日按实机观感改为 1.5（固定靶少见；带速度目标仍取 max(1.5, |v|+1.0)）。",
+        "speed_mps": 1.5,
         "track_speed_margin_mps": 1.0,
         "lead_time_ms": 500,
         "_comment_lowpass": "引导点一阶低通时间常数（ms，0=关闭）：地面站目标 5Hz 观测跳变经此摊平，代价约一个时间常数滞后。",
