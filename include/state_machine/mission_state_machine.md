@@ -226,10 +226,18 @@ bit5 =「S5 目标失效保持中」（`kWarningTargetHold`）。目标不可用
 - **成功**：实际 `armed && Offboard(6/0)` → S4。实际 `armed && !landed` 时
   每拍调用 `MissionAssignmentTracker::MarkAirborne()`（幂等；消耗一次上电
   一次空中任务机会，但不推进 tracker 阶段）。
-- **S4**：水平保持 `x0/y0`；z 目标 `z_target = z0 - takeoff.height_m`，
-  每拍按 `climb_rate_mps * dt` 向目标推进（**不阶跃**）；意图继续带 bit31，
-  `yaw_deg` 尽量取当前姿态 yaw。到达判据同时满足并保持 `stable_time`：
-  `|z-z_target| ≤ z_tolerance_m`、水平误差 `≤ xy_tolerance_m`、
+- **S4**：水平保持 `x0/y0`；z 目标 `z_target = z0 - takeoff.height_m`。
+  **2026-11-02 起改用“位置台阶 + 垂直速度前馈”**：仍每拍发 `kTakeoff` 位置
+  意图（维持控制器起飞预授权链连续），z 指令按 `climb_rate_mps` 逐拍抬升；
+  距目标高度 > `max(0.20, z_tolerance_m)` 时额外带**垂直速度前馈**
+  （`feedforward_vz_mps = -climb_rate_mps`，mask 含 `kVelocityValidDown`），
+  进入末段后直接发目标高度并撤掉前馈。理由：位置台阶会被 PX4 位置环按拍
+  执行成“加速→到位→减速”，是 0082 实飞高度抖动的主要来源；补垂直前馈后
+  PX4 速度环按恒定速率推进，且不改意图类型（曾试过纯速度型
+  `kVelocityHeading`，因意图类型变化触发授权链 `BOOTSTRAP→IDLE→ACTIVE`
+  抖动、起飞延迟，已废弃）。
+  意图继续带 bit31；`yaw_deg` 尽量取当前姿态 yaw。到达判据同时满足并保持
+  `stable_time`：`|z-z_target| ≤ z_tolerance_m`、水平误差 `≤ xy_tolerance_m`、
   `|vz| ≤ max_vz_mps`；满足后 `TakeoffComplete()` + `BeginEngage()` → **S5**
   （availability=engaged）。
 - **S4 空中超时**（`height_timeout`）：PX4 仍在 Offboard → 转 **S13**，由现有
@@ -522,9 +530,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     armed）。176/400 由阶段迁移保证各一次；`SendCommand` 入队失败立即中止。
   - 起飞意图每拍直接发布（10Hz，不走内容节流/重发上限）：控制器需要持续的
     原点保持/爬升流；`type=kTakeoff`、`frame_id=3`、`reason=bit31|7`。
-  - S4 爬升：`takeoff_z_cmd_` 从原点 z 逐拍按 `climb_rate*dt` 推进到
-    `z0-height_m`，到达判据看**实际** z/xy/vz（不是指令值），保持
-    `stable_time` 后 `TakeoffComplete()+BeginEngage()` → S5。
+  - S4 爬升：仍发 `kTakeoff` 位置意图（z 指令按 `climb_rate` 逐拍抬升）；
+    远段（`|实际 z - 目标| > max(0.20, z_tolerance_m)`）附带垂直速度前馈
+    `feedforward_vz_mps = -climb_rate`、mask 含 `kVelocityValidDown`；末段
+    改盯目标高度并撤前馈。到达判据看**实际** z/xy/vz（不是指令值），
+    保持 `stable_time` 后 `TakeoffComplete()+BeginEngage()` → S5。
   - 中止统一入口 `AbortTakeoff()`：已离地 → S12 不 disarm；地面且
     `armed+landed` → 一次 DISARM(400 param1=0) → S2；不确定 → 置
     `takeoff_unavailable_latched_` → S2 且 unavailable。S4 空中超时单独走
@@ -948,8 +958,10 @@ ctest --test-dir build --output-on-failure
     aborted/mode_timeout，只发一次 DISARM(param1=0)；
   - `TakeoffAirborneAbortReturnsHomeWithoutDisarm`：已离地 PX4 断连 →
     aborted/px4_disconnected、availability=unavailable、转 S12 且不 DISARM；
-  - `TakeoffClimbRampsZTargetAndReachesS5`：S4 z 目标逐拍推进（不阶跃），
-    到达后 S5；
+  - `TakeoffClimbRampsPositionWithVerticalFeedforward`：S4 远段持续发
+    `kTakeoff` 位置意图（z 在 `[目标, 起飞点]` 之间逐拍抬升）并带
+    `feedforward_vz_mps=-climb_rate`、mask 含 `kVelocityValidDown`；发布
+    到达目标高度的飞行快照后，末段撤前馈并直接盯目标高度，随后进入 S5；
   - `TakeoffClimbGroundTimeoutDisarmsAndReturnsReady`：S4 地面超时 →
     aborted/takeoff_timeout、一次 DISARM、回 S2 READY；
   - `TakeoffClimbAirTimeoutLandsInPlace`：S4 空中超时且仍 Offboard → S13
@@ -1063,8 +1075,11 @@ ctest --test-dir build --output-on-failure
   arm_timeout=未等到实际 armed（查 PX4 解锁检查/ACK，PX4 拒绝 arm 表现为
   超时），bootstrap_timeout=176 入队失败，px4_disconnected=心跳断。
   **不重试 176/400**，需地面站用新 assignment_id 重新分配。
-- **S4 不爬升/不前进**：确认仍在 Offboard(6/0) 且 kTakeoff 意图的 target_z
-  在逐拍下降（10Hz 每次 `climb_rate*dt`，不是一步到目标）；高度/水平/速度
+- **S4 不爬升/不前进**：确认仍在 Offboard(6/0) 且意图在流动——全程是
+  `kTakeoff` 位置意图（z 指令按 `climb_rate` 逐拍抬升），远段另带垂直前馈
+  `feedforward_vz_mps=-climb_rate`（mask 含 `kVelocityValidDown`），进入
+  `|z-z_target| ≤ max(0.20, z_tolerance_m)` 后改为直接盯目标高度并撤前馈；
+  高度/水平/速度
   到达判据看实际快照，持续 `stable_time` 才进 S5。S4 空中超时仍 Offboard →
   S13 发 AUTO.LAND；已离开 Offboard → S13 仅监控（不发 176）。
 - **起飞中止后 availability 一直 unavailable、新分配被拒 not_ready**：中止

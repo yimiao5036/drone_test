@@ -3131,8 +3131,9 @@ TEST(MissionStateMachineTest, TakeoffAirborneAbortReturnsHomeWithoutDisarm) {
     }
 }
 
-// S4 按 climb_rate 逐拍推进 z 目标（不阶跃）；到达判据满足并稳定后 S5。
-TEST(MissionStateMachineTest, TakeoffClimbRampsZTargetAndReachesS5) {
+// S4 爬升（2026-11-02）：远段发速度型意图（vz=-climb_rate，恒定爬升率），
+// 末段切位置保持到目标高度；到达判据满足并稳定后进 S5。
+TEST(MissionStateMachineTest, TakeoffClimbRampsPositionWithVerticalFeedforward) {
     AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
                                                     5000ms, /*height=*/0.5,
                                                     /*climb=*/0.5));
@@ -3155,11 +3156,14 @@ TEST(MissionStateMachineTest, TakeoffClimbRampsZTargetAndReachesS5) {
                     .has_value());
 
     const float goal_z = kTakeoffOriginZ - 0.5f;
-    bool saw_intermediate = false;
-    float last_z = kTakeoffOriginZ;
-    const auto deadline =
-        std::chrono::steady_clock::now() + 700ms;
-    while (std::chrono::steady_clock::now() < deadline) {
+
+    // 1) 远段：位置目标逐拍向目标高度推进，并携带垂直速度前馈
+    //    （vz=-climb_rate，NED 向下为正）。前馈让 PX4 直接拿到爬升率，
+    //    避免位置台阶被位置环执行成加速→到位→减速的抖动。
+    bool saw_feedforward = false;
+    bool saw_position_intent = false;
+    const auto climb_deadline = std::chrono::steady_clock::now() + 700ms;
+    while (std::chrono::steady_clock::now() < climb_deadline) {
         auto message = harness.intent_subscription.WaitTakeFor(50ms);
         if (!message) {
             continue;
@@ -3168,22 +3172,47 @@ TEST(MissionStateMachineTest, TakeoffClimbRampsZTargetAndReachesS5) {
         if (value.type != common::ControlIntentType::kTakeoff) {
             continue;
         }
-        EXPECT_LE(value.target_z, last_z + 1e-4f)
-            << "爬升目标不得反向/阶跃上升";
-        if (value.target_z < kTakeoffOriginZ - 1e-3f &&
-            value.target_z > goal_z + 1e-3f) {
-            saw_intermediate = true;
+        saw_position_intent = true;
+        EXPECT_NEAR(value.target_x, kTakeoffOriginX, 1e-4f);
+        EXPECT_NEAR(value.target_y, kTakeoffOriginY, 1e-4f);
+        // 位置目标只向目标高度推进，不越过。
+        EXPECT_LE(value.target_z, kTakeoffOriginZ + 1e-4f);
+        EXPECT_GE(value.target_z, goal_z - 1e-3f);
+        if ((value.feedforward_valid_mask & common::kVelocityValidDown) != 0) {
+            EXPECT_NEAR(value.feedforward_vz_mps, -0.5f, 1e-4f);
+            saw_feedforward = true;
+            break;
         }
-        last_z = value.target_z;
     }
-    EXPECT_TRUE(saw_intermediate) << "z 目标必须逐拍推进而非一步到目标";
+    EXPECT_TRUE(saw_position_intent) << "S4 应持续发 kTakeoff 位置意图";
+    EXPECT_TRUE(saw_feedforward)
+        << "爬升远段应携带垂直速度前馈（vz=-climb_rate）";
 
+    // 2) 末段：到达目标高度附近后撤掉前馈，位置环自行收敛。
     auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
     arrived.local_x_m = kTakeoffOriginX;
     arrived.local_y_m = kTakeoffOriginY;
     arrived.local_z_m = goal_z;
     arrived.vz_mps = 0.f;
     ASSERT_TRUE(PublishFlight(harness.flight_topic, arrived));
+    bool saw_handover = false;
+    const auto hold_deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < hold_deadline) {
+        auto message = harness.intent_subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& value = **message;
+        if (value.type != common::ControlIntentType::kTakeoff) {
+            continue;
+        }
+        // 末段不再带垂直前馈，交给位置环把最后一段收掉。
+        EXPECT_EQ(value.feedforward_valid_mask & common::kVelocityValidDown, 0);
+        EXPECT_NEAR(value.target_z, goal_z, 0.05f);
+        saw_handover = true;
+        break;
+    }
+    EXPECT_TRUE(saw_handover) << "末段应撤掉垂直前馈并由位置环收敛到目标高度";
     const auto approach = WaitForState(harness.status_subscription,
                                        common::MissionState::kGpsApproach,
                                        4000ms);

@@ -129,6 +129,9 @@ constexpr uint8_t kPx4FlightSubModeAutoLand = 6;
 constexpr uint8_t kFrameLocalNed = 3;
 /// 热备份年龄核对周期（设计 §2.4「S7 期间每秒核对」）。
 constexpr uint64_t kHotBackupCheckIntervalMs = 1000;
+/// S4 爬升：距目标高度小于该值即从速度型切回位置保持（末段收敛）。
+/// 与到达判据容差取较大者，避免切回位置时离目标仍太远。
+constexpr double kClimbHandoverMeters = 0.20;
 /// MAV_CMD_DO_SET_ACTUATOR（MAVLink common.xml #187，Task 10 捕网触发）。
 /// 弧度 → 度换算（视线角与视场半角比较统一用度，与配置项单位一致）。
 constexpr double kRadToDeg = 57.29577951308232;
@@ -1407,13 +1410,29 @@ private:
 
         // 迁移（S3→S4、S4→S5）或中止后按当拍新状态决定是否继续发意图：
         // - 仍在 S3：原点保持（z=z0）；
-        // - 已进入 S4：起飞意图目标 z 为逐拍推进的爬升值；
+        // - 已进入 S4：位置目标按爬升率逐拍推进，同时携带垂直速度前馈
+        //   （进入末段后撤掉前馈，交给位置环收速）；
         // - 已中止（S2/S12/S13）：停发，不留下持续控制流。
         const auto after = CurrentState();
         if (after == common::MissionState::kArming) {
             PublishTakeoffIntent(assignment_tracker_.OriginZ(), now_ms);
         } else if (after == common::MissionState::kTakeoff) {
-            PublishTakeoffIntent(takeoff_z_cmd_, now_ms);
+            const double goal_z =
+                static_cast<double>(assignment_tracker_.OriginZ()) -
+                takeoff_.height_m;
+            const double handover_m =
+                std::max(kClimbHandoverMeters, takeoff_.z_tolerance_m);
+            const bool climbing =
+                flight.local_position_valid &&
+                std::fabs(static_cast<double>(flight.local_z_m) - goal_z) >
+                    handover_m;
+            // 末段（进入到达判据范围内）直接盯目标高度，避免逐拍爬升值落后于
+            // 实际高度时，位置环还在追一个更低的旧目标。
+            const float climb_cmd_z =
+                climbing ? takeoff_z_cmd_ : static_cast<float>(goal_z);
+            PublishTakeoffIntent(
+                climb_cmd_z, now_ms,
+                climbing ? static_cast<float>(-takeoff_.climb_rate_mps) : 0.f);
         }
     }
 
@@ -2534,7 +2553,8 @@ private:
     /// 目标 x/y=tracker 起飞原点，z 为 S3 原点值或 S4 逐拍爬升值；reason_code
     /// 带 bit31 控制权请求位；航向尽量保持当前姿态 yaw。每决策拍发布，
     /// 不走内容节流——控制器需要持续的原点保持/爬升流。
-    void PublishTakeoffIntent(float z_target, uint64_t now_ms) {
+    void PublishTakeoffIntent(float z_target, uint64_t now_ms,
+                              float vz_feedforward_mps = 0.f) {
         common::ControlIntent intent;
         intent.header.sequence = ++intent_sequence_;
         intent.header.source_time_ms = now_ms;
@@ -2556,6 +2576,13 @@ private:
         // 低位 7（地面站任务下发）。
         intent.reason_code =
             common::kControlIntentReasonRequestControl | kReasonGroundStationTask;
+        if (std::isfinite(vz_feedforward_mps) && vz_feedforward_mps != 0.f) {
+            // 垂直速度前馈（NED 向下为正）：爬升远段直接把爬升率交给 PX4，
+            // 避免位置台阶被位置环执行成“加速→到位→减速”的抖动；末段
+            // 调用方传 0 撤掉前馈，由位置环自然收敛到目标高度。
+            intent.feedforward_vz_mps = vz_feedforward_mps;
+            intent.feedforward_valid_mask = common::kVelocityValidDown;
+        }
         intent.valid_until_ms = now_ms + intent_valid_for_ms_;
         (void)intent_output_.Publish(
             std::make_shared<const common::ControlIntent>(intent));
