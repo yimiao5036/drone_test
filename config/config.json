@@ -148,8 +148,11 @@
         "authorization_timeout_ms": 1000
     },
     "return_home": {
+        "_comment": "climb_rate_mps/cruise_speed_mps 经控制器位置引导限速执行：爬升段按 climb_rate 原地升到 altitude_m，再按 cruise_speed 水平返航（2026-11-03：此前位置目标阶跃，PX4 用自身 MPC_Z_VEL_MAX_UP=3m/s 冲，体感过快）。",
         "enabled": true,
         "altitude_m": 5.0,
+        "climb_rate_mps": 0.5,
+        "cruise_speed_mps": 3.0,
         "arrival_radius_m": 2.0,
         "arrival_vertical_m": 0.5,
         "arrival_speed_mps": 0.5,

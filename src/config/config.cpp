@@ -612,6 +612,12 @@ void ReturnHomeConfig::Validate() const {
     if (!std::isfinite(altitude_m) || altitude_m <= 0.0) {
         throw std::invalid_argument("return_home.altitude_m 必须为有限正数");
     }
+    if (!std::isfinite(climb_rate_mps) || climb_rate_mps <= 0.0) {
+        throw std::invalid_argument("return_home.climb_rate_mps 必须为有限正数");
+    }
+    if (!std::isfinite(cruise_speed_mps) || cruise_speed_mps <= 0.0) {
+        throw std::invalid_argument("return_home.cruise_speed_mps 必须为有限正数");
+    }
     if (!std::isfinite(arrival_radius_m) || arrival_radius_m <= 0.0) {
         throw std::invalid_argument("return_home.arrival_radius_m 必须为有限正数");
     }
@@ -1018,6 +1024,12 @@ AppConfig LoadAppConfig(const std::string& path,
         return_home.value("enabled", config.return_home.enabled);
     config.return_home.altitude_m = ReadOptionalPositiveDouble(
         return_home, "altitude_m", config.return_home.altitude_m);
+    // 返航爬升率/水平巡航速度（2026-11-03）：位置目标阶跃时 PX4 会按自身
+    // MPC_Z_VEL_MAX_UP 冲，这两个值把爬升与返航速度交给控制器位置引导限速。
+    config.return_home.climb_rate_mps = ReadOptionalPositiveDouble(
+        return_home, "climb_rate_mps", config.return_home.climb_rate_mps);
+    config.return_home.cruise_speed_mps = ReadOptionalPositiveDouble(
+        return_home, "cruise_speed_mps", config.return_home.cruise_speed_mps);
     config.return_home.arrival_radius_m = ReadOptionalPositiveDouble(
         return_home, "arrival_radius_m", config.return_home.arrival_radius_m);
     config.return_home.arrival_vertical_m = ReadOptionalPositiveDouble(

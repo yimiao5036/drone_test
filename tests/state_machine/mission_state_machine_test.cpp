@@ -1938,6 +1938,7 @@ TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
     EXPECT_NEAR(return_intent->target_x, 0.0f, 0.05f);   // Home 局部 NED x
     EXPECT_NEAR(return_intent->target_y, 0.0f, 0.05f);
     EXPECT_NEAR(return_intent->target_z, -10.0f, 0.05f); // 保持当前高度
+    EXPECT_FLOAT_EQ(return_intent->max_speed_mps, 3.0f); // 水平巡航相位上限
     EXPECT_EQ(return_intent->feedforward_valid_mask, 0U);
 
     // 到达 Home 附近并稳定 300ms → S13；发 AUTO.LAND（176，4/6）。
@@ -2045,6 +2046,9 @@ TEST(MissionStateMachineTest, ReturnHomeClimbsToFiveMetersBeforeCruise) {
     EXPECT_NEAR(climb_intent->target_x, 10.0f, 0.05f);  // 原地爬升
     EXPECT_NEAR(climb_intent->target_y, 5.0f, 0.05f);
     EXPECT_NEAR(climb_intent->target_z, -5.0f, 0.05f);  // Home 上方 5m
+    // 爬升段带相位速度上限：控制器位置引导限速据此按 climb_rate 推进，
+    // 否则位置阶跃会被 PX4 按自身 MPC_Z_VEL_MAX_UP（3m/s）冲上去。
+    EXPECT_FLOAT_EQ(climb_intent->max_speed_mps, 0.5f);
 
     // 到达 5m、垂速归零 → 进入水平巡航（目标 Home x/y）。
     for (int round = 0; round < 8; ++round) {

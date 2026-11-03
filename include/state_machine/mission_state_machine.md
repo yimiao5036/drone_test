@@ -702,8 +702,12 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `ned_ref_valid`/`local_position_valid` 任一无效 → 原地悬停并告警（不盲目返航）。
   - **S12 返航**：相对 Home 高度 <`altitude_m`（5m）先原地爬升，达标后再水平
     飞 Home；≥5m 保持当前高度。位置意图 10Hz 重发，`reason_code` 低位=8
-    （`kReasonReturnHome`），不带速度前馈。PX4 离开 Offboard（failsafe/人工）→
-    立即停发、转 S13 仅监控，不与其争控。
+    （`kReasonReturnHome`），不带速度前馈。**爬升与水平段都带相位速度上限**
+    （2026-11-03）：爬升段 `max_speed_mps=climb_rate_mps`（默认 0.5）、水平段
+    `max_speed_mps=cruise_speed_mps`（默认 3.0），由控制器“位置引导限速”逐拍推进
+    ——此前不带上限，位置目标从当前高度阶跃到 5m，PX4 按自身
+    `MPC_Z_VEL_MAX_UP`（3m/s）冲上去，实机反馈“低于 5m 时上升很快”。PX4 离开
+    Offboard（failsafe/人工）→ 立即停发、转 S13 仅监控，不与其争控。
   - **到达判据**：水平距 Home ≤`arrival_radius_m`（2m）、垂直误差
     ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
     持续 `arrival_hold`（1s）→ S13。返航超 `timeout`（60s）→ 原地悬停告警。

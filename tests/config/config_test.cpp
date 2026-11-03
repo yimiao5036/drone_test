@@ -895,6 +895,8 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
     value["interception"]["authorization_timeout_ms"] = 1500;
     value["return_home"]["enabled"] = true;
     value["return_home"]["altitude_m"] = 6.5;
+    value["return_home"]["climb_rate_mps"] = 0.8;
+    value["return_home"]["cruise_speed_mps"] = 4.5;
     value["return_home"]["arrival_radius_m"] = 1.5;
     value["return_home"]["arrival_vertical_m"] = 0.4;
     value["return_home"]["arrival_speed_mps"] = 0.3;
@@ -916,6 +918,8 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
               std::chrono::milliseconds(1500));
     EXPECT_TRUE(config.return_home.enabled);
     EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 6.5);
+    EXPECT_DOUBLE_EQ(config.return_home.climb_rate_mps, 0.8);
+    EXPECT_DOUBLE_EQ(config.return_home.cruise_speed_mps, 4.5);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 1.5);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_vertical_m, 0.4);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_speed_mps, 0.3);
@@ -923,6 +927,18 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
     EXPECT_EQ(config.return_home.timeout, std::chrono::milliseconds(45000));
     EXPECT_EQ(config.return_home.fire_timeout, std::chrono::milliseconds(2500));
     EXPECT_EQ(config.return_home.command_retry, std::chrono::milliseconds(700));
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveReturnClimbRate) {
+    // 返航爬升率/巡航速度必须为正：0 或负数会让位置引导限速失效或反向推进。
+    json value = ReadSourceConfig();
+    value["return_home"]["climb_rate_mps"] = 0.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_return_climb_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
     std::filesystem::remove(path);
 }
 

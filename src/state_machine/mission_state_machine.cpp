@@ -3758,9 +3758,12 @@ private:
 
     /// 发布返航位置意图（低位原因码 8；不带目标速度前馈）。
     /// heading_valid 时附带航向（S12 机头朝飞行方向，2026-10-29）。
+    /// S12 返航位置意图（2026-11-03）：`max_speed_mps` 交给控制器位置引导限速，
+    /// 爬升段传 `climb_rate_mps`、水平段传 `cruise_speed_mps`；悬停收口传 0（不推进）。
     void PublishReturnHomeIntent(float x, float y, float z, uint64_t now_ms,
                                  bool heading_valid = false,
-                                 float heading_deg = 0.f) {
+                                 float heading_deg = 0.f,
+                                 float max_speed_mps = 0.f) {
         PositionIntentTarget target;
         target.x = x;
         target.y = y;
@@ -3768,6 +3771,7 @@ private:
         target.frame_id = kFrameLocalNed;
         target.yaw_valid = heading_valid;
         target.yaw_deg = heading_deg;
+        target.max_speed_mps = max_speed_mps;
         PublishPositionIntent(target, now_ms, kReasonReturnHome);
     }
 
@@ -3938,7 +3942,10 @@ private:
         PublishReturnHomeIntent(static_cast<float>(target_x),
                                 static_cast<float>(target_y),
                                 static_cast<float>(target_z), now_ms,
-                                heading_valid, heading_deg);
+                                heading_valid, heading_deg,
+                                static_cast<float>(return_climb_phase_
+                                                       ? return_home_.climb_rate_mps
+                                                       : return_home_.cruise_speed_mps));
 
         if (return_climb_phase_) {
             return;

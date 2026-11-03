@@ -164,6 +164,12 @@ struct ReturnHomeConfig {
     bool enabled = true;
     /// 相对 Home 的返航高度：低于该值先原地爬升，再水平返航。
     double altitude_m = 5.0;
+    /// 返航爬升率（m/s）：爬升段经控制器“位置引导限速”推进，避免位置目标
+    /// 阶跃时 PX4 用自身 MPC_Z_VEL_MAX_UP（默认 3m/s）冲上去——2026-11-03
+    /// 实机反馈“低于 5m 时上升很快”即此原因。
+    double climb_rate_mps = 0.5;
+    /// 水平返航速度上限（m/s）：爬升完成后朝 Home 推进的最大速度。
+    double cruise_speed_mps = 3.0;
     /// 到达判据：水平半径、垂直误差、水平速度与稳定保持时长。
     double arrival_radius_m = 2.0;
     double arrival_vertical_m = 0.5;
