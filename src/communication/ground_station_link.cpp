@@ -2392,13 +2392,22 @@ private:
         });
     }
 
-    // GLOBAL_POSITION_INT：relative_alt 仅在 Home 有效时由 MSL 高差计算，否则为 0。
+    // GLOBAL_POSITION_INT：relative_alt 与机载围栏同口径，取 EKF 差分的
+    // 「相对起飞点高度」（解锁瞬间 local_z − 当前 local_z），锁定时抓不到基准则
+    // 为 0。**不再用 MSL − Home 海拔**：Home 高度是 GNSS 绝对海拔，现场
+    // 0083/0084 在 25 分钟内漂了 38.81m，下传的 REL ALT 会跟着虚高 18~21m，
+    // 让地面站显示与围栏判据一起失真（见 docs/故障排查手册.md §17.9.1）。
     bool SendGlobalPosition(const common::FlightStateSnapshot& state) {
         if (!state.global_position_valid) {
             return false;
         }
-        const int32_t relative_altitude =
-            state.home_valid ? state.altitude_mm - state.home_altitude_mm : 0;
+        int32_t relative_altitude = 0;
+        if (state.takeoff_ref_valid && state.local_position_valid) {
+            const double relative_m =
+                static_cast<double>(state.takeoff_ref_local_z_m) -
+                static_cast<double>(state.local_z_m);
+            relative_altitude = static_cast<int32_t>(std::lround(relative_m * 1000.0));
+        }
         const int16_t vx = ClampRounded<int16_t>(
             state.vx_mps, 100.f, std::numeric_limits<int16_t>::min(),
             std::numeric_limits<int16_t>::max());

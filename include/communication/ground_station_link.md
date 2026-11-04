@@ -87,7 +87,10 @@ Px4Link::StateOutput()
 - `FlightStateSnapshot`订阅队列默认容量2，满时丢最旧状态，避免电台拥塞积压旧遥测。
 - 只在对应有效标志为真时发送姿态、位置、GPS、电池和Home消息；无效数据不伪造成有效零值。
 - `FlightStateSnapshot`只有动力电池总压，没有单体电压，因此总压放在`SYS_STATUS.voltage_battery`；`BATTERY_STATUS.voltages[]`保持未知，禁止把总压误当成首节电芯电压。
-- `GLOBAL_POSITION_INT.relative_alt`仅在Home有效时由MSL高度差计算；Home无效时为0，地面站应结合Home有效消息判断。
+- `GLOBAL_POSITION_INT.relative_alt` **自 2026-11-04 起改用 EKF 差分**：`(takeoff_ref_local_z_m − local_z_m) × 1000`，
+  基准由 `Px4Link` 在解锁上升沿抓取（`takeoff_ref_valid`）；基准不可用时发 0，不再用
+  `MSL − HOME_POSITION.alt`（那个会被 GNSS 海拔漂移带偏，见 `docs/故障排查手册.md` §17.9.1）。
+  `alt` 仍是 `MSL`（EKF 绝对海拔），两者口径不同，地面站不要互相换算。
 - 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。实链验证中状态和`TRACK_TARGET_UPDATE`均采用MAVLink2短帧承载：`V2_EXTENSION`头部5字节加协议有效55字节，`mavlink_payload_len=60`，不要求发送满长扩展payload。
 - `HEALTH_STATUS`使用私有`message_type=65012`（版本1），`MISSION_STATUS`使用私有`message_type=65013`（版本2）；两者均为飞机→地面站单向状态消息，不返回ACK。状态变化由输入Topic事件触发立即发送，未变化时按JSON周期发送。65013 v2 在 offset 40/44/48/49 写入`assignment_id/target_id/availability/interceptor_type`，offset 0~39 与 v1 不变；`kHealthStatusProtocolVersion`与`kMissionStatusProtocolVersion`独立，不再共用版本常量。
 - 健康状态字段布局见`docs/地面站目标位置与时间同步协议.md` §13；任务状态中的距离使用毫米整数，未知值为`INT32_MIN`，CPU负载使用百分之一整数。
@@ -148,7 +151,7 @@ Px4Link::StateOutput()
 
 | 方向 | 类型 | 处理 |
 |---|---|---|
-| 下行 | 65020 `MISSION_COMMAND` | `HandleMissionCommand()`：帧长、地址双字段（帧头 `target_system/component` 与 payload[50]/[51] 都必须指向本机，2026-10-30 补齐 payload 校验；不符即丢帧、不回 65021）、尾部 marker=1、版本、类型逐项校验后填 `MissionCommand`（`valid_for_ms = kMissionCommandValidForMs = 1000`）并发布；校验失败分别计数（`mission_command_invalid_count_` / `mission_command_address_mismatch_count_`）并节流 WARN |
+| 下行 | 65020 `MISSION_COMMAND` | `HandleMissionCommand()`：帧长、地址双字段（帧头 `target_system/component` 与 payload[50]/[51] 都必须指向本机，2026-10-30 补齐 payload 校验；不符即丢帧、不回 65021）、尾部 marker=1、版本、类型逐项校验后填 `MissionCommand`（`valid_for_ms = kMissionCommandValidForMs = 1000`）并发布；校验失败分别计数（`mission_command_invalid_count_` / `mission_command_address_mismatch_count_`）并节流 WARN。`type` 只做 `static_cast` 透传（2026-11-04 增 `kResetState(2)`），类型是否受理由状态机判定并回 65021 `reason=3` |
 | 上行 | 65021 `MISSION_COMMAND_ACK` | `SetMissionCommandAckInput()` + 工作线程每拍 `DrainMissionCommandAcks()`（逐条发送，不合并）→ `SendMissionCommandAck()` 编码后定向发 255/190 |
 
 设计取舍：
@@ -156,10 +159,12 @@ Px4Link::StateOutput()
 - **与 65014 分工**：65014 是"分配任务"（可重复、带 target/zone 版本）；65020 是"现在就做某件事"，
   一次性、`command_id` 幂等、带 1s 有效期。串口积压导致迟到超过 1s 的指令会被丢弃，避免
   "补执行"一个已经过期的返航动作。
-- **拒绝原因不复用 65015 的 reason 空间**：65021 有独立的 `MissionCommandReason`（0~7、20），
+- **拒绝原因不复用 65015 的 reason 空间**：65021 有独立的 `MissionCommandReason`（0~8、20），
   因为 65015 的原因码是任务分配语义，混用会让地面站无法区分"分配被拒"与"指令被拒"。
-- **状态由机载决定**：地面站只能"请求返航"，是否接受取决于当前状态（未起飞拒绝、已在返航回
-  `kCompleted`、故障拒绝）。回执里的 `mission_state` 让地面站不必猜机载在哪一态。
+  `reason=8 kNotOnGround` 专供 `type=2 重置任务状态`（2026-11-04）：只在落地并上锁后受理。
+- **状态由机载决定**：地面站只能"请求返航/请求重置"，是否接受取决于当前状态（未起飞拒绝、
+  已在返航回 `kCompleted`、故障拒绝、重置时未落地回 `reason=8`）。回执里的 `mission_state`
+  让地面站不必猜机载在哪一态。
 
 ## 日志行为
 

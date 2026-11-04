@@ -4221,6 +4221,8 @@ common::FlightStateSnapshot MakeFenceFlight() {
 }
 
 /// 空中快照（Offboard）覆盖局部位置与锚点，用于制造越界/回界。
+/// 起飞基准取 0m（解锁瞬间 local_z=0）：相对起飞点高度 = −z，与用例里
+/// “抬高到相对锚点 N 米”的写法一一对应。
 common::FlightStateSnapshot MakeFenceOffboardFlight(float x_m, float y_m,
                                                     float z_m) {
     common::FlightStateSnapshot flight = MakeOffboardFlight(true, false);
@@ -4232,6 +4234,8 @@ common::FlightStateSnapshot MakeFenceOffboardFlight(float x_m, float y_m,
     flight.local_x_m = x_m;
     flight.local_y_m = y_m;
     flight.local_z_m = z_m;
+    flight.takeoff_ref_valid = true;
+    flight.takeoff_ref_local_z_m = 0.f;
     return flight;
 }
 
@@ -4323,16 +4327,15 @@ TEST(MissionStateMachineTest, FenceStateReportedEvenWhenDisabled) {
     DrainAcks(harness.ack_subscription);
 }
 
-/// 高度带“相对 Home”必须减掉 Home 高度，不能直接用 −local_z：
-/// EKF 锚点常比地面高数米（现场日志地面静止时 local_z≈+6.2m）。
-TEST(MissionStateMachineTest, FenceAltitudeUsesHomeReference) {
+/// 高度带“相对起飞点”必须是 EKF 差分（解锁瞬间 local_z − 当前 local_z），
+/// **不得**用 `MSL − HOME_POSITION.alt`：Home 高度是 GNSS 绝对海拔，现场
+/// 0083/0084 在 25 分钟内漂了 38.81m（341.775→248.159），把相对高度整体抬高
+/// 18~21m，起飞 4.83m 就撞 20m 上限被判越界（docs/故障排查手册.md §17.9.1）。
+TEST(MissionStateMachineTest, FenceAltitudeUsesTakeoffReference) {
     AssignmentHarness harness(MakeFenceTestConfig());
-    // 构造“锚点比 Home 高 6m”的现场情形（现场日志里锚点常高于地面数米）：
-    //   EKF 锚点 106m、Home 100m、机体相对锚点向下 2m → AMSL=108m → 相对 Home=8m。
-    //   旧实现直接用 −local_z=2m，会把“相对 Home 8m”算成 2m。
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
                               /*with_estimation=*/true, MakeFenceFlight()));
-    // 面积给足（±100m），高度带 [0,10]m 相对 Home：起飞前 8m 合规。
+    // 面积给足（±100m），高度带 [0,10]m 相对起飞点。
     auto zone = MakeSquareZone(5, 2, common::FenceAction::kReturn, 100.0);
     zone.altitude_reference = 1;
     zone.alt_min_m = 0.0;
@@ -4343,17 +4346,37 @@ TEST(MissionStateMachineTest, FenceAltitudeUsesHomeReference) {
     std::this_thread::sleep_for(60ms);
     ASSERT_TRUE(DriveToGpsApproach(harness, 1));
 
-    // 位置留在区域内，抬高到相对锚点 8m（AMSL=114m，相对 Home=14m > 上限 10m）：
-    // 正确的 Home 相对高度应判越界；旧实现算成 −local_z=8m，会误判为“合规”。
+    // 起飞基准 0m、当前 z=-8m → 相对起飞 8m，未超 10m；同时把 Home 高度造出
+    // 20m 漂移（100000→80000）：旧实现会算成 (100+8)−80=28m 误判越界。
     auto high = MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f);
-    high.ned_ref_alt_mm = 106000;
     high.home_valid = true;
-    high.home_altitude_mm = 100000;
+    high.home_altitude_mm = 80000;
+    high.ned_ref_alt_mm = 100000;
+    high.takeoff_ref_local_z_m = 0.0f;
     ASSERT_TRUE(harness.flight_topic
                     .Publish(std::make_shared<const common::FlightStateSnapshot>(high))
                     .accepted);
 
     bool saw_violated = false;
+    const auto calm_deadline = std::chrono::steady_clock::now() + 400ms;
+    while (std::chrono::steady_clock::now() < calm_deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (status && (*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_FALSE(saw_violated)
+        << "相对起飞 8m 未超上限 10m，Home 漂移 20m 不得影响判定";
+
+    // 抬到相对起飞 12m：超上限 10m → 越界。
+    auto too_high = MakeFenceOffboardFlight(5.0f, 5.0f, -12.0f);
+    too_high.home_valid = true;
+    too_high.home_altitude_mm = 80000;
+    too_high.ned_ref_alt_mm = 100000;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        too_high))
+                    .accepted);
     const auto deadline = std::chrono::steady_clock::now() + 2000ms;
     while (std::chrono::steady_clock::now() < deadline) {
         auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
@@ -4365,27 +4388,129 @@ TEST(MissionStateMachineTest, FenceAltitudeUsesHomeReference) {
             break;
         }
     }
-    EXPECT_TRUE(saw_violated)
-        << "相对 Home 高度 14m 超上限 10m，应判越界（旧的 −local_z 会误算成 8m 合规）";
+    EXPECT_TRUE(saw_violated) << "相对起飞高度 12m 超上限 10m，应判越界";
     DrainAcks(harness.ack_subscription);
 }
 
-/// 2026-10-30 现场日志 0078 回归：相对 Home 的高度带不设下限（从地面起算）。
-/// 地面静止时相对 Home≈0m，alt_min=10m 在旧实现下会报 violated，且解锁/爬升后
+/// 高度基准不可用（未解锁过/断连后失效）时只判水平：不拿 GNSS 绝对海拔兜底。
+/// 现场就是被“AMSL − Home”这条兜底路径误判的，宁可少判高度也不能误中止。
+TEST(MissionStateMachineTest, FenceAltitudeUnavailableJudgesHorizontalOnly) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定与 65019，不执行中止动作
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(11, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // z=-30m 若按相对高度算必越界；基准不可用 → 只判水平（仍在区域内）。
+    auto no_base = MakeFenceOffboardFlight(5.0f, 5.0f, -30.0f);
+    no_base.takeoff_ref_valid = false;
+    no_base.takeoff_ref_local_z_m = 0.f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(no_base))
+                    .accepted);
+    bool saw_violated = false;
+    bool saw_any = false;
+    const auto deadline = std::chrono::steady_clock::now() + 600ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status || (*status)->zone_id != 11U) {
+            continue;
+        }
+        saw_any = true;
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_TRUE(saw_any) << "65019 仍须上报";
+    EXPECT_FALSE(saw_violated) << "基准不可用时不判高度带，只判水平";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 高度带迟滞 1.5m：越界后必须回到带内 1.5m 才算恢复，避免贴边抖动反复
+/// 触发越界（配合 violation_debounce 使用；本用例关闭动作只看判定）。
+TEST(MissionStateMachineTest, FenceAltitudeHysteresisAwaitsClearance) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定，避免越界即中止
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(12, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    auto wait_state = [&](common::FenceState expected, bool expected_violated) {
+        const auto limit = std::chrono::steady_clock::now() + 1500ms;
+        while (std::chrono::steady_clock::now() < limit) {
+            auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+            if (!status || (*status)->zone_id != 12U) {
+                continue;
+            }
+            const bool violated = (*status)->state == common::FenceState::kViolated;
+            if (violated == expected_violated) {
+                return true;
+            }
+        }
+        (void)expected;
+        return false;
+    };
+
+    // 10.5m：刚超上限 0.5m → 越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(5.0f, 5.0f, -10.5f)))
+                    .accepted);
+    EXPECT_TRUE(wait_state(common::FenceState::kViolated, true));
+    // 9.5m：已回到带内 0.5m，仍在 1.5m 迟滞区内 → 保持越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(5.0f, 5.0f, -9.5f)))
+                    .accepted);
+    EXPECT_TRUE(wait_state(common::FenceState::kViolated, true))
+        << "回到带内 0.5m 不应立即恢复（迟滞 1.5m）";
+    // 8.0m：低于 10−1.5=8.5m → 恢复非越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f)))
+                    .accepted);
+    EXPECT_TRUE(wait_state(common::FenceState::kNormal, false))
+        << "回到 8.0m（<8.5m）应恢复";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 2026-10-30 现场日志 0078 回归：相对起飞点的高度带不设下限（从地面起算）。
+/// 地面静止时相对起飞点≈0m，alt_min=10m 在旧实现下会报 violated，且解锁/爬升后
 /// 会触发越界中止（S3/S4 都在围栏动作生效态）。现在必须报非越界。
+/// 2026-11-04：高度基准由 GNSS Home 海拔改为 EKF 差分（起飞基准 local_z），
+/// 该用例的语义不变。
 TEST(MissionStateMachineTest, FenceHomeRelativeIgnoresAltMin) {
     AssignmentHarness harness(MakeFenceTestConfig());
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
                               /*with_estimation=*/true, MakeFenceFlight()));
     auto zone = MakeSquareZone(41, 1, common::FenceAction::kReturn, 100.0);
-    zone.altitude_reference = 1;  // 相对 Home
+    zone.altitude_reference = 1;  // 相对起飞点（原“相对 Home”，基准已改）
     zone.alt_min_m = 10.0;
     zone.alt_max_m = 0.0;  // 上限不限
     ASSERT_TRUE(harness.fence_topic
                     .Publish(std::make_shared<const common::FenceZone>(zone))
                     .accepted);
     std::this_thread::sleep_for(60ms);
-    // 地面静止：相对 Home≈0.4m，水平在区域内 → 旧实现会报 0.4<10 越界。
+    // 地面静止：相对起飞点≈0.4m，水平在区域内 → 旧实现会报 0.4<10 越界。
     ASSERT_TRUE(harness.flight_topic
                     .Publish(std::make_shared<const common::FlightStateSnapshot>(
                         MakeFenceOffboardFlight(1.5f, -2.5f, -0.4f)))
@@ -5113,6 +5238,117 @@ TEST(MissionStateMachineTest, MissionCommandAckSequenceIncrementsOnce) {
     EXPECT_EQ(second->result, common::MissionCommandResult::kRejected);
     EXPECT_EQ(first->header.sequence + 1U, second->header.sequence)
         << "65021 序号必须逐条递增 1";
+}
+
+// ---------------------------------------------------------------------------
+// 65020 重置任务状态（2026-11-04）：S14 DISARMED → S2 READY，免重启机载程序
+// ---------------------------------------------------------------------------
+
+/// 构造一条 65020 重置任务状态指令。
+common::MissionCommand MakeResetStateCommand(uint32_t command_id) {
+    common::MissionCommand command = MakeMissionCommand(command_id);
+    command.type = common::MissionCommandType::kResetState;
+    return command;
+}
+
+/// S14（落地上锁、任务已结束）收到重置 → 回执 accepted，状态回 S2 READY。
+/// 旧实现 S14 没有回 S2 的路径，现场只能重启机载程序才能再接任务。
+TEST(MissionStateMachineTest, MissionCommandResetStateReturnsDisarmedToReady) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;  // 用例需把状态机摆到 S14
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false, /*landed=*/true)));
+    std::this_thread::sleep_for(80ms);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9300)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "重置指令应回 65021";
+    EXPECT_EQ(ack->type, common::MissionCommandType::kResetState);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReady, 2000ms)
+                    .has_value())
+        << "重置后应回到 S2 READY";
+}
+
+/// 未上锁（armed=true）时拒绝重置：回执 kNotOnGround，状态保持 S14。
+/// 清状态会让控制意图与 tracker 断裂，必须等落地 disarm。
+TEST(MissionStateMachineTest, MissionCommandResetStateRejectedWhenArmed) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()));
+    harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true, /*landed=*/false)));
+    std::this_thread::sleep_for(80ms);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9301)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
+        << "拒绝时不得改变任务状态";
+}
+
+/// 只在 S14 受理：空中任务态（S5）重置被拒绝（kNotOnGround），任务状态不变。
+TEST(MissionStateMachineTest, MissionCommandResetStateRejectedOutsideDisarmed) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 44));
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9302)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "飞行中不得重置任务状态";
+}
+
+/// 已在 S2 READY 时重置是幂等完成（kCompleted/kNone），不重复执行清理。
+TEST(MissionStateMachineTest, MissionCommandResetStateIdempotentInReady) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9303)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kCompleted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
 }
 
 }  // namespace

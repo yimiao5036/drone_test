@@ -261,6 +261,15 @@ struct FlightStateSnapshot {
     int32_t home_lat_1e7 = 0;
     int32_t home_lon_1e7 = 0;
     int32_t home_altitude_mm = 0;
+    /// 起飞基准（2026-11-04）：解锁瞬间（HEARTBEAT.armed 上升沿）抓取的 EKF 局部
+    /// 高度 local_z。机载相对高度一律用 `takeoff_ref_local_z_m − local_z_m` 差分，
+    /// **不再用** `MSL − HOME_POSITION.alt`：后者是 GNSS 绝对海拔，0083/0084 现场
+    /// 25 分钟内从 341.775m 漂到 248.159m（窗口 38.81m），把“相对 Home 高度”整体
+    /// 抬高 18~21m，导致起飞 4.83m 就被围栏高度上限判越界并中止返航。
+    /// valid=false（未解锁过 / 断连后失效 / 解锁时无局部位置）表示基准不可用，
+    /// 此时围栏只判水平越界，不下发相对高度语义。
+    bool takeoff_ref_valid = false;
+    float takeoff_ref_local_z_m = 0.f;
     /// EKF 投影参考锚点（MAVLink GPS_GLOBAL_ORIGIN = LOCAL_POSITION_NED.ref_* 的
     /// MAVLink 出口）：局部坐标系的 WGS84 锚，与持续刷新的 Home 不同源。该消息为
     /// 变化触发式（锚点变化 >1.1cm 才发），`ned_ref_received_count` 用于判读锚点
@@ -654,7 +663,12 @@ struct NetFireAck {
 /// 地面站任务指令类型（65020 MISSION_COMMAND）。
 /// 与 65014 的区别：65014 是“分配任务”，65020 是“对已起飞任务的即时指令”。
 enum class MissionCommandType : uint8_t {
-    kReturnHome = 1,  ///< 主动返航：中止当前任务并返回 Home（当前唯一指令）
+    kReturnHome = 1,  ///< 主动返航：中止当前任务并返回 Home
+    /// 重置任务状态（2026-11-04）：任务结束（S14 DISARMED）后清空本次任务的
+    /// 中止/越界锁存与分配状态并回到 S2 READY，使其可再次接受任务分配。
+    /// 只在落地且上锁时受理（否则 reason=kNotOnGround）；无此指令时现场只能
+    /// 重启机载程序才能重新接任务。
+    kResetState = 2,
 };
 
 /// 65021 任务指令回执结果。
@@ -674,6 +688,9 @@ enum class MissionCommandReason : uint8_t {
     kNotAirborne = 5,          ///< 不在可执行的空中任务状态（未起飞/已落地/故障）
     kAlreadyReturning = 6,     ///< 已在返航或降落流程
     kMissionFault = 7,         ///< 执行器故障等任务级故障，交 PX4/人工处置
+    /// 需落地并上锁后才能重置（2026-11-04，仅 kResetState 使用）：空中/解锁
+    /// 状态下拒绝重置，避免把进行中的任务状态清掉造成控制意图断裂。
+    kNotOnGround = 8,
     kInternalError = 20,
 };
 

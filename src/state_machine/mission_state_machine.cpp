@@ -458,22 +458,39 @@ public:
             transition_count_ = 0;
             active_warning_bits_ = 0;
         }
-        // 交接层迟滞计数复位（决策线程尚未启动，无并发）；去重记忆一并清空，
-        // 重启后同一锁定帧不得沿用上一轮的计数。
+        // 单次任务状态复位（per-sortie）：启动与 65020「重置任务状态」指令共用
+        // 同一份清单，避免两处漂移（只清一半锁存会导致重置后仍拒绝分配）。
+        ResetSortieState();
+        PublishStatus(now_ms);
+
+        running_.store(true, std::memory_order_release);
+        worker_ = std::thread([this] { WorkerLoop(); });
+        SPDLOG_INFO("任务状态机启动: shadow=true");
+        return true;
+    }
+
+    /// 单次任务（per-sortie）状态复位：启动时与 65020「重置任务状态」指令共用
+    /// 同一份清单，避免两处漂移（只清一半锁存会导致重置后仍拒绝分配）。
+    /// 不动状态机当前状态与启动专属计数（transition_count_ 等），也不碰任何
+    /// 遥测链路；调用方负责随后迁移状态并发布状态快照。
+    void ResetSortieState() {
+        // 交接层迟滞计数复位；去重记忆一并清空，新一轮任务不得沿用旧帧计数。
         ResetHandoverHysteresis();
         last_counted_locked_frame_.reset();
-        // 任务故障标志复位：重启后不得沿用上一轮 S16 记忆（执行器本体若已
-        // 处于终态故障仍由执行器自身拒绝动作，需人工/维护处置）。
+        // 任务故障标志复位：不得沿用上一轮 S16 记忆（执行器本体若已处于终态
+        // 故障仍由执行器自身拒绝动作，需人工/维护处置）。
+        // 注意：65020 重置指令在 mission_faulted_=true 时直接拒绝，所以这条
+        // 复位实际只对启动路径生效（S16 仍需人工处置后重启）。
         mission_faulted_ = false;
-        // 任务分配状态复位：一次上电一次空中任务语义以 Start 为界，
-        // 重启后重新允许分配（分配历史与原点不得沿用上一轮）。
+        // 任务分配状态复位：一次上电一次空中任务的语义原以 Start 为界，现在也
+        // 以「重置」为界——重置后重新允许分配，分配历史与原点不得沿用上一轮。
         assignment_tracker_ = MissionAssignmentTracker{};
         latest_assignment_.reset();
         accepted_assignment_.reset();
         assignment_receive_count_ = 0;
         assignment_reject_count_ = 0;
         assignment_duplicate_count_ = 0;
-        // 自动起飞时序复位（Task 5）：per-boot 语义，重启后重新允许调度。
+        // 自动起飞时序复位（Task 5）：重新允许调度。
         takeoff_stage_ = TakeoffStage::kNone;
         takeoff_stage_ms_ = 0;
         takeoff_last_tick_ms_ = 0;
@@ -482,19 +499,20 @@ public:
         takeoff_disarm_sent_ = false;
         takeoff_ack_baseline_matched_ = 0;
         takeoff_unavailable_latched_ = false;
-        // 电池守卫复位（Task 8）：per-boot 语义，中止锁存与防抖计时清空。
+        // 电池守卫复位（Task 8）：中止锁存与防抖计时清空。
         battery_abort_latched_ = false;
         battery_low_since_ms_.reset();
-        // 目标等待/丢失看门狗与地面站取消（Task 10）：per-boot 复位。
+        // 目标等待/丢失看门狗与地面站取消（Task 10）复位。
         mission_abort_latched_ = false;
-        // 围栏越界中止锁存（per-boot）：重启后重新允许一次越界中止。
+        // 围栏越界中止锁存：重置后重新允许一次越界中止；高度带迟滞状态同清。
         fence_abort_latched_ = false;
+        fence_altitude_ok_ = true;
         target_wait_started_ms_ = 0;
         assigned_target_acquired_ = false;
         target_lost_since_ms_.reset();
         ResetTargetHold();
         last_cancel_action_ms_.reset();
-        // 拦截后返航段状态复位：重启不得沿用上一轮发射/返航记忆。
+        // 拦截后返航段状态复位：不得沿用上一轮发射/返航记忆。
         interception_fired_ = false;
         return_climb_phase_ = true;
         return_px4_takeover_ = false;
@@ -510,12 +528,6 @@ public:
         disarm_command_ms_ = 0;
         disarm_command_fail_count_ = 0;
         mission_end_logged_ = false;
-        PublishStatus(now_ms);
-
-        running_.store(true, std::memory_order_release);
-        worker_ = std::thread([this] { WorkerLoop(); });
-        SPDLOG_INFO("任务状态机启动: shadow=true");
-        return true;
     }
 
     /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
@@ -1655,6 +1667,11 @@ private:
                                      common::MissionCommandReason::kUnsupportedVersion);
             return;
         }
+        // 指令分派：返航沿用既有路径；重置任务状态走独立分支（2026-11-04）。
+        if (command.type == common::MissionCommandType::kResetState) {
+            ExecuteResetStateCommand(command);
+            return;
+        }
         if (command.type != common::MissionCommandType::kReturnHome) {
             SPDLOG_WARN("任务指令类型不支持: type={}",
                         static_cast<int>(command.type));
@@ -1720,6 +1737,60 @@ private:
                     static_cast<int>(state));
         PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
                                  common::MissionCommandReason::kNotAirborne);
+    }
+
+    /// 65020 kResetState：重置任务状态（2026-11-04）。
+    /// 场景：一次任务正常/中止结束后停在 S14 DISARMED，tracker 已进 kTerminal、
+    /// 中止锁存与 65015 结果仍在，地面站只能重启机载程序才能再接任务。该指令
+    /// 清空 per-sortie 状态并回 S2 READY，清理清单与 Start 的启动复位完全一致
+    /// （共用 ResetSortieState），因此不会出现"重启能恢复、重置却漏清某项"。
+    /// 守卫：**已落地且上锁**才受理（armed 时清状态会让控制意图与 tracker 断裂）；
+    /// S16 故障态与 S15 人工接管不通过本指令恢复，仍需人工处置。
+    /// 幂等：已在 S2 回 kCompleted；已在返航/降落/空中回 kRejected(kNotOnGround)。
+    void ExecuteResetStateCommand(const common::MissionCommand& command) {
+        const common::MissionState state = CurrentState();
+        if (mission_faulted_) {
+            SPDLOG_WARN("任务指令（重置状态）: 任务故障态拒绝，需人工处置 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kMissionFault);
+            return;
+        }
+        // 已就绪：幂等完成。这里不重复 ResetSortieState，避免把刚记下的 65015
+        // 结果与 tracker 终态记忆再清一次。
+        if (state == common::MissionState::kReady) {
+            SPDLOG_INFO("任务指令（重置状态）: 已在 READY，回执完成");
+            PublishMissionCommandAck(command, common::MissionCommandResult::kCompleted,
+                                     common::MissionCommandReason::kNone);
+            return;
+        }
+        if (state != common::MissionState::kDisarmed) {
+            SPDLOG_WARN("任务指令（重置状态）: 当前状态不可重置 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kNotOnGround);
+            return;
+        }
+        const bool armed = latest_flight_.has_value() && latest_flight_->armed;
+        // 兜底：状态机已在 S14 但 tracker 仍认为在空中（状态机/PX4 不同步）时
+        // 不重置，避免地面站据此误判"可再次分配"。
+        const bool airborne_task =
+            assignment_tracker_.ConsumedAirborneMission() &&
+            assignment_tracker_.Phase() != AssignmentPhase::kTerminal;
+        if (armed || airborne_task) {
+            SPDLOG_WARN("任务指令（重置状态）: 未落地/未上锁拒绝 armed={} phase={}",
+                        armed, static_cast<int>(assignment_tracker_.Phase()));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kNotOnGround);
+            return;
+        }
+        RecordExecutedMissionCommandId(command.command_id);
+        ResetSortieState();
+        SPDLOG_WARN("任务指令（重置状态）: 已清空本次任务状态 DISARMED → READY command_id={}",
+                    command.command_id);
+        TransitionTo(common::MissionState::kReady, "地面站重置任务状态");
+        PublishMissionCommandAck(command, common::MissionCommandResult::kAccepted,
+                                 common::MissionCommandReason::kNone);
     }
 
     /// 空中任务态（可被主动返航中止的状态集合）。
@@ -1892,27 +1963,38 @@ private:
     /// 后按区域动作处置：hold=原地保持（不中止任务）、return=中止到 S12 返航、
     /// land=转 S13 降落。每拍在电池守卫之后、目标看门狗之前评估；动作只在地面/
     /// 空中任务态生效（见 FenceActionActiveState），65019 状态始终上报。
-    /// 高度带判据使用的高度（米）。
+    /// 高度带判据使用的高度（米）；基准不可用返回 nullopt，调用方只判水平。
     /// - altitude_reference=0：AMSL = EKF 锚点高度 + 相对锚点高度(−local_z)
-    /// - altitude_reference=1：相对 Home = AMSL − Home 高度
-    /// **不能直接用 −local_z 当“相对 Home”**：EKF 锚点常比地面高数米（现场日志
-    /// 出现过地面静止时 local_z≈+6.2m），直接用会让高度带整体偏移，没起飞就判越界。
-    /// 无 Home 快照时退回相对锚点，并保持与旧行为一致（仅兜底）。
-    double AltitudeForFence(uint8_t altitude_reference,
-                            const common::FlightStateSnapshot& flight) const {
-        const double altitude_amsl = static_cast<double>(flight.ned_ref_alt_mm) * 1e-3 -
-                                     static_cast<double>(flight.local_z_m);
-        if (altitude_reference != 1U && flight.ned_ref_valid) {
-            return altitude_amsl;
+    /// - altitude_reference=1：相对起飞点 = 解锁瞬间 local_z − 当前 local_z
+    /// **不能用 `AMSL − HOME_POSITION.alt` 当“相对 Home”**：Home 高度是 GNSS
+    /// 绝对海拔，0083/0084 现场 25 分钟内从 341.775m 漂到 248.159m（窗口
+    /// 38.81m），把相对高度整体抬到 19.3m，起飞 4.83m 就撞上 20m 上限被判越界
+    /// 并中止返航（见 docs/故障排查手册.md §17.9.1）。EKF 差分在地面恒为 0，
+    /// 只受 IMU 漂移影响，与 Home 何时重设、锚点比地形高多少都无关。
+    /// **也不能用 −local_z 兜底**：EKF 锚点常比地面高数米（现场地面静止时
+    /// local_z≈+6.2m），兜底会让地面静止就判越界；宁可只判水平。
+    static std::optional<double> AltitudeForFence(
+        uint8_t altitude_reference,
+        const common::FlightStateSnapshot& flight) {
+        if (!flight.local_position_valid) {
+            return std::nullopt;
         }
-        if (flight.home_valid) {
-            return altitude_amsl - static_cast<double>(flight.home_altitude_mm) * 1e-3;
+        if (altitude_reference != 0U) {
+            if (!flight.takeoff_ref_valid) {
+                return std::nullopt;
+            }
+            return static_cast<double>(flight.takeoff_ref_local_z_m) -
+                   static_cast<double>(flight.local_z_m);
         }
-        return -static_cast<double>(flight.local_z_m);
+        if (!flight.ned_ref_valid) {
+            return std::nullopt;
+        }
+        return static_cast<double>(flight.ned_ref_alt_mm) * 1e-3 -
+               static_cast<double>(flight.local_z_m);
     }
 
     /// 高度带下限的有效值（米；<=0 表示不判下限）。
-    /// - 相对 Home（altitude_reference=1）：从地面起算，下限恒按 0（不判）。
+    /// - 相对起飞点（altitude_reference=1）：从地面起算，下限恒按 0（不判）。
     ///   否则起飞必须穿过 0→alt_min，而 S3/S4 都在围栏动作生效态、防抖只有 1.5s，
     ///   正常起飞会被自家围栏判越界（2026-10-30 现场日志 0078 实证：地面静止
     ///   state=2“越界 19.51m”，实际水平仍在区域内 19.5m，越界的是高度带下限）。
@@ -2038,18 +2120,32 @@ private:
             const bool inside = control::fence::PointInPolygon(polygon.vertices, point);
             distance_m =
                 control::fence::SignedDistanceToBoundary(polygon.vertices, point);
-            // 高度带：altitude_reference=1 相对 Home、0 相对 AMSL。上限 0 表示不限制。
-            const double altitude_m =
-                polygon.alt_max_m <= 0.0 && polygon.alt_min_m <= 0.0
-                    ? 0.0
-                    : AltitudeForFence(fence_zone_->altitude_reference, flight);
-            // 下限按有效下限（相对 Home 从地面起算、AMSL 保留绝对下限，见
+            // 高度带：altitude_reference=1 相对起飞点（EKF 差分）、0 相对 EKF
+            // 锚点 AMSL。上限 0 表示不限制。
+            // 下限按有效下限（相对起飞点从地面起算、AMSL 保留绝对下限，见
             // FenceEffectiveAltMin）；未起飞/爬升阶段一律不判下限。
             const double alt_min_m =
                 FenceEffectiveAltMin(*fence_zone_, CurrentState());
-            const bool altitude_ok =
-                (polygon.alt_max_m <= 0.0 || altitude_m <= polygon.alt_max_m) &&
-                (alt_min_m <= 0.0 || altitude_m >= alt_min_m);
+            bool altitude_ok = true;
+            if (polygon.alt_max_m > 0.0 || alt_min_m > 0.0) {
+                const auto altitude =
+                    AltitudeForFence(fence_zone_->altitude_reference, flight);
+                if (!altitude.has_value()) {
+                    // 基准不可用（未解锁过/断连后失效/无锚点）：只判水平。
+                    // 不用 GNSS 绝对海拔兜底——那正是 §17.9.1 的误判来源。
+                    altitude_ok = true;
+                } else {
+                    // 迟滞：进入越界按带边界（超过 alt_max 即算），已越界后要回到
+                    // 带内 kFenceAltitudeHysteresisM 才算恢复，避免边界抖动反复触发。
+                    const double margin_m =
+                        fence_altitude_ok_ ? 0.0 : kFenceAltitudeHysteresisM;
+                    altitude_ok =
+                        (polygon.alt_max_m <= 0.0 ||
+                         *altitude <= polygon.alt_max_m - margin_m) &&
+                        (alt_min_m <= 0.0 || *altitude >= alt_min_m + margin_m);
+                }
+            }
+            fence_altitude_ok_ = altitude_ok;
             violated = !inside || !altitude_ok;
             if (violated) {
                 state = common::FenceState::kViolated;
@@ -4319,6 +4415,11 @@ private:
     std::optional<uint64_t> fence_violation_since_ms_;  ///< 越界持续起点
     bool fence_abort_latched_ = false;     ///< 越界中止已执行（一次任务一次）
     bool fence_hold_active_ = false;       ///< 本拍按"保持"动作接管位置意图
+    /// 围栏高度带迟滞（米）：进入越界按带边界判定，已越界后要回到带内该距离
+    /// 才算恢复，避免高度贴边抖动导致越界/恢复反复切换。
+    static constexpr double kFenceAltitudeHysteresisM = 1.5;
+    /// 上一拍高度带是否正常（迟滞状态；基准不可用时置 true = 只判水平）。
+    bool fence_altitude_ok_ = true;
     common::FenceState fence_state_ = common::FenceState::kNoZone;
     double fence_distance_m_ = 0.0;        ///< 距边界带符号距离（内正外负）
     uint32_t fence_violation_ms_ = 0;      ///< 越界已持续时长（65019）

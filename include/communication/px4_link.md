@@ -232,7 +232,15 @@ bits 24..31 → flight_sub_mode（sub mode）
   两者此前无法区分；**配置已订正为 49**，定案工具：
   `px4_link_smoke --probe-message-interval 49`（见 `tools/px4_link_smoke.md` §2.4）。
 - RC：链路有效性、在线状态和 RSSI，不自动等同人工接管；
-- 固件：`flight_sw_version`、语义版本、capabilities。
+- 固件：`flight_sw_version`、语义版本、capabilities；
+- **起飞高度基准**（2026-11-04 新增）：`takeoff_ref_valid/takeoff_ref_local_z_m`——
+  在 HEARTBEAT 的**解锁上升沿**（`armed` false→true）抓一次 `state_.local_z_m` 作为
+  "相对高度 0"；若当时还没有 `LOCAL_POSITION_NED`，置 `takeoff_ref_pending_`，
+  等 `HandleLocalPosition()` 到达时补抓（`CaptureTakeoffReference()`）。链路失效
+  （`InvalidateVolatileState()`）清空基准，下次解锁重新抓。用途：围栏高度判定与
+  65011 `relative_alt` 下传都改成 `takeoff_ref_local_z_m − local_z_m`（EKF 差分），
+  不再用两个 GNSS 绝对海拔相减（`ned_ref_alt − local_z − home_alt`），后者会被
+  Home 海拔漂移带偏，见 `docs/故障排查手册.md` §17.9.1。
 
 各类周期遥测使用 `telemetry_timeout` 判断新鲜度。超时后保留最后数值供排查，但将对应 valid
 标志清零，控制模块只能使用 valid=true 的字段。Home 在心跳连接期间保持有效，但连接断开时
@@ -404,7 +412,7 @@ false）。
 
 | 等级 | 场景 |
 |---|---|
-| INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、电池参数读取完成（每连接一次）、命令 ACK、固件版本、正常停止 |
+| INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、电池参数读取完成（每连接一次）、命令 ACK、固件版本、正常停止、解锁上升沿锁定起飞高度基准（`起飞高度基准已锁定: local_z=..m`，每次解锁一条） |
 | WARN | 心跳超时、串口断链/重连失败、电池参数读取超时（首次 + 每 100 次）、固件不一致、命令队列满、命令发送失败（首次 + 每 100 次）、ACK 超时、非法/过期设定值（均节流） |
 | ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
 

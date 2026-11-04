@@ -583,6 +583,11 @@ TEST(GroundStationLinkTest, EncodesFlightSnapshotAsStandardTelemetry) {
     snapshot.home_lat_1e7 = 231230000;
     snapshot.home_lon_1e7 = 1131230000;
     snapshot.home_altitude_mm = 120000;
+    // 相对高度自 2026-11-04 起改用 EKF 差分（起飞基准 local_z − 当前 local_z），
+    // 不再用 MSL − Home（那个会被 GNSS 海拔漂移带偏，见 docs/故障排查手册.md §17.9.1）。
+    // 这里 0.4 − (−3.0) = 3.4 m，对应下面 3400 mm 的断言。
+    snapshot.takeoff_ref_valid = true;
+    snapshot.takeoff_ref_local_z_m = 0.4f;
     snapshot.battery_valid = true;
     snapshot.battery_voltage_v = 15.2f;
     snapshot.battery_current_valid = true;

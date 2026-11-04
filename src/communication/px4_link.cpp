@@ -835,8 +835,17 @@ private:
 
         last_heartbeat_time_ms_ = now_ms;
         state_.connected = true;
+        // 解锁上升沿抓取起飞基准（2026-11-04）：相对高度改由 EKF 局部高度差分
+        // 计算，基准必须在解锁那一刻取，之后 local_z 的绝对偏置（锚点比地面高
+        // 数米）也不影响差分。上一次上锁后的旧基准在建链/解锁时一并失效。
+        const bool was_armed = state_.armed;
         state_.armed =
             (heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+        if (state_.armed && !was_armed) {
+            state_.takeoff_ref_valid = false;
+            takeoff_ref_pending_ = true;
+            CaptureTakeoffReference();
+        }
         state_.base_mode = heartbeat.base_mode;
         state_.custom_mode = heartbeat.custom_mode;
         state_.flight_mode = static_cast<uint8_t>((heartbeat.custom_mode >> 16U) & 0xFFU);
@@ -897,6 +906,21 @@ private:
         state_.vz_mps = position.vz;
         state_.local_position_valid = true;
         last_local_position_time_ms_ = now_ms;
+        // 解锁时若尚无局部位置，这里补抓（基准只能取解锁后第一帧，不能延后）。
+        CaptureTakeoffReference();
+    }
+
+    // 抓取起飞基准（解锁上升沿或其后第一帧局部位置）。
+    // 只取一次：pending 在成功写入后清零；未上锁时不应有 pending。
+    void CaptureTakeoffReference() {
+        if (!takeoff_ref_pending_ || !state_.local_position_valid) {
+            return;
+        }
+        state_.takeoff_ref_local_z_m = state_.local_z_m;
+        state_.takeoff_ref_valid = true;
+        takeoff_ref_pending_ = false;
+        SPDLOG_INFO("起飞高度基准已锁定: local_z={:.2f}m（相对高度=EKF 差分）",
+                    static_cast<double>(state_.takeoff_ref_local_z_m));
     }
 
     // EKF 投影参考锚点（GPS_GLOBAL_ORIGIN，内容为 LOCAL_POSITION_NED.ref_*）。
@@ -1330,6 +1354,11 @@ private:
         state_.home_valid = false;
         state_.ned_ref_valid = false;
         state_.ned_ref_received_count = 0;
+        // 起飞基准同属易变状态：断连后重新解锁必须重新抓取（否则沿途 local_z
+        // 已被 EKF 重置，旧基准会给出错误相对高度）。
+        state_.takeoff_ref_valid = false;
+        state_.takeoff_ref_local_z_m = 0.f;
+        takeoff_ref_pending_ = false;
         rc_link_present_ = false;
         InvalidateBatteryParameters();
     }
@@ -1516,6 +1545,8 @@ private:
     uint64_t last_battery_time_ms_ = 0;
     uint64_t last_rc_time_ms_ = 0;
     bool rc_link_present_ = false;
+    /// 解锁上升沿已置位、等待第一帧局部位置来锁定起飞基准（见 CaptureTakeoffReference）。
+    bool takeoff_ref_pending_ = false;
     bool firmware_version_logged_ = false;
     bool telemetry_requests_queued_ = false;
 

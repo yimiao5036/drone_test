@@ -394,13 +394,22 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     优先级低于电池、高于任务）。用 `PointInPolygon()` 与 `SignedDistanceToBoundary()`
     得出 `kNormal / kNearBoundary（距离 ≤ boundary_warn_m）/ kViolated（出区或超高度带）`，
     越界持续到 `violation_debounce_ms` 才动作，避免单帧抖动触发中止链。
-  - 高度带语义（2026-10-30 现场日志 0078 修正）：`altitude_reference=1`（相对 Home）
-    一律**不判下限**（有效下限恒 0）——高度从地面起算，起飞必然穿过 0→设定值，而
+  - 高度带语义（2026-10-30 现场日志 0078 修正，**2026-11-04 换基准**）：`altitude_reference=1`
+    （相对起飞点，原"相对 Home"）的高度由 **EKF 差分**给出——
+    `takeoff_ref_local_z_m − local_z_m`（基准由 `Px4Link` 在解锁上升沿抓取，
+    见 `include/communication/px4_link.md`），地面恒 0，不吃 GNSS 海拔漂移；
+    该基准**一律不判下限**（有效下限恒 0）——高度从地面起算，起飞必然穿过 0→设定值，而
     S3/S4 在围栏动作生效态、防抖只有 `violation_debounce_ms`（1.5s），旧实现
     （`alt_min=5m`）会让地面静止就被判 `kViolated`、解锁后立刻中止返航；地面站表单
     对该基准把最低高度固定 0 并置灰。`altitude_reference=0`（AMSL）保留绝对海拔下限
     （跨海拔场地仍有意义），但 S0~S4（未起飞/爬升）同样不判下限，S5 起才按绝对海拔
     生效。实现为 `FenceEffectiveAltMin(zone, CurrentState())`，`alt_max≤0` 仍表示不限。
+  - 高度基准不可用（2026-11-04）：`AltitudeForFence()` 返回 `std::optional<double>`——
+    无 `local_position_valid`、相对参考无起飞基准、AMSL 无 `ned_ref_valid` 时为空，
+    该拍**只判水平**、不判高度（旧实现退回 `−local_z`，地面约 +39 m，会把地面判成越界）。
+  - 高度迟滞（2026-11-04）：`kFenceAltitudeHysteresisM = 1.5`——进入越界用原始阈值，
+    从越界恢复要多退 1.5 m（`fence_altitude_ok_` 记忆上一拍结论），避免在阈值附近
+    抖动刷出一串 65019 `state=2`。
   - 动作：`follow_zone_action=true` 时按区域声明的 action，否则按 `violation_action`。
     `kHold` → 每拍把位置意图钉在当前局部位置（reason=10 `kReasonFenceViolation`），
     任务状态不迁移；`kReturn` → `AbortForFence()`（停发位置意图、`assignment_tracker_.AbortAirborne()`、
@@ -412,7 +421,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     同一次越界不重复触发中止链/重复回执。
   - 只在**飞行相关状态**动作（`kArming`~`kPostIntercept`）：地面 S0~S2、S12/S13/S14
     与故障态只上报 65019，不触发中止链，避免地面就锁死任务。
-- **人工任务指令（2026-10-29，65020/65021）**：地面站可下发"主动返航"打断当前任务。
+- **人工任务指令（2026-10-29，65020/65021；2026-11-04 增 type=2 重置状态）**：地面站可下发
+  "主动返航"打断当前任务，或"重置任务状态"把落地后的飞机从 S14 拉回 S2。
   - 输入：`SetMissionCommandInput()` 绑定 `kMissionCommand`（Start 前）；`DrainInputs()`
     每拍只保留最新一条（`latest_mission_command_`），`valid_for_ms=1000` 由链路层写入，
     过期指令由状态机侧按时钟判定丢弃。
@@ -422,7 +432,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     （`RecordExecutedMissionCommandId()`：`kArming/kTakeoff` 中止、飞行态中止返航），
     被版本/类型/状态守卫拒绝或「已在返航」早退的指令不占槽位——地面站修正后可用同一
     `command_id` 重发（2026-10-30 修复：旧实现在校验前登记，被拒 id 再发被判重复）；
-    版本不符 → `kUnsupportedVersion`；非 `kReturnHome` → `kUnsupportedCommand`；
+    版本不符 → `kUnsupportedVersion`；`type=2 kResetState` 在版本校验后立即分派给
+    `ExecuteResetStateCommand()`（不走返航判定）；其余非 `kReturnHome` → `kUnsupportedCommand`；
     `mission_faulted_` → `kMissionFault`；已在 `kReturnHome/kLanding` → `kCompleted`
     + `kAlreadyReturning`（幂等，不重复发 65015）；`kArming/kTakeoff` →
     `AbortTakeoff(kCancelledByGcs)`；其余飞行态 → 复用内部中止入口。
@@ -430,6 +441,15 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `assignment_tracker_.AbortAirborne()`、`RememberTakeoffAbort(kCancelledByGcs)`、
     `TransitionTo(kReturnHome,"地面站主动返航指令，中止任务并返航")`，并发 65015
     `aborted reason=kCancelledByGcs(12)`。**不是 PX4 RTL**：返航轨迹仍由 S12 位置意图控制。
+  - **`type=2` 重置任务状态（2026-11-04）**：`ExecuteResetStateCommand()` 的守卫顺序为
+    `mission_faulted_` → `kRejected/kMissionFault`；当前已在 S2 `READY` → `kCompleted/kNone`
+    （幂等，不重复清状态）；状态不是 S14 `DISARMED` → `kRejected/kNotOnGround`；
+    `armed=true` 或任务分配已进 `kAirborne/kEngaged/kReturning` → 同样 `kRejected/kNotOnGround`。
+    受理时 `RecordExecutedMissionCommandId()` → `ResetSortieState()`（与进程启动共用同一份
+    复位清单：任务分配记忆、起飞/返航/降落/围栏/目标保持/各类锁存与计次）→
+    `TransitionTo(kReady,"地面站重置任务状态")`，回 `kAccepted/kNone`。
+    动机：S14 是纯终态（只记 `任务结束: S14 DISARMED`），没有回 S2 的迁移，改前现场只能
+    重启机载程序才能继续接 65014 分配。
   - 回执：`PublishMissionCommandAck()` 走 `kMissionCommandAck`，字段含 result/reason/
     `mission_state`（回执时刻状态），地面站无需猜测机载处于哪一态；`header.sequence`
     每条回执只自增一次（2026-10-30 审查修复：旧实现同一条回执自增两次、序号跳 2，
@@ -759,10 +779,12 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 
 人工指令相关（2026-10-29）：
 
-- INFO：`任务状态机任务指令输入已绑定（65020 主动返航）`（启动期一次）；
+- INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
   `任务指令回执已发布: command_id=.. type=.. result=.. reason=.. state=.. count=..`（节流，首条与每 100 条）；
   `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航/降落流程，回执完成`、
   `任务指令（主动返航）: 当前状态不可执行`。
+- WARN：`任务指令（重置状态）: 已清空本次任务状态 DISARMED → READY command_id=..`
+  （2026-11-04，受理后打一条；随后 `DISARMED -> READY` 由统一迁移日志记录）。
 - WARN：`任务指令协议版本不支持`、`任务指令类型不支持`、
   `任务指令（主动返航）: state=.. → S12 返航 command_id=..`（接受路径，关键动作不节流）、
   `任务指令（主动返航）: 起飞阶段中止 returning=.. command_id=..`。
@@ -922,6 +944,15 @@ ctest --test-dir build --output-on-failure
   非法高度基准均拒收并保留上一份可用区域）、
   `FenceSameIdVersionGeometryChangeRewritesCache`（同 id/version 改几何也落盘）；
   `MissionCommandAckSequenceIncrementsOnce`（65021 序号逐条 +1）。
+- 围栏高度基准（2026-11-04）：`FenceAltitudeUsesTakeoffReference`（`altitude_reference=1` 用
+  EKF 差分——Home 海拔跳 20 m 不改变相对高度，爬升越过 `alt_max` 才报 `kViolated`）、
+  `FenceAltitudeUnavailableJudgesHorizontalOnly`（无起飞基准时只判水平、不判高度）、
+  `FenceAltitudeHysteresisAwaitsClearance`（−10.5 m 越界 → −9.5 m 仍越界 → −8.0 m 才恢复）。
+- 65020 重置任务状态（2026-11-04）：`MissionCommandResetStateReturnsDisarmedToReady`
+  （S14 + 未 arm → `kAccepted`、状态回 S2）、`MissionCommandResetStateRejectedWhenArmed`
+  （`armed=true` → `kRejected/kNotOnGround`、状态不变）、
+  `MissionCommandResetStateRejectedOutsideDisarmed`（S5 飞行态 → `kRejected/kNotOnGround`）、
+  `MissionCommandResetStateIdempotentInReady`（S2 再重置 → `kCompleted`）。
 - 配置（`interception`/`return_home` 节）：默认值、显式解析、非法窗口/
   返航高度拒绝、`interception.enabled=true` 且 `return_home.enabled=false`
   拒绝（发射后必须有返航收口）。
