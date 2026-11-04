@@ -54,6 +54,11 @@ sitl_gcs.py → UDP 14550 回发 MAV_TYPE_GCS 心跳（PX4 无 RC 时解锁前�
 4. 无需真实硬件；SITL 参数由装置在启动后设置（`COM_LOW_BAT_ACT=0`、
    `BAT_LOW_THR=0.15`、`SIM_BAT_MIN_PCT=50`、`SIM_BAT_DRAIN=0`；`smoke` 另设
    `MPC_XY_VEL_MAX=2.0`）。
+5. **想看 3D（可选）**：需要 WSLg（`/mnt/wslg` 存在、`$DISPLAY` 有值，Windows 11 +
+   WSL2 默认自带；缺了先 `wsl --update`），然后
+   `SITL_GUI=1 bash tools/sitl_harness.sh stack` —— Gazebo 窗口会直接出现在 Windows
+   桌面。默认 `HEADLESS=1` 无窗口。注意 GUI 会拉低仿真实时率（画面卡顿、起飞更慢），
+   自动化时序断言（`height_timeout=15000ms` 等）仍建议无界面跑。
 
 ## 4. 命令
 
