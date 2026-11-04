@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>地面站布局示意</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #070b14; }
+  body { font-family: "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; color: #cbd5e1; }
+  .mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
+
+  .screen {
+    position: relative; width: 1440px; height: 900px; overflow: hidden;
+    display: flex; background: radial-gradient(1200px 700px at 70% -10%, #16233a 0%, #0b1220 55%, #070b14 100%);
+    margin-bottom: 24px;
+  }
+
+  /* ---------- 侧栏 ---------- */
+  .sidebar { width: 210px; flex: 0 0 210px; border-right: 1px solid rgba(148,163,184,.14); padding: 14px 12px; display: flex; flex-direction: column; gap: 12px; }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .brand-mark { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg,#22d3ee,#3b82f6); }
+  .brand b { display: block; font-size: 14px; letter-spacing: .08em; color: #e2e8f0; }
+  .brand small { font-size: 9px; letter-spacing: .12em; color: #64748b; }
+  .nav-item { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 10px; border-radius: 8px; font-size: 13px; color: #94a3b8; }
+  .nav-item.active { background: rgba(34,211,238,.12); color: #67e8f9; border: 1px solid rgba(34,211,238,.28); }
+  .fleet-title { font-size: 11px; color: #64748b; letter-spacing: .08em; margin-top: 6px; }
+  .fleet-item { border: 1px solid rgba(148,163,184,.18); background: rgba(15,23,42,.5); border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+  .fleet-item b { color: #e2e8f0; font-size: 13px; }
+  .fleet-item small { color: #64748b; display: block; margin-top: 2px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+  .dot.green { background: #22c55e; } .dot.amber { background: #f59e0b; } .dot.red { background: #ef4444; } .dot.grey { background: #475569; }
+
+  /* ---------- 主区 ---------- */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  /* 顶栏：高 58，单行不换行，标题与按钮都不压缩 */
+  .topbar { height: 58px; flex: 0 0 58px; display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid rgba(148,163,184,.14); }
+  .title-block { flex: 0 0 auto; white-space: nowrap; }
+  .title-block .eyebrow { font-size: 9px; letter-spacing: .14em; color: #475569; }
+  .title-block h1 { margin: 0; font-size: 20px; line-height: 1.1; color: #f1f5f9; letter-spacing: .04em; white-space: nowrap; }
+  .spacer { flex: 1 1 auto; min-width: 8px; }
+
+  .chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; border: 1px solid rgba(148,163,184,.3); background: rgba(15,23,42,.55); color: #cbd5e1; }
+  .chip.ok { border-color: rgba(34,197,94,.5); color: #86efac; }
+  .chip.off { border-color: rgba(239,68,68,.5); color: #fca5a5; }
+  .chip.alert { border-color: rgba(245,158,11,.65); color: #fbbf24; background: rgba(245,158,11,.1); cursor: pointer; }
+  .chip.alert .badge { background: #f59e0b; color: #1c1206; border-radius: 999px; padding: 0 6px; font-size: 10px; line-height: 15px; }
+
+  .btn { flex: 0 0 auto; height: 30px; padding: 0 12px; border-radius: 6px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; border: 1px solid rgba(148,163,184,.28); background: transparent; color: #cbd5e1; }
+  .btn.primary { border-color: #3b82f6; background: #2563eb; color: #fff; }
+  .btn.ghost { border-color: rgba(148,163,184,.2); color: #94a3b8; }
+  .btn .caret { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid currentColor; opacity: .8; }
+  .clock { flex: 0 0 auto; font-size: 12px; color: #94a3b8; letter-spacing: .04em; }
+
+  /* 选中飞机上下文条：动作按钮带机名，消除“对谁生效”的歧义 */
+  .contextbar { height: 40px; flex: 0 0 40px; display: flex; align-items: center; gap: 10px; padding: 0 14px; background: rgba(15,23,42,.55); border-bottom: 1px solid rgba(148,163,184,.1); font-size: 12px; }
+  .contextbar .who { display: flex; align-items: center; gap: 8px; color: #e2e8f0; font-weight: 600; white-space: nowrap; }
+  .contextbar .who small { color: #64748b; font-weight: 400; }
+  .pill { height: 22px; padding: 0 8px; border-radius: 999px; font-size: 10px; display: inline-flex; align-items: center; background: rgba(34,211,238,.12); color: #67e8f9; border: 1px solid rgba(34,211,238,.3); }
+
+  /* 紧凑状态条：替代 4 张留白很大的指标卡 */
+  .metricbar { height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 0; padding: 0 6px; border-bottom: 1px solid rgba(148,163,184,.1); background: rgba(2,6,23,.35); }
+  .metric { flex: 1 1 0; display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 24px; border-right: 1px solid rgba(148,163,184,.12); min-width: 0; }
+  .metric:last-child { border-right: none; }
+  .metric .k { font-size: 10px; color: #64748b; letter-spacing: .06em; white-space: nowrap; }
+  .metric .v { font-size: 13px; color: #e2e8f0; font-weight: 600; white-space: nowrap; }
+  .metric .n { font-size: 11px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .metric .v.green { color: #4ade80; } .metric .v.amber { color: #fbbf24; } .metric .v.red { color: #f87171; }
+
+  /* 主体区 */
+  .body { flex: 1; display: flex; gap: 10px; padding: 10px 12px 104px; min-height: 0; }
+  .map { flex: 1; border-radius: 10px; border: 1px solid rgba(148,163,184,.16); position: relative; overflow: hidden;
+         background:
+           radial-gradient(600px 300px at 30% 30%, rgba(56,189,248,.08), transparent 70%),
+           repeating-linear-gradient(0deg, rgba(148,163,184,.055) 0 1px, transparent 1px 46px),
+           repeating-linear-gradient(90deg, rgba(148,163,184,.055) 0 1px, transparent 1px 46px),
+           linear-gradient(160deg, #0d1a26 0%, #0a1520 45%, #08111a 100%); }
+  .map-tag { position: absolute; left: 12px; top: 10px; font-size: 11px; color: #94a3b8; background: rgba(2,6,23,.6); border: 1px solid rgba(148,163,184,.2); border-radius: 6px; padding: 4px 8px; }
+  .polygon { position: absolute; left: 22%; top: 26%; width: 46%; height: 46%; border: 2px dashed #38bdf8; transform: skewY(-6deg); border-radius: 6px; background: rgba(56,189,248,.06); }
+  .polygon span { position: absolute; left: 10px; top: -22px; font-size: 10px; color: #7dd3fc; }
+  .plane { position: absolute; left: 47%; top: 47%; width: 16px; height: 16px; transform: rotate(-24deg); }
+  .plane::before { content: ""; position: absolute; inset: 0; background: #22d3ee; clip-path: polygon(50% 0, 100% 100%, 50% 72%, 0 100%); }
+  .video { position: absolute; right: 12px; top: 42px; width: 320px; height: 300px; border-radius: 10px; border: 1px solid rgba(148,163,184,.28); background: rgba(5,10,19,.94); display: flex; flex-direction: column; box-shadow: 0 16px 36px rgba(0,0,0,.5); overflow: hidden; }
+  .video .vh { height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; font-size: 11px; color: #94a3b8; border-bottom: 1px solid rgba(148,163,184,.14); }
+  .video .body2 { flex: 1; display: flex; align-items: center; justify-content: center; color: #334155; font-size: 12px; }
+  .video .vf { height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 8px; border-top: 1px solid rgba(148,163,184,.12); }
+
+  /* 告警中心下拉 */
+  .alert-panel { position: absolute; right: 300px; top: 100px; width: 340px; background: #0d1726; border: 1px solid rgba(245,158,11,.45); border-radius: 10px; box-shadow: 0 18px 40px rgba(0,0,0,.55); overflow: hidden; }
+  .alert-panel .ap-h { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; font-size: 12px; color: #fbbf24; background: rgba(245,158,11,.1); border-bottom: 1px solid rgba(245,158,11,.25); }
+  .alert-row { display: flex; gap: 10px; padding: 10px 12px; border-bottom: 1px solid rgba(148,163,184,.1); font-size: 12px; }
+  .alert-row:last-child { border-bottom: none; }
+  .alert-row b { color: #e2e8f0; }
+  .alert-row small { display: block; color: #94a3b8; margin-top: 3px; line-height: 1.5; }
+  .alert-row .act { margin-left: auto; display: flex; flex-direction: column; gap: 6px; }
+  .mini { height: 22px; padding: 0 8px; font-size: 11px; border-radius: 5px; border: 1px solid rgba(148,163,184,.3); background: transparent; color: #cbd5e1; white-space: nowrap; }
+  .mini.danger { border-color: rgba(239,68,68,.55); color: #fca5a5; }
+
+  /* 弹窗 */
+  .mask { position: absolute; inset: 0; background: rgba(3,7,18,.62); backdrop-filter: blur(1px); }
+
+  /* 非模态告警条：自动出现，但不遮挡地图、不拦鼠标 */
+  .banner { height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 10px; padding: 0 14px; font-size: 12px; color: #fde68a; background: rgba(245,158,11,.12); border-bottom: 1px solid rgba(245,158,11,.35); }
+  .banner .ico { width: 16px; height: 16px; border-radius: 50%; background: rgba(245,158,11,.2); border: 1px solid rgba(245,158,11,.6); color: #fbbf24; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+  .banner b { color: #fef3c7; }
+  .banner .sep { color: rgba(245,158,11,.5); }
+  .banner .more { color: #fbbf24; text-decoration: underline dotted; cursor: pointer; white-space: nowrap; }
+  .banner .spacer2 { flex: 1; }
+  .banner .x { color: #fbbf24; opacity: .8; cursor: pointer; margin-left: 2px; }
+  .dialog { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 520px; background: #0d1726; border: 1px solid rgba(148,163,184,.25); border-radius: 12px; box-shadow: 0 30px 70px rgba(0,0,0,.6); overflow: hidden; }
+  .dialog .dh { display: flex; align-items: center; gap: 8px; padding: 14px 16px; border-bottom: 1px solid rgba(148,163,184,.14); }
+  .dialog .dh b { font-size: 15px; color: #f1f5f9; }
+  .dialog .dh .warn { width: 22px; height: 22px; border-radius: 50%; background: rgba(245,158,11,.15); border: 1px solid rgba(245,158,11,.5); color: #fbbf24; display: flex; align-items: center; justify-content: center; font-size: 13px; }
+  .dialog .db { padding: 14px 16px; font-size: 13px; color: #cbd5e1; line-height: 1.7; }
+  .dialog .db table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+  .dialog .db td { padding: 6px 8px; border-top: 1px solid rgba(148,163,184,.12); color: #94a3b8; }
+  .dialog .db td b { color: #e2e8f0; font-weight: 600; }
+  .dialog .df { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid rgba(148,163,184,.14); }
+
+  /* 说明条 */
+  .legend { position: absolute; left: 0; right: 0; bottom: 0; height: 92px; background: rgba(2,6,23,.92); border-top: 1px solid rgba(148,163,184,.16); padding: 10px 16px; font-size: 12px; color: #94a3b8; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 22px; }
+  .legend b { color: #e2e8f0; }
+  .num { display: inline-flex; width: 16px; height: 16px; border-radius: 50%; background: #22d3ee; color: #06202a; font-size: 10px; font-weight: 700; align-items: center; justify-content: center; margin-right: 6px; }
+  .callout { position: absolute; width: 16px; height: 16px; border-radius: 50%; background: #22d3ee; color: #06202a; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 3px rgba(34,211,238,.22); }
+  /* 行内编号：紧贴被标注的元素，避免绝对定位跑到别处 */
+  .badge-in { display: inline-flex; width: 15px; height: 15px; border-radius: 50%; background: #22d3ee; color: #06202a; font-size: 10px; font-weight: 700; align-items: center; justify-content: center; margin-left: 6px; vertical-align: middle; flex: 0 0 auto; }
+</style>
+</head>
+<body>
+
+<!-- ================== 方案一：主界面 ================== -->
+<div class="screen" id="screen1">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div><b>AEROLINK</b><small>PX4 GROUND STATION</small></div>
+    </div>
+    <div class="nav-item active">◆ 任务态势</div>
+    <div class="nav-item">≣ 运行日志</div>
+    <div class="nav-item">⚙ 系统设置</div>
+    <div class="fleet-title">飞机选择 · 1</div>
+    <div class="fleet-item" style="border-color:rgba(34,211,238,.35)">
+      <div style="display:flex;align-items:center"><b>捕网-01</b><span style="margin-left:auto" class="dot amber"></span></div>
+      <small>25:1 · GPS_APPROACH · 未发现目标</small>
+    </div>
+  </aside>
+
+  <div class="main">
+    <!-- 顶栏：单行、不换行、标题不被压缩 -->
+    <header class="topbar">
+      <div class="title-block">
+        <div class="eyebrow">CONTROL CENTER /</div>
+        <h1>任务态势</h1>
+      </div>
+      <span class="badge-in">1</span>
+      <div class="chip ok"><span class="dot green"></span>SITL-5761 已连接</div>
+      <div class="chip alert">⚠ 未发现目标<span class="badge">1</span></div>
+      <span class="badge-in">2</span>
+      <div class="spacer"></div>
+      <div class="clock mono">23:58:23</div>
+      <button class="btn">任务调度</button>
+      <button class="btn">共享区域</button>
+      <button class="btn ghost">更多 <span class="caret"></span></button>
+      <span class="badge-in">3</span>
+      <button class="btn primary">连接设备</button>
+    </header>
+
+    <!-- 选中飞机上下文条：动作按钮带机名 -->
+    <div class="contextbar">
+      <div class="who"><span class="dot green"></span>捕网-01 <small>25:1 · 组件 25 / 系统 1</small></div>
+      <span class="pill">GPS_APPROACH（S5）</span>
+      <span class="pill" style="background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35);color:#fbbf24">已到点 20 s · 视觉未锁定</span>
+      <div class="spacer"></div>
+      <button class="btn" style="border-color:rgba(239,68,68,.45);color:#fca5a5">返航 · 捕网-01</button>
+      <span class="badge-in">4</span>
+      <button class="btn ghost">重置 · 捕网-01</button>
+    </div>
+
+    <!-- 紧凑状态条：替代 4 张指标卡 -->
+    <div class="metricbar">
+      <div class="metric"><span class="k">GPS</span><span class="v green">3D FIX</span><span class="n">12 星 · HDOP 0.9</span></div>
+      <div class="metric"><span class="k">电量</span><span class="v green mono">78%</span><span class="n">22.4 V · 3.1 A</span></div>
+      <div class="metric"><span class="k">模式</span><span class="v">OFFBOARD</span><span class="n">已解锁</span></div>
+      <div class="metric"><span class="k">链路</span><span class="v green">ONLINE</span><span class="n">SITL-5761 · 3491 PKTS</span></div>
+      <span class="badge-in" style="margin-right:10px">5</span>
+    </div>
+
+    <div class="body">
+      <div class="map">
+        <div class="map-tag">任务卫星地图 · WGS84</div>
+        <div class="polygon"><span>区域 1 v1 · 越界后：中止任务返航</span></div>
+        <div class="plane"></div>
+        <!-- 视频保持“悬浮在地图上”的原设计，不占独立列 -->
+        <div class="video">
+          <div class="vh"><span>实时视频 · 捕网-01</span><span class="dot red"></span></div>
+          <div class="body2">等待图传画面</div>
+          <div class="vf"><button class="mini">播放</button><button class="mini">重连</button><button class="mini">全屏</button></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><span class="num">1</span><b>顶栏单行不换行</b>：标题固定宽度、按钮与 chip 均 <span class="mono">white-space:nowrap</span>，内容超宽时只收进「更多」，不再把标题压成竖排。</div>
+      <div><span class="num">2</span><b>告警中心</b>：全局只放一个聚合 chip「⚠ 未发现目标 1」，点开是逐机明细，平时不占位。</div>
+      <div><span class="num">3</span><b>低频操作收进「更多」</b>：捕网发射 / 系统状态 / 断开连接等进下拉；「连接设备」保持主色常驻。</div>
+      <div><span class="num">4</span><b>动作按钮带机名</b>：返航/重置从顶栏移到「选中飞机」上下文条，按钮上写明「返航 · 捕网-01」，多机不会下错。</div>
+      <div><span class="num">5</span><b>指标区改紧凑条</b>：4 张卡（高 71px、右侧大片留白）合并为 38px 状态条，省出的高度给地图。</div>
+      <div style="grid-column:2"><b>保留</b>：地图 / 视频 / 机队列表位置不变，本次只压缩顶部信息层，不改交互入口。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ================== 方案二：多机告警 ================== -->
+<div class="screen" id="screen2">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"></div><div><b>AEROLINK</b><small>PX4 GROUND STATION</small></div></div>
+    <div class="nav-item active">◆ 任务态势</div>
+    <div class="nav-item">≣ 运行日志</div>
+    <div class="nav-item">⚙ 系统设置</div>
+    <div class="fleet-title">飞机选择 · 3</div>
+    <div class="fleet-item" style="border-color:rgba(245,158,11,.45)">
+      <div style="display:flex;align-items:center"><b>捕网-01</b><span style="margin-left:auto" class="dot amber"></span></div>
+      <small>25:1 · S5 · 未发现目标 20s</small>
+    </div>
+    <div class="fleet-item">
+      <div style="display:flex;align-items:center"><b>捕网-02</b><span style="margin-left:auto" class="dot green"></span></div>
+      <small>26:1 · S7 · 视觉跟踪中</small>
+    </div>
+    <div class="fleet-item">
+      <div style="display:flex;align-items:center"><b>捕网-03</b><span style="margin-left:auto" class="dot red"></span></div>
+      <small>27:1 · S5 · 未发现目标 95s</small>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="title-block"><div class="eyebrow">CONTROL CENTER /</div><h1>任务态势</h1></div>
+      <div class="chip ok"><span class="dot green"></span>SITL-5761 已连接</div>
+      <div class="chip alert">⚠ 2 架未发现目标<span class="badge">2</span></div>
+      <div class="spacer"></div>
+      <div class="clock mono">00:04:11</div>
+      <button class="btn">任务调度</button>
+      <button class="btn">共享区域</button>
+      <button class="btn ghost">更多 <span class="caret"></span></button>
+      <button class="btn primary">连接设备</button>
+    </header>
+
+    <!-- 告警条：自动出现，但不弹窗、不遮地图、不拦鼠标 -->
+    <div class="banner">
+      <span class="ico">!</span>
+      <span><b>捕网-01</b> 已到目标点，<b>20 s</b> 未发现视觉目标</span>
+      <span class="sep">|</span>
+      <button class="mini" style="border-color:rgba(239,68,68,.55);color:#fca5a5">立即返航 · 捕网-01</button>
+      <button class="mini">继续等待</button>
+      <button class="mini">稍后提醒 60 s</button>
+      <span class="spacer2"></span>
+      <span class="more">还有 1 架：捕网-03 95 s ›</span>
+      <span class="x">✕</span>
+    </div>
+
+    <div class="contextbar">
+      <div class="who"><span class="dot amber"></span>捕网-01 <small>25:1</small></div>
+      <span class="pill">GPS_APPROACH（S5）</span>
+      <span class="pill" style="background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35);color:#fbbf24">已到点 20 s · 视觉未锁定</span>
+      <div class="spacer"></div>
+      <button class="btn" style="border-color:rgba(239,68,68,.45);color:#fca5a5">返航 · 捕网-01</button>
+      <button class="btn ghost">重置 · 捕网-01</button>
+    </div>
+
+    <div class="metricbar">
+      <div class="metric"><span class="k">GPS</span><span class="v green">3D FIX</span><span class="n">14 星 · HDOP 0.8</span></div>
+      <div class="metric"><span class="k">电量</span><span class="v green mono">72%</span><span class="n">22.1 V · 4.6 A</span></div>
+      <div class="metric"><span class="k">模式</span><span class="v">OFFBOARD</span><span class="n">已解锁</span></div>
+      <div class="metric"><span class="k">链路</span><span class="v green">ONLINE</span><span class="n">SITL-5761 · 5820 PKTS</span></div>
+    </div>
+
+    <div class="body">
+      <div class="map">
+        <div class="map-tag">任务卫星地图 · WGS84</div>
+        <div class="polygon"><span>区域 1 v1 · 越界后：中止任务返航</span></div>
+        <div class="plane"></div>
+        <!-- 视频保持“悬浮在地图上”的原设计，不占独立列 -->
+        <div class="video">
+          <div class="vh"><span>实时视频 · 捕网-01</span><span class="dot red"></span></div>
+          <div class="body2">等待图传画面</div>
+          <div class="vf"><button class="mini">播放</button><button class="mini">重连</button><button class="mini">全屏</button></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 告警中心下拉 -->
+    <div class="alert-panel">
+      <div class="ap-h"><span>⚠ 未发现目标 · 2 架</span><span class="mono" style="font-size:10px;opacity:.8">点条目标题切换飞机</span></div>
+      <div class="alert-row">
+        <div><b>捕网-01</b> <span style="color:#fbbf24">20 s</span><small>已到目标点，视觉未锁定</small></div>
+        <div class="act"><button class="mini">查看</button><button class="mini danger">返航</button></div>
+      </div>
+      <div class="alert-row">
+        <div><b>捕网-03</b> <span style="color:#f87171">95 s</span><small>已到目标点，视觉未锁定</small></div>
+        <div class="act"><button class="mini">查看</button><button class="mini danger">返航</button></div>
+      </div>
+    </div>
+
+    <div class="mask" style="display:none"></div>
+    <div class="legend">
+      <div><b>角标</b>：逐机状态在左侧机队列表用小圆点 + 一行说明（黄=等待、红=超时更久、绿=正常），不占顶栏空间。</div>
+      <div><b>聚合 chip</b>：顶栏只显示「2 架未发现目标」，点开是逐机明细 + 单机「返航」快捷按钮。</div>
+      <div><b>默认是这条告警条（自动出现、不遮挡）</b>：38 px 高、横在地图上方，地图照常可见可操作；不会自动弹模态框。</div>
+      <div><b>要处置才点「详情」</b>：弹出上面这个下拉面板（同样不遮挡）；只有点面板里的「查看」才打开该机的完整信息。</div>
+      <div><b>动作只作用于该机</b>：立即返航走 <span class="mono">/api/aircraft/25/1/return-home</span>，与现有单机返航链路一致。</div>
+      <div><b>关掉告警条</b>：本次提醒静默到状态变化或 60 s 后（按 飞机 + 状态进入时间 去重）。</div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
