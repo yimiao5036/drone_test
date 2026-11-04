@@ -719,20 +719,27 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - **完成判据**：S10 内执行器 `Fired()`（触发命令成功入队，不等 ACK）→ S11；
     **V1 不判断命中**，随后 S11 当拍/下一拍进入 S12。发射入队超时/断连不再走
     “失败返航”，而是 `HandleMissionFault()` 进入 S16。摄像头状态不参与返航判断。
-  - **Home 局部 NED**：`HomeLocalNed()` 用 Home 经纬度（`home_*`）+ EKF 锚点
+  - **返航水平目标（2026-11-04 现场回归）**：优先用 S3 接受分配时记录的**起飞原点**
+    （`RememberTakeoffOrigin()` 存 `local_x/y/z`，与 `local_position` 同一坐标系），
+    不再默认用 Home 经纬度换算——PX4 Home 经纬度随 GPS 漂（现场 25 分钟水平漂
+    5~16 m），用它换算会让返航点偏离真实起飞点，表现为“飞到起飞点附近又拐个弯、
+    最后落到坡上”。只有无起飞原点（如 65020 人工返航且未走任务分配）时才退回
+    `HomeLocalNed()`。`HomeLocalNed()` 用 Home 经纬度（`home_*`）+ EKF 锚点
     （`ned_ref_*`）经 `perception::GeodeticToLocalNed` 换算；不依赖
-    `HOME_POSITION.x/y/z`（MAVLink 无 `valid_lpos` 标志）。`home_valid`/
-    `ned_ref_valid`/`local_position_valid` 任一无效 → 原地悬停并告警（不盲目返航）。
-  - **S12 返航**：相对 Home 高度 <`altitude_m`（5m）先原地爬升，达标后再水平
-    飞 Home；≥5m 保持当前高度。位置意图 10Hz 重发，`reason_code` 低位=8
+    `HOME_POSITION.x/y/z`（MAVLink 无 `valid_lpos` 标志）。两者都不可用 →
+    原地悬停并告警（不盲目返航）。
+  - **S12 返航**：相对高度基准（`common::RelativeAltitudeBaseZ()`，与围栏/下传同口径）
+    下 <`altitude_m`（5m）先原地爬升，达标后再水平飞返航目标；≥5m 保持当前高度；
+    基准不可用时退回 `HomeLocalNed().down_m`，仍无则悬停告警。位置意图 10Hz 重发，
+    `reason_code` 低位=8
     （`kReasonReturnHome`），不带速度前馈。**爬升与水平段都带相位速度上限**
     （2026-11-03）：爬升段 `max_speed_mps=climb_rate_mps`（默认 0.5）、水平段
     `max_speed_mps=cruise_speed_mps`（默认 3.0），由控制器“位置引导限速”逐拍推进
     ——此前不带上限，位置目标从当前高度阶跃到 5m，PX4 按自身
     `MPC_Z_VEL_MAX_UP`（3m/s）冲上去，实机反馈“低于 5m 时上升很快”。PX4 离开
     Offboard（failsafe/人工）→ 立即停发、转 S13 仅监控，不与其争控。
-  - **到达判据**：水平距 Home ≤`arrival_radius_m`（2m）、垂直误差
-    ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
+  - **到达判据**：水平距返航目标（起飞原点或 Home）≤`arrival_radius_m`（2m）、
+    垂直误差 ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
     持续 `arrival_hold`（1s）→ S13。返航超 `timeout`（60s）→ 原地悬停告警。
   - **进入 S12 时已落地/上锁**（`landed && !armed`，例如 S5 无目标停发后
     PX4 自行 RTL 完成、模式又恢复 Offboard）：不再发返航位置意图，直接转
@@ -925,6 +932,10 @@ ctest --test-dir build --output-on-failure
     （DISARM）→ disarmed 进 S14；
   - `ReturnHomeClimbsToFiveMetersBeforeCruise`：相对 Home 2m → 先原地爬升到
     Home 上方 5m（intent x/y=当前），到高后改为水平飞 Home；
+  - `ReturnHomeTargetsTakeoffOriginNotDriftedHome`（2026-11-04 现场回归）：S3 起飞点
+    (10,5,−10) → Home 经纬度北漂 ~10m → 返航意图仍为 (10,5,−10)，不走 Home 换算；
+    注意测试要等 ≥2 个决策周期（`kDecisionPeriod=100ms`）再 `SeedAcceptedAssignmentForTest`，
+    否则 `latest_flight_` 未就绪、起飞原点记不下来；
   - `ReturnHomeHoldsWhenHomeInvalid`：`home_valid=false` → 原地悬停意图
     （当前 x/y/z），状态保持 S12，不盲目返航；
   - `ReturnHomeYieldsWhenPx4LeavesOffboard`：S12 中 PX4 切 4/5 → 停发返航

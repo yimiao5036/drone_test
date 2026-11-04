@@ -1984,6 +1984,58 @@ TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
     machine.Stop();
 }
 
+// 定义在文件后部（S12 用例区之前先用，这里前向声明）。
+common::MissionAssignment MakeAssignment(uint32_t assignment_id);
+
+// 返航水平目标优先用**起飞原点**（2026-11-04 现场回归）：PX4 Home 经纬度随
+// GPS 漂移（实测 25 分钟 5~16 m），用 Home 换算会把返航点带偏，表现就是
+// “飞到起飞点附近又拐一个弯、最后落到坡上”。这里让 Home 北漂 ~10 m，
+// 断言返航意图仍指向 S3 记录的起飞原点。
+TEST(MissionStateMachineTest, ReturnHomeTargetsTakeoffOriginNotDriftedHome) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 起飞点：北 10 m / 东 5 m（S3 接受分配时记为返航原点）。
+    ASSERT_TRUE(flight_topic.Publish(
+                    std::make_shared<const common::FlightStateSnapshot>(
+                        MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    // 决策周期 100 ms：等至少两个周期，确保 latest_flight_ 已就绪再预置分配
+    // （否则起点记不下来，返航会退回 Home 经纬度换算）。
+    std::this_thread::sleep_for(250ms);
+    machine.SeedAcceptedAssignmentForTest(MakeAssignment(91));
+
+    // Home 经纬度北漂 ~10 m（900 × 1e-7° ≈ 10 m）。
+    auto drifted = MakeReturnHomeFlight(10.0f, 5.0f, -10.0f);
+    drifted.home_lat_1e7 += 900;
+    ASSERT_TRUE(flight_topic.Publish(
+                    std::make_shared<const common::FlightStateSnapshot>(drifted))
+                    .accepted);
+    std::this_thread::sleep_for(80ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto return_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(return_intent.has_value());
+    // 目标 = 起飞原点 (10, 5)；若仍用漂移后的 Home 换算，东向会变成 ~0。
+    EXPECT_NEAR(return_intent->target_x, 10.0f, 0.3f);
+    EXPECT_NEAR(return_intent->target_y, 5.0f, 0.3f);
+    // 相对高度 10 m ≥ 返航高度 5 m → 保持当前高度。
+    EXPECT_NEAR(return_intent->target_z, -10.0f, 0.1f);
+    machine.Stop();
+}
+
 // S5 无目标停发后 PX4 已自行 RTL 落地/上锁、模式又恢复 Offboard：
 // S12 不得继续发返航设定值（会卡到返航超时），直接 S13→S14 收口。
 TEST(MissionStateMachineTest, ReturnHomeAlreadyLandedDisarmedCloses) {

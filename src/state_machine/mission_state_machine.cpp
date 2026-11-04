@@ -499,6 +499,11 @@ public:
         takeoff_disarm_sent_ = false;
         takeoff_ack_baseline_matched_ = 0;
         takeoff_unavailable_latched_ = false;
+        // 返航水平目标（2026-11-04）：本次任务的起飞原点随任务一起复位。
+        return_origin_valid_ = false;
+        return_origin_x_ = 0.f;
+        return_origin_y_ = 0.f;
+        return_origin_z_ = 0.f;
         // 电池守卫复位（Task 8）：中止锁存与防抖计时清空。
         battery_abort_latched_ = false;
         battery_low_since_ms_.reset();
@@ -700,6 +705,7 @@ public:
             const auto& flight = *latest_flight_;
             assignment_tracker_.BeginTakeoff(flight.local_x_m, flight.local_y_m,
                                             flight.local_z_m, MonotonicMs());
+            RememberTakeoffOrigin(flight);
         }
         SPDLOG_INFO("测试钩子：已预置任务分配 id={} target={}（仅用于验证 65015 链路）",
                     assignment.assignment_id, assignment.target_id);
@@ -1132,6 +1138,8 @@ private:
                 const auto& flight = *latest_flight_;
                 assignment_tracker_.BeginTakeoff(
                     flight.local_x_m, flight.local_y_m, flight.local_z_m, now_ms);
+                // 同时记一份给 S12 返航用（不受 PX4 Home 经纬度漂移影响）。
+                RememberTakeoffOrigin(flight);
                 accepted = true;
             }
         }
@@ -3835,6 +3843,48 @@ private:
     /// Home 在 EKF 锚点坐标系下的局部 NED（返航目标）。
     /// 使用 Home 经纬度 + 锚点换算，避免依赖 HOME_POSITION.x/y/z（MAVLink
     /// 报文未携带 PX4 的 valid_lpos 标志）；home/锚点/当前位置任一无效返回 nullopt。
+    /// 记录本次任务的起飞原点（S3 接受分配时）。返航水平目标优先用它，
+    /// 避免 PX4 Home 经纬度漂移把返航点带偏。
+    void RememberTakeoffOrigin(const common::FlightStateSnapshot& flight) {
+        return_origin_valid_ = true;
+        return_origin_x_ = flight.local_x_m;
+        return_origin_y_ = flight.local_y_m;
+        return_origin_z_ = flight.local_z_m;
+    }
+
+    /// 返航水平目标（局部 NED，2026-11-04 现场回归）：
+    /// 优先用 S3 记录的**起飞原点**——它与 `local_position` 同一坐标系，不受
+    /// PX4 Home 经纬度漂移影响（现场 25 分钟内 Home 水平漂 5~16 m，用它换算会
+    /// 让返航点偏离真实起飞点，表现为“飞到起飞点附近又拐弯、落到坡上”）。
+    /// 无起飞原点（如 65020 人工返航且未走任务分配）时退回 Home 经纬度换算。
+    /// 高度不在这里取：返航高度统一走 `RelativeAltitudeBaseZ()` 的 EKF 差分口径。
+    std::optional<common::Vec2Ned> ReturnHorizontalTarget() const {
+        if (return_origin_valid_) {
+            return common::Vec2Ned{return_origin_x_, return_origin_y_};
+        }
+        if (!latest_flight_.has_value()) {
+            return std::nullopt;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.home_valid || !flight.ned_ref_valid) {
+            return std::nullopt;
+        }
+        const perception::GeodeticCoordinate anchor{
+            static_cast<double>(flight.ned_ref_lat_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_lon_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_alt_mm) * 1e-3};
+        const perception::GeodeticCoordinate home{
+            static_cast<double>(flight.home_lat_1e7) * 1e-7,
+            static_cast<double>(flight.home_lon_1e7) * 1e-7,
+            static_cast<double>(flight.home_altitude_mm) * 1e-3};
+        const auto ned = perception::GeodeticToLocalNed(anchor, home);
+        if (!ned.has_value()) {
+            return std::nullopt;
+        }
+        return common::Vec2Ned{static_cast<float>(ned->north_m),
+                               static_cast<float>(ned->east_m)};
+    }
+
     std::optional<perception::LocalNedCoordinate> HomeLocalNed() const {
         if (!latest_flight_.has_value()) {
             return std::nullopt;
@@ -3989,13 +4039,35 @@ private:
                                     flight.local_z_m, now_ms);
             return;
         }
-        const auto home = HomeLocalNed();
-        if (!home.has_value()) {
+        const auto home_xy = ReturnHorizontalTarget();
+        if (!home_xy.has_value()) {
             if (!return_home_wait_logged_) {
-                SPDLOG_WARN("返航等待 Home/EKF 锚点有效（无局部返航基准）");
+                SPDLOG_WARN("返航等待起飞原点/Home/EKF 锚点有效（无局部返航基准）");
                 return_home_wait_logged_ = true;
             }
-            // 无 Home 基准时原地悬停，不盲目返航。
+            // 无基准时原地悬停，不盲目返航。
+            PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
+                                    flight.local_z_m, now_ms);
+            return;
+        }
+        // 返航高度基准（2026-11-04）：优先与围栏/65011 同口径的 EKF 差分，
+        // 不再用 Home 的 GNSS 绝对海拔（现场会漂 18~38 m）；仅有 Home 基准的
+        // 老装配（无 HOME_POSITION.z / 起飞快照）退回 Home 换算，保持旧行为。
+        double base_z = 0.0;
+        bool altitude_known = false;
+        if (const auto ekf_base = common::RelativeAltitudeBaseZ(flight);
+            ekf_base.has_value()) {
+            base_z = *ekf_base;
+            altitude_known = true;
+        } else if (const auto home = HomeLocalNed(); home.has_value()) {
+            base_z = home->down_m;
+            altitude_known = true;
+        }
+        if (!altitude_known) {
+            if (!return_home_wait_logged_) {
+                SPDLOG_WARN("返航等待相对高度基准（HOME_POSITION/起飞快照/Home）");
+                return_home_wait_logged_ = true;
+            }
             PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
                                     flight.local_z_m, now_ms);
             return;
@@ -4003,10 +4075,10 @@ private:
 
         // 返航高度：低于 5m 先原地爬升；≥5m 保持当前高度。
         const double relative_alt_m =
-            home->down_m - static_cast<double>(flight.local_z_m);
+            base_z - static_cast<double>(flight.local_z_m);
         double target_z = static_cast<double>(flight.local_z_m);
         if (relative_alt_m < return_home_.altitude_m) {
-            target_z = home->down_m - return_home_.altitude_m;
+            target_z = base_z - return_home_.altitude_m;
         } else {
             return_climb_phase_ = false;
         }
@@ -4018,16 +4090,16 @@ private:
                     return_home_.arrival_speed_mps;
             if (climbed) {
                 return_climb_phase_ = false;
-                SPDLOG_INFO("返航爬升完成（相对 Home {:.1f}m），开始水平返航",
+                SPDLOG_INFO("返航爬升完成（相对起飞点 {:.1f}m），开始水平返航",
                             return_home_.altitude_m);
             }
         }
         const double target_x = return_climb_phase_
                                     ? static_cast<double>(flight.local_x_m)
-                                    : home->north_m;
+                                    : static_cast<double>(home_xy->north_m);
         const double target_y = return_climb_phase_
                                     ? static_cast<double>(flight.local_y_m)
-                                    : home->east_m;
+                                    : static_cast<double>(home_xy->east_m);
         // 返航航向（机头朝飞行方向，2026-10-29）：只在水平返航段生效；
         // 爬升段（水平目标=当前位置）与 heading_mode=0 不指定航向。
         const bool heading_valid = !return_climb_phase_ &&
@@ -4050,8 +4122,10 @@ private:
             return;
         }
         const double horizontal_m = std::hypot(
-            home->north_m - static_cast<double>(flight.local_x_m),
-            home->east_m - static_cast<double>(flight.local_y_m));
+            static_cast<double>(home_xy->north_m) -
+                static_cast<double>(flight.local_x_m),
+            static_cast<double>(home_xy->east_m) -
+                static_cast<double>(flight.local_y_m));
         const double vertical_m =
             std::fabs(target_z - static_cast<double>(flight.local_z_m));
         const double horizontal_speed_mps =
@@ -4225,8 +4299,9 @@ private:
                 return_timeout_warned_ = false;
                 return_home_wait_logged_ = false;
                 arrival_stable_since_ms_ = 0;
-                SPDLOG_INFO("返航开始: Home 局部NED 由 Home+EKF锚点换算，"
-                            "返航高度 {:.1f}m，到达半径 {:.1f}m",
+                SPDLOG_INFO("返航开始: 水平目标={}（起飞原点优先，Home 经纬度仅兜底），"
+                            "高度基准=EKF 差分，返航高度 {:.1f}m，到达半径 {:.1f}m",
+                            return_origin_valid_ ? "起飞原点" : "Home 经纬度",
                             return_home_.altitude_m, return_home_.arrival_radius_m);
             } else if (next_state == common::MissionState::kLanding) {
                 landing_command_sent_ = false;
@@ -4527,6 +4602,15 @@ private:
     uint64_t takeoff_stable_since_ms_ = 0; ///< S4 到达判据连续成立起点
     float takeoff_z_cmd_ = 0.f;            ///< S4 逐拍推进的 z 目标（局部 NED）
     bool takeoff_disarm_sent_ = false;     ///< 地面中止 DISARM 已尝试（仅一次）
+    /// 本次任务的起飞原点（局部 NED，S3 接受分配时记录，2026-11-04）。
+    /// 返航水平目标优先用它：PX4 Home 的经纬度会随 GPS 漂移（现场 5~16 m），
+    /// 用 Home 经纬度换算会让返航点偏离真实起飞点（表现为“飞过起飞点再拐弯、
+    /// 落到坡上”）。`ReturnHorizontalTarget()` 在无原点（人工返航未走分配）时
+    /// 退回 Home 换算。
+    bool return_origin_valid_ = false;
+    float return_origin_x_ = 0.f;
+    float return_origin_y_ = 0.f;
+    float return_origin_z_ = 0.f;
     uint64_t takeoff_ack_baseline_matched_ = 0;  ///< S3 入口 ACK 匹配计数基线
     /// 起飞中止后 PX4 状态不确定（断连/离地状态不明）：per-boot 锁存，
     /// availability=unavailable 且新分配回 not_ready，直到 Start() 复位。
