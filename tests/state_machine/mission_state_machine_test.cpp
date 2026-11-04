@@ -1659,6 +1659,9 @@ common::FlightStateSnapshot MakeReturnHomeFlight(float x_m, float y_m, float z_m
 state_machine::MissionStateMachineConfig MakeReturnHomeTestConfig() {
     state_machine::MissionStateMachineConfig config;
     config.test_hooks_enabled = true;
+    // 不读不写 config/zone.json：返航用例不应受工作目录里残留区域影响
+    // （2026-11-04 曾有用例注入 alt_max=3 的区域落盘，导致后续用例误判）。
+    config.fence.zone_cache_path.clear();
     // 默认 return_home.enabled=true；缩短稳定/重试时间便于测试。
     config.return_home.arrival_hold = 300ms;
     config.return_home.command_retry = 100ms;
@@ -2036,8 +2039,125 @@ TEST(MissionStateMachineTest, ReturnHomeTargetsTakeoffOriginNotDriftedHome) {
     machine.Stop();
 }
 
-// S5 无目标停发后 PX4 已自行 RTL 落地/上锁、模式又恢复 Offboard：
-// S12 不得继续发返航设定值（会卡到返航超时），直接 S13→S14 收口。
+// 2026-11-04：返航取消总时长上限。旧实现"进 S12 满 timeout_ms 就原地悬停"，
+// 现场 128m/1.5m/s 需 85s、配置 60s，直接卡死。现在 timeout_ms 只作停滞告警
+// 间隔：即使超过它，也必须继续朝返航目标飞，绝不把"当前位置"当目标。
+TEST(MissionStateMachineTest, ReturnHomeIgnoresLegacyTotalTimeout) {
+    auto config = MakeReturnHomeTestConfig();
+    config.return_home.timeout = 300ms;  // 旧的"总时长"；现为停滞告警间隔
+    config.fence.zone_cache_path.clear();  // 不写盘，避免污染工作目录
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 距返航点（Home=局部原点）60 m，相对高度 10 m ≥ 返航高度 5 m → 直接巡航。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(60.0f, 0.0f, -10.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReturnHome,
+                             2000ms)
+                    .has_value());
+
+    // 远超旧超时（4×300ms）：必须仍在返航，并持续朝返航点飞。
+    std::this_thread::sleep_for(1200ms);
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kReturnHome)
+        << "取消总时长上限后不得因超时改变状态";
+
+    common::ControlIntent last{};
+    bool have_intent = false;
+    while (auto message = intent_subscription.WaitTakeFor(100ms)) {
+        const auto& intent = **message;
+        if (intent.type == common::ControlIntentType::kPositionGuide &&
+            (intent.reason_code & 0xFFU) == 8U) {
+            last = intent;
+            have_intent = true;
+        }
+    }
+    ASSERT_TRUE(have_intent) << "返航应持续发布位置意图";
+    EXPECT_NEAR(last.target_x, 0.0f, 0.5f) << "目标必须仍是返航点，不是悬停用的当前位置";
+    EXPECT_NEAR(last.target_y, 0.0f, 0.5f);
+    machine.Stop();
+}
+
+// 返航高度受区域高度带上限约束（2026-11-04）：区域上限 3 m 时，返航高度从
+// 5 m 收敛到 2.5 m；否则飞控把设定值钳在上限、垂直差永远超限，S12 永远等不到
+// "到达"。用例断言爬升目标 z = 基准 − 2.5。
+TEST(MissionStateMachineTest, ReturnHomeAltitudeCappedByZoneCeiling) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::FenceZone> fence_topic;
+    FakeCommandSender sender;
+    auto config = MakeReturnHomeTestConfig();
+    // 注入的区域会被落盘；测试里关掉缓存路径，避免污染工作目录并影响其它用例
+    // （2026-11-04 曾因此让 ReturnHomeClimbsToFiveMetersBeforeCruise 读到 alt_max=3）。
+    config.fence.zone_cache_path.clear();
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetFenceInput(fence_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 以 Home（23.120°N/113.120°E）为心的 ±500 m 方形区域，高度带上限 3 m。
+    common::FenceZone zone;
+    zone.header.receive_time_ms = TestMonotonicMs();
+    zone.header.valid_for_ms = 0;
+    zone.header.health = 1;
+    zone.protocol_version = 1;
+    zone.zone_id = 7;
+    zone.version = 2;
+    zone.type = common::FenceZoneType::kPolygon;
+    zone.action = common::FenceAction::kReturn;
+    zone.altitude_reference = 1;  // 相对起飞点
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 3.0;
+    {
+        const double lat0 = 23.120;
+        const double lon0 = 113.120;
+        const double dlat = 500.0 / 111320.0;
+        const double dlon = 500.0 / (111320.0 * std::cos(lat0 * 3.14159265358979323846 / 180.0));
+        zone.vertices = {
+            {lat0 - dlat, lon0 - dlon},
+            {lat0 + dlat, lon0 - dlon},
+            {lat0 + dlat, lon0 + dlon},
+            {lat0 - dlat, lon0 + dlon},
+        };
+    }
+    zone.received_ms = TestMonotonicMs();
+    ASSERT_TRUE(fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    // 本机在地面（相对高度 0）→ 需要爬升到 min(5, 3−0.5)=2.5 m。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(0.0f, 0.0f, 0.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReturnHome,
+                             2000ms)
+                    .has_value());
+
+    const auto intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value()) << "返航应发布爬升意图";
+    EXPECT_NEAR(intent->target_z, -2.5f, 0.1f)
+        << "返航高度应被区域上限收敛到 2.5 m（3 − 0.5）";
+    machine.Stop();
+}
+
+// S5 无目标停发后 PX4 已自行 RTL 落地/上锁、模式又恢复 Offboard：// S12 不得继续发返航设定值（会卡到返航超时），直接 S13→S14 收口。
 TEST(MissionStateMachineTest, ReturnHomeAlreadyLandedDisarmedCloses) {
     common::Topic<common::GroundStationTarget> ground_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
@@ -5185,6 +5305,39 @@ TEST(MissionStateMachineTest, MissionCommandReturnHomeAbortsToReturnHome) {
                     harness.ack_subscription,
                     common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
                     .has_value());
+}
+
+/// 65020 主动返航在 S12 中再次下发：按"继续返航"回执受理（2026-11-04）。
+/// 旧行为回 kCompleted/kAlreadyReturning，Web 显示"目标状态已达成"，容易被误读成
+/// 已到达；S12 已无总时长上限，操作员需要一个明确的"我在等你回来"入口。
+TEST(MissionStateMachineTest, MissionCommandReturnHomeWhileReturningAcksAccepted) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 45));
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9101)))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value());
+    (void)WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+
+    // 仍在 S12 时再下发一条（新 command_id）→ 回执 accepted 且状态不变。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9102)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "应回 65021";
+    EXPECT_EQ(ack->command_id, 9102U);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReturnHome)
+        << "继续返航不应改变状态";
 }
 
 /// 测试钩子：未启用 `test_hooks_enabled` 时拒绝预置任务分配（生产装配语义），

@@ -729,8 +729,14 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `HOME_POSITION.x/y/z`（MAVLink 无 `valid_lpos` 标志）。两者都不可用 →
     原地悬停并告警（不盲目返航）。
   - **S12 返航**：相对高度基准（`common::RelativeAltitudeBaseZ()`，与围栏/下传同口径）
-    下 <`altitude_m`（5m）先原地爬升，达标后再水平飞返航目标；≥5m 保持当前高度；
-    基准不可用时退回 `HomeLocalNed().down_m`，仍无则悬停告警。位置意图 10Hz 重发，
+    下低于**返航高度**先原地爬升，达标后再水平飞返航目标；高于则保持当前高度。
+    返航高度由 `ReturnAltitudeM()` 给出：`return_home.altitude_m`（5m）起步，若区域
+    `altitude_reference != 0`（相对起飞点）且 `alt_max_m > 0`，收敛为
+    `min(5.0, alt_max_m − 0.5)`（2026-11-04 现场回归：区域上限 20m 时无影响，但区域上限
+    压到 5m 以下时，飞控会把设定值钳在区域内 → 垂直误差永远超 `arrival_vertical_m`、
+    S12 永远等不到"到达"），首次被压低时打 WARN
+    `返航高度受区域高度带上限约束: 5.0m -> ..m`。基准不可用时退回
+    `HomeLocalNed().down_m`，仍无则悬停告警。位置意图 10Hz 重发，
     `reason_code` 低位=8
     （`kReasonReturnHome`），不带速度前馈。**爬升与水平段都带相位速度上限**
     （2026-11-03）：爬升段 `max_speed_mps=climb_rate_mps`（默认 0.5）、水平段
@@ -740,10 +746,20 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     Offboard（failsafe/人工）→ 立即停发、转 S13 仅监控，不与其争控。
   - **到达判据**：水平距返航目标（起飞原点或 Home）≤`arrival_radius_m`（2m）、
     垂直误差 ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
-    持续 `arrival_hold`（1s）→ S13。返航超 `timeout`（60s）→ 原地悬停告警。
+    持续 `arrival_hold`（1s）→ S13。
+  - **不设总时长上限（2026-11-04 改）**：原 `return_home.timeout`（60s）是"从进入 S12
+    起的绝对时长"，与距离和限速无关——现场 128m 返航在 1.5m/s 限速下需 ≈85s，60s 必超，
+    超时后只把"当前位置"当目标原地悬停，等于任务卡死。现在 `timeout` 只作**停滞告警间隔**：
+    返航距离在 `kReturnStallProgressM`（0.3m）内无改善持续该时长才打 WARN
+    `返航停滞: ..s 未靠近返航目标（距目标 ..m，检查逆风/区域钳制/遥控接管），继续返航`，
+    **只告警、不中止**。真正的兜底交给 PX4（失联 `COM_OF_LOSS_T`、低电动作）。
   - **进入 S12 时已落地/上锁**（`landed && !armed`，例如 S5 无目标停发后
     PX4 自行 RTL 完成、模式又恢复 Offboard）：不再发返航位置意图，直接转
-    S13 → S14 收口（SITL 2026-10-22 实测：否则会停在 S12 直到返航超时）。
+    S13 → S14 收口（SITL 2026-10-22 实测：否则会停在 S12 空转）。
+  - **S12 内再收 65020 `type=1`**：视为"继续返航"，重置停滞计时与最佳距离，
+    回 65021 `kAccepted/kNone`（日志 `任务指令（主动返航）: 已在返航，按继续返航处理`）；
+    S13 仍回 `kCompleted/kAlreadyReturning`。地面站「主动返航」按钮本身只在
+    `mission.state ∈ [3,11]` 可点，这条路径主要给脚本/命令行重发用。
   - **S13/S14**：S13 发 `MAV_CMD_DO_SET_MODE`（AUTO.LAND，4/6）；停止位置意图；
     落地后若仍 armed 发 `MAV_CMD_COMPONENT_ARM_DISARM`（0）；确认 disarmed →
     S14。正常返航不使用 PX4 自动 RTL；PX4 已接管则只监控 landed/disarmed。
@@ -791,7 +807,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 
 - INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
   `任务指令回执已发布: command_id=.. type=.. result=.. reason=.. state=.. count=..`（节流，首条与每 100 条）；
-  `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航/降落流程，回执完成`、
+  `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航，按继续返航处理 command_id=..`
+  （S12）、`任务指令（主动返航）: 已在返航/降落流程，回执完成`（S13）、
   `任务指令（主动返航）: 当前状态不可执行`。
 - WARN：`任务指令（重置状态）: 已清空本次任务状态 DISARMED → READY command_id=..`
   （2026-11-04，受理后打一条；随后 `DISARMED -> READY` 由统一迁移日志记录）。
@@ -815,8 +832,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
   S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）；
   **捕网执行器触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
-  捕网命令入队失败（节流，下拍重试）；**单发发射超时/返航超时/Home 或锚点无效/
-  PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）；
+  捕网命令入队失败（节流，下拍重试）；**单发发射超时/返航停滞（只告警，检测到
+  距返航目标 0.3m 内无进展且持续 `return_home.timeout`）/返航高度被区域上限压低/
+  Home 或锚点无效/PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）；
   **任务分配被拒绝（节流，带 assignment_id/target_id/reason/当前状态）**；
   **自动起飞中止（带 reason/detail/airborne/uncertain，每次中止一条）/
   地面中止 DISARM 入队失败（不重试）**（Task 5）；
@@ -1083,8 +1101,14 @@ ctest --test-dir build --output-on-failure
   （默认 true；捕网执行器隔离测试显式 false）、执行器 `Fired()`/发射超时日志；
   若已进入 S16，说明发射入队超时或执行器故障，属故障处置而非返航路径。
 - **S12 原地不动/不飞 Home**：查 `home_valid`/`ned_ref_valid`/
-  `local_position_valid`（任一无效按设计原地悬停并 WARN）；查返航超时日志
-  （60s 后原地悬停）；确认 PX4 仍在 Offboard(6/0)，否则状态机按设计转 S13 让权。
+  `local_position_valid`（任一无效按设计原地悬停并 WARN）；查
+  `返航停滞: ..s 未靠近返航目标` WARN（2026-11-04 起只告警不中止，飞机仍应继续飞）；
+  日志若出现旧版 `返航超时，原地悬停` 说明跑的是改造前的固件。确认 PX4 仍在
+  Offboard(6/0)，否则状态机按设计转 S13 让权。
+- **S12 不远却很久不判"到达"**：先看有没有
+  `返航高度受区域高度带上限约束: 5.0m -> ..m`——区域高度带上限低于返航高度时，
+  飞控会把设定值钳在区域内，垂直误差永远超 0.5m；此时要么抬高区域上限，
+  要么按改造后的语义让返航高度自动收敛（2026-11-04 起）。
 - **S12 不进入 S13**：到达判据为水平 2m、垂直 0.5m、水平速度 0.5m/s
   持续 1s；查位置/速度遥测是否持续满足；位置意图 reason 低位应为 8。
 - **S13 不发 AUTO.LAND**：确认 `SetCommandSender` 已注入（`enable_control=true`

@@ -521,8 +521,11 @@ public:
         interception_fired_ = false;
         return_climb_phase_ = true;
         return_px4_takeover_ = false;
-        return_timeout_warned_ = false;
         return_home_wait_logged_ = false;
+        return_best_distance_m_ = std::numeric_limits<double>::max();
+        return_progress_ms_ = 0;
+        return_stall_warned_ms_ = 0;
+        return_altitude_clamped_ = false;
         arrival_stable_since_ms_ = 0;
         landing_command_sent_ = false;
         landing_command_ms_ = 0;
@@ -1697,10 +1700,25 @@ private:
                                      common::MissionCommandReason::kMissionFault);
             return;
         }
-        // 已在返航/降落：指令目标状态已达成（幂等），不重复中止。
-        if (state == common::MissionState::kReturnHome ||
-            state == common::MissionState::kLanding) {
-            SPDLOG_INFO("任务指令（主动返航）: 已在返航/降落流程，回执完成 state={}",
+        // 已在返航：不重复中止、不重启爬升，但把它当成“继续返航”——重置停滞
+        // 诊断计时并回执受理（2026-11-04：S12 已取消总时长超时，操作员仍需要
+        // 一个明确的“我在等你回来”入口；旧行为是回 kCompleted，Web 提示
+        // “目标状态已达成”，容易被误读为已到达）。
+        if (state == common::MissionState::kReturnHome) {
+            RecordExecutedMissionCommandId(command.command_id);
+            return_best_distance_m_ = std::numeric_limits<double>::max();
+            return_progress_ms_ = 0;
+            return_stall_warned_ms_ = 0;
+            SPDLOG_INFO("任务指令（主动返航）: 已在返航，按继续返航处理 command_id={}",
+                        command.command_id);
+            PublishMissionCommandAck(command,
+                                     common::MissionCommandResult::kAccepted,
+                                     common::MissionCommandReason::kNone);
+            return;
+        }
+        // 已在降落：不可撤销，回执“目标状态已达成”。
+        if (state == common::MissionState::kLanding) {
+            SPDLOG_INFO("任务指令（主动返航）: 已在降落流程，回执完成 state={}",
                         static_cast<int>(state));
             PublishMissionCommandAck(command, common::MissionCommandResult::kCompleted,
                                      common::MissionCommandReason::kAlreadyReturning);
@@ -3885,6 +3903,23 @@ private:
                                static_cast<float>(ned->east_m)};
     }
 
+    /// 返航目标相对高度（m，相对起飞点/AMSL 由区域口径决定，2026-11-04）。
+    /// 默认 `return_home_.altitude_m`（5 m），但如果区域高度带上限更低，必须
+    /// 收敛到 `上限 − 0.5m`：否则飞控把设定值压在上限，垂直差永远大于
+    /// `arrival_vertical_m`，S12 会永远判不到"到达"，表现就是一直返航不降落。
+    double ReturnAltitudeM() const {
+        double altitude_m = return_home_.altitude_m;
+        if (fence_zone_.has_value() && fence_zone_->altitude_reference != 0U &&
+            fence_zone_->alt_max_m > 0.0) {
+            const double capped =
+                fence_zone_->alt_max_m - kReturnAltitudeMarginM;
+            if (capped > 0.0 && altitude_m > capped) {
+                altitude_m = capped;
+            }
+        }
+        return altitude_m;
+    }
+
     std::optional<perception::LocalNedCoordinate> HomeLocalNed() const {
         if (!latest_flight_.has_value()) {
             return std::nullopt;
@@ -4025,20 +4060,10 @@ private:
             }
             return;
         }
-        // 同一拍刚进入 S12 时 state_entered_ms_ 可能晚于本拍 now_ms，unsigned
-        // 相减会回绕；钳到 0，避免"刚进返航就超时"。
-        const uint64_t return_elapsed_ms =
-            now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
-        if (return_elapsed_ms >=
-            static_cast<uint64_t>(return_home_.timeout.count())) {
-            if (!return_timeout_warned_) {
-                SPDLOG_WARN("返航超时，原地悬停等待地面站/人工处置");
-                return_timeout_warned_ = true;
-            }
-            PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
-                                    flight.local_z_m, now_ms);
-            return;
-        }
+        // 返航不设总时长上限（2026-11-04 用户裁决）：用"从进 S12 起的绝对时长"
+        // 猜"飞不飞得到"必然误判——现场 128m、限速 1.5m/s 需要 85s，旧 60s
+        // 超时一到就原地悬停。返航一直飞到"到达判据"成立为止；卡住与否改用
+        // 长度无关的停滞诊断（见下方 horizontal_m 段），只 WARN 不中止。
         const auto home_xy = ReturnHorizontalTarget();
         if (!home_xy.has_value()) {
             if (!return_home_wait_logged_) {
@@ -4073,12 +4098,21 @@ private:
             return;
         }
 
-        // 返航高度：低于 5m 先原地爬升；≥5m 保持当前高度。
+        // 返航高度：低于目标高度（默认 5m，受区域上限约束）先原地爬升；
+        // 已达到则保持当前高度。
+        const double return_altitude_m = ReturnAltitudeM();
+        if (return_altitude_m < return_home_.altitude_m &&
+            !return_altitude_clamped_) {
+            return_altitude_clamped_ = true;
+            SPDLOG_WARN("返航高度受区域高度带上限约束: {:.1f}m -> {:.1f}m"
+                        "（否则飞控钳制后垂直差永远超限、无法判到达）",
+                        return_home_.altitude_m, return_altitude_m);
+        }
         const double relative_alt_m =
             base_z - static_cast<double>(flight.local_z_m);
         double target_z = static_cast<double>(flight.local_z_m);
-        if (relative_alt_m < return_home_.altitude_m) {
-            target_z = base_z - return_home_.altitude_m;
+        if (relative_alt_m < return_altitude_m) {
+            target_z = base_z - return_altitude_m;
         } else {
             return_climb_phase_ = false;
         }
@@ -4091,7 +4125,7 @@ private:
             if (climbed) {
                 return_climb_phase_ = false;
                 SPDLOG_INFO("返航爬升完成（相对起飞点 {:.1f}m），开始水平返航",
-                            return_home_.altitude_m);
+                            return_altitude_m);
             }
         }
         const double target_x = return_climb_phase_
@@ -4126,6 +4160,30 @@ private:
                 static_cast<double>(flight.local_x_m),
             static_cast<double>(home_xy->east_m) -
                 static_cast<double>(flight.local_y_m));
+
+        // 停滞诊断（只告警，不中止）：距离连续 `return_home_.timeout` 没有缩短
+        // kReturnStallProgressM 以上，说明"没在靠近"，排查风/围栏钳制/遥控接管，
+        // 但返航照常继续——程序和 PX4 都可能在正常工作。
+        if (horizontal_m + kReturnStallProgressM < return_best_distance_m_) {
+            return_best_distance_m_ = horizontal_m;
+            return_progress_ms_ = now_ms;
+        } else if (return_progress_ms_ != 0 && now_ms >= return_progress_ms_) {
+            const uint64_t stalled_ms = now_ms - return_progress_ms_;
+            // `return_home.timeout_ms` 语义已改为“停滞告警间隔”（2026-11-04，
+            // 不再用于中止返航），默认 60s。
+            const uint64_t warn_interval =
+                static_cast<uint64_t>(return_home_.timeout.count());
+            if (stalled_ms >= warn_interval &&
+                (return_stall_warned_ms_ == 0 ||
+                 now_ms - return_stall_warned_ms_ >= warn_interval)) {
+                return_stall_warned_ms_ = now_ms;
+                SPDLOG_WARN("返航停滞: {:.1f}s 未靠近返航目标（距目标 {:.1f}m，"
+                            "检查逆风/区域钳制/遥控接管），继续返航",
+                            static_cast<double>(stalled_ms) / 1000.0,
+                            horizontal_m);
+            }
+        }
+
         const double vertical_m =
             std::fabs(target_z - static_cast<double>(flight.local_z_m));
         const double horizontal_speed_mps =
@@ -4296,13 +4354,17 @@ private:
             if (next_state == common::MissionState::kReturnHome) {
                 return_climb_phase_ = true;
                 return_px4_takeover_ = false;
-                return_timeout_warned_ = false;
                 return_home_wait_logged_ = false;
+                return_best_distance_m_ = std::numeric_limits<double>::max();
+                return_progress_ms_ = 0;
+                return_stall_warned_ms_ = 0;
+                return_altitude_clamped_ = false;
                 arrival_stable_since_ms_ = 0;
                 SPDLOG_INFO("返航开始: 水平目标={}（起飞原点优先，Home 经纬度仅兜底），"
-                            "高度基准=EKF 差分，返航高度 {:.1f}m，到达半径 {:.1f}m",
+                            "高度基准=EKF 差分，返航高度 {:.1f}m，到达半径 {:.1f}m，"
+                            "不设总时长上限",
                             return_origin_valid_ ? "起飞原点" : "Home 经纬度",
-                            return_home_.altitude_m, return_home_.arrival_radius_m);
+                            ReturnAltitudeM(), return_home_.arrival_radius_m);
             } else if (next_state == common::MissionState::kLanding) {
                 landing_command_sent_ = false;
                 landing_command_ms_ = 0;
@@ -4645,8 +4707,19 @@ private:
     bool interception_fired_ = false;       ///< 单发触发命令已入队（S10→S11 依据）
     bool return_climb_phase_ = true;        ///< S12：先爬升到 5m（若不足）
     bool return_px4_takeover_ = false;      ///< S12 中 PX4 离开 Offboard（停止争控）
-    bool return_timeout_warned_ = false;    ///< 返航超时告警已打印
     bool return_home_wait_logged_ = false;  ///< Home/锚点无效告警已打印
+    /// 返航停滞诊断（2026-11-04）：只告警不中止。
+    /// 总时长超时已删除——用"从进 S12 起的绝对时长"猜"飞不飞得到"必然误判
+    /// （现场 128m/1.5m/s 需 85s，给了 60s 就原地悬停）。改为看"有没有靠近"：
+    /// 到返航目标的距离连续 `return_home_.timeout` 没有缩短 kReturnStallProgressM
+    /// 以上就 WARN 一次（提示风/围栏钳制/遥控接管），返航继续。
+    static constexpr double kReturnStallProgressM = 0.3;
+    /// 返航高度相对区域上限的安全余量（m）。
+    static constexpr double kReturnAltitudeMarginM = 0.5;
+    double return_best_distance_m_ = std::numeric_limits<double>::max();
+    uint64_t return_progress_ms_ = 0;       ///< 最近一次"靠近"的时刻
+    uint64_t return_stall_warned_ms_ = 0;   ///< 最近一次停滞告警时刻（节流）
+    bool return_altitude_clamped_ = false;  ///< 返航高度被区域上限压低的告警已打印
     uint64_t arrival_stable_since_ms_ = 0;  ///< 到达判据连续成立起点
     bool landing_command_sent_ = false;     ///< AUTO.LAND 曾成功入队
     uint64_t landing_command_ms_ = 0;       ///< 最近一次 AUTO.LAND 入队尝试时刻
