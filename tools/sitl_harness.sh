@@ -12,6 +12,8 @@
 #   tools/sitl_harness.sh app   [--config <cfg>]   仅重启 drone_control（PX4/桥/GCS 保持）
 #   tools/sitl_harness.sh smoke --config <cfg> <px4_link_smoke 参数...>
 #                                                  起 PX4+GCS 后运行冒烟/SITL 场景
+#   tools/sitl_harness.sh webgcs [--port 5761]     把 /tmp/gcs_test 桥到 TCP，交给 Web 地面站
+#                                                  （会停掉 sitl_gcs.py，由 Web 端扮演 255/190）
 #   tools/sitl_harness.sh stop                     停止全部（tmux 会话与进程）
 #   tools/sitl_harness.sh status                   打印会话/进程/最新日志路径
 #
@@ -39,6 +41,7 @@ APP_BIN="$REPO/build/drone_control"
 SMOKE_BIN="$REPO/build/px4_link_smoke"
 BRIDGE_PY="$REPO/tools/sitl_pty_bridge.py"
 GCS_PY="$REPO/tools/sitl_gcs.py"
+WEB_GCS_PY="$REPO/tools/sitl_web_gcs.py"
 DEFAULT_APP_CONFIG="$REPO/config/px4_sitl_assignment.json"
 
 PX4_LOG="$LOG_DIR/px4.log"
@@ -59,6 +62,7 @@ kill_processes() {
     pkill -f "[g]z sim" 2>/dev/null
     pkill -f "[s]itl_pty_bridge" 2>/dev/null
     pkill -f "[s]itl_gcs" 2>/dev/null
+    pkill -f "[s]itl_web_gcs" 2>/dev/null
 }
 
 kill_sessions() {
@@ -66,6 +70,7 @@ kill_sessions() {
     tmux kill-session -t gcs 2>/dev/null
     tmux kill-session -t px4 2>/dev/null
     tmux kill-session -t bridge 2>/dev/null
+    tmux kill-session -t webgcs 2>/dev/null
 }
 
 stop_all() {
@@ -215,6 +220,33 @@ cmd_smoke() {
     return "$rc"
 }
 
+cmd_webgcs() {
+    local port=5761
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port) port="${2:-}"; shift 2 ;;
+            *) die "webgcs 参数非法: $1（可用: --port <端口>）" ;;
+        esac
+    done
+    require_file "$WEB_GCS_PY"
+    [ -e /tmp/gcs_test ] || die "/tmp/gcs_test 不存在（先执行 stack）"
+    # 同一个端点只能有一个地面站：sitl_gcs.py 也扮演 255/190 并抢心跳，必须先停。
+    tmux kill-session -t gcs 2>/dev/null
+    pkill -f "[s]itl_gcs" 2>/dev/null
+    sleep 1
+    tmux kill-session -t webgcs 2>/dev/null
+    tmux new-session -d -s webgcs "python3 $WEB_GCS_PY --port $port 2>&1 | tee $LOG_DIR/webgcs.log"
+    sleep 1
+    local host_ip
+    host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -n "$host_ip" ] || host_ip="127.0.0.1"
+    info "Web 地面站桥已启动：/tmp/gcs_test <-> TCP $port（已停掉 sitl_gcs.py）"
+    info "Web 端「连接设备」选 TCP 客户端："
+    info "  地址 127.0.0.1（WSL2 本地转发不通时用 $host_ip）  端口 $port"
+    info "  机载身份 1/25，地面站必须是 255/190；连上后应看到 65011/65012/65013 回传"
+    info "日志：$LOG_DIR/webgcs.log"
+}
+
 cmd_status() {
     echo "== tmux 会话 =="; tmux ls 2>&1 | head -10
     echo "== 进程 =="; pgrep -af "[p]x4_sitl|[g]z sim|[s]itl_pty_bridge|[s]itl_gcs|[d]rone_control" | head -10
@@ -226,6 +258,7 @@ case "${1:-}" in
     stack)  shift; cmd_stack "$@" ;;
     app)    shift; cmd_app "$@" ;;
     smoke)  shift; cmd_smoke "$@" ;;
+    webgcs) shift; cmd_webgcs "$@" ;;
     stop)   stop_all ;;
     status) cmd_status ;;
     ""|-h|--help|help)

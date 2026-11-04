@@ -11,7 +11,10 @@
   场景（S2→S5、取消、目标等待/丢失、低电等），见
   [`docs/PX4实链验证清单.md`](../docs/PX4实链验证清单.md) §7.4；
 - `build/px4_link_smoke`：G1~G3 与 S11~S14 分级场景，见
-  [`px4_link_smoke.md`](px4_link_smoke.md)、[`PX4_SITL分级测试.md`](PX4_SITL分级测试.md)。
+  [`px4_link_smoke.md`](px4_link_smoke.md)、[`PX4_SITL分级测试.md`](PX4_SITL分级测试.md)；
+- Web 地面站（`tools/web平台`，跑在 Windows）：`webgcs` 子命令把 `/tmp/gcs_test`
+  桥成 TCP，让 Web 端用「TCP 客户端」链路做真实界面联调（65011/65012/65013 回传、
+  65020 返航/重置、65018 围栏下发），机载代码不改。
 
 **不做什么**：
 
@@ -25,9 +28,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `tools/sitl_harness.sh` | 本装置入口（子命令 `stack`/`app`/`smoke`/`stop`/`status`） |
+| `tools/sitl_harness.sh` | 本装置入口（子命令 `stack`/`app`/`smoke`/`webgcs`/`stop`/`status`） |
 | `tools/sitl_pty_bridge.py` | 双 PTY 桥：`/tmp/gcs_app`（机载串口）↔ `/tmp/gcs_test`（验收工具） |
 | `tools/sitl_gcs.py` | PX4 GCS 链路（UDP 14550）255/190 心跳，并打印 Home/模式 |
+| `tools/sitl_web_gcs.py` | 把 `/tmp/gcs_test` 桥到 TCP（默认 5761），供 Windows 上的 Web 地面站接入（2026-11-04） |
 | `config/px4_sitl_assignment.json` | SITL 验收配置：PX4 走 UDP、地面站串口=`/tmp/gcs_app`、`enable_control=true` |
 | `tools/sitl_restart.sh` | 兼容入口（等价 `sitl_harness.sh stack`），保留给既有证据 README 的复现步骤 |
 
@@ -76,6 +80,28 @@ bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --
 bash tools/sitl_harness.sh status
 bash tools/sitl_harness.sh stop
 ```
+
+### 4.1 接 Web 地面站（`webgcs`，2026-11-04）
+
+Web 地面站（`tools/web平台`）跑在 Windows 上，打不开 WSL 里的 PTY；`webgcs` 用
+`tools/sitl_web_gcs.py` 把验收端点 `/tmp/gcs_test` 桥成 TCP，让 Web 服务端用
+「TCP 客户端」链路接进来。**机载代码与 `serial.device` 都不改**。
+
+```bash
+bash tools/sitl_harness.sh stack                 # 先起环境（PX4+桥+机载）
+bash tools/sitl_harness.sh webgcs                # 停掉 sitl_gcs.py，桥到 TCP 5761
+bash tools/sitl_harness.sh webgcs --port 5762    # 换端口
+```
+
+然后在 Web 端「连接设备」选 **TCP 客户端**：地址 `127.0.0.1`（WSL2 本地转发不通时
+用 `hostname -I` 打印的地址），端口 `5761`。连上后应看到 65011/65012/65013 回传，
+可在界面上点「主动返航」「重置状态」，或在「共享区域」里保存并下发 65018。
+
+> - **同一个端点只能有一个地面站**：`webgcs` 会先停掉 `sitl_gcs.py`（它也发 255/190
+>   心跳，两个一起发会打架）。要回到脚本验收，直接 `stack` 或 `app` 重启即可。
+> - Web 端地面站身份必须是 `255/190`，机载是 `1/25`；不一致时 65010~65022 会被
+>   地址校验丢掉（表现为"链路 online 但看不到任务状态"）。
+> - 桥的日志在 `$LOG_DIR/webgcs.log`，`stop` 会一并清理该会话与进程。
 
 > **场景之间必须 `stop` 并等待数秒**（2026-10-28 复现）：`smoke` 跑完会留下 SITL 进程与
 > 会话状态，紧接着再起下一段会带着上一段的初值起飞，表现为悬停窗口不达标
