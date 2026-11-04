@@ -87,10 +87,12 @@ Px4Link::StateOutput()
 - `FlightStateSnapshot`订阅队列默认容量2，满时丢最旧状态，避免电台拥塞积压旧遥测。
 - 只在对应有效标志为真时发送姿态、位置、GPS、电池和Home消息；无效数据不伪造成有效零值。
 - `FlightStateSnapshot`只有动力电池总压，没有单体电压，因此总压放在`SYS_STATUS.voltage_battery`；`BATTERY_STATUS.voltages[]`保持未知，禁止把总压误当成首节电芯电压。
-- `GLOBAL_POSITION_INT.relative_alt` **自 2026-11-04 起改用 EKF 差分**：`(takeoff_ref_local_z_m − local_z_m) × 1000`，
-  基准由 `Px4Link` 在解锁上升沿抓取（`takeoff_ref_valid`）；基准不可用时发 0，不再用
-  `MSL − HOME_POSITION.alt`（那个会被 GNSS 海拔漂移带偏，见 `docs/故障排查手册.md` §17.9.1）。
-  `alt` 仍是 `MSL`（EKF 绝对海拔），两者口径不同，地面站不要互相换算。
+- `GLOBAL_POSITION_INT.relative_alt` **自 2026-11-04 起改用 EKF 差分**：`(相对高度基准 − local_z_m) × 1000`，
+  基准由 `common::RelativeAltitudeBaseZ()` 决定——优先 `HOME_POSITION.z`（PX4 重设 Home 时
+  随之平移，EKF 高度重置自愈），退化到解锁上升沿抓取的 `takeoff_ref_local_z_m`；
+  都不可用时发 0，不再用 `MSL − HOME_POSITION.alt`（那个会被 GNSS 海拔漂移带偏，
+  见 `docs/故障排查手册.md` §17.9.1）。`alt` 仍是 `MSL`（EKF 绝对海拔），两者口径不同，
+  地面站不要互相换算。
 - 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。实链验证中状态和`TRACK_TARGET_UPDATE`均采用MAVLink2短帧承载：`V2_EXTENSION`头部5字节加协议有效55字节，`mavlink_payload_len=60`，不要求发送满长扩展payload。
 - `HEALTH_STATUS`使用私有`message_type=65012`（版本1），`MISSION_STATUS`使用私有`message_type=65013`（版本2）；两者均为飞机→地面站单向状态消息，不返回ACK。状态变化由输入Topic事件触发立即发送，未变化时按JSON周期发送。65013 v2 在 offset 40/44/48/49 写入`assignment_id/target_id/availability/interceptor_type`，offset 0~39 与 v1 不变；`kHealthStatusProtocolVersion`与`kMissionStatusProtocolVersion`独立，不再共用版本常量。
 - 健康状态字段布局见`docs/地面站目标位置与时间同步协议.md` §13；任务状态中的距离使用毫米整数，未知值为`INT32_MIN`，CPU负载使用百分之一整数。

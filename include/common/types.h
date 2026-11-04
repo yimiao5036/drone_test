@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace drone::common {
@@ -270,6 +271,14 @@ struct FlightStateSnapshot {
     /// 此时围栏只判水平越界，不下发相对高度语义。
     bool takeoff_ref_valid = false;
     float takeoff_ref_local_z_m = 0.f;
+    /// Home 点的 EKF 局部高度（MAVLink HOME_POSITION.z，NED，向下为正）。
+    /// 相对起飞点高度的**首选基准**：PX4 在 EKF 位置相对 Home 漂移超过 2×EPH/EPV
+    /// 时会在 commander/HomePosition 里自动重设 Home，该字段随之整体平移，
+    /// 因此差分 `home_local_z_m − local_z_m` 对 EKF 坐标重置免疫（自愈）；
+    /// `takeoff_ref_local_z_m` 只是 HOME_POSITION 未到时的退化基准。
+    /// 取基准统一走 `RelativeAltitudeBaseZ()`，不要在别处各写一遍。
+    bool home_local_z_valid = false;
+    float home_local_z_m = 0.f;
     /// EKF 投影参考锚点（MAVLink GPS_GLOBAL_ORIGIN = LOCAL_POSITION_NED.ref_* 的
     /// MAVLink 出口）：局部坐标系的 WGS84 锚，与持续刷新的 Home 不同源。该消息为
     /// 变化触发式（锚点变化 >1.1cm 才发），`ned_ref_received_count` 用于判读锚点
@@ -306,6 +315,22 @@ struct FlightStateSnapshot {
     uint8_t last_ack_result = 0;        ///< 最近 ACK 结果
     uint64_t last_ack_time_ms = 0;
 };
+
+/// 相对起飞点高度基准（NED z，向下为正），供围栏判据、飞控钳制、65011 下传共用：
+/// 1. 优先 HOME_POSITION.z——PX4 会在 EKF 漂移超阈值时重设 Home，基准随坐标系整体
+///    平移，`基准 − local_z` 因此对 EKF 高度重置免疫（与 PX4 任务相对高度的自愈一致）；
+/// 2. 退化到解锁瞬间抓取的 local_z 快照（HOME_POSITION 未到 / 旧固件）；
+/// 3. 都不可用返回 nullopt——调用方按“只判水平、不下发相对高度”处理。
+inline std::optional<double> RelativeAltitudeBaseZ(
+    const FlightStateSnapshot& state) {
+    if (state.home_local_z_valid) {
+        return static_cast<double>(state.home_local_z_m);
+    }
+    if (state.takeoff_ref_valid) {
+        return static_cast<double>(state.takeoff_ref_local_z_m);
+    }
+    return std::nullopt;
+}
 
 /// 控制意图类型（状态机/策略 → 飞行控制）。
 enum class ControlIntentType : uint8_t {

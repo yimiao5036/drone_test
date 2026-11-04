@@ -181,8 +181,10 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
    上报 `no_zone`）与 PX4 侧参数兜底。
 4. 高度上限：仅多边形生效且 `alt_max_m > 0` 时按区域高度带上限钳制；否则不设上限。
    **基准按 `FencePolygonNed.altitude_reference` 选**（2026-11-04）：
-   `1`（相对起飞点）用 EKF 差分 `h = takeoff_ref_local_z_m − target_z`，基准不可用
-   （未解锁过 / `InvalidateVolatileState()` 后）不钳制，与围栏“只判水平”一致；
+   `1`（相对起飞点）用 EKF 差分 `h = base_z − target_z`，`base_z` 取
+   `common::RelativeAltitudeBaseZ()`（优先 `HOME_POSITION.z`，PX4 重设 Home 时随之前移；
+   退化到解锁快照 `takeoff_ref_local_z_m`），基准不可用（未解锁过 /
+   `InvalidateVolatileState()` 后）不钳制，与围栏“只判水平”一致；
    `0`（AMSL）用 `h = ned_ref_alt − target_z`，无锚点时退回旧近似 `h = −target_z`。
    **禁止直接用 `−target_z` 当相对高度**：EKF 原点是 `GPS_GLOBAL_ORIGIN` 锚点，
    与地面可差十几米（0084 现场地面 `local_z≈−21.4m`），直接比较会把 S4 的 2m 目标
@@ -207,7 +209,8 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   `RejectedIntentCount`（无基准不可围栏）。
 - **水平**：按多边形内缩 `fence_margin_m` 钳制（`fence::ClampIntoPolygon`），
   不再有圆形半径；顶点不足 3 或多边形无效时**不钳制**。
-- **高度**：基准见 `altitude_reference`（1=相对起飞点，`takeoff_ref_local_z_m − z`；
+- **高度**：基准见 `altitude_reference`（1=相对起飞点，`base_z − z`，`base_z` 取
+  `common::RelativeAltitudeBaseZ()`：优先 `HOME_POSITION.z`、退化解锁快照；
   0=AMSL，`ned_ref_alt − z`）；仅当区域 `alt_max_m > 0` 时超限钳制到
   `z = base_z − alt_max_m`（不设下限，近地/贴地由任务层负责）。
   `2026-11-04` 之前这里用 `h = −z`，隐含“局部 NED 原点即地面”，与锚点实际高度

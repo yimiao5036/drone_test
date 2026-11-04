@@ -1035,13 +1035,17 @@ private:
         }
     }
 
-    // Home 点：经纬度 1e7 与 MSL 高度；到达后保持有效直到断连。
+    // Home 点：经纬度 1e7、MSL 高度与 EKF 局部高度（NED z）；到达后保持有效直到断连。
+    // home.z 参与相对起飞点高度计算（`common::RelativeAltitudeBaseZ`）——PX4 会在
+    // EKF 位置相对 Home 漂移超阈值时重设 Home，此时 z 与本条一起平移，差分自愈。
     void HandleHomePosition(const mavlink_message_t& message) {
         mavlink_home_position_t home{};
         mavlink_msg_home_position_decode(&message, &home);
         state_.home_lat_1e7 = home.latitude;
         state_.home_lon_1e7 = home.longitude;
         state_.home_altitude_mm = home.altitude;
+        state_.home_local_z_m = home.z;
+        state_.home_local_z_valid = true;
         state_.home_valid = true;
     }
 
@@ -1352,6 +1356,8 @@ private:
         state_.rc_state_valid = false;
         state_.rc_connected = false;
         state_.home_valid = false;
+        state_.home_local_z_valid = false;
+        state_.home_local_z_m = 0.f;
         state_.ned_ref_valid = false;
         state_.ned_ref_received_count = 0;
         // 起飞基准同属易变状态：断连后重新解锁必须重新抓取（否则沿途 local_z

@@ -396,8 +396,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     越界持续到 `violation_debounce_ms` 才动作，避免单帧抖动触发中止链。
   - 高度带语义（2026-10-30 现场日志 0078 修正，**2026-11-04 换基准**）：`altitude_reference=1`
     （相对起飞点，原"相对 Home"）的高度由 **EKF 差分**给出——
-    `takeoff_ref_local_z_m − local_z_m`（基准由 `Px4Link` 在解锁上升沿抓取，
-    见 `include/communication/px4_link.md`），地面恒 0，不吃 GNSS 海拔漂移；
+    `相对高度基准 − local_z_m`，基准统一取 `common::RelativeAltitudeBaseZ()`：
+    **优先 `HOME_POSITION.z`**（PX4 在 EKF 漂移超 `2×EPH/2×EPV` 时重设 Home，基准随
+    局部坐标系一起平移，对 EKF 高度重置免疫、与 PX4 任务相对高度同源），
+    `HOME_POSITION` 未到达时退化到解锁上升沿抓取的 `takeoff_ref_local_z_m`
+    （见 `include/communication/px4_link.md`）；地面恒 0，不吃 GNSS 海拔漂移；
     该基准**一律不判下限**（有效下限恒 0）——高度从地面起算，起飞必然穿过 0→设定值，而
     S3/S4 在围栏动作生效态、防抖只有 `violation_debounce_ms`（1.5s），旧实现
     （`alt_min=5m`）会让地面静止就被判 `kViolated`、解锁后立刻中止返航；地面站表单
@@ -946,6 +949,8 @@ ctest --test-dir build --output-on-failure
   `MissionCommandAckSequenceIncrementsOnce`（65021 序号逐条 +1）。
 - 围栏高度基准（2026-11-04）：`FenceAltitudeUsesTakeoffReference`（`altitude_reference=1` 用
   EKF 差分——Home 海拔跳 20 m 不改变相对高度，爬升越过 `alt_max` 才报 `kViolated`）、
+  `FenceAltitudeFollowsHomeReanchor`（Home 与 `local_z` 同时平移 15 m，相对高度不变；
+  旧快照仍被使用的话会算成 13 m 误判）、
   `FenceAltitudeUnavailableJudgesHorizontalOnly`（无起飞基准时只判水平、不判高度）、
   `FenceAltitudeHysteresisAwaitsClearance`（−10.5 m 越界 → −9.5 m 仍越界 → −8.0 m 才恢复）。
 - 65020 重置任务状态（2026-11-04）：`MissionCommandResetStateReturnsDisarmedToReady`

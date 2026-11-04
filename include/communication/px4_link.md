@@ -237,10 +237,19 @@ bits 24..31 → flight_sub_mode（sub mode）
   在 HEARTBEAT 的**解锁上升沿**（`armed` false→true）抓一次 `state_.local_z_m` 作为
   "相对高度 0"；若当时还没有 `LOCAL_POSITION_NED`，置 `takeoff_ref_pending_`，
   等 `HandleLocalPosition()` 到达时补抓（`CaptureTakeoffReference()`）。链路失效
-  （`InvalidateVolatileState()`）清空基准，下次解锁重新抓。用途：围栏高度判定与
-  65011 `relative_alt` 下传都改成 `takeoff_ref_local_z_m − local_z_m`（EKF 差分），
+  （`InvalidateVolatileState()`）清空基准，下次解锁重新抓。**该基准只是兜底**：
+  首选见下一条 `home_local_z`。用途：围栏高度判定、飞控高度钳制与 65011
+  `relative_alt` 下传统一走 `common::RelativeAltitudeBaseZ()`（EKF 差分），
   不再用两个 GNSS 绝对海拔相减（`ned_ref_alt − local_z − home_alt`），后者会被
   Home 海拔漂移带偏，见 `docs/故障排查手册.md` §17.9.1。
+- **Home 局部高度**（2026-11-04 新增）：`home_local_z_valid/home_local_z_m`——
+  从 `HOME_POSITION.z` 解析（EKF 局部 NED 高度，不是 `altitude`）。它是"相对起飞点
+  高度"的**首选基准**：PX4 在 EKF 位置相对 Home 漂移超过 `2×EPH/2×EPV` 时会重设
+  Home（`commander/HomePosition` 的 `hasMovedFromCurrentHomeLocation()`），该字段
+  与 `local_z` 同属一个局部坐标系、一起平移，因此差分对 EKF 高度重置免疫（自愈），
+  与 PX4 任务相对高度同源。取值统一走 `common::RelativeAltitudeBaseZ()`：先 Home
+  `z`、再 `takeoff_ref`、都无则 `nullopt`（调用方按"只判水平/不下发相对高度"处理）。
+  链路失效一并清空。
 
 各类周期遥测使用 `telemetry_timeout` 判断新鲜度。超时后保留最后数值供排查，但将对应 valid
 标志清零，控制模块只能使用 valid=true 的字段。Home 在心跳连接期间保持有效，但连接断开时

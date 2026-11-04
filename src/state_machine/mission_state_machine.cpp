@@ -1980,11 +1980,13 @@ private:
             return std::nullopt;
         }
         if (altitude_reference != 0U) {
-            if (!flight.takeoff_ref_valid) {
+            // 基准优先 HOME_POSITION.z（PX4 重设 Home 时随之平移，EKF 重置自愈），
+            // 退化到解锁瞬间快照；都不可用则只判水平。
+            const auto base_z = common::RelativeAltitudeBaseZ(flight);
+            if (!base_z.has_value()) {
                 return std::nullopt;
             }
-            return static_cast<double>(flight.takeoff_ref_local_z_m) -
-                   static_cast<double>(flight.local_z_m);
+            return *base_z - static_cast<double>(flight.local_z_m);
         }
         if (!flight.ned_ref_valid) {
             return std::nullopt;

@@ -820,8 +820,9 @@ private:
                 if (state.ned_ref_valid) {
                     base_z = static_cast<double>(state.ned_ref_alt_mm) * 1e-3;
                 }
-            } else if (state.takeoff_ref_valid && state.local_position_valid) {
-                base_z = static_cast<double>(state.takeoff_ref_local_z_m);
+            } else if (const auto takeoff_base = common::RelativeAltitudeBaseZ(state);
+                       takeoff_base.has_value() && state.local_position_valid) {
+                base_z = *takeoff_base;
             } else {
                 altitude_known = false;
             }

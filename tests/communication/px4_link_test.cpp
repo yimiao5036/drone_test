@@ -532,6 +532,7 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
     home.latitude = 312345678;
     home.longitude = 1212345678;
     home.altitude = 100000;
+    home.z = -21.5f;  // EKF 局部高度：相对起飞点高度的首选基准
     AppendEncoded(encoder, &bytes, [&](mavlink_status_t* status, mavlink_message_t* message) {
         return mavlink_msg_home_position_encode_status(
             1, MAV_COMP_ID_AUTOPILOT1, status, message, &home);
@@ -609,6 +610,13 @@ TEST(Px4LinkTest, TelemetryMessagesPopulateFlightStateSnapshot) {
     EXPECT_EQ(snapshot.home_lat_1e7, home.latitude);
     EXPECT_EQ(snapshot.home_lon_1e7, home.longitude);
     EXPECT_EQ(snapshot.home_altitude_mm, home.altitude);
+    // HOME_POSITION.z：相对起飞点高度的首选基准（PX4 重设 Home 时随之平移）
+    EXPECT_TRUE(snapshot.home_local_z_valid);
+    EXPECT_FLOAT_EQ(snapshot.home_local_z_m, home.z);
+    // 基准取值优先级：HOME_POSITION.z 优先于解锁瞬间快照
+    ASSERT_TRUE(common::RelativeAltitudeBaseZ(snapshot).has_value());
+    EXPECT_DOUBLE_EQ(*common::RelativeAltitudeBaseZ(snapshot),
+                     static_cast<double>(home.z));
     // EKF 投影参考锚点（GPS_GLOBAL_ORIGIN）：值与收到计数
     EXPECT_TRUE(snapshot.ned_ref_valid);
     EXPECT_EQ(snapshot.ned_ref_lat_1e7, origin.latitude);

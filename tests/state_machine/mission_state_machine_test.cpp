@@ -4392,6 +4392,79 @@ TEST(MissionStateMachineTest, FenceAltitudeUsesTakeoffReference) {
     DrainAcks(harness.ack_subscription);
 }
 
+/// 相对高度基准优先 HOME_POSITION.z：PX4 在 EKF 位置漂移超阈值时会重设 Home，
+/// 基准与 local_z 同属一个局部坐标系、一起平移，差分因此对 EKF 高度重置免疫。
+/// 用例还顺手证明“冻结在解锁瞬间的 takeoff 快照”不再是首选（否则第二阶段会误判）。
+TEST(MissionStateMachineTest, FenceAltitudeFollowsHomeReanchor) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定与 65019，不执行中止动作
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(6, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 阶段一：Home 的 EKF 局部 z=-21m、当前 z=-23m → 相对起飞 2m，未超上限。
+    auto base = MakeFenceOffboardFlight(5.0f, 5.0f, -23.0f);
+    base.home_local_z_valid = true;
+    base.home_local_z_m = -21.0f;
+    base.takeoff_ref_valid = true;
+    base.takeoff_ref_local_z_m = -21.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(base))
+                    .accepted);
+
+    auto saw_violated = [&harness](std::chrono::milliseconds window) {
+        bool violated = false;
+        const auto deadline = std::chrono::steady_clock::now() + window;
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+            if (status && (*status)->state == common::FenceState::kViolated) {
+                violated = true;
+            }
+        }
+        return violated;
+    };
+    EXPECT_FALSE(saw_violated(400ms))
+        << "相对起飞 2m 未超上限 10m，不得判越界";
+
+    // 阶段二：模拟 EKF 高度重置后 PX4 重设 Home——Home 与 local_z 同时平移 15m
+    // （Home -21→-6、z -23→-8），相对高度仍是 2m。此时旧的解锁快照仍是 -21，
+    // 若还按快照算会得到 -21-(-8)=13m 而误判越界，因此这一阶段区分了两种基准。
+    auto shifted = MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f);
+    shifted.home_local_z_valid = true;
+    shifted.home_local_z_m = -6.0f;
+    shifted.takeoff_ref_valid = true;
+    shifted.takeoff_ref_local_z_m = -21.0f;  // 故意保留旧快照
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        shifted))
+                    .accepted);
+    EXPECT_FALSE(saw_violated(400ms))
+        << "Home 重设后基准应随之平移，相对起飞 2m 不得判越界";
+
+    // 阶段三：同一基准下抬到相对 12m → 超上限 10m，应判越界。
+    auto too_high = MakeFenceOffboardFlight(5.0f, 5.0f, -18.0f);
+    too_high.home_local_z_valid = true;
+    too_high.home_local_z_m = -6.0f;
+    too_high.takeoff_ref_valid = true;
+    too_high.takeoff_ref_local_z_m = -21.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        too_high))
+                    .accepted);
+    EXPECT_TRUE(saw_violated(2000ms))
+        << "Home 重设后相对起飞 12m 超上限 10m，应判越界";
+    DrainAcks(harness.ack_subscription);
+}
+
 /// 高度基准不可用（未解锁过/断连后失效）时只判水平：不拿 GNSS 绝对海拔兜底。
 /// 现场就是被“AMSL − Home”这条兜底路径误判的，宁可少判高度也不能误中止。
 TEST(MissionStateMachineTest, FenceAltitudeUnavailableJudgesHorizontalOnly) {

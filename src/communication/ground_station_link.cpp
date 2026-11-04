@@ -2402,10 +2402,12 @@ private:
             return false;
         }
         int32_t relative_altitude = 0;
-        if (state.takeoff_ref_valid && state.local_position_valid) {
+        // 相对起飞点高度：基准优先 HOME_POSITION.z（随 PX4 重设 Home 平移，EKF
+        // 重置自愈），退化到解锁瞬间快照；不可用发 0（不冒充高度）。
+        const auto base_z = common::RelativeAltitudeBaseZ(state);
+        if (base_z.has_value() && state.local_position_valid) {
             const double relative_m =
-                static_cast<double>(state.takeoff_ref_local_z_m) -
-                static_cast<double>(state.local_z_m);
+                *base_z - static_cast<double>(state.local_z_m);
             relative_altitude = static_cast<int32_t>(std::lround(relative_m * 1000.0));
         }
         const int16_t vx = ClampRounded<int16_t>(
