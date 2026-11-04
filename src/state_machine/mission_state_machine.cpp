@@ -2272,6 +2272,7 @@ private:
             polygon.zone_id = fence_zone_->zone_id;
             polygon.version = fence_zone_->version;
             polygon.action = fence_zone_->action;
+            polygon.altitude_reference = fence_zone_->altitude_reference;
             polygon.alt_min_m = fence_zone_->alt_min_m;
             polygon.alt_max_m = fence_zone_->alt_max_m;
             polygon.vertices.reserve(fence_zone_->vertices.size());

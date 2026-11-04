@@ -180,6 +180,14 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
    只有地面站划定的多边形这一种形态，缺区域即无围栏，靠状态机围栏守卫（65019
    上报 `no_zone`）与 PX4 侧参数兜底。
 4. 高度上限：仅多边形生效且 `alt_max_m > 0` 时按区域高度带上限钳制；否则不设上限。
+   **基准按 `FencePolygonNed.altitude_reference` 选**（2026-11-04）：
+   `1`（相对起飞点）用 EKF 差分 `h = takeoff_ref_local_z_m − target_z`，基准不可用
+   （未解锁过 / `InvalidateVolatileState()` 后）不钳制，与围栏“只判水平”一致；
+   `0`（AMSL）用 `h = ned_ref_alt − target_z`，无锚点时退回旧近似 `h = −target_z`。
+   **禁止直接用 `−target_z` 当相对高度**：EKF 原点是 `GPS_GLOBAL_ORIGIN` 锚点，
+   与地面可差十几米（0084 现场地面 `local_z≈−21.4m`），直接比较会把 S4 的 2m 目标
+   算成 23.4m、钳到 20m 后设定值落到地面以下，表现为“起飞爬升超时 → AUTO.LAND”
+   （`docs/故障排查手册.md` §17.9.1）。
 5. 航向：`setpoint.use_yaw = intent.yaw_valid || intent.yaw_deg != 0.f`——新增
    `ControlIntent.yaw_valid` 解决“正北 0° 无法表达”的历史问题；S12 返航用它
    请求机头朝飞行方向，其余位置意图不置位即保持原机头平移。
@@ -199,8 +207,11 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   `RejectedIntentCount`（无基准不可围栏）。
 - **水平**：按多边形内缩 `fence_margin_m` 钳制（`fence::ClampIntoPolygon`），
   不再有圆形半径；顶点不足 3 或多边形无效时**不钳制**。
-- **高度**：NED z 向下为正，相对高度 = `-z`；仅当区域 `alt_max_m > 0` 时超限钳制到
-  `z = -alt_max_m`（不设下限，近地/贴地由任务层负责）。
+- **高度**：基准见 `altitude_reference`（1=相对起飞点，`takeoff_ref_local_z_m − z`；
+  0=AMSL，`ned_ref_alt − z`）；仅当区域 `alt_max_m > 0` 时超限钳制到
+  `z = base_z − alt_max_m`（不设下限，近地/贴地由任务层负责）。
+  `2026-11-04` 之前这里用 `h = −z`，隐含“局部 NED 原点即地面”，与锚点实际高度
+  不一致，属缺陷（见 `docs/故障排查手册.md` §17.9.1）。
 - 每次钳制生效 `ClampedCount()+1` 并节流 WARN（第 1 次与每满 100 次）。
 
 ## 位置速度前馈（P3，2026-10-19）

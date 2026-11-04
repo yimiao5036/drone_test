@@ -582,8 +582,11 @@ struct FencePolygonNed {
     uint16_t zone_id = 0;
     uint16_t version = 0;
     FenceAction action = FenceAction::kHold;
-    double alt_min_m = 0.0;  ///< 相对 Home 高度下限（m）
-    double alt_max_m = 0.0;  ///< 相对 Home 高度上限（m）；0=用配置默认
+    /// 高度带基准（与 FenceZone::altitude_reference 同义，2026-11-04 起下传）：
+    /// 0=AMSL 绝对海拔，1=相对起飞点（EKF 差分）。钳制方按此选基准，不能默认按 -z。
+    uint8_t altitude_reference = 0;
+    double alt_min_m = 0.0;  ///< 高度下限（m），基准见 altitude_reference
+    double alt_max_m = 0.0;  ///< 高度上限（m）；0=不限制，基准见 altitude_reference
     std::vector<Vec2Ned> vertices;
     bool valid() const { return vertices.size() >= 3; }
 };

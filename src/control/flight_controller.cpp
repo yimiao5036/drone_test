@@ -802,17 +802,40 @@ private:
                 }
             }
         }
-        // 高度：NED z 向下为正，相对 Home 高度 = -z。
+        // 高度：NED z 向下为正。区域高度带的上限**与状态机围栏判据同口径**
+        // （2026-11-04，见 docs/故障排查手册.md §17.9.1）：
+        // - altitude_reference=1（相对起飞点）：h = 起飞基准 local_z − target_z；
+        //   基准不可用（未解锁过/断连失效）时不钳制，与围栏“只判水平”一致。
+        // - altitude_reference=0（AMSL）：h = EKF 锚点高度 − target_z；无锚点时
+        //   退回旧近似 h = −target_z（历史行为，仅兜底）。
+        // **不能直接用 −target_z 当“相对高度”**：EKF 原点(锚点)与地面可差十几米
+        // （0084 现场地面 local_z≈−21.4m），直接比较会把 S4 的 2m 目标算成 23.4m，
+        // 钳到上限后设定值落到地面以下，表现为“起飞爬升超时→AUTO.LAND”。
         // 只有多边形自带高度带上限时才钳制：圆形围栏已随 2026-10-29 裁决删除，
         // 高度保护统一由地面站区域高度带承担（无区域/无上限则不额外钳制）。
         if (zone_active && zone.alt_max_m > 0.0) {
-            const double altitude_m = -target_z;
-            if (altitude_m > zone.alt_max_m) {
-                target_z = -zone.alt_max_m;
-                const uint64_t count = ++clamped_count_;
-                if (ShouldLogThrottled(count)) {
-                    SPDLOG_WARN("飞行控制器围栏高度钳制: h={:.2f} > 区域上限={:.2f} 累计={}",
-                                altitude_m, zone.alt_max_m, count);
+            double base_z = 0.0;
+            bool altitude_known = true;
+            if (zone.altitude_reference == 0U) {
+                if (state.ned_ref_valid) {
+                    base_z = static_cast<double>(state.ned_ref_alt_mm) * 1e-3;
+                }
+            } else if (state.takeoff_ref_valid && state.local_position_valid) {
+                base_z = static_cast<double>(state.takeoff_ref_local_z_m);
+            } else {
+                altitude_known = false;
+            }
+            if (altitude_known) {
+                const double altitude_m = base_z - target_z;
+                if (altitude_m > zone.alt_max_m) {
+                    target_z = base_z - zone.alt_max_m;
+                    const uint64_t count = ++clamped_count_;
+                    if (ShouldLogThrottled(count)) {
+                        SPDLOG_WARN(
+                            "飞行控制器围栏高度钳制: h={:.2f} > 区域上限={:.2f} 基准={} 累计={}",
+                            altitude_m, zone.alt_max_m,
+                            zone.altitude_reference == 0U ? "AMSL" : "起飞点", count);
+                    }
                 }
             }
         }

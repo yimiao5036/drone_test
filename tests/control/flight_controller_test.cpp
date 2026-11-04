@@ -134,11 +134,13 @@ common::FlightStateSnapshot MakeLandedSnapshot() {
 /// 只来自多边形，用例用它注入一份固定的 NED 正方形区域。
 class StubFenceSource final : public common::IFencePolygonSource {
 public:
-    void SetSquare(double half_side_m, double alt_max_m) {
+    void SetSquare(double half_side_m, double alt_max_m,
+                   uint8_t altitude_reference = 0U) {
         zone_ = common::FencePolygonNed{};
         zone_.zone_id = 1;
         zone_.version = 1;
         zone_.action = common::FenceAction::kReturn;
+        zone_.altitude_reference = altitude_reference;
         zone_.alt_min_m = 0.0;
         zone_.alt_max_m = alt_max_m;
         zone_.vertices = {{-half_side_m, -half_side_m},
@@ -826,6 +828,41 @@ TEST_F(FlightControllerAuthorityTest, FenceClampsPositionIntent) {
     Tick();
     EXPECT_FALSE(TakeOutput().has_value());
     EXPECT_GT(controller_.RejectedIntentCount(), 0u);
+}
+
+TEST_F(FlightControllerAuthorityTest, FenceClampsAltitudeByTakeoffReference) {
+    // 2026-11-04：区域高度带基准改为“相对起飞点”后，钳制必须走 EKF 差分
+    // (起飞基准 local_z − target_z)，不能拿 -z 直接比较。0084 现场 EKF 原点
+    // 比地面高约 21.4m，按 -z 比较会把 S4 的 2m 目标算成 23.4m、钳到 20m 后
+    // 设定值落到地面以下，表现为“起飞爬升超时 → AUTO.LAND”（§17.9.1）。
+    fence_source_.SetSquare(100.0, 20.0, /*altitude_reference=*/1U);
+    controller_.SetFencePolygonSource(&fence_source_);
+    auto state = MakeOffboardSnapshot();
+    state.takeoff_ref_valid = true;
+    state.takeoff_ref_local_z_m = -21.0f;  // 起飞点在地面：local_z = -21m
+    px4_link_.SetState(state);
+
+    // 相对高度 2.0m（z=-23.0）在高度带内 → 不钳制，也不被 20m 上限误伤
+    common::ControlIntent inside;
+    inside.type = common::ControlIntentType::kPositionGuide;
+    inside.control_source = 0;
+    inside.target_z = -23.f;
+    PublishIntent(inside);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_NEAR(out->z, -23.f, 1e-4);
+
+    // 相对高度 24m（z=-45.0）超上限 → 钳到 z = -21 - 20 = -41
+    common::ControlIntent outside;
+    outside.type = common::ControlIntentType::kPositionGuide;
+    outside.control_source = 0;
+    outside.target_z = -45.f;
+    PublishIntent(outside);
+    Tick();
+    out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_NEAR(out->z, -41.f, 1e-4);
 }
 
 TEST_F(FlightControllerAuthorityTest, NoPolygonMeansNoClamp) {
