@@ -7,6 +7,8 @@
 <!--
   用途：给维护者演示「接近段速度剖面」的设计取舍，替代口头描述。
   两个世界同时跑：
+    峰值不是拍出来的：无上限时 v_p² = 2·a_a·a_d·D/(a_a+a_d)（三角形，匀速段 0），
+    峰顶被上限削平后才出现匀速段——"最高速度"只是安全上限，真正决定时间的是 a_a / a_d。
     A（蓝）= 我们的设计：v_cruise = max(地板 1.5, |v_t| + 余量)，参考速度按
              加速 / 匀速 / 减速(斜边) / 速度匹配 四段推进（梯形），引导点跟着参考走。
     B（红）= 对照组：去掉余量、去掉地板（v_cruise = |v_t|），纯尾追。
@@ -68,11 +70,11 @@
   .legendbox .dot{width:8px; height:8px; border-radius:50%; border-top:0; margin-right:5px; border:2px solid #409eff; background:#fff}
 
   .stats{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px 12px 6px}
-  .stats .grid{display:grid; grid-template-columns:repeat(9,1fr); gap:6px 10px}
+  .stats .grid{display:grid; grid-template-columns:repeat(12,1fr); gap:6px 8px}
   .stats .cell{border-left:2px solid #eef1f5; padding-left:7px; min-width:0}
   .stats .cell:first-child{border-left:0; padding-left:0}
-  .stats .k{font-size:10px; color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-  .stats .v{font:650 14px/1.35 ui-monospace,Consolas,monospace; white-space:nowrap}
+  .stats .k{font-size:9.5px; color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .stats .v{font:650 13px/1.35 ui-monospace,Consolas,monospace; white-space:nowrap}
   .stats .v small{font:600 9px/1 inherit; color:var(--ink-3); margin-left:1px}
   .stats .verdict{margin-top:5px; font-size:11px; color:var(--ink-2); line-height:1.45}
 
@@ -131,11 +133,14 @@
         <div class="cell"><div class="k">接近速度 v_c</div><div class="v" id="sVc">—</div></div>
         <div class="cell"><div class="k">本机速度</div><div class="v" id="sVd">—</div></div>
         <div class="cell"><div class="k">参考速度 v_ref</div><div class="v" id="sVr">—</div></div>
-        <div class="cell"><div class="k">巡航上限 v_cruise</div><div class="v" id="sVmax">—</div></div>
+        <div class="cell"><div class="k">实际峰值</div><div class="v" id="sVp">—</div></div>
+        <div class="cell"><div class="k">理论峰值</div><div class="v" id="sVpt">—</div></div>
         <div class="cell"><div class="k">刹车距离 d_brake</div><div class="v" id="sDb">—</div></div>
         <div class="cell"><div class="k">稳态接近速率</div><div class="v" id="sRate">—</div></div>
         <div class="cell"><div class="k">参考点领先</div><div class="v" id="sLag">—</div></div>
         <div class="cell"><div class="k">到点用时</div><div class="v" id="sTa">—</div></div>
+        <div class="cell"><div class="k">理论用时</div><div class="v" id="sTt">—</div></div>
+        <div class="cell"><div class="k">匀速段</div><div class="v" id="sTc">—</div></div>
       </div>
       <div class="verdict" id="verdict"></div>
     </section>
@@ -178,21 +183,26 @@
         <output id="marginOut">1.0</output>
       </div>
       <div class="row">
-        <label>加速度</label>
+        <label>加速度 a_a</label>
         <input id="accel" type="range" min="0.4" max="3" step="0.1" value="1">
         <output id="accelOut">1.0 m/s²</output>
       </div>
       <div class="row">
+        <label>减速度 a_d</label>
+        <input id="decel" type="range" min="0.4" max="3" step="0.1" value="1">
+        <output id="decelOut">1.0 m/s²</output>
+      </div>
+      <div class="row">
         <label>策略</label>
         <div class="seg" id="policySeg">
-          <button data-policy="safe" class="on">保守</button>
-          <button data-policy="fast">时间最优</button>
+          <button data-policy="safe">保守</button>
+          <button data-policy="fast" class="on">时间最优</button>
         </div>
       </div>
       <div class="row">
         <label>速度上限</label>
-        <input id="vcap" type="range" min="1" max="6" step="0.1" value="4">
-        <output id="vcapOut">4.0 m/s</output>
+        <input id="vcap" type="range" min="0" max="8" step="0.5" value="0">
+        <output id="vcapOut">由几何决定</output>
       </div>
       <div class="row">
         <label>剖面</label>
@@ -250,8 +260,8 @@ const SPEED_WIN = 25;
 
 const P = {
   vt: 2.0, heading: 90, turn: 'straight',
-  margin: 1.0, accel: 1.0, profile: 'trap', end: 'match', floor: true,
-  policy: 'safe', vcap: 4.0,
+  margin: 1.0, accel: 1.0, decel: 1.0, profile: 'trap', end: 'match', floor: true,
+  policy: 'fast', vcap: 0,
   speed: 2.0, paused: false,
 };
 
@@ -271,15 +281,46 @@ function makeSim(variant) {
     drone: { x: -40, y: 0 }, vel: { x: 0, y: 0 }, guide: { x: -40, y: 0 },
     target: { x: 0, y: 0 }, tv: { x: 0, y: 0 }, tHeading: P.heading,
     trailD: [], trailT: [], hist: [],
-    vref: 0, lag: 0, d: 40, vc: 0, vmax: 0, dbrk: 0, phase: 'idle',
+    vref: 0, lag: 0, d: 40, vc: 0, vmax: 0, vpeak: 0, plateau: Infinity, dbrk: 0, phase: 'idle',
   };
 }
 let A = makeSim('design');
 let B = makeSim('baseline');
 
+const START_D = 40;
+let THEORY = null;
+
+// 闭式解：只有两个加速度和距离时，峰值、总时间、匀速段都能直接算出来。
+//   v_p² = (2·a_a·a_d·D + a_d·v0² + a_a·v_end²) / (a_a + a_d)
+//   无上限 → 匀速段为 0（三角形）；峰顶被上限削平后才有匀速段。
+function theory(d0) {
+  const vtAbs = P.vt;
+  const vEnd = P.end === 'match' ? vtAbs : 0;
+  const offset = P.end === 'match' ? ARRIVAL_RADIUS_M : 0.6;
+  const D = Math.max(0, d0 - offset);
+  const aa = P.accel, ad = P.decel, v0 = 0;
+  const cap = P.vcap > 0 ? P.vcap : Infinity;
+  const plateau = P.policy === 'fast'
+    ? cap
+    : Math.min(cap, P.floor ? Math.max(1.5, vtAbs + P.margin) : vtAbs + P.margin);
+  // 相对系：u = v − v_t（收敛速度）。u 从 u0 加速到峰值再减到 0，
+  // 两个加速度决定峰值：u_p² = (2·a_a·a_d·D + a_d·u0²) / (a_a + a_d)
+  const u0 = v0 - vEnd;
+  const uGeo = Math.sqrt(Math.max(0, (2 * aa * ad * D + ad * u0 * u0) / (aa + ad)));
+  const uCap = isFinite(plateau) ? Math.max(0, plateau - vEnd) : Infinity;
+  const u_p = Math.min(uCap, uGeo);
+  const sA = Math.max(0, (u_p * u_p - u0 * u0) / (2 * aa));
+  const sD = Math.max(0, u_p * u_p / (2 * ad));
+  const cruiseD = Math.max(0, D - sA - sD);
+  const tCruise = u_p > 1e-6 ? cruiseD / u_p : 0;
+  const tTotal = Math.max(0, u_p - u0) / aa + u_p / ad + tCruise;
+  return { vp: vEnd + u_p, u_p, tTotal, tCruise, plateau };
+}
+
 function resetSims() {
   A = makeSim('design');
   B = makeSim('baseline');
+  THEORY = theory(START_D);
   const h = P.heading * Math.PI / 180;
   for (const s of [A, B]) {
     s.tv = { x: P.vt * Math.sin(h), y: P.vt * Math.cos(h) };
@@ -313,44 +354,52 @@ function stepSim(s, dt) {
   s.vc = vdAlong - vtAlong;
 
   const vtAbs = Math.hypot(s.tv.x, s.tv.y);
-  // 两种策略的差别只在"巡航上限怎么定"：
-  //   safe = 只保证稳态收敛：max(地板, |v_t| + 余量)          → 目标不动时只飞 1.5
-  //   fast = 时间最优：直接顶到 V_max，靠 d_brake 决定何时减速 → 目标不动时也全速接近
-  let vmax;
-  if (s.variant === 'design') {
-    vmax = P.policy === 'fast'
-      ? P.vcap
-      : (P.floor ? Math.max(1.5, vtAbs + P.margin) : vtAbs + P.margin);
-    vmax = Math.min(vmax, P.vcap);
-  } else {
-    vmax = vtAbs;
-  }
-  vmax = Math.max(0, vmax);
-  s.vmax = vmax;
-
   const vEnd = P.end === 'match' ? vtAbs : 0;
   const offset = P.end === 'match' ? ARRIVAL_RADIUS_M : 0.6;
-  s.dbrk = Math.max(0, offset + (vmax * vmax - vEnd * vEnd) / (2 * P.accel) * BRAKE_SAFETY + BRAKE_PAD_M);
+
+  // 上限：0 = 不设上限 → 峰值由「剩余距离 + 两个加速度」自己算出来（三角形剖面）
+  const cap = P.vcap > 0 ? P.vcap : Infinity;
+  // 平台速度：时间最优直接顶到上限；保守只保证稳态收敛（目标不动时取地板 1.5）
+  let plateau;
+  if (s.variant === 'design') {
+    plateau = P.policy === 'fast'
+      ? cap
+      : Math.min(cap, P.floor ? Math.max(1.5, vtAbs + P.margin) : vtAbs + P.margin);
+  } else {
+    plateau = vtAbs;
+  }
+  plateau = Math.max(0, plateau);
+
+  // 刹车包络（相对系）：目标以 v_t 后退，先追上 v_t 才谈得上收敛，
+  // 所以包络是 v_t + √(2·a_d·s)，不是"从当前速度刹到停止"的 √(2a s + v_end²)。
+  const envelope = vEnd + Math.sqrt(Math.max(0, 2 * P.decel * Math.max(0, d - offset)));
+  const vTop = Math.min(plateau, envelope);
 
   let vref, phase;
-  if (vmax <= 1e-3) {
+  if (vTop <= 1e-3) {
     vref = 0; phase = 'idle';
   } else if (P.profile === 'step') {
-    vref = Math.min(vmax, Math.sqrt(Math.max(0, 2 * P.accel * Math.max(0, d - offset)) + vEnd * vEnd));
-    phase = vref >= vmax - 1e-3 ? 'cruise' : 'decel';
-  } else if (d > s.dbrk) {
-    vref = Math.min(vmax, s.vref + P.accel * dt);
-    phase = vref >= vmax - 1e-3 ? 'cruise' : 'accel';
+    // 现状：参考点直接跳到包络/上限，速度是台阶
+    vref = vTop; phase = isFinite(plateau) && vTop >= plateau - 1e-3 ? 'cruise' : 'decel';
+  } else if (vTop < s.vref - 1e-6) {
+    // 刹车包络已经压到当前速度以下 → 减速斜边
+    vref = vTop; phase = 'decel';
   } else {
-    vref = Math.sqrt(Math.max(0, 2 * P.accel * Math.max(0, d - offset)) + vEnd * vEnd);
-    phase = 'decel';
+    // 加速斜坡：斜率就是 a_a；与包络相交处就是峰值，不需要事先定巡航速度
+    vref = Math.min(vTop, s.vref + P.accel * dt);
+    phase = (isFinite(plateau) && vref >= plateau - 1e-3) ? 'cruise' : 'accel';
   }
   if (P.end === 'match' && d <= ARRIVAL_RADIUS_M + 0.02) { vref = vEnd; phase = 'match'; }
-  vref = Math.min(vmax, Math.max(0, vref));
+  vref = Math.min(vTop, Math.max(0, vref));
   s.vref = vref;
   s.phase = phase;
+  s.vpeak = Math.max(s.vpeak || 0, vref);
+  s.vmax = isFinite(plateau) ? plateau : 0;
+  s.plateau = plateau;
+  const uNow = Math.max(0, vref - vEnd);
+  s.dbrk = Math.max(0, offset + uNow * uNow / (2 * P.decel) * BRAKE_SAFETY + BRAKE_PAD_M);
 
-  const guideSpeed = P.profile === 'step' ? vmax : vref;
+  const guideSpeed = P.profile === 'step' ? (isFinite(plateau) ? plateau : vref) : vref;
   s.guide.x += ux * guideSpeed * dt;
   s.guide.y += uy * guideSpeed * dt;
   s.lag = Math.hypot(s.guide.x - s.drone.x, s.guide.y - s.drone.y);
@@ -358,7 +407,8 @@ function stepSim(s, dt) {
   const cmdX = ux * vref, cmdY = uy * vref;
   let ax = (cmdX - s.vel.x) / dt, ay = (cmdY - s.vel.y) / dt;
   const aMag = Math.hypot(ax, ay);
-  if (aMag > P.accel) { ax *= P.accel / aMag; ay *= P.accel / aMag; }
+  const aLimit = (phase === 'decel' || phase === 'match') ? P.decel : P.accel;
+  if (aMag > aLimit) { ax *= aLimit / aMag; ay *= aLimit / aMag; }
   s.vel.x += ax * dt; s.vel.y += ay * dt;
   s.drone.x += s.vel.x * dt; s.drone.y += s.vel.y * dt;
   s.t += dt;
@@ -395,10 +445,10 @@ function drawScene() {
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = '#f8fafc'; ctx.fillRect(0, 0, w, h);
 
-  const pts = [A.drone, B.drone, A.target];
+  const pts = [A.drone, A.target];  // 对照机停在 42 m 外，不参与取景，否则镜头一直很宽
   const minX = Math.min(...pts.map(p => p.x)), maxX = Math.max(...pts.map(p => p.x));
   const minY = Math.min(...pts.map(p => p.y)), maxY = Math.max(...pts.map(p => p.y));
-  const spanX = Math.max(46, maxX - minX), spanY = Math.max(26, maxY - minY);
+  const spanX = Math.max(26, maxX - minX), spanY = Math.max(22, maxY - minY);
   const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
   let scale = Math.min((w - 100) / (spanX + 26), (h - 96) / (spanY + 26));
   scale = Math.max(1.5, Math.min(9, scale));
@@ -570,7 +620,7 @@ function drawSpeedChart() {
   ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
   const tEnd = Math.max(SPEED_WIN, A.t);
   const tStart = tEnd - SPEED_WIN;
-  const yMax = Math.max(2, Math.ceil((Math.max(A.vmax, A.vref, 1) + 0.4) * 2) / 2);
+  const yMax = Math.max(2, Math.ceil((Math.max(A.vmax, A.vref, A.vpeak || 0, 1) + 0.4) * 2) / 2);
   const g = axes(ctx, w, h, tStart, tEnd, yMax, yMax <= 2 ? 0.5 : 1, '速度 m/s', 5);
 
   let start = null, cur = null;
@@ -600,7 +650,7 @@ function drawSpeedChart() {
     ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(180,83,9,.55)'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(g.padL, g.Y(A.vmax)); ctx.lineTo(g.padL + g.iw, g.Y(A.vmax)); ctx.stroke(); ctx.restore();
     ctx.fillStyle = 'rgba(180,83,9,.85)'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
-    ctx.fillText('v_cruise ' + A.vmax.toFixed(1), g.padL + g.iw - 64, g.Y(A.vmax) - 4);
+    ctx.fillText('上限 ' + A.vmax.toFixed(1), g.padL + g.iw - 64, g.Y(A.vmax) - 4);
   }
 }
 
@@ -618,26 +668,35 @@ function updateHud() {
   bp.className = 'badge' + (A.arrived ? ' on' : '');
 
   const vtAbs = Math.hypot(A.tv.x, A.tv.y);
-  const rate = A.vmax - vtAbs;
+  // 判词读平台速度：无上限时平台是 ∞，就用已经跑到的峰值当"能维持的速度"
+  const sustain = isFinite(A.plateau) ? A.plateau : (A.vpeak || 0);
+  const rate = sustain - vtAbs;
   $('sD').innerHTML = A.d.toFixed(2) + '<small>m</small>';
   $('sVc').innerHTML = A.vc.toFixed(2) + '<small>m/s</small>';
   $('sVd').innerHTML = Math.hypot(A.vel.x, A.vel.y).toFixed(2) + '<small>m/s</small>';
   $('sVr').innerHTML = A.vref.toFixed(2) + '<small>m/s</small>';
-  $('sVmax').innerHTML = A.vmax.toFixed(2) + '<small>m/s</small>';
+  $('sVp').innerHTML = (A.vpeak || 0).toFixed(2) + '<small>m/s</small>';
+  $('sVpt').innerHTML = THEORY ? THEORY.vp.toFixed(2) + '<small>m/s</small>' : '—';
+  $('sTt').innerHTML = THEORY ? THEORY.tTotal.toFixed(1) + '<small>s</small>' : '—';
+  $('sTc').innerHTML = THEORY ? THEORY.tCruise.toFixed(1) + '<small>s</small>' : '—';
   $('sDb').innerHTML = A.dbrk.toFixed(2) + '<small>m</small>';
   $('sRate').innerHTML = rate.toFixed(2) + '<small>m/s</small>';
   $('sLag').innerHTML = A.lag.toFixed(2) + '<small>m</small>';
   $('sTa').innerHTML = A.arrivedAt != null ? A.arrivedAt.toFixed(1) + '<small>s</small>' : '—';
 
   const v = $('verdict');
-  if (vtAbs > 0.05 && A.vmax <= vtAbs + 0.05) {
-    v.innerHTML = `<b style="color:#c0392b">追不上</b>：v_cruise=${A.vmax.toFixed(2)} ≤ 目标 ${vtAbs.toFixed(2)} m/s，`
+  if (vtAbs > 0.05 && sustain <= vtAbs + 0.05) {
+    v.innerHTML = `<b style="color:#c0392b">追不上</b>：v_cruise=${sustain.toFixed(2)} ≤ 目标 ${vtAbs.toFixed(2)} m/s，`
       + `稳态 ḋ≈0 —— 距离停在加速期拉开的差值上（红色虚线不收敛）。余量就是稳态收敛速率。`;
   } else if (P.policy === 'fast') {
-    v.innerHTML = `<b style="color:#3d7a1f">时间最优</b>：巡航顶到 V_max=${P.vcap.toFixed(1)} m/s，`
-      + `在刹车包络（d_brake=${A.dbrk.toFixed(2)} m）处切减速，末端匹配目标速度——`
-      + `目标不动时也是全速接近，不会因为"余量只有 1"而慢慢蹭。`;
-  } else if (A.vmax <= 1e-3) {
+    const tp = THEORY ? THEORY.vp.toFixed(2) : '—';
+    const capTxt = P.vcap > 0 ? `上限 ${P.vcap.toFixed(1)} m/s` : `无固定上限，峰值 ${tp} m/s 由几何算出（三角形）`;
+    const cruiseTxt = THEORY && THEORY.tCruise < 0.05
+      ? '匀速段为 0——加速度拉满、到点即减速，不需要"先定一个巡航速度"。'
+      : `匀速段 ${THEORY ? THEORY.tCruise.toFixed(1) : '—'} s（峰顶被上限削平）。`;
+    v.innerHTML = `<b style="color:#3d7a1f">时间最优</b>：${capTxt}，`
+      + `在刹车包络处按 a_d=${P.decel.toFixed(1)} m/s² 切减速，末端匹配目标速度。${cruiseTxt}`;
+  } else if (sustain <= 1e-3) {
     v.innerHTML = `目标不动：v_cruise=0，飞机原地等待（地板 1.5 m/s 不生效）。`;
   } else {
     v.innerHTML = `<b style="color:#3d7a1f">可追上</b>：稳态 ḋ ≈ −${rate.toFixed(2)} m/s（= v_cruise − v_t）；`
@@ -686,7 +745,8 @@ bindRange('vt', 'vt', v => v.toFixed(1) + ' m/s');
 bindRange('hdg', 'heading', v => v.toFixed(0) + '°');
 bindRange('margin', 'margin', v => v.toFixed(1));
 bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
-bindRange('vcap', 'vcap', v => v.toFixed(1) + ' m/s');
+bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
+bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '由几何决定');
 bindRange('speed', 'speed', v => v.toFixed(1) + '×');
 bindSeg('turnSeg', 'turn');
 bindSeg('profSeg', 'profile');
