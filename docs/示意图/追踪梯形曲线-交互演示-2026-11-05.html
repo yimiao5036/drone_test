@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>追踪速度梯形曲线 · 交互演示（2026-11-05）</title>
+<!--
+  用途：给维护者演示「接近段速度剖面」的设计取舍，替代口头描述。
+  两个世界同时跑：
+    A（蓝）= 我们的设计：v_cruise = max(地板 1.5, |v_t| + 余量)，参考速度按
+             加速 / 匀速 / 减速(斜边) / 速度匹配 四段推进（梯形），引导点跟着参考走。
+    B（红）= 对照组：去掉余量、去掉地板（v_cruise = |v_t|），纯尾追。
+
+  这张图要说明的两件事：
+    1) 余量决定「能不能追上」——稳态 ḋ = -(v_cruise - v_t)，余量为 0 时距离停在
+       加速期拉开的差值上（红色虚线贴住 +42 m 不收敛）；
+    2) 梯形决定「怎么追」——加速斜坡、巡航平台、减速斜边、末端速度匹配。
+      没有加速段的现状（剖面=现状）会让参考点跑到飞机前面 4~5 m。
+
+  配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
+  警示 #b45309、危险 #c0392b、成功 #3d7a1f。
+-->
+<style>
+  :root{
+    --bg:#f5f7fa; --panel:#fff; --line:#e4e7ed; --line-2:#dcdfe6;
+    --ink:#303133; --ink-2:#606266; --ink-3:#909399;
+    --primary:#1677d2; --primary-fill:#409eff;
+    --warning:#b45309; --danger:#c0392b; --success:#3d7a1f; --target:#c2410c;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:13px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    display:grid; grid-template-rows:52px 1fr 232px; height:100vh; min-height:720px;
+  }
+  header{
+    display:flex; align-items:center; gap:14px; padding:0 16px;
+    background:var(--panel); border-bottom:1px solid var(--line);
+  }
+  header h1{font-size:14px; margin:0; font-weight:650; white-space:nowrap}
+  header .sub{color:var(--ink-3); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  header .spacer{flex:1}
+  .badge{
+    font:600 11px/1 ui-monospace,Consolas,monospace; padding:5px 9px; white-space:nowrap;
+    border-radius:6px; border:1px solid var(--line-2); color:var(--ink-2); background:#fafafa;
+  }
+  .badge.on{border-color:#bcd6f5; background:#eef5ff; color:var(--primary)}
+
+  main{display:grid; grid-template-columns:1fr 340px; gap:12px; padding:12px; min-height:0}
+  .stagecol{display:grid; grid-template-rows:1fr auto; gap:10px; min-height:0}
+
+  .stage{position:relative; min-height:0; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden}
+  #scene{display:block; width:100%; height:100%}
+  .hud{position:absolute; top:10px; left:12px; display:flex; gap:8px; flex-wrap:wrap; pointer-events:none}
+  .hud .box{background:rgba(255,255,255,.94); border:1px solid var(--line-2); border-radius:8px; padding:5px 9px; min-width:82px}
+  .hud .k{font-size:10px; color:var(--ink-3)}
+  .hud .v{font:650 15px/1.3 ui-monospace,Consolas,monospace; color:var(--ink)}
+  .hud .v small{font:600 10px/1 inherit; color:var(--ink-3); margin-left:2px}
+  .hud .box.blue .v{color:var(--primary)}
+  .hud .box.orange .v{color:var(--target)}
+  .legendbox{
+    position:absolute; left:12px; bottom:10px; display:flex; gap:12px; flex-wrap:wrap;
+    background:rgba(255,255,255,.94); border:1px solid var(--line-2); border-radius:8px;
+    padding:6px 10px; font-size:11px; color:var(--ink-2); pointer-events:none;
+  }
+  .legendbox i{display:inline-block; width:14px; height:0; border-top-width:2px; margin-right:5px; vertical-align:middle}
+  .legendbox .dot{width:8px; height:8px; border-radius:50%; border-top:0; margin-right:5px; border:2px solid #409eff; background:#fff}
+
+  .stats{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px 12px 6px}
+  .stats .grid{display:grid; grid-template-columns:repeat(8,1fr); gap:6px 10px}
+  .stats .cell{border-left:2px solid #eef1f5; padding-left:7px; min-width:0}
+  .stats .cell:first-child{border-left:0; padding-left:0}
+  .stats .k{font-size:10px; color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .stats .v{font:650 14px/1.35 ui-monospace,Consolas,monospace; white-space:nowrap}
+  .stats .v small{font:600 9px/1 inherit; color:var(--ink-3); margin-left:1px}
+  .stats .verdict{margin-top:5px; font-size:11px; color:var(--ink-2); line-height:1.45}
+
+  aside.panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; overflow:auto}
+  aside h2{font-size:12px; margin:0 0 6px; color:var(--ink-2); font-weight:650}
+  .group{border-top:1px solid var(--line); padding-top:9px; margin-top:9px}
+  .group:first-of-type{border-top:0; margin-top:0; padding-top:0}
+  .row{display:grid; grid-template-columns:72px 1fr 56px; align-items:center; gap:7px; margin:5px 0}
+  .row label{font-size:12px; color:var(--ink-2); white-space:nowrap}
+  .row output{font:600 11px/1 ui-monospace,Consolas,monospace; text-align:right}
+  input[type=range]{width:100%; accent-color:var(--primary-fill); height:16px}
+  .seg{display:flex; gap:4px}
+  .seg button{flex:1; font:600 11px/1 inherit; padding:6px 4px; border-radius:6px; cursor:pointer; border:1px solid var(--line-2); background:#fff; color:var(--ink-2); white-space:nowrap}
+  .seg button.on{background:#eef5ff; border-color:#bcd6f5; color:var(--primary)}
+  .presets{display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:6px}
+  .presets button{font:600 11px/1 inherit; padding:6px 2px; border-radius:6px; cursor:pointer; border:1px dashed var(--line-2); background:#fafafa; color:var(--ink-2)}
+  .presets button:hover{border-color:#bcd6f5; color:var(--primary)}
+  .btn{width:100%; margin-top:6px; font:650 12px/1 inherit; padding:8px; border-radius:8px; cursor:pointer; border:1px solid var(--line-2); background:#fff; color:var(--ink)}
+  .btn.primary{background:var(--primary-fill); border-color:var(--primary-fill); color:#fff}
+
+  .charts{display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:0 12px 12px; min-height:0}
+  .chart{position:relative; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; min-height:0}
+  .chart canvas{display:block; width:100%; height:100%}
+  .chart .cap{position:absolute; top:7px; left:11px; font-size:11px; color:var(--ink-2); background:rgba(255,255,255,.92); padding:1px 5px; border-radius:5px; pointer-events:none}
+  .chart .cap b{color:var(--ink)}
+</style>
+</head>
+<body>
+<header>
+  <h1>接近段速度剖面 · 梯形曲线（交互）</h1>
+  <span class="sub">蓝 = 设计（梯形 + 余量）　红 = 对照（无余量、无下限，纯尾追）</span>
+  <span class="spacer"></span>
+  <span class="badge" id="badgePhase">推进中</span>
+  <span class="badge" id="badgeTime">t = 0.0 s</span>
+</header>
+
+<main>
+  <div class="stagecol">
+    <section class="stage">
+      <canvas id="scene"></canvas>
+      <div class="hud" id="hud"></div>
+      <div class="legendbox">
+        <span><i style="border-color:#409eff"></i>设计机（梯形）</span>
+        <span><i style="border-color:#c0392b;border-top-style:dashed"></i>对照机（无余量）</span>
+        <span><i style="border-color:#c2410c"></i>目标</span>
+        <span><i style="border-color:#1677d2;border-top-style:dotted"></i>视线</span>
+        <span><span class="dot"></span>引导点</span>
+        <span><span class="dot" style="border-color:#b45309;border-style:dashed"></span>刹车点</span>
+        <span>空格 = 暂停　R = 重跑</span>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="grid">
+        <div class="cell"><div class="k">视线距离 d</div><div class="v" id="sD">—</div></div>
+        <div class="cell"><div class="k">接近速度 v_c</div><div class="v" id="sVc">—</div></div>
+        <div class="cell"><div class="k">本机速度</div><div class="v" id="sVd">—</div></div>
+        <div class="cell"><div class="k">参考速度 v_ref</div><div class="v" id="sVr">—</div></div>
+        <div class="cell"><div class="k">巡航上限 v_cruise</div><div class="v" id="sVmax">—</div></div>
+        <div class="cell"><div class="k">刹车距离 d_brake</div><div class="v" id="sDb">—</div></div>
+        <div class="cell"><div class="k">稳态接近速率</div><div class="v" id="sRate">—</div></div>
+        <div class="cell"><div class="k">参考点领先</div><div class="v" id="sLag">—</div></div>
+      </div>
+      <div class="verdict" id="verdict"></div>
+    </section>
+  </div>
+
+  <aside class="panel">
+    <div class="group">
+      <h2>目标</h2>
+      <div class="row">
+        <label>目标速度</label>
+        <input id="vt" type="range" min="0" max="4" step="0.1" value="2">
+        <output id="vtOut">2.0 m/s</output>
+      </div>
+      <div class="row">
+        <label>目标航向</label>
+        <input id="hdg" type="range" min="0" max="360" step="5" value="90">
+        <output id="hdgOut">90°</output>
+      </div>
+      <div class="row">
+        <label>机动</label>
+        <div class="seg" id="turnSeg">
+          <button data-turn="straight" class="on">直线</button>
+          <button data-turn="circle">绕圈</button>
+          <button data-turn="weave">蛇形</button>
+        </div>
+      </div>
+      <div class="presets">
+        <button data-preset="static">静止</button>
+        <button data-preset="line2">2 直线</button>
+        <button data-preset="circle2">2 绕圈</button>
+        <button data-preset="weave3">3 蛇形</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2>设计参数（对照组固定「无余量、无下限」）</h2>
+      <div class="row">
+        <label>速度余量</label>
+        <input id="margin" type="range" min="0" max="2" step="0.1" value="1">
+        <output id="marginOut">1.0</output>
+      </div>
+      <div class="row">
+        <label>加速度</label>
+        <input id="accel" type="range" min="0.4" max="3" step="0.1" value="1">
+        <output id="accelOut">1.0 m/s²</output>
+      </div>
+      <div class="row">
+        <label>剖面</label>
+        <div class="seg" id="profSeg">
+          <button data-prof="trap" class="on">梯形</button>
+          <button data-prof="step">现状</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>末端</label>
+        <div class="seg" id="endSeg">
+          <button data-end="match" class="on">速度匹配</button>
+          <button data-end="stop">减到 0</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>地板 1.5</label>
+        <div class="seg" id="floorSeg">
+          <button data-floor="on" class="on">保留</button>
+          <button data-floor="off">去掉</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>播放</label>
+        <input id="speed" type="range" min="0.5" max="8" step="0.5" value="2">
+        <output id="speedOut">2.0×</output>
+      </div>
+      <button class="btn primary" id="reset">重置并重跑</button>
+      <button class="btn" id="pause">暂停 / 继续</button>
+    </div>
+  </aside>
+</main>
+
+<section class="charts">
+  <div class="chart">
+    <div class="cap">距离 d(t)：<b style="color:#1677d2">设计</b> vs <b style="color:#c0392b">无余量</b>　绿虚线 = 到点半径 3 m</div>
+    <canvas id="chartD"></canvas>
+  </div>
+  <div class="chart">
+    <div class="cap">设计机速度（25 s 滚动窗）：<b style="color:#409eff">实际</b> vs <b style="color:#909399">参考剖面</b>　底色 = 加速 / 巡航 / 减速 / 匹配</div>
+    <canvas id="chartV"></canvas>
+  </div>
+</section>
+
+<script>
+"use strict";
+
+const ARRIVAL_RADIUS_M = 3.0;   // 与 handover.arrival_radius_m 对齐
+const ARRIVAL_SPEED_MPS = 0.5;  // 与 handover 到点判据对齐
+const BRAKE_SAFETY = 1.3;
+const BRAKE_PAD_M = 0.5;
+const DT = 0.02;
+const T_MAX = 60;
+const SPEED_WIN = 25;
+
+const P = {
+  vt: 2.0, heading: 90, turn: 'straight',
+  margin: 1.0, accel: 1.0, profile: 'trap', end: 'match', floor: true,
+  speed: 2.0, paused: false,
+};
+
+const COL = {
+  design: '#409eff', designDark: '#1677d2', baseline: '#c0392b',
+  target: '#c2410c', ink: '#303133', ink3: '#909399',
+};
+const PHASE_COL = {
+  accel: 'rgba(64,158,255,.12)', cruise: 'rgba(61,122,31,.10)',
+  decel: 'rgba(230,162,60,.16)', match: 'rgba(22,119,210,.20)', idle: 'transparent',
+};
+const PHASE_NAME = { accel: '加速', cruise: '匀速', decel: '减速', match: '匹配', idle: '不动' };
+
+function makeSim(variant) {
+  return {
+    variant, t: 0, arrived: false, arrivedAt: null,
+    drone: { x: -40, y: 0 }, vel: { x: 0, y: 0 }, guide: { x: -40, y: 0 },
+    target: { x: 0, y: 0 }, tv: { x: 0, y: 0 }, tHeading: P.heading,
+    trailD: [], trailT: [], hist: [],
+    vref: 0, lag: 0, d: 40, vc: 0, vmax: 0, dbrk: 0, phase: 'idle',
+  };
+}
+let A = makeSim('design');
+let B = makeSim('baseline');
+
+function resetSims() {
+  A = makeSim('design');
+  B = makeSim('baseline');
+  const h = P.heading * Math.PI / 180;
+  for (const s of [A, B]) {
+    s.tv = { x: P.vt * Math.sin(h), y: P.vt * Math.cos(h) };
+    s.target = { x: 0, y: 0 };
+    s.tHeading = P.heading;
+  }
+}
+
+// 四段剖面：加速 → 巡航 → 减速(斜边) → 速度匹配
+//   v_cruise = max(地板?, |v_t| + 余量)                     ← 决定"能不能追上"
+//   d_brake  = R_arr + (v_cruise² − v_end²)/(2a)·1.3 + 0.5   ← 决定"何时开始减速"
+function stepSim(s, dt) {
+  if (s.arrived) return;
+
+  if (P.turn === 'circle') {
+    s.tHeading += (P.vt / 20) * (180 / Math.PI) * dt;
+  } else if (P.turn === 'weave') {
+    s.tHeading = P.heading + 55 * Math.sin(s.t * 0.55);
+  }
+  const th = s.tHeading * Math.PI / 180;
+  s.tv = { x: P.vt * Math.sin(th), y: P.vt * Math.cos(th) };
+  s.target.x += s.tv.x * dt;
+  s.target.y += s.tv.y * dt;
+
+  const dx = s.target.x - s.drone.x, dy = s.target.y - s.drone.y;
+  const d = Math.hypot(dx, dy);
+  s.d = d;
+  const ux = d > 1e-6 ? dx / d : 1, uy = d > 1e-6 ? dy / d : 0;
+  const vtAlong = s.tv.x * ux + s.tv.y * uy;
+  const vdAlong = s.vel.x * ux + s.vel.y * uy;
+  s.vc = vdAlong - vtAlong;
+
+  const vtAbs = Math.hypot(s.tv.x, s.tv.y);
+  let vmax = s.variant === 'design'
+    ? (P.floor ? Math.max(1.5, vtAbs + P.margin) : vtAbs + P.margin)
+    : vtAbs;
+  vmax = Math.max(0, vmax);
+  s.vmax = vmax;
+
+  const vEnd = P.end === 'match' ? vtAbs : 0;
+  const offset = P.end === 'match' ? ARRIVAL_RADIUS_M : 0.6;
+  s.dbrk = Math.max(0, offset + (vmax * vmax - vEnd * vEnd) / (2 * P.accel) * BRAKE_SAFETY + BRAKE_PAD_M);
+
+  let vref, phase;
+  if (vmax <= 1e-3) {
+    vref = 0; phase = 'idle';
+  } else if (P.profile === 'step') {
+    vref = Math.min(vmax, Math.sqrt(Math.max(0, 2 * P.accel * Math.max(0, d - offset)) + vEnd * vEnd));
+    phase = vref >= vmax - 1e-3 ? 'cruise' : 'decel';
+  } else if (d > s.dbrk) {
+    vref = Math.min(vmax, s.vref + P.accel * dt);
+    phase = vref >= vmax - 1e-3 ? 'cruise' : 'accel';
+  } else {
+    vref = Math.sqrt(Math.max(0, 2 * P.accel * Math.max(0, d - offset)) + vEnd * vEnd);
+    phase = 'decel';
+  }
+  if (P.end === 'match' && d <= ARRIVAL_RADIUS_M + 0.02) { vref = vEnd; phase = 'match'; }
+  vref = Math.min(vmax, Math.max(0, vref));
+  s.vref = vref;
+  s.phase = phase;
+
+  const guideSpeed = P.profile === 'step' ? vmax : vref;
+  s.guide.x += ux * guideSpeed * dt;
+  s.guide.y += uy * guideSpeed * dt;
+  s.lag = Math.hypot(s.guide.x - s.drone.x, s.guide.y - s.drone.y);
+
+  const cmdX = ux * vref, cmdY = uy * vref;
+  let ax = (cmdX - s.vel.x) / dt, ay = (cmdY - s.vel.y) / dt;
+  const aMag = Math.hypot(ax, ay);
+  if (aMag > P.accel) { ax *= P.accel / aMag; ay *= P.accel / aMag; }
+  s.vel.x += ax * dt; s.vel.y += ay * dt;
+  s.drone.x += s.vel.x * dt; s.drone.y += s.vel.y * dt;
+  s.t += dt;
+
+  if (!s.arrived && d <= ARRIVAL_RADIUS_M + 0.02 && Math.abs(s.vc) <= ARRIVAL_SPEED_MPS) {
+    s.arrived = true; s.arrivedAt = s.t; s.phase = 'match';
+  }
+
+  s.trailD.push({ x: s.drone.x, y: s.drone.y });
+  s.trailT.push({ x: s.target.x, y: s.target.y });
+  if (s.trailD.length > 4000) { s.trailD.shift(); s.trailT.shift(); }
+  if (s.hist.length === 0 || s.t - s.hist[s.hist.length - 1].t >= 0.1) {
+    s.hist.push({ t: s.t, d, vd: Math.hypot(s.vel.x, s.vel.y), vref, phase });
+  }
+}
+
+const sceneCv = document.getElementById('scene');
+const chartDCv = document.getElementById('chartD');
+const chartVCv = document.getElementById('chartV');
+
+function fitCanvas(cv) {
+  const r = cv.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(r.width * dpr));
+  const h = Math.max(1, Math.round(r.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: r.width, h: r.height };
+}
+
+function drawScene() {
+  const { ctx, w, h } = fitCanvas(sceneCv);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#f8fafc'; ctx.fillRect(0, 0, w, h);
+
+  const pts = [A.drone, B.drone, A.target];
+  const minX = Math.min(...pts.map(p => p.x)), maxX = Math.max(...pts.map(p => p.x));
+  const minY = Math.min(...pts.map(p => p.y)), maxY = Math.max(...pts.map(p => p.y));
+  const spanX = Math.max(46, maxX - minX), spanY = Math.max(26, maxY - minY);
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  let scale = Math.min((w - 100) / (spanX + 26), (h - 96) / (spanY + 26));
+  scale = Math.max(1.5, Math.min(9, scale));
+  const ox = w / 2, oy = h / 2;
+  const X = x => ox + (x - cx) * scale, Y = y => oy - (y - cy) * scale;
+
+  ctx.strokeStyle = '#e8edf3'; ctx.lineWidth = 1;
+  const step = 10;
+  for (let x = Math.floor((cx - w / 2 / scale) / step) * step; x <= cx + w / 2 / scale; x += step) {
+    ctx.beginPath(); ctx.moveTo(X(x), 0); ctx.lineTo(X(x), h); ctx.stroke();
+  }
+  for (let y = Math.floor((cy - h / 2 / scale) / step) * step; y <= cy + h / 2 / scale; y += step) {
+    ctx.beginPath(); ctx.moveTo(0, Y(y)); ctx.lineTo(w, Y(y)); ctx.stroke();
+  }
+  ctx.strokeStyle = '#909399'; ctx.fillStyle = '#909399'; ctx.lineWidth = 1.4;
+  const bar = 10 * scale;
+  ctx.beginPath(); ctx.moveTo(16, h - 18); ctx.lineTo(16 + bar, h - 18);
+  ctx.moveTo(16, h - 23); ctx.lineTo(16, h - 13);
+  ctx.moveTo(16 + bar, h - 23); ctx.lineTo(16 + bar, h - 13); ctx.stroke();
+  ctx.font = '600 10px ui-monospace,Consolas,monospace';
+  ctx.fillText('10 m', 16 + bar / 2 - 12, h - 25);
+
+  const poly = (arr, color, width, dash) => {
+    if (arr.length < 2) return;
+    ctx.save(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = width;
+    ctx.beginPath(); ctx.moveTo(X(arr[0].x), Y(arr[0].y));
+    for (let i = 1; i < arr.length; i++) ctx.lineTo(X(arr[i].x), Y(arr[i].y));
+    ctx.stroke(); ctx.restore();
+  };
+  poly(A.trailT, 'rgba(194,65,12,.5)', 2);
+  poly(A.trailD, 'rgba(64,158,255,.9)', 2.2);
+  poly(B.trailD, 'rgba(192,57,43,.8)', 1.7, [6, 5]);
+
+  ctx.save(); ctx.setLineDash([2, 5]); ctx.strokeStyle = 'rgba(22,119,210,.5)'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(X(A.drone.x), Y(A.drone.y)); ctx.lineTo(X(A.target.x), Y(A.target.y)); ctx.stroke();
+  ctx.restore();
+
+  const tX = X(A.target.x), tY = Y(A.target.y);
+  if (A.dbrk > 0.2) {
+    ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = 'rgba(180,83,9,.7)'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(tX, tY, A.dbrk * scale, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = 'rgba(180,83,9,.85)'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
+    ctx.fillText('刹车点 ' + A.dbrk.toFixed(1) + ' m',
+      tX - A.dbrk * scale * 0.72 - 8, tY - A.dbrk * scale * 0.72 - 2);
+  }
+  ctx.save(); ctx.setLineDash([2, 3]); ctx.strokeStyle = 'rgba(61,122,31,.45)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(tX, tY, ARRIVAL_RADIUS_M * scale, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+
+  ctx.fillStyle = COL.target;
+  ctx.beginPath(); ctx.arc(tX, tY, 6.5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = COL.target; ctx.font = '600 11px ui-monospace,Consolas,monospace';
+  ctx.fillText('目标', tX + 10, tY - 12);
+  arrow(ctx, tX, tY, A.tv.x, A.tv.y, scale, COL.target, 2.2);
+
+  const gX = X(A.guide.x), gY = Y(A.guide.y);
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = COL.design; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(gX, gY, 4.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+  drawDrone(ctx, X(A.drone.x), Y(A.drone.y), A.vel, COL.design, '设计机', false);
+  drawDrone(ctx, X(B.drone.x), Y(B.drone.y), B.vel, COL.baseline, '对照', true);
+
+  if (A.lag * scale > 14) {
+    ctx.save(); ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(64,158,255,.6)';
+    ctx.beginPath(); ctx.moveTo(X(A.drone.x), Y(A.drone.y)); ctx.lineTo(gX, gY); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = COL.designDark; ctx.font = '600 10px ui-monospace,Consolas,monospace';
+    ctx.fillText('参考领先 ' + A.lag.toFixed(1) + ' m',
+      (X(A.drone.x) + gX) / 2 + 6, (Y(A.drone.y) + gY) / 2 - 8);
+  }
+
+  // 距离标记：贴着到点球面外的视线中点；距离很近时藏起来（会压住目标标记，读数在下方读数条里）
+  if (A.d > 6) {
+    const mx = (X(A.drone.x) + tX) / 2, my = (Y(A.drone.y) + tY) / 2;
+    ctx.fillStyle = 'rgba(255,255,255,.94)'; ctx.strokeStyle = '#dcdfe6'; ctx.lineWidth = 1;
+    roundRect(ctx, mx - 32, my - 22, 64, 20, 6); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = COL.ink; ctx.font = '650 11px ui-monospace,Consolas,monospace';
+    ctx.fillText(A.d.toFixed(1) + ' m', mx - 20, my - 8);
+  }
+}
+
+function arrow(ctx, x, y, vx, vy, scale, color, width) {
+  const mag = Math.hypot(vx, vy);
+  if (mag < 0.05) return;
+  const len = Math.min(70, Math.max(18, mag * scale * 1.6));
+  const ux = vx / mag, uy = vy / mag;
+  const ex = x + ux * len, ey = y - uy * len;
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+  const a = Math.atan2(-(ey - y), ex - x);
+  ctx.beginPath(); ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - 7 * Math.cos(a - 0.4), ey - 7 * Math.sin(a - 0.4));
+  ctx.lineTo(ex - 7 * Math.cos(a + 0.4), ey - 7 * Math.sin(a + 0.4));
+  ctx.closePath(); ctx.fill();
+}
+
+function drawDrone(ctx, x, y, vel, color, label, dashed) {
+  const mag = Math.hypot(vel.x, vel.y);
+  const hdg = mag > 0.05 ? Math.atan2(vel.y, vel.x) : Math.PI / 2;
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(-hdg + Math.PI / 2);
+  ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(6.5, 7); ctx.lineTo(0, 4); ctx.lineTo(-6.5, 7); ctx.closePath();
+  if (dashed) ctx.setLineDash([4, 3]);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.6; ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = color; ctx.font = '600 10px ui-monospace,Consolas,monospace';
+  ctx.fillText(label, x + 9, y + 17);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function axes(ctx, w, h, tStart, tEnd, yMax, yStep, yLabel, xStep) {
+  const padL = 40, padR = 14, padT = 24, padB = 22;
+  const iw = w - padL - padR, ih = h - padT - padB;
+  ctx.strokeStyle = '#eef1f5'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#909399'; ctx.font = '600 10px ui-monospace,Consolas,monospace';
+  for (let v = 0; v <= yMax + 1e-6; v += yStep) {
+    const y = padT + ih * (1 - v / yMax);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + iw, y); ctx.stroke();
+    ctx.fillText(v.toFixed(yStep < 1 ? 1 : 0), 8, y + 3);
+  }
+  for (let t = Math.ceil(tStart / xStep) * xStep; t <= tEnd + 1e-6; t += xStep) {
+    const x = padL + iw * (t - tStart) / (tEnd - tStart);
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ih); ctx.stroke();
+    ctx.fillText(t.toFixed(0) + 's', x - 7, h - 7);
+  }
+  ctx.fillStyle = '#909399'; ctx.fillText(yLabel, padL, 13);
+  return { padL, padR, padT, padB, iw, ih,
+    X: t => padL + iw * (t - tStart) / (tEnd - tStart),
+    Y: v => padT + ih * (1 - v / yMax) };
+}
+
+function drawDistanceChart() {
+  const { ctx, w, h } = fitCanvas(chartDCv);
+  ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  const maxD = Math.max(50, Math.ceil(Math.max(A.hist.length ? A.hist[0].d : 40, B.d) / 10) * 10);
+  const g = axes(ctx, w, h, 0, T_MAX, maxD, 10, '距离 m', 10);
+  ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = 'rgba(61,122,31,.6)'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(g.padL, g.Y(ARRIVAL_RADIUS_M)); ctx.lineTo(g.padL + g.iw, g.Y(ARRIVAL_RADIUS_M)); ctx.stroke();
+  ctx.restore();
+  const series = (sim, color, dash) => {
+    if (sim.hist.length < 2) return;
+    ctx.save(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath();
+    sim.hist.forEach((p, i) => { const x = g.X(p.t), y = g.Y(Math.min(maxD, p.d)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke(); ctx.restore();
+  };
+  series(B, '#c0392b', [6, 5]);
+  series(A, '#1677d2');
+  if (A.arrivedAt != null) {
+    const x = g.X(A.arrivedAt);
+    ctx.strokeStyle = 'rgba(61,122,31,.75)'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(x, g.padT); ctx.lineTo(x, g.padT + g.ih); ctx.stroke();
+    ctx.fillStyle = '#3d7a1f'; ctx.font = '600 10px ui-monospace,Consolas,monospace';
+    ctx.fillText('到点 ' + A.arrivedAt.toFixed(1) + ' s', x + 4, g.padT + 12);
+  }
+}
+
+function drawSpeedChart() {
+  const { ctx, w, h } = fitCanvas(chartVCv);
+  ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  const tEnd = Math.max(SPEED_WIN, A.t);
+  const tStart = tEnd - SPEED_WIN;
+  const yMax = Math.max(2, Math.ceil((Math.max(A.vmax, A.vref, 1) + 0.4) * 2) / 2);
+  const g = axes(ctx, w, h, tStart, tEnd, yMax, yMax <= 2 ? 0.5 : 1, '速度 m/s', 5);
+
+  let start = null, cur = null;
+  const flush = endT => {
+    if (cur == null || start == null) return;
+    const x0 = Math.max(g.padL, g.X(start)), x1 = Math.min(g.padL + g.iw, g.X(endT));
+    if (x1 > x0) { ctx.fillStyle = PHASE_COL[cur] || 'transparent'; ctx.fillRect(x0, g.padT, x1 - x0, g.ih); }
+  };
+  A.hist.forEach(p => { if (p.phase !== cur) { flush(p.t); start = p.t; cur = p.phase; } });
+  flush(A.t);
+
+  const line = (key, color, dash, width) => {
+    const seg = A.hist.filter(p => p.t >= tStart - 1);
+    if (seg.length < 2) return;
+    ctx.save(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = width;
+    ctx.beginPath();
+    seg.forEach((p, i) => {
+      const x = g.X(p.t), y = g.Y(Math.max(0, p[key]));
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke(); ctx.restore();
+  };
+  line('vref', '#909399', [5, 4], 1.6);
+  line('vd', '#409eff', null, 2.2);
+
+  if (A.vmax > 0) {
+    ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(180,83,9,.55)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(g.padL, g.Y(A.vmax)); ctx.lineTo(g.padL + g.iw, g.Y(A.vmax)); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = 'rgba(180,83,9,.85)'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
+    ctx.fillText('v_cruise ' + A.vmax.toFixed(1), g.padL + g.iw - 64, g.Y(A.vmax) - 4);
+  }
+}
+
+const $ = id => document.getElementById(id);
+
+function updateHud() {
+  $('hud').innerHTML = `
+    <div class="box blue"><div class="k">设计机 d</div><div class="v">${A.d.toFixed(1)}<small>m</small></div></div>
+    <div class="box blue"><div class="k">接近 v_c</div><div class="v">${A.vc.toFixed(2)}<small>m/s</small></div></div>
+    <div class="box"><div class="k">剖面相位</div><div class="v" style="font-size:13px">${PHASE_NAME[A.phase] || A.phase}</div></div>
+    <div class="box orange"><div class="k">对照机 d</div><div class="v">${B.d.toFixed(1)}<small>m</small></div></div>`;
+  $('badgeTime').textContent = 't = ' + A.t.toFixed(1) + ' s';
+  const bp = $('badgePhase');
+  bp.textContent = A.arrived ? '已到点（可交接）' : (PHASE_NAME[A.phase] || A.phase);
+  bp.className = 'badge' + (A.arrived ? ' on' : '');
+
+  const vtAbs = Math.hypot(A.tv.x, A.tv.y);
+  const rate = A.vmax - vtAbs;
+  $('sD').innerHTML = A.d.toFixed(2) + '<small>m</small>';
+  $('sVc').innerHTML = A.vc.toFixed(2) + '<small>m/s</small>';
+  $('sVd').innerHTML = Math.hypot(A.vel.x, A.vel.y).toFixed(2) + '<small>m/s</small>';
+  $('sVr').innerHTML = A.vref.toFixed(2) + '<small>m/s</small>';
+  $('sVmax').innerHTML = A.vmax.toFixed(2) + '<small>m/s</small>';
+  $('sDb').innerHTML = A.dbrk.toFixed(2) + '<small>m</small>';
+  $('sRate').innerHTML = rate.toFixed(2) + '<small>m/s</small>';
+  $('sLag').innerHTML = A.lag.toFixed(2) + '<small>m</small>';
+
+  const v = $('verdict');
+  if (vtAbs > 0.05 && A.vmax <= vtAbs + 0.05) {
+    v.innerHTML = `<b style="color:#c0392b">追不上</b>：v_cruise=${A.vmax.toFixed(2)} ≤ 目标 ${vtAbs.toFixed(2)} m/s，`
+      + `稳态 ḋ≈0 —— 距离停在加速期拉开的差值上（红色虚线不收敛）。余量就是稳态收敛速率。`;
+  } else if (A.vmax <= 1e-3) {
+    v.innerHTML = `目标不动：v_cruise=0，飞机原地等待（地板 1.5 m/s 不生效）。`;
+  } else {
+    v.innerHTML = `<b style="color:#3d7a1f">可追上</b>：稳态 ḋ ≈ −${rate.toFixed(2)} m/s（= v_cruise − v_t）；`
+      + `梯形只决定追上之前的加速/减速形状。`;
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dtReal = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!P.paused) {
+    const simDt = dtReal * P.speed;
+    const steps = Math.min(240, Math.max(1, Math.round(simDt / DT)));
+    for (let i = 0; i < steps; i++) {
+      if (A.t < T_MAX) stepSim(A, DT);
+      if (B.t < T_MAX) stepSim(B, DT);
+    }
+  }
+  drawScene(); drawDistanceChart(); drawSpeedChart(); updateHud();
+  requestAnimationFrame(frame);
+}
+
+function bindRange(id, key, fmt) {
+  const el = $(id), out = $(id + 'Out');
+  const upd = () => {
+    P[key] = parseFloat(el.value);
+    if (out) out.textContent = fmt(P[key]);
+    if (key !== 'speed') resetSims();
+  };
+  el.addEventListener('input', upd);
+  P[key] = parseFloat(el.value);
+  if (out) out.textContent = fmt(P[key]);
+}
+function bindSeg(id, key) {
+  const wrap = $(id);
+  wrap.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    [...wrap.querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
+    P[key] = Object.values(b.dataset)[0];
+    resetSims();
+  });
+}
+
+bindRange('vt', 'vt', v => v.toFixed(1) + ' m/s');
+bindRange('hdg', 'heading', v => v.toFixed(0) + '°');
+bindRange('margin', 'margin', v => v.toFixed(1));
+bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
+bindRange('speed', 'speed', v => v.toFixed(1) + '×');
+bindSeg('turnSeg', 'turn');
+bindSeg('profSeg', 'profile');
+bindSeg('endSeg', 'end');
+
+$('floorSeg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  [...$('floorSeg').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
+  P.floor = b.dataset.floor === 'on';
+  resetSims();
+});
+$('reset').addEventListener('click', () => { resetSims(); P.paused = false; });
+$('pause').addEventListener('click', () => { P.paused = !P.paused; });
+document.querySelector('.presets').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const k = b.dataset.preset;
+  if (k === 'static') { P.vt = 0; P.turn = 'straight'; }
+  if (k === 'line2') { P.vt = 2; P.turn = 'straight'; P.heading = 90; }
+  if (k === 'circle2') { P.vt = 2; P.turn = 'circle'; }
+  if (k === 'weave3') { P.vt = 3; P.turn = 'weave'; }
+  $('vt').value = P.vt; $('vtOut').textContent = P.vt.toFixed(1) + ' m/s';
+  $('hdg').value = P.heading; $('hdgOut').textContent = P.heading.toFixed(0) + '°';
+  [...$('turnSeg').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x.dataset.turn === P.turn));
+  resetSims();
+});
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); P.paused = !P.paused; }
+  if (e.code === 'KeyR') resetSims();
+});
+window.addEventListener('resize', () => { drawScene(); drawDistanceChart(); drawSpeedChart(); });
+
+resetSims();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
