@@ -213,6 +213,19 @@
         "violation_action": 1,
         "status_period_ms": 1000
     },
+    "handover": {
+        "lock_frames": 10,
+        "fow_margin_deg": 5.0,
+        "innovation_gate_m": 3.0,
+        "timeout_ms": 3000,
+        "exit_lost_frames": 30,
+        "distance_lost_ms": 3000,
+        "arrival_radius_m": 3.0,
+        "arrival_vertical_m": 2.0,
+        "arrival_hold_ms": 2000,
+        "visual_wait_warn_ms": 20000,
+        "visual_wait_abort_ms": 0
+    },
     "visual_monitor": {
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,
