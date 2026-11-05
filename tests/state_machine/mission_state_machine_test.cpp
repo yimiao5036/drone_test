@@ -6029,4 +6029,97 @@ TEST(MissionStateMachineTest, FenceDefaultZoneGeneratedFromHome) {
     EXPECT_NEAR(max_north - min_north, 100.0, 2.0);
 }
 
+// 到点后视觉未识别（2026-11-05）：目标持续新鲜、飞机悬停在目标点正上方、
+// 视觉始终没有 LOCKED —— 目标看门狗的三条计时器都不会启动（这正是现场
+// 0100 记录里悬停 3.5 分钟不返航的原因），但必须抬 65013 warning bit6
+// 让地面站看到"已到点、没识别"。
+// visual_wait_abort_ms=0（现场默认）：只提示，不得中止任务。
+TEST(MissionStateMachineTest, S5ArrivedWithoutVisualRaisesHandoverWarning) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 20000ms;
+    config.takeoff.target_lost_timeout = 20000ms;
+    config.takeoff.target_hold_max = 60000ms;
+    config.handover.arrival_hold_ms = 100ms;
+    config.handover.visual_wait_warn_ms = 300ms;
+    config.handover.visual_wait_abort_ms = 0ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+
+    // 悬停在目标点正上方：本机局部位置 (1.5,-2.5,-0.4)，地速 0。
+    auto flight = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    flight.local_x_m = kTakeoffOriginX;
+    flight.local_y_m = kTakeoffOriginY;
+    flight.local_z_m = kTakeoffOriginZ - 0.5f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+
+    bool warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        // 目标估计与自身位置重合：水平/垂直距离均为 0，满足到点半径。
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = kTakeoffOriginX;
+        estimate.pos_y_m = kTakeoffOriginY;
+        estimate.pos_z_m = kTakeoffOriginZ - 0.5f;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        auto status = harness.status_subscription.WaitTakeFor(50ms);
+        if (status && (((*status)->active_warning_bits & (1U << 6U)) != 0U)) {
+            warning_seen = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(warning_seen) << "已到点但视觉未锁定超过 visual_wait_warn_ms 应置 bit6";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "visual_wait_abort_ms=0 时不得自动中止（只提示）";
+}
+
+// 同一判据把 visual_wait_abort_ms 配成非 0：越过阈值即中止到 S12（与目标
+// 看门狗同一收口路径），回执按目标等待超时。
+TEST(MissionStateMachineTest, S5ArrivedWithoutVisualAbortsWhenConfigured) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 20000ms;
+    config.takeoff.target_lost_timeout = 20000ms;
+    config.takeoff.target_hold_max = 60000ms;
+    config.handover.arrival_hold_ms = 100ms;
+    config.handover.visual_wait_warn_ms = 200ms;
+    config.handover.visual_wait_abort_ms = 400ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+
+    auto flight = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    flight.local_x_m = kTakeoffOriginX;
+    flight.local_y_m = kTakeoffOriginY;
+    flight.local_z_m = kTakeoffOriginZ - 0.5f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+
+    const auto deadline = std::chrono::steady_clock::now() + 3000ms;
+    while (std::chrono::steady_clock::now() < deadline &&
+           harness.machine.CurrentState() ==
+               common::MissionState::kGpsApproach) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = kTakeoffOriginX;
+        estimate.pos_y_m = kTakeoffOriginY;
+        estimate.pos_z_m = kTakeoffOriginZ - 0.5f;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome)
+        << "visual_wait_abort_ms 非 0 时应中止到 S12";
+}
+
 }  // namespace

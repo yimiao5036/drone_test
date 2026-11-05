@@ -174,8 +174,16 @@ def changed_files() -> list[str]:
     files: set[str] = set()
     for command in commands:
         try:
+            # 仓库里有中文路径，Windows 默认按 GBK 解码 git 输出会抛 UnicodeDecodeError，
+            # 导致 --changed 静默拿不到改动列表，这里固定 UTF-8 并容错。
             output = subprocess.run(
-                command, cwd=ROOT, capture_output=True, text=True, check=False
+                command,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
             ).stdout
         except OSError:
             continue

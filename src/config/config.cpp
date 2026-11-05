@@ -585,6 +585,18 @@ void HandoverConfig::Validate() const {
     if (timeout.count() <= 0) throw std::invalid_argument("handover.timeout_ms 必须为正");
     if (distance_lost_ms.count() <= 0)
         throw std::invalid_argument("handover.distance_lost_ms 必须为正");
+    // 到点判定与"到点后视觉未识别"（2026-11-05）：半径必须为正；保持/告警
+    // 时长必须为正；自动处置阈值允许为 0（= 只提示不返航），负值非法。
+    if (!std::isfinite(arrival_radius_m) || arrival_radius_m <= 0.0)
+        throw std::invalid_argument("handover.arrival_radius_m 必须为有限正数");
+    if (!std::isfinite(arrival_vertical_m) || arrival_vertical_m <= 0.0)
+        throw std::invalid_argument("handover.arrival_vertical_m 必须为有限正数");
+    if (arrival_hold_ms.count() <= 0)
+        throw std::invalid_argument("handover.arrival_hold_ms 必须为正");
+    if (visual_wait_warn_ms.count() <= 0)
+        throw std::invalid_argument("handover.visual_wait_warn_ms 必须为正");
+    if (visual_wait_abort_ms.count() < 0)
+        throw std::invalid_argument("handover.visual_wait_abort_ms 不得为负（0 = 不自动处置）");
 }
 
 void InterceptionConfig::Validate() const {
@@ -993,6 +1005,18 @@ AppConfig LoadAppConfig(const std::string& path,
         handover.value("exit_lost_frames", config.handover.exit_lost_frames);
     config.handover.distance_lost_ms = ReadOptionalPositiveMilliseconds(
         handover, "distance_lost_ms", config.handover.distance_lost_ms);
+    // 到点判定与"到点后视觉未识别"（2026-11-05）：半径用正数读取，保持/告警
+    // 用正毫秒读取，自动处置阈值用非负毫秒读取（0 = 不自动处置）。
+    config.handover.arrival_radius_m = ReadOptionalPositiveDouble(
+        handover, "arrival_radius_m", config.handover.arrival_radius_m);
+    config.handover.arrival_vertical_m = ReadOptionalPositiveDouble(
+        handover, "arrival_vertical_m", config.handover.arrival_vertical_m);
+    config.handover.arrival_hold_ms = ReadOptionalPositiveMilliseconds(
+        handover, "arrival_hold_ms", config.handover.arrival_hold_ms);
+    config.handover.visual_wait_warn_ms = ReadOptionalPositiveMilliseconds(
+        handover, "visual_wait_warn_ms", config.handover.visual_wait_warn_ms);
+    config.handover.visual_wait_abort_ms = ReadOptionalNonNegativeMilliseconds(
+        handover, "visual_wait_abort_ms", config.handover.visual_wait_abort_ms);
     config.handover.Validate();
 
     // 拦截入口/授权（interception 节，2026-10-19）：默认关闭；射程上限已按

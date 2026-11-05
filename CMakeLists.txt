@@ -542,6 +542,24 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(mission_assignment_test)
 
+        # 到点/到点后视觉未识别等待计时测试：迟滞、保持门槛、
+        # 告警与中止阈值、视觉锁定清零（2026-11-05，S5 到点不告警）
+        add_executable(handover_wait_test
+            tests/state_machine/handover_wait_test.cpp)
+        target_link_libraries(handover_wait_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(handover_wait_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(handover_wait_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(handover_wait_test)
+
         # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
         add_executable(serial_port_test tests/communication/serial_port_test.cpp)
         target_link_libraries(serial_port_test PRIVATE

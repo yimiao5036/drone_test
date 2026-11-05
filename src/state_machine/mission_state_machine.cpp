@@ -46,6 +46,7 @@
 #include "control/tracking_types.h"
 #include "perception/geodetic_converter.h"
 #include "perception/target_estimator.h"
+#include "state_machine/handover_wait.h"
 #include "state_machine/mission_assignment.h"
 #include "state_machine/net_actuator.h"
 
@@ -88,6 +89,15 @@ constexpr uint32_t kWarningActuatorFault = 1U << 4U;
 /// 地面站可据此显示"悬停等待目标"；累计保持超过 `takeoff.target_hold_max_ms`
 /// 会中止任务并转 S12 返航（65013 全量下发，Web UI 渲染待补）。
 constexpr uint32_t kWarningTargetHold = 1U << 5U;
+/// 告警位：已到点但视觉迟迟未锁定（2026-11-05，S5 到点不告警）。
+/// 判据见 state_machine/handover_wait.h：水平/垂直进入 handover.arrival_* 半径
+/// 且地速足够小并保持 arrival_hold_ms 之后，视觉未锁定累计超过
+/// handover.visual_wait_warn_ms 即置位。本告警只提示不处置；
+/// 只有 handover.visual_wait_abort_ms 非 0 时才由同一判据中止任务
+/// （现场默认 0，交地面站人工决定返航）。
+constexpr uint32_t kWarningHandoverNoVisual = 1U << 6U;
+/// 到点判据的"停稳"地速门限（m/s）：设计 §4.2 冻结值，不做配置键。
+constexpr double kHandoverArrivalSpeedMps = 0.5;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
 /// 内容无变化时按该间隔重发，内容变化立即发。
 constexpr uint64_t kIntentRepublishIntervalMs = 100;
@@ -871,6 +881,13 @@ private:
         // 超时当拍中止到 S12 并停发位置引导；后续状态判定自然跳过交接/拦截。
         EvaluateTargetWatchdog(now_ms);
 
+        // 到点后视觉未识别（2026-11-05）：与目标看门狗独立的提示判据——
+        // 目标以 5Hz 持续送达时看门狗永不启动，需单独观测"已到点但没锁定"。
+        // 只抬告警位（bit6），自动化处置由 visual_wait_abort_ms 决定（默认关）。
+        if (EvaluateHandoverWait(now_ms).warn) {
+            warnings |= kWarningHandoverNoVisual;
+        }
+
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
         // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
         EvaluateHandover(now_ms);
@@ -1598,6 +1615,87 @@ private:
     /// 目标保持（2026-10-22）：目标失效期间由原地保持意图续住控制流，本函数
     /// 之外另有 `target_hold_max` 绝对兜底——目标反复闪烁会不断清零丢失计时，
     /// 单靠 lost_timeout 无法收口，累计保持超限同样走中止返航。
+    /// 到点判定与"到点后视觉未识别"计时（2026-11-05）。
+    ///
+    /// 目标看门狗（EvaluateTargetWatchdog）只在目标**失效**时计时；现场 65010
+    /// 以 5Hz 持续送达时那三条计时器都不会启动，于是"飞机悬停在目标
+    /// 点上方、视觉整段 SEARCHING"既无告警也无处置。本函数用独立判据补这一段，
+    /// 与看门狗的计时互不影响。
+    ///
+    /// 生效条件（任一不满足即清计时返回空状态）：控制任务注入、当前 S5、
+    /// 分配目标估计新鲜、目标估计为局部 NED、本机局部位置有效。
+    ///
+    /// 数据来源：目标点取 `latest_estimated_`（与位置意图同帧），自身位置取
+    /// `latest_flight_->local_*`，地速取局部三轴速度合成，视觉锁定取"状态
+    /// LOCKED 且未超龄"（与 S6 进入判据同口径）。
+    HandoverWaitStatus EvaluateHandoverWait(uint64_t now_ms) {
+        if (mission_abort_latched_ || CurrentState() != common::MissionState::kGpsApproach ||
+            command_sender_ == nullptr || !HasFreshEstimate(now_ms) ||
+            !latest_flight_.has_value() || !latest_flight_->local_position_valid ||
+            !latest_estimated_.has_value() ||
+            latest_estimated_->header.frame_id != kFrameLocalNed) {
+            handover_wait_tracker_.Reset();
+            handover_wait_warn_logged_ = false;
+            return HandoverWaitStatus{};
+        }
+        const auto& flight = *latest_flight_;
+        const auto& target = *latest_estimated_;
+        const double dx = static_cast<double>(target.pos_x_m) -
+                          static_cast<double>(flight.local_x_m);
+        const double dy = static_cast<double>(target.pos_y_m) -
+                          static_cast<double>(flight.local_y_m);
+        const double dz = static_cast<double>(target.pos_z_m) -
+                          static_cast<double>(flight.local_z_m);
+        HandoverWaitSample sample;
+        sample.horizontal_m = std::sqrt(dx * dx + dy * dy);
+        sample.vertical_m = std::fabs(dz);
+        sample.ground_speed_mps = std::sqrt(static_cast<double>(flight.vx_mps) * flight.vx_mps +
+                                            static_cast<double>(flight.vy_mps) * flight.vy_mps);
+        sample.visual_locked = VisualLockedNow(now_ms);
+        const auto status = handover_wait_tracker_.Update(sample, now_ms,
+                                                          HandoverWaitParamsFromConfig());
+        if (status.warn && !handover_wait_warn_logged_) {
+            handover_wait_warn_logged_ = true;
+            SPDLOG_WARN("到点后视觉未识别: waited={}ms 水平={:.2f}m 垂直={:.2f}m 地速={:.2f}m/s",
+                        status.waited_ms, sample.horizontal_m, sample.vertical_m,
+                        sample.ground_speed_mps);
+        }
+        if (!status.warn) {
+            handover_wait_warn_logged_ = false;
+        }
+        // 自动处置阈值非 0 且已越过：按"目标等待超时"中止到 S12（与看门狗
+        // 同一收口路径），现场默认 0 时不走到这里。
+        if (status.abort) {
+            SPDLOG_WARN("到点后视觉未识别超过 visual_wait_abort_ms({}ms)，中止任务",
+                        status.waited_ms);
+            AbortForTargetWatchdog(
+                common::MissionAssignmentReason::kTargetWaitTimeout,
+                "到点后视觉未识别超时（handover.visual_wait_abort_ms）");
+        }
+        return status;
+    }
+
+    /// 组装到点判据参数：半径/保持/告警/处置四项来自 handover 配置节；
+    /// 地速门限固定为设计 §4.2 的 0.5m/s（不做配置键——它是"停稳"的物理
+    /// 口径，被调高会把"掠过目标点"误判成到点）。
+    HandoverWaitParams HandoverWaitParamsFromConfig() const {
+        HandoverWaitParams params;
+        params.arrival_radius_m = handover_.arrival_radius_m;
+        params.arrival_vertical_m = handover_.arrival_vertical_m;
+        params.arrival_speed_mps = kHandoverArrivalSpeedMps;
+        params.arrival_hold = handover_.arrival_hold_ms;
+        params.visual_warn = handover_.visual_wait_warn_ms;
+        params.visual_abort = handover_.visual_wait_abort_ms;
+        return params;
+    }
+
+    /// 视觉是否已锁定：状态为 LOCKED 且视觉状态消息未超龄（与 S6 进入判据
+    /// 同一视觉新鲜度阈值，避免两处对"视觉还在"给出不同答案）。
+    bool VisualLockedNow(uint64_t now_ms) const {
+        return !VisualStatusStale(now_ms) && latest_visual_status_.has_value() &&
+               latest_visual_status_->state == common::VisualTargetState::kLocked;
+    }
+
     void EvaluateTargetWatchdog(uint64_t now_ms) {
         if (command_sender_ == nullptr) {
             return;  // 影子模式不启用
@@ -4396,6 +4494,8 @@ private:
             } else if (next_state == common::MissionState::kGpsApproach) {
                 // S5 目标等待计时从进入任务高度起算（仅控制任务）。
                 BeginTargetWatchdog(now_ms);
+                // 到点/未识别计时同拍复位：换一段接近必须重新累计。
+                handover_wait_tracker_.Reset();
                 // 新一段接近：引导点低通从当前目标重新对齐，避免沿用上段状态。
                 guide_filter_valid_ = false;
             } else if (next_state == common::MissionState::kVisualHandover) {
@@ -4580,6 +4680,11 @@ private:
     uint64_t status_sequence_ = 0;
     uint64_t last_status_publish_ms_ = 0;
     uint32_t active_warning_bits_ = 0;
+    /// 到点判定与"到点后视觉未识别"计时（2026-11-05）。纯逻辑，每拍推进；
+    /// 离开 S5 / 目标失效 / 任务中止时 Reset()。
+    HandoverWaitTracker handover_wait_tracker_;
+    /// 告警日志节流：只在首次越过 visual_wait_warn_ms 时打一次。
+    bool handover_wait_warn_logged_ = false;
     uint64_t target_receive_count_ = 0;
     uint64_t target_stale_count_ = 0;
     uint64_t assignment_receive_count_ = 0;

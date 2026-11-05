@@ -134,6 +134,21 @@ struct HandoverConfig {
     /// S7 退出：双目测距失效（invalid 或超龄）连续达该时长即回退——覆盖
     /// "测距丢失但视觉仍锁定"的收口（no_distance_action 不触发 kExit 的档位）
     std::chrono::milliseconds distance_lost_ms{3000};
+    // ---- 到点判定与"到点后视觉未识别"等待（2026-11-05，S5 到点不告警）----
+    // 目标看门狗只在目标失效时计时；目标以 5Hz 持续送达时它永不启动，
+    // 于是"飞到目标点上方悬停、视觉一直没锁定"没有任何提示。以下四组参数
+    // 用独立的判据补这一段，语义与 target_wait/lost/hold 完全无关。
+    /// 到点水平半径（m）：飞机与分配目标点的水平距离进入该值视为到点候选。
+    double arrival_radius_m = 3.0;
+    /// 到点垂直半径（m）：相对目标点高度差的绝对值上限。
+    double arrival_vertical_m = 2.0;
+    /// 到点需连续保持的时长：进入半径且地速 ≤ 0.5m/s 持续该时长才判到点，
+    /// 避免掠过目标点就当"到点"。
+    std::chrono::milliseconds arrival_hold_ms{2000};
+    /// 到点后视觉未锁定的告警阈值：超过即置 warning bit6「到点未识别」。
+    std::chrono::milliseconds visual_wait_warn_ms{20000};
+    /// 到点后视觉未锁定的自动处置阈值：0 = 只提示、不自动返航（现场默认）。
+    std::chrono::milliseconds visual_wait_abort_ms{0};
     void Validate() const;
 };
 
