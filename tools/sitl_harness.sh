@@ -13,7 +13,8 @@
 #   tools/sitl_harness.sh smoke --config <cfg> <px4_link_smoke 参数...>
 #                                                  起 PX4+GCS 后运行冒烟/SITL 场景
 #   tools/sitl_harness.sh webgcs [--port 5761]     把 /tmp/gcs_test 桥到 TCP，交给 Web 地面站
-#                                                  （会停掉 sitl_gcs.py，由 Web 端扮演 255/190）
+#                                                  （PX4 侧 14550 心跳由 sitl_gcs.py 继续提供，
+#                                                    没在跑会自动补启；两条链路互不重叠）
 #   tools/sitl_harness.sh stop                     停止全部（tmux 会话与进程）
 #   tools/sitl_harness.sh status                   打印会话/进程/最新日志路径
 #
@@ -61,8 +62,8 @@ kill_processes() {
     pkill -f "[p]x4_sitl_default" 2>/dev/null
     pkill -f "[g]z sim" 2>/dev/null
     pkill -f "[s]itl_pty_bridge" 2>/dev/null
-    pkill -f "[s]itl_gcs" 2>/dev/null
-    pkill -f "[s]itl_web_gcs" 2>/dev/null
+    pkill -f "^python3 .*sitl_gcs\.py" 2>/dev/null
+    pkill -f "^python3 .*sitl_web_gcs\.py" 2>/dev/null
 }
 
 kill_sessions() {
@@ -220,6 +221,30 @@ cmd_smoke() {
     return "$rc"
 }
 
+# 保证 PX4 侧存在 255/190 的 MAV_TYPE_GCS 心跳（UDP 14550）。
+# 没有它，commander 会以 `Preflight Fail: No connection to the GCS` 拒绝解锁；
+# 这与机载地面站链路是两条独立通道，Web 接入时同样需要保留。
+# 只认真正的 python 进程：`pgrep -f "sitl_gcs"` 会命中调用方 shell 自己的命令行
+# （例如诊断命令里带了该文件名），造成“明明没跑却判为在跑”的假阳性。
+px4_gcs_pids() {
+    pgrep -f "^python3 .*sitl_gcs\.py" 2>/dev/null
+}
+
+ensure_px4_gcs() {
+    if [ -n "$(px4_gcs_pids)" ]; then
+        return 0
+    fi
+    require_file "$GCS_PY"
+    tmux kill-session -t gcs 2>/dev/null
+    tmux new-session -d -s gcs "python3 $GCS_PY 2>&1 | tee $GCS_LOG"
+    local i
+    for i in $(seq 1 20); do
+        [ -n "$(px4_gcs_pids)" ] && { info "PX4 侧 GCS 心跳已启动（sitl_gcs.py → UDP 14550）"; return 0; }
+        sleep 0.5
+    done
+    return 1
+}
+
 cmd_webgcs() {
     local port=5761
     while [ $# -gt 0 ]; do
@@ -230,17 +255,19 @@ cmd_webgcs() {
     done
     require_file "$WEB_GCS_PY"
     [ -e /tmp/gcs_test ] || die "/tmp/gcs_test 不存在（先执行 stack）"
-    # 同一个端点只能有一个地面站：sitl_gcs.py 也扮演 255/190 并抢心跳，必须先停。
-    tmux kill-session -t gcs 2>/dev/null
-    pkill -f "[s]itl_gcs" 2>/dev/null
-    sleep 1
+    # PX4 的解锁前置检查的是它自己那条 MAVLink（SITL 为 UDP 14550）上是否收到
+    # MAV_TYPE_GCS 心跳；Web 地面站的心跳走 /tmp/gcs_app→/tmp/gcs_test 的机载链路，
+    # 到不了 PX4。因此 webgcs 不能停 sitl_gcs.py，反而要保证它在跑：
+    # 两条链路互不重叠（14550 vs PTY），同时存在不冲突。
+    ensure_px4_gcs || die "PX4 侧 GCS 心跳未能启动（见 $GCS_LOG）"
     tmux kill-session -t webgcs 2>/dev/null
     tmux new-session -d -s webgcs "python3 $WEB_GCS_PY --port $port 2>&1 | tee $LOG_DIR/webgcs.log"
     sleep 1
     local host_ip
     host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     [ -n "$host_ip" ] || host_ip="127.0.0.1"
-    info "Web 地面站桥已启动：/tmp/gcs_test <-> TCP $port（已停掉 sitl_gcs.py）"
+    info "Web 地面站桥已启动：/tmp/gcs_test <-> TCP $port"
+    info "PX4 侧 GCS 心跳保持运行（sitl_gcs.py → UDP 14550），解锁前置已满足"
     info "Web 端「连接设备」选 TCP 客户端："
     info "  地址 127.0.0.1（WSL2 本地转发不通时用 $host_ip）  端口 $port"
     info "  机载身份 1/25，地面站必须是 255/190；连上后应看到 65011/65012/65013 回传"

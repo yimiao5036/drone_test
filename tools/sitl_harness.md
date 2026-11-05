@@ -30,7 +30,7 @@
 |---|---|
 | `tools/sitl_harness.sh` | 本装置入口（子命令 `stack`/`app`/`smoke`/`webgcs`/`stop`/`status`） |
 | `tools/sitl_pty_bridge.py` | 双 PTY 桥：`/tmp/gcs_app`（机载串口）↔ `/tmp/gcs_test`（验收工具） |
-| `tools/sitl_gcs.py` | PX4 GCS 链路（UDP 14550）255/190 心跳，并打印 Home/模式 |
+| `tools/sitl_gcs.py` | PX4 GCS 链路（UDP 14550）255/190 心跳，并打印 Home/模式；**PX4 解锁前置只认这条链路**，`webgcs` 下也保留运行 |
 | `tools/sitl_web_gcs.py` | 把 `/tmp/gcs_test` 桥到 TCP（默认 5761），供 Windows 上的 Web 地面站接入（2026-11-04） |
 | `config/px4_sitl_assignment.json` | SITL 验收配置：PX4 走 UDP、地面站串口=`/tmp/gcs_app`、`enable_control=true` |
 | `tools/sitl_restart.sh` | 兼容入口（等价 `sitl_harness.sh stack`），保留给既有证据 README 的复现步骤 |
@@ -42,6 +42,7 @@ assignment_sitl.py --connection /tmp/gcs_test
 drone_control 的 Px4Link
   → UDP 127.0.0.1:14540（本地）/14580（PX4）→ PX4 SITL
 sitl_gcs.py → UDP 14550 回发 MAV_TYPE_GCS 心跳（PX4 无 RC 时解锁前置条件）
+sitl_web_gcs.py → TCP 5761（只桥机载地面站链路，与上一行是两条独立通道）
 ```
 
 ## 3. 前置条件
@@ -93,8 +94,8 @@ Web 地面站（`tools/web平台`）跑在 Windows 上，打不开 WSL 里的 PT
 「TCP 客户端」链路接进来。**机载代码与 `serial.device` 都不改**。
 
 ```bash
-bash tools/sitl_harness.sh stack                 # 先起环境（PX4+桥+机载）
-bash tools/sitl_harness.sh webgcs                # 停掉 sitl_gcs.py，桥到 TCP 5761
+bash tools/sitl_harness.sh stack                 # 先起环境（PX4+桥+机载+PX4 侧 GCS 心跳）
+bash tools/sitl_harness.sh webgcs                # 桥到 TCP 5761；sitl_gcs.py 保持运行
 bash tools/sitl_harness.sh webgcs --port 5762    # 换端口
 ```
 
@@ -102,8 +103,13 @@ bash tools/sitl_harness.sh webgcs --port 5762    # 换端口
 用 `hostname -I` 打印的地址），端口 `5761`。连上后应看到 65011/65012/65013 回传，
 可在界面上点「主动返航」「重置状态」，或在「共享区域」里保存并下发 65018。
 
-> - **同一个端点只能有一个地面站**：`webgcs` 会先停掉 `sitl_gcs.py`（它也发 255/190
->   心跳，两个一起发会打架）。要回到脚本验收，直接 `stack` 或 `app` 重启即可。
+> - **两条链路互不重叠（2026-11-05 修正）**：PX4 的解锁前置只检查它自己那条 MAVLink
+>   （SITL 为 UDP 14550）上是否收到 `MAV_TYPE_GCS` 心跳；Web 的心跳走
+>   `/tmp/gcs_app → /tmp/gcs_test` 的机载链路，**到不了 PX4**。所以 `webgcs` 不再停
+>   `sitl_gcs.py`，没在跑会自动补启；否则 commander 报
+>   `Preflight Fail: No connection to the GCS` 并拒绝解锁。
+> - 想用 **QGC** 承担这个角色：让 QGC 连 UDP 14550，并停掉 `sitl_gcs.py`
+>   （14550 只能被一个进程占用，QGC 自己会发 255/190 心跳）。两者二选一即可。
 > - Web 端地面站身份必须是 `255/190`，机载是 `1/25`；不一致时 65010~65022 会被
 >   地址校验丢掉（表现为"链路 online 但看不到任务状态"）。
 > - 桥的日志在 `$LOG_DIR/webgcs.log`，`stop` 会一并清理该会话与进程。
@@ -170,7 +176,7 @@ python3 tools/assignment_sitl.py --connection /tmp/gcs_test \
 | `PX4 SITL 启动失败` | 看 `$LOG_DIR/px4.log` 尾部；确认 `~/PX4-Autopilot` 已构建、Gazebo 可用、无残留 `gz sim`（先 `stop`） |
 | `drone_control 未进入 READY` | 看 `$LOG_DIR/app.log` 与机载日志：PX4 心跳/UDP 端口占用、`ground_station.serial.device` 是否 `/tmp/gcs_app`、桥是否先于 app 启动 |
 | 65014 无 65015 回执 | 地址双字段是否 `1/25`、地面站来源是否 `255/190`；`enable_control=true` 且命令接口已注入 |
-| PX4 拒绝解锁 | GCS 心跳是否在线（`gcs.log`）；`COM_LOW_BAT_ACT=0`；S5 引导速度受 `MPC_XY_VEL_MAX` 约束（`smoke` 已设 2.0） |
+| PX4 拒绝解锁 / `Preflight Fail: No connection to the GCS` | 14550 上有没有 255/190 心跳：`pgrep -af sitl_gcs`、`tail $LOG_DIR/gcs.log`；用 QGC 时确认 `sitl_gcs.py` 已停（端口冲突反而两边都收不到）；再查 `COM_LOW_BAT_ACT=0`；S5 引导速度受 `MPC_XY_VEL_MAX` 约束（`smoke` 已设 2.0） |
 | 手工清理进程时 shell 自杀 | 不要用 `pkill -f "gz sim"`（会匹配到自己的命令行）；用括号转义 `pkill -f "[g]z sim"`（本装置已按此处理）。**注意**：若同一条命令里既有 `harness stop` 又出现 `gz sim`/`sitl_pty_bridge`/`sitl_gcs` 字样，括号转义仍会命中，导致 shell 被 SIGTERM；杀桥请改用 `tmux kill-session -t bridge` |
 | 围栏恒越界 / 65014 恒被拒 21 | `config/zone.json` 是运行时缓存：换场地或换 SITL 前删除 `config/zone.json` 与 `build/config/zone.json`（旧坐标区域与当前 Home 相距过远会恒越界；机载启动无缓存时会生成 Home 中心 100m 默认区域 1/1，地面站需声明 1/1 或 `--zone-id 0` 不声明） |
 | 场景间状态残留 | 用 `stack`/`smoke` 干净重启；`app` 只重启机载，PX4 侧位置/模式状态保留 |

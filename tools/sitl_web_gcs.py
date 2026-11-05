@@ -15,9 +15,14 @@ Windows 上，打不开 WSL 的 /tmp 路径。本脚本在 WSL 侧打开 /tmp/gc
     python3 tools/sitl_web_gcs.py --port 5762     # 换端口
     python3 tools/sitl_web_gcs.py --pty /tmp/xxx  # 换端点
 
-注意（同一个端点只能有一个“地面站”）：
-- 接了 Web 地面站就要停掉 `tools/sitl_gcs.py`（它同样扮演 255/190 地面站、发心跳），
-  否则心跳与指令来源打架。`tools/sitl_harness.sh webgcs` 会自动处理；
+注意（两条链路是分开的，别弄混）：
+- 本脚本只搬**机载地面站链路**（`/tmp/gcs_test` ↔ TCP），不带任何 PX4 侧东西；
+- PX4 的解锁前置检查的是它自己那条 MAVLink（SITL 为 UDP 14550）上的
+  `MAV_TYPE_GCS` 心跳，由 `tools/sitl_gcs.py` 提供。接 Web 时**必须继续让
+  `sitl_gcs.py` 跑**（或改用 QGC 连 14550），否则 commander 会报
+  `Preflight Fail: No connection to the GCS` 拒绝解锁。`webgcs` 子命令会自动补启；
+- 同一个机载端点只能有一个地面站：Web 连上后不要再跑 `assignment_sitl.py`
+  之类同样扮演 255/190 的工具；
 - Web 端必须发 255/190 心跳，并在机载的 `ground_station` 配置范围内，
   否则 65010~65022 会被地址校验丢掉；
 - 停止：Ctrl-C，或 `tools/sitl_harness.sh stop`。
