@@ -117,6 +117,17 @@ bit5 =「S5 目标失效保持中」（`kWarningTargetHold`）。目标不可用
 （目标过期）可同时出现——bit1 表示“目标已过期”，bit5 表示“控制流已切换为原地
 保持”。映射表见 `docs/数据接口文档.md` §3.4/§3.5。
 
+**引导点越出围栏告警位 bit7（2026-11-05）**：`MissionStatus.active_warning_bits`
+bit7 =「引导点越出围栏」（`kWarningGuideOutsideFence`）。判据：本拍 `PublishPositionIntent`
+下发的局部 NED 引导点（成员 `guide_point_`，每拍刷新）落在围栏多边形外，且当前处于
+S5/S6/S7。背景是现场"目标跑出区域后飞机贴边悬停、页面没有任何信息"：控制器在发
+setpoint 前用 `fence::ClampIntoPolygon()` 把越界设定值按 `controller.fence_margin_m`
+拉回边界（`src/control/flight_controller.cpp`，只打一条节流 WARN），而
+`EvaluateFenceGuard` 只按**飞机自身**位置判定，于是这件事对 65013/65019 都不可见。
+bit7 只提示、不改变动作——越界处置仍由 `fence.violation_action` 与自身越界判定决定；
+每拍重算，引导点回到区域内即清除（跃变时打一条 WARN「引导点越出围栏」）。
+地面站消费口径见 `docs/数据接口文档.md` §3.4。
+
 **G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
 
 本阶段仍不做以下事情：

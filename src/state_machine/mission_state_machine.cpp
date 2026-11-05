@@ -96,6 +96,12 @@ constexpr uint32_t kWarningTargetHold = 1U << 5U;
 /// 只有 handover.visual_wait_abort_ms 非 0 时才由同一判据中止任务
 /// （现场默认 0，交地面站人工决定返航）。
 constexpr uint32_t kWarningHandoverNoVisual = 1U << 6U;
+/// 告警位：本拍发布的位置引导点落在围栏多边形之外（2026-11-05，围栏钳制无提示）。
+/// FlightController 会把越界的设定值按 `controller.fence_margin_m` 回拉到边界
+/// （src/control/flight_controller.cpp:791），于是目标跑到区域外时飞机会贴着边界
+/// 悬停——原来的状态机对此一无所知（65019 只报"接近边界"、65013 无对应位），
+/// 地面站看起来就像"任务卡住了"。本告警只提示"引导点被围栏挡住"，不改变动作。
+constexpr uint32_t kWarningGuideOutsideFence = 1U << 7U;
 /// 到点判据的"停稳"地速门限（m/s）：设计 §4.2 冻结值，不做配置键。
 constexpr double kHandoverArrivalSpeedMps = 0.5;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
@@ -886,6 +892,13 @@ private:
         // 只抬告警位（bit6），自动化处置由 visual_wait_abort_ms 决定（默认关）。
         if (EvaluateHandoverWait(now_ms).warn) {
             warnings |= kWarningHandoverNoVisual;
+        }
+
+        // 引导点被围栏挡住（2026-11-05）：目标跑出区域时控制器把设定值钳到
+        // 边界，飞机贴边悬停；EvaluateFenceGuard 只看飞机自身位置，看不到这件
+        // 事。这里抬 bit7 提示，动作仍由围栏守卫决定。
+        if (EvaluateGuideOutsideFence()) {
+            warnings |= kWarningGuideOutsideFence;
         }
 
         // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
@@ -1687,6 +1700,46 @@ private:
         params.visual_warn = handover_.visual_wait_warn_ms;
         params.visual_abort = handover_.visual_wait_abort_ms;
         return params;
+    }
+
+    /// 本拍引导点是否被围栏挡住（2026-11-05，围栏钳制无提示）。
+    ///
+    /// 现场现象：目标跑出围栏后飞机贴着边界悬停、页面没有任何信息。根因是
+    /// FlightController 在发 setpoint 前用 `fence::ClampIntoPolygon()` 把越界
+    /// 设定值拉回边界（src/control/flight_controller.cpp:791），只打一条节流
+    /// WARN；而状态机的 `EvaluateFenceGuard` 只看**飞机自身**位置，于是这件事
+    /// 对 65013/65019 都不可见。
+    ///
+    /// 判据：本拍下发的引导点（PublishPositionIntent 记录）落在围栏多边形外，
+    /// 且当前处于"跟着目标飞"的 S5/S6/S7。S3/S4 的起飞点是规划好的、S12 的
+    /// 返航点是 HOME，都不该报"被围栏挡住"。
+    ///
+    /// 只抬告警位，不改变任何动作：真正的越界处置仍由 EvaluateFenceGuard
+    /// （按飞机自身位置）决定。
+    bool EvaluateGuideOutsideFence() {
+        const auto state = CurrentState();
+        const bool tracking = state == common::MissionState::kGpsApproach ||
+                              state == common::MissionState::kVisualHandover ||
+                              state == common::MissionState::kVisualTracking;
+        if (!guide_point_valid_ || mission_abort_latched_ || !tracking) {
+            guide_outside_fence_ = false;
+            return false;
+        }
+        const common::FencePolygonNed polygon = LatestFencePolygon();
+        if (!polygon.valid()) {
+            guide_outside_fence_ = false;
+            return false;
+        }
+        const bool outside =
+            !control::fence::PointInPolygon(polygon.vertices, guide_point_);
+        if (outside && !guide_outside_fence_) {
+            SPDLOG_WARN("引导点越出围栏: 引导=({:.2f},{:.2f}) zone={} v{} "
+                        "—— 控制器会把设定值钳到边界，飞机将贴边悬停",
+                        guide_point_.north_m, guide_point_.east_m,
+                        polygon.zone_id, polygon.version);
+        }
+        guide_outside_fence_ = outside;
+        return outside;
     }
 
     /// 视觉是否已锁定：状态为 LOCKED 且视觉状态消息未超龄（与 S6 进入判据
@@ -3710,6 +3763,15 @@ private:
         (void)intent_output_.Publish(
             std::make_shared<const common::ControlIntent>(intent));
         last_intent_publish_ms_ = now_ms;
+
+        // 围栏钳制提示（2026-11-05）：记下本拍真正下发的局部 NED 引导点，
+        // 供 EvaluateGuideOutsideFence 判断它是否被控制器钳到边界。
+        // 非局部 NED 或坐标非有限时不参与判断。
+        guide_point_valid_ = target.frame_id == kFrameLocalNed &&
+                             std::isfinite(target.x) && std::isfinite(target.y);
+        if (guide_point_valid_) {
+            guide_point_ = common::Vec2Ned{target.x, target.y};
+        }
     }
 
     // ---- S7 视觉伺服（Task 9：TrackingControlLaw 迁入状态机） ----
@@ -4685,6 +4747,12 @@ private:
     HandoverWaitTracker handover_wait_tracker_;
     /// 告警日志节流：只在首次越过 visual_wait_warn_ms 时打一次。
     bool handover_wait_warn_logged_ = false;
+    /// 本拍下发的局部 NED 引导点（2026-11-05，围栏钳制提示）。由
+    /// PublishPositionIntent 每拍刷新；非局部 NED 或坐标非有限时置无效。
+    common::Vec2Ned guide_point_{};
+    bool guide_point_valid_ = false;
+    /// 上一拍是否已判定"引导点越界"——用于只在跃变时打一次日志。
+    bool guide_outside_fence_ = false;
     uint64_t target_receive_count_ = 0;
     uint64_t target_stale_count_ = 0;
     uint64_t assignment_receive_count_ = 0;
