@@ -14,6 +14,9 @@ docs/硬件资料/*.pdf
 yolo_pt/
 .claude/
 
+# 布局量测/截图证据（体积大，可由 tools/measure_*.py 随时重出，不入库）
+tools/layout_evidence/
+
 # 双目探测脚本输出（板上/本地运行产物，不入库）
 stereo_probe_*/
 # 相机标定采集图片（体积大，不入库；calibration.json 也不入库，标定结果另行归档）
