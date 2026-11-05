@@ -134,8 +134,21 @@ def main():
         step = state(page)
         page.screenshot(path=str(SHOT / "demo2-step-1440.png"))
 
-        # 复位到梯形跑一段，用于截图
+        # --- 6) 保守 vs 时间最优（目标静止 40 m）
         click_seg(page, "profSeg", "prof", "trap")
+        click_seg(page, "policySeg", "policy", "safe")
+        set_slider(page, "vt", 0)
+        run_until(page, 0, "arrived")
+        safe_static = state(page)
+
+        click_seg(page, "policySeg", "policy", "fast")
+        run_until(page, 0, "arrived")
+        fast_static = state(page)
+        page.screenshot(path=str(SHOT / "demo2-fast-static-1440.png"))
+
+        # 复位到梯形跑一段，用于截图
+        click_seg(page, "policySeg", "policy", "safe")
+        set_slider(page, "vt", 2)
         run_until(page, 8)
         page.wait_for_timeout(200)
         page.screenshot(path=str(SHOT / "demo2-mid-1440.png"))
@@ -149,6 +162,9 @@ def main():
     print("对照机：d=%.2f arrived=%s" % (design["bd"], design["bArrived"]))
     print("余量 0（t=%.1f）：设计 d=%.2f vmax=%.2f 对照 d=%.2f" % (zero["t"], zero["d"], zero["vmax"], zero["bd"]))
     print("现状剖面 t=%.1f：lag=%.2f vref=%.2f" % (step["t"], step["lag"], step["vref"]))
+    print("目标静止 40 m：保守 %.1f s（v_cruise=%.2f） / 时间最优 %.1f s（v_cruise=%.2f）" % (
+        safe_static["arrivedAt"] or -1, safe_static["vmax"],
+        fast_static["arrivedAt"] or -1, fast_static["vmax"]))
     print("页面错误：", errors or "无")
 
     ok = True
@@ -170,6 +186,14 @@ def main():
     else:
         ok = False
         print("✗ 余量 0 的对照不符合预期")
+    if (safe_static["arrived"] and fast_static["arrived"]
+            and fast_static["arrivedAt"] < safe_static["arrivedAt"] * 0.75):
+        print("✓ 时间最优比保守快 %.0f%%（%.1f s vs %.1f s）" % (
+            100 * (1 - fast_static["arrivedAt"] / safe_static["arrivedAt"]),
+            fast_static["arrivedAt"], safe_static["arrivedAt"]))
+    else:
+        ok = False
+        print("✗ 时间最优没有明显更快")
     if step["lag"] > 2.0:
         print("✓ 现状剖面参考点跑到前面（lag=%.2f）" % step["lag"])
     else:
