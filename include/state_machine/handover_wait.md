@@ -96,6 +96,18 @@ class HandoverWaitTracker {
 - `abort` 触发时打一条 WARN（含 `visual_wait_abort_ms` 时长），随后由
   `AbortForTargetWatchdog` 打既有的中止日志。
 
+## 消费方（地面站）
+
+机载只把结论摊成 `65013.active_warning_bits` 的 **bit6**，不带毫秒字段，因此地面站
+（`tools/web平台/`）的分工是：
+
+- **是否未识别**：以 bit6 为准——置位即判未识别，角标直接红、卡片行标「机载确认」，
+  不再用"`state≠5` 且 bit5 清零"的近似推翻它；
+- **等了多久**：由地面端自己的到点计时给出（几何阈值与本模块同源），因为 bit6 不含
+  时长，按置位时刻起算只能得到"≥ `visual_wait_warn_ms`"的粗粒度；
+- **20 s 之前**：bit6 还没亮，地面端用近似判据做早期提示，两边不一致最多差几秒提醒，
+  不影响任何动作（自动处置只由 `visual_wait_abort_ms` 决定）。
+
 ## 测试方式
 
 - 单元测试：`tests/state_machine/handover_wait_test.cpp`（9 例，无硬件、无时钟），

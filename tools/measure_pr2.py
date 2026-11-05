@@ -90,7 +90,9 @@ INJECT = """
       // S5 且没有 bit5 → 判为"没看见目标"，到点后进入等待 → 黄/红告警
       '25:1': mk('25:1', '捕网-01', 5, 'S5 目标接近', 0),
       // S7 且无失效位 → 判为"已识别"，到点即绿角标，不弹卡片
-      '25:2': mk('25:2', '捕网-02', 7, 'S7 跟踪', 0)
+      '25:2': mk('25:2', '捕网-02', 7, 'S7 跟踪', 0),
+      // bit6（机载 kWarningHandoverNoVisual）已置位 → 判据来自机载，行内标「机载确认」、角标红
+      '26:1': mk('26:1', '火箭-01', 5, 'S5 目标接近', 64)
     },
     link: { ...store.link, type: 'serial', name: 'SITL-5761', health: 'online', packets: 3491 }
   })
@@ -100,7 +102,7 @@ INJECT = """
 }
 """
 
-MEASURE = """
+MEASURE = r"""
 () => {
   const NL = String.fromCharCode(10)
   const box = (s) => {
@@ -133,6 +135,9 @@ MEASURE = """
       return b ? `${i.callsign}·${b.level}·${b.abbr}` : `${i.callsign}·none`
     }),
     chipText: (() => { const e = document.querySelector('.handover-chip'); return e ? e.textContent.trim() : null })(),
+    tags: Array.from(document.querySelectorAll('.hc-tag')).map(e => e.textContent.trim()),
+    rows: Array.from(document.querySelectorAll('.hc-row')).map(e => e.textContent.replace(/\s+/g, ' ').trim()),
+    alertConfirmed: handover.alerts.map(a => `${a.callsign}:${a.confirmed}`),
     chipBox: box('.handover-chip'),
     topbarOverflow: ov('.topbar'),
     topActionsOverflow: ov('.top-actions'),
