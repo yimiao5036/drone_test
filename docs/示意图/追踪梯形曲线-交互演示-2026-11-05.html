@@ -70,14 +70,14 @@
   .legendbox .dot{width:8px; height:8px; border-radius:50%; border-top:0; margin-right:5px; border:2px solid #409eff; background:#fff}
 
   .tip{font-size:10.5px; color:var(--ink-3); line-height:1.5; margin:4px 0 6px}
-  .kfbar{display:flex; align-items:center; gap:9px; flex-wrap:nowrap; background:var(--panel);
+  .kfbar{display:flex; align-items:center; gap:7px; flex-wrap:nowrap; background:var(--panel);
     border:1px solid var(--line); border-radius:10px; padding:6px 12px; font-size:11px; overflow:hidden}
   .kfbar b{font-size:11px; color:var(--ink-2); white-space:nowrap}
   .kfbar label{display:flex; align-items:center; gap:5px; white-space:nowrap; color:var(--ink-2)}
-  .kfbar input[type=range]{width:58px}
-  .kfbar output{font:650 11px ui-monospace,Consolas,monospace; min-width:44px}
+  .kfbar input[type=range]{width:50px}
+  .kfbar output{font:650 11px ui-monospace,Consolas,monospace; min-width:40px}
   .kfbar .seg{padding:1px}
-  .kfbar .seg button{padding:2px 7px; font-size:10.5px}
+  .kfbar .seg button{padding:2px 6px; font-size:10.5px}
   .kfbar .kfnote{color:var(--ink-3); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .stats{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px 12px 6px}
   .stats .grid{display:grid; grid-template-columns:repeat(12,1fr); gap:6px 8px}
@@ -169,6 +169,7 @@
         <button data-src="truth" class="on">真值</button>
         <button data-src="raw">量测</button>
         <button data-src="kf">卡尔曼</button>
+        <button data-src="vmsg">速度位</button>
       </div>
       <label>噪声 σ<input id="noise" type="range" min="0" max="3" step="0.1" value="0.8"><output id="noiseOut">0.8 m</output></label>
       <label>频率<input id="measHz" type="range" min="1" max="20" step="1" value="5"><output id="measHzOut">5 Hz</output></label>
@@ -228,6 +229,11 @@
           <button data-turn="circle">绕圈</button>
           <button data-turn="weave">蛇形</button>
         </div>
+      </div>
+      <div class="row" id="vsigRow" style="display:none">
+        <label>速度误差 σ_v</label>
+        <input id="vsig" type="range" min="0" max="1" step="0.05" value="0.3">
+        <output id="vsigOut">0.30 m/s</output>
       </div>
       <div class="presets">
         <button data-preset="static">静止</button>
@@ -339,6 +345,7 @@ const P = {
   k: 0.6,                       // 比例接近增益 1/s
   src: 'truth',
   noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
+  vsig: 0.3,                    // 地面站速度误差 σ（m/s，仅「地面站速度」来源用）
   lead: 0,                      // 拦截提前量 ms（0 = 只补时延）
   startD: 40,                   // 起始距离 m（飞机在 -x 方向，目标在原点）
   speed: 2.0, paused: false,
@@ -412,7 +419,7 @@ function makeSim(variant) {
     step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
     est: {
       kfX: new AxisKF(), kfY: new AxisKF(), lastMeasT: -1,
-      meas: [], trail: [], pred: null, predHist: [],
+      meas: [], measT: [], trail: [], pred: null, predHist: [],
       errMeas: [], errEst: [], errPred: [],
     },
   };
@@ -484,12 +491,12 @@ function stepSim(s, dt) {
   const est = s.est;
   const lat = P.latency / 1000;
   s.step += 1;
-  s.truthHist.push({ t: s.t, x: s.target.x, y: s.target.y });
+  s.truthHist.push({ t: s.t, x: s.target.x, y: s.target.y, vx: s.tv.x, vy: s.tv.y });
   if (s.truthHist.length > 1200) s.truthHist.shift();
 
   if (P.src === 'truth') {
     est.kfX.reset(); est.kfY.reset(); est.lastMeasT = -1; est.filterT = null;
-    est.meas.length = 0; est.trail.length = 0; est.pred = null;
+    est.meas.length = 0; est.measT.length = 0; est.trail.length = 0; est.pred = null;
     est.errMeas.length = 0; est.errEst.length = 0; est.errPred.length = 0; est.predHist.length = 0;
     s.seen = { x: s.target.x, y: s.target.y };
     s.tgtVel = { x: s.tv.x, y: s.tv.y };
@@ -514,15 +521,32 @@ function stepSim(s, dt) {
       est.filterT = measuredAt;
       est.errEst.push(Math.hypot(est.kfX.pos - truth.x, est.kfY.pos - truth.y));
       est.meas.push({ x: mx, y: my });
+      est.measT.push({ t: measuredAt, vx: truth.vx, vy: truth.vy });
+      if (est.measT.length > 320) est.measT.shift();
       if (est.meas.length > 320) est.meas.shift();
     }
     // 前视到"现在"：状态 + 速度 × (真实经过时间 + 拦截提前量)。
     // 用真实经过时间而不是固定 latency——量测是被采样到"lat 之前"的某一拍上的，
     // 固定值会少推一拍，看上去就"总在目标后面"。
-    const p = { x: est.kfX.pos, y: est.kfY.pos };
-    const elapsed = Math.max(0, s.t - (est.filterT ?? s.t));
+    // 「现在位置 + 目标速度」三种来源：
+    //   量测   = 只能追过期点，速度用相邻两点差分（噪声被放大）
+    //   卡尔曼 = 滤波状态 + 滤波速度，按真实经过时间前视
+    //   地面站 = 位置带噪 + 时延，但速度由 65010 显式给出（带 σ_v 误差）→ 直接外推
+    let p, vx, vy, elapsed;
+    if (P.src === 'vmsg') {
+      const m = est.meas[est.meas.length - 1] || { x: s.target.x, y: s.target.y };
+      const last = est.measT[est.measT.length - 1];
+      vx = (last ? last.vx : s.tv.x) + P.vsig * gaussAt(s.step, 3);
+      vy = (last ? last.vy : s.tv.y) + P.vsig * gaussAt(s.step, 4);
+      p = { x: m.x, y: m.y };
+      elapsed = Math.max(0, s.t - (last ? last.t : s.t));
+    } else {
+      p = { x: est.kfX.pos, y: est.kfY.pos };
+      vx = est.kfX.vel; vy = est.kfY.vel;
+      elapsed = Math.max(0, s.t - (est.filterT ?? s.t));
+    }
     const ahead = elapsed + P.lead;
-    const pred = { x: p.x + est.kfX.vel * ahead, y: p.y + est.kfY.vel * ahead };
+    const pred = { x: p.x + vx * ahead, y: p.y + vy * ahead };
     est.pred = pred;
     // 瞄准点 = 估计点 + 目标速度 × (拦截提前 t_go + 手动提前)。
     // 直线后退目标 t_go≈0 → 瞄准点≈预测点；绕圈/蛇形时它会明显落在目标前方，
@@ -530,12 +554,12 @@ function stepSim(s, dt) {
     const aimAdvance = ahead + (s.tGo || 0);
     // 瞄准点离估计点最多半个视距：卡尔曼速度在起手阶段不确定度很大（p11 初值 20²），
     // 不加这个夹紧会算出几十米外的瞄准点，看着像"预测点跑到天边"。
-    const aimLen = Math.hypot(est.kfX.vel, est.kfY.vel) * aimAdvance;
+    const aimLen = Math.hypot(vx, vy) * aimAdvance;
     const seenDist = Math.hypot(s.seen.x - s.drone.x, s.seen.y - s.drone.y);
     const aimScale = aimLen > 1e-6 ? Math.min(1, 0.5 * seenDist / aimLen) : 1;
     est.aim = {
-      x: p.x + est.kfX.vel * aimAdvance * aimScale,
-      y: p.y + est.kfY.vel * aimAdvance * aimScale,
+      x: p.x + vx * aimAdvance * aimScale,
+      y: p.y + vy * aimAdvance * aimScale,
     };
     const lastMeas = est.meas.length ? est.meas[est.meas.length - 1] : null;
     // 三个误差各评各的时刻，才看得懂：
@@ -550,7 +574,9 @@ function stepSim(s, dt) {
     // 控制器「能知道」的目标速度：量测模式用最近两点差分（含噪声），卡尔曼模式用滤波速度。
     // 首版这里直接用真值 s.tv —— 等于量测/卡尔曼模式下偷偷作弊，前视点永远准得离谱。
     let gvx = 0, gvy = 0;
-    if (P.src === 'kf') {
+    if (P.src === 'vmsg') {
+      gvx = vx; gvy = vy;
+    } else if (P.src === 'kf') {
       gvx = est.kfX.vel; gvy = est.kfY.vel;
     } else if (est.meas.length >= 2) {
       const m0 = est.meas[est.meas.length - 2], m1 = est.meas[est.meas.length - 1];
@@ -1095,12 +1121,18 @@ bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
 bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '默认 ' + V_PLAN_MPS + ' m/s');
 bindRange('speed', 'speed', v => v.toFixed(1) + '×');
 bindRange('noise', 'noise', v => v.toFixed(1) + ' m');
+bindRange('vsig', 'vsig', v => v.toFixed(2) + ' m/s');
 bindRange('measHz', 'measHz', v => v.toFixed(0) + ' Hz');
 bindRange('latency', 'latency', v => v.toFixed(0) + ' ms');
 bindRange('sigmaA', 'sigmaA', v => v.toFixed(1) + ' m/s²' + (v >= 7.9 ? '（机载）' : ''));
 bindRange('lead', 'lead', v => v.toFixed(0) + ' ms');
 bindRange('k', 'k', v => v.toFixed(2) + ' 1/s');
 bindSeg('srcSeg', 'src');
+// σ_v 只在「地面站速度」来源下有意义，其它模式把该行收起来，免得误导。
+document.getElementById('srcSeg').addEventListener('click', () => {
+  const row = document.getElementById('vsigRow');
+  if (row) row.style.display = P.src === 'vmsg' ? '' : 'none';
+});
 bindSeg('turnSeg', 'turn');
 $('lawSeg').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
