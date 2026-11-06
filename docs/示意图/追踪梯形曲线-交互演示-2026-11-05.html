@@ -576,11 +576,11 @@ function stepSim(s, dt) {
   s.dAim = dAim;
   // 方向必须按瞄准点距离归一，用显示距离 d 归一会把速度矢量缩水（首版就踩了这个坑）
   const ux = dAim > 1e-6 ? dx / dAim : 1, uy = dAim > 1e-6 ? dy / dAim : 0;
-  const vtAlong = s.tv.x * ux + s.tv.y * uy;
+  const vtAlong = gv.x * ux + gv.y * uy;
   const vdAlong = s.vel.x * ux + s.vel.y * uy;
   s.vc = vdAlong - vtAlong;
 
-  const vtAbs = Math.hypot(s.tv.x, s.tv.y);
+  const vtAbs = Math.hypot(gv.x, gv.y);
   const vEnd = P.end === 'match' ? vtAbs : 0;
   const offset = P.end === 'match' ? ARRIVAL_RADIUS_M : 0.6;
 
@@ -605,9 +605,6 @@ function stepSim(s, dt) {
   // 会让参考速度虚高、飞机冲过头再兜圈子（实测 d 在 4~66 m 之间来回摆）。
   const uEnv = Math.sqrt(Math.max(0, 2 * P.decel * Math.max(0, d - offset)));
   const envelope = Math.max(0, vtAlong) + uEnv;
-  // 转弯约束：横向机动的目标要求飞机绕着它转，速度越高所需向心加速度越大。
-  // 可用横向加速度按 accel 计，转弯半径按当前视距 d 估 → v ≤ √(a·d)。
-  // 少了这一条，纯追击会在「冲过头 → 掉队 → 再冲」之间无限循环（实测 d 在 5~66 m 摆荡）。
   // 转弯约束（物理口径）：以速度 v 跟着视线转，需要向心加速度 a = v·ω，而视线角速度
   // ω ≈ 目标横向速度 / 视距 = vtCross / d，于是 v ≤ a·d / vtCross。
   // 纯追击在绕圈目标上会陷「冲过头 → 掉队 → 再冲」的极限环，靠这一条压住；
