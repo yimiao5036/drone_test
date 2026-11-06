@@ -148,12 +148,22 @@ def main():
         page.wait_for_timeout(200)
         zero = state(page)
 
-        # --- 6) 现状剖面 lag
+        # --- 6) 现状剖面：参考速度是台阶（一拍就顶到包络），梯形剖面按 a 爬坡。
+        # 走 UI 的 run_until 会按 8× 追赶，采样时刻不准，这里直接手动推进到 t=0.5 s。
         set_slider(page, "margin", 1)
-        click_seg(page, "profSeg", "prof", "step")
-        run_until(page, 6)
-        page.wait_for_timeout(100)
-        step = state(page)
+        step, trap = page.evaluate(
+            """() => {
+                const runOne = (prof) => {
+                    P.profile = prof; P.paused = true; resetSims();
+                    while (A.t < 0.5 - 1e-9) { stepSim(A, 0.02); stepSim(B, 0.02); }
+                    return {t: +A.t.toFixed(2), vref: +A.vref.toFixed(2)};
+                };
+                const out = [runOne('step'), runOne('trap')];
+                P.paused = false;
+                return out;
+            }"""
+        )
+        page.evaluate("() => { P.profile = 'trap'; P.paused = false; resetSims(); }")
         page.screenshot(path=str(SHOT / "demo2-step-1440.png"))
 
         # --- 7) 保守 vs 时间最优（目标静止 40 m）
@@ -188,7 +198,7 @@ def main():
         capped["arrivedAt"] or -1, capped["vpeak"], capped["theory"]["tTotal"], capped["theory"]["vp"],
         capped["theory"]["tCruise"]))
     print("余量 0（t=%.1f）：设计 d=%.2f vmax=%.2f 对照 d=%.2f" % (zero["t"], zero["d"], zero["vmax"], zero["bd"]))
-    print("现状剖面 t=%.1f：lag=%.2f vref=%.2f" % (step["t"], step["lag"], step["vref"]))
+    print("剖面 t=%.2f s：现状 vref=%.2f / 梯形 vref=%.2f" % (step["t"], step["vref"], trap["vref"]))
     print("目标静止 40 m：保守 %.1f s / 时间最优 %.1f s" % (
         safe_static["arrivedAt"] or -1, fast_static["arrivedAt"] or -1))
     print("页面错误：", errors or "无")
@@ -229,8 +239,9 @@ def main():
               100 * (1 - fast_static["arrivedAt"] / safe_static["arrivedAt"]),
               fast_static["arrivedAt"], safe_static["arrivedAt"]),
           "时间最优没有明显更快")
-    check(step["lag"] > 2.0, "现状剖面参考点跑到前面（lag=%.2f）" % step["lag"],
-          "现状剖面 lag 未体现")
+    check(step["vref"] > 2.5 and trap["vref"] < 1.0,
+          "现状剖面是台阶：0.5 s 时 vref %.2f，梯形剖面只有 %.2f（≈a·t）" % (step["vref"], trap["vref"]),
+          "现状剖面没有体现台阶：%.2f vs %.2f" % (step["vref"], trap["vref"]))
 
     print("OK" if ok else "FAIL")
     sys.exit(0 if ok else 1)

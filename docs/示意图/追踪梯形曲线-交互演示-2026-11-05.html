@@ -153,6 +153,7 @@
       <label>频率<input id="measHz" type="range" min="1" max="20" step="1" value="5"><output id="measHzOut">5 Hz</output></label>
       <label>提前<input id="latency" type="range" min="0" max="600" step="20" value="200"><output id="latencyOut">200 ms</output></label>
       <label>σ_a<input id="sigmaA" type="range" min="0.5" max="8" step="0.5" value="2"><output id="sigmaAOut">2.0 m/s²（机载 8.0）</output></label>
+      <label>拦截提前<input id="lead" type="range" min="0" max="1000" step="50" value="0"><output id="leadOut">0 ms</output></label>
       <span class="kfnote">量测 = 提前量之前的真值 + 噪声；σ_a 机载 8.0</span>
     </section>
 
@@ -288,6 +289,8 @@
 const ARRIVAL_RADIUS_M = 3.0;   // 与 handover.arrival_radius_m 对齐
 const ARRIVAL_SPEED_MPS = 0.5;  // 与 handover 到点判据对齐
 const BRAKE_SAFETY = 1.3;
+const LEAD_TAU = 0.3;      // 位置设定点的跟随时间常数 s
+const LEAD_MAX_M = 6;      // 设定点最多领先飞机多少米
 const BRAKE_PAD_M = 0.5;
 const DT = 0.02;
 const T_MAX = 60;
@@ -297,7 +300,9 @@ const P = {
   vt: 2.0, heading: 90, turn: 'straight',
   margin: 1.0, accel: 1.0, decel: 1.0, profile: 'trap', end: 'match', floor: true,
   policy: 'fast', vcap: 0,
-  src: 'truth', noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
+  src: 'truth',
+  noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
+  lead: 0,                      // 拦截提前量 ms（0 = 只补时延）
   speed: 2.0, paused: false,
 };
 
@@ -473,10 +478,19 @@ function stepSim(s, dt) {
       est.meas.push({ x: mx, y: my });
       if (est.meas.length > 320) est.meas.shift();
     }
-    // 前视到"现在"：状态 + 速度 × 时延（等价于 PredictedState(latency)）
+    // 前视到"现在"：状态 + 速度 × (真实经过时间 + 拦截提前量)。
+    // 用真实经过时间而不是固定 latency——量测是被采样到"lat 之前"的某一拍上的，
+    // 固定值会少推一拍，看上去就"总在目标后面"。
     const p = { x: est.kfX.pos, y: est.kfY.pos };
-    const pred = { x: p.x + est.kfX.vel * lat, y: p.y + est.kfY.vel * lat };
+    const elapsed = Math.max(0, s.t - (est.filterT ?? s.t));
+    const ahead = elapsed + P.lead;
+    const pred = { x: p.x + est.kfX.vel * ahead, y: p.y + est.kfY.vel * ahead };
     est.pred = pred;
+    // 瞄准点 = 估计点 + 目标速度 × (拦截提前 t_go + 手动提前)。
+    // 直线后退目标 t_go≈0 → 瞄准点≈预测点；绕圈/蛇形时它会明显落在目标前方，
+    // 这正是飞机实际飞向的那个点（"预测"本来就该指向前方）。
+    const aimAdvance = ahead + (s.tGo || 0);
+    est.aim = { x: p.x + est.kfX.vel * aimAdvance, y: p.y + est.kfY.vel * aimAdvance };
     const lastMeas = est.meas.length ? est.meas[est.meas.length - 1] : null;
     // 三个误差各评各的时刻，才看得懂：
     //   量测误差 = 过期量测点 vs 现在真值（含时延 + 噪声）
@@ -489,7 +503,21 @@ function stepSim(s, dt) {
     s.seen = P.src === 'raw' ? (lastMeas || p) : pred;
   }
 
-  const dx = s.seen.x - s.drone.x, dy = s.seen.y - s.drone.y;
+  // 目标横向速度（垂直于视线的分量）：绕圈/蛇形时它很大，直线接近时接近 0
+  const dxRaw = s.seen.x - s.drone.x, dyRaw = s.seen.y - s.drone.y;
+  const dReal = Math.hypot(dxRaw, dyRaw);
+  s.dReal = dReal;
+  const uxRaw = dReal > 1e-6 ? dxRaw / dReal : 1, uyRaw = dReal > 1e-6 ? dyRaw / dReal : 0;
+  const vtCross = Math.abs(s.tv.x * uyRaw - s.tv.y * uxRaw);
+  const vtAbs0 = Math.hypot(s.tv.x, s.tv.y);
+  // 拦截提前量（纯追击转不过来）：t_go = 视距 / 相对速度，上限 4 s。
+  // 直线后退目标 vtCross≈0 → tGo=0，行为与原来完全一致。
+  const tGo = vtCross > 0.8
+    ? Math.min(4, dReal / Math.max(2, Math.max(P.vcap > 0 ? P.vcap : 6, vtAbs0 + 0.5)))
+    : 0;
+  s.tGo = tGo;
+  const ax2 = s.seen.x + s.tv.x * tGo, ay2 = s.seen.y + s.tv.y * tGo;
+  const dx = ax2 - s.drone.x, dy = ay2 - s.drone.y;
   const d = Math.hypot(dx, dy);
   s.d = d;
   const ux = d > 1e-6 ? dx / d : 1, uy = d > 1e-6 ? dy / d : 0;
@@ -514,10 +542,16 @@ function stepSim(s, dt) {
   }
   plateau = Math.max(0, plateau);
 
-  // 刹车包络（相对系）：目标以 v_t 后退，先追上 v_t 才谈得上收敛，
-  // 所以包络是 v_t + √(2·a_d·s)，不是"从当前速度刹到停止"的 √(2a s + v_end²)。
-  const envelope = vEnd + Math.sqrt(Math.max(0, 2 * P.decel * Math.max(0, d - offset)));
-  const vTop = Math.min(plateau, envelope);
+  // 刹车包络：只在目标「沿视线后退」时才需要额外补偿速度。
+  // 用 |v_t| 整体补偿是错的——目标横向跑（绕圈/蛇形）时 vtAlong≈0，多补的那部分
+  // 会让参考速度虚高、飞机冲过头再兜圈子（实测 d 在 4~66 m 之间来回摆）。
+  const uEnv = Math.sqrt(Math.max(0, 2 * P.decel * Math.max(0, d - offset)));
+  const envelope = Math.max(0, vtAlong) + uEnv;
+  // 转弯约束：横向机动的目标要求飞机绕着它转，速度越高所需向心加速度越大。
+  // 可用横向加速度按 accel 计，转弯半径按当前视距 d 估 → v ≤ √(a·d)。
+  // 少了这一条，纯追击会在「冲过头 → 掉队 → 再冲」之间无限循环（实测 d 在 5~66 m 摆荡）。
+  const turnCap = vtCross > 0.8 ? Math.sqrt(Math.max(0, P.accel * Math.max(0, d))) : Infinity;
+  const vTop = Math.min(plateau, envelope, turnCap);
 
   let vref, phase;
   if (vTop <= 1e-3) {
@@ -533,7 +567,7 @@ function stepSim(s, dt) {
     vref = Math.min(vTop, s.vref + P.accel * dt);
     phase = (isFinite(plateau) && vref >= plateau - 1e-3) ? 'cruise' : 'accel';
   }
-  if (P.end === 'match' && d <= ARRIVAL_RADIUS_M + 0.02) { vref = vEnd; phase = 'match'; }
+  if (P.end === 'match' && dReal <= ARRIVAL_RADIUS_M + 0.02) { vref = vEnd; phase = 'match'; }
   vref = Math.min(vTop, Math.max(0, vref));
   s.vref = vref;
   s.phase = phase;
@@ -542,11 +576,6 @@ function stepSim(s, dt) {
   s.plateau = plateau;
   const uNow = Math.max(0, vref - vEnd);
   s.dbrk = Math.max(0, offset + uNow * uNow / (2 * P.decel) * BRAKE_SAFETY + BRAKE_PAD_M);
-
-  const guideSpeed = P.profile === 'step' ? (isFinite(plateau) ? plateau : vref) : vref;
-  s.guide.x += ux * guideSpeed * dt;
-  s.guide.y += uy * guideSpeed * dt;
-  s.lag = Math.hypot(s.guide.x - s.drone.x, s.guide.y - s.drone.y);
 
   const cmdX = ux * vref, cmdY = uy * vref;
   let ax = (cmdX - s.vel.x) / dt, ay = (cmdY - s.vel.y) / dt;
@@ -557,7 +586,17 @@ function stepSim(s, dt) {
   s.drone.x += s.vel.x * dt; s.drone.y += s.vel.y * dt;
   s.t += dt;
 
-  if (!s.arrived && d <= ARRIVAL_RADIUS_M + 0.02 && Math.abs(s.vc) <= ARRIVAL_SPEED_MPS) {
+  // 参考点 = 飞机 + 沿视线的前瞻距离（一阶跟随），代表"位置设定点"。
+  // 之前写成 `guide += u · v_ref · dt` 会以 8~15 m/s 无限往前跑——目标一绕圈，
+  // 参考点就被甩到 200 m 外（截图里的「参考领先 73.1 m」就是这么来的）。
+  const leadWant = Math.min(LEAD_MAX_M, Math.max(0, vref) * LEAD_TAU);
+  const gx = s.drone.x + ux * leadWant, gy = s.drone.y + uy * leadWant;
+  const k = 1 - Math.exp(-dt / LEAD_TAU);
+  s.guide.x += (gx - s.guide.x) * k;
+  s.guide.y += (gy - s.guide.y) * k;
+  s.lag = Math.hypot(s.guide.x - s.drone.x, s.guide.y - s.drone.y);
+
+  if (!s.arrived && dReal <= ARRIVAL_RADIUS_M + 0.02 && Math.abs(s.vc) <= ARRIVAL_SPEED_MPS) {
     s.arrived = true; s.arrivedAt = s.t; s.phase = 'match';
   }
 
@@ -659,15 +698,16 @@ function drawScene() {
     ctx.save(); ctx.translate(ex, ey); ctx.rotate(Math.PI / 4);
     ctx.fillStyle = '#fff'; ctx.strokeStyle = '#0f766e'; ctx.lineWidth = 1.8;
     ctx.beginPath(); ctx.rect(-4, -4, 8, 8); ctx.fill(); ctx.stroke(); ctx.restore();
-    if (A.est.pred) {
-      const px = X(A.est.pred.x), py = Y(A.est.pred.y);
+    if (A.est.aim || A.est.pred) {
+      const aimPt = A.est.aim || A.est.pred;
+      const px = X(aimPt.x), py = Y(aimPt.y);
       ctx.save(); ctx.setLineDash([2, 3]); ctx.strokeStyle = 'rgba(124,58,237,.7)'; ctx.lineWidth = 1.2;
       ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(px, py); ctx.stroke(); ctx.restore();
       ctx.fillStyle = 'rgba(124,58,237,.16)'; ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 1.8;
       ctx.beginPath(); ctx.moveTo(px, py - 7); ctx.lineTo(px + 6, py + 4); ctx.lineTo(px - 6, py + 4);
       ctx.closePath(); ctx.fill(); ctx.stroke();
       ctx.fillStyle = '#7c3aed'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
-      ctx.fillText('预测 +' + P.latency + ' ms', px + 9, py + 3);
+      ctx.fillText('瞄准 提前 ' + ((P.latency + P.lead + Math.round((A.tGo || 0) * 1000)) / 1000).toFixed(1) + ' s', px + 9, py + 3);
     }
   }
 
@@ -955,6 +995,7 @@ bindRange('noise', 'noise', v => v.toFixed(1) + ' m');
 bindRange('measHz', 'measHz', v => v.toFixed(0) + ' Hz');
 bindRange('latency', 'latency', v => v.toFixed(0) + ' ms');
 bindRange('sigmaA', 'sigmaA', v => v.toFixed(1) + ' m/s²' + (v >= 7.9 ? '（机载）' : ''));
+bindRange('lead', 'lead', v => v.toFixed(0) + ' ms');
 bindSeg('srcSeg', 'src');
 bindSeg('turnSeg', 'turn');
 bindSeg('profSeg', 'profile');
