@@ -71,7 +71,9 @@ def main() -> int:
         page.screenshot(path=str(OUT / "sym-closed-1440.png"))
         check(not closed["open"], "默认不展开", "默认就展开了")
         check(closed["btn"]["y"] < 52, f"按钮在顶栏（y={closed['btn']['y']}）", f"按钮不在顶栏（y={closed['btn']['y']}）")
-        check(closed["stage"]["h"] >= 440, f"收起时舞台 {closed['stage']['h']} px", f"舞台只有 {closed['stage']['h']} px")
+        # 默认来源改成「速度位」后，读数条第二行（卡尔曼误差）默认可见，舞台比原来矮约 45 px；
+        # 这里只要求舞台仍有可用高度，不再咬死 451 px。
+        check(closed["stage"]["h"] >= 400, f"收起时舞台 {closed['stage']['h']} px", f"舞台只有 {closed['stage']['h']} px")
         check(closed["docScroll"] <= closed["winH"] + 1, "整页无纵向滚动", "整页出现纵向滚动")
         check(not closed["overflowX"], "无横向溢出", "横向溢出")
 

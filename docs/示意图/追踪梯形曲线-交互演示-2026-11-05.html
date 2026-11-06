@@ -114,7 +114,7 @@
   aside h2{font-size:12px; margin:0 0 6px; color:var(--ink-2); font-weight:650}
   .group{border-top:1px solid var(--line); padding-top:9px; margin-top:9px}
   .group:first-of-type{border-top:0; margin-top:0; padding-top:0}
-  .row{display:grid; grid-template-columns:72px 1fr 56px; align-items:center; gap:7px; margin:3px 0}
+  .row{display:grid; grid-template-columns:72px 1fr 56px; align-items:center; gap:7px; margin:2px 0}
   .row label{font-size:12px; color:var(--ink-2); white-space:nowrap}
   .row output{font:600 11px/1 ui-monospace,Consolas,monospace; text-align:right}
   input[type=range]{width:100%; accent-color:var(--primary-fill); height:16px}
@@ -166,17 +166,17 @@
     <section class="kfbar">
       <b>目标位置来源</b>
       <div class="seg" id="srcSeg">
-        <button data-src="truth" class="on">真值</button>
+        <button data-src="truth">真值</button>
         <button data-src="raw">量测</button>
         <button data-src="kf">卡尔曼</button>
-        <button data-src="vmsg">速度位</button>
+        <button data-src="vmsg" class="on">速度位</button>
       </div>
       <label>噪声 σ<input id="noise" type="range" min="0" max="3" step="0.1" value="0.8"><output id="noiseOut">0.8 m</output></label>
       <label>频率<input id="measHz" type="range" min="1" max="20" step="1" value="5"><output id="measHzOut">5 Hz</output></label>
       <label>提前<input id="latency" type="range" min="0" max="600" step="20" value="200"><output id="latencyOut">200 ms</output></label>
       <label>σ_a<input id="sigmaA" type="range" min="0.5" max="8" step="0.5" value="2"><output id="sigmaAOut">2.0 m/s²（机载 8.0）</output></label>
       <label>拦截提前<input id="lead" type="range" min="0" max="1000" step="50" value="0"><output id="leadOut">0 ms</output></label>
-      <span class="kfnote">真值 = 只验法则本身；量测 = 提前量之前的真值 + 噪声（速度只能差分，基本不可用）；看真实链路请切卡尔曼；σ_a 机载 8.0</span>
+      <span class="kfnote">实机默认 = 速度位（雷达三轴速度，分辨率 0.01 m/s）；真值只验法则；σ_a 机载 8.0</span>
     </section>
 
     <section class="stats">
@@ -230,7 +230,7 @@
           <button data-turn="weave">蛇形</button>
         </div>
       </div>
-      <div class="row" id="vsigRow" style="display:none">
+      <div class="row" id="vsigRow">
         <label>速度误差 σ_v</label>
         <input id="vsig" type="range" min="0" max="1" step="0.05" value="0.3">
         <output id="vsigOut">0.30 m/s</output>
@@ -343,9 +343,9 @@ const P = {
   policy: 'fast', vcap: 0,
   law: 'prop',                  // 速度律：prop=比例接近（基线）/ env=刹车包络
   k: 0.6,                       // 比例接近增益 1/s
-  src: 'truth',
+  src: 'vmsg',                  // 真实链路默认：雷达/地面站带速度位（真值仅用于验法则）
   noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
-  vsig: 0.3,                    // 地面站速度误差 σ（m/s，仅「地面站速度」来源用）
+  vsig: 0.1,                    // 速度位误差 σ（m/s；雷达分辨率 0.01 m/s，取 0.1 偏保守）
   lead: 0,                      // 拦截提前量 ms（0 = 只补时延）
   startD: 40,                   // 起始距离 m（飞机在 -x 方向，目标在原点）
   speed: 2.0, paused: false,
@@ -1129,10 +1129,12 @@ bindRange('lead', 'lead', v => v.toFixed(0) + ' ms');
 bindRange('k', 'k', v => v.toFixed(2) + ' 1/s');
 bindSeg('srcSeg', 'src');
 // σ_v 只在「地面站速度」来源下有意义，其它模式把该行收起来，免得误导。
-document.getElementById('srcSeg').addEventListener('click', () => {
+function syncVsigRow() {
   const row = document.getElementById('vsigRow');
   if (row) row.style.display = P.src === 'vmsg' ? '' : 'none';
-});
+}
+document.getElementById('srcSeg').addEventListener('click', syncVsigRow);
+syncVsigRow();
 bindSeg('turnSeg', 'turn');
 $('lawSeg').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;

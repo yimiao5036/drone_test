@@ -57,8 +57,9 @@ SCENARIOS = [
 
 SOURCES = [
     ("真值", dict(src="truth", vsig=0.0, sigmaA=2.0)),
-    ("地面站 σ_v=0.2", dict(src="vmsg", vsig=0.2, sigmaA=2.0)),
-    ("地面站 σ_v=0.5", dict(src="vmsg", vsig=0.5, sigmaA=2.0)),
+    ("速度位 σ_v=0.05", dict(src="vmsg", vsig=0.05, sigmaA=2.0)),
+    ("速度位 σ_v=0.10", dict(src="vmsg", vsig=0.1, sigmaA=2.0)),
+    ("速度位 σ_v=0.30", dict(src="vmsg", vsig=0.3, sigmaA=2.0)),
     ("卡尔曼 σ_a=2", dict(src="kf", vsig=0.0, sigmaA=2.0)),
     ("卡尔曼 σ_a=8（机载）", dict(src="kf", vsig=0.0, sigmaA=8.0)),
     ("差分", dict(src="raw", vsig=0.0, sigmaA=2.0)),

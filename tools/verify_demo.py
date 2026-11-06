@@ -107,6 +107,7 @@ def main():
         page = browser.new_page(viewport={"width": 1440, "height": 900}, device_scale_factor=2)
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.goto(DEMO.as_uri())
+        page.evaluate("() => { P.src = 'truth'; resetSims(); }")
         page.wait_for_selector("#scene")
         page.wait_for_timeout(600)
 
