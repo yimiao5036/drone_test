@@ -111,20 +111,23 @@
   .stats .verdict{margin-top:5px; font-size:11px; color:var(--ink-2); line-height:1.45}
 
   aside.panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; overflow:auto}
-  aside h2{font-size:12px; margin:0 0 6px; color:var(--ink-2); font-weight:650}
-  .group{border-top:1px solid var(--line); padding-top:9px; margin-top:9px}
+  aside h2{font-size:12px; margin:0 0 4px; color:var(--ink-2); font-weight:650}
+  .group{border-top:1px solid var(--line); padding-top:3px; margin-top:3px}
   .group:first-of-type{border-top:0; margin-top:0; padding-top:0}
-  .row{display:grid; grid-template-columns:72px 1fr 56px; align-items:center; gap:7px; margin:2px 0}
+  .row{display:grid; grid-template-columns:70px 1fr 58px; align-items:center; gap:6px; margin:0}
   .row label{font-size:12px; color:var(--ink-2); white-space:nowrap}
   .row output{font:600 11px/1 ui-monospace,Consolas,monospace; text-align:right}
   input[type=range]{width:100%; accent-color:var(--primary-fill); height:16px}
   .seg{display:flex; gap:4px}
+  /* 速度律四按钮在 340 px 面板里放不下，改 2×2 */
+  #lawSeg{display:grid; grid-template-columns:repeat(2,1fr); gap:4px}
+  #lawSeg button{padding:4px 3px}
   .seg button{flex:1; font:600 11px/1 inherit; padding:6px 4px; border-radius:6px; cursor:pointer; border:1px solid var(--line-2); background:#fff; color:var(--ink-2); white-space:nowrap}
   .seg button.on{background:#eef5ff; border-color:#bcd6f5; color:var(--primary)}
-  .presets{display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:6px}
+  .presets{display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:2px}
   .presets button{font:600 11px/1 inherit; padding:6px 2px; border-radius:6px; cursor:pointer; border:1px dashed var(--line-2); background:#fafafa; color:var(--ink-2)}
   .presets button:hover{border-color:#bcd6f5; color:var(--primary)}
-  .btn{width:100%; margin-top:6px; font:650 12px/1 inherit; padding:8px; border-radius:8px; cursor:pointer; border:1px solid var(--line-2); background:#fff; color:var(--ink)}
+  .btn{width:100%; margin-top:4px; font:650 12px/1 inherit; padding:8px; border-radius:8px; cursor:pointer; border:1px solid var(--line-2); background:#fff; color:var(--ink)}
   .btn.primary{background:var(--primary-fill); border-color:var(--primary-fill); color:#fff}
 
   .charts{display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:0 12px 12px; min-height:0}
@@ -261,6 +264,11 @@
         <output id="decelOut">1.0 m/s²</output>
       </div>
       <div class="row">
+        <label title="对参考速率做变化率限幅：相当于给速度指令本身加加速度上限，0 = 关闭">参考限速</label>
+        <input id="slew" type="range" min="0" max="3" step="0.1" value="0">
+        <output id="slewOut">关闭</output>
+      </div>
+      <div class="row">
         <label>策略</label>
         <div class="seg" id="policySeg">
           <button data-policy="safe">保守</button>
@@ -277,6 +285,7 @@
         <div class="seg" id="lawSeg">
           <button data-law="prop" class="on">比例接近</button>
           <button data-law="trap">梯形包络</button>
+          <button data-law="brake">制动曲线</button>
           <button data-law="step">现状台阶</button>
         </div>
       </div>
@@ -339,7 +348,7 @@ const SPEED_WIN = 25;
 
 const P = {
   vt: 2.0, heading: 90, turn: 'straight',
-  margin: 1.0, accel: 1.0, decel: 1.0, profile: 'trap', end: 'match', floor: true,
+  margin: 1.0, accel: 1.0, decel: 1.0, slew: 0, profile: 'trap', end: 'match', floor: true,
   policy: 'fast', vcap: 0,
   law: 'prop',                  // 速度律：prop=比例接近（基线）/ env=刹车包络
   k: 0.6,                       // 比例接近增益 1/s
@@ -672,6 +681,24 @@ function stepSim(s, dt) {
     vref = Math.max(0, Math.min(plateau, turnCap, vtAlong + u));
     const vNow0 = Math.hypot(s.vel.x, s.vel.y);
     phase = vref > vNow0 + 0.05 ? 'accel' : (vref < vNow0 - 0.05 ? 'decel' : 'cruise');
+  } else if (P.law === 'brake') {
+    // 制动曲线（Kimi 版）：允许接近速度 = min(V_catch, √(v_end² + 2·a·(dAim − s0)))，
+    // 再叠加目标沿视线速度分量；总速度仍受机体上限与转弯约束。
+    // 与梯形包络的唯一实质差别：远段接近速度被 V_catch 顶住，不会把
+    // `v_t∥ + √(2a·d)` 一路加到超过机体上限（包络律在目标快速后退时会超）。
+    // 正向形式：先把「目标速度矢量」和「沿视线的接近速度」矢量相加，
+    // 再按机体上限整矢量缩放，最后投影回视线方向作为参考速率。
+    // 这样两个上限各管一层：V_catch 管接近分量，V_body 管合成速度。
+    const vCatch = P.vcap > 0 ? P.vcap : V_PLAN_MPS;
+    const vBody = P.vcap > 0 ? P.vcap : V_PLAN_MPS;
+    const vAllow = Math.sqrt(vEnd * vEnd + 2 * P.decel * Math.max(0, dAim - offset));
+    const vClose = Math.min(vCatch, vAllow);
+    let vxDes = gv.x + vClose * ux, vyDes = gv.y + vClose * uy;
+    const magDes = Math.hypot(vxDes, vyDes);
+    if (magDes > vBody) { vxDes *= vBody / magDes; vyDes *= vBody / magDes; }
+    vref = Math.max(0, Math.min(Math.min(vBody, turnCap), vxDes * ux + vyDes * uy));
+    const vNow1 = Math.hypot(s.vel.x, s.vel.y);
+    phase = vref > vNow1 + 0.05 ? 'accel' : (vref < vNow1 - 0.05 ? 'decel' : 'cruise');
   } else if (vTop <= 1e-3) {
     vref = 0; phase = 'idle';
   } else if (P.profile === 'step') {
@@ -686,6 +713,13 @@ function stepSim(s, dt) {
     phase = (isFinite(plateau) && vref >= plateau - 1e-3) ? 'cruise' : 'accel';
   }
   if (P.end === 'match' && dReal <= ARRIVAL_RADIUS_M + 0.02) { vref = vEnd; phase = 'match'; }
+  // 参考速率变化率限幅（Kimi 第 3 条：给速度指令本身加加速度上限）。
+  // 不限幅时到点那一拍 vref 会从巡航值一步跳到 vEnd（0 或 |v_t|），飞机只能靠
+  // 姿态环硬吃——这正是"静止目标也急加速急减速"的来源。
+  if (P.slew > 0) {
+    const dvMax = P.slew * dt;
+    vref = Math.max(0, s.vref + Math.max(-dvMax, Math.min(dvMax, vref - s.vref)));
+  }
   vref = Math.max(0, Math.min(P.law === 'prop' ? Math.max(vTop, 0) : vTop, vref));
   s.vref = vref;
   s.phase = phase;
@@ -1118,7 +1152,8 @@ bindRange('startd', 'startD', v => v.toFixed(0) + ' m');
 bindRange('margin', 'margin', v => v.toFixed(1));
 bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
-bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '默认 ' + V_PLAN_MPS + ' m/s');
+bindRange('slew', 'slew', v => v > 0 ? v.toFixed(1) + ' m/s²' : '关闭');
+bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '默认 ' + V_PLAN_MPS);
 bindRange('speed', 'speed', v => v.toFixed(1) + '×');
 bindRange('noise', 'noise', v => v.toFixed(1) + ' m');
 bindRange('vsig', 'vsig', v => v.toFixed(2) + ' m/s');
@@ -1139,7 +1174,7 @@ bindSeg('turnSeg', 'turn');
 $('lawSeg').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   [...$('lawSeg').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
-  P.law = b.dataset.law === 'prop' ? 'prop' : 'env';
+  P.law = b.dataset.law === 'trap' ? 'env' : b.dataset.law;
   P.profile = b.dataset.law === 'step' ? 'step' : 'trap';
   resetSims();
 });
