@@ -83,8 +83,26 @@ def main():
         for name, cfg, shot in cases:
             res = page.evaluate(RUN, cfg)
             summarize(name, res)
-            page.evaluate("(cfg) => { Object.assign(P, cfg); P.paused = false; resetSims(); }", cfg)
-            page.wait_for_timeout(2500)
+            # 截图走真实 UI：点分段按钮，让高亮与 P 一致，再点「重置并重跑」
+            page.evaluate(
+                """(cfg) => {
+                    const turnBtn = [...document.querySelectorAll('#turnSeg button')]
+                        .find(x => x.dataset.turn === cfg.turn);
+                    if (turnBtn) turnBtn.click();
+                    const setS = (id, v) => {
+                        const el = document.getElementById(id);
+                        if (!el) return;
+                        el.value = String(v);
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                    };
+                    setS('vt', cfg.vt);
+                    if (cfg.accel) setS('accel', cfg.accel);
+                    P.paused = false;
+                    resetSims();
+                }""",
+                cfg,
+            )
+            page.wait_for_timeout(3500)
             page.screenshot(path=str(SHOT / shot))
 
         browser.close()

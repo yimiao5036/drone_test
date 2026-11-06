@@ -127,6 +127,14 @@ def main():
         advance(page, 8)
         clean = stats(page)
 
+        # --- 5) 工具条不被裁
+        kfbar = page.evaluate(
+            """() => {
+                const el = document.querySelector('.kfbar');
+                return {sw: el.scrollWidth, cw: el.clientWidth};
+            }"""
+        )
+
         browser.close()
 
     print("整定后 σ_a=2.0：量测 %.2f m / 估计 %.2f m / 前视 %.2f m（采样 %d）" % (
@@ -156,6 +164,10 @@ def main():
     check(clean["ee"] is not None and clean["ee"] < 0.02,
           "无噪声时估计误差≈0（%.3f m）" % (clean["ee"] or -1),
           "无噪声仍有偏置：%.3f m" % (clean["ee"] if clean["ee"] is not None else -1))
+    check(kfbar["sw"] <= kfbar["cw"] + 1,
+          "「目标位置来源」工具条不溢出（%d/%d）" % (kfbar["sw"], kfbar["cw"]),
+          "工具条被裁：%s" % kfbar)
+
     check(tuned["lead"] is not None and tuned["lead"] > 0.2,
           "预测点在估计点前方 %.2f m" % (tuned["lead"] or -1),
           "预测点没有前视：%.2f m" % (tuned["lead"] or -1))

@@ -70,11 +70,11 @@
   .legendbox .dot{width:8px; height:8px; border-radius:50%; border-top:0; margin-right:5px; border:2px solid #409eff; background:#fff}
 
   .tip{font-size:10.5px; color:var(--ink-3); line-height:1.5; margin:4px 0 6px}
-  .kfbar{display:flex; align-items:center; gap:12px; flex-wrap:nowrap; background:var(--panel);
+  .kfbar{display:flex; align-items:center; gap:9px; flex-wrap:nowrap; background:var(--panel);
     border:1px solid var(--line); border-radius:10px; padding:6px 12px; font-size:11px; overflow:hidden}
   .kfbar b{font-size:11px; color:var(--ink-2); white-space:nowrap}
   .kfbar label{display:flex; align-items:center; gap:5px; white-space:nowrap; color:var(--ink-2)}
-  .kfbar input[type=range]{width:82px}
+  .kfbar input[type=range]{width:58px}
   .kfbar output{font:650 11px ui-monospace,Consolas,monospace; min-width:44px}
   .kfbar .seg{padding:1px}
   .kfbar .seg button{padding:2px 7px; font-size:10.5px}
@@ -490,7 +490,15 @@ function stepSim(s, dt) {
     // 直线后退目标 t_go≈0 → 瞄准点≈预测点；绕圈/蛇形时它会明显落在目标前方，
     // 这正是飞机实际飞向的那个点（"预测"本来就该指向前方）。
     const aimAdvance = ahead + (s.tGo || 0);
-    est.aim = { x: p.x + est.kfX.vel * aimAdvance, y: p.y + est.kfY.vel * aimAdvance };
+    // 瞄准点离估计点最多半个视距：卡尔曼速度在起手阶段不确定度很大（p11 初值 20²），
+    // 不加这个夹紧会算出几十米外的瞄准点，看着像"预测点跑到天边"。
+    const aimLen = Math.hypot(est.kfX.vel, est.kfY.vel) * aimAdvance;
+    const seenDist = Math.hypot(s.seen.x - s.drone.x, s.seen.y - s.drone.y);
+    const aimScale = aimLen > 1e-6 ? Math.min(1, 0.5 * seenDist / aimLen) : 1;
+    est.aim = {
+      x: p.x + est.kfX.vel * aimAdvance * aimScale,
+      y: p.y + est.kfY.vel * aimAdvance * aimScale,
+    };
     const lastMeas = est.meas.length ? est.meas[est.meas.length - 1] : null;
     // 三个误差各评各的时刻，才看得懂：
     //   量测误差 = 过期量测点 vs 现在真值（含时延 + 噪声）
