@@ -69,8 +69,20 @@
   .legendbox i{display:inline-block; width:14px; height:0; border-top-width:2px; margin-right:5px; vertical-align:middle}
   .legendbox .dot{width:8px; height:8px; border-radius:50%; border-top:0; margin-right:5px; border:2px solid #409eff; background:#fff}
 
+  .tip{font-size:10.5px; color:var(--ink-3); line-height:1.5; margin:4px 0 6px}
+  .kfbar{display:flex; align-items:center; gap:12px; flex-wrap:nowrap; background:var(--panel);
+    border:1px solid var(--line); border-radius:10px; padding:6px 12px; font-size:11px; overflow:hidden}
+  .kfbar b{font-size:11px; color:var(--ink-2); white-space:nowrap}
+  .kfbar label{display:flex; align-items:center; gap:5px; white-space:nowrap; color:var(--ink-2)}
+  .kfbar input[type=range]{width:82px}
+  .kfbar output{font:650 11px ui-monospace,Consolas,monospace; min-width:44px}
+  .kfbar .seg{padding:1px}
+  .kfbar .seg button{padding:2px 7px; font-size:10.5px}
+  .kfbar .kfnote{color:var(--ink-3); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .stats{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px 12px 6px}
   .stats .grid{display:grid; grid-template-columns:repeat(12,1fr); gap:6px 8px}
+  .stats .grid2{grid-template-columns:repeat(4,1fr); margin-top:6px; padding-top:6px; border-top:1px dashed var(--line)}
+  .stats .grid2 .k{color:#0f766e}
   .stats .cell{border-left:2px solid #eef1f5; padding-left:7px; min-width:0}
   .stats .cell:first-child{border-left:0; padding-left:0}
   .stats .k{font-size:9.5px; color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
@@ -105,7 +117,7 @@
 <body>
 <header>
   <h1>接近段速度剖面 · 梯形曲线（交互）</h1>
-  <span class="sub">蓝 = 设计（梯形 + 余量）　红 = 对照（无余量、无下限，纯尾追）</span>
+  <span class="sub">蓝 = 设计（梯形 + 余量）　红 = 对照（无余量、无下限，纯尾追）　舞台下方可切「目标位置来源」：真值 / 量测 / 卡尔曼（含前视预测）</span>
   <span class="spacer"></span>
   <span class="badge" id="badgePhase">推进中</span>
   <span class="badge" id="badgeTime">t = 0.0 s</span>
@@ -122,9 +134,26 @@
         <span><i style="border-color:#c2410c"></i>目标</span>
         <span><i style="border-color:#1677d2;border-top-style:dotted"></i>视线</span>
         <span><span class="dot"></span>引导点</span>
+        <span><span class="dot" style="border-color:#0f766e"></span>卡尔曼估计</span>
+        <span><span class="dot" style="border-color:#7c3aed;border-style:dashed"></span>预测点</span>
+        <span><span class="dot" style="border-color:#909399"></span>量测点</span>
         <span><span class="dot" style="border-color:#b45309;border-style:dashed"></span>刹车点</span>
         <span>空格 = 暂停　R = 重跑</span>
       </div>
+    </section>
+
+    <section class="kfbar">
+      <b>目标位置来源</b>
+      <div class="seg" id="srcSeg">
+        <button data-src="truth" class="on">真值</button>
+        <button data-src="raw">量测</button>
+        <button data-src="kf">卡尔曼</button>
+      </div>
+      <label>噪声 σ<input id="noise" type="range" min="0" max="3" step="0.1" value="0.8"><output id="noiseOut">0.8 m</output></label>
+      <label>频率<input id="measHz" type="range" min="1" max="20" step="1" value="5"><output id="measHzOut">5 Hz</output></label>
+      <label>提前<input id="latency" type="range" min="0" max="600" step="20" value="200"><output id="latencyOut">200 ms</output></label>
+      <label>σ_a<input id="sigmaA" type="range" min="0.5" max="8" step="0.5" value="2"><output id="sigmaAOut">2.0 m/s²（机载 8.0）</output></label>
+      <span class="kfnote">量测 = 提前量之前的真值 + 噪声；σ_a 机载 8.0</span>
     </section>
 
     <section class="stats">
@@ -141,6 +170,12 @@
         <div class="cell"><div class="k">到点用时</div><div class="v" id="sTa">—</div></div>
         <div class="cell"><div class="k">理论用时</div><div class="v" id="sTt">—</div></div>
         <div class="cell"><div class="k">匀速段</div><div class="v" id="sTc">—</div></div>
+      </div>
+      <div class="grid grid2" id="estRow" style="display:none">
+        <div class="cell"><div class="k">量测误差 RMS</div><div class="v" id="sEm">—</div></div>
+        <div class="cell"><div class="k">估计误差 RMS</div><div class="v" id="sEe">—</div></div>
+        <div class="cell"><div class="k">预测误差 RMS</div><div class="v" id="sEp">—</div></div>
+        <div class="cell"><div class="k">轨迹横向抖动</div><div class="v" id="sJit">—</div></div>
       </div>
       <div class="verdict" id="verdict"></div>
     </section>
@@ -262,6 +297,7 @@ const P = {
   vt: 2.0, heading: 90, turn: 'straight',
   margin: 1.0, accel: 1.0, decel: 1.0, profile: 'trap', end: 'match', floor: true,
   policy: 'fast', vcap: 0,
+  src: 'truth', noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
   speed: 2.0, paused: false,
 };
 
@@ -275,6 +311,54 @@ const PHASE_COL = {
 };
 const PHASE_NAME = { accel: '加速', cruise: '匀速', decel: '减速', match: '匹配', idle: '不动' };
 
+// 确定性高斯：A/B 两个世界用同一串噪声，比较才公平。
+function rand01(n) { const x = Math.sin(n) * 43758.5453; return x - Math.floor(x); }
+function gaussAt(k, salt) {
+  const u = Math.max(1e-6, rand01(k * 12.9898 + salt * 78.233));
+  const v = rand01(k * 39.3460 + salt * 11.1350);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// 与机载 LinearTargetKalmanFilter 同构：白噪声加速度恒速度模型，每轴独立 [位置,速度]。
+//   predict: p += v·dt, P ← F P Fᵀ + Q，Q = σ_a²·[[dt⁴/4, dt³/2], [dt³/2, dt²]]
+//   update : 位置量测，K = P·Hᵀ/(H P Hᵀ + R)
+class AxisKF {
+  constructor() { this.reset(); }
+  reset() { this.init = false; this.pos = 0; this.vel = 0; this.p00 = 0; this.p01 = 0; this.p10 = 0; this.p11 = 0; }
+  start(z, posVar) {
+    this.init = true; this.pos = z; this.vel = 0;
+    this.p00 = Math.max(posVar, 0.25);   // minimum_measurement_std_m = 0.5
+    this.p01 = 0; this.p10 = 0;
+    this.p11 = 20 * 20;                  // initial_velocity_std_mps = 20
+  }
+  predict(dt) {
+    if (!this.init || !(dt > 0)) return;
+    this.pos += this.vel * dt;
+    const q = P.sigmaA * P.sigmaA;
+    const dt2 = dt * dt, dt3 = dt2 * dt, dt4 = dt2 * dt2;
+    const o00 = this.p00, o01 = this.p01, o10 = this.p10, o11 = this.p11;
+    this.p00 = o00 + dt * (o10 + o01) + dt2 * o11 + q * dt4 * 0.25;
+    this.p01 = o01 + dt * o11 + q * dt3 * 0.5;
+    this.p10 = o10 + dt * o11 + q * dt3 * 0.5;
+    this.p11 = o11 + q * dt2;
+  }
+  update(z, r) {
+    if (!this.init) { this.start(z, r); return; }
+    const denom = this.p00 + r;
+    if (!(denom > 0)) return;
+    const kp = this.p00 / denom, kv = this.p10 / denom;
+    const y = z - this.pos;
+    this.pos += kp * y; this.vel += kv * y;
+    const o00 = this.p00, o01 = this.p01, o10 = this.p10, o11 = this.p11;
+    this.p00 = (1 - kp) * o00;
+    this.p01 = (1 - kp) * o01;
+    this.p10 = o10 - kv * o00;
+    this.p11 = o11 - kv * o01;
+    const c = 0.5 * (this.p01 + this.p10); this.p01 = c; this.p10 = c;
+    this.p00 = Math.max(0, this.p00); this.p11 = Math.max(0, this.p11);
+  }
+}
+
 function makeSim(variant) {
   return {
     variant, t: 0, arrived: false, arrivedAt: null,
@@ -282,6 +366,12 @@ function makeSim(variant) {
     target: { x: 0, y: 0 }, tv: { x: 0, y: 0 }, tHeading: P.heading,
     trailD: [], trailT: [], hist: [],
     vref: 0, lag: 0, d: 40, vc: 0, vmax: 0, vpeak: 0, plateau: Infinity, dbrk: 0, phase: 'idle',
+    step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
+    est: {
+      kfX: new AxisKF(), kfY: new AxisKF(), lastMeasT: -1,
+      meas: [], trail: [], pred: null, predHist: [],
+      errMeas: [], errEst: [], errPred: [],
+    },
   };
 }
 let A = makeSim('design');
@@ -345,7 +435,61 @@ function stepSim(s, dt) {
   s.target.x += s.tv.x * dt;
   s.target.y += s.tv.y * dt;
 
-  const dx = s.target.x - s.drone.x, dy = s.target.y - s.drone.y;
+  // ===== 目标估计（带时延的量测 → 卡尔曼 → 前视到"现在"）=====
+  // 真实链路：65010 目标以 5 Hz 送来，收到时已经是 latency 毫秒之前的真值。
+  //   量测模式  = 直接追这个"过期点"            → 落后 v_t·latency，还带噪声
+  //   卡尔曼模式= 滤波器状态停在量测时刻，再按估计速度前视 latency 毫秒 → 补掉时延
+  const est = s.est;
+  const lat = P.latency / 1000;
+  s.step += 1;
+  s.truthHist.push({ t: s.t, x: s.target.x, y: s.target.y });
+  if (s.truthHist.length > 1200) s.truthHist.shift();
+
+  if (P.src === 'truth') {
+    est.kfX.reset(); est.kfY.reset(); est.lastMeasT = -1; est.filterT = null;
+    est.meas.length = 0; est.trail.length = 0; est.pred = null;
+    est.errMeas.length = 0; est.errEst.length = 0; est.errPred.length = 0; est.predHist.length = 0;
+    s.seen = { x: s.target.x, y: s.target.y };
+  } else {
+    const period = 1 / Math.max(0.5, P.measHz);
+    if (s.t - est.lastMeasT >= period - 1e-9) {
+      est.lastMeasT = s.t;
+      // 传感器测的是 latency 之前的真值（找不到更早的就用最早一条）
+      let truth = s.truthHist[0];
+      for (const h of s.truthHist) { if (h.t <= s.t - lat + 1e-9) truth = h; else break; }
+      const measuredAt = truth.t;
+      const mx = truth.x + P.noise * gaussAt(s.step, 1);
+      const my = truth.y + P.noise * gaussAt(s.step, 2);
+      const r = Math.max(1e-6, P.noise * P.noise);
+      if (!est.kfX.init) {
+        est.kfX.start(mx, r); est.kfY.start(my, r);
+      } else {
+        const dtF = measuredAt - (est.filterT == null ? measuredAt : est.filterT);
+        if (dtF > 0) { est.kfX.predict(dtF); est.kfY.predict(dtF); }
+        est.kfX.update(mx, r); est.kfY.update(my, r);
+      }
+      est.filterT = measuredAt;
+      est.errEst.push(Math.hypot(est.kfX.pos - truth.x, est.kfY.pos - truth.y));
+      est.meas.push({ x: mx, y: my });
+      if (est.meas.length > 320) est.meas.shift();
+    }
+    // 前视到"现在"：状态 + 速度 × 时延（等价于 PredictedState(latency)）
+    const p = { x: est.kfX.pos, y: est.kfY.pos };
+    const pred = { x: p.x + est.kfX.vel * lat, y: p.y + est.kfY.vel * lat };
+    est.pred = pred;
+    const lastMeas = est.meas.length ? est.meas[est.meas.length - 1] : null;
+    // 三个误差各评各的时刻，才看得懂：
+    //   量测误差 = 过期量测点 vs 现在真值（含时延 + 噪声）
+    //   估计误差 = 滤波后的状态 vs 该量测时刻的真值（纯降噪效果）
+    //   预测误差 = 状态前视到"现在" vs 现在真值（控制器真正看到的点）
+    if (lastMeas) est.errMeas.push(Math.hypot(lastMeas.x - s.target.x, lastMeas.y - s.target.y));
+    est.errPred.push(Math.hypot(pred.x - s.target.x, pred.y - s.target.y));
+    est.trail.push(p);
+    if (est.trail.length > 900) est.trail.shift();
+    s.seen = P.src === 'raw' ? (lastMeas || p) : pred;
+  }
+
+  const dx = s.seen.x - s.drone.x, dy = s.seen.y - s.drone.y;
   const d = Math.hypot(dx, dy);
   s.d = d;
   const ux = d > 1e-6 ? dx / d : 1, uy = d > 1e-6 ? dy / d : 0;
@@ -417,7 +561,7 @@ function stepSim(s, dt) {
     s.arrived = true; s.arrivedAt = s.t; s.phase = 'match';
   }
 
-  s.trailD.push({ x: s.drone.x, y: s.drone.y });
+  s.trailD.push({ x: s.drone.x, y: s.drone.y, t: s.t });
   s.trailT.push({ x: s.target.x, y: s.target.y });
   if (s.trailD.length > 4000) { s.trailD.shift(); s.trailT.shift(); }
   if (s.hist.length === 0 || s.t - s.hist[s.hist.length - 1].t >= 0.1) {
@@ -503,6 +647,29 @@ function drawScene() {
   ctx.fillStyle = COL.target; ctx.font = '600 11px ui-monospace,Consolas,monospace';
   ctx.fillText('目标', tX + 10, tY - 12);
   arrow(ctx, tX, tY, A.tv.x, A.tv.y, scale, COL.target, 2.2);
+
+  // 估计器可视化：量测点（灰）、卡尔曼估计（青虚线 + 菱形）、预测点（紫三角 + 点线）
+  if (P.src !== 'truth' && A.est.kfX.init) {
+    for (const m of A.est.meas) {
+      ctx.fillStyle = 'rgba(144,147,153,.45)';
+      ctx.beginPath(); ctx.arc(X(m.x), Y(m.y), 2, 0, Math.PI * 2); ctx.fill();
+    }
+    poly(A.est.trail, 'rgba(15,118,110,.9)', 1.8, [5, 4]);
+    const ex = X(A.est.kfX.pos), ey = Y(A.est.kfY.pos);
+    ctx.save(); ctx.translate(ex, ey); ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#0f766e'; ctx.lineWidth = 1.8;
+    ctx.beginPath(); ctx.rect(-4, -4, 8, 8); ctx.fill(); ctx.stroke(); ctx.restore();
+    if (A.est.pred) {
+      const px = X(A.est.pred.x), py = Y(A.est.pred.y);
+      ctx.save(); ctx.setLineDash([2, 3]); ctx.strokeStyle = 'rgba(124,58,237,.7)'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(px, py); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = 'rgba(124,58,237,.16)'; ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 1.8;
+      ctx.beginPath(); ctx.moveTo(px, py - 7); ctx.lineTo(px + 6, py + 4); ctx.lineTo(px - 6, py + 4);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#7c3aed'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
+      ctx.fillText('预测 +' + P.latency + ' ms', px + 9, py + 3);
+    }
+  }
 
   const gX = X(A.guide.x), gY = Y(A.guide.y);
   ctx.fillStyle = '#fff'; ctx.strokeStyle = COL.design; ctx.lineWidth = 2;
@@ -656,6 +823,32 @@ function drawSpeedChart() {
 
 const $ = id => document.getElementById(id);
 
+// 最近 3 s 的飞行轨迹相对"首尾直线"的横向偏差 RMS：
+// 追带噪声的量测点时飞机会不停重新瞄准，轨迹会左右摆；追平滑估计时基本贴着直线。
+function pathWander(trail, sinceT, t) {
+  const pts = trail.filter(p => p.t !== undefined && t - p.t <= sinceT);
+  const tail = pts.length > 1 ? pts : trail.slice(-Math.max(2, Math.round(3 / DT)));
+  if (tail.length < 3) return null;
+  const a = tail[0], b = tail[tail.length - 1];
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return null;
+  let sum = 0;
+  for (const p of tail) {
+    const cross = Math.abs((p.x - a.x) * dy - (p.y - a.y) * dx) / len;
+    sum += cross * cross;
+  }
+  return Math.sqrt(sum / tail.length);
+}
+
+function rms(values, keep) {
+  if (!values.length) return null;
+  const arr = values.slice(-keep);
+  let sum = 0;
+  for (const v of arr) sum += v * v;
+  return Math.sqrt(sum / arr.length);
+}
+
 function updateHud() {
   $('hud').innerHTML = `
     <div class="box blue"><div class="k">设计机 d</div><div class="v">${A.d.toFixed(1)}<small>m</small></div></div>
@@ -676,6 +869,16 @@ function updateHud() {
   $('sVd').innerHTML = Math.hypot(A.vel.x, A.vel.y).toFixed(2) + '<small>m/s</small>';
   $('sVr').innerHTML = A.vref.toFixed(2) + '<small>m/s</small>';
   $('sVp').innerHTML = (A.vpeak || 0).toFixed(2) + '<small>m/s</small>';
+  const estRow = $('estRow');
+  estRow.style.display = P.src === 'truth' ? 'none' : 'grid';
+  if (P.src !== 'truth') {
+    const em = rms(A.est.errMeas, 200), ee = rms(A.est.errEst, 200), ep = rms(A.est.errPred, 200);
+    $('sEm').innerHTML = em == null ? '—' : em.toFixed(2) + '<small>m</small>';
+    $('sEe').innerHTML = ee == null ? '—' : ee.toFixed(2) + '<small>m</small>';
+    $('sEp').innerHTML = ep == null ? '—' : ep.toFixed(2) + '<small>m</small>';
+    const wander = pathWander(A.trailD, 3, A.t);
+    $('sJit').innerHTML = wander == null ? '—' : wander.toFixed(2) + '<small>m</small>';
+  }
   $('sVpt').innerHTML = THEORY ? THEORY.vp.toFixed(2) + '<small>m/s</small>' : '—';
   $('sTt').innerHTML = THEORY ? THEORY.tTotal.toFixed(1) + '<small>s</small>' : '—';
   $('sTc').innerHTML = THEORY ? THEORY.tCruise.toFixed(1) + '<small>s</small>' : '—';
@@ -748,6 +951,11 @@ bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
 bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '由几何决定');
 bindRange('speed', 'speed', v => v.toFixed(1) + '×');
+bindRange('noise', 'noise', v => v.toFixed(1) + ' m');
+bindRange('measHz', 'measHz', v => v.toFixed(0) + ' Hz');
+bindRange('latency', 'latency', v => v.toFixed(0) + ' ms');
+bindRange('sigmaA', 'sigmaA', v => v.toFixed(1) + ' m/s²' + (v >= 7.9 ? '（机载）' : ''));
+bindSeg('srcSeg', 'src');
 bindSeg('turnSeg', 'turn');
 bindSeg('profSeg', 'profile');
 bindSeg('policySeg', 'policy');
