@@ -88,6 +88,26 @@
   .stats .k{font-size:9.5px; color:var(--ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .stats .v{font:650 13px/1.35 ui-monospace,Consolas,monospace; white-space:nowrap}
   .stats .v small{font:600 9px/1 inherit; color:var(--ink-3); margin-left:1px}
+  .symbtn{padding:3px 10px; font-size:11px; font-weight:600; color:#1677d2; background:#fff;
+    border:1px solid #dcdfe6; border-radius:6px; cursor:pointer; white-space:nowrap}
+  .symbtn:hover{border-color:#409eff; color:#0b63b8}
+  .symmodal{position:fixed; inset:0; z-index:60; background:rgba(15,23,42,.42);
+    display:flex; align-items:center; justify-content:center; padding:24px}
+  .symmodal[hidden]{display:none}
+  .symcard{width:min(980px, 94vw); max-height:84vh; display:flex; flex-direction:column;
+    background:#fff; border-radius:12px; box-shadow:0 20px 60px rgba(15,23,42,.35)}
+  .symcard header{display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:12px 16px; border-bottom:1px solid var(--line)}
+  .symcard header b{font-size:14px}
+  .symcard header button{padding:3px 12px; font-size:12px; border:1px solid #dcdfe6; border-radius:6px;
+    background:#fff; cursor:pointer}
+  .symbody{overflow:auto; padding:12px 16px 16px}
+  .symbody .formula{font-family:"JetBrains Mono",monospace; font-size:11px; color:#303133;
+    background:#f5f7fa; border:1px solid #e4e7ed; border-radius:6px; padding:8px 10px; margin-bottom:10px; line-height:1.65}
+  .symbody .symgrid{display:grid; grid-template-columns:repeat(2, 1fr); gap:2px 20px}
+  .symbody .symgrid div{display:flex; gap:8px; line-height:1.6; font-size:11.5px}
+  .symbody .symgrid b{flex:0 0 74px; color:#409eff; font-family:"JetBrains Mono",monospace; font-weight:600}
+  .symbody .symgrid span{color:#606266; min-width:0}
   .stats .verdict{margin-top:5px; font-size:11px; color:var(--ink-2); line-height:1.45}
 
   aside.panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; overflow:auto}
@@ -121,6 +141,7 @@
   <span class="spacer"></span>
   <span class="badge" id="badgePhase">推进中</span>
   <span class="badge" id="badgeTime">t = 0.0 s</span>
+  <button type="button" class="symbtn" id="symBtn">符号表</button>
 </header>
 
 <main>
@@ -194,6 +215,11 @@
         <label>目标航向</label>
         <input id="hdg" type="range" min="0" max="360" step="5" value="90">
         <output id="hdgOut">90°</output>
+      </div>
+      <div class="row">
+        <label>起始距离</label>
+        <input id="startd" type="range" min="10" max="120" step="5" value="40">
+        <output id="startdOut">40 m</output>
       </div>
       <div class="row">
         <label>机动</label>
@@ -314,6 +340,7 @@ const P = {
   src: 'truth',
   noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
   lead: 0,                      // 拦截提前量 ms（0 = 只补时延）
+  startD: 40,                   // 起始距离 m（飞机在 -x 方向，目标在原点）
   speed: 2.0, paused: false,
 };
 
@@ -378,10 +405,10 @@ class AxisKF {
 function makeSim(variant) {
   return {
     variant, t: 0, arrived: false, arrivedAt: null,
-    drone: { x: -40, y: 0 }, vel: { x: 0, y: 0 }, guide: { x: -40, y: 0 },
+    drone: { x: -P.startD, y: 0 }, vel: { x: 0, y: 0 }, guide: { x: -P.startD, y: 0 },
     target: { x: 0, y: 0 }, tv: { x: 0, y: 0 }, tHeading: P.heading,
     trailD: [], trailT: [], hist: [],
-    vref: 0, lag: 0, d: 40, vc: 0, vmax: 0, vpeak: 0, plateau: Infinity, dbrk: 0, phase: 'idle',
+    vref: 0, lag: 0, d: P.startD, vc: 0, vmax: 0, vpeak: 0, plateau: Infinity, dbrk: 0, phase: 'idle',
     step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
     est: {
       kfX: new AxisKF(), kfY: new AxisKF(), lastMeasT: -1,
@@ -393,7 +420,6 @@ function makeSim(variant) {
 let A = makeSim('design');
 let B = makeSim('baseline');
 
-const START_D = 40;
 let THEORY = null;
 
 // 闭式解：只有两个加速度和距离时，峰值、总时间、匀速段都能直接算出来。
@@ -426,7 +452,7 @@ function theory(d0) {
 function resetSims() {
   A = makeSim('design');
   B = makeSim('baseline');
-  THEORY = theory(START_D);
+  THEORY = theory(P.startD);
   const h = P.heading * Math.PI / 180;
   for (const s of [A, B]) {
     s.tv = { x: P.vt * Math.sin(h), y: P.vt * Math.cos(h) };
@@ -1062,6 +1088,7 @@ function bindSeg(id, key) {
 
 bindRange('vt', 'vt', v => v.toFixed(1) + ' m/s');
 bindRange('hdg', 'heading', v => v.toFixed(0) + '°');
+bindRange('startd', 'startD', v => v.toFixed(0) + ' m');
 bindRange('margin', 'margin', v => v.toFixed(1));
 bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
@@ -1113,6 +1140,50 @@ window.addEventListener('resize', () => { drawScene(); drawDistanceChart(); draw
 
 resetSims();
 requestAnimationFrame(frame);
+  window.addEventListener('DOMContentLoaded', () => {
+    const modal = document.getElementById('symModal');
+    const open = () => { modal.hidden = false; };
+    const close = () => { modal.hidden = true; };
+    document.getElementById('symBtn').addEventListener('click', open);
+    document.getElementById('symClose').addEventListener('click', close);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  });
 </script>
+  <div class="symmodal" id="symModal" hidden>
+    <div class="symcard" role="dialog" aria-modal="true" aria-label="符号表与公式">
+      <header><b>符号表与公式（比例接近律）</b><button type="button" id="symClose">关闭 Esc</button></header>
+      <div class="symbody">
+<div class="formula">
+          瞄准点 a = 目标位置 + v_t·t_go　　视线 r = a − 飞机位置, d̂ = r/|r|, dAim = |r|<br>
+          t_go = [(r·v_t) + √((r·v_t)² + (Vmax²−v_t²)|r|²)] / (Vmax²−v_t²)，夹紧 t_go ≤ 4 s、提前距离 ≤ min(0.5·d, Vmax·0.5 s)<br>
+          u = clamp(k·(dAim − R), 0, Vmax)　v_turn = a_lat·dAim / v_t⊥　v_ref = clamp(v_t∥ + u, 0, min(Vmax, v_turn))<br>
+          飞机：v̇ = clamp((v_ref·d̂ − v)/dt, −a_d, +a_a)　　位置设定点 = 飞机 + d̂·min(6 m, v_ref·0.3 s)（一阶跟随）
+        </div>
+<div class="symgrid">
+          <div><b>d</b><span>飞机到目标真实位置的距离（读数用）</span></div>
+          <div><b>dAim</b><span>飞机到瞄准点的距离（制导用，≥ d）</span></div>
+          <div><b>r, d̂</b><span>飞机→瞄准点的向量与单位方向</span></div>
+          <div><b>v_t</b><span>目标速度矢量，来自所选「目标位置来源」</span></div>
+          <div><b>v_t∥</b><span>目标速度沿视线分量（后退为正；包络只补偿这部分）</span></div>
+          <div><b>v_t⊥</b><span>目标速度垂直视线分量（绕圈/蛇形的主力）</span></div>
+          <div><b>t_go</b><span>碰撞三角形解出的接触时间，夹紧 ≤ 4 s</span></div>
+          <div><b>Vmax</b><span>规划速度上限（上限滑块为 0 时取 6 m/s）</span></div>
+          <div><b>k</b><span>比例增益 1/s：误差 1 m → 0.6 m/s 额外接近速度</span></div>
+          <div><b>u</b><span>沿视线的额外接近速度 u = k(dAim − R)</span></div>
+          <div><b>R</b><span>到点半径 3 m（进圈且接近率够小才算到位）</span></div>
+          <div><b>a_lat</b><span>可用加速度（加速 a_a / 减速 a_d）</span></div>
+          <div><b>v_turn</b><span>转弯约束上限 v ≤ a_lat·dAim/v_t⊥</span></div>
+          <div><b>v_ref</b><span>沿视线的参考速度（飞机要跟的量）</span></div>
+          <div><b>v</b><span>飞机当前速度矢量（含方向滞后）</span></div>
+          <div><b>v_c</b><span>接近率 = v·d̂ − v_t∥；≥0 才在缩小距离</span></div>
+          <div><b>d_brake</b><span>当前速度刹到末端速度所需距离（×1.3 + 0.5 m 余量）</span></div>
+          <div><b>envelope</b><span>刹车包络 v_t∥ + √(2a_d(d−R))，梯形律用它切减速</span></div>
+          <div><b>lag</b><span>「参考点领先」：位置设定点与飞机的距离</span></div>
+          <div><b>σ_a</b><span>卡尔曼过程噪声：目标加速度标准差（机载 8.0 m/s²）</span></div>
+        
+      </div>
+    </div>
+  </div>
 </body>
 </html>
