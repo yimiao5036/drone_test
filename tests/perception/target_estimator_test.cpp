@@ -107,6 +107,61 @@ TEST(LinearTargetKalmanFilterTest, InitializesAndPredictsVelocity) {
     EXPECT_NEAR(state.east_m, 16.0, 1e-9);
 }
 
+TEST(LinearTargetKalmanFilterTest, WithoutExplicitVelocityDropsVelocityFlagsOnly) {
+    // 方案 A：显式速度位只走前馈，不进卡尔曼；去掉速度位后位置与有效位必须原样保留。
+    LinearTargetMeasurement measurement;
+    measurement.north_m = 12.5;
+    measurement.east_m = -3.5;
+    measurement.down_m = -20.0;
+    measurement.down_valid = true;
+    measurement.horizontal_position_std_m = 2.0;
+    measurement.vertical_position_std_m = 3.0;
+    measurement.velocity_north_mps = 4.0;
+    measurement.velocity_east_mps = -1.0;
+    measurement.velocity_down_mps = 0.5;
+    measurement.velocity_north_valid = true;
+    measurement.velocity_east_valid = true;
+    measurement.velocity_down_valid = true;
+
+    const auto position_only = WithoutExplicitVelocity(measurement);
+    EXPECT_FALSE(position_only.velocity_north_valid);
+    EXPECT_FALSE(position_only.velocity_east_valid);
+    EXPECT_FALSE(position_only.velocity_down_valid);
+    EXPECT_DOUBLE_EQ(position_only.north_m, measurement.north_m);
+    EXPECT_DOUBLE_EQ(position_only.east_m, measurement.east_m);
+    EXPECT_DOUBLE_EQ(position_only.down_m, measurement.down_m);
+    EXPECT_TRUE(position_only.down_valid);
+    EXPECT_DOUBLE_EQ(position_only.horizontal_position_std_m, 2.0);
+    EXPECT_DOUBLE_EQ(position_only.vertical_position_std_m, 3.0);
+    // 原量测不被修改（前馈链路还要用）。
+    EXPECT_TRUE(measurement.velocity_north_valid);
+    EXPECT_DOUBLE_EQ(measurement.velocity_north_mps, 4.0);
+}
+
+TEST(LinearTargetKalmanFilterTest, ExplicitVelocityIsNotFedIntoFilter) {
+    // 同样两帧位置、不同显式速度：滤波结果必须一致（速度不参与滤波）。
+    const auto run = [](double velocity_north) {
+        LinearTargetKalmanFilter filter;
+        LinearTargetMeasurement first;
+        first.north_m = 0.0;
+        first.horizontal_position_std_m = 1.0;
+        EXPECT_TRUE(filter.Initialize(WithoutExplicitVelocity(first)));
+        LinearTargetMeasurement second;
+        second.north_m = 10.0;
+        second.horizontal_position_std_m = 1.0;
+        second.velocity_north_mps = velocity_north;
+        second.velocity_north_valid = true;
+        EXPECT_TRUE(filter.Predict(1.0));
+        EXPECT_TRUE(filter.Update(WithoutExplicitVelocity(second)));
+        return filter.State();
+    };
+    const auto zero_velocity = run(0.0);
+    const auto fast_velocity = run(50.0);
+    EXPECT_NEAR(zero_velocity.north_m, fast_velocity.north_m, 1e-9);
+    EXPECT_NEAR(zero_velocity.velocity_north_mps, fast_velocity.velocity_north_mps,
+                1e-9);
+}
+
 TEST(LinearTargetKalmanFilterTest, LaterAltitudeObservationInitializesVerticalAxis) {
     LinearTargetKalmanFilter filter;
     LinearTargetMeasurement first;

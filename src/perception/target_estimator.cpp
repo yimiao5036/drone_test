@@ -728,16 +728,21 @@ struct TargetEstimator::Impl {
                         target.target_id);
         }
 
+        // 方案 A（2026-11-06）：显式速度位只喂前馈，不喂卡尔曼——滤波器只吃位置，
+        // 速度由 ground_velocity_* 独立提供（见下方前馈可用性段）。
+        const LinearTargetMeasurement filter_measurement =
+            WithoutExplicitVelocity(measurement);
         bool accepted = false;
         if (!filter.IsInitialized()) {
-            accepted = filter.Initialize(measurement);
+            accepted = filter.Initialize(filter_measurement);
         } else {
             const double dt_seconds =
                 ground_out_of_order_degraded
                     ? 0.0  // 降级：原地更新，不回溯 Predict（也避免无符号回绕）
                     : static_cast<double>(observation_time_ms - state_time_ms) *
                           kMillisecondsToSeconds;
-            accepted = filter.Predict(dt_seconds) && filter.Update(measurement);
+            accepted =
+                filter.Predict(dt_seconds) && filter.Update(filter_measurement);
         }
         if (!accepted) {
             Reject("线性卡尔曼更新失败");

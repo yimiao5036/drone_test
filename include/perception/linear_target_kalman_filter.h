@@ -30,6 +30,23 @@ struct LinearTargetMeasurement {
     double vertical_position_std_m = 1.0;
 };
 
+/// 去掉显式速度位的量测副本（2026-11-06，方案 A）。
+///
+/// 背景：雷达/地面站的显式速度（`65010` 的 vn/ve/vd，分辨率 0.01 m/s）比滤波
+/// 外推出来的速度可信得多，速度前馈直接用它（见 `TargetEstimator` 的
+/// `ground_velocity_*`）。再把这组速度当量测喂进卡尔曼，只有副作用：
+/// `velocity_measurement_std_mps` 默认 5 m/s，权重很弱拉不动状态；而 `flags`
+/// 置位、值却是 0（手动打点的静止目标）时，反而会把估计速度慢慢拉向 0。
+/// 因此交给滤波器的量测只保留位置，速度由前馈链路独立提供。
+inline LinearTargetMeasurement WithoutExplicitVelocity(
+    const LinearTargetMeasurement& measurement) {
+    LinearTargetMeasurement position_only = measurement;
+    position_only.velocity_north_valid = false;
+    position_only.velocity_east_valid = false;
+    position_only.velocity_down_valid = false;
+    return position_only;
+}
+
 /// 线性卡尔曼状态快照，坐标系为局部NED。
 struct LinearTargetKalmanState {
     double north_m = 0.0;
