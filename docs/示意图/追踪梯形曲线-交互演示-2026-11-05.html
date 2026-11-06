@@ -94,7 +94,7 @@
   aside h2{font-size:12px; margin:0 0 6px; color:var(--ink-2); font-weight:650}
   .group{border-top:1px solid var(--line); padding-top:9px; margin-top:9px}
   .group:first-of-type{border-top:0; margin-top:0; padding-top:0}
-  .row{display:grid; grid-template-columns:72px 1fr 56px; align-items:center; gap:7px; margin:5px 0}
+  .row{display:grid; grid-template-columns:72px 1fr 56px; align-items:center; gap:7px; margin:3px 0}
   .row label{font-size:12px; color:var(--ink-2); white-space:nowrap}
   .row output{font:600 11px/1 ui-monospace,Consolas,monospace; text-align:right}
   input[type=range]{width:100%; accent-color:var(--primary-fill); height:16px}
@@ -116,8 +116,8 @@
 </head>
 <body>
 <header>
-  <h1>接近段速度剖面 · 梯形曲线（交互）</h1>
-  <span class="sub">蓝 = 设计（梯形 + 余量）　红 = 对照（无余量、无下限，纯尾追）　舞台下方可切「目标位置来源」：真值 / 量测 / 卡尔曼（含前视预测）</span>
+  <h1>接近段速度律（交互）：比例接近 vs 梯形包络</h1>
+  <span class="sub">蓝 = 基线（比例接近 u=k·d + 碰撞三角形提前量）　红 = 对照（无余量、无下限，纯尾追）　舞台下方可切「目标位置来源」：真值 / 量测 / 卡尔曼（含前视预测）</span>
   <span class="spacer"></span>
   <span class="badge" id="badgePhase">推进中</span>
   <span class="badge" id="badgeTime">t = 0.0 s</span>
@@ -241,11 +241,17 @@
         <output id="vcapOut">由几何决定</output>
       </div>
       <div class="row">
-        <label>剖面</label>
-        <div class="seg" id="profSeg">
-          <button data-prof="trap" class="on">梯形</button>
-          <button data-prof="step">现状</button>
+        <label>速度律</label>
+        <div class="seg" id="lawSeg">
+          <button data-law="prop" class="on">比例接近</button>
+          <button data-law="trap">梯形包络</button>
+          <button data-law="step">现状台阶</button>
         </div>
+      </div>
+      <div class="row">
+        <label>增益 k</label>
+        <input id="k" type="range" min="0.2" max="1.6" step="0.05" value="0.6">
+        <output id="kOut">0.60 1/s</output>
       </div>
       <div class="row">
         <label>末端</label>
@@ -291,6 +297,9 @@ const ARRIVAL_SPEED_MPS = 0.5;  // 与 handover 到点判据对齐
 const BRAKE_SAFETY = 1.3;
 const LEAD_TAU = 0.3;      // 位置设定点的跟随时间常数 s
 const LEAD_MAX_M = 6;      // 设定点最多领先飞机多少米
+const V_PLAN_MPS = 6;      // 规划速度（vcap=0 时按它算提前量与比例接近的上限）
+const T_GO_MAX = 4;        // 碰撞三角形解出的 t_go 上限 s
+const T_LEAD_MAX = 0.5;    // 提前距离上限：Vmax × 0.5 s（D2）
 const BRAKE_PAD_M = 0.5;
 const DT = 0.02;
 const T_MAX = 60;
@@ -300,6 +309,8 @@ const P = {
   vt: 2.0, heading: 90, turn: 'straight',
   margin: 1.0, accel: 1.0, decel: 1.0, profile: 'trap', end: 'match', floor: true,
   policy: 'fast', vcap: 0,
+  law: 'prop',                  // 速度律：prop=比例接近（基线）/ env=刹车包络
+  k: 0.6,                       // 比例接近增益 1/s
   src: 'truth',
   noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
   lead: 0,                      // 拦截提前量 ms（0 = 只补时延）
@@ -518,17 +529,39 @@ function stepSim(s, dt) {
   const uxRaw = dReal > 1e-6 ? dxRaw / dReal : 1, uyRaw = dReal > 1e-6 ? dyRaw / dReal : 0;
   const vtCross = Math.abs(s.tv.x * uyRaw - s.tv.y * uxRaw);
   const vtAbs0 = Math.hypot(s.tv.x, s.tv.y);
-  // 拦截提前量（纯追击转不过来）：t_go = 视距 / 相对速度，上限 4 s。
-  // 直线后退目标 vtCross≈0 → tGo=0，行为与原来完全一致。
-  const tGo = vtCross > 0.8
-    ? Math.min(4, dReal / Math.max(2, Math.max(P.vcap > 0 ? P.vcap : 6, vtAbs0 + 0.5)))
-    : 0;
+  // ---- 拦截提前量：碰撞三角形（固定速度追击、瞬时命中的经典解）----
+  //   (Vp² − Vt²)·t² − 2(r·v_t)·t − |r|² = 0
+  //   t_go = [ (r·v_t) + √( (r·v_t)² + (Vp² − Vt²)·|r|² ) ] / (Vp² − Vt²)
+  // 只有 Vp > Vt 才有正根；追不上时退化成 d/Vp 粗估。提前距离再按三个上限夹紧：
+  //   半个视距、Vmax × 0.5 s、t_go ≤ 4 s —— 碰撞三角形在远距离会解出几十米的提前点，
+  //   那是几何真值但飞不动（转弯半径不允许），必须夹。
+  const vPlan = P.vcap > 0 ? P.vcap : V_PLAN_MPS;
+  let tGo = 0;
+  {
+    const rx = s.seen.x - s.drone.x, ry = s.seen.y - s.drone.y;
+    const rv = rx * s.tv.x + ry * s.tv.y;
+    const dv = vPlan * vPlan - vtAbs0 * vtAbs0;
+    let t;
+    if (dv > 1e-6) {
+      t = (rv + Math.sqrt(Math.max(0, rv * rv + dv * (rx * rx + ry * ry)))) / dv;
+    } else {
+      t = dReal / Math.max(1, vPlan);
+    }
+    t = Math.max(0, Math.min(t, T_GO_MAX));
+    const leadWant = Math.min(vtAbs0 * t, 0.5 * dReal, vPlan * T_LEAD_MAX);
+    tGo = vtAbs0 > 1e-6 ? leadWant / vtAbs0 : 0;
+  }
   s.tGo = tGo;
+  // 按到瞄准点（= 估计点 + 提前量）的相对速度算接近率；但对外显示的 d 必须回到
+  // 真实目标距离，否则"追不上"的稳态间距会被提前量虚增几米，读数没法对账。
   const ax2 = s.seen.x + s.tv.x * tGo, ay2 = s.seen.y + s.tv.y * tGo;
+  const dAim = Math.hypot(ax2 - s.drone.x, ay2 - s.drone.y);
   const dx = ax2 - s.drone.x, dy = ay2 - s.drone.y;
-  const d = Math.hypot(dx, dy);
+  const d = dReal;
   s.d = d;
-  const ux = d > 1e-6 ? dx / d : 1, uy = d > 1e-6 ? dy / d : 0;
+  s.dAim = dAim;
+  // 方向必须按瞄准点距离归一，用显示距离 d 归一会把速度矢量缩水（首版就踩了这个坑）
+  const ux = dAim > 1e-6 ? dx / dAim : 1, uy = dAim > 1e-6 ? dy / dAim : 0;
   const vtAlong = s.tv.x * ux + s.tv.y * uy;
   const vdAlong = s.vel.x * ux + s.vel.y * uy;
   s.vc = vdAlong - vtAlong;
@@ -537,11 +570,14 @@ function stepSim(s, dt) {
   const vEnd = P.end === 'match' ? vtAbs : 0;
   const offset = P.end === 'match' ? ARRIVAL_RADIUS_M : 0.6;
 
-  // 上限：0 = 不设上限 → 峰值由「剩余距离 + 两个加速度」自己算出来（三角形剖面）
-  const cap = P.vcap > 0 ? P.vcap : Infinity;
+  // 上限：包络律里 0 = 不设上限（峰值由几何算出）；比例接近律必须有上限，
+  // 否则 u = k·d 在远距离会无穷大。
+  const capEnv = P.vcap > 0 ? P.vcap : Infinity;
+  const capProp = P.vcap > 0 ? P.vcap : V_PLAN_MPS;
   // 平台速度：时间最优直接顶到上限；保守只保证稳态收敛（目标不动时取地板 1.5）
   let plateau;
   if (s.variant === 'design') {
+    const cap = P.law === 'prop' ? capProp : capEnv;
     plateau = P.policy === 'fast'
       ? cap
       : Math.min(cap, P.floor ? Math.max(1.5, vtAbs + P.margin) : vtAbs + P.margin);
@@ -558,11 +594,22 @@ function stepSim(s, dt) {
   // 转弯约束：横向机动的目标要求飞机绕着它转，速度越高所需向心加速度越大。
   // 可用横向加速度按 accel 计，转弯半径按当前视距 d 估 → v ≤ √(a·d)。
   // 少了这一条，纯追击会在「冲过头 → 掉队 → 再冲」之间无限循环（实测 d 在 5~66 m 摆荡）。
-  const turnCap = vtCross > 0.8 ? Math.sqrt(Math.max(0, P.accel * Math.max(0, d))) : Infinity;
+  // 转弯约束（物理口径）：以速度 v 跟着视线转，需要向心加速度 a = v·ω，而视线角速度
+  // ω ≈ 目标横向速度 / 视距 = vtCross / d，于是 v ≤ a·d / vtCross。
+  // 纯追击在绕圈目标上会陷「冲过头 → 掉队 → 再冲」的极限环，靠这一条压住；
+  // 之前用 √(a·d) 只是拍脑袋的量纲凑法，会把 k 的作用整个盖掉。
+  const turnCap = vtCross > 0.2 ? P.accel * Math.max(0, dAim) / vtCross : Infinity;
   const vTop = Math.min(plateau, envelope, turnCap);
 
   let vref, phase;
-  if (vTop <= 1e-3) {
+  if (P.law === 'prop') {
+    // 比例接近（基线）：u = k·(d − R)，连续、无切换面，不会在加速/减速之间横跳。
+    // 远距离被 plateau 饱和（和梯形一样顶速跑），进到 d ≈ plateau/k + R 之后线性收速。
+    const u = Math.min(plateau, Math.max(0, P.k * Math.max(0, dAim - offset)));
+    vref = Math.max(0, Math.min(plateau, turnCap, vtAlong + u));
+    const vNow0 = Math.hypot(s.vel.x, s.vel.y);
+    phase = vref > vNow0 + 0.05 ? 'accel' : (vref < vNow0 - 0.05 ? 'decel' : 'cruise');
+  } else if (vTop <= 1e-3) {
     vref = 0; phase = 'idle';
   } else if (P.profile === 'step') {
     // 现状：参考点直接跳到包络/上限，速度是台阶
@@ -576,7 +623,7 @@ function stepSim(s, dt) {
     phase = (isFinite(plateau) && vref >= plateau - 1e-3) ? 'cruise' : 'accel';
   }
   if (P.end === 'match' && dReal <= ARRIVAL_RADIUS_M + 0.02) { vref = vEnd; phase = 'match'; }
-  vref = Math.min(vTop, Math.max(0, vref));
+  vref = Math.max(0, Math.min(P.law === 'prop' ? Math.max(vTop, 0) : vTop, vref));
   s.vref = vref;
   s.phase = phase;
   s.vpeak = Math.max(s.vpeak || 0, vref);
@@ -927,16 +974,26 @@ function updateHud() {
     const wander = pathWander(A.trailD, 3, A.t);
     $('sJit').innerHTML = wander == null ? '—' : wander.toFixed(2) + '<small>m</small>';
   }
-  $('sVpt').innerHTML = THEORY ? THEORY.vp.toFixed(2) + '<small>m/s</small>' : '—';
-  $('sTt').innerHTML = THEORY ? THEORY.tTotal.toFixed(1) + '<small>s</small>' : '—';
-  $('sTc').innerHTML = THEORY ? THEORY.tCruise.toFixed(1) + '<small>s</small>' : '—';
+  // 梯形包络才有闭式解；比例接近律没有解析用时，留占位
+  const hasTheory = THEORY && P.law !== 'prop';
+  $('sVpt').innerHTML = hasTheory ? THEORY.vp.toFixed(2) + '<small>m/s</small>' : '—';
+  $('sTt').innerHTML = hasTheory ? THEORY.tTotal.toFixed(1) + '<small>s</small>' : '—';
+  $('sTc').innerHTML = hasTheory ? THEORY.tCruise.toFixed(1) + '<small>s</small>' : '—';
   $('sDb').innerHTML = A.dbrk.toFixed(2) + '<small>m</small>';
   $('sRate').innerHTML = rate.toFixed(2) + '<small>m/s</small>';
   $('sLag').innerHTML = A.lag.toFixed(2) + '<small>m</small>';
   $('sTa').innerHTML = A.arrivedAt != null ? A.arrivedAt.toFixed(1) + '<small>s</small>' : '—';
 
   const v = $('verdict');
-  if (vtAbs > 0.05 && sustain <= vtAbs + 0.05) {
+  if (P.law === 'prop') {
+    const aimPt = A.est.aim || A.est.pred;
+    const aimLead = aimPt ? Math.hypot(aimPt.x - A.seen.x, aimPt.y - A.seen.y) : 0;
+    v.innerHTML = `<b style="color:#1677d2">比例接近（基线）</b>：u = k·(d − R) 连续收速，`
+      + `k=${P.k.toFixed(2)} 1/s，上限 ${isFinite(sustain) ? sustain.toFixed(2) : '6.00'} m/s；`
+      + `提前量由碰撞三角形按 t_go 算（当前 ${(A.tGo || 0).toFixed(2)} s，瞄准点领先估计点 ${aimLead.toFixed(1)} m，`
+      + `夹紧 ≤ 半个视距 / ≤ Vmax×0.5 s）。没有加速-减速切换面，所以不会在峰顶抖；`
+      + `代价是远距离没有「顶到上限再收油」的锐利感，靠 k 调接近快慢。`;
+  } else if (vtAbs > 0.05 && sustain <= vtAbs + 0.05) {
     v.innerHTML = `<b style="color:#c0392b">追不上</b>：v_cruise=${sustain.toFixed(2)} ≤ 目标 ${vtAbs.toFixed(2)} m/s，`
       + `稳态 ḋ≈0 —— 距离停在加速期拉开的差值上（红色虚线不收敛）。余量就是稳态收敛速率。`;
   } else if (P.policy === 'fast') {
@@ -997,16 +1054,23 @@ bindRange('hdg', 'heading', v => v.toFixed(0) + '°');
 bindRange('margin', 'margin', v => v.toFixed(1));
 bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
-bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '由几何决定');
+bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '默认 ' + V_PLAN_MPS + ' m/s');
 bindRange('speed', 'speed', v => v.toFixed(1) + '×');
 bindRange('noise', 'noise', v => v.toFixed(1) + ' m');
 bindRange('measHz', 'measHz', v => v.toFixed(0) + ' Hz');
 bindRange('latency', 'latency', v => v.toFixed(0) + ' ms');
 bindRange('sigmaA', 'sigmaA', v => v.toFixed(1) + ' m/s²' + (v >= 7.9 ? '（机载）' : ''));
 bindRange('lead', 'lead', v => v.toFixed(0) + ' ms');
+bindRange('k', 'k', v => v.toFixed(2) + ' 1/s');
 bindSeg('srcSeg', 'src');
 bindSeg('turnSeg', 'turn');
-bindSeg('profSeg', 'profile');
+$('lawSeg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  [...$('lawSeg').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
+  P.law = b.dataset.law === 'prop' ? 'prop' : 'env';
+  P.profile = b.dataset.law === 'step' ? 'step' : 'trap';
+  resetSims();
+});
 bindSeg('policySeg', 'policy');
 bindSeg('endSeg', 'end');
 

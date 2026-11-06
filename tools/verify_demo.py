@@ -130,7 +130,14 @@ def main():
             if r["bottom"] > 900 or r["right"] > 1440:
                 clipped.append((name, r))
 
-        # --- 2) 默认：无上限 → 三角形，用时与闭式解一致
+        # --- 2) 包络律：无上限 → 三角形，用时与闭式解一致
+        # 页面默认已改「比例接近」（基线），闭式解/匀速段的断言只对包络律成立，
+        # 这里显式切回包络，并同步按钮态，避免截图与读数不一致。
+        page.evaluate(
+            "() => { P.law = 'env'; P.profile = 'trap'; resetSims();"
+            " [...document.querySelectorAll('#lawSeg button')]"
+            ".forEach(x => x.classList.toggle('on', x.dataset.law === 'trap')); }"
+        )
         run_until(page, 0, "arrived")
         tri = state(page)
         page.screenshot(path=str(SHOT / "demo2-arrived-1440.png"))
@@ -167,7 +174,7 @@ def main():
         page.screenshot(path=str(SHOT / "demo2-step-1440.png"))
 
         # --- 7) 保守 vs 时间最优（目标静止 40 m）
-        click_seg(page, "profSeg", "prof", "trap")
+        click_seg(page, "lawSeg", "law", "trap")
         set_slider(page, "vcap", 0)
         click_seg(page, "policySeg", "policy", "safe")
         set_slider(page, "vt", 0)
@@ -186,6 +193,24 @@ def main():
         page.wait_for_timeout(200)
         page.screenshot(path=str(SHOT / "demo2-mid-1440.png"))
 
+        # --- 8) 基线（比例接近律）：绕圈目标 a=1.5 能收敛；无切换面抖动
+        base = page.evaluate(
+            """() => {
+                P.law = 'prop'; P.profile = 'trap'; P.policy = 'fast'; P.vcap = 0; P.floor = true;
+                Object.assign(P, {vt: 4, turn: 'circle', accel: 1.5, decel: 1.5, k: 0.6, end: 'match'});
+                resetSims(); P.paused = true;
+                let t = 0, sw = 0, last = '';
+                for (let i = 0; i < 60 * 120; i++) {
+                    stepSim(A, 1 / 60); stepSim(B, 1 / 60); t += 1 / 60;
+                    if (A.phase !== last) { sw++; last = A.phase; }
+                    if (A.arrived) break;
+                }
+                P.paused = false;
+                return {arrived: !!A.arrived, t: +t.toFixed(1), d: +A.d.toFixed(2), sw};
+            }"""
+        )
+        page.screenshot(path=str(SHOT / "demo2-circle-base-1440.png"))
+
         browser.close()
 
     print("版式：", layout)
@@ -201,6 +226,8 @@ def main():
     print("剖面 t=%.2f s：现状 vref=%.2f / 梯形 vref=%.2f" % (step["t"], step["vref"], trap["vref"]))
     print("目标静止 40 m：保守 %.1f s / 时间最优 %.1f s" % (
         safe_static["arrivedAt"] or -1, fast_static["arrivedAt"] or -1))
+    print("绕圈（比例接近 a=1.5）：arrived=%s 到点 %.1f s 末距 %.2f m 相位切换 %d" % (
+        base["arrived"], base["t"], base["d"], base["sw"]))
     print("页面错误：", errors or "无")
 
     check(not clipped, "四块区域都不越界", "有区域越界：%s" % clipped)
@@ -242,6 +269,12 @@ def main():
     check(step["vref"] > 2.5 and trap["vref"] < 1.0,
           "现状剖面是台阶：0.5 s 时 vref %.2f，梯形剖面只有 %.2f（≈a·t）" % (step["vref"], trap["vref"]),
           "现状剖面没有体现台阶：%.2f vs %.2f" % (step["vref"], trap["vref"]))
+
+    check(base["arrived"] and base["d"] <= 3.5,
+          "比例接近律追上绕圈目标：%.1f s 到点，末距 %.2f m" % (base["t"], base["d"]),
+          "比例接近律没追上绕圈目标：arrived=%s d=%.2f" % (base["arrived"], base["d"]))
+    check(base["sw"] <= 12, "切换次数 %d（无切换面抖动）" % base["sw"],
+          "切换过于频繁：%d 次" % base["sw"])
 
     print("OK" if ok else "FAIL")
     sys.exit(0 if ok else 1)
