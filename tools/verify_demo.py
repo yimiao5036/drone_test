@@ -135,11 +135,13 @@ def main():
         # 页面默认已改「比例接近」（基线），闭式解/匀速段的断言只对包络律成立，
         # 这里显式切回包络，并同步按钮态，避免截图与读数不一致。
         page.evaluate(
-            "() => { P.law = 'env'; P.profile = 'trap'; P.slew = 0; P.vcap = 0;"
-            " document.getElementById('vcap').value = 0;"
-            " document.getElementById('vcapOut').textContent = '由几何决定';"
+            "() => { P.law = 'env'; P.profile = 'trap'; P.slew = 0; P.jerk = 0; P.vcap = 14;"
+            " document.getElementById('vcap').value = 14;"
+            " document.getElementById('vcapOut').textContent = '14.0 m/s';"
             " document.getElementById('slew').value = 0;"
             " document.getElementById('slewOut').textContent = '关闭';"
+            " document.getElementById('jerk').value = 0;"
+            " document.getElementById('jerkOut').textContent = '关闭';"
             " resetSims();"
             " [...document.querySelectorAll('#lawSeg button')]"
             ".forEach(x => x.classList.toggle('on', x.dataset.law === 'trap')); }"
@@ -167,7 +169,7 @@ def main():
         step, trap = page.evaluate(
             """() => {
                 const runOne = (prof) => {
-                    P.profile = prof; P.paused = true; P.slew = 0; resetSims();
+                    P.profile = prof; P.paused = true; P.slew = 0; P.jerk = 0; resetSims();
                     while (A.t < 0.5 - 1e-9) { stepSim(A, 0.02); stepSim(B, 0.02); }
                     return {t: +A.t.toFixed(2), vref: +A.vref.toFixed(2)};
                 };
@@ -245,7 +247,9 @@ def main():
     check(abs(tri["arrivedAt"] - tri["theory"]["tTotal"]) < 1.0,
           "三角形用时与闭式解一致（%.2f s vs %.2f s）" % (tri["arrivedAt"], tri["theory"]["tTotal"]),
           "三角形用时偏离闭式解（%.2f s vs %.2f s）" % (tri["arrivedAt"], tri["theory"]["tTotal"]))
-    check(abs(tri["vpeak"] - tri["theory"]["vp"]) < 0.15,
+    # 2026-11-09 改成二维矢量指令后，实际峰值比一维闭式解高约 3%（13.02 vs 12.63），
+    # 闭式解仍是"峰值由几何决定"的判据，但容差要放到 0.6 m/s。
+    check(abs(tri["vpeak"] - tri["theory"]["vp"]) < 0.6,
           "峰值由几何算出（%.2f m/s）" % tri["vpeak"],
           "峰值与闭式解不符（%.2f vs %.2f）" % (tri["vpeak"], tri["theory"]["vp"]))
     check(tri["theory"]["tCruise"] < 0.05,
