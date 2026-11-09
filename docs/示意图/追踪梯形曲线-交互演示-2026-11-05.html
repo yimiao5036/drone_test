@@ -131,7 +131,7 @@
   .btn{width:100%; margin-top:4px; font:650 12px/1 inherit; padding:8px; border-radius:8px; cursor:pointer; border:1px solid var(--line-2); background:#fff; color:var(--ink)}
   .btn.primary{background:var(--primary-fill); border-color:var(--primary-fill); color:#fff}
 
-  .charts{display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:0 12px 12px; min-height:0}
+  .charts{display:grid; grid-template-columns:repeat(3,1fr); gap:12px; padding:0 12px 12px; min-height:0}
   .chart{position:relative; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; min-height:0}
   .chart canvas{display:block; width:100%; height:100%}
   .chart .cap{position:absolute; top:7px; left:11px; font-size:11px; color:var(--ink-2); background:rgba(255,255,255,.92); padding:1px 5px; border-radius:5px; pointer-events:none}
@@ -141,7 +141,7 @@
 <body>
 <header>
   <h1>接近段速度律（交互）：制动曲线（默认）</h1>
-  <span class="sub">蓝 = 设计（上限 10 m/s + 距离制动 a=3 + 二维指令变化率 3 m/s²）　红 = 对照（纯尾追）　下方可切来源：真值 / 量测 / 卡尔曼 / 速度位</span>
+  <span class="sub">蓝 = 设计（上限 10 m/s + 距离制动 a=3 + 二维指令变化率 3 m/s²）　红 = 对照（纯尾追）　下方可切来源：真值 / 速度位</span>
   <span class="spacer"></span>
   <span class="badge" id="badgePhase">推进中</span>
   <span class="badge" id="badgeTime">t = 0.0 s</span>
@@ -171,14 +171,11 @@
       <b>目标位置来源</b>
       <div class="seg" id="srcSeg">
         <button data-src="truth">真值</button>
-        <button data-src="raw">量测</button>
-        <button data-src="kf">卡尔曼</button>
         <button data-src="vmsg" class="on">速度位</button>
       </div>
       <label>噪声 σ<input id="noise" type="range" min="0" max="3" step="0.1" value="0.8"><output id="noiseOut">0.8 m</output></label>
       <label>频率<input id="measHz" type="range" min="1" max="20" step="1" value="5"><output id="measHzOut">5 Hz</output></label>
       <label>提前<input id="latency" type="range" min="0" max="600" step="20" value="200"><output id="latencyOut">200 ms</output></label>
-      <label>σ_a<input id="sigmaA" type="range" min="0.5" max="8" step="0.5" value="2"><output id="sigmaAOut">2.0 m/s²（机载 8.0）</output></label>
       <label>拦截提前<input id="lead" type="range" min="0" max="1000" step="50" value="0"><output id="leadOut">0 ms</output></label>
       <span class="kfnote">实机默认 = 速度位（雷达三轴速度，分辨率 0.01 m/s）；真值只验法则；σ_a 机载 8.0</span>
     </section>
@@ -334,6 +331,10 @@
     <div class="cap">设计机速度（25 s 滚动窗）：<b style="color:#409eff">实际</b> vs <b style="color:#909399">参考剖面</b>　底色 = 加速 / 巡航 / 减速 / 匹配</div>
     <canvas id="chartV"></canvas>
   </div>
+  <div class="chart">
+    <div class="cap">加速度 a(t)：<b style="color:#0f766e">实际</b> vs <b style="color:#b45309">指令 a_cmd</b>（虚线 = 上限）</div>
+    <canvas id="chartA"></canvas>
+  </div>
 </section>
 
 <script>
@@ -432,7 +433,7 @@ function makeSim(variant) {
     drone: { x: -P.startD, y: 0 }, vel: { x: 0, y: 0 }, cmd: { x: 0, y: 0 }, acc: { x: 0, y: 0 }, guide: { x: -P.startD, y: 0 },
     target: { x: 0, y: 0 }, tv: { x: 0, y: 0 }, tHeading: P.heading,
     trailD: [], trailT: [], hist: [],
-    vref: 0, lag: 0, d: P.startD, dObs: P.startD, dTruth: P.startD, vc: 0, relSpeed: 0, aCmd: 0,
+    vref: 0, lag: 0, d: P.startD, dObs: P.startD, dTruth: P.startD, vc: 0, relSpeed: 0, aCmd: 0, a: 0,
     vmax: 0, vpeak: 0, plateau: Infinity, dbrk: 0, phase: 'idle',
     step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
     est: {
@@ -828,6 +829,7 @@ function stepSim(s, dt) {
   const aMag = Math.hypot(ax, ay);
   const aLimit = (phase === 'decel' || phase === 'match') ? P.decel : P.accel;
   if (aMag > aLimit) { ax *= aLimit / aMag; ay *= aLimit / aMag; }
+  s.a = Math.hypot(ax, ay);   // 本拍实际施加的加速度（指令经 aLimit 夹过）
   s.vel.x += ax * dt; s.vel.y += ay * dt;
   s.drone.x += s.vel.x * dt; s.drone.y += s.vel.y * dt;
 
@@ -858,13 +860,15 @@ function stepSim(s, dt) {
   s.trailT.push({ x: s.target.x, y: s.target.y });
   if (s.trailD.length > 4000) { s.trailD.shift(); s.trailT.shift(); }
   if (s.hist.length === 0 || s.t - s.hist[s.hist.length - 1].t >= 0.1) {
-    s.hist.push({ t: s.t, d: s.dTruth, vd: Math.hypot(s.vel.x, s.vel.y), vref, phase: s.phase });
+    s.hist.push({ t: s.t, d: s.dTruth, vd: Math.hypot(s.vel.x, s.vel.y), vref,
+                  aCmd: s.aCmd || 0, aAct: s.a || 0, phase: s.phase });
   }
 }
 
 const sceneCv = document.getElementById('scene');
 const chartDCv = document.getElementById('chartD');
 const chartVCv = document.getElementById('chartV');
+const chartACv = document.getElementById('chartA');
 
 function fitCanvas(cv) {
   const r = cv.getBoundingClientRect();
@@ -1115,6 +1119,39 @@ function drawSpeedChart() {
   }
 }
 
+function drawAccelChart() {
+  const { ctx, w, h } = fitCanvas(chartACv);
+  ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  const tEnd = Math.max(SPEED_WIN, A.t);
+  const tStart = tEnd - SPEED_WIN;
+  const cap = P.slew > 0 ? P.slew : 0;
+  let yPeak = cap;
+  A.hist.forEach(p => { yPeak = Math.max(yPeak, p.aCmd || 0, p.aAct || 0); });
+  const yMax = Math.max(1, Math.ceil((yPeak + 0.4) * 2) / 2);
+  const g = axes(ctx, w, h, tStart, tEnd, yMax, yMax <= 2 ? 0.5 : 1, '加速度 m/s²', 5);
+
+  const line = (key, color, dash, width) => {
+    const seg = A.hist.filter(p => p.t >= tStart - 1);
+    if (seg.length < 2) return;
+    ctx.save(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = width;
+    ctx.beginPath();
+    seg.forEach((p, i) => {
+      const x = g.X(p.t), y = g.Y(Math.max(0, p[key] || 0));
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke(); ctx.restore();
+  };
+  line('aCmd', '#b45309', [5, 4], 1.6);
+  line('aAct', '#0f766e', null, 2.2);
+
+  if (cap > 0) {
+    ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(180,83,9,.55)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(g.padL, g.Y(cap)); ctx.lineTo(g.padL + g.iw, g.Y(cap)); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = 'rgba(180,83,9,.85)'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
+    ctx.fillText('上限 ' + cap.toFixed(1), g.padL + g.iw - 56, g.Y(cap) - 4);
+  }
+}
+
 const $ = id => document.getElementById(id);
 
 // 最近 3 s 的飞行轨迹相对"首尾直线"的横向偏差 RMS：
@@ -1168,7 +1205,7 @@ function updateHud() {
   if (P.src !== 'truth') {
     // 三类误差采样率不同：统一取最近 4 s 的样本，避免“量测误差 4 s、估计误差 40 s”。
     const em = rms(A.est.errMeas, Math.max(1, Math.round(4 / DT)));
-    const ee = rms(A.est.errEst, Math.max(1, Math.round(4 * P.measHz)));
+    const ee = P.src === 'kf' ? rms(A.est.errEst, Math.max(1, Math.round(4 * P.measHz))) : null;
     const ep = rms(A.est.errPred, Math.max(1, Math.round(4 / DT)));
     $('sEm').innerHTML = em == null ? '—' : em.toFixed(2) + '<small>m</small>';
     $('sEe').innerHTML = ee == null ? '—' : ee.toFixed(2) + '<small>m</small>';
@@ -1232,12 +1269,14 @@ function frame(now) {
       if (B.t < T_MAX) stepSim(B, DT);
     }
   }
-  drawScene(); drawDistanceChart(); drawSpeedChart(); updateHud();
+  drawScene(); drawDistanceChart(); drawSpeedChart(); drawAccelChart(); updateHud();
   requestAnimationFrame(frame);
 }
 
 function bindRange(id, key, fmt) {
   const el = $(id), out = $(id + 'Out');
+  // 控件可能已被精简掉（例如 σ_a 只在卡尔曼调试路径里用），缺了就跳过。
+  if (!el) return;
   const upd = () => {
     P[key] = parseFloat(el.value);
     if (out) out.textContent = fmt(P[key]);
@@ -1271,7 +1310,6 @@ bindRange('noise', 'noise', v => v.toFixed(1) + ' m');
 bindRange('vsig', 'vsig', v => v.toFixed(2) + ' m/s');
 bindRange('measHz', 'measHz', v => v.toFixed(0) + ' Hz');
 bindRange('latency', 'latency', v => v.toFixed(0) + ' ms');
-bindRange('sigmaA', 'sigmaA', v => v.toFixed(1) + ' m/s²' + (v >= 7.9 ? '（机载）' : ''));
 bindRange('lead', 'lead', v => v.toFixed(0) + ' ms');
 bindRange('k', 'k', v => v.toFixed(2) + ' 1/s');
 bindSeg('srcSeg', 'src');

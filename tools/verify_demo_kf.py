@@ -25,6 +25,16 @@ DEMO = ROOT / "docs" / "示意图" / "追踪梯形曲线-交互演示-2026-11-05
 SHOT = ROOT / "tools" / "layout_evidence"
 
 
+def set_src(page, src):
+    """直接切目标位置来源（面板按钮已精简，只剩 真值 / 速度位）。"""
+    page.evaluate("(src) => { P.src = src; resetSims(); }", src)
+
+
+def set_sigma(page, value):
+    """σ_a 滑块已从面板移除，直接改参数供卡尔曼回归用。"""
+    page.evaluate("(v) => { P.sigmaA = v; resetSims(); }", value)
+
+
 def set_slider(page, sid, value):
     page.evaluate(
         """([sid, v]) => {
@@ -105,25 +115,25 @@ def main():
         set_slider(page, "latency", 200)
 
         # --- 1) 整定后的 σ_a = 2.0
-        set_slider(page, "sigmaA", 2)
-        click_seg(page, "srcSeg", "src", "kf")
+        set_sigma(page, 2.0)
+        set_src(page, "kf")
         advance(page, 10)
         tuned = stats(page)
         page.screenshot(path=str(SHOT / "demo-kf-1440.png"))
 
         # --- 2) 机载当前 σ_a = 8.0
-        set_slider(page, "sigmaA", 8)
+        set_sigma(page, 8.0)
         advance(page, 10)
         onboard = stats(page)
 
         # --- 3) 只追量测（同一噪声序列）
-        click_seg(page, "srcSeg", "src", "raw")
+        set_src(page, "raw")
         advance(page, 10)
         raw = stats(page)
 
         # --- 4) 无噪声
         set_slider(page, "noise", 0)
-        click_seg(page, "srcSeg", "src", "kf")
+        set_src(page, "kf")
         advance(page, 8)
         clean = stats(page)
 
