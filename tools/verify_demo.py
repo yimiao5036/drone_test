@@ -135,7 +135,12 @@ def main():
         # 页面默认已改「比例接近」（基线），闭式解/匀速段的断言只对包络律成立，
         # 这里显式切回包络，并同步按钮态，避免截图与读数不一致。
         page.evaluate(
-            "() => { P.law = 'env'; P.profile = 'trap'; resetSims();"
+            "() => { P.law = 'env'; P.profile = 'trap'; P.slew = 0; P.vcap = 0;"
+            " document.getElementById('vcap').value = 0;"
+            " document.getElementById('vcapOut').textContent = '由几何决定';"
+            " document.getElementById('slew').value = 0;"
+            " document.getElementById('slewOut').textContent = '关闭';"
+            " resetSims();"
             " [...document.querySelectorAll('#lawSeg button')]"
             ".forEach(x => x.classList.toggle('on', x.dataset.law === 'trap')); }"
         )
@@ -162,7 +167,7 @@ def main():
         step, trap = page.evaluate(
             """() => {
                 const runOne = (prof) => {
-                    P.profile = prof; P.paused = true; resetSims();
+                    P.profile = prof; P.paused = true; P.slew = 0; resetSims();
                     while (A.t < 0.5 - 1e-9) { stepSim(A, 0.02); stepSim(B, 0.02); }
                     return {t: +A.t.toFixed(2), vref: +A.vref.toFixed(2)};
                 };
@@ -267,7 +272,9 @@ def main():
               100 * (1 - fast_static["arrivedAt"] / safe_static["arrivedAt"]),
               fast_static["arrivedAt"], safe_static["arrivedAt"]),
           "时间最优没有明显更快")
-    check(step["vref"] > 2.5 and trap["vref"] < 1.0,
+    # 梯形剖面 0.5 s 的 vref ≈ a·0.5（现默认 a=3.0 → 1.5），台阶剖面一拍就顶上去，
+    # 所以判据用「比例」而不是写死的 1.0 m/s。
+    check(step["vref"] > 2.5 and trap["vref"] < step["vref"] * 0.7,
           "现状剖面是台阶：0.5 s 时 vref %.2f，梯形剖面只有 %.2f（≈a·t）" % (step["vref"], trap["vref"]),
           "现状剖面没有体现台阶：%.2f vs %.2f" % (step["vref"], trap["vref"]))
 

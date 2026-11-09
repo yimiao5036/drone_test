@@ -40,7 +40,8 @@
     display:flex; align-items:center; gap:14px; padding:0 16px;
     background:var(--panel); border-bottom:1px solid var(--line);
   }
-  header h1{font-size:14px; margin:0; font-weight:650; white-space:nowrap}
+  header h1{font-size:14px; margin:0; font-weight:650; white-space:nowrap; flex:0 0 auto}
+  header .sub{min-width:0}
   header .sub{color:var(--ink-3); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   header .spacer{flex:1}
   .badge{
@@ -139,8 +140,8 @@
 </head>
 <body>
 <header>
-  <h1>接近段速度律（交互）：比例接近 vs 梯形包络</h1>
-  <span class="sub">蓝 = 基线（比例接近 u=k·d + 碰撞三角形提前量）　红 = 对照（无余量、无下限，纯尾追）　舞台下方可切「目标位置来源」：真值 / 量测 / 卡尔曼（含前视预测）</span>
+  <h1>接近段速度律（交互）：制动曲线（默认）</h1>
+  <span class="sub">蓝 = 设计（上限 10 m/s + 距离制动 a=3 + 参考限速 3）　红 = 对照（纯尾追）　下方可切来源：真值 / 量测 / 卡尔曼 / 速度位</span>
   <span class="spacer"></span>
   <span class="badge" id="badgePhase">推进中</span>
   <span class="badge" id="badgeTime">t = 0.0 s</span>
@@ -255,18 +256,18 @@
       </div>
       <div class="row">
         <label>加速度 a_a</label>
-        <input id="accel" type="range" min="0.4" max="3" step="0.1" value="1">
-        <output id="accelOut">1.0 m/s²</output>
+        <input id="accel" type="range" min="0.4" max="5" step="0.1" value="3">
+        <output id="accelOut">3.0 m/s²</output>
       </div>
       <div class="row">
         <label>减速度 a_d</label>
-        <input id="decel" type="range" min="0.4" max="3" step="0.1" value="1">
-        <output id="decelOut">1.0 m/s²</output>
+        <input id="decel" type="range" min="0.4" max="5" step="0.1" value="3">
+        <output id="decelOut">3.0 m/s²</output>
       </div>
       <div class="row">
         <label title="对参考速率做变化率限幅：相当于给速度指令本身加加速度上限，0 = 关闭">参考限速</label>
-        <input id="slew" type="range" min="0" max="3" step="0.1" value="0">
-        <output id="slewOut">关闭</output>
+        <input id="slew" type="range" min="0" max="6" step="0.1" value="3">
+        <output id="slewOut">3.0 m/s²</output>
       </div>
       <div class="row">
         <label>策略</label>
@@ -277,15 +278,15 @@
       </div>
       <div class="row">
         <label>速度上限</label>
-        <input id="vcap" type="range" min="0" max="8" step="0.5" value="0">
-        <output id="vcapOut">由几何决定</output>
+        <input id="vcap" type="range" min="0" max="14" step="0.5" value="10">
+        <output id="vcapOut">10.0 m/s</output>
       </div>
       <div class="row">
         <label>速度律</label>
         <div class="seg" id="lawSeg">
-          <button data-law="prop" class="on">比例接近</button>
+          <button data-law="prop">比例接近</button>
           <button data-law="trap">梯形包络</button>
-          <button data-law="brake">制动曲线</button>
+          <button data-law="brake" class="on">制动曲线</button>
           <button data-law="step">现状台阶</button>
         </div>
       </div>
@@ -348,9 +349,9 @@ const SPEED_WIN = 25;
 
 const P = {
   vt: 2.0, heading: 90, turn: 'straight',
-  margin: 1.0, accel: 1.0, decel: 1.0, slew: 0, profile: 'trap', end: 'match', floor: true,
-  policy: 'fast', vcap: 0,
-  law: 'prop',                  // 速度律：prop=比例接近（基线）/ env=刹车包络
+  margin: 1.0, accel: 3.0, decel: 3.0, slew: 3.0, profile: 'trap', end: 'match', floor: true,
+  policy: 'fast', vcap: 10,
+  law: 'brake',                 // 速度律：brake=制动曲线（默认，2026-11-09）/ prop=比例接近（基线）/ env=梯形包络
   k: 0.6,                       // 比例接近增益 1/s
   src: 'vmsg',                  // 真实链路默认：雷达/地面站带速度位（真值仅用于验法则）
   noise: 0.8, measHz: 5, latency: 200, sigmaA: 2.0,
