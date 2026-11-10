@@ -5,93 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>追踪速度梯形曲线 · 交互演示（2026-11-05）</title>
 <!--
-  用途：给维护者演示「接近段速度剖面」的设计取舍，替代口头描述。
-  两个世界同时跑：
-    峰值不是拍出来的：无上限时 v_p² = 2·a_a·a_d·D/(a_a+a_d)（三角形，匀速段 0），
-    峰顶被上限削平后才出现匀速段——"最高速度"只是安全上限，真正决定时间的是 a_a / a_d。
-    A（蓝）= 我们的设计：v_cruise = max(地板 1.5, |v_t| + 余量)，参考速度按
-             加速 / 匀速 / 减速(斜边) / 速度匹配 四段推进（梯形），引导点跟着参考走。
-    B（红）= 对照组：去掉余量、去掉地板（v_cruise = |v_t|），纯尾追。
-
-  这张图要说明的两件事：
-    1) 余量决定「能不能追上」——稳态 ḋ = -(v_cruise - v_t)，余量为 0 时距离停在
-       加速期拉开的差值上（红色虚线贴住 +40.6 m 不收敛）；
-    2) 梯形决定「怎么追」——加速斜坡、巡航平台、减速斜边、末端速度匹配。
-      没有加速段的现状（剖面=现状）会让参考点跑到飞机前面 4~5 m。
-
-  2026-11-09 修正（数学分析见 docs/接近段速度律-数学分析-2026-11-09.md §5）：
-    1) 刹车包络改用真实距离 dObs（原 dAim 含 t_go 提前，虚高最多 5 m → 穿过到点球）；
-    2) 包络按 BRAKE_SAFETY=1.3 留余量（原来只有 d_brake 读数用了它，律里没用）；
-    3) 碰撞三角形二次式 qc 符号修正（+r2 → -r2，与符号表公式一致）；
-    4) end=match 不再做 t_go 提前（只保留链路时延预测）；jerk 默认 0
-       （J>0 时二阶平滑在包络拐点反向太慢，短距离会穿球，结构问题待定）。
-    5) 「速度位」来源的位置也进卡尔曼（与机载 target_estimator 的"显式速度只当前馈、
-       不喂滤波器"一致），不再拿带噪量测点直接外推——固定点/静止目标原来会随量测噪声乱跳。
-    6) 默认不加量测噪声：收到地面站的点/速度直接算（代码本身不制造噪声）；σ/σ_v 滑块
-       只在模拟雷达/链路误差时调大，预设只切目标运动。
-    7) 加速度图改为有符号切向加速度（原来画 |a|，减速也显示为正）：J=0 时指令加速度用
-       cmd 差分（原来读 s.acc，而它只在 J>0 分支更新，曲线恒 0）；相位按切向加速度判。
-    8) 目标运动扩到 6 种（直线/加速脱离/绕圈/螺旋/蛇形/随机机动），加速度有界；用来暴露
-       "刹车包络假设目标匀速"的适用边界，不是给包络喂加速度模型。
-    9) 仿真不设 60 s 截止：跑到 A.arrived（进 3 m 球）为止，追不上的工况一直跑、由用户暂停；
-       距离图横轴按 max(60, 当前时间) 自适应、纵轴按实际最大距离重标。
-
-  2026-11-10 修复（复核记录见 docs/接近段速度律-数学分析-2026-11-09.md §5.10）：
-    1) 速度上限滑块为 0 时，理论解按"无限速"、速度律按 6 m/s，同屏自相矛盾——
-       统一按 6 m/s（V_PLAN_MPS），理论/律/判词/图表同一个口径；
-    2) end=stop 的停车点原来写死 0.6 m，与 handover.arrival_radius_m=3 m 冲突——
-       两种末端都停在到点半径上，stop 的到点容差放宽到 +0.3 m（工程容差）；
-    3) 新增"最小距离/包络越界"读数：机动目标会突破刹车包络（绕圈 4 m/s、a=3 实测
-       进到点球内 0.45 m），原来只报到点、不报穿球；J>0 时同一行显式告警；
-    4) "实际峰值"原来取的是指令峰值（A.vpeak），改为真实速度峰值 A.vactPeak；
-    5) 估计误差 RMS 原来只在 ui 不可达的 kf 源下显示，vmsg 下改为显示 KF 位置误差；
-       量测误差 RMS 的"最近 4 s"原来按 4/DT 取了 200 个 5 Hz 样本（=40 s），一并修正；
-    6) errPred/errMeas 长跑无界增长——加 4 s 窗口上限（原来 300 s 能涨到上万条）；
-    7) 纯横穿目标判词原来落进"时间最优"（要求 v_t∥>0.05），改为按二维接近预算判"追不上"；
-    8) 删掉恒假条件 `law==='env' && profile==='step'`（step 律的 law 值是 'step'），
-       统一"速度匹配时加完整 v_t 前馈"——与机载 enable_position_velocity_feedforward 一致；
-    9) 刹车点读数与律同口径（a_d/1.3，去掉多余的 0.5 m 垫片），环比律晚 0.5 m 的问题消失；
-   10) 新增"匹配不了"诊断：读数条给出目标机动峰值 a_t（真值，仅评价）与转弯约束最小值；
-       判词在"进过 3 m 球但相对速度压不到 0.5"时显式归因（典型：蛇形 vt≥7、绕圈 vt≥7），
-       不再笼统显示"时间最优"。详见 §5.11。
-   11) 转弯约束改为"只削额外接近速度、不削目标速度前馈"（二次修正）：
-       旧式 v ≤ a·d/|v_t⊥| 假设机速没有横向分量，d 小时把 7 m/s 目标削到 1.4 m/s，
-       连前馈一起削——绕圈 7 m/s 因此永远到不了。新式用相对横向速度算 λ̇，
-       机速跟住目标后 λ̇→0、约束自然释放；实测绕圈 7 m/s 由"永远不到"变为 24 s 到点，
-       蛇形 7 m/s 由"不到"变为 15.4 s 到点。剩余边界（蛇形 8 m/s：a_t=4.22 > a=3、
-       且目标横向扫过会穿到 0.34 m）是目标机动超能力 + 1D 包络不建模横向接近，
-       不是约束写错（§5.11）。
-   12) 加速度拆成两个量（2026-11-10，§5.12）：
-       a_phys = 机体物理硬上限（plant 夹在这里，对应实机倾角/推力）；
-       a_plan = 剖面/包络/闭式解用多少（原 a_a/a_d）。规划高于物理 → 剖面不可实现，
-       实际加速度被饱和、到点变慢甚至穿球；物理高于规划 → 只是"没把能力用满"，
-       剖面不会因为调大 a_phys 而变快。jerk 仍单独限：工程建议 ≥8 m/s³，
-       但当前"包络 + 独立限幅"结构下 J>0 会穿球（§5.4），默认 0 保持已知行为。
-   13) 末端判据可切换 + 垂直通道（2026-11-10，§5.13）：
-       判据 rel=相对速度（演示默认）/ abs=地速（机载 handover 的 0.5 m/s）；
-       "速度匹配 + 地速判据"对动目标不相容，判词显式说明。
-       垂直通道与水平解耦：目标高度/垂直速度可切（同高/高 10 m/爬升/下降），
-       限速 2 m/s、限加速度 2 m/s²、刹车余量 1.3；到点 = 水平 3 m + 垂直 2 m + 速度判据。
-       垂直用真值高度（演示不做垂直估计），图上有 |dz| 曲线与 2 m 容差线。
-
-    14) 视觉交接模型（2026-11-10，§5.14）：S5→S6 的放行条件不是"到点 3 m + 0.5 m/s"，
-        而是 LOCKED 连续 10 帧 + 双目测距 ≤7.95 m + 俯仰 ≤5.24°（测距校正 FOV
-        10.24° − 5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s/2 s 只是到点告警。
-        FOV 用双目测距测试的校正内参（P_ref：fx=fy=1057.3349、cx=692.7685、
-        cy=529.0832）；测距 7.95 m 由 fxb=63.5665 ÷ disp_min_px=8 推出；
-        识别距离未标定，不设门（机载只要识别到）。
-        默认 40 m 直线在 7.6 m / 5.5 s 交接（相对 4.65 m/s），
-        高位目标因俯仰出视场推迟（高 10 m → 5.6 m / 6.0 s）。
-    15) 到点告警补 2 s 保持（2026-11-10，§5.15）：机载 handover.arrival_hold_ms=2000，
-        原来"首次满足"就置位，到点用时低估 2 s；现在要求水平/垂直/速度三条连续保持
-        2 s，中途失效重新计时，读数行显示保持进度。
-    16) 加速度图可切分量（2026-11-10，§5.16）：原来只画切向加速度，蛇形/绕圈是"改方向"，
-        切向分量小、看起来像"追踪时没有加速度"；现在可切 切向/横向/总（只换显示不重跑）。
-        8 m/s 蛇形实测：总加速度 99% 时间贴 3 m/s²（饱和）、横向峰值 3.0、
-        切向均值 1.37——响应目标是"够不够"而不是"变化大不大"。
-
-  配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
-  警示 #b45309、危险 #c0392b、成功 #3d7a1f。
+  追踪速度剖面交互演示；2026-11-10 数学与离散实现复核。
+  A：保守平台或快速接近；B：无余量平台。均使用二维向量速度约束。
+  1. 有效规划加/减速度 = min(规划值、机体物理上限、非零指令变化率上限)。
+  2. 总速预算：u <= sqrt(V² - vt_cross²) - vt_along，保留迎面分量的符号。
+  3. 制动律使用估计当前距离；J>0 时按当前加速度计算 jerk 制动距离并反解速度。
+     该距离基于匀速目标的一维模型，不是任意机动下的二维安全证明。
+  4. 末端用有符号位置反馈保持 2.9 m；统一到点条件为水平<=3 m、垂直<=2 m、
+     所选三维速度<=0.5 m/s，连续2 s。3 m是到点区域，不是防撞禁入区。
+  5. 硬速度/加速度上限优先；若限速裁剪破坏jerk，页面显示次数，不隐瞒约束冲突。
+  6. 理想一维用时保留加速阶段的负相对位移，不含末端比例收敛和保持时间。
+  7. 量测与控制在同一时间戳计算，随后目标和飞机共同积分；播放采用固定步长累积器。
+  8. 视觉模块是理想朝向/检测下的几何交接示意，位置KF创新不等同于真实视觉创新。
+  9. 2026-11-10 维护者复核：图表/HUD 改 20 Hz 重绘、hist 二分窗口、每帧最多 20 拍
+     （卡顿来自绘制，实测 frame 0.96 ms）；物理上限默认 9.8（PX4 45°），
+     输出显示有效 min(a_plan,a_phys)——它只封顶，剖面由 a_plan 决定；
+     slew=0 恢复关闭指令加速度限幅（否则"现状台阶"被 a_plan 抹成斜坡）。
+  本文件可单独运行，无外部文件依赖。验证结论见同目录的《追踪算法-复核与修复说明》。
 -->
 <style>
   :root{
@@ -221,7 +151,7 @@
 <body>
 <header>
   <h1>接近段速度律（交互）：制动曲线（默认）</h1>
-  <span class="sub">蓝 = 设计（上限 10 m/s + 距离制动 a=3 + 二维指令变化率 3 m/s²）　红 = 对照（纯尾追）　下方可切来源：真值 / 速度位</span>
+  <span class="sub">蓝 = 设计（规划加减速 + 实际能力约束 + 末端速度匹配）　红 = 对照（纯尾追）　下方可切来源：真值 / 速度位</span>
   <span class="spacer"></span>
   <span class="badge" id="badgePhase">推进中</span>
   <span class="badge" id="badgeTime">t = 0.0 s</span>
@@ -268,7 +198,7 @@
       <b>到点判据</b>
       <div class="seg" id="critSeg">
         <button data-criterion="rel" class="on" title="相对速度 ≤ 0.5（演示默认）：速度匹配末端用这条">相对</button>
-        <button data-criterion="abs" title="地速 ≤ 0.5（机载 handover 用这条）：动目标速度匹配时永远满足不了">地速</button>
+        <button data-criterion="abs" title="地速 ≤ 0.5（机载 handover 用这条）：速度匹配动目标时可能与该告警条件冲突">地速</button>
       </div>
       <span class="kfnote">σ/σ_v=0：收到 65010 的点/速度直接算；位置进 KF 降噪，σ 只在模拟链路误差时调大</span>
     </section>
@@ -278,15 +208,15 @@
         <div class="cell"><div class="k">视线距离 d</div><div class="v" id="sD">—</div></div>
         <div class="cell"><div class="k">接近速度 v_c</div><div class="v" id="sVc">—</div></div>
         <div class="cell"><div class="k">本机速度</div><div class="v" id="sVd">—</div></div>
-        <div class="cell"><div class="k">参考速度 v_ref</div><div class="v" id="sVr">—</div></div>
+        <div class="cell"><div class="k">指令速度 |v_ref|</div><div class="v" id="sVr">—</div></div>
         <div class="cell"><div class="k">实际峰值</div><div class="v" id="sVp">—</div></div>
-        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">理论峰值</div><div class="v" id="sVpt">—</div></div>
-        <div class="cell"><div class="k">刹车距离 d_brake</div><div class="v" id="sDb">—</div></div>
+        <div class="cell"><div class="k" title="理想一维梯形基准：无 jerk、有效减速/1.3；运动用时不含末端比例收敛和 2 s 保持">理论峰值</div><div class="v" id="sVpt">—</div></div>
+        <div class="cell"><div class="k">局部制动距离</div><div class="v" id="sDb">—</div></div>
         <div class="cell"><div class="k">稳态接近速率</div><div class="v" id="sRate">—</div></div>
         <div class="cell"><div class="k">参考点领先</div><div class="v" id="sLag">—</div></div>
         <div class="cell"><div class="k" title="到点告警：水平 3 m + 垂直 2 m + 速度 ≤0.5，且三条连续保持 2 s（handover.arrival_hold_ms=2000）。这只是告警线，不是 S5→S6 的交接判据——交接看视觉锁定 10 帧 + 测距有效 + 视场 + 创新">告警用时</div><div class="v" id="sTa">—</div></div>
-        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">理论用时</div><div class="v" id="sTt">—</div></div>
-        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">匀速段</div><div class="v" id="sTc">—</div></div>
+        <div class="cell"><div class="k" title="理想一维梯形基准：无 jerk、有效减速/1.3；运动用时不含末端比例收敛和 2 s 保持">理想运动用时</div><div class="v" id="sTt">—</div></div>
+        <div class="cell"><div class="k" title="理想一维梯形基准：无 jerk、有效减速/1.3；运动用时不含末端比例收敛和 2 s 保持">匀速段</div><div class="v" id="sTc">—</div></div>
       </div>
       <div class="grid grid2" id="estRow" style="display:none">
         <div class="cell"><div class="k">量测误差 RMS</div><div class="v" id="sEm">—</div></div>
@@ -322,6 +252,9 @@
         <select id="turnSel" title="目标运动模型。加速脱离=速度在 0.5~1.5 倍之间按 1.5 m/s² 来回；螺旋=半径 10~30 m；随机机动=±1.2 m/s² 横向加速度（三正弦叠加，确定性）；蛇形=航向 ±55°@0.55 rad/s，横向加速度≈0.53·vt（随速度变严，vt≳7 时超过默认 a=3 会匹配不了，见分析 §5.11）">
           <option value="straight">直线（匀速）</option>
           <option value="accel">加速脱离（±1.5 m/s²）</option>
+          <option value="burst">7 s 临近加速（+2 m/s²）</option>
+          <option value="brake">7 s 目标急停（−2.5 m/s²）</option>
+          <option value="restart">14 s 到点后脱离（+2 m/s²）</option>
           <option value="circle">绕圈（r=20 m）</option>
           <option value="spiral">螺旋（r=10~30 m）</option>
           <option value="weave">蛇形（±55°）</option>
@@ -338,30 +271,47 @@
         <button data-preset="line2">2 直线</button>
         <button data-preset="circle2">2 绕圈</button>
         <button data-preset="weave3">3 蛇形</button>
+        <button data-preset="burst">临近加速</button>
+        <button data-preset="brake">目标急停</button>
+        <button data-preset="guardedBrake">急停+预留</button>
+        <button data-preset="restart">到点脱离</button>
       </div>
     </div>
 
     <div class="group">
       <h2>设计参数（对照组固定「无余量、无下限」）</h2>
       <div class="row">
-        <label title="只对「保守」策略生效：v_cruise = max(地板 1.5, |v_t|+余量)；稳态接近速率≈余量，余量 0 = 追不上。时间最优忽略它">速度余量</label>
+        <label title="动态：估计目标加速度、预留横向能力、重算相对制动预算；匀速假设：不使用目标加速度，供对比。两者都受相同物理硬限">机动预算</label>
+        <div class="seg" id="adaptiveSeg"><button data-adaptive="on" class="on">动态</button><button data-adaptive="off">匀速假设</button></div>
+      </div>
+      <div class="row">
+        <label title="持续：到点后继续跟踪，脱离会重新追赶并重新保持2秒；到点停：保留首次捕获的观察方式">到点之后</label>
+        <div class="seg" id="continuousSeg"><button data-continuous="on" class="on">持续跟踪</button><button data-continuous="off">到点停</button></div>
+      </div>
+      <div class="row">
+        <label title="已知的目标最大内向加速度界，0=仅响应已观测机动。预留会压低接近速度并计入采样/传输反应距离；不是任意二维运动的安全证明">目标急停预留</label>
+        <input id="targetBrake" type="range" min="0" max="5" step="0.1" value="0">
+        <output id="targetBrakeOut">0.0 m/s²</output>
+      </div>
+      <div class="row">
+        <label title="只对「保守」策略生效：v_cruise = max(地板 1.5, |v_t|+余量)；稳态接近速率≈余量，余量 0 = 追不上。快速接近策略忽略它">速度余量</label>
         <input id="margin" type="range" min="0" max="2" step="0.1" value="1">
         <output id="marginOut">1.0</output>
       </div>
       <div class="row">
-        <label title="剖面/闭式解用的规划加速度（a_plan，应 ≤ 物理上限）。调大=加速段更陡；超过 a_phys 时 plant 饱和，实际跟不上剖面">规划加速 a_plan</label>
+        <label title="剖面/闭式解用的规划加速度；有效值取规划、物理、非零指令变化率上限的最小值">规划加速 a_plan</label>
         <input id="accel" type="range" min="0.4" max="5" step="0.1" value="3">
         <output id="accelOut">3.0 m/s²</output>
       </div>
       <div class="row">
-        <label title="刹车包络用的规划减速度（a_plan↓），包络按它/1.3 留余量。调大=晚刹车、时间短；调小=早刹车、更保守；超过 a_phys 时 plant 刹不住">规划减速 a_plan↓</label>
+        <label title="有效规划减速度取规划、物理、非零指令变化率上限的最小值，制动距离再按 /1.3 留余量">规划减速 a_plan↓</label>
         <input id="decel" type="range" min="0.4" max="5" step="0.1" value="3">
         <output id="decelOut">3.0 m/s²</output>
       </div>
       <div class="row">
-        <label title="机体物理加速度上限（硬边界，plant 夹在这里）。多旋翼参考 g·tan(倾角)：45°≈9.8、30°≈5.7、20°≈3.6。默认 3 = 规划值，保持旧行为；调到规划值以下看“能力不够”，调高只说明“没把能力用满”">物理上限 a_phys</label>
-        <input id="aPhys" type="range" min="0.4" max="10" step="0.1" value="3">
-        <output id="aPhysOut">3.0 m/s²</output>
+        <label title="机体物理加速度上限（硬边界，plant 夹在这里）。多旋翼参考 g·tan(倾角)：45°≈9.8、30°≈5.7、20°≈3.6。默认 9.8 = PX4 45° 倾角的理论水平能力。注意：它只封顶，剖面由 a_plan 决定——调到 a_plan 以下才会改变轨迹，调高只说明“没把能力用满”">物理上限 a_phys</label>
+        <input id="aPhys" type="range" min="0.4" max="10" step="0.1" value="9.8">
+        <output id="aPhysOut">9.8 m/s²（有效 3.0）</output>
       </div>
       <div class="row">
         <label title="对完整二维速度指令做变化率限幅（m/s²），0 = 关闭">指令加速度</label>
@@ -369,15 +319,15 @@
         <output id="slewOut">3.0 m/s²</output>
       </div>
       <div class="row">
-        <label title="指令加速度的变化率上限（m/s³）。开启后加速度按 J 爬坡，短距离/低速时到不了加速度上限。注意：J 太小（如 8）时二阶平滑在刹车包络拐点反向太慢，会冲过包络、短距离穿过到点球（分析见 docs/接近段速度律-数学分析-2026-11-09.md §5.4）；默认 0 = 只用一阶限幅">jerk J</label>
+        <label title="指令二维加速度变化率上限（m/s³）。开启后制动距离包含加速度回收；总速硬限优先，安全裁剪次数显示在诊断行。0=关闭 jerk 限制">jerk J</label>
         <input id="jerk" type="range" min="0" max="30" step="0.5" value="0">
         <output id="jerkOut">关闭</output>
       </div>
       <div class="row">
-        <label title="保守：巡航封顶 = max(地板 1.5, |v_t|+余量)；时间最优：顶到速度上限，峰顶由剩余距离和两个加速度算出">策略</label>
+        <label title="保守：巡航封顶 = max(地板 1.5, |v_t|+余量)；快速接近：尽量使用速度上限，仍受制动距离、实际加减速和转弯约束">策略</label>
         <div class="seg" id="policySeg">
           <button data-policy="safe">保守</button>
-          <button data-policy="fast" class="on">时间最优</button>
+          <button data-policy="fast" class="on">快速接近</button>
         </div>
       </div>
       <div class="row">
@@ -402,8 +352,8 @@
       <div class="row">
         <label>末端</label>
         <div class="seg" id="endSeg">
-          <button data-end="match" class="on" title="末端匹配完整目标速度矢量，相对速度→0；停在到点半径 3 m 上">速度匹配</button>
-          <button data-end="stop" title="末端减到地速 0；同样停在到点半径 3 m 上（2026-11-10 由 0.6 m 改为 3 m，与 handover 对齐）">减到 0</button>
+          <button data-end="match" class="on" title="末端匹配完整目标速度矢量，相对速度趋于0；控制间距2.9 m，到点半径3 m">速度匹配</button>
+          <button data-end="stop" title="不加目标速度前馈，跟随重算的停车点；适用于静止目标，动目标可能反复接近">减到 0</button>
         </div>
       </div>
       <div class="row">
@@ -426,11 +376,11 @@
 
 <section class="charts">
   <div class="chart">
-    <div class="cap">距离 d(t)：<b style="color:#1677d2">设计</b> vs <b style="color:#c0392b">无余量</b>　绿虚线 = 到点告警线 3 m　紫竖线 = 视觉交接（测距 7.95 m 内且锁定 10 帧）　赭虚线 = |dz|、赭横线 = 垂直容差 2 m</div>
+    <div class="cap">距离 d(t)：<b style="color:#1677d2">设计</b> vs <b style="color:#c0392b">无余量</b>　绿虚线 = 到点告警线 3 m　紫竖线 = 几何交接示意（测距 7.95 m 内且锁定 10 帧）　赭虚线 = |dz|、赭横线 = 垂直容差 2 m</div>
     <canvas id="chartD"></canvas>
   </div>
   <div class="chart">
-    <div class="cap">设计机速度（25 s 滚动窗）：<b style="color:#409eff">实际</b> vs <b style="color:#909399">参考剖面</b>　底色 = 加速 / 巡航 / 减速 / 匹配</div>
+    <div class="cap">设计机速度（25 s 滚动窗）：<b style="color:#409eff">实际</b> vs <b style="color:#909399">指令模长</b>　底色 = 加速 / 巡航 / 减速 / 匹配</div>
     <canvas id="chartV"></canvas>
   </div>
   <div class="chart">
@@ -487,9 +437,9 @@ const SPEED_WIN = 25;
 const P = {
   vt: 2.0, heading: 90, turn: 'straight',
   margin: 1.0, accel: 3.0, decel: 3.0, slew: 3.0, // accel/decel = 规划值 a_plan（剖面/包络用）
-  aPhys: 3.0,                   // 机体物理加速度上限：plant 夹在这里；默认 = 规划值，保持旧行为
+  aPhys: 9.8,                   // 机体物理加速度上限（PX4 45° 倾角 ≈9.8）；只封顶，剖面由 a_plan 决定
   jerk: 0.0,                    // jerk = 指令加速度变化率上限（m/s³），0 = 关闭二阶平滑
-                                // （J>0 会在刹车包络拐点冲过界，短距离穿过到点球；结构问题待定，见分析文档 §5.4）
+                                // （J>0 时使用含加速度回收的制动距离；任意二维机动仍不是严格安全保证）
   profile: 'trap', end: 'match', floor: true,
   policy: 'fast', vcap: 10,
   law: 'brake',                 // 速度律：brake=制动曲线（默认，2026-11-09）/ prop=比例接近（基线）/ env=梯形包络
@@ -503,6 +453,7 @@ const P = {
   vzT: 0,                       // 目标垂直速度 m/s（爬升为正）
   criterion: 'rel',             // 到点速度判据：rel=相对速度（演示默认）/ abs=地速（机载 handover）
   accelView: 'tan',             // 加速度图分量：tan=切向（默认）/ lat=横向 / mag=总模长
+  adaptive: 'on', continuous: 'on', targetBrake: 0, // 可选的目标最大内向加速度界，0=不作预先保证
   speed: 2.0, paused: false,
 };
 
@@ -565,9 +516,155 @@ class AxisKF {
   }
 }
 
+// ---- 可实现的规划约束与 jerk 制动距离 ----
+// 3 m 是到点区域，不是防撞禁入区。控制在其内留 0.1 m 余量，判据仍严格用 3 m。
+const TRACK_RADIUS_M = ARRIVAL_RADIUS_M - 0.1;
+const TERMINAL_GAIN = 1.5;
+function motionLimits() {
+  const cmd = P.slew > 0 ? P.slew : Infinity;
+  return { up: Math.min(P.accel, P.aPhys, cmd), down: Math.min(P.decel, P.aPhys, cmd) };
+}
+// 只在新速度样本到达时差分；量测模式绝不读取真值加速度。
+function updateTargetAcceleration(s, velocity, stamp) {
+  const e = s.est, last = e.accSample;
+  if (last && stamp > last.t + 1e-6) {
+    const h = stamp - last.t;
+    let ax = (velocity.x - last.x) / h, ay = (velocity.y - last.y) / h;
+    const mag = Math.hypot(ax, ay), bound = 20; // 估计器抗离群限幅，独立于机体能力
+    if (mag > bound) { ax *= bound / mag; ay *= bound / mag; }
+    const tau = 0.12 + 1.5 * P.vsig + 0.1 * P.noise;
+    const f = 1 - Math.exp(-h / tau);
+    e.targetAcc.x += f * (ax - e.targetAcc.x);
+    e.targetAcc.y += f * (ay - e.targetAcc.y);
+  }
+  if (!last || stamp > last.t + 1e-6) e.accSample = { t: stamp, x: velocity.x, y: velocity.y };
+}
+// u=-d_dot；u_dot=(a_drone-a_target)·n-|v_relative,perp|²/d。
+// 侧向预留用于 a_target,perp + u*n_dot，径向能力由加速度圆反解。
+function relativeBudget(up, down, targetAlong, sideNeed) {
+  const radial = cap => Math.sqrt(Math.max(0, cap * cap - sideNeed * sideNeed));
+  return {
+    up: Math.max(0, radial(up) - targetAlong),
+    down: Math.max(0, radial(down) + targetAlong),
+    feasible: Math.abs(sideNeed) <= Math.min(up, down) &&
+      targetAlong <= radial(up) && targetAlong >= -radial(down),
+  };
+}
+function velocityBudget(cap, along, cross, match) {
+  if (!match) return cap;
+  // 完整前馈超出平台能力时无精确匹配解；最终仍受机体总速度硬上限保护。
+  if (Math.abs(cross) > cap) return 0;
+  return Math.max(0, Math.sqrt(Math.max(0, cap * cap - cross * cross)) - along);
+}
+function stoppingDistance(speed, acceleration, decel, jerk) {
+  const u = Math.max(0, speed), b = Math.max(1e-6, decel);
+  if (!(jerk > 0)) return u * u / (2 * b);
+  const j = jerk, a = Math.max(-b, acceleration);
+  let v = u, x = 0;
+  const integrate = (t, a0, j0) => {
+    x += v * t + 0.5 * a0 * t * t + j0 * t * t * t / 6;
+    v += a0 * t + 0.5 * j0 * t * t;
+  };
+  // 已在刹车且速度太低：先回收负加速度，速度首次归零时的距离。
+  if (a < 0 && u <= a * a / (2 * j)) {
+    integrate((-a - Math.sqrt(Math.max(0, a * a - 2 * j * u))) / j, a, j);
+    return Math.max(0, x);
+  }
+  const peak = Math.sqrt(j * u + a * a / 2);
+  const p = Math.min(b, peak);
+  integrate(Math.max(0, (a + p) / j), a, -j);
+  if (peak > b) integrate(Math.max(0, (v - b * b / (2 * j)) / b), -b, 0);
+  integrate(p / j, -p, j);
+  return Math.max(0, x);
+}
+function brakingSpeed(distance, acceleration, decel, jerk, cap, dt) {
+  if (!(distance > 0) || !(decel > 1e-6)) return 0;
+  if (!(jerk > 0)) {
+    // 一拍反应距离 + 匀减速距离，而不是只给连续时间平方根曲线。
+    return Math.min(cap, Math.sqrt((decel * dt) ** 2 + 2 * decel * distance) - decel * dt);
+  }
+  let lo = 0, hi = cap;
+  for (let i = 0; i < 26; i++) {
+    const mid = (lo + hi) / 2;
+    const need = mid * dt + 0.5 * Math.max(0, acceleration) * dt * dt +
+      stoppingDistance(mid, acceleration, decel, jerk);
+    if (need <= distance) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+function guardedBrakingSpeed(distance, acceleration, decel, jerk, cap, delay, reactionAccel) {
+  if (!(distance > 0) || !(decel > 1e-6)) return 0;
+  let lo = 0, hi = cap;
+  for (let i = 0; i < 26; i++) {
+    const u = (lo + hi) / 2, after = u + reactionAccel * delay;
+    const need = u * delay + 0.5 * reactionAccel * delay * delay +
+      stoppingDistance(after, acceleration, decel, jerk);
+    if (need <= distance) lo = u; else hi = u;
+  }
+  return lo;
+}
+function smoothCommand(s, x, y, dt, cap, nx, ny) {
+  // 指令加速度限幅关闭（slew=0 且无 jerk）时，指令直接取期望值，由 plant 的 a_phys 限幅。
+  // 否则"现状台阶"也会被抹成 a_plan 斜坡，与滑块说明"0 = 关闭"冲突（2026-11-10）。
+  if (!(P.slew > 0) && !(P.jerk > 0)) {
+    s.cmd.x = x; s.cmd.y = y;
+    const m0 = Math.hypot(s.cmd.x, s.cmd.y);
+    if (m0 > cap + 1e-9) {
+      s.cmd.x *= cap / m0; s.cmd.y *= cap / m0;
+      s.safetyClips = (s.safetyClips || 0) + 1;
+    }
+    return;
+  }
+  const limits = motionLimits();
+  const tracking = P.adaptive === 'on' && P.end === 'match';
+  const ff = tracking ? s.tgtAcc : { x: 0, y: 0 };
+  // 预览一拍目标速度，避免在加速目标后面永久滞后一拍。
+  const ex = x + ff.x * dt - s.cmd.x, ey = y + ff.y * dt - s.cmd.y;
+  const error = Math.hypot(ex, ey);
+  // 规划加/减速按朝向/背离目标的加速度方向分配，不按相对速度误差模长。
+  // 否则起步追赶（u<0）会误用减速上限，绕过用户设置的启动加速度。
+  const reducing = ex * nx + ey * ny < -1e-9;
+  const requestedCap = reducing ? limits.down : limits.up;
+  // J>0 时上限切换也要回收加速度，不能瞬间夹断 jerk。
+  const aCap = P.jerk > 0
+    ? Math.max(requestedCap, Math.hypot(s.acc.x, s.acc.y) - P.jerk * dt)
+    : requestedCap;
+  if (!(P.jerk > 0)) {
+    const dv = Math.min(error, aCap * dt);
+    if (error > 1e-12) { s.cmd.x += ex / error * dv; s.cmd.y += ey / error * dv; }
+  } else {
+    // 在速度空间提前回收加速度：误差内要容纳 a²/(2J) 的加速度卸载量。
+    // 各轴给出回收目标，再统一限制二维加速度和 jerk 范数。
+    const recover = (e, a) => {
+      const sign = Math.sign(e) || -Math.sign(a);
+      const q = Math.max(0, 2 * P.jerk * Math.abs(e) - sign * a * P.jerk * dt);
+      return sign * Math.max(0, Math.sqrt(q + (P.jerk * dt / 2) ** 2) - P.jerk * dt / 2);
+    };
+    let ax = recover(ex, s.acc.x), ay = recover(ey, s.acc.y);
+    const mag = Math.hypot(ax, ay);
+    if (mag > aCap) { ax *= aCap / mag; ay *= aCap / mag; }
+    const dx = ax - s.acc.x, dy = ay - s.acc.y;
+    const change = Math.hypot(dx, dy), maxChange = P.jerk * dt;
+    const f = change > maxChange ? maxChange / change : 1;
+    const prevX = s.acc.x, prevY = s.acc.y;
+    s.acc.x += dx * f; s.acc.y += dy * f;
+    s.cmd.x += (prevX + s.acc.x) * dt / 2;
+    s.cmd.y += (prevY + s.acc.y) * dt / 2;
+  }
+  // 硬速度上限优先于舒适性。不可行的突变/机动会显式记录 jerk 被安全裁剪打断。
+  const mag = Math.hypot(s.cmd.x, s.cmd.y);
+  if (mag > cap + 1e-9) {
+    s.cmd.x *= cap / mag; s.cmd.y *= cap / mag;
+    s.safetyClips = (s.safetyClips || 0) + 1;
+  }
+}
+
 function makeSim(variant) {
   return {
-    variant, t: 0, arrived: false, arrivedAt: null,
+    variant, t: 0, arrived: false, arrivedAt: null, trackingNow: false,
+    lostCount: 0, reacquiredCount: 0, everArrivedAt: null, maneuverAt: null,
+    tgtAcc: { x: 0, y: 0 }, relativeUp: 0, relativeDown: 0, capabilityLimited: false,
+    movingObserved: false, brakeAvailable: 0, brakingInfeasible: false, reserveLimited: false,
     drone: { x: -P.startD, y: 0, z: 0 }, vel: { x: 0, y: 0 }, cmd: { x: 0, y: 0 }, acc: { x: 0, y: 0 }, guide: { x: -P.startD, y: 0 },
     target: { x: 0, y: 0, z: P.alt }, tv: { x: 0, y: 0 }, vzT: P.vzT, vz: 0, vzCmd: 0,
     dz: P.alt, dzAbs: Math.abs(P.alt), minDzAbs: null, dzAtMinD: 0,
@@ -590,6 +687,7 @@ function makeSim(variant) {
     step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
     est: {
       kfX: new AxisKF(), kfY: new AxisKF(), lastMeasT: -1,
+      accSample: null, targetAcc: { x: 0, y: 0 },
       meas: [], measT: [], msgVel: null, trail: [], pred: null, predHist: [],
       ahead: 0, aimAdvance: 0, errMeas: [], errEst: [], errPred: [],
     },
@@ -606,9 +704,9 @@ let THEORY = null;
 function theory(d0) {
   const vtAbs = P.vt;
   const vEnd = P.end === 'match' ? vtAbs : 0;
-  const offset = ARRIVAL_RADIUS_M;   // 与两种末端的停车点同口径（2026-11-10）
-  const D = Math.max(0, d0 - offset);
-  const aa = P.accel, ad = P.decel / BRAKE_SAFETY, v0 = 0;
+  const D = Math.max(0, d0 - TRACK_RADIUS_M);
+  const limits = motionLimits();
+  const aa = limits.up, ad = limits.down / BRAKE_SAFETY, v0 = 0;
   // 减速项用 ad = a_d/BRAKE_SAFETY，与制动曲线律/包络律里的"可用减速度"同口径；
   // 否则闭式解会高估峰值（2026-11-09 修正）。
   // 上限滑块为 0 时按规划速度 6 m/s，与速度律一致（原来这里按无限速，同屏两个口径）。
@@ -623,20 +721,20 @@ function theory(d0) {
   const uCap = isFinite(plateau) ? Math.max(0, plateau - vEnd) : Infinity;
   const u_p = Math.min(uCap, uGeo);
   const sAraw = (u_p * u_p - u0 * u0) / (2 * aa);
-  const sA = Math.max(0, sAraw);
+  const sA = sAraw; // 初始 u0<0 时位移为负，必须保留目标在加速期拉开的距离
   const sD = Math.max(0, u_p * u_p / (2 * ad));
   const cruiseD = Math.max(0, D - sA - sD);
-  const tCruise = u_p > 1e-6 ? cruiseD / u_p : 0;
+  const tCruise = u_p > 1e-6 ? cruiseD / u_p : Infinity;
   const tTotal = Math.max(0, u_p - u0) / aa + u_p / ad + tCruise;
-  // sAraw<0 时初始相对状态已经越过标准三段剖面的适用域，不能把闭式解当成精确值。
-  return { vp: vEnd + u_p, u_p, tTotal, tCruise, plateau, valid: sAraw >= -1e-9 };
+  // 初始相对速度为负时加速段可以有负位移，仍是合法剖面。
+  return { vp: vEnd + u_p, u_p, tTotal, tCruise, plateau, valid: u_p > 1e-9 };
 }
 
 function theoryApplicable() {
   if (!THEORY || !THEORY.valid) return false;
   const h = ((P.heading % 360) + 360) % 360;
   const oneDimensional = P.vt <= 1e-9 || Math.abs(h - 90) < 1e-6;
-  const slewCompatible = P.slew === 0 || P.slew >= Math.max(P.accel, P.decel);
+  // 理想基准也使用已收紧的有效规划加减速。
   // 闭式解只依赖几何与两个加速度，与用哪条速度律实现无关（2026-11-09 修正：
   // 原来要求 law==='env'，默认的制动曲线律永远显示"—"）。但必须无 jerk、
   // 无额外提前、目标速度已知且估计无误差：真值源，或"速度位 + σ=σ_v=0"——
@@ -646,29 +744,25 @@ function theoryApplicable() {
   // 闭式解的末端条件是"相对速度 0"：只有速度匹配（v_end=v_t）或静止目标（v_t=0）
   // 才成立。end=stop + 动目标时末端相对速度是 −v_t，三角形剖面不适用（2026-11-10）。
   const terminalConsistent = P.end === 'match' || P.vt <= 1e-9;
-  // 剖面必须可实现：规划加速度不能超过物理硬上限，否则闭式解只是纸面值（§5.12）。
-  const physRealizable = P.aPhys + 1e-9 >= Math.max(P.accel, P.decel / BRAKE_SAFETY);
+  // 有效规划值已按物理能力收紧，理论与实际使用同一加减速预算。
   // 闭式解只算水平剖面；有高度差/垂直速度时到点时间还取决于垂直通道（§5.13）。
   const noVertical = P.alt === 0 && P.vzT === 0;
   // 闭式解是"加速—巡航—制动"的理想剖面，只有实现该剖面的速度律能用它对照。
   // 比例接近是 u=k(d−R) 连续收速、且保留 t_go 提前量，不适用（2026-11-10 修）。
   const lawMatchesProfile = P.law === 'brake' || P.law === 'env';
   return lawMatchesProfile && P.profile === 'trap' && exactSource && P.turn === 'straight' &&
-    P.lead === 0 && P.jerk === 0 && oneDimensional && slewCompatible &&
-    terminalConsistent && physRealizable && noVertical;
+    P.lead === 0 && P.jerk === 0 && oneDimensional &&
+    terminalConsistent && noVertical && !(P.adaptive === 'on' && P.targetBrake > 0 && P.vt > 0);
 }
 
 // 闭式解不可用时，给出具体原因（判词里直接显示，避免笼统的"场景不支持"）。
 function theoryBlockReason() {
   if (!THEORY || !THEORY.valid) {
-    return '初始相对状态已越过三段剖面适用域（距离太短或初速过大）';
+    return '平台速度不足，没有正的稳态接近预算';
   }
   if (P.jerk > 0) return `jerk J=${P.jerk.toFixed(1)}（闭式解假设加速度瞬时反向）`;
   if (P.law !== 'brake' && P.law !== 'env') {
     return '比例接近律不是时间最优剖面，闭式解不适用';
-  }
-  if (P.aPhys + 1e-9 < Math.max(P.accel, P.decel / BRAKE_SAFETY)) {
-    return `规划加速度超过物理上限 a_phys=${P.aPhys.toFixed(1)}（剖面不可实现）`;
   }
   if (P.alt !== 0 || P.vzT !== 0) return '垂直通道未建模（闭式解只算水平剖面）';
   if (P.src !== 'truth' && !(P.src === 'vmsg' && P.noise === 0 && P.vsig === 0)) {
@@ -677,7 +771,8 @@ function theoryBlockReason() {
   if (P.end === 'stop' && P.vt > 1e-9) {
     return 'end=stop 且目标在动：末端相对速度不是 0（机速减到 0 时目标仍在离开）';
   }
-  if (P.turn !== 'straight') return '目标在机动（绕圈/蛇形）';
+  if (P.turn !== 'straight') return '目标速度或方向随时间变化';
+  if (P.adaptive === 'on' && P.targetBrake > 0 && P.vt > 0) return '已启用目标急停预留，接近预算小于匀速理想解';
   if (P.lead !== 0) return `有额外拦截提前 ${P.lead.toFixed(0)} ms`;
   if (P.slew > 0 && P.slew < Math.max(P.accel, P.decel)) {
     return `参考限速 ${P.slew.toFixed(1)} 小于加速度`;
@@ -685,10 +780,12 @@ function theoryBlockReason() {
   return '不是一维直线后退（目标横穿）';
 }
 
+let simAccumulator = 0;
 function resetSims() {
   A = makeSim('design');
   B = makeSim('baseline');
   THEORY = theory(P.startD);
+  simAccumulator = 0;
   const h = P.heading * Math.PI / 180;
   for (const s of [A, B]) {
     s.tv = { x: P.vt * Math.sin(h), y: P.vt * Math.cos(h) };
@@ -702,14 +799,13 @@ function resetSims() {
 //   v_cruise = max(地板?, |v_t| + 余量)                     ← 决定"能不能追上"
 //   d_brake  = R_arr + (v_cruise² − v_end²)/(2·(a_plan↓/1.3))   ← 决定"何时开始减速"
 function stepSim(s, dt) {
-  if (s.arrived) return;
+  if (s.arrived && P.continuous !== 'on') return;
 
-  // 本步目标、量测和无人机都使用同一个“当前时刻”，避免真值推进后仍打上旧时间戳。
-  s.t += dt;
+  // 在 t 时刻估计/控制，再把目标与飞机一起推进到 t+dt。
   // ---- 目标运动模型 ----
   // 统一用 s.tHeading（航向，°）与瞬时速率 tSpeed 生成速度矢量；除"直线"外都带
   // 有界加速度：加速脱离 ±1.5 m/s²、螺旋向心 a=v²/r、随机机动 ±1.2 m/s² 横向。
-  // 注意：制导律的刹车包络仍假设目标匀速，这些模式是用来暴露"假设不成立"的应力工况。
+  // 动态预算只外推已观测机动，不预知目标未来；突变/链路延迟仍可能突破包络。
   let tSpeed = P.vt;
   if (P.turn === 'circle') {
     s.tHeading += (P.vt / 20) * (180 / Math.PI) * dt;
@@ -723,6 +819,14 @@ function stepSim(s, dt) {
     const goal = (s.t % 12) < 6 ? 1.5 * P.vt : 0.5 * P.vt;
     s.tSpeed += Math.max(-1.5 * dt, Math.min(1.5 * dt, goal - s.tSpeed));
     s.tSpeed = Math.max(0, s.tSpeed);
+    tSpeed = s.tSpeed;
+  } else if (P.turn === 'burst' || P.turn === 'restart' || P.turn === 'brake') {
+    // 固定时间脚本保证 A/B 目标轨迹相同，不按某架飞机的位置触发。
+    const trigger = P.turn === 'restart' ? 14 : 7;
+    if (s.t >= trigger && s.maneuverAt === null) s.maneuverAt = s.t;
+    const goal = s.t < trigger ? P.vt : P.turn === 'brake' ? 0 : P.vt + 4;
+    const rate = P.turn === 'brake' ? 2.5 : 2;
+    s.tSpeed += Math.max(-rate * dt, Math.min(rate * dt, goal - s.tSpeed));
     tSpeed = s.tSpeed;
   } else if (P.turn === 'jink') {
     // 随机机动：横向加速度 = 三个正弦叠加并夹到 ±1.2 m/s²；航向按 a_lat/v 积分。
@@ -743,9 +847,7 @@ function stepSim(s, dt) {
     if (aT > s.tgtAccelPeak) s.tgtAccelPeak = aT;
   }
   s.prevTv = { x: s.tv.x, y: s.tv.y };
-  s.target.x += s.tv.x * dt;
-  s.target.y += s.tv.y * dt;
-  s.target.z += s.vzT * dt;   // 垂直通道：匀速爬升/下降（2026-11-10）
+
 
   // ===== 目标估计（带时延的量测 → 卡尔曼 → 前视到"现在"）=====
   // 真实链路：65010 目标以 5 Hz 送来，收到时已经是 latency 毫秒之前的真值。
@@ -869,6 +971,21 @@ function stepSim(s, dt) {
     s.tgtVel = { x: gvx, y: gvy };
   }
 
+  const sampleT = P.src === 'truth' ? s.t : est.filterT;
+  if (sampleT !== null) updateTargetAcceleration(s, s.tgtVel, sampleT);
+  // 消息之间保持估计，不将同一条速度位每20 ms重复差分。
+  const age = Math.max(0, s.t - (sampleT ?? s.t));
+  const fresh = age <= 0.6 ? 1 : Math.exp(-(age - 0.6) / 0.3);
+  s.tgtAcc = { x: est.targetAcc.x * fresh, y: est.targetAcc.y * fresh };
+  if (P.adaptive === 'on' && P.src === 'vmsg') {
+    const h = Math.min(age, 0.6), ga = s.tgtAcc;
+    s.tgtVel = { x: s.tgtVel.x + ga.x * h, y: s.tgtVel.y + ga.y * h };
+    s.seen = { x: s.seen.x + 0.5 * ga.x * h * h, y: s.seen.y + 0.5 * ga.y * h * h };
+    est.pred = { ...s.seen };
+    if (est.errPred.length) est.errPred[est.errPred.length - 1] =
+      Math.hypot(s.seen.x - s.target.x, s.seen.y - s.target.y);
+  }
+
   // 控制器只能使用估计/预测位置；dTruth 仅用于仿真评价和捕获成功判定。
   const dxObs = s.seen.x - s.drone.x, dyObs = s.seen.y - s.drone.y;
   const dObs = Math.hypot(dxObs, dyObs);
@@ -880,8 +997,8 @@ function stepSim(s, dt) {
   const uxRaw = dObs > 1e-6 ? dxObs / dObs : 1, uyRaw = dObs > 1e-6 ? dyObs / dObs : 0;
   // 制导侧只使用所选来源提供的目标速度，不读取真值速度。
   const gv = s.tgtVel || { x: 0, y: 0 };
-  const vtCross = Math.abs(gv.x * uyRaw - gv.y * uxRaw);
-  s.vtCross = vtCross;
+  const vtCrossRaw = Math.abs(gv.x * uyRaw - gv.y * uxRaw);
+  s.vtCross = vtCrossRaw;
   const vtAbs0 = Math.hypot(gv.x, gv.y);
   // ---- 拦截提前量：碰撞三角形 ----
   // (Vp²−Vt²)t² − 2(r·v_t)t − |r|² = 0。求解后取最小正根；
@@ -915,8 +1032,8 @@ function stepSim(s, dt) {
     // 速度匹配（end=match）+ 制动曲线律：不需要拦截前置。目标位置已按链路时延预测到
     // "现在"（seen），再叠加 t_go 提前会把瞄准点推到目标前面（默认最多 5 m），而刹车
     // 包络按真实距离算，末端就会多冲出一段（2026-11-09 修正）。
-    // 比例接近/梯形包络仍保留碰撞三角形的有限提前：它们是"追点"律，提前量是设计的一部分。
-    const leadWant = (P.law === 'brake' && P.end === 'match')
+    // 速度匹配的各速度律统一只补链路时延；停车模式保留有限拦截提前。
+    const leadWant = (P.end === 'match')
       ? 0
       : Math.min(vtAbs0 * t, 0.5 * dObs, vPlan * T_LEAD_MAX);
     tGo = vtAbs0 > 1e-6 ? leadWant / vtAbs0 : 0;
@@ -932,19 +1049,59 @@ function stepSim(s, dt) {
   // 方向必须按瞄准点距离归一，用显示距离 d 归一会把速度矢量缩水（首版就踩了这个坑）
   const ux = dAim > 1e-6 ? dx / dAim : 1, uy = dAim > 1e-6 ? dy / dAim : 0;
   const vtAlong = gv.x * ux + gv.y * uy;
+  const vtCross = Math.abs(-uy * gv.x + ux * gv.y);
+  s.vtCross = vtCross;
   s.vtAlong = vtAlong;
   const vdAlong = s.vel.x * ux + s.vel.y * uy;
   s.vc = vdAlong - vtAlong;
 
   const vtAbs = Math.hypot(gv.x, gv.y);
-  const offset = ARRIVAL_RADIUS_M;   // 两种末端的停车点都取到点半径（2026-11-10）
+  const offset = TRACK_RADIUS_M;
+  const limits = motionLimits();
+  const dynamic = P.adaptive === 'on' && P.end === 'match';
+  const ga = dynamic ? s.tgtAcc : { x: 0, y: 0 };
+  const targetAlong = ga.x * uxRaw + ga.y * uyRaw;
+  const targetSide = -uyRaw * ga.x + uxRaw * ga.y;
+  const crossRelative = -(s.vel.x - gv.x) * uyRaw + (s.vel.y - gv.y) * uxRaw;
+  const losRate = -crossRelative / Math.max(0.1, dObs);
+  const closingNow = (s.vel.x - gv.x) * uxRaw + (s.vel.y - gv.y) * uyRaw;
+  const sideNeed = dynamic ? targetSide + closingNow * losRate : 0;
+  const budget = relativeBudget(limits.up, limits.down, targetAlong, sideNeed);
+  if (vtAbs > 0.05) s.movingObserved = true;
+  const reserve = dynamic && s.movingObserved ? P.targetBrake : 0;
+  if (reserve > 0) {
+    const guarded = relativeBudget(limits.up, limits.down, Math.min(targetAlong, -reserve), sideNeed);
+    budget.down = Math.min(budget.down, guarded.down);
+  }
+  s.relativeUp = budget.up; s.relativeDown = budget.down;
+  s.capabilityLimited = dynamic && (!budget.feasible || budget.down <= 1e-6 || budget.up <= 1e-6);
+  // 不透支目标继续向外加速带来的收益：它可能下一拍停止加速。
+  const decelEff = Math.min(limits.down, budget.down) / BRAKE_SAFETY;
+  s.brakeAvailable = decelEff;
+  // 曲率项有助降低接近速度；制动能力不额外计这份收益，避免乐观外推。
+  const radialAcc = s.acc.x * uxRaw + s.acc.y * uyRaw - targetAlong -
+    (dynamic ? crossRelative * crossRelative / Math.max(0.1, dObs) : 0);
+
+  const reactionT = reserve > 0
+    ? dt + (P.src === 'truth' ? 0 : lat + 1 / Math.max(0.5, P.measHz)) : dt;
+  const worstTargetBrake = Math.max(reserve, -targetAlong);
+  const guardAcceleration = s.acc.x * uxRaw + s.acc.y * uyRaw + worstTargetBrake;
+  const reactionAccel = reserve > 0
+    ? Math.max(0, s.acc.x * uxRaw + s.acc.y * uyRaw) + worstTargetBrake : 0;
+  const closeBound = (distance, cap) => {
+    const nominal = brakingSpeed(distance, radialAcc, decelEff, P.jerk, cap, dt);
+    // 2.9 m 为控制间距，0.5 m 为预留模型的最小几何余量，二者不混为到点判据。
+    const guarded = reserve > 0 ? guardedBrakingSpeed(distance + offset - 0.5,
+      guardAcceleration, decelEff, P.jerk, cap, reactionT, reactionAccel) : cap;
+    return Math.min(nominal, guarded);
+  };
 
   // 包络越界（2026-11-10）：实际接近速度超过"可行域边界"多少。只在还没进到点球
   // 时统计——进了球以后 dObs−R<0，边界退化为 0，读数会变成速度本身，没有意义。
-  // 这是给机动目标用的：刹车包络假设目标匀速，绕圈/蛇形会瞬时突破。
+  // 动态时使用当前相对加速度的局部模型；突发机动、观测滞后仍会导致瞬时越界。
   {
-    const aEffEnv = P.decel / BRAKE_SAFETY;
-    const envBound = Math.sqrt(2 * aEffEnv * Math.max(0, dObs - offset));
+    const envBound = closeBound(Math.max(0, dObs - offset),
+      (P.vcap > 0 ? P.vcap : V_PLAN_MPS) + vtAbs + 1);
     const envExcess = s.vc - envBound;
     if (dObs > offset + 0.05 && envExcess > (s.envPeak || 0)) {
       s.envPeak = envExcess;
@@ -970,12 +1127,17 @@ function stepSim(s, dt) {
   // 刹车包络：只在目标「沿视线后退」时才需要额外补偿速度。
   // 用 |v_t| 整体补偿是错的——目标横向跑（绕圈/蛇形）时 vtAlong≈0，多补的那部分
   // 会让参考速度虚高、飞机冲过头再兜圈子（实测 d 在 4~66 m 之间来回摆）。
-  // 距离用「到目标的真实距离 dObs」，不是瞄准点 dAim：dAim 比目标多 v_t·t_go，
+  // 距离用「到目标的控制可见估计距离 dObs」，不是瞄准点 dAim：dAim 比目标多 v_t·t_go，
   // 拿它算会把可用刹车距离虚高一段（2026-11-09 修正）。
   // a_d 除以 BRAKE_SAFETY 与 d_brake 读数同口径：临界曲线离散化后必然越界，要留余量。
-  const uEnv = Math.sqrt(Math.max(0, 2 * (P.decel / BRAKE_SAFETY) * Math.max(0, dObs - offset)));
-  const envelope = (P.end === 'match' ? Math.max(0, vtAlong) : 0) + uEnv;
-  // 转弯约束（2026-11-10 改）：只约束"额外接近速度"，不缩放目标速度前馈。
+  const brakeBound = closeBound(Math.max(0, dObs - offset), capEnv + vtAbs + 1);
+  s.reserveLimited = reserve > 0 && brakeBound < 0.01 && dObs > ARRIVAL_RADIUS_M;
+  s.brakingInfeasible = dynamic && closingNow > 0 && dObs > offset &&
+    stoppingDistance(closingNow, radialAcc, budget.down, P.jerk) > dObs - offset + 0.1;
+  const uEnv = Math.min(brakeBound, TERMINAL_GAIN * Math.max(0, dObs - offset));
+  const envelope = (P.end === 'match' ? vtAlong : 0) + uEnv;
+  // 转弯约束只削额外接近，不缩放目标速度前馈。动态分支预留目标侧向加速度，
+  // 按剩余侧向能力约束 u*lambda_dot；以下旧近似仅供“匀速假设”对照。
   // 依据：跟住视线需要的向心加速度 a = |v|·λ̇，而 λ̇ 由"相对横向速度"决定
   //   λ̇ ≈ |(v − v_t)·n⊥| / d
   // 机速 |v| ≈ |v_t| + u_extra，于是 u_extra ≤ a/λ̇ − |v_t|。
@@ -984,7 +1146,9 @@ function stepSim(s, dt) {
   // 新写法在机速已经跟上目标时 λ̇→0，约束自然释放；它只压"还差多少没追上"。
   const relCross = (s.vel.x - gv.x) * (-uy) + (s.vel.y - gv.y) * ux;
   const omegaLos = Math.abs(relCross) / Math.max(1e-6, dObs);
-  const uTurn = omegaLos > 1e-4 ? Math.max(0, P.aPhys / omegaLos - vtAbs) : Infinity;
+  const sideRoom = Math.max(0, 0.8 * Math.min(limits.up, limits.down) - Math.abs(targetSide));
+  const uTurn = omegaLos > 1e-4
+    ? (dynamic ? sideRoom / omegaLos : Math.max(0, Math.min(P.accel, P.decel, P.aPhys) / omegaLos - vtAbs)) : Infinity;
   if (isFinite(uTurn) && uTurn < (s.turnCapMin ?? Infinity)) s.turnCapMin = uTurn;
 
 
@@ -1004,12 +1168,9 @@ function stepSim(s, dt) {
     // （safe 余量 0 时设计组与对照组结果完全相同，2026-11-10 修）。
     const vCapTotal = isFinite(plateau) ? plateau
       : (P.vcap > 0 ? P.vcap : V_PLAN_MPS);
-    const uBudget = P.end === 'match'
-      ? Math.max(0, Math.sqrt(Math.max(0, vCapTotal * vCapTotal - vtCross * vtCross)) -
-        Math.max(0, vtAlong))
-      : vCapTotal;
+    const uBudget = velocityBudget(vCapTotal, vtAlong, vtCross, useTargetFf);
     const uWant = Math.min(uBudget, Math.max(0, P.k * Math.max(0, dAim - offset)));
-    const u = Math.min(uWant, uTurn);
+    const u = Math.min(uWant, uTurn, reserve > 0 ? uEnv : Infinity);
     if (uTurn < uWant - 1e-9) s.turnBind = true;
     desiredX = ffX + u * ux;
     desiredY = ffY + u * uy;
@@ -1020,14 +1181,10 @@ function stepSim(s, dt) {
     // 余量在默认律下是个摆设）。end=stop 没有前馈，接近速度就是机体速度，直接用 V。
     const vCapTotal = isFinite(plateau) ? plateau
       : (P.vcap > 0 ? P.vcap : V_PLAN_MPS);
-    const vCatch = P.end === 'match'
-      ? Math.max(0, Math.sqrt(Math.max(0, vCapTotal * vCapTotal - vtCross * vtCross)) -
-        Math.max(0, vtAlong))
-      : vCapTotal;
-    const uEnd = 0;
-    // 距离用真实距离 dObs（不用瞄准点 dAim），并按 BRAKE_SAFETY 留余量：
+    const vCatch = velocityBudget(vCapTotal, vtAlong, vtCross, useTargetFf);
+        // 距离用估计当前距离 dObs（不用瞄准点 dAim），并按 BRAKE_SAFETY 留余量：
     // 临界曲线 u=√(2a_d(d−R)) 在离散 20 ms + 指令限幅下一定越界，越界后追不回来。
-    const vAllow = Math.sqrt(uEnd * uEnd + 2 * (P.decel / BRAKE_SAFETY) * Math.max(0, dObs - offset));
+    const vAllow = uEnv;
     const vCloseWant = Math.min(vCatch, vAllow);
     const vClose = Math.min(vCloseWant, uTurn);   // 转弯约束只削"额外接近"，保留 ff
     if (uTurn < vCloseWant - 1e-9) s.turnBind = true;
@@ -1036,32 +1193,28 @@ function stepSim(s, dt) {
   } else {
     // 梯形包络/位置阶跃仍用标量纵向剖面，再与横向目标速度合成二维指令。
     // 转弯约束在这里作用在"总沿视线速度"上：radial − v_t∥ 才是额外接近量。
-    const vTopNoTurn = Math.min(plateau, envelope);
-    const vTop = Math.min(vTopNoTurn, Math.max(0, vtAlong) + uTurn);
+    const radialCap = useTargetFf
+      ? Math.sqrt(Math.max(0, plateau * plateau - vtCross * vtCross)) : plateau;
+    const vTopNoTurn = Math.min(radialCap, envelope);
+    const vTop = Math.min(vTopNoTurn, (useTargetFf ? vtAlong : 0) + uTurn);
     if (vTop < vTopNoTurn - 1e-9) s.turnBind = true;
-    let radial = 0;
-    if (vTop > 1e-3) {
-      if (P.profile === 'step') {
-        radial = vTop;
-      } else if (vTop < s.vref - 1e-6) {
-        radial = vTop;
-      } else {
-        radial = Math.min(vTop, s.vref + P.accel * dt);
-      }
-    }
+    // 径向分量允许为负（迎面目标）；不能用二维速度模长充当上一拍径向速度。
+    const previousRadial = s.cmd.x * ux + s.cmd.y * uy;
+    const radial = P.profile === 'step' ? vTop : Math.max(
+      previousRadial - limits.down * dt,
+      Math.min(vTop, previousRadial + limits.up * dt));
     const lateral = useTargetFf ? vtLateral : 0;
     desiredX = ux * radial - uy * lateral;
     desiredY = uy * radial + ux * lateral;
   }
 
-  const nearEnd = dObs <= offset + 0.02;
-  if (nearEnd && P.end === 'match') {
-    // 速度匹配必须匹配完整目标速度矢量，而不是 |v_t|·n。
-    desiredX = gv.x; desiredY = gv.y;
+  // 平方根制动律在末端离散抖动；用小范围有符号比例误差平稳匹配并恢复间距。
+  if (dObs < offset) {
+    const close = -Math.min(TERMINAL_GAIN * (offset - dObs),
+      brakingSpeed(offset - dObs, -radialAcc, budget.up / BRAKE_SAFETY, P.jerk, capEnv, dt));
+    desiredX = ffX + close * uxRaw;
+    desiredY = ffY + close * uyRaw;
     phase = 'match';
-  } else if (nearEnd && P.end === 'stop') {
-    desiredX = 0; desiredY = 0;
-    phase = 'decel';
   }
 
   // 所有动态上限都在变化率限制之前执行，避免最终硬夹紧绕过平滑。
@@ -1075,51 +1228,18 @@ function stepSim(s, dt) {
     desiredY *= commandCap / desiredMag;
   }
   const cmdPrevX = s.cmd.x, cmdPrevY = s.cmd.y;   // 本拍指令起点（差分算指令加速度）
-  if (P.jerk > 0) {
-    // 二阶平滑：先算"一拍内追上期望速度"所需的加速度，夹到指令加速度上限，
-    // 再让加速度本身按 J 爬坡，最后积分成速度指令。
-    // 关键区别：爬坡要时间，短距离/低速时加速度还没爬到上限就得反向收，
-    // 于是同一套参数下加速度随距离和速度自然变化——不必为每个距离写一条加速度。
-    let aWantX = (desiredX - s.cmd.x) / dt, aWantY = (desiredY - s.cmd.y) / dt;
-    const aWantMag = Math.hypot(aWantX, aWantY);
-    const aCap = P.slew > 0 ? P.slew : Infinity;
-    if (aWantMag > aCap && aWantMag > 1e-9) {
-      aWantX *= aCap / aWantMag; aWantY *= aCap / aWantMag;
-    }
-    const daX = aWantX - s.acc.x, daY = aWantY - s.acc.y;
-    const daMag = Math.hypot(daX, daY), daMax = P.jerk * dt;
-    if (daMag > daMax && daMag > 1e-9) {
-      s.acc.x += daX * daMax / daMag; s.acc.y += daY * daMax / daMag;
-    } else {
-      s.acc.x = aWantX; s.acc.y = aWantY;
-    }
-    s.cmd.x += s.acc.x * dt; s.cmd.y += s.acc.y * dt;
-    const cmdMag0 = Math.hypot(s.cmd.x, s.cmd.y);
-    if (cmdMag0 > commandCap && cmdMag0 > 1e-9) {
-      s.cmd.x *= commandCap / cmdMag0; s.cmd.y *= commandCap / cmdMag0;
-    }
-  } else if (P.slew > 0) {
-    const dxCmd = desiredX - s.cmd.x, dyCmd = desiredY - s.cmd.y;
-    const dvCmd = Math.hypot(dxCmd, dyCmd), dvMax = P.slew * dt;
-    if (dvCmd > dvMax && dvCmd > 1e-9) {
-      s.cmd.x += dxCmd * dvMax / dvCmd;
-      s.cmd.y += dyCmd * dvMax / dvCmd;
-    } else {
-      s.cmd.x = desiredX; s.cmd.y = desiredY;
-    }
-  } else {
-    s.cmd.x = desiredX; s.cmd.y = desiredY;
-  }
+  smoothCommand(s, desiredX, desiredY, dt, commandCap, uxRaw, uyRaw);
   // 指令加速度用 cmd 的差分：一阶 slew 与二阶 jerk 两个分支都成立。
   // 原来读 s.acc，而 J=0 时它从不更新，曲线恒为 0（2026-11-09 修正）。
   const aCmdVecX = (s.cmd.x - cmdPrevX) / dt;
   const aCmdVecY = (s.cmd.y - cmdPrevY) / dt;
   s.aCmd = Math.hypot(aCmdVecX, aCmdVecY);
+  if (!(P.jerk > 0)) { s.acc.x = aCmdVecX; s.acc.y = aCmdVecY; }
 
   const cmdX = s.cmd.x, cmdY = s.cmd.y;
   const cmdSpeed = Math.hypot(cmdX, cmdY);
   const actualSpeed = Math.hypot(s.vel.x, s.vel.y);
-  const vref = Math.max(0, cmdX * ux + cmdY * uy); // 图表仍显示沿瞄准线的参考速率
+  const vref = cmdSpeed; // 与实际速度曲线同为二维模长
   if (phase !== 'match') {
     phase = cmdSpeed > actualSpeed + 0.05 ? 'accel'
       : (cmdSpeed < actualSpeed - 0.05 ? 'decel' : 'cruise');
@@ -1130,14 +1250,15 @@ function stepSim(s, dt) {
   s.vmax = isFinite(plateau) ? plateau : 0;
   s.plateau = plateau;
   const uNow = Math.max(0, (s.vel.x - ffX) * ux + (s.vel.y - ffY) * uy);
-  // 刹车点读数与律同口径：u²/(2·(a_d/1.3))，不再额外加 0.5 m 垫片
-  // （原来环比律晚 0.5 m，看起来像"还没到刹车点就减速了"）。
-  s.dbrk = Math.max(0, offset + uNow * uNow / (2 * (P.decel / BRAKE_SAFETY)));
+  // 制动距离读数与限速模型同口径；预留时另外计算含链路反应距离的下界。
+  s.dbrk = Math.max(0, offset + uNow * dt + stoppingDistance(uNow, radialAcc, decelEff, P.jerk));
+  if (reserve > 0) s.dbrk = Math.max(s.dbrk, 0.5 + uNow * reactionT +
+    0.5 * reactionAccel * reactionT * reactionT + stoppingDistance(uNow + reactionAccel * reactionT,
+      guardAcceleration, decelEff, P.jerk));
   let ax = (cmdX - s.vel.x) / dt, ay = (cmdY - s.vel.y) / dt;
   const aMag = Math.hypot(ax, ay);
   // plant 只受物理硬上限约束（2026-11-10 拆分）：规划值只影响指令，不再夹 plant。
-  // a_plan > a_phys 时能看到"规划超出能力"的饱和；a_phys > a_plan 时能看到
-  // "能力够但规划没把能力用满"（只调大 a_phys 不会让剖面变快）。
+  // 规划已先按物理能力收紧；plant 保留独立硬限，避免未来修改绕过保护。
   const aLimit = P.aPhys;
   if (aMag > aLimit) { ax *= aLimit / aMag; ay *= aLimit / aMag; }
   s.a = Math.hypot(ax, ay);   // 本拍实际施加的加速度（指令经 aLimit 夹过）
@@ -1187,11 +1308,17 @@ function stepSim(s, dt) {
   // 之前写成 `guide += u · v_ref · dt` 会以 8~15 m/s 无限往前跑——目标一绕圈，
   // 参考点就被甩到 200 m 外（截图里的「参考领先 73.1 m」就是这么来的）。
   const leadWant = Math.min(LEAD_MAX_M, cmdSpeed * LEAD_TAU);
-  const gx = s.drone.x + ux * leadWant, gy = s.drone.y + uy * leadWant;
+  const gx = s.drone.x + (cmdSpeed > 1e-9 ? cmdX / cmdSpeed : ux) * leadWant,
+    gy = s.drone.y + (cmdSpeed > 1e-9 ? cmdY / cmdSpeed : uy) * leadWant;
   const k = 1 - Math.exp(-dt / LEAD_TAU);
   s.guide.x += (gx - s.guide.x) * k;
   s.guide.y += (gy - s.guide.y) * k;
   s.lag = Math.hypot(s.guide.x - s.drone.x, s.guide.y - s.drone.y);
+
+  s.target.x += s.tv.x * dt;
+  s.target.y += s.tv.y * dt;
+  s.target.z += s.vzT * dt;
+  s.t += dt;
 
   // 仿真捕获评价使用更新后的真实目标距离；相对速度判据仅在这里读取真值速度。
   // 控制器本身仍只使用估计量，不把真值泄漏进制导环。
@@ -1253,12 +1380,17 @@ function stepSim(s, dt) {
   }
   // stop 模式停在球面附近（a_d/1.3 的余量让它停在 3 m 略外侧），容差给 0.3 m；
   // match 模式在球面内侧收速，实测 3.00~3.02 m，仍按 0.02 m 严判。
-  const arriveSlack = P.end === 'match' ? 0.02 : 0.3;
+  const arriveSlack = 1e-6; // 同一到点定义，不能因末端模式改变半径
   // 到点 = 水平进圈 + 垂直进带（handover 是水平 3 m / 垂直 2 m 分开判的）+ 速度判据，
   // 且三条要连续保持 handover.arrival_hold_ms=2000（2026-11-10 补；原来"首次满足"就置位，
   // 会把到点用时低估 2 s）。中途任一条件失效即重新计时。
   const arriveOk = arriveDistance <= ARRIVAL_RADIUS_M + arriveSlack &&
     dzAbs <= ARRIVAL_VERTICAL_M && arrivalSpeedError <= ARRIVAL_SPEED_MPS;
+  s.trackingNow = arriveOk;
+  if (s.arrived && !arriveOk) {
+    s.arrived = false; s.lostCount++;
+    s.arriveHoldT = null; s.arriveHold = 0;
+  }
   if (!s.arrived) {
     if (arriveOk) {
       if (s.arriveHoldT === null) { s.arriveHoldT = s.t; s.arriveFirstT = s.t; }
@@ -1268,6 +1400,8 @@ function stepSim(s, dt) {
       s.phase = P.end === 'match' ? 'match' : 'idle';
       if (s.arriveHold >= ARRIVAL_HOLD_S - 1e-9) {
         s.arrived = true; s.arrivedAt = s.t;
+        if (s.everArrivedAt === null) s.everArrivedAt = s.t;
+        else s.reacquiredCount++;
       }
     } else {
       s.arriveHoldT = null;
@@ -1479,6 +1613,17 @@ function axes(ctx, w, h, tStart, tEnd, yMax, yStep, yLabel, xStep, yMin = 0) {
     Y: v => padT + ih * (1 - (v - yMin) / ySpan) };
 }
 
+// 历史按时间有序：二分找可见窗口起点，避免每帧 filter 全量历史（长跑后 2 万+ 条，
+// 每帧三次 filter 是"卡卡的"的主要来源，2026-11-10）。
+function histStart(hist, tStart) {
+  let lo = 0, hi = hist.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (hist[mid].t < tStart) lo = mid + 1; else hi = mid;
+  }
+  return Math.max(0, lo - 1);
+}
+
 function drawDistanceChart() {
   const { ctx, w, h } = fitCanvas(chartDCv);
   ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
@@ -1563,24 +1708,28 @@ function drawSpeedChart() {
   const yMax = Math.max(2, Math.ceil((Math.max(A.vmax, A.vref, A.vpeak || 0, A.vactPeak || 0, 1) + 0.4) * 2) / 2);
   const g = axes(ctx, w, h, tStart, tEnd, yMax, yMax <= 2 ? 0.5 : 1, '速度 m/s', 5);
 
+  const i0 = histStart(A.hist, tStart - 1);
   let start = null, cur = null;
   const flush = endT => {
     if (cur == null || start == null) return;
     const x0 = Math.max(g.padL, g.X(start)), x1 = Math.min(g.padL + g.iw, g.X(endT));
     if (x1 > x0) { ctx.fillStyle = PHASE_COL[cur] || 'transparent'; ctx.fillRect(x0, g.padT, x1 - x0, g.ih); }
   };
-  A.hist.forEach(p => { if (p.phase !== cur) { flush(p.t); start = p.t; cur = p.phase; } });
+  for (let i = i0; i < A.hist.length; i++) {
+    const p = A.hist[i];
+    if (p.phase !== cur) { flush(p.t); start = p.t; cur = p.phase; }
+  }
   flush(A.t);
 
   const line = (key, color, dash, width) => {
-    const seg = A.hist.filter(p => p.t >= tStart - 1);
-    if (seg.length < 2) return;
+    if (A.hist.length - i0 < 2) return;
     ctx.save(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = width;
     ctx.beginPath();
-    seg.forEach((p, i) => {
+    for (let i = i0; i < A.hist.length; i++) {
+      const p = A.hist[i];
       const x = g.X(p.t), y = g.Y(Math.max(0, p[key]));
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
+      i === i0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
     ctx.stroke(); ctx.restore();
   };
   line('vref', '#909399', [5, 4], 1.6);
@@ -1605,10 +1754,12 @@ function drawAccelChart() {
   const view = P.accelView || 'tan';
   const keyAct = view === 'lat' ? 'aLat' : (view === 'mag' ? 'aMag' : 'aAct');
   const keyCmd = view === 'lat' ? 'aCmdLat' : (view === 'mag' ? 'aCmdMag' : 'aCmd');
+  const i0 = histStart(A.hist, tStart - 1);
   let yPeak = cap;
-  A.hist.forEach(p => {
+  for (let i = i0; i < A.hist.length; i++) {
+    const p = A.hist[i];
     yPeak = Math.max(yPeak, Math.abs(p[keyCmd] || 0), Math.abs(p[keyAct] || 0));
-  });
+  }
   const yMax = Math.max(1, Math.ceil((yPeak + 0.4) * 2) / 2);
   // 有符号加速度：上下对称，0 在中间（切向负=减速；横向负=右）
   const axisLabel = view === 'lat' ? '横向加速度 m/s²'
@@ -1625,14 +1776,14 @@ function drawAccelChart() {
   }
 
   const line = (key, color, dash, width) => {
-    const seg = A.hist.filter(p => p.t >= tStart - 1);
-    if (seg.length < 2) return;
+    if (A.hist.length - i0 < 2) return;
     ctx.save(); ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = width;
     ctx.beginPath();
-    seg.forEach((p, i) => {
+    for (let i = i0; i < A.hist.length; i++) {
+      const p = A.hist[i];
       const x = g.X(p.t), y = g.Y(p[key] || 0);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
+      i === i0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
     ctx.stroke(); ctx.restore();
   };
   line(keyCmd, '#b45309', [5, 4], 1.6);
@@ -1691,18 +1842,19 @@ function updateHud() {
         ? `斜距 ${A.slant.toFixed(2)} > ${RANGE_MAX_M.toFixed(2)} m（测距无效）`
         : (Math.abs(A.losElDeg) + FOV_MARGIN_DEG > FOV_HALF_EL_DEG
           ? `俯仰 ${A.losElDeg.toFixed(1)}° 超出 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`
-          : `创新 ${A.innov.toFixed(2)} > ${INNOVATION_GATE_M} m`))
+          : (A.lockFrames < LOCK_FRAMES ? `锁定帧数不足 ${A.lockFrames}/${LOCK_FRAMES}`
+            : `创新 ${A.innov.toFixed(2)} > ${INNOVATION_GATE_M} m`)))
       : `未检测：俯仰 ${A.losElDeg.toFixed(1)}° 出视场 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`;
   $('hud').innerHTML = `
     <div class="box blue"><div class="k">设计机 d</div><div class="v">${A.d.toFixed(1)}<small>m</small></div></div>
     <div class="box blue"><div class="k">接近 v_c</div><div class="v">${A.vc.toFixed(2)}<small>m/s</small></div></div>
     <div class="box"><div class="k">剖面相位</div><div class="v" style="font-size:13px">${PHASE_NAME[A.phase] || A.phase}</div></div>
     <div class="box orange"><div class="k">对照机 d</div><div class="v">${B.d.toFixed(1)}<small>m</small></div></div>
-    <div class="box" title="${hoDetail}"><div class="k">视觉交接</div>
+    <div class="box" title="${hoDetail}"><div class="k">几何交接示意</div>
       <div class="v" style="font-size:12px;color:${A.handover ? '#3d7a1f' : 'inherit'}">${hoShort}</div></div>`;
   $('badgeTime').textContent = 't = ' + A.t.toFixed(1) + ' s';
   const bp = $('badgePhase');
-  bp.textContent = A.handover ? '可交接（视觉已锁定）'
+  bp.textContent = A.handover ? '几何条件通过（示意）'
     : (A.arrived ? '到点告警（未交接）' : (PHASE_NAME[A.phase] || A.phase));
   bp.className = 'badge' + (A.handover ? ' on' : '');
 
@@ -1715,8 +1867,9 @@ function updateHud() {
   // 判"追不上"用稳态上限，不用当前峰值：起步时 vpeak≈0，拿它算会误报"追不上"。
   const verdictCap = isFinite(A.plateau) ? A.plateau
     : (P.vcap > 0 ? P.vcap : V_PLAN_MPS);
-  const closing = Math.sqrt(Math.max(0, verdictCap * verdictCap - vtCross * vtCross)) -
-    Math.max(0, vtAlong);
+  const closing = Math.abs(vtCross) > verdictCap
+    ? -Math.abs(vtCross) + verdictCap
+    : Math.sqrt(Math.max(0, verdictCap * verdictCap - vtCross * vtCross)) - vtAlong;
   const rate = closing;
   $('sD').innerHTML = A.d.toFixed(2) + '<small>m</small>';
   $('sVc').innerHTML = A.vc.toFixed(2) + '<small>m/s</small>';
@@ -1747,24 +1900,22 @@ function updateHud() {
   $('sLag').innerHTML = A.lag.toFixed(2) + '<small>m</small>';
   $('sTa').innerHTML = A.arrivedAt != null ? A.arrivedAt.toFixed(1) + '<small>s</small>' : '—';
 
-  // 最小距离 / 包络越界 / 目标机动（2026-11-10）：机动目标只报"到点"会掩盖穿球，
+  // 最小间距/匀速一维包络偏差；进入到点区域本身不是碰撞。
   // 而"进过球但没置位"最容易被误判成 bug，这里把三个诊断量摊开。
   const minD = A.minD == null ? A.d : A.minD;
-  const inSphere = minD <= ARRIVAL_RADIUS_M + 0.05;
   const penetrate = Math.max(0, ARRIVAL_RADIUS_M - minD);
   const envPeak = A.envPeak || 0;
   const tgtA = A.tgtAccelPeak || 0;
   const critName = P.criterion === 'rel' ? '相对速度' : '地速';
   const dzNow = A.dzAbs || 0;
   const speedNow = P.criterion === 'rel' ? (A.relSpeed3 || 0) : (A.groundSpeed || 0);
+  const unmet = [];
+  if (A.d > ARRIVAL_RADIUS_M + 1e-9) unmet.push(`当前水平距离 ${A.d.toFixed(2)} m > 3 m`);
+  if (dzNow > ARRIVAL_VERTICAL_M + 1e-9) unmet.push(`当前垂直 |dz|=${dzNow.toFixed(2)} m > 2 m`);
+  if (speedNow > ARRIVAL_SPEED_MPS + 1e-9) unmet.push(`当前${critName} ${speedNow.toFixed(2)} m/s > 0.5`);
   const arriveTxt = A.arrived
-    ? `（已到点，最近点进深 ${penetrate.toFixed(2)} m）`
-    : inSphere
-      ? (dzNow > ARRIVAL_VERTICAL_M + 1e-9
-        ? `（水平进圈 ${penetrate.toFixed(2)} m，但垂直 |dz|=${dzNow.toFixed(2)} m > 2 m，到点未置位）`
-        : `（进到球内 <b style="color:#c0392b">${penetrate.toFixed(2)} m</b>，但${critName} `
-          + `${speedNow.toFixed(2)} m/s > 0.5，到点未置位）`)
-      : '（未进到点球内）';
+    ? `（当前已到点，历史最近点进深 ${penetrate.toFixed(2)} m）`
+    : unmet.length ? `（未到点：${unmet.join('；')}）` : '（当前距离与速度满足，正在保持）';
   const holdTxt = (!A.arrived && A.arriveHoldT != null)
     ? `　到点条件保持 <b>${Math.min(ARRIVAL_HOLD_S, A.arriveHold || 0).toFixed(1)}</b>/${ARRIVAL_HOLD_S.toFixed(1)} s`
     : '';
@@ -1773,35 +1924,45 @@ function updateHud() {
     + (P.alt !== 0 || P.vzT !== 0
       ? `　垂直 dz=${(A.dz || 0).toFixed(2)} m，vz=${(A.vz || 0).toFixed(2)} m/s（容差 2 m）`
       : '')
-    + `　包络最大越界 <b>${envPeak.toFixed(2)} m/s</b>`
+    + `　机体有效加/减速 ${motionLimits().up.toFixed(2)}/${motionLimits().down.toFixed(2)} m/s²`
+    + `　相对加/减速预算 ${(A.relativeUp || 0).toFixed(2)}/${(A.relativeDown || 0).toFixed(2)} m/s²`
+    + `　制动采用 ${(A.brakeAvailable || 0).toFixed(2)} m/s²（含1.3余量）`
+    + `　目标估计加速度 ${Math.hypot(A.tgtAcc.x, A.tgtAcc.y).toFixed(2)} m/s²`
+    + `　目标急停预留 ${P.targetBrake.toFixed(1)} m/s²${P.adaptive !== 'on' || P.end !== 'match' ? '（当前未启用）' : ''}`
+    + `　脱离/重新到点 ${A.lostCount || 0}/${A.reacquiredCount || 0}`
+    + `　局部制动包络最大偏差 <b>${envPeak.toFixed(2)} m/s</b>`
     + `　目标机动峰值 <b style="color:${tgtA > P.aPhys ? '#c0392b' : 'inherit'}">${tgtA.toFixed(2)}</b> m/s²`
     + `（a_phys=${P.aPhys.toFixed(1)}，真值仅评价）`
     + (A.turnBind
       ? `　转弯约束（额外接近）最小 <b>${isFinite(A.turnCapMin) ? A.turnCapMin.toFixed(2) : '—'}</b> m/s`
       : '')
     + (P.jerk > 0
-      ? `　<b style="color:#b45309">J=${P.jerk.toFixed(1)} 二阶平滑会突破包络（已知残留，§5.4）</b>`
+      ? `　J=${P.jerk.toFixed(1)}（制动距离已计入加速度回收）`
+        + `；安全限速裁剪 ${A.safetyClips || 0} 次（裁剪时 jerk 不保证）`
       : '');
 
   const v = $('verdict');
   const vtAbsHud = Math.hypot(vtAlong, vtCross);
   const vzTAbsHud = Math.abs(P.vzT);
-  if (P.end === 'stop' && (vtAbsHud > ARRIVAL_SPEED_MPS || vzTAbsHud > ARRIVAL_SPEED_MPS)) {
-    // 物理事实，不是模拟 bug：机速要降到 0，而目标仍在离开，两者不可能同点同速。
-    // 这也正是机载 handover 的 Q4 冲突（地速≤0.5 与动目标交接不相容）。
-    v.innerHTML = `<b style="color:#b45309">末端「减到 0」与动目标不相容</b>：飞机要减到地速 0，`
-      + `而目标仍以 ${vtAbsHud.toFixed(2)} m/s（水平）/ ${vzTAbsHud.toFixed(2)} m/s（垂直）离开，`
-      + `到点判据（地速 ≤0.5、水平 3 m、垂直 2 m）永远不成立。`
-      + `飞机停在最近接近点 ${minD.toFixed(2)} m（该点相对速度≈0、机速≈v_t），之后目标继续远离。`
-      + `动目标交接必须用相对速度判据，或把末端改成速度匹配。`;
+  if (A.arrived) {
+    v.innerHTML = `<b style="color:#3d7a1f">到点条件已连续保持 2 s</b>：水平 ≤3 m、垂直 ≤2 m、${critName} ≤0.5 m/s。`
+      + '这是本次仿真结果；几何交接示意不等于真实视觉验证。';
+  } else if (A.capabilityLimited) {
+    v.innerHTML = '<b style="color:#c0392b">当前匹配或制动预算不足</b>：目标估计加速度、侧向需求或急停预留已用完可用径向能力。'
+      + '控制器保持硬速度/加速度约束；增加速度上限不能补回加速度能力。可减小接近速度，或核实预留与平台能力。';
+  } else if (A.reserveLimited) {
+    v.innerHTML = '<b style="color:#b45309">当前预留模型不允许继续接近</b>：急停界、采样/传输延迟和 jerk 制动距离已用完当前间距。'
+      + '为保留所声明机动余量，可能停在到点区域外；需缩短链路延迟、核实预留值或重新评估能力。';
+  } else if (A.brakingInfeasible) {
+    v.innerHTML = '<b style="color:#b45309">当前局部模型下制动距离不足</b>：现有接近速度已超出当前机动预算。'
+      + '观测后会尽力制动，但不保证不越过目标；已知目标急停能力时，应在接近开始前设置预留。';
+  } else if (P.end === 'stop' && (vtAbsHud > ARRIVAL_SPEED_MPS || vzTAbsHud > ARRIVAL_SPEED_MPS)) {
+    v.innerHTML = '<b style="color:#b45309">动目标使用停车末端</b>：零地速与持续速度匹配目标不同。'
+      + '控制器会持续重算停车点，可能发生短时到点或反复接近；持续追踪建议使用速度匹配和相对速度判据。';
   } else if (P.end === 'match' && P.criterion === 'abs' &&
-             Math.hypot(vtAbsHud, P.vzT) > ARRIVAL_SPEED_MPS) {
-    // 机载 handover 用"地速 ≤0.5"，而速度匹配末端机速≈目标速度：两者不可能同拍成立。
-    // 这不是谁写错了，是判据口径冲突（Q4），必须先拍板。
-    v.innerHTML = `<b style="color:#b45309">末端匹配 + 地速判据不相容</b>：地速判据要求 ≤0.5 m/s，`
-      + `而速度匹配末端的机速≈目标速度（${Math.hypot(vtAbsHud, P.vzT).toFixed(2)} m/s），不可能同时成立`
-      + `（当前相对速度 ${(A.relSpeed3 || 0).toFixed(2)} m/s，其实已经匹配上了）。`
-      + `要么把交接判据改成相对速度，要么末端改成停在球上——但动目标停不住（见"减到 0"）。`;
+             Math.hypot(vtAbsHud, P.vzT) > 2 * ARRIVAL_SPEED_MPS) {
+    v.innerHTML = '<b style="color:#b45309">速度判据存在冲突</b>：当目标速率 >1 m/s 时，'
+      + '地速 ≤0.5 与相对速度 ≤0.5 无法同时满足（由三角不等式）。当前选择地速告警，建议动目标改用相对速度。';
   } else if (P.law === 'prop') {
     const aimPt = A.est.aim || A.est.pred;
     const aimLead = aimPt ? Math.hypot(aimPt.x - A.seen.x, aimPt.y - A.seen.y) : 0;
@@ -1839,14 +2000,14 @@ function updateHud() {
       : '';
     v.innerHTML = `<b style="color:#b45309">追得上但匹配不了</b>：飞机进过 3 m 球（最近 ${A.minD.toFixed(2)} m），`
       + `但最近点相对速度 ${(A.minDRel || 0).toFixed(2)} m/s > 0.5；到点判据要求"距离 + 相对速度"同拍成立，`
-      + `所以永远不置位。原因：${why.join('；')}${sweep}。调大 a_phys 或降低目标机动强度可解，`
+      + `本次尚未完成连续保持。可能原因：${why.join('；')}${sweep}。调大 a_phys 或降低目标机动强度可解，`
       + `只提高速度上限无效（实测 vcap 10→16 仍到不了）。`;
   } else if (!A.arrived && (A.tgtAccelPeak || 0) > P.aPhys * 1.02 && A.t > 4) {
     // 从未进到球内，但目标机动已经超出机体加速度：能力边界，不是参数没调好。
     v.innerHTML = `<b style="color:#b45309">目标机动超出机体能力</b>：机动加速度峰值 `
       + `${A.tgtAccelPeak.toFixed(2)} m/s² > a_phys=${P.aPhys.toFixed(1)}，飞机跟不住目标速度矢量，`
-      + `到点球内压不到 0.5 m/s（本次最近 ${minD.toFixed(2)} m）。提高速度上限无效，`
-      + `只能提高机体加速度或降低目标机动强度。`;
+      + `到点球内压不到 0.5 m/s（本次最近 ${minD.toFixed(2)} m）。仅提高速度上限不能保证改善，`
+      + `应结合估计时延、速度/加速度能力和机动强度评估。`;
   } else if (P.policy === 'fast') {
     const th = theoryApplicable() ? THEORY : null;
     // 0 不再表示"无限速"：理论/律/判词统一按 V_PLAN_MPS（§5.10）。
@@ -1858,8 +2019,8 @@ function updateHud() {
         ? '匀速段为 0——加速度拉满、到点即减速，不需要"先定一个巡航速度"。'
         : `匀速段 ${th.tCruise.toFixed(1)} s（峰顶被上限削平）。`)
       : `理论值不可用：${theoryBlockReason()}。`;
-    v.innerHTML = `<b style="color:#3d7a1f">时间最优</b>：${capTxt}，`
-      + `按 a_d=${(P.decel / BRAKE_SAFETY).toFixed(1)} m/s²（= a_d/1.3 余量）在剩余距离处切减速，末端匹配目标速度。${cruiseTxt}`
+    v.innerHTML = `<b style="color:#3d7a1f">快速接近</b>：${capTxt}，`
+      + `按 a_d=${(motionLimits().down / BRAKE_SAFETY).toFixed(1)} m/s²（= a_d/1.3 余量）在剩余距离处切减速，末端采用小范围比例收敛。理想运动用时不含末端收敛与 2 s 保持。${cruiseTxt}`
       + `　指令加速度 a_cmd=${(A.aCmd || 0).toFixed(2)} m/s²（上限 ${P.slew > 0 ? P.slew.toFixed(1) : '—'}，jerk ${P.jerk > 0 ? P.jerk.toFixed(1) : '关闭'}）`;
   } else if (sustain <= 1e-3) {
     v.innerHTML = `目标不动：v_cruise=0，飞机原地等待（地板 1.5 m/s 不生效）。`;
@@ -1870,22 +2031,41 @@ function updateHud() {
 }
 
 let last = performance.now();
+let chartLast = 0;
 function frame(now) {
   const dtReal = Math.min(0.05, (now - last) / 1000);
   last = now;
-  // 仿真跑到"追上"（A.arrived）为止，不再设 60 s 截止；追不上的工况会一直跑，由用户暂停/重置。
-  if (!P.paused && !A.arrived) {
-    const simDt = dtReal * P.speed;
-    const steps = Math.min(240, Math.max(1, Math.round(simDt / DT)));
-    for (let i = 0; i < steps; i++) {
+  // 持续模式到点后仍运行；条件失效会退出到点状态并自动重新追赶。
+  if (!P.paused && (P.continuous === 'on' || !A.arrived)) {
+    simAccumulator += dtReal * P.speed;
+    // 每帧最多追 20 拍：一次长帧（切标签/拖窗口）后不突发几百拍，避免"越跑越卡"。
+    let budget = 20;
+    while (simAccumulator + 1e-12 >= DT && budget > 0 &&
+           (P.continuous === 'on' || !A.arrived)) {
       stepSim(A, DT);
       stepSim(B, DT);
+      simAccumulator -= DT;
+      budget--;
     }
+    if (budget === 0) simAccumulator = 0;
+  } else {
+    simAccumulator = 0;
   }
-  drawScene(); drawDistanceChart(); drawSpeedChart(); drawAccelChart(); updateHud();
+  drawScene();
+  // 图表/HUD 20 Hz 足够；每帧全量扫历史（2 万+ 条）是长跑后卡顿的主要来源（2026-11-10）。
+  if (now - chartLast >= 50) {
+    chartLast = now;
+    drawDistanceChart(); drawSpeedChart(); drawAccelChart(); updateHud();
+  }
   requestAnimationFrame(frame);
 }
 
+// 物理上限只封顶：输出里同时给出"有效值"，否则用户把 3 调到 9.8 会以为滑块坏了。
+function syncAphysOut() {
+  const out = $('aPhysOut');
+  if (out) out.textContent = P.aPhys.toFixed(1) + ' m/s²（有效 '
+    + Math.min(P.accel, P.decel, P.aPhys).toFixed(1) + '）';
+}
 function bindRange(id, key, fmt) {
   const el = $(id), out = $(id + 'Out');
   // 控件可能已被精简掉（例如 σ_a 只在卡尔曼调试路径里用），缺了就跳过。
@@ -1893,11 +2073,13 @@ function bindRange(id, key, fmt) {
   const upd = () => {
     P[key] = parseFloat(el.value);
     if (out) out.textContent = fmt(P[key]);
+    if (key === 'accel' || key === 'decel' || key === 'aPhys') syncAphysOut();
     if (key !== 'speed') resetSims();
   };
   el.addEventListener('input', upd);
   P[key] = parseFloat(el.value);
   if (out) out.textContent = fmt(P[key]);
+  if (key === 'accel' || key === 'decel' || key === 'aPhys') syncAphysOut();
 }
 function bindSeg(id, key) {
   const wrap = $(id);
@@ -1915,6 +2097,7 @@ bindRange('startd', 'startD', v => v.toFixed(0) + ' m');
 bindRange('margin', 'margin', v => v.toFixed(1));
 bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
+bindRange('targetBrake', 'targetBrake', v => v.toFixed(1) + ' m/s²');
 bindRange('aPhys', 'aPhys', v => v.toFixed(1) + ' m/s²');
 bindRange('slew', 'slew', v => v > 0 ? v.toFixed(1) + ' m/s²' : '关闭');
 bindRange('jerk', 'jerk', v => v > 0 ? v.toFixed(1) + ' m/s³' : '关闭');
@@ -1928,6 +2111,8 @@ bindRange('lead', 'lead', v => v.toFixed(0) + ' ms');
 bindRange('k', 'k', v => v.toFixed(2) + ' 1/s');
 bindSeg('srcSeg', 'src');
 bindSeg('critSeg', 'criterion');
+bindSeg('adaptiveSeg', 'adaptive');
+bindSeg('continuousSeg', 'continuous');
 document.getElementById('vertSel').addEventListener('change', e => {
   const [alt, vzT] = e.target.value.split(':').map(Number);
   P.alt = alt; P.vzT = vzT;
@@ -1974,6 +2159,19 @@ document.querySelector('.presets').addEventListener('click', e => {
   if (k === 'line2') { P.vt = 2; P.turn = 'straight'; P.heading = 90; }
   if (k === 'circle2') { P.vt = 2; P.turn = 'circle'; }
   if (k === 'weave3') { P.vt = 3; P.turn = 'weave'; }
+  if (['burst', 'brake', 'guardedBrake', 'restart'].includes(k)) {
+    P.vt = ['brake', 'guardedBrake'].includes(k) ? 4 : 2;
+    P.turn = k === 'guardedBrake' ? 'brake' : k; P.heading = 90;
+    P.targetBrake = k === 'guardedBrake' ? 2.5 : 0;
+    P.adaptive = 'on'; P.end = 'match'; P.criterion = 'rel';
+    $('targetBrake').value = P.targetBrake; $('targetBrakeOut').textContent = P.targetBrake.toFixed(1) + ' m/s²';
+    for (const [id, key] of [['adaptiveSeg', 'adaptive'], ['endSeg', 'end'], ['critSeg', 'criterion']]) {
+      [...$(id).querySelectorAll('button')].forEach(x => x.classList.toggle('on', Object.values(x.dataset)[0] === P[key]));
+    }
+    P.startD = 40; P.continuous = 'on';
+    $('startd').value = P.startD; $('startdOut').textContent = P.startD + ' m';
+    [...$('continuousSeg').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x.dataset.continuous === P.continuous));
+  }
   $('vt').value = P.vt; $('vtOut').textContent = P.vt.toFixed(1) + ' m/s';
   $('hdg').value = P.heading; $('hdgOut').textContent = P.heading.toFixed(0) + '°';
   $('turnSel').value = P.turn;
@@ -2003,12 +2201,12 @@ requestAnimationFrame(frame);
       <div class="symbody">
 <div class="formula">
           瞄准点 a = 目标估计位置 + v_t·t_go（仅 end=stop）；end=match 时 t_go=0，瞄准点就是预测到"现在"的目标位置<br>
-          视线 r = a − 飞机位置, d̂ = r/|r|, dAim = |r|；刹车距离用真实距离 dObs，不用 dAim<br>
+          视线 r = a − 飞机位置, d̂ = r/|r|, dAim = |r|；刹车距离用控制可见的估计距离 dObs，不用 dAim<br>
           (Vmax²−v_t²)t_go² − 2(r·v_t)t_go − |r|² = 0，取最小正根并夹紧 t_go ≤ 4 s、提前距离 ≤ min(0.5·dObs, Vmax·0.5 s)<br>
-          制动曲线：u_close = min(V_catch, √(2·(a_d/1.3)·max(dObs−R,0)))　比例接近：u_close = clamp(k(dAim−R), 0, Vmax)<br>
+          制动曲线：u_close 由当前相对减速预算/1.3 和 jerk 制动距离反解；末端在 R−0.1 m 附近用有符号比例反馈　比例接近：u_close = clamp(k(dAim−R), 0, Vmax)<br>
           v_des = v_ff + u_close·d̂，速度匹配时 v_ff=v_t（完整二维矢量，含横向分量），减到 0 时 v_ff=0<br>
-          |v_des| ≤ V_body；转弯约束：u_extra ≤ a_phys/λ̇ − |v_t|（λ̇ = |(v−v_t)·n⊥|/d）；<br>指令平滑：|a_cmd| ≤ slew（指令加速度上限）且 |ȧ_cmd| ≤ J（jerk）；plant 加速度硬夹在 a_phys<br>
-          视觉交接（S5→S6）：LOCKED 连续 10 帧 + 斜距 ≤7.95 m（双目测距）+ 俯仰 ≤5.24°（测距校正 FOV 10.24° − 5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s 只是到点告警
+          |v_des| ≤ V_body；u ≤ √(V_body²−v_t⊥²)−v_t∥（横向速度超过上限时无完整匹配解）<br>有效机体加减速 = min(a_plan, a_phys, slew)，slew=0 时不参与；动态预算预留 a_side=â_t⊥+u·λ̇，再取 a_rad=√max(0,a_eff²−a_side²)<br>相对加速上限=max(0,a_rad↑−â_t∥)，相对减速预算=max(0,a_rad↓+â_t∥)；制动不透支目标继续向外加速的收益<br>u̇=(a_drone−a_target)·n−|v_relative,perp|²/d；动态转弯约束 u_extra ≤ max(0,0.8·min(a_eff↑,a_eff↓)−|â_t⊥|)/|λ̇|，λ̇≈0 时不约束<br>急停预留 B>0 时，另按 a_target∥≥−B 收紧制动预算并计入采样/传输反应距离；0.5 m 只是该一维预留模型的几何余量，不能视为二维安全距离证明<br>J>0 时制动距离含加速度回收，硬限速安全裁剪可能打断 jerk；估计有滞后，局部模型不能保证任意未知机动不超调<br>
+          几何交接示意（假设完美朝向与检测；创新仅用位置 KF 残差，不能替代真实视觉验证）：LOCKED 连续 10 帧 + 斜距 ≤7.95 m（双目测距）+ 俯仰 ≤5.24°（测距校正 FOV 10.24° − 5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s 只是到点告警
         </div>
 <div class="symgrid">
           <div><b>dTruth</b><span>飞机到目标真值的距离，仅用于仿真图表和捕获评价</span></div>
@@ -2016,7 +2214,7 @@ requestAnimationFrame(frame);
           <div><b>dAim</b><span>飞机到瞄准点的距离，制导用</span></div>
           <div><b>r, d̂</b><span>飞机→瞄准点的向量与单位方向</span></div>
           <div><b>v_t</b><span>目标速度矢量，来自所选「目标位置来源」</span></div>
-          <div><b>v_t∥</b><span>目标速度沿视线分量（后退为正；包络只补偿这部分）</span></div>
+          <div><b>v_t∥</b><span>目标速度沿视线的有符号分量（后退为正，迎面为负）</span></div>
           <div><b>v_t⊥</b><span>目标速度垂直视线分量（绕圈/蛇形的主力）</span></div>
           <div><b>t_go</b><span>碰撞三角形解出的接触时间，夹紧 ≤ 4 s</span></div>
           <div><b>Vmax</b><span>规划速度上限（上限滑块为 0 时取 6 m/s）</span></div>
@@ -2026,16 +2224,18 @@ requestAnimationFrame(frame);
           <div><b>dz</b><span>目标高度差 z_t − z_d；垂直通道跟踪它，容差 2 m</span></div>
           <div><b>vz</b><span>机体垂直速度（限速 2 m/s、限加速度 2 m/s²）</span></div>
           <div><b>a_phys</b><span>机体物理加速度上限：plant 夹在这里，超过它的指令会被饱和</span></div>
-          <div><b>a_plan</b><span>剖面/包络/闭式解用的规划加速度（应 ≤ a_phys）</span></div>
-          <div><b>u_turn</b><span>转弯约束：额外接近速度 ≤ a_phys/λ̇ − |v_t|，λ̇ = |(v−v_t)·n⊥|/d（只削额外接近，不削前馈）</span></div>
-          <div><b>v_ref</b><span>实际二维速度指令在视线方向上的投影，仅用于曲线对照</span></div>
+          <div><b>a_plan</b><span>用户规划加速度；运行取 min(a_plan, a_phys, 非零 slew)</span></div>
+          <div><b>u_turn</b><span>动态时按目标横向加速度预留能力，限制 u·|λ̇|；只削额外接近，不削目标速度前馈</span></div>
+          <div><b>v_ref</b><span>实际二维速度指令的模长，与实际速度曲线同口径</span></div>
           <div><b>v</b><span>飞机当前速度矢量（含方向滞后）</span></div>
           <div><b>v_c</b><span>沿瞄准线的接近率 = (v−v_ff)·d̂；≥0 才在缩小瞄准距离</span></div>
-          <div><b>d_brake</b><span>按当前相对接近速度刹到末端速度所需距离（a_plan↓/1.3，与包络同口径）</span></div>
-          <div><b>envelope</b><span>刹车包络 v_t∥ + √(2·(a_plan↓/1.3)·(dObs−R))，梯形律用它切减速</span></div>
+          <div><b>d_brake</b><span>局部模型所需间距：控制间距2.9 m + 反应/制动距离；启用预留时取含链路反应模型的较大值</span></div>
+          <div><b>â_t</b><span>仅在收到新速度样本时差分并低通滤波；不读取仿真真值加速度；滤波/延迟会带来误差</span></div>
+          <div><b>目标急停预留</b><span>已知的目标最大内向加速度界 B；0=只响应观测。仅动态预算+速度匹配启用，静止目标未观测到运动时不预留</span></div>
+          <div><b>envelope</b><span>目标沿视线速度 + 制动距离反解的接近速度；含 jerk 和末端比例收敛</span></div>
           <div><b>lag</b><span>「参考点领先」：位置设定点与飞机的距离</span></div>
           <div><b>σ_a</b><span>卡尔曼过程噪声：目标加速度标准差（机载 8.0 m/s²）</span></div>
-          <div><b>J</b><span>jerk 上限（m/s³）：加速度按它爬坡，短距离时到不了 a_cap，加速度自然随场景变</span></div>
+          <div><b>J</b><span>jerk 上限（m/s³）：加速度按它爬坡，规划会提前计入加速度回收距离；硬速度上限优先，发生安全裁剪时不保证 jerk</span></div>
         
       </div>
     </div>

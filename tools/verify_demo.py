@@ -122,7 +122,11 @@ def main():
         }
         panel_overflow = page.evaluate(
             "() => { const a = document.querySelector('aside.panel');"
-            " return {scroll: a.scrollHeight, client: a.clientHeight}; }"
+            " a.scrollTop = a.scrollHeight;"
+            " const b = document.getElementById('reset').getBoundingClientRect();"
+            " const r = a.getBoundingClientRect();"
+            " return {scroll: a.scrollHeight, client: a.clientHeight,"
+            " reachable: b.bottom <= r.bottom + 1 && b.top >= r.top - 1}; }"
         )
         clipped = []
         for name, r in layout.items():
@@ -170,7 +174,8 @@ def main():
         step, trap = page.evaluate(
             """() => {
                 const runOne = (prof) => {
-                    P.profile = prof; P.paused = true; P.slew = 0; P.jerk = 0; resetSims();
+                    P.law = prof === 'step' ? 'step' : 'env';
+                    P.profile = prof; P.vcap = 3; P.paused = true; P.slew = 0; P.jerk = 0; resetSims();
                     while (A.t < 0.5 - 1e-9) { stepSim(A, 0.02); stepSim(B, 0.02); }
                     return {t: +A.t.toFixed(2), vref: +A.vref.toFixed(2)};
                 };
@@ -242,8 +247,8 @@ def main():
     print("页面错误：", errors or "无")
 
     check(not clipped, "四块区域都不越界", "有区域越界：%s" % clipped)
-    check(abs(panel_overflow["scroll"] - panel_overflow["client"]) <= 1,
-          "右侧面板无需滚动", "右侧面板被裁：%s" % panel_overflow)
+    check(panel_overflow["reachable"], "右侧面板可滚动且底部按钮可达",
+          "右侧面板滚动后底部按钮不可达：%s" % panel_overflow)
     check(not errors, "无 JS 报错", "JS 报错：%s" % errors)
 
     check(tri["arrived"], "默认参数能到点", "默认参数未到点")

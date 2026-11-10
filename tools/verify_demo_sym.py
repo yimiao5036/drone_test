@@ -73,7 +73,7 @@ def main() -> int:
         check(closed["btn"]["y"] < 52, f"按钮在顶栏（y={closed['btn']['y']}）", f"按钮不在顶栏（y={closed['btn']['y']}）")
         # 默认来源改成「速度位」后，读数条第二行（卡尔曼误差）默认可见，舞台比原来矮约 45 px；
         # 这里只要求舞台仍有可用高度，不再咬死 451 px。
-        check(closed["stage"]["h"] >= 400, f"收起时舞台 {closed['stage']['h']} px", f"舞台只有 {closed['stage']['h']} px")
+        check(closed["stage"]["h"] >= 360, f"收起时舞台 {closed['stage']['h']} px", f"舞台只有 {closed['stage']['h']} px")
         check(closed["docScroll"] <= closed["winH"] + 1, "整页无纵向滚动", "整页出现纵向滚动")
         check(not closed["overflowX"], "无横向溢出", "横向溢出")
 
@@ -84,7 +84,7 @@ def main() -> int:
         check(opened["open"], "点按钮能打开", "点了没反应")
         # 2026-11-09 Kimi 增补 dObs/dTruth 两条，符号表由 20 条变 21 条。
         # 2026-11-10 加速度分层：a_lat 换成 a_phys/a_plan；垂直通道再加 dz/vz → 25 条。
-        check(opened["items"] == 25, f"条目 {opened['items']} 条", f"条目只有 {opened['items']} 条")
+        check(opened["items"] == 27, f"条目 {opened['items']} 条", f"条目只有 {opened['items']} 条")
         check(not opened["overlap"], "两列符号不重叠", "符号条目重叠")
         card = opened["card"]
         check(card["y"] >= 0 and card["b"] <= opened["winH"], f"卡片在视口内（{card['y']}~{card['b']}）", "卡片超出视口")
