@@ -593,4 +593,45 @@ check(measWindow.meas >= 15 && measWindow.meas <= 25 && measWindow.pred >= 190,
       + `HUD 窗口 ${measWindow.hud} 条）`,
       `量测误差窗口口径错误：${JSON.stringify(measWindow)}`);
 
+// ⑳ 分相位调度 + 矢量分配（§5.18）：近段降 a，包络必须按"未来最低减速度"提前规划
+//    （不提前规划时实测 minD 0.11 m）；矢量预留吃掉纵向能力时变慢但不穿球。
+const sched = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', sched:'off', aTerm:1.5, aLatRes:0,
+    adaptive:'off', continuous:'off', targetBrake:0};
+  const runOne = extra => {
+    Object.assign(P, base, extra);
+    resetSims(); P.paused = true;
+    let capDownNear = null;
+    for (let i = 0; i < 6000; i++) {
+      stepSim(A, DT);
+      const h = A.hist[A.hist.length - 1];
+      if (h && A.d < 7.9 && capDownNear === null) capDownNear = h.aCapDown;
+      if (A.arrived) break;
+    }
+    return {t:+A.t.toFixed(2), arrived:!!A.arrived, minD:+(A.minD??A.d).toFixed(2),
+            capDownNear:capDownNear==null?null:+capDownNear.toFixed(2),
+            theory:theoryApplicable(), reason:theoryBlockReason()};
+  };
+  return {fixed: runOne({}), sched: runOne({sched:'on'}),
+          term1: runOne({sched:'on', aTerm:1.0}), vec: runOne({aLatRes:9.5})};
+})`).runInContext(ctx)();
+check(sched.sched.arrived && sched.sched.minD >= 2.85 &&
+      sched.sched.t > sched.fixed.t &&
+      sched.sched.capDownNear !== null && sched.sched.capDownNear <= 1.6,
+      `分相位调度：近段 a 降到 ${sched.sched.capDownNear} m/s²，到点 ${sched.sched.t} s`
+      + `（固定 ${sched.fixed.t} s），minD ${sched.sched.minD} m`,
+      `分相位调度异常：${JSON.stringify(sched.sched)}`);
+check(sched.term1.arrived && sched.term1.minD >= 2.85 && sched.term1.t > sched.sched.t,
+      `末端 a_term=1.0 更保守（${sched.term1.t} s，minD ${sched.term1.minD} m）`,
+      `a_term 未生效：${JSON.stringify(sched.term1)}`);
+check(sched.vec.arrived && sched.vec.minD >= 2.85 && sched.vec.t > sched.fixed.t &&
+      sched.vec.capDownNear < 3,
+      `矢量预留 9.5 → 纵向 ${sched.vec.capDownNear} m/s²，到点 ${sched.vec.t} s`,
+      `矢量预留未生效：${JSON.stringify(sched.vec)}`);
+check(!sched.sched.theory && sched.fixed.theory,
+      `分相位/矢量下闭式解判不可用（${sched.sched.reason}）`,
+      `分相位仍显示固定剖面理论值：${JSON.stringify(sched.sched)}`);
+
 process.exit(ok ? 0 : 1);

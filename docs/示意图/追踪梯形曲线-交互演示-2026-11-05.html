@@ -21,6 +21,10 @@
      （卡顿来自绘制，实测 frame 0.96 ms）；物理上限默认 9.8（PX4 45°），
      输出显示有效 min(a_plan,a_phys)——它只封顶，剖面由 a_plan 决定；
      slew=0 恢复关闭指令加速度限幅（否则"现状台阶"被 a_plan 抹成斜坡）。
+  10. 2026-11-10 分相位调度 + 矢量分配（§5.19）：默认关闭保持基线可比；
+      "分相位"=12 m 外用 a_plan、8 m 内用 a_term（8~12 m 过渡）；
+      "横向预留 a_lat"让纵向可用 = √(a_phys²−a_lat²)。包络按未来最低减速度
+      （min(调度, a_term)）提前规划——否则近段才收紧会刹不住（实测 minD 0.11 m）。
   本文件可单独运行，无外部文件依赖。验证结论见同目录的《追踪算法-复核与修复说明》。
 -->
 <style>
@@ -314,6 +318,23 @@
         <output id="aPhysOut">9.8 m/s²（有效 3.0）</output>
       </div>
       <div class="row">
+        <label title="分相位调度：12 m 外按 a_plan，8 m 内按 a_term（8~12 m 线性过渡），靠近目标时降低纵向加速度、给横向留余量。固定 = 全程 a_plan">加速度调度</label>
+        <div class="seg" id="schedSeg">
+          <button data-sched="on">分相位</button>
+          <button data-sched="off" class="on">固定</button>
+        </div>
+      </div>
+      <div class="row">
+        <label title="近段/末端规划加速度（8 m 内生效）；低于 a_plan 是为了末端精度与横向余量">末端 a_term</label>
+        <input id="aTerm" type="range" min="0.4" max="3" step="0.1" value="1.5">
+        <output id="aTermOut">1.5 m/s²</output>
+      </div>
+      <div class="row">
+        <label title="矢量分配：侧向预留 a_lat 后，纵向可用 = √(a_phys²−a_lat²)。调大 = 给横向留更多、纵向更早饱和">横向预留 a_lat</label>
+        <input id="aLatRes" type="range" min="0" max="9" step="0.1" value="0">
+        <output id="aLatResOut">0.0 m/s²</output>
+      </div>
+      <div class="row">
         <label title="对完整二维速度指令做变化率限幅（m/s²），0 = 关闭">指令加速度</label>
         <input id="slew" type="range" min="0" max="6" step="0.1" value="3">
         <output id="slewOut">3.0 m/s²</output>
@@ -438,6 +459,9 @@ const P = {
   vt: 2.0, heading: 90, turn: 'straight',
   margin: 1.0, accel: 3.0, decel: 3.0, slew: 3.0, // accel/decel = 规划值 a_plan（剖面/包络用）
   aPhys: 9.8,                   // 机体物理加速度上限（PX4 45° 倾角 ≈9.8）；只封顶，剖面由 a_plan 决定
+  sched: 'off',                 // 分相位调度：off=全程 a_plan / on=远段 a_plan、近段 a_term（2026-11-10）
+  aTerm: 1.5,                   // 近段/末端规划加速度（8 m 内生效，8~12 m 线性过渡）
+  aLatRes: 0.0,                 // 矢量分配的侧向预留：纵向可用 = √(a_phys² − a_lat²)
   jerk: 0.0,                    // jerk = 指令加速度变化率上限（m/s³），0 = 关闭二阶平滑
                                 // （J>0 时使用含加速度回收的制动距离；任意二维机动仍不是严格安全保证）
   profile: 'trap', end: 'match', floor: true,
@@ -520,9 +544,28 @@ class AxisKF {
 // 3 m 是到点区域，不是防撞禁入区。控制在其内留 0.1 m 余量，判据仍严格用 3 m。
 const TRACK_RADIUS_M = ARRIVAL_RADIUS_M - 0.1;
 const TERMINAL_GAIN = 1.5;
-function motionLimits() {
+// 分相位调度（2026-11-10）：12 m 以外用 a_plan，8 m 以内用 a_term，之间线性过渡。
+// 过渡带避免上限在 8 m 处台阶式收紧，导致包络突变。
+function planSchedule(s) {
+  if (P.sched !== 'on' || !s) return { up: P.accel, down: P.decel, w: 1 };
+  const w = Math.min(1, Math.max(0, (s.dObs - 8) / 4));
+  return {
+    up: P.aTerm + (P.accel - P.aTerm) * w,
+    down: P.aTerm + (P.decel - P.aTerm) * w,
+    w,
+  };
+}
+// 矢量分配：侧向预留 a_lat 后，纵向可用 = √(a_phys² − a_lat²)。
+// 加速度圆的剩余部分才给纵向，避免"减速用满、横向没余量跟目标"。
+function motionLimits(s) {
   const cmd = P.slew > 0 ? P.slew : Infinity;
-  return { up: Math.min(P.accel, P.aPhys, cmd), down: Math.min(P.decel, P.aPhys, cmd) };
+  const plan = planSchedule(s);
+  const vecLong = Math.sqrt(Math.max(0, P.aPhys * P.aPhys - P.aLatRes * P.aLatRes));
+  return {
+    up: Math.min(plan.up, vecLong, P.aPhys, cmd),
+    down: Math.min(plan.down, vecLong, P.aPhys, cmd),
+    plan, vecLong,
+  };
 }
 // 只在新速度样本到达时差分；量测模式绝不读取真值加速度。
 function updateTargetAcceleration(s, velocity, stamp) {
@@ -615,7 +658,7 @@ function smoothCommand(s, x, y, dt, cap, nx, ny) {
     }
     return;
   }
-  const limits = motionLimits();
+  const limits = motionLimits(s);
   const tracking = P.adaptive === 'on' && P.end === 'match';
   const ff = tracking ? s.tgtAcc : { x: 0, y: 0 };
   // 预览一拍目标速度，避免在加速目标后面永久滞后一拍。
@@ -750,9 +793,12 @@ function theoryApplicable() {
   // 闭式解是"加速—巡航—制动"的理想剖面，只有实现该剖面的速度律能用它对照。
   // 比例接近是 u=k(d−R) 连续收速、且保留 t_go 提前量，不适用（2026-11-10 修）。
   const lawMatchesProfile = P.law === 'brake' || P.law === 'env';
+  // 分相位调度 / 矢量预留下，加减速随距离变化，不再是固定剖面，闭式解不适用（2026-11-10）。
+  const fixedProfile = P.sched !== 'on' && !(P.aLatRes > 0);
   return lawMatchesProfile && P.profile === 'trap' && exactSource && P.turn === 'straight' &&
     P.lead === 0 && P.jerk === 0 && oneDimensional &&
-    terminalConsistent && noVertical && !(P.adaptive === 'on' && P.targetBrake > 0 && P.vt > 0);
+    terminalConsistent && noVertical && fixedProfile &&
+    !(P.adaptive === 'on' && P.targetBrake > 0 && P.vt > 0);
 }
 
 // 闭式解不可用时，给出具体原因（判词里直接显示，避免笼统的"场景不支持"）。
@@ -764,6 +810,8 @@ function theoryBlockReason() {
   if (P.law !== 'brake' && P.law !== 'env') {
     return '比例接近律不是时间最优剖面，闭式解不适用';
   }
+  if (P.sched === 'on') return '分相位调度下加减速随距离变化，没有固定剖面';
+  if (P.aLatRes > 0) return `矢量预留 ${P.aLatRes.toFixed(1)} m/s² 下纵向能力随侧向需求变化`;
   if (P.alt !== 0 || P.vzT !== 0) return '垂直通道未建模（闭式解只算水平剖面）';
   if (P.src !== 'truth' && !(P.src === 'vmsg' && P.noise === 0 && P.vsig === 0)) {
     return '目标位置来源带噪声/时延（σ 或 σ_v > 0）';
@@ -1057,7 +1105,12 @@ function stepSim(s, dt) {
 
   const vtAbs = Math.hypot(gv.x, gv.y);
   const offset = TRACK_RADIUS_M;
-  const limits = motionLimits();
+  const limits = motionLimits(s);
+  // 分相位调度会在近段把减速度降到 a_term。包络必须按"未来允许的最低减速度"提前规划，
+  // 否则进入 8 m 后才收紧就刹不住（实测 sched=on 未修正时 minD 0.11 m，2026-11-10）。
+  const brakeLimits = P.sched === 'on'
+    ? { ...limits, down: Math.min(limits.down, P.aTerm) }
+    : limits;
   const dynamic = P.adaptive === 'on' && P.end === 'match';
   const ga = dynamic ? s.tgtAcc : { x: 0, y: 0 };
   const targetAlong = ga.x * uxRaw + ga.y * uyRaw;
@@ -1066,17 +1119,17 @@ function stepSim(s, dt) {
   const losRate = -crossRelative / Math.max(0.1, dObs);
   const closingNow = (s.vel.x - gv.x) * uxRaw + (s.vel.y - gv.y) * uyRaw;
   const sideNeed = dynamic ? targetSide + closingNow * losRate : 0;
-  const budget = relativeBudget(limits.up, limits.down, targetAlong, sideNeed);
+  const budget = relativeBudget(brakeLimits.up, brakeLimits.down, targetAlong, sideNeed);
   if (vtAbs > 0.05) s.movingObserved = true;
   const reserve = dynamic && s.movingObserved ? P.targetBrake : 0;
   if (reserve > 0) {
-    const guarded = relativeBudget(limits.up, limits.down, Math.min(targetAlong, -reserve), sideNeed);
+    const guarded = relativeBudget(brakeLimits.up, brakeLimits.down, Math.min(targetAlong, -reserve), sideNeed);
     budget.down = Math.min(budget.down, guarded.down);
   }
   s.relativeUp = budget.up; s.relativeDown = budget.down;
   s.capabilityLimited = dynamic && (!budget.feasible || budget.down <= 1e-6 || budget.up <= 1e-6);
   // 不透支目标继续向外加速带来的收益：它可能下一拍停止加速。
-  const decelEff = Math.min(limits.down, budget.down) / BRAKE_SAFETY;
+  const decelEff = Math.min(brakeLimits.down, budget.down) / BRAKE_SAFETY;
   s.brakeAvailable = decelEff;
   // 曲率项有助降低接近速度；制动能力不额外计这份收益，避免乐观外推。
   const radialAcc = s.acc.x * uxRaw + s.acc.y * uyRaw - targetAlong -
@@ -1415,6 +1468,7 @@ function stepSim(s, dt) {
   if (s.hist.length === 0 || s.t - s.hist[s.hist.length - 1].t >= 0.1) {
     s.hist.push({ t: s.t, d: s.dTruth, vd: Math.hypot(s.vel.x, s.vel.y), vref,
                   dzAbs: s.dzAbs || 0,
+                  aCapUp: limits.up, aCapDown: limits.down,
                   aCmd: s.aCmdTan || 0, aAct: s.aTan || 0,
                   aLat: s.aLat || 0, aMag: s.aMag || 0,
                   aCmdLat: s.aCmdLat || 0, aCmdMag: s.aCmdMag || 0, phase: s.phase });
@@ -1790,13 +1844,29 @@ function drawAccelChart() {
   line(keyAct, '#0f766e', null, 2.2);
 
   if (cap > 0) {
-    ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(180,83,9,.55)'; ctx.lineWidth = 1;
-    for (const y of [cap, -cap]) {
-      ctx.beginPath(); ctx.moveTo(g.padL, g.Y(y)); ctx.lineTo(g.padL + g.iw, g.Y(y)); ctx.stroke();
+    // 调度上限按 hist 画阶梯线（固定时就是水平线）：分相位/矢量预留会在这里看到台阶。
+    const capLine = (key, sign) => {
+      if (A.hist.length - i0 < 2) return;
+      ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(180,83,9,.55)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      let first = true;
+      for (let i = i0; i < A.hist.length; i++) {
+        const p = A.hist[i];
+        const v = sign * (p[key] || 0);
+        const y = g.Y(Math.max(-yMax, Math.min(yMax, v)));
+        first ? ctx.moveTo(g.X(p.t), y) : ctx.lineTo(g.X(p.t), y);
+        first = false;
+      }
+      ctx.stroke(); ctx.restore();
+    };
+    capLine('aCapUp', 1);
+    capLine('aCapDown', -1);
+    const lastH = A.hist[A.hist.length - 1];
+    if (lastH) {
+      ctx.fillStyle = 'rgba(180,83,9,.85)'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
+      ctx.fillText(`调度 +${(lastH.aCapUp || 0).toFixed(1)}/−${(lastH.aCapDown || 0).toFixed(1)}`,
+        g.padL + g.iw - 118, g.Y(cap) - 4);
     }
-    ctx.restore();
-    ctx.fillStyle = 'rgba(180,83,9,.85)'; ctx.font = '600 9px ui-monospace,Consolas,monospace';
-    ctx.fillText('±上限 ' + cap.toFixed(1), g.padL + g.iw - 62, g.Y(cap) - 4);
   }
 }
 
@@ -1924,7 +1994,7 @@ function updateHud() {
     + (P.alt !== 0 || P.vzT !== 0
       ? `　垂直 dz=${(A.dz || 0).toFixed(2)} m，vz=${(A.vz || 0).toFixed(2)} m/s（容差 2 m）`
       : '')
-    + `　机体有效加/减速 ${motionLimits().up.toFixed(2)}/${motionLimits().down.toFixed(2)} m/s²`
+    + `　机体有效加/减速 ${motionLimits(A).up.toFixed(2)}/${motionLimits(A).down.toFixed(2)} m/s²`
     + `　相对加/减速预算 ${(A.relativeUp || 0).toFixed(2)}/${(A.relativeDown || 0).toFixed(2)} m/s²`
     + `　制动采用 ${(A.brakeAvailable || 0).toFixed(2)} m/s²（含1.3余量）`
     + `　目标估计加速度 ${Math.hypot(A.tgtAcc.x, A.tgtAcc.y).toFixed(2)} m/s²`
@@ -2020,7 +2090,7 @@ function updateHud() {
         : `匀速段 ${th.tCruise.toFixed(1)} s（峰顶被上限削平）。`)
       : `理论值不可用：${theoryBlockReason()}。`;
     v.innerHTML = `<b style="color:#3d7a1f">快速接近</b>：${capTxt}，`
-      + `按 a_d=${(motionLimits().down / BRAKE_SAFETY).toFixed(1)} m/s²（= a_d/1.3 余量）在剩余距离处切减速，末端采用小范围比例收敛。理想运动用时不含末端收敛与 2 s 保持。${cruiseTxt}`
+      + `按 a_d=${(motionLimits(A).down / BRAKE_SAFETY).toFixed(1)} m/s²（= a_d/1.3 余量）在剩余距离处切减速，末端采用小范围比例收敛。理想运动用时不含末端收敛与 2 s 保持。${cruiseTxt}`
       + `　指令加速度 a_cmd=${(A.aCmd || 0).toFixed(2)} m/s²（上限 ${P.slew > 0 ? P.slew.toFixed(1) : '—'}，jerk ${P.jerk > 0 ? P.jerk.toFixed(1) : '关闭'}）`;
   } else if (sustain <= 1e-3) {
     v.innerHTML = `目标不动：v_cruise=0，飞机原地等待（地板 1.5 m/s 不生效）。`;
@@ -2064,7 +2134,8 @@ function frame(now) {
 function syncAphysOut() {
   const out = $('aPhysOut');
   if (out) out.textContent = P.aPhys.toFixed(1) + ' m/s²（有效 '
-    + Math.min(P.accel, P.decel, P.aPhys).toFixed(1) + '）';
+    + Math.min(P.accel, P.decel, P.aPhys,
+      Math.sqrt(Math.max(0, P.aPhys * P.aPhys - P.aLatRes * P.aLatRes))).toFixed(1) + '）';
 }
 function bindRange(id, key, fmt) {
   const el = $(id), out = $(id + 'Out');
@@ -2073,7 +2144,7 @@ function bindRange(id, key, fmt) {
   const upd = () => {
     P[key] = parseFloat(el.value);
     if (out) out.textContent = fmt(P[key]);
-    if (key === 'accel' || key === 'decel' || key === 'aPhys') syncAphysOut();
+    if (key === 'accel' || key === 'decel' || key === 'aPhys' || key === 'aLatRes') syncAphysOut();
     if (key !== 'speed') resetSims();
   };
   el.addEventListener('input', upd);
@@ -2099,6 +2170,9 @@ bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
 bindRange('targetBrake', 'targetBrake', v => v.toFixed(1) + ' m/s²');
 bindRange('aPhys', 'aPhys', v => v.toFixed(1) + ' m/s²');
+bindSeg('schedSeg', 'sched');
+bindRange('aTerm', 'aTerm', v => v.toFixed(1) + ' m/s²');
+bindRange('aLatRes', 'aLatRes', v => v.toFixed(1) + ' m/s²');
 bindRange('slew', 'slew', v => v > 0 ? v.toFixed(1) + ' m/s²' : '关闭');
 bindRange('jerk', 'jerk', v => v > 0 ? v.toFixed(1) + ' m/s³' : '关闭');
 bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '默认 ' + V_PLAN_MPS);
