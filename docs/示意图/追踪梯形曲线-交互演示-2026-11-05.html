@@ -82,6 +82,9 @@
         识别距离未标定，不设门（机载只要识别到）。
         默认 40 m 直线在 7.6 m / 5.5 s 交接（相对 4.65 m/s），
         高位目标因俯仰出视场推迟（高 10 m → 5.6 m / 6.0 s）。
+    15) 到点告警补 2 s 保持（2026-11-10，§5.15）：机载 handover.arrival_hold_ms=2000，
+        原来"首次满足"就置位，到点用时低估 2 s；现在要求水平/垂直/速度三条连续保持
+        2 s，中途失效重新计时，读数行显示保持进度。
 
   配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
   警示 #b45309、危险 #c0392b、成功 #3d7a1f。
@@ -272,7 +275,7 @@
         <div class="cell"><div class="k">刹车距离 d_brake</div><div class="v" id="sDb">—</div></div>
         <div class="cell"><div class="k">稳态接近速率</div><div class="v" id="sRate">—</div></div>
         <div class="cell"><div class="k">参考点领先</div><div class="v" id="sLag">—</div></div>
-        <div class="cell"><div class="k" title="到点告警：水平 3 m + 垂直 2 m + 速度 ≤0.5（机载还要求保持 2 s）。这只是告警线，不是 S5→S6 的交接判据——交接看视觉锁定 10 帧 + 测距有效 + 视场 + 创新">告警用时</div><div class="v" id="sTa">—</div></div>
+        <div class="cell"><div class="k" title="到点告警：水平 3 m + 垂直 2 m + 速度 ≤0.5，且三条连续保持 2 s（handover.arrival_hold_ms=2000）。这只是告警线，不是 S5→S6 的交接判据——交接看视觉锁定 10 帧 + 测距有效 + 视场 + 创新">告警用时</div><div class="v" id="sTa">—</div></div>
         <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">理论用时</div><div class="v" id="sTt">—</div></div>
         <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">匀速段</div><div class="v" id="sTc">—</div></div>
       </div>
@@ -433,6 +436,7 @@
 const ARRIVAL_RADIUS_M = 3.0;   // 与 handover.arrival_radius_m 对齐
 const ARRIVAL_SPEED_MPS = 0.5;  // 与 handover 到点判据对齐（kHandoverArrivalSpeedMps）
 const ARRIVAL_VERTICAL_M = 2.0; // 与 handover.arrival_vertical_m 对齐（2026-11-10）
+const ARRIVAL_HOLD_S = 2.0;     // 与 handover.arrival_hold_ms=2000 对齐（2026-11-10 补）
 const VZ_MAX = 2.0;             // 垂直速度上限（position_guide_vz_mps=1.5，演示取 2）
 const AZ_MAX = 2.0;             // 垂直加速度上限（accel_limit.az_mps2=1.5，演示取 2）
 
@@ -557,6 +561,8 @@ function makeSim(variant) {
     vref: 0, lag: 0, d: P.startD, dObs: P.startD, dTruth: P.startD, vc: 0, relSpeed: 0, aCmd: 0, a: 0,
     vmax: 0, vpeak: 0, vactPeak: 0, plateau: Infinity, dbrk: 0, phase: 'idle',
     minD: null, minDT: 0, envPeak: 0, envPeakT: 0,   // 2026-11-10：穿球/越界读数
+    arriveHoldT: null, arriveHold: 0,                // 到点条件连续保持计时（arrival_hold_ms=2000）
+    arriveFirstT: null,                              // 到点条件首次成立时刻（评价用，不含 2 s 保持）
     minDRel: 0,                        // 最近接近点处的相对速度（判"匹配不了"）
     prevTv: null, tgtAccelPeak: 0,     // 目标机动加速度（真值，仅评价用）
     turnCapMin: Infinity, turnBind: false,   // 转弯约束是否削过"额外接近速度"
@@ -1210,10 +1216,25 @@ function stepSim(s, dt) {
   // stop 模式停在球面附近（a_d/1.3 的余量让它停在 3 m 略外侧），容差给 0.3 m；
   // match 模式在球面内侧收速，实测 3.00~3.02 m，仍按 0.02 m 严判。
   const arriveSlack = P.end === 'match' ? 0.02 : 0.3;
-  // 到点 = 水平进圈 + 垂直进带（handover 是水平 3 m / 垂直 2 m 分开判的）+ 速度判据。
-  if (!s.arrived && arriveDistance <= ARRIVAL_RADIUS_M + arriveSlack &&
-      dzAbs <= ARRIVAL_VERTICAL_M && arrivalSpeedError <= ARRIVAL_SPEED_MPS) {
-    s.arrived = true; s.arrivedAt = s.t; s.phase = P.end === 'match' ? 'match' : 'idle';
+  // 到点 = 水平进圈 + 垂直进带（handover 是水平 3 m / 垂直 2 m 分开判的）+ 速度判据，
+  // 且三条要连续保持 handover.arrival_hold_ms=2000（2026-11-10 补；原来"首次满足"就置位，
+  // 会把到点用时低估 2 s）。中途任一条件失效即重新计时。
+  const arriveOk = arriveDistance <= ARRIVAL_RADIUS_M + arriveSlack &&
+    dzAbs <= ARRIVAL_VERTICAL_M && arrivalSpeedError <= ARRIVAL_SPEED_MPS;
+  if (!s.arrived) {
+    if (arriveOk) {
+      if (s.arriveHoldT === null) { s.arriveHoldT = s.t; s.arriveFirstT = s.t; }
+      s.arriveHold = s.t - s.arriveHoldT;
+      // 保持期固定相位：否则末端几厘米的指令抖动会在 cruise/decel 之间反复切换，
+      // 相位统计（verify_demo.py 的"切换次数"）会被这 2 s 放大（2026-11-10）。
+      s.phase = P.end === 'match' ? 'match' : 'idle';
+      if (s.arriveHold >= ARRIVAL_HOLD_S - 1e-9) {
+        s.arrived = true; s.arrivedAt = s.t;
+      }
+    } else {
+      s.arriveHoldT = null;
+      s.arriveHold = 0;
+    }
   }
 
   s.trailD.push({ x: s.drone.x, y: s.drone.y, t: s.t });
@@ -1688,7 +1709,10 @@ function updateHud() {
         : `（进到球内 <b style="color:#c0392b">${penetrate.toFixed(2)} m</b>，但${critName} `
           + `${speedNow.toFixed(2)} m/s > 0.5，到点未置位）`)
       : '（未进到点球内）';
-  $('minNote').innerHTML = `本次最小距离 <b>${minD.toFixed(2)} m</b>${arriveTxt}`
+  const holdTxt = (!A.arrived && A.arriveHoldT != null)
+    ? `　到点条件保持 <b>${Math.min(ARRIVAL_HOLD_S, A.arriveHold || 0).toFixed(1)}</b>/${ARRIVAL_HOLD_S.toFixed(1)} s`
+    : '';
+  $('minNote').innerHTML = `本次最小距离 <b>${minD.toFixed(2)} m</b>${arriveTxt}${holdTxt}`
     + `　判据 <b>${critName}</b> ≤0.5（地速 ${(A.groundSpeed || 0).toFixed(2)} / 相对 ${(A.relSpeed3 || 0).toFixed(2)}）`
     + (P.alt !== 0 || P.vzT !== 0
       ? `　垂直 dz=${(A.dz || 0).toFixed(2)} m，vz=${(A.vz || 0).toFixed(2)} m/s（容差 2 m）`

@@ -47,6 +47,7 @@ def state(page):
             t: A.t, d: A.d, vc: A.vc, vref: A.vref, vmax: A.vmax,
             vpeak: A.vpeak, lag: A.lag, phase: A.phase,
             arrived: A.arrived, arrivedAt: A.arrivedAt,
+            arriveFirstT: A.arriveFirstT, holdS: ARRIVAL_HOLD_S,
             bd: B.d, bArrived: B.arrived,
             theory: THEORY ? {vp: THEORY.vp, tTotal: THEORY.tTotal,
                               tCruise: THEORY.tCruise} : null
@@ -224,10 +225,12 @@ def main():
     print("版式：", layout)
     print("面板滚动：", panel_overflow)
     print("越界：", clipped or "无")
-    print("三角形（无上限）：到点 %.2f s，峰值 %.2f m/s，理论 %.2f s / %.2f m/s，匀速段 %.2f s" % (
+    print("三角形（无上限）：条件成立 %.2f s / 保持后 %.2f s，峰值 %.2f m/s，理论 %.2f s / %.2f m/s，匀速段 %.2f s" % (
+        (tri["arriveFirstT"] if tri["arriveFirstT"] is not None else -1),
         tri["arrivedAt"] or -1, tri["vpeak"], tri["theory"]["tTotal"], tri["theory"]["vp"],
         tri["theory"]["tCruise"]))
-    print("上限 4.0：到点 %.2f s，峰值 %.2f m/s，理论 %.2f s / %.2f m/s，匀速段 %.2f s" % (
+    print("上限 4.0：条件成立 %.2f s / 保持后 %.2f s，峰值 %.2f m/s，理论 %.2f s / %.2f m/s，匀速段 %.2f s" % (
+        (capped["arriveFirstT"] if capped["arriveFirstT"] is not None else -1),
         capped["arrivedAt"] or -1, capped["vpeak"], capped["theory"]["tTotal"], capped["theory"]["vp"],
         capped["theory"]["tCruise"]))
     print("余量 0（t=%.1f）：设计 d=%.2f vmax=%.2f 对照 d=%.2f" % (zero["t"], zero["d"], zero["vmax"], zero["bd"]))
@@ -244,9 +247,12 @@ def main():
     check(not errors, "无 JS 报错", "JS 报错：%s" % errors)
 
     check(tri["arrived"], "默认参数能到点", "默认参数未到点")
-    check(abs(tri["arrivedAt"] - tri["theory"]["tTotal"]) < 1.0,
-          "三角形用时与闭式解一致（%.2f s vs %.2f s）" % (tri["arrivedAt"], tri["theory"]["tTotal"]),
-          "三角形用时偏离闭式解（%.2f s vs %.2f s）" % (tri["arrivedAt"], tri["theory"]["tTotal"]))
+    # 到点条件现在要连续保持 2 s（handover.arrival_hold_ms=2000），与闭式解比较的是
+    # "条件首次成立"的 arriveFirstT，不是保持后的 arrivedAt。
+    tri_first = tri["arriveFirstT"] if tri["arriveFirstT"] is not None else -1
+    check(tri["arrived"] and abs(tri_first - tri["theory"]["tTotal"]) < 1.0,
+          "三角形用时与闭式解一致（%.2f s vs %.2f s）" % (tri_first, tri["theory"]["tTotal"]),
+          "三角形用时偏离闭式解（%.2f s vs %.2f s）" % (tri_first, tri["theory"]["tTotal"]))
     # 2026-11-09 改成二维矢量指令后，实际峰值比一维闭式解高约 3%（13.02 vs 12.63），
     # 闭式解仍是"峰值由几何决定"的判据，但容差要放到 0.6 m/s。
     check(abs(tri["vpeak"] - tri["theory"]["vp"]) < 0.6,
@@ -261,8 +267,9 @@ def main():
     check(capped["theory"]["tCruise"] > 0.5,
           "峰顶削平后出现匀速段（%.2f s）" % capped["theory"]["tCruise"],
           "削平后仍未出现匀速段")
-    check(abs(capped["arrivedAt"] - capped["theory"]["tTotal"]) < 1.0,
-          "带匀速段时用时与闭式解一致（%.2f s vs %.2f s）" % (capped["arrivedAt"], capped["theory"]["tTotal"]),
+    capped_first = capped["arriveFirstT"] if capped["arriveFirstT"] is not None else -1
+    check(abs(capped_first - capped["theory"]["tTotal"]) < 1.0,
+          "带匀速段时用时与闭式解一致（%.2f s vs %.2f s）" % (capped_first, capped["theory"]["tTotal"]),
           "带匀速段时用时偏离闭式解")
 
     check(abs(tri["bd"] - 42.0) < 1.5, "对照组停在 +%.1f m（追不上）" % tri["bd"],
