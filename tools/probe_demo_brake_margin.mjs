@@ -530,4 +530,25 @@ check(!handover.climbEscape.handover,
       `目标以 2 m/s 爬升时俯仰始终出视场、不交接（阻塞 ${handover.climbEscape.blkFov} 拍）`,
       `爬升逃逸工况竟然交接了：${JSON.stringify(handover.climbEscape)}`);
 
+// ⑰ 加速度图分量（§5.16）：蛇形/绕圈是"改方向"，横向分量才是主力；只看切向会误以为没有加速度。
+const accelParts = new vm.Script(`(function(){
+  Object.assign(P, {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3,
+    aPhys:3, slew:3, vcap:12, vt:8, heading:90, turn:'weave', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', accelView:'lat'});
+  resetSims(); P.paused = true;
+  for (let i = 0; i < 6000; i++) stepSim(A, DT);
+  let maxLat=0, maxMag=0, meanTan=0, n=0, sat=0;
+  for (const p of A.hist) {
+    maxLat = Math.max(maxLat, Math.abs(p.aLat||0));
+    maxMag = Math.max(maxMag, p.aMag||0);
+    meanTan += Math.abs(p.aAct||0); if ((p.aMag||0) > 2.5) sat++; n++;
+  }
+  return {maxLat:+maxLat.toFixed(2), maxMag:+maxMag.toFixed(2),
+          meanTan:+(meanTan/Math.max(1,n)).toFixed(2), satPct:+(100*sat/Math.max(1,n)).toFixed(0)};
+})`).runInContext(ctx)();
+check(accelParts.maxMag > 2.5 && accelParts.maxLat > 1.5 && accelParts.satPct > 80,
+      `加速度分量可见（8 m/s 蛇形：总 ${accelParts.maxMag}、横向 ${accelParts.maxLat}、`
+      + `切向均值 ${accelParts.meanTan}、饱和 ${accelParts.satPct}%）`,
+      `加速度分量异常：${JSON.stringify(accelParts)}`);
+
 process.exit(ok ? 0 : 1);

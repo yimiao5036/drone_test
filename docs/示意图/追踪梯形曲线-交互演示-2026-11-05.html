@@ -85,6 +85,10 @@
     15) 到点告警补 2 s 保持（2026-11-10，§5.15）：机载 handover.arrival_hold_ms=2000，
         原来"首次满足"就置位，到点用时低估 2 s；现在要求水平/垂直/速度三条连续保持
         2 s，中途失效重新计时，读数行显示保持进度。
+    16) 加速度图可切分量（2026-11-10，§5.16）：原来只画切向加速度，蛇形/绕圈是"改方向"，
+        切向分量小、看起来像"追踪时没有加速度"；现在可切 切向/横向/总（只换显示不重跑）。
+        8 m/s 蛇形实测：总加速度 99% 时间贴 3 m/s²（饱和）、横向峰值 3.0、
+        切向均值 1.37——响应目标是"够不够"而不是"变化大不大"。
 
   配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
   警示 #b45309、危险 #c0392b、成功 #3d7a1f。
@@ -207,6 +211,11 @@
   .chart canvas{display:block; width:100%; height:100%}
   .chart .cap{position:absolute; top:7px; left:11px; font-size:11px; color:var(--ink-2); background:rgba(255,255,255,.92); padding:1px 5px; border-radius:5px; pointer-events:none}
   .chart .cap b{color:var(--ink)}
+  /* 加速度图右上角的分量切换（2026-11-10）：放在图上，不占右侧面板高度 */
+  .chartseg{position:absolute; top:5px; right:8px; display:flex; gap:3px; z-index:2}
+  .chartseg button{font:600 9.5px/1 inherit; padding:3px 6px; border-radius:5px; cursor:pointer;
+    border:1px solid var(--line-2); background:#fff; color:var(--ink-3); white-space:nowrap}
+  .chartseg button.on{background:#eef5ff; border-color:#bcd6f5; color:var(--primary)}
 </style>
 </head>
 <body>
@@ -425,7 +434,12 @@
     <canvas id="chartV"></canvas>
   </div>
   <div class="chart">
-    <div class="cap">切向加速度 a_t(t)：<b style="color:#0f766e">实际</b> vs <b style="color:#b45309">指令</b>（沿速度方向，正=加速/负=减速；虚线 = ±上限）</div>
+    <div class="cap" id="accelCap">切向加速度 a_t(t)：<b style="color:#0f766e">实际</b> vs <b style="color:#b45309">指令</b>（沿速度方向，正=加速/负=减速；虚线 = ±上限）</div>
+    <div class="chartseg" id="accelSeg">
+      <button data-acc="tan" class="on">切向</button>
+      <button data-acc="lat">横向</button>
+      <button data-acc="mag">总</button>
+    </div>
     <canvas id="chartA"></canvas>
   </div>
 </section>
@@ -488,6 +502,7 @@ const P = {
   alt: 0,                       // 目标初始高度 m（飞机从 0 m 起飞，演示只建模高度差）
   vzT: 0,                       // 目标垂直速度 m/s（爬升为正）
   criterion: 'rel',             // 到点速度判据：rel=相对速度（演示默认）/ abs=地速（机载 handover）
+  accelView: 'tan',             // 加速度图分量：tan=切向（默认）/ lat=横向 / mag=总模长
   speed: 2.0, paused: false,
 };
 
@@ -1116,7 +1131,13 @@ function stepSim(s, dt) {
   const dirY = speedDir > 0.1 ? s.vel.y / speedDir
     : (cmdSpeed > 1e-6 ? cmdY / cmdSpeed : uy);
   s.aTan = ax * dirX + ay * dirY;
+  // 横向投影（2026-11-10）：正=左。蛇形/绕圈是"改方向"，主力在横向分量，
+  // 切向分量只反映速度大小变化——原来只有切向曲线，所以 8 m/s 蛇形看起来"没有加速度"。
+  s.aLat = ax * (-dirY) + ay * dirX;
+  s.aMag = Math.hypot(ax, ay);
   s.aCmdTan = aCmdVecX * dirX + aCmdVecY * dirY;
+  s.aCmdLat = aCmdVecX * (-dirY) + aCmdVecY * dirX;
+  s.aCmdMag = Math.hypot(aCmdVecX, aCmdVecY);
   s.vel.x += ax * dt; s.vel.y += ay * dt;
   s.drone.x += s.vel.x * dt; s.drone.y += s.vel.y * dt;
   s.vactPeak = Math.max(s.vactPeak || 0, Math.hypot(s.vel.x, s.vel.y));   // 真实速度峰值
@@ -1243,7 +1264,9 @@ function stepSim(s, dt) {
   if (s.hist.length === 0 || s.t - s.hist[s.hist.length - 1].t >= 0.1) {
     s.hist.push({ t: s.t, d: s.dTruth, vd: Math.hypot(s.vel.x, s.vel.y), vref,
                   dzAbs: s.dzAbs || 0,
-                  aCmd: s.aCmdTan || 0, aAct: s.aTan || 0, phase: s.phase });
+                  aCmd: s.aCmdTan || 0, aAct: s.aTan || 0,
+                  aLat: s.aLat || 0, aMag: s.aMag || 0,
+                  aCmdLat: s.aCmdLat || 0, aCmdMag: s.aCmdMag || 0, phase: s.phase });
     // 不再有 60 s 截止，长时间"追不上"工况要防止 hist 无界增长（10 Hz × 40 min）。
     if (s.hist.length > 24000) s.hist.shift();
   }
@@ -1560,13 +1583,29 @@ function drawAccelChart() {
   const tEnd = Math.max(SPEED_WIN, A.t);
   const tStart = tEnd - SPEED_WIN;
   const cap = P.slew > 0 ? P.slew : Math.max(P.accel, P.decel);
+  // 分量切换（2026-11-10）：蛇形/绕圈是"改方向"，切向分量小、横向分量才是主力；
+  // 只看切向会误以为"追踪时没有加速度"。总模长贴住 ±上限 = 在饱和。
+  const view = P.accelView || 'tan';
+  const keyAct = view === 'lat' ? 'aLat' : (view === 'mag' ? 'aMag' : 'aAct');
+  const keyCmd = view === 'lat' ? 'aCmdLat' : (view === 'mag' ? 'aCmdMag' : 'aCmd');
   let yPeak = cap;
   A.hist.forEach(p => {
-    yPeak = Math.max(yPeak, Math.abs(p.aCmd || 0), Math.abs(p.aAct || 0));
+    yPeak = Math.max(yPeak, Math.abs(p[keyCmd] || 0), Math.abs(p[keyAct] || 0));
   });
   const yMax = Math.max(1, Math.ceil((yPeak + 0.4) * 2) / 2);
-  // 有符号加速度：上下对称，0 在中间（负 = 减速）
-  const g = axes(ctx, w, h, tStart, tEnd, yMax, yMax <= 2 ? 0.5 : 1, '切向加速度 m/s²', 5, -yMax);
+  // 有符号加速度：上下对称，0 在中间（切向负=减速；横向负=右）
+  const axisLabel = view === 'lat' ? '横向加速度 m/s²'
+    : (view === 'mag' ? '总加速度 m/s²' : '切向加速度 m/s²');
+  const g = axes(ctx, w, h, tStart, tEnd, yMax, yMax <= 2 ? 0.5 : 1, axisLabel, 5, -yMax);
+  const capEl = $('accelCap');
+  if (capEl && capEl.dataset.view !== view) {
+    capEl.dataset.view = view;
+    capEl.innerHTML = view === 'lat'
+      ? '横向 a_⊥：<b style="color:#0f766e">实际</b> vs <b style="color:#b45309">指令</b>（正=左/负=右）'
+      : (view === 'mag'
+        ? '总 |a|：<b style="color:#0f766e">实际</b> vs <b style="color:#b45309">指令</b>（贴 ±上限 = 饱和）'
+        : '切向 a_t：<b style="color:#0f766e">实际</b> vs <b style="color:#b45309">指令</b>（正=加速/负=减速）');
+  }
 
   const line = (key, color, dash, width) => {
     const seg = A.hist.filter(p => p.t >= tStart - 1);
@@ -1579,8 +1618,8 @@ function drawAccelChart() {
     });
     ctx.stroke(); ctx.restore();
   };
-  line('aCmd', '#b45309', [5, 4], 1.6);
-  line('aAct', '#0f766e', null, 2.2);
+  line(keyCmd, '#b45309', [5, 4], 1.6);
+  line(keyAct, '#0f766e', null, 2.2);
 
   if (cap > 0) {
     ctx.save(); ctx.setLineDash([2, 4]); ctx.strokeStyle = 'rgba(180,83,9,.55)'; ctx.lineWidth = 1;
@@ -1893,6 +1932,13 @@ $('lawSeg').addEventListener('click', e => {
 });
 bindSeg('policySeg', 'policy');
 bindSeg('endSeg', 'end');
+// 加速度图分量切换：只换显示，不重跑仿真（2026-11-10）。
+$('accelSeg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  [...$('accelSeg').querySelectorAll('button')].forEach(x => x.classList.toggle('on', x === b));
+  P.accelView = b.dataset.acc;
+  drawAccelChart();
+});
 $('turnSel').addEventListener('change', e => { P.turn = e.target.value; resetSims(); });
 
 $('floorSeg').addEventListener('click', e => {
