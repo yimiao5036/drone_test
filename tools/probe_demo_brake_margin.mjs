@@ -57,7 +57,8 @@ function makeContext() {
   vm.runInContext(source[1], context, { filename: 'demo.js' });
   // DOM 桩把所有 input.value 当 '0'，bindRange 会把 P 全清成 0；恢复页面默认值。
   // 各用例仍显式覆盖自己用到的字段（含 aPhys——拆分后 plant 只认它）。
-  vm.runInContext('P.aPhys = 3; P.accel = 3; P.decel = 3; P.slew = 3; P.vcap = 10;', context);
+  vm.runInContext('P.aPhys = 3; P.accel = 3; P.decel = 3; P.slew = 3; P.vcap = 10;' +
+                  ' P.alt = 0; P.vzT = 0; P.criterion = "rel";', context);
   return context;
 }
 
@@ -440,5 +441,50 @@ check(!splitAccel.p2.arrived || splitAccel.p2.t > splitAccel.p3.t + 0.2 ||
       splitAccel.p2.minD < 2.9,
       `a_phys 低于规划时能力不足（a_phys=2：t=${splitAccel.p2.t} s / 最近 ${splitAccel.p2.minD} m）`,
       `a_phys=2 没有体现能力不足（arrived=${splitAccel.p2.arrived} t=${splitAccel.p2.t}）`);
+
+// ⑭ 垂直通道（§5.13）：目标高 10 m / 爬升 1.5 m/s 时，垂直通道与水平并行收敛，到点仍成立。
+const vertical = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:3,
+    slew:3, vcap:10, vt:0, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    criterion:'rel', alt:0, vzT:0};
+  const runOne = extra => {
+    Object.assign(P, base, extra);
+    resetSims(); P.paused = true;
+    for (let i = 0; i < 4000; i++) { stepSim(A, DT); if (A.arrived) break; }
+    return {arrived:!!A.arrived, t:+A.t.toFixed(2), dz:+(A.dzAbs??0).toFixed(2),
+            vz:+(A.vz||0).toFixed(2)};
+  };
+  return {alt10: runOne({alt:10}), climb: runOne({vzT:1.5, vt:2})};
+})`).runInContext(ctx)();
+check(vertical.alt10.arrived && vertical.alt10.dz <= 2 &&
+      vertical.climb.arrived && Math.abs(vertical.climb.vz - 1.5) < 0.2 &&
+      vertical.climb.dz <= 2,
+      `垂直通道并行收敛（高 10 m：${vertical.alt10.t} s / |dz|=${vertical.alt10.dz} m；`
+      + `爬升 1.5：${vertical.climb.t} s / vz=${vertical.climb.vz}）`,
+      `垂直通道未收敛：alt10=${JSON.stringify(vertical.alt10)} climb=${JSON.stringify(vertical.climb)}`);
+
+// ⑮ 末端判据（§5.13）：同一"速度匹配 + 动目标"工况，相对速度判据能到点、地速判据永远不能；
+//    垂直运动的动目标同样触发地速判据冲突（机速≈目标垂直速度）。
+const criteria = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:3,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel'};
+  const runOne = extra => {
+    Object.assign(P, base, extra);
+    resetSims(); P.paused = true;
+    for (let i = 0; i < 4000; i++) { stepSim(A, DT); if (A.arrived) break; }
+    updateHud();
+    return {arrived:!!A.arrived, t:+A.t.toFixed(2), ground:+(A.groundSpeed||0).toFixed(2),
+            rel:+(A.relSpeed3||0).toFixed(2), verdict: document.getElementById('verdict').innerHTML};
+  };
+  return {rel: runOne({criterion:'rel'}), abs: runOne({criterion:'abs'}),
+          climbAbs: runOne({criterion:'abs', vzT:1.5, vt:0})};
+})`).runInContext(ctx)();
+check(criteria.rel.arrived && !criteria.abs.arrived &&
+      criteria.abs.verdict.includes('地速判据不相容') &&
+      !criteria.climbAbs.arrived && criteria.climbAbs.verdict.includes('地速判据不相容'),
+      `末端判据可切换（相对：${criteria.rel.t} s 到点；地速：${criteria.abs.t} s 未到点，判词正确）`,
+      `判据切换失效：rel=${criteria.rel.arrived} abs=${criteria.abs.arrived} `
+      + `climbAbs=${criteria.climbAbs.arrived}`);
 
 process.exit(ok ? 0 : 1);

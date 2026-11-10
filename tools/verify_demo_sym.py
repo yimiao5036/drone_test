@@ -83,8 +83,8 @@ def main() -> int:
         page.screenshot(path=str(OUT / "sym-open-1440.png"))
         check(opened["open"], "点按钮能打开", "点了没反应")
         # 2026-11-09 Kimi 增补 dObs/dTruth 两条，符号表由 20 条变 21 条。
-        # 2026-11-10 加速度分层：a_lat 一条换成 a_phys/a_plan 两条 → 23 条。
-        check(opened["items"] == 23, f"条目 {opened['items']} 条", f"条目只有 {opened['items']} 条")
+        # 2026-11-10 加速度分层：a_lat 换成 a_phys/a_plan；垂直通道再加 dz/vz → 25 条。
+        check(opened["items"] == 25, f"条目 {opened['items']} 条", f"条目只有 {opened['items']} 条")
         check(not opened["overlap"], "两列符号不重叠", "符号条目重叠")
         card = opened["card"]
         check(card["y"] >= 0 and card["b"] <= opened["winH"], f"卡片在视口内（{card['y']}~{card['b']}）", "卡片超出视口")
