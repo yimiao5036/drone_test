@@ -74,6 +74,13 @@
        限速 2 m/s、限加速度 2 m/s²、刹车余量 1.3；到点 = 水平 3 m + 垂直 2 m + 速度判据。
        垂直用真值高度（演示不做垂直估计），图上有 |dz| 曲线与 2 m 容差线。
 
+    14) 视觉交接模型（2026-11-10，§5.14）：S5→S6 的放行条件不是"到点 3 m + 0.5 m/s"，
+        而是 LOCKED 连续 10 帧 + 双目测距 ≤7.95 m + 俯仰 ≤5.56°（FOV 10.56° − 5° 余量）
+        + 创新 ≤3 m；3 m/0.5 m/s/2 s 只是到点告警。测距 7.95 m 由标定推出
+        （fxb=63.5665 m·px ÷ disp_min_px=8），检测距离暂取 15 m（YOLO 未标定）。
+        默认 40 m 直线实测在 7.6 m / 5.5 s 就交接（相对速度 4.65 m/s），
+        高位目标会因俯仰出视场而推迟（高 10 m → 5.6 m / 6.0 s）。
+
   配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
   警示 #b45309、危险 #c0392b、成功 #3d7a1f。
 -->
@@ -263,7 +270,7 @@
         <div class="cell"><div class="k">刹车距离 d_brake</div><div class="v" id="sDb">—</div></div>
         <div class="cell"><div class="k">稳态接近速率</div><div class="v" id="sRate">—</div></div>
         <div class="cell"><div class="k">参考点领先</div><div class="v" id="sLag">—</div></div>
-        <div class="cell"><div class="k">到点用时</div><div class="v" id="sTa">—</div></div>
+        <div class="cell"><div class="k" title="到点告警：水平 3 m + 垂直 2 m + 速度 ≤0.5（机载还要求保持 2 s）。这只是告警线，不是 S5→S6 的交接判据——交接看视觉锁定 10 帧 + 测距有效 + 视场 + 创新">告警用时</div><div class="v" id="sTa">—</div></div>
         <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">理论用时</div><div class="v" id="sTt">—</div></div>
         <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">匀速段</div><div class="v" id="sTc">—</div></div>
       </div>
@@ -405,7 +412,7 @@
 
 <section class="charts">
   <div class="chart">
-    <div class="cap">距离 d(t)：<b style="color:#1677d2">设计</b> vs <b style="color:#c0392b">无余量</b>　绿虚线 = 到点半径 3 m　赭虚线 = |dz|、赭横线 = 垂直容差 2 m（垂直通道开启时显示）</div>
+    <div class="cap">距离 d(t)：<b style="color:#1677d2">设计</b> vs <b style="color:#c0392b">无余量</b>　绿虚线 = 到点告警线 3 m　紫竖线 = 视觉交接（测距 7.95 m 内且锁定 10 帧）　赭虚线 = |dz|、赭横线 = 垂直容差 2 m</div>
     <canvas id="chartD"></canvas>
   </div>
   <div class="chart">
@@ -426,6 +433,24 @@ const ARRIVAL_SPEED_MPS = 0.5;  // 与 handover 到点判据对齐（kHandoverAr
 const ARRIVAL_VERTICAL_M = 2.0; // 与 handover.arrival_vertical_m 对齐（2026-11-10）
 const VZ_MAX = 2.0;             // 垂直速度上限（position_guide_vz_mps=1.5，演示取 2）
 const AZ_MAX = 2.0;             // 垂直加速度上限（accel_limit.az_mps2=1.5，演示取 2）
+
+// ---- 视觉交接模型（2026-11-10）----
+// 与机载 HandoverEntryConditionsMet 同构（mission_state_machine.cpp:188）：
+//   视觉 LOCKED + 测距有效 + 视线角距边缘 ≥5° + 创新 ≤3 m + 连续锁定 10 帧。
+// 锁定帧与测距分开计数：LOCKED 帧在检测距离内就攒，交接发生在"条件全满足"的第一拍。
+// FOV 半角由内参推（取 (W−cx)/(H−cy) 侧，对上侧保守）：
+//   水平 atan((1280−620.7305)/1007.8217)=33.20°，垂直 atan((720−532.0672)/1008.0223)=10.56°。
+// 测距上限：双目 Z=f·b/d，d_min=8 px、fxb=63.5665 m·px → 7.95 m（对应 max_range_m=8）。
+// 检测距离：YOLO 未标定，暂取 15 m（维护者 2026-11-10 指定）。
+const CAM = { w: 1280, h: 720, fx: 1007.8217, fy: 1008.0223, cx: 620.7305, cy: 532.0672 };
+const FOV_HALF_AZ_DEG = Math.atan((CAM.w - CAM.cx) / CAM.fx) * 180 / Math.PI;
+const FOV_HALF_EL_DEG = Math.atan((CAM.h - CAM.cy) / CAM.fy) * 180 / Math.PI;
+const FOV_MARGIN_DEG = 5.0;       // handover.fow_margin_deg
+const INNOVATION_GATE_M = 3.0;    // handover.innovation_gate_m
+const RANGE_MAX_M = 7.95;         // 双目测距上限（fxb / disp_min_px）
+const DETECT_MAX_M = 15.0;        // 暂定：YOLO 检测距离未标定
+const LOCK_FRAMES = 10;           // handover.lock_frames
+const LOCK_PERIOD = 0.1;          // visual_monitor.publish_interval_ms=100
 const BRAKE_SAFETY = 1.3;
 const LEAD_TAU = 0.3;      // 位置设定点的跟随时间常数 s
 const LEAD_MAX_M = 6;      // 设定点最多领先飞机多少米
@@ -481,7 +506,7 @@ function gaussAt(k, salt) {
 //   update : 位置量测，K = P·Hᵀ/(H P Hᵀ + R)
 class AxisKF {
   constructor() { this.reset(); }
-  reset() { this.init = false; this.pos = 0; this.vel = 0; this.p00 = 0; this.p01 = 0; this.p10 = 0; this.p11 = 0; }
+  reset() { this.init = false; this.pos = 0; this.vel = 0; this.p00 = 0; this.p01 = 0; this.p10 = 0; this.p11 = 0; this.lastInnovY = 0; }
   start(z, posVar) {
     this.init = true; this.pos = z; this.vel = 0;
     this.p00 = Math.max(posVar, 0.25);   // minimum_measurement_std_m = 0.5
@@ -505,6 +530,7 @@ class AxisKF {
     if (!(denom > 0)) return;
     const kp = this.p00 / denom, kv = this.p10 / denom;
     const y = z - this.pos;
+    this.lastInnovY = y;   // 视觉/量测创新（交接判据用，2026-11-10）
     this.pos += kp * y; this.vel += kv * y;
     const o00 = this.p00, o01 = this.p01, o10 = this.p10, o11 = this.p11;
     this.p00 = (1 - kp) * o00;
@@ -530,6 +556,12 @@ function makeSim(variant) {
     minDRel: 0,                        // 最近接近点处的相对速度（判"匹配不了"）
     prevTv: null, tgtAccelPeak: 0,     // 目标机动加速度（真值，仅评价用）
     turnCapMin: Infinity, turnBind: false,   // 转弯约束是否削过"额外接近速度"
+    // 视觉交接（2026-11-10）：检测/锁定/交接三层，与机载 HandoverEntryConditionsMet 同构
+    detected: false, detectedAt: null, detectedMinD: null,
+    handover: false, handoverAt: null, handoverD: 0, handoverRel: 0, handoverEl: 0,
+    lockFrames: 0, lockBest: 0, lockSampleT: -1,
+    slant: 0, losElDeg: 0, innov: 0,
+    blkFov: 0, blkRange: 0, blkInnov: 0,   // 交接阻塞计数（每 100 ms 采样一次）
     step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
     est: {
       kfX: new AxisKF(), kfY: new AxisKF(), lastMeasT: -1,
@@ -1134,6 +1166,43 @@ function stepSim(s, dt) {
     s.dzAtMinD = dzAbs; s.minDSpeed = arrivalSpeedError;
   }
   if (s.minDzAbs === null || dzAbs < s.minDzAbs) s.minDzAbs = dzAbs;
+
+  // ---- 视觉交接（2026-11-10）----
+  // 与机载 HandoverEntryConditionsMet 同构；演示不做检测/测距的物理仿真，用真值几何评价。
+  // 方位角按 0 处理：S5 会把机头指向目标（mission_state_machine.cpp:3658 yaw=atan2(de,dn)），
+  // 目标在画面水平方向居中，限制交接的是俯仰（高度差）与测距，不是方位。
+  const dzNow = s.target.z - s.drone.z;
+  s.slant = Math.hypot(s.d, dzNow);
+  s.losElDeg = Math.atan2(dzNow, Math.max(1e-6, s.d)) * 180 / Math.PI;
+  const fovOk = Math.abs(s.losElDeg) + FOV_MARGIN_DEG <= FOV_HALF_EL_DEG;
+  const rangeOk = s.slant <= RANGE_MAX_M;
+  s.innov = s.est.kfX.init ? Math.hypot(s.est.kfX.lastInnovY, s.est.kfY.lastInnovY) : 0;
+  const innovOk = s.innov <= INNOVATION_GATE_M;
+  const detectedNow = fovOk && s.slant <= DETECT_MAX_M;
+  if (detectedNow && !s.detected) {
+    s.detected = true; s.detectedAt = s.t; s.detectedMinD = s.d;
+  }
+  if (!detectedNow) s.detected = false;
+  // LOCKED 帧按 monitor 10 Hz 采样；丢检即清零（连续帧语义）。
+  // 锁定帧与测距分开计数——测距有效前就攒帧，进入 RANGE_MAX 的那一拍才交接。
+  if (s.t - s.lockSampleT >= LOCK_PERIOD - 1e-9) {
+    s.lockSampleT = s.t;
+    if (detectedNow) {
+      s.lockFrames++;
+      if (s.lockFrames > s.lockBest) s.lockBest = s.lockFrames;
+    } else {
+      s.lockFrames = 0;
+    }
+    if (!s.handover && s.lockFrames >= LOCK_FRAMES && detectedNow && rangeOk && innovOk) {
+      s.handover = true; s.handoverAt = s.t; s.handoverD = s.d;
+      s.handoverRel = s.relSpeed3; s.handoverEl = s.losElDeg;
+    }
+    if (!s.handover) {
+      if (!fovOk) s.blkFov++;
+      else if (!rangeOk) s.blkRange++;
+      else if (!innovOk) s.blkInnov++;
+    }
+  }
   // stop 模式停在球面附近（a_d/1.3 的余量让它停在 3 m 略外侧），容差给 0.3 m；
   // match 模式在球面内侧收速，实测 3.00~3.02 m，仍按 0.02 m 严判。
   const arriveSlack = P.end === 'match' ? 0.02 : 0.3;
@@ -1403,12 +1472,21 @@ function drawDistanceChart() {
     }
     ctx.stroke(); ctx.restore();
   }
+  if (A.handoverAt != null) {
+    const x = g.X(A.handoverAt);
+    ctx.save(); ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = 'rgba(124,58,237,.8)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(x, g.padT); ctx.lineTo(x, g.padT + g.ih); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#7c3aed'; ctx.font = '600 10px ui-monospace,Consolas,monospace';
+    ctx.fillText('交接 ' + A.handoverAt.toFixed(1) + ' s', x + 4, g.padT + 24);
+  }
   if (A.arrivedAt != null) {
     const x = g.X(A.arrivedAt);
     ctx.strokeStyle = 'rgba(61,122,31,.75)'; ctx.lineWidth = 1.4;
     ctx.beginPath(); ctx.moveTo(x, g.padT); ctx.lineTo(x, g.padT + g.ih); ctx.stroke();
     ctx.fillStyle = '#3d7a1f'; ctx.font = '600 10px ui-monospace,Consolas,monospace';
-    ctx.fillText('到点 ' + A.arrivedAt.toFixed(1) + ' s', x + 4, g.padT + 12);
+    ctx.fillText('告警 ' + A.arrivedAt.toFixed(1) + ' s', x + 4, g.padT + 12);
   }
 }
 
@@ -1519,15 +1597,34 @@ function rms(values, keep) {
 }
 
 function updateHud() {
+  // 视觉交接状态放到画布角标（不占布局高度）：交接判据与"到点告警"是两件事，
+  // 放在读数行会把统计区撑高、压缩舞台（2026-11-10）。
+  const hoShort = A.handover
+    ? `${A.handoverD.toFixed(1)} m · ${A.handoverAt.toFixed(1)} s`
+    : (A.detected ? `锁 ${A.lockFrames}/${LOCK_FRAMES}` : '未检测');
+  const hoDetail = A.handover
+    ? `视觉交接 ${A.handoverAt.toFixed(1)} s @ ${A.handoverD.toFixed(1)} m，`
+      + `俯仰 ${A.handoverEl.toFixed(1)}°，相对 ${A.handoverRel.toFixed(2)} m/s`
+    : A.detected
+      ? `已检测但未交接：锁定 ${A.lockFrames}/${LOCK_FRAMES} 帧；` + (A.slant > RANGE_MAX_M
+        ? `斜距 ${A.slant.toFixed(2)} > ${RANGE_MAX_M.toFixed(2)} m（测距无效）`
+        : (Math.abs(A.losElDeg) + FOV_MARGIN_DEG > FOV_HALF_EL_DEG
+          ? `俯仰 ${A.losElDeg.toFixed(1)}° 超出 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`
+          : `创新 ${A.innov.toFixed(2)} > ${INNOVATION_GATE_M} m`))
+      : `未检测：斜距 ${A.slant.toFixed(1)} m > ${DETECT_MAX_M} m，或俯仰 `
+        + `${A.losElDeg.toFixed(1)}° 出视场 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`;
   $('hud').innerHTML = `
     <div class="box blue"><div class="k">设计机 d</div><div class="v">${A.d.toFixed(1)}<small>m</small></div></div>
     <div class="box blue"><div class="k">接近 v_c</div><div class="v">${A.vc.toFixed(2)}<small>m/s</small></div></div>
     <div class="box"><div class="k">剖面相位</div><div class="v" style="font-size:13px">${PHASE_NAME[A.phase] || A.phase}</div></div>
-    <div class="box orange"><div class="k">对照机 d</div><div class="v">${B.d.toFixed(1)}<small>m</small></div></div>`;
+    <div class="box orange"><div class="k">对照机 d</div><div class="v">${B.d.toFixed(1)}<small>m</small></div></div>
+    <div class="box" title="${hoDetail}"><div class="k">视觉交接</div>
+      <div class="v" style="font-size:12px;color:${A.handover ? '#3d7a1f' : 'inherit'}">${hoShort}</div></div>`;
   $('badgeTime').textContent = 't = ' + A.t.toFixed(1) + ' s';
   const bp = $('badgePhase');
-  bp.textContent = A.arrived ? '已到点（可交接）' : (PHASE_NAME[A.phase] || A.phase);
-  bp.className = 'badge' + (A.arrived ? ' on' : '');
+  bp.textContent = A.handover ? '可交接（视觉已锁定）'
+    : (A.arrived ? '到点告警（未交接）' : (PHASE_NAME[A.phase] || A.phase));
+  bp.className = 'badge' + (A.handover ? ' on' : '');
 
   // 判词读平台速度：无上限时平台是 ∞，就用已经跑到的峰值当"能维持的速度"
   const sustain = isFinite(A.plateau) ? A.plateau : (A.vpeak || 0);
@@ -1820,7 +1917,8 @@ requestAnimationFrame(frame);
           (Vmax²−v_t²)t_go² − 2(r·v_t)t_go − |r|² = 0，取最小正根并夹紧 t_go ≤ 4 s、提前距离 ≤ min(0.5·dObs, Vmax·0.5 s)<br>
           制动曲线：u_close = min(V_catch, √(2·(a_d/1.3)·max(dObs−R,0)))　比例接近：u_close = clamp(k(dAim−R), 0, Vmax)<br>
           v_des = v_ff + u_close·d̂，速度匹配时 v_ff=v_t（完整二维矢量，含横向分量），减到 0 时 v_ff=0<br>
-          |v_des| ≤ V_body；转弯约束：u_extra ≤ a_phys/λ̇ − |v_t|（λ̇ = |(v−v_t)·n⊥|/d）；<br>指令平滑：|a_cmd| ≤ slew（指令加速度上限）且 |ȧ_cmd| ≤ J（jerk）；plant 加速度硬夹在 a_phys
+          |v_des| ≤ V_body；转弯约束：u_extra ≤ a_phys/λ̇ − |v_t|（λ̇ = |(v−v_t)·n⊥|/d）；<br>指令平滑：|a_cmd| ≤ slew（指令加速度上限）且 |ȧ_cmd| ≤ J（jerk）；plant 加速度硬夹在 a_phys<br>
+          视觉交接（S5→S6）：LOCKED 连续 10 帧 + 斜距 ≤7.95 m（双目测距）+ 俯仰 ≤5.56°（FOV 10.56°−5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s 只是到点告警
         </div>
 <div class="symgrid">
           <div><b>dTruth</b><span>飞机到目标真值的距离，仅用于仿真图表和捕获评价</span></div>
@@ -1834,7 +1932,7 @@ requestAnimationFrame(frame);
           <div><b>Vmax</b><span>规划速度上限（上限滑块为 0 时取 6 m/s）</span></div>
           <div><b>k</b><span>比例增益 1/s：误差 1 m → 0.6 m/s 额外接近速度</span></div>
           <div><b>u_close</b><span>沿视线的相对接近速度，按当前速度律的制动曲线或比例增益计算</span></div>
-          <div><b>R</b><span>到点半径 3 m（真实距离进圈且相对速度够小才算捕获）</span></div>
+          <div><b>R</b><span>到点告警半径 3 m（绿虚线）；S5→S6 交接判据是视觉条件，不是它</span></div>
           <div><b>dz</b><span>目标高度差 z_t − z_d；垂直通道跟踪它，容差 2 m</span></div>
           <div><b>vz</b><span>机体垂直速度（限速 2 m/s、限加速度 2 m/s²）</span></div>
           <div><b>a_phys</b><span>机体物理加速度上限：plant 夹在这里，超过它的指令会被饱和</span></div>

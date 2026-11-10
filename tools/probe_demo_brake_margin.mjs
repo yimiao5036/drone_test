@@ -487,4 +487,46 @@ check(criteria.rel.arrived && !criteria.abs.arrived &&
       `判据切换失效：rel=${criteria.rel.arrived} abs=${criteria.abs.arrived} `
       + `climbAbs=${criteria.climbAbs.arrived}`);
 
+// ⑯ 视觉交接（§5.14）：S5→S6 的判据是"LOCKED 10 帧 + 测距 ≤7.95 m + 俯仰 ≤5.56° + 创新 ≤3 m"，
+//    不是"到点 3 m + 0.5 m/s"。默认 40 m 直线应在测距边缘、到点之前交接，且交接时相对速度 >0.5。
+const handover = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:3,
+    slew:3, vcap:10, vt:0, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel'};
+  const runOne = extra => {
+    Object.assign(P, base, extra);
+    resetSims(); P.paused = true;
+    for (let i = 0; i < 6000; i++) { stepSim(A, DT); if (A.arrived) break; }
+    return {handover:!!A.handover, hoT:A.handoverAt===null?null:+A.handoverAt.toFixed(2),
+            hoD:A.handoverD===null?null:+A.handoverD.toFixed(2),
+            hoRel:+A.handoverRel.toFixed(2), arrived:!!A.arrived,
+            arrT:A.arrivedAt===null?null:+A.arrivedAt.toFixed(2),
+            blkFov:A.blkFov, lockBest:A.lockBest};
+  };
+  return {straight: runOne({}), high: runOne({alt:10}),
+          climbEscape: runOne({alt:10, vzT:2}),
+          consts:{az:+FOV_HALF_AZ_DEG.toFixed(2), el:+FOV_HALF_EL_DEG.toFixed(2),
+                  range:+RANGE_MAX_M.toFixed(2), lock:LOCK_FRAMES}};
+})`).runInContext(ctx)();
+check(handover.consts.az > 33 && handover.consts.az < 34 &&
+      handover.consts.el > 10.5 && handover.consts.el < 10.7 &&
+      handover.consts.range > 7.9 && handover.consts.range < 8.0,
+      `视觉交接常量与标定一致（FOV ${handover.consts.az}°/${handover.consts.el}°，测距 ${handover.consts.range} m）`,
+      `视觉交接常量异常：${JSON.stringify(handover.consts)}`);
+check(handover.straight.handover &&
+      handover.straight.hoD <= handover.consts.range + 0.01 &&
+      handover.straight.hoT < handover.straight.arrT &&
+      handover.straight.hoRel > 0.5,
+      `默认直线在 ${handover.straight.hoT} s / ${handover.straight.hoD} m 交接`
+      + `（相对 ${handover.straight.hoRel} m/s，早于到点 ${handover.straight.arrT} s）`,
+      `默认直线未交接或交接点异常：${JSON.stringify(handover.straight)}`);
+check(handover.high.handover && handover.high.blkFov > 0 &&
+      handover.high.hoD < handover.straight.hoD,
+      `高 10 m 目标因俯仰出视场推迟交接（${handover.high.hoT} s / ${handover.high.hoD} m，`
+      + `FOV 阻塞 ${handover.high.blkFov} 拍）`,
+      `高位目标交接异常：${JSON.stringify(handover.high)}`);
+check(!handover.climbEscape.handover,
+      `目标以 2 m/s 爬升时俯仰始终出视场、不交接（阻塞 ${handover.climbEscape.blkFov} 拍）`,
+      `爬升逃逸工况竟然交接了：${JSON.stringify(handover.climbEscape)}`);
+
 process.exit(ok ? 0 : 1);
