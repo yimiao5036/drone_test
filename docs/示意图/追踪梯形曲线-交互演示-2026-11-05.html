@@ -650,7 +650,10 @@ function theoryApplicable() {
   const physRealizable = P.aPhys + 1e-9 >= Math.max(P.accel, P.decel / BRAKE_SAFETY);
   // 闭式解只算水平剖面；有高度差/垂直速度时到点时间还取决于垂直通道（§5.13）。
   const noVertical = P.alt === 0 && P.vzT === 0;
-  return P.profile === 'trap' && exactSource && P.turn === 'straight' &&
+  // 闭式解是"加速—巡航—制动"的理想剖面，只有实现该剖面的速度律能用它对照。
+  // 比例接近是 u=k(d−R) 连续收速、且保留 t_go 提前量，不适用（2026-11-10 修）。
+  const lawMatchesProfile = P.law === 'brake' || P.law === 'env';
+  return lawMatchesProfile && P.profile === 'trap' && exactSource && P.turn === 'straight' &&
     P.lead === 0 && P.jerk === 0 && oneDimensional && slewCompatible &&
     terminalConsistent && physRealizable && noVertical;
 }
@@ -661,6 +664,9 @@ function theoryBlockReason() {
     return '初始相对状态已越过三段剖面适用域（距离太短或初速过大）';
   }
   if (P.jerk > 0) return `jerk J=${P.jerk.toFixed(1)}（闭式解假设加速度瞬时反向）`;
+  if (P.law !== 'brake' && P.law !== 'env') {
+    return '比例接近律不是时间最优剖面，闭式解不适用';
+  }
   if (P.aPhys + 1e-9 < Math.max(P.accel, P.decel / BRAKE_SAFETY)) {
     return `规划加速度超过物理上限 a_phys=${P.aPhys.toFixed(1)}（剖面不可实现）`;
   }
@@ -780,6 +786,11 @@ function stepSim(s, dt) {
         }
         est.filterT = measuredAt;
         est.errEst.push(Math.hypot(est.kfX.pos - truth.x, est.kfY.pos - truth.y));
+        // 量测误差按"收到并接受一帧新消息"采样（不是每 20 ms 重写同一条）：
+        // 原来在每步都 push，4 s 攒 200 条而 HUD 按 4*measHz=20 条取 → 实际只有 0.4 s
+        //（2026-11-10 修）。这里用"过期量测点 vs 现在真值"，仍含时延 + 噪声。
+        est.errMeas.push(Math.hypot(mx - s.target.x, my - s.target.y));
+        if (est.errMeas.length > 200) est.errMeas.shift();
         // 长跑防护（2026-11-10）：rms 只取最近 4 s，窗口之外的历史不再需要；
         // 原来这三个数组无上限，300 s 不收敛工况能涨到上万条。
         if (est.errEst.length > 200) est.errEst.shift();
@@ -831,10 +842,6 @@ function stepSim(s, dt) {
     //   量测误差 = 过期量测点 vs 现在真值（含时延 + 噪声）
     //   估计误差 = 滤波后的状态 vs 该量测时刻的真值（纯降噪效果）
     //   预测误差 = 状态前视到"现在" vs 现在真值（控制器真正看到的点）
-    if (lastMeas) {
-      est.errMeas.push(Math.hypot(lastMeas.x - s.target.x, lastMeas.y - s.target.y));
-      if (est.errMeas.length > 200) est.errMeas.shift();
-    }
     est.errPred.push(Math.hypot(pred.x - s.target.x, pred.y - s.target.y));
     if (est.errPred.length > 600) est.errPred.shift();
     est.trail.push(p);
@@ -991,7 +998,17 @@ function stepSim(s, dt) {
   const ffX = useTargetFf ? gv.x : 0, ffY = useTargetFf ? gv.y : 0;
   let desiredX = 0, desiredY = 0, phase = 'idle';
   if (P.law === 'prop') {
-    const uWant = Math.min(plateau, Math.max(0, P.k * Math.max(0, dAim - offset)));
+    // 与制动曲线同口径：plateau 是"总速度上限"，不是"额外接近量"。
+    // 二维预算 u ≤ √(V² − v_t⊥²) − v_t∥，否则 desired = v_t + u 的总速度会到
+    // |v_t| + plateau，「余量决定能不能追上」的 A/B 对照在比例律下失效
+    // （safe 余量 0 时设计组与对照组结果完全相同，2026-11-10 修）。
+    const vCapTotal = isFinite(plateau) ? plateau
+      : (P.vcap > 0 ? P.vcap : V_PLAN_MPS);
+    const uBudget = P.end === 'match'
+      ? Math.max(0, Math.sqrt(Math.max(0, vCapTotal * vCapTotal - vtCross * vtCross)) -
+        Math.max(0, vtAlong))
+      : vCapTotal;
+    const uWant = Math.min(uBudget, Math.max(0, P.k * Math.max(0, dAim - offset)));
     const u = Math.min(uWant, uTurn);
     if (uTurn < uWant - 1e-9) s.turnBind = true;
     desiredX = ffX + u * ux;

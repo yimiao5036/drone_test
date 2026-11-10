@@ -551,4 +551,46 @@ check(accelParts.maxMag > 2.5 && accelParts.maxLat > 1.5 && accelParts.satPct > 
       + `切向均值 ${accelParts.meanTan}、饱和 ${accelParts.satPct}%）`,
       `加速度分量异常：${JSON.stringify(accelParts)}`);
 
+// ⑱ 比例接近律的二维总速度预算（2026-11-10 外部审查）：plateau 是总速度上限，
+//    不是额外接近量。否则 desired=v_t+u 的总速度到 |v_t|+plateau，A/B"余量"对照失效
+//    （safe 余量 0 时设计组与对照组结果完全相同）。
+const propBudget = new vm.Script(`(function(){
+  const base = {src:'truth', law:'prop', policy:'fast', end:'match', accel:3, decel:3, aPhys:3,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0, k:0.6,
+    floor:true, margin:1};
+  const runBoth = extra => {
+    Object.assign(P, base, extra); resetSims(); P.paused = true;
+    for (let i = 0; i < 8000; i++) { stepSim(A, DT); stepSim(B, DT); if (A.arrived) break; }
+    return {a:!!A.arrived, at:+A.t.toFixed(1), b:!!B.arrived, bd:+B.d.toFixed(1)};
+  };
+  const fast = runBoth({policy:'fast'}), safe0 = runBoth({policy:'safe', margin:0});
+  const safe1 = runBoth({policy:'safe', margin:1});
+  return {fast, safe0, safe1, theory: theoryApplicable()};
+})`).runInContext(ctx)();
+check(propBudget.fast.a && !propBudget.fast.b &&
+      !propBudget.safe0.a && !propBudget.safe0.b &&
+      propBudget.safe1.a && !propBudget.safe1.b,
+      `比例律总速度预算生效（fast：A ${propBudget.fast.at} s / B 停在 ${propBudget.fast.bd} m；`
+      + `safe 余量 1：A ${propBudget.safe1.at} s / B 停在 ${propBudget.safe1.bd} m）`,
+      `比例律预算仍有问题：${JSON.stringify(propBudget)}`);
+check(!propBudget.theory,
+      '比例接近律不显示梯形闭式理论值',
+      '比例接近律仍在显示闭式理论值（theoryApplicable 缺 law 门控）');
+
+// ⑲ 量测误差按"收到新消息"采样：5 Hz 跑 4 s 应约 19~20 条（原来每 20 ms 写一次，
+//    4 s 攒 200 条，而 HUD 只取 20 条 → 实际窗口 0.4 s）。
+const measWindow = new vm.Script(`(function(){
+  Object.assign(P, {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3,
+    aPhys:3, slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    noise:0.8, vsig:0, latency:200, measHz:5});
+  resetSims(); P.paused = true;
+  for (let i = 0; i < 200; i++) stepSim(A, DT);
+  return {meas:A.est.errMeas.length, pred:A.est.errPred.length,
+          est:A.est.errEst.length, hud:Math.round(4*P.measHz)};
+})`).runInContext(ctx)();
+check(measWindow.meas >= 15 && measWindow.meas <= 25 && measWindow.pred >= 190,
+      `量测误差按消息帧采样（4 s：量测 ${measWindow.meas} 条 / 预测 ${measWindow.pred} 条，`
+      + `HUD 窗口 ${measWindow.hud} 条）`,
+      `量测误差窗口口径错误：${JSON.stringify(measWindow)}`);
+
 process.exit(ok ? 0 : 1);
