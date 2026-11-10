@@ -75,11 +75,13 @@
        垂直用真值高度（演示不做垂直估计），图上有 |dz| 曲线与 2 m 容差线。
 
     14) 视觉交接模型（2026-11-10，§5.14）：S5→S6 的放行条件不是"到点 3 m + 0.5 m/s"，
-        而是 LOCKED 连续 10 帧 + 双目测距 ≤7.95 m + 俯仰 ≤5.56°（FOV 10.56° − 5° 余量）
-        + 创新 ≤3 m；3 m/0.5 m/s/2 s 只是到点告警。测距 7.95 m 由标定推出
-        （fxb=63.5665 m·px ÷ disp_min_px=8），检测距离暂取 15 m（YOLO 未标定）。
-        默认 40 m 直线实测在 7.6 m / 5.5 s 就交接（相对速度 4.65 m/s），
-        高位目标会因俯仰出视场而推迟（高 10 m → 5.6 m / 6.0 s）。
+        而是 LOCKED 连续 10 帧 + 双目测距 ≤7.95 m + 俯仰 ≤5.24°（测距校正 FOV
+        10.24° − 5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s/2 s 只是到点告警。
+        FOV 用双目测距测试的校正内参（P_ref：fx=fy=1057.3349、cx=692.7685、
+        cy=529.0832）；测距 7.95 m 由 fxb=63.5665 ÷ disp_min_px=8 推出；
+        识别距离未标定，不设门（机载只要识别到）。
+        默认 40 m 直线在 7.6 m / 5.5 s 交接（相对 4.65 m/s），
+        高位目标因俯仰出视场推迟（高 10 m → 5.6 m / 6.0 s）。
 
   配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
   警示 #b45309、危险 #c0392b、成功 #3d7a1f。
@@ -437,18 +439,20 @@ const AZ_MAX = 2.0;             // 垂直加速度上限（accel_limit.az_mps2=1
 // ---- 视觉交接模型（2026-11-10）----
 // 与机载 HandoverEntryConditionsMet 同构（mission_state_machine.cpp:188）：
 //   视觉 LOCKED + 测距有效 + 视线角距边缘 ≥5° + 创新 ≤3 m + 连续锁定 10 帧。
-// 锁定帧与测距分开计数：LOCKED 帧在检测距离内就攒，交接发生在"条件全满足"的第一拍。
-// FOV 半角由内参推（取 (W−cx)/(H−cy) 侧，对上侧保守）：
-//   水平 atan((1280−620.7305)/1007.8217)=33.20°，垂直 atan((720−532.0672)/1008.0223)=10.56°。
+// 锁定帧与测距分开计数：LOCKED 帧在视场内就攒，交接发生在"条件全满足"的第一拍。
+// FOV 半角用「双目测距测试」的校正后内参（stereo_rectify_uvc_1280x720.json 的 P_ref）：
+//   fx=fy=1057.3349、cx=692.7685、cy=529.0832（测距 Z=f·b/d 也用同一对校正图）。
+//   水平 atan((1280−692.7685)/1057.3349)=29.05°，垂直 atan((720−529.0832)/1057.3349)=10.24°。
+//   注意：机载 handover 的 fow_half_* 现在用 tracking.camera（原始 K_aux：33.19°/10.56°），
+//   与测距校正内参差 2~4°；演示按维护者 2026-11-10 指示用测距内参（取更紧的一侧，见 §5.14）。
 // 测距上限：双目 Z=f·b/d，d_min=8 px、fxb=63.5665 m·px → 7.95 m（对应 max_range_m=8）。
-// 检测距离：YOLO 未标定，暂取 15 m（维护者 2026-11-10 指定）。
-const CAM = { w: 1280, h: 720, fx: 1007.8217, fy: 1008.0223, cx: 620.7305, cy: 532.0672 };
+// 识别距离：未标定；机载只要"识别到"，不设距离门（2026-11-10）。
+const CAM = { w: 1280, h: 720, fx: 1057.3349, fy: 1057.3349, cx: 692.7685, cy: 529.0832 };
 const FOV_HALF_AZ_DEG = Math.atan((CAM.w - CAM.cx) / CAM.fx) * 180 / Math.PI;
 const FOV_HALF_EL_DEG = Math.atan((CAM.h - CAM.cy) / CAM.fy) * 180 / Math.PI;
 const FOV_MARGIN_DEG = 5.0;       // handover.fow_margin_deg
 const INNOVATION_GATE_M = 3.0;    // handover.innovation_gate_m
 const RANGE_MAX_M = 7.95;         // 双目测距上限（fxb / disp_min_px）
-const DETECT_MAX_M = 15.0;        // 暂定：YOLO 检测距离未标定
 const LOCK_FRAMES = 10;           // handover.lock_frames
 const LOCK_PERIOD = 0.1;          // visual_monitor.publish_interval_ms=100
 const BRAKE_SAFETY = 1.3;
@@ -1178,7 +1182,7 @@ function stepSim(s, dt) {
   const rangeOk = s.slant <= RANGE_MAX_M;
   s.innov = s.est.kfX.init ? Math.hypot(s.est.kfX.lastInnovY, s.est.kfY.lastInnovY) : 0;
   const innovOk = s.innov <= INNOVATION_GATE_M;
-  const detectedNow = fovOk && s.slant <= DETECT_MAX_M;
+  const detectedNow = fovOk;   // 识别距离未标定：只要在视场内就算识别到（2026-11-10）
   if (detectedNow && !s.detected) {
     s.detected = true; s.detectedAt = s.t; s.detectedMinD = s.d;
   }
@@ -1611,8 +1615,7 @@ function updateHud() {
         : (Math.abs(A.losElDeg) + FOV_MARGIN_DEG > FOV_HALF_EL_DEG
           ? `俯仰 ${A.losElDeg.toFixed(1)}° 超出 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`
           : `创新 ${A.innov.toFixed(2)} > ${INNOVATION_GATE_M} m`))
-      : `未检测：斜距 ${A.slant.toFixed(1)} m > ${DETECT_MAX_M} m，或俯仰 `
-        + `${A.losElDeg.toFixed(1)}° 出视场 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`;
+      : `未检测：俯仰 ${A.losElDeg.toFixed(1)}° 出视场 ±${(FOV_HALF_EL_DEG - FOV_MARGIN_DEG).toFixed(1)}°`;
   $('hud').innerHTML = `
     <div class="box blue"><div class="k">设计机 d</div><div class="v">${A.d.toFixed(1)}<small>m</small></div></div>
     <div class="box blue"><div class="k">接近 v_c</div><div class="v">${A.vc.toFixed(2)}<small>m/s</small></div></div>
@@ -1918,7 +1921,7 @@ requestAnimationFrame(frame);
           制动曲线：u_close = min(V_catch, √(2·(a_d/1.3)·max(dObs−R,0)))　比例接近：u_close = clamp(k(dAim−R), 0, Vmax)<br>
           v_des = v_ff + u_close·d̂，速度匹配时 v_ff=v_t（完整二维矢量，含横向分量），减到 0 时 v_ff=0<br>
           |v_des| ≤ V_body；转弯约束：u_extra ≤ a_phys/λ̇ − |v_t|（λ̇ = |(v−v_t)·n⊥|/d）；<br>指令平滑：|a_cmd| ≤ slew（指令加速度上限）且 |ȧ_cmd| ≤ J（jerk）；plant 加速度硬夹在 a_phys<br>
-          视觉交接（S5→S6）：LOCKED 连续 10 帧 + 斜距 ≤7.95 m（双目测距）+ 俯仰 ≤5.56°（FOV 10.56°−5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s 只是到点告警
+          视觉交接（S5→S6）：LOCKED 连续 10 帧 + 斜距 ≤7.95 m（双目测距）+ 俯仰 ≤5.24°（测距校正 FOV 10.24° − 5° 余量）+ 创新 ≤3 m；3 m/0.5 m/s 只是到点告警
         </div>
 <div class="symgrid">
           <div><b>dTruth</b><span>飞机到目标真值的距离，仅用于仿真图表和捕获评价</span></div>

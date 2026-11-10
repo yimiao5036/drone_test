@@ -487,8 +487,9 @@ check(criteria.rel.arrived && !criteria.abs.arrived &&
       `判据切换失效：rel=${criteria.rel.arrived} abs=${criteria.abs.arrived} `
       + `climbAbs=${criteria.climbAbs.arrived}`);
 
-// ⑯ 视觉交接（§5.14）：S5→S6 的判据是"LOCKED 10 帧 + 测距 ≤7.95 m + 俯仰 ≤5.56° + 创新 ≤3 m"，
+// ⑯ 视觉交接（§5.14）：S5→S6 的判据是"LOCKED 10 帧 + 测距 ≤7.95 m + 俯仰 ≤5.24° + 创新 ≤3 m"，
 //    不是"到点 3 m + 0.5 m/s"。默认 40 m 直线应在测距边缘、到点之前交接，且交接时相对速度 >0.5。
+//    FOV 用双目测距测试的校正内参（P_ref：fx=fy=1057.3349、cx=692.7685、cy=529.0832）。
 const handover = new vm.Script(`(function(){
   const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:3,
     slew:3, vcap:10, vt:0, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
@@ -508,10 +509,10 @@ const handover = new vm.Script(`(function(){
           consts:{az:+FOV_HALF_AZ_DEG.toFixed(2), el:+FOV_HALF_EL_DEG.toFixed(2),
                   range:+RANGE_MAX_M.toFixed(2), lock:LOCK_FRAMES}};
 })`).runInContext(ctx)();
-check(handover.consts.az > 33 && handover.consts.az < 34 &&
-      handover.consts.el > 10.5 && handover.consts.el < 10.7 &&
+check(handover.consts.az > 28.9 && handover.consts.az < 29.2 &&
+      handover.consts.el > 10.1 && handover.consts.el < 10.4 &&
       handover.consts.range > 7.9 && handover.consts.range < 8.0,
-      `视觉交接常量与标定一致（FOV ${handover.consts.az}°/${handover.consts.el}°，测距 ${handover.consts.range} m）`,
+      `视觉交接常量与测距校正内参一致（FOV ${handover.consts.az}°/${handover.consts.el}°，测距 ${handover.consts.range} m）`,
       `视觉交接常量异常：${JSON.stringify(handover.consts)}`);
 check(handover.straight.handover &&
       handover.straight.hoD <= handover.consts.range + 0.01 &&
