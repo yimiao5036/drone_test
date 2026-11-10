@@ -83,12 +83,14 @@ def main():
         for name, cfg, shot in cases:
             res = page.evaluate(RUN, cfg)
             summarize(name, res)
-            # 截图走真实 UI：点分段按钮，让高亮与 P 一致，再点「重置并重跑」
+            # 截图走真实 UI：切机动下拉，让控件态与 P 一致，再点「重置并重跑」
             page.evaluate(
                 """(cfg) => {
-                    const turnBtn = [...document.querySelectorAll('#turnSeg button')]
-                        .find(x => x.dataset.turn === cfg.turn);
-                    if (turnBtn) turnBtn.click();
+                    const sel = document.getElementById('turnSel');
+                    if (sel) {
+                        sel.value = cfg.turn;
+                        sel.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
                     const setS = (id, v) => {
                         const el = document.getElementById(id);
                         if (!el) return;
