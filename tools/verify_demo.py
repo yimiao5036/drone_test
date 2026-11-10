@@ -188,7 +188,7 @@ def main():
         page.screenshot(path=str(SHOT / "demo2-step-1440.png"))
 
         # --- 7) 保守 vs 时间最优（目标静止 40 m）
-        click_seg(page, "lawSeg", "law", "trap")
+        click_seg(page, "policySeg", "policy", "safe")
         set_slider(page, "vcap", 0)
         click_seg(page, "policySeg", "policy", "safe")
         set_slider(page, "vt", 0)
