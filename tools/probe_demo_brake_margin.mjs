@@ -55,6 +55,9 @@ function makeContext() {
   sandbox.globalThis = sandbox;
   const context = vm.createContext(sandbox);
   vm.runInContext(source[1], context, { filename: 'demo.js' });
+  // DOM 桩把所有 input.value 当 '0'，bindRange 会把 P 全清成 0；恢复页面默认值。
+  // 各用例仍显式覆盖自己用到的字段（含 aPhys——拆分后 plant 只认它）。
+  vm.runInContext('P.aPhys = 3; P.accel = 3; P.decel = 3; P.slew = 3; P.vcap = 10;', context);
   return context;
 }
 
@@ -73,7 +76,7 @@ const RUN = `(function(cfg){
 })`;
 
 const BASE = {
-  law: 'brake', policy: 'fast', end: 'match', accel: 3, decel: 3, slew: 3,
+  law: 'brake', policy: 'fast', end: 'match', accel: 3, decel: 3, slew: 3, aPhys: 3,
   vcap: 10, heading: 90, turn: 'straight',
 };
 const CASES = {
@@ -372,12 +375,12 @@ const weave8 = new vm.Script(`(function(){
   const base = {src:'truth', law:'brake', policy:'fast', end:'match',
     vt:8, heading:90, turn:'weave', startD:40, jerk:0, lead:0};
   const runOne = extra => {
-    Object.assign(P, base, {accel:3, decel:3, slew:3, vcap:10}, extra);
+    Object.assign(P, base, {accel:3, decel:3, slew:3, aPhys:3, vcap:10}, extra);
     resetSims(); P.paused = true;
     for (let i = 0; i < 6000; i++) { stepSim(A, DT); if (A.arrived) break; }
     return {arrived:!!A.arrived, minD:+(A.minD??A.d).toFixed(2)};
   };
-  return {base: runOne({}), a45: runOne({accel:4.5, decel:4.5, slew:4.5}),
+  return {base: runOne({}), a45: runOne({accel:4.5, decel:4.5, slew:4.5, aPhys:4.5}),
           cap16: runOne({vcap:16})};
 })`).runInContext(ctx)();
 check(!weave8.base.arrived && weave8.a45.arrived && !weave8.cap16.arrived,
@@ -414,5 +417,28 @@ const circle8 = new vm.Script(`(function(){
 check(!circle8.arrived && circle8.minD > 3 && circle8.verdict.includes('目标机动超出'),
       `绕圈 8 m/s 未进球时报能力边界（最近 ${circle8.minD} m，a_t=${circle8.tgtA}）`,
       `绕圈 8 m/s 归因不对：arrived=${circle8.arrived} minD=${circle8.minD}`);
+
+// ⑬ 加速度分层（§5.12）：a_phys 是 plant 硬上限，a_plan 只是规划。
+//    只调大 a_phys（规划不变）→ 剖面不变；a_plan > a_phys → 剖面不可实现（理论行判不可用）。
+const splitAccel = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3,
+    slew:3, vcap:10, vt:0, heading:90, turn:'straight', startD:40, jerk:0, lead:0};
+  const runOne = aPhys => {
+    Object.assign(P, base, {aPhys});
+    resetSims(); P.paused = true;
+    for (let i = 0; i < 3000; i++) { stepSim(A, DT); if (A.arrived) break; }
+    return {arrived:!!A.arrived, t:+A.t.toFixed(2), minD:+(A.minD??A.d).toFixed(2)};
+  };
+  Object.assign(P, base, {aPhys:2}); resetSims();
+  const theoryBlocked = !theoryApplicable() && theoryBlockReason().includes('物理上限');
+  return {p3: runOne(3), p10: runOne(10), p2: runOne(2), theoryBlocked};
+})`).runInContext(ctx)();
+check(Math.abs(splitAccel.p10.t - splitAccel.p3.t) < 0.05 && splitAccel.theoryBlocked,
+      `只调大 a_phys 不改变剖面（${splitAccel.p3.t} vs ${splitAccel.p10.t} s），a_plan>a_phys 判不可实现`,
+      `a_phys/a_plan 未分离：t3=${splitAccel.p3.t} t10=${splitAccel.p10.t} blocked=${splitAccel.theoryBlocked}`);
+check(!splitAccel.p2.arrived || splitAccel.p2.t > splitAccel.p3.t + 0.2 ||
+      splitAccel.p2.minD < 2.9,
+      `a_phys 低于规划时能力不足（a_phys=2：t=${splitAccel.p2.t} s / 最近 ${splitAccel.p2.minD} m）`,
+      `a_phys=2 没有体现能力不足（arrived=${splitAccel.p2.arrived} t=${splitAccel.p2.t}）`);
 
 process.exit(ok ? 0 : 1);

@@ -61,6 +61,12 @@
        蛇形 7 m/s 由"不到"变为 15.4 s 到点。剩余边界（蛇形 8 m/s：a_t=4.22 > a=3、
        且目标横向扫过会穿到 0.34 m）是目标机动超能力 + 1D 包络不建模横向接近，
        不是约束写错（§5.11）。
+   12) 加速度拆成两个量（2026-11-10，§5.12）：
+       a_phys = 机体物理硬上限（plant 夹在这里，对应实机倾角/推力）；
+       a_plan = 剖面/包络/闭式解用多少（原 a_a/a_d）。规划高于物理 → 剖面不可实现，
+       实际加速度被饱和、到点变慢甚至穿球；物理高于规划 → 只是"没把能力用满"，
+       剖面不会因为调大 a_phys 而变快。jerk 仍单独限：工程建议 ≥8 m/s³，
+       但当前"包络 + 独立限幅"结构下 J>0 会穿球（§5.4），默认 0 保持已知行为。
 
   配色沿用站点浅色主题（室外可读）：背景 #f5f7fa、面板 #fff、主色 #1677d2、
   警示 #b45309、危险 #c0392b、成功 #3d7a1f。
@@ -154,9 +160,9 @@
   .symbody .symgrid span{color:#606266; min-width:0}
   .stats .verdict{margin-top:5px; font-size:11px; color:var(--ink-2); line-height:1.45}
 
-  aside.panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; overflow:auto}
+  aside.panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:6px 12px; overflow:auto}
   aside h2{font-size:12px; margin:0 0 4px; color:var(--ink-2); font-weight:650}
-  .group{border-top:1px solid var(--line); padding-top:3px; margin-top:3px}
+  .group{border-top:1px solid var(--line); padding-top:2px; margin-top:2px}
   .group:first-of-type{border-top:0; margin-top:0; padding-top:0}
   .row{display:grid; grid-template-columns:70px 1fr 58px; align-items:center; gap:6px; margin:0}
   .row label{font-size:12px; color:var(--ink-2); white-space:nowrap}
@@ -233,13 +239,13 @@
         <div class="cell"><div class="k">本机速度</div><div class="v" id="sVd">—</div></div>
         <div class="cell"><div class="k">参考速度 v_ref</div><div class="v" id="sVr">—</div></div>
         <div class="cell"><div class="k">实际峰值</div><div class="v" id="sVp">—</div></div>
-        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_d/1.3">理论峰值</div><div class="v" id="sVpt">—</div></div>
+        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">理论峰值</div><div class="v" id="sVpt">—</div></div>
         <div class="cell"><div class="k">刹车距离 d_brake</div><div class="v" id="sDb">—</div></div>
         <div class="cell"><div class="k">稳态接近速率</div><div class="v" id="sRate">—</div></div>
         <div class="cell"><div class="k">参考点领先</div><div class="v" id="sLag">—</div></div>
         <div class="cell"><div class="k">到点用时</div><div class="v" id="sTa">—</div></div>
-        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_d/1.3">理论用时</div><div class="v" id="sTt">—</div></div>
-        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_d/1.3">匀速段</div><div class="v" id="sTc">—</div></div>
+        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">理论用时</div><div class="v" id="sTt">—</div></div>
+        <div class="cell"><div class="k" title="理想梯形：无 jerk、减速按 a_plan↓/1.3">匀速段</div><div class="v" id="sTc">—</div></div>
       </div>
       <div class="grid grid2" id="estRow" style="display:none">
         <div class="cell"><div class="k">量测误差 RMS</div><div class="v" id="sEm">—</div></div>
@@ -302,14 +308,19 @@
         <output id="marginOut">1.0</output>
       </div>
       <div class="row">
-        <label title="机体加速能力上限（m/s²）：加速段的飞机加速度夹在这里；闭式峰值和时间也由它决定">加速度 a_a</label>
+        <label title="剖面/闭式解用的规划加速度（a_plan，应 ≤ 物理上限）。调大=加速段更陡；超过 a_phys 时 plant 饱和，实际跟不上剖面">规划加速 a_plan</label>
         <input id="accel" type="range" min="0.4" max="5" step="0.1" value="3">
         <output id="accelOut">3.0 m/s²</output>
       </div>
       <div class="row">
-        <label title="机体减速能力上限（m/s²）：刹车包络用 a_d/1.3 留余量。调大=晚刹车、时间短；调小=早刹车、更保守">减速度 a_d</label>
+        <label title="刹车包络用的规划减速度（a_plan↓），包络按它/1.3 留余量。调大=晚刹车、时间短；调小=早刹车、更保守；超过 a_phys 时 plant 刹不住">规划减速 a_plan↓</label>
         <input id="decel" type="range" min="0.4" max="5" step="0.1" value="3">
         <output id="decelOut">3.0 m/s²</output>
+      </div>
+      <div class="row">
+        <label title="机体物理加速度上限（硬边界，plant 夹在这里）。多旋翼参考 g·tan(倾角)：45°≈9.8、30°≈5.7、20°≈3.6。默认 3 = 规划值，保持旧行为；调到规划值以下看“能力不够”，调高只说明“没把能力用满”">物理上限 a_phys</label>
+        <input id="aPhys" type="range" min="0.4" max="10" step="0.1" value="3">
+        <output id="aPhysOut">3.0 m/s²</output>
       </div>
       <div class="row">
         <label title="对完整二维速度指令做变化率限幅（m/s²），0 = 关闭">指令加速度</label>
@@ -405,7 +416,8 @@ const SPEED_WIN = 25;
 
 const P = {
   vt: 2.0, heading: 90, turn: 'straight',
-  margin: 1.0, accel: 3.0, decel: 3.0, slew: 3.0, // slew = 指令加速度上限（|ȧ| ≤ slew，m/s²）
+  margin: 1.0, accel: 3.0, decel: 3.0, slew: 3.0, // accel/decel = 规划值 a_plan（剖面/包络用）
+  aPhys: 3.0,                   // 机体物理加速度上限：plant 夹在这里；默认 = 规划值，保持旧行为
   jerk: 0.0,                    // jerk = 指令加速度变化率上限（m/s³），0 = 关闭二阶平滑
                                 // （J>0 会在刹车包络拐点冲过界，短距离穿过到点球；结构问题待定，见分析文档 §5.4）
   profile: 'trap', end: 'match', floor: true,
@@ -489,7 +501,7 @@ function makeSim(variant) {
     minD: null, minDT: 0, envPeak: 0, envPeakT: 0,   // 2026-11-10：穿球/越界读数
     minDRel: 0,                        // 最近接近点处的相对速度（判"匹配不了"）
     prevTv: null, tgtAccelPeak: 0,     // 目标机动加速度（真值，仅评价用）
-    turnCapMin: Infinity, turnBind: false,   // 转弯约束是否削过指令
+    turnCapMin: Infinity, turnBind: false,   // 转弯约束是否削过"额外接近速度"
     step: 0, seen: { x: 0, y: 0 }, truthHist: [], filterT: null,
     est: {
       kfX: new AxisKF(), kfY: new AxisKF(), lastMeasT: -1,
@@ -549,8 +561,11 @@ function theoryApplicable() {
   // 闭式解的末端条件是"相对速度 0"：只有速度匹配（v_end=v_t）或静止目标（v_t=0）
   // 才成立。end=stop + 动目标时末端相对速度是 −v_t，三角形剖面不适用（2026-11-10）。
   const terminalConsistent = P.end === 'match' || P.vt <= 1e-9;
+  // 剖面必须可实现：规划加速度不能超过物理硬上限，否则闭式解只是纸面值（§5.12）。
+  const physRealizable = P.aPhys + 1e-9 >= Math.max(P.accel, P.decel / BRAKE_SAFETY);
   return P.profile === 'trap' && exactSource && P.turn === 'straight' &&
-    P.lead === 0 && P.jerk === 0 && oneDimensional && slewCompatible && terminalConsistent;
+    P.lead === 0 && P.jerk === 0 && oneDimensional && slewCompatible &&
+    terminalConsistent && physRealizable;
 }
 
 // 闭式解不可用时，给出具体原因（判词里直接显示，避免笼统的"场景不支持"）。
@@ -559,6 +574,9 @@ function theoryBlockReason() {
     return '初始相对状态已越过三段剖面适用域（距离太短或初速过大）';
   }
   if (P.jerk > 0) return `jerk J=${P.jerk.toFixed(1)}（闭式解假设加速度瞬时反向）`;
+  if (P.aPhys + 1e-9 < Math.max(P.accel, P.decel / BRAKE_SAFETY)) {
+    return `规划加速度超过物理上限 a_phys=${P.aPhys.toFixed(1)}（剖面不可实现）`;
+  }
   if (P.src !== 'truth' && !(P.src === 'vmsg' && P.noise === 0 && P.vsig === 0)) {
     return '目标位置来源带噪声/时延（σ 或 σ_v > 0）';
   }
@@ -587,7 +605,7 @@ function resetSims() {
 
 // 四段剖面：加速 → 巡航 → 减速(斜边) → 速度匹配
 //   v_cruise = max(地板?, |v_t| + 余量)                     ← 决定"能不能追上"
-//   d_brake  = R_arr + (v_cruise² − v_end²)/(2a)·1.3 + 0.5   ← 决定"何时开始减速"
+//   d_brake  = R_arr + (v_cruise² − v_end²)/(2·(a_plan↓/1.3))   ← 决定"何时开始减速"
 function stepSim(s, dt) {
   if (s.arrived) return;
 
@@ -869,7 +887,7 @@ function stepSim(s, dt) {
   // 新写法在机速已经跟上目标时 λ̇→0，约束自然释放；它只压"还差多少没追上"。
   const relCross = (s.vel.x - gv.x) * (-uy) + (s.vel.y - gv.y) * ux;
   const omegaLos = Math.abs(relCross) / Math.max(1e-6, dObs);
-  const uTurn = omegaLos > 1e-4 ? Math.max(0, P.accel / omegaLos - vtAbs) : Infinity;
+  const uTurn = omegaLos > 1e-4 ? Math.max(0, P.aPhys / omegaLos - vtAbs) : Infinity;
   if (isFinite(uTurn) && uTurn < (s.turnCapMin ?? Infinity)) s.turnCapMin = uTurn;
 
 
@@ -1010,7 +1028,10 @@ function stepSim(s, dt) {
   s.dbrk = Math.max(0, offset + uNow * uNow / (2 * (P.decel / BRAKE_SAFETY)));
   let ax = (cmdX - s.vel.x) / dt, ay = (cmdY - s.vel.y) / dt;
   const aMag = Math.hypot(ax, ay);
-  const aLimit = (phase === 'decel' || phase === 'match') ? P.decel : P.accel;
+  // plant 只受物理硬上限约束（2026-11-10 拆分）：规划值只影响指令，不再夹 plant。
+  // a_plan > a_phys 时能看到"规划超出能力"的饱和；a_phys > a_plan 时能看到
+  // "能力够但规划没把能力用满"（只调大 a_phys 不会让剖面变快）。
+  const aLimit = P.aPhys;
   if (aMag > aLimit) { ax *= aLimit / aMag; ay *= aLimit / aMag; }
   s.a = Math.hypot(ax, ay);   // 本拍实际施加的加速度（指令经 aLimit 夹过）
   // 切向投影：正 = 加速、负 = 减速。速度接近 0 时用指令方向兜底，避免起步被画成 0。
@@ -1483,8 +1504,8 @@ function updateHud() {
       : '（未进到点球内）';
   $('minNote').innerHTML = `本次最小距离 <b>${minD.toFixed(2)} m</b>${arriveTxt}`
     + `　包络最大越界 <b>${envPeak.toFixed(2)} m/s</b>`
-    + `　目标机动峰值 <b style="color:${tgtA > P.accel ? '#c0392b' : 'inherit'}">${tgtA.toFixed(2)}</b> m/s²`
-    + `（a_a=${P.accel.toFixed(1)}，真值仅评价）`
+    + `　目标机动峰值 <b style="color:${tgtA > P.aPhys ? '#c0392b' : 'inherit'}">${tgtA.toFixed(2)}</b> m/s²`
+    + `（a_phys=${P.aPhys.toFixed(1)}，真值仅评价）`
     + (A.turnBind
       ? `　转弯约束（额外接近）最小 <b>${isFinite(A.turnCapMin) ? A.turnCapMin.toFixed(2) : '—'}</b> m/s`
       : '')
@@ -1520,13 +1541,13 @@ function updateHud() {
       + `差值上（红色虚线不收敛）。余量就是稳态收敛速率。`;
   } else if (!A.arrived && A.minD != null && A.minD <= ARRIVAL_RADIUS_M + 0.05 &&
              A.d > A.minD + 0.3 && (A.minDRel || 0) > ARRIVAL_SPEED_MPS &&
-             ((A.tgtAccelPeak || 0) > P.accel || A.turnBind)) {
+             ((A.tgtAccelPeak || 0) > P.aPhys || A.turnBind)) {
     // "进过球但没置位"：不是判定点坏了，是相对速度压不到 0.5。两种机制：
-    //   ① 目标机动加速度 > 机体 a_a（典型：蛇形，a_t = v_t·0.528，与速度成正比）；
+    //   ① 目标机动加速度 > 机体物理上限 a_phys（典型：蛇形，a_t = v_t·0.528，与速度成正比）；
     //   ② 目标横向扫过：1D 包络只看距离/接近速度，目标自己扫过来时距离会直接缩水。
     const why = [];
-    if ((A.tgtAccelPeak || 0) > P.accel) {
-      why.push(`目标机动加速度 ${A.tgtAccelPeak.toFixed(2)} m/s² > 机体 a_a=${P.accel.toFixed(1)}，`
+    if ((A.tgtAccelPeak || 0) > P.aPhys) {
+      why.push(`目标机动加速度 ${A.tgtAccelPeak.toFixed(2)} m/s² > 机体 a_phys=${P.aPhys.toFixed(1)}，`
         + `速度矢量跟不上`);
     }
     if (A.turnBind) {
@@ -1538,12 +1559,12 @@ function updateHud() {
       : '';
     v.innerHTML = `<b style="color:#b45309">追得上但匹配不了</b>：飞机进过 3 m 球（最近 ${A.minD.toFixed(2)} m），`
       + `但最近点相对速度 ${(A.minDRel || 0).toFixed(2)} m/s > 0.5；到点判据要求"距离 + 相对速度"同拍成立，`
-      + `所以永远不置位。原因：${why.join('；')}${sweep}。调大 a_a 或降低目标机动强度可解，`
+      + `所以永远不置位。原因：${why.join('；')}${sweep}。调大 a_phys 或降低目标机动强度可解，`
       + `只提高速度上限无效（实测 vcap 10→16 仍到不了）。`;
-  } else if (!A.arrived && (A.tgtAccelPeak || 0) > P.accel * 1.02 && A.t > 4) {
+  } else if (!A.arrived && (A.tgtAccelPeak || 0) > P.aPhys * 1.02 && A.t > 4) {
     // 从未进到球内，但目标机动已经超出机体加速度：能力边界，不是参数没调好。
     v.innerHTML = `<b style="color:#b45309">目标机动超出机体能力</b>：机动加速度峰值 `
-      + `${A.tgtAccelPeak.toFixed(2)} m/s² > a_a=${P.accel.toFixed(1)}，飞机跟不住目标速度矢量，`
+      + `${A.tgtAccelPeak.toFixed(2)} m/s² > a_phys=${P.aPhys.toFixed(1)}，飞机跟不住目标速度矢量，`
       + `到点球内压不到 0.5 m/s（本次最近 ${minD.toFixed(2)} m）。提高速度上限无效，`
       + `只能提高机体加速度或降低目标机动强度。`;
   } else if (P.policy === 'fast') {
@@ -1614,6 +1635,7 @@ bindRange('startd', 'startD', v => v.toFixed(0) + ' m');
 bindRange('margin', 'margin', v => v.toFixed(1));
 bindRange('accel', 'accel', v => v.toFixed(1) + ' m/s²');
 bindRange('decel', 'decel', v => v.toFixed(1) + ' m/s²');
+bindRange('aPhys', 'aPhys', v => v.toFixed(1) + ' m/s²');
 bindRange('slew', 'slew', v => v > 0 ? v.toFixed(1) + ' m/s²' : '关闭');
 bindRange('jerk', 'jerk', v => v > 0 ? v.toFixed(1) + ' m/s³' : '关闭');
 bindRange('vcap', 'vcap', v => v > 0 ? v.toFixed(1) + ' m/s' : '默认 ' + V_PLAN_MPS);
@@ -1692,7 +1714,7 @@ requestAnimationFrame(frame);
           (Vmax²−v_t²)t_go² − 2(r·v_t)t_go − |r|² = 0，取最小正根并夹紧 t_go ≤ 4 s、提前距离 ≤ min(0.5·dObs, Vmax·0.5 s)<br>
           制动曲线：u_close = min(V_catch, √(2·(a_d/1.3)·max(dObs−R,0)))　比例接近：u_close = clamp(k(dAim−R), 0, Vmax)<br>
           v_des = v_ff + u_close·d̂，速度匹配时 v_ff=v_t（完整二维矢量，含横向分量），减到 0 时 v_ff=0<br>
-          |v_des| ≤ min(V_body, a_lat·dAim/v_t⊥)；<br>指令平滑：|a_cmd| ≤ slew（指令加速度上限）且 |ȧ_cmd| ≤ J（jerk）；飞机加速度再受 a_a/a_d 限制
+          |v_des| ≤ V_body；转弯约束：u_extra ≤ a_phys/λ̇ − |v_t|（λ̇ = |(v−v_t)·n⊥|/d）；<br>指令平滑：|a_cmd| ≤ slew（指令加速度上限）且 |ȧ_cmd| ≤ J（jerk）；plant 加速度硬夹在 a_phys
         </div>
 <div class="symgrid">
           <div><b>dTruth</b><span>飞机到目标真值的距离，仅用于仿真图表和捕获评价</span></div>
@@ -1707,13 +1729,14 @@ requestAnimationFrame(frame);
           <div><b>k</b><span>比例增益 1/s：误差 1 m → 0.6 m/s 额外接近速度</span></div>
           <div><b>u_close</b><span>沿视线的相对接近速度，按当前速度律的制动曲线或比例增益计算</span></div>
           <div><b>R</b><span>到点半径 3 m（真实距离进圈且相对速度够小才算捕获）</span></div>
-          <div><b>a_lat</b><span>可用加速度（加速 a_a / 减速 a_d）</span></div>
-          <div><b>u_turn</b><span>转弯约束：额外接近速度 ≤ a/λ̇ − |v_t|，λ̇ = |(v−v_t)·n⊥|/d（只削额外接近，不削前馈）</span></div>
+          <div><b>a_phys</b><span>机体物理加速度上限：plant 夹在这里，超过它的指令会被饱和</span></div>
+          <div><b>a_plan</b><span>剖面/包络/闭式解用的规划加速度（应 ≤ a_phys）</span></div>
+          <div><b>u_turn</b><span>转弯约束：额外接近速度 ≤ a_phys/λ̇ − |v_t|，λ̇ = |(v−v_t)·n⊥|/d（只削额外接近，不削前馈）</span></div>
           <div><b>v_ref</b><span>实际二维速度指令在视线方向上的投影，仅用于曲线对照</span></div>
           <div><b>v</b><span>飞机当前速度矢量（含方向滞后）</span></div>
           <div><b>v_c</b><span>沿瞄准线的接近率 = (v−v_ff)·d̂；≥0 才在缩小瞄准距离</span></div>
-          <div><b>d_brake</b><span>按当前相对接近速度刹到末端速度所需距离（a_d/1.3，与包络同口径）</span></div>
-          <div><b>envelope</b><span>刹车包络 v_t∥ + √(2a_d(dAim−R))，梯形律用它切减速</span></div>
+          <div><b>d_brake</b><span>按当前相对接近速度刹到末端速度所需距离（a_plan↓/1.3，与包络同口径）</span></div>
+          <div><b>envelope</b><span>刹车包络 v_t∥ + √(2·(a_plan↓/1.3)·(dObs−R))，梯形律用它切减速</span></div>
           <div><b>lag</b><span>「参考点领先」：位置设定点与飞机的距离</span></div>
           <div><b>σ_a</b><span>卡尔曼过程噪声：目标加速度标准差（机载 8.0 m/s²）</span></div>
           <div><b>J</b><span>jerk 上限（m/s³）：加速度按它爬坡，短距离时到不了 a_cap，加速度自然随场景变</span></div>
