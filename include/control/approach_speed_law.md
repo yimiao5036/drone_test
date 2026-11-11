@@ -52,6 +52,9 @@ config.approach.speed_law（approach 节） ───────┴─► Appro
   会在制动段额外加速，2026-11-11 SITL 实测冲进控制间距（0.65m）。
 - `max_speed_mps = max(|v_ref|, 0.5)`，只用于控制器“位置引导限速”；控制器
   仍有 `position_guide_speed_mps` 与前馈硬上限兜底。
+- **速度上限唯一来源**：`ApproachSpeedLaw` 构造参数 `max_speed_mps`，由
+  `MissionStateMachineConfig::max_speed_mps`（即 `controller.max_speed_mps`）注入；
+  本模块配置不重复定义。
 - S5 只有本律一条路径（2026-11-11 已删除旧“目标点 + 固定提前”回退）；输入无效
   （无局部位置/目标无效）时本拍不发意图并打节流 WARN。
 
@@ -84,7 +87,6 @@ config.approach.speed_law（approach 节） ───────┴─► Appro
 | `accel_phys_mps2` | 9.8 | 机体物理加速度上限（只封顶） |
 | `accel_term_mps2` | 1.5 | 近段加速度下限 |
 | `slew_mps2` | 3.0 | 指令加速度上限；0=关闭一阶限幅 |
-| `speed_cap_mps` | 6.0（生产）/10.0（代码默认） | 机体总速度上限；与 `controller.max_feedforward_mps` 对齐 |
 | `brake_safety` | 1.3 | 制动力先除该系数 |
 | `terminal_gain` | 1.5 | 末端比例收敛增益 |
 | `lead_scaled_k` / `lead_scaled_max_m` / `lead_extra_m` | 0.06 / 2.0 / 0.0 | 距离自适应提前量 |
@@ -127,9 +129,9 @@ ctest --test-dir build -R 'ApproachSpeedLaw|SpeedLaw' --output-on-failure
 - **首拍速度很小**：正常——指令从自机速度按 `slew` 爬坡（10 Hz 下 0.3 m/s/拍）；
   不是“没生效”。
 - **到点前冲/回退**：先看 `brake_safety`、`decel_plan_mps2`、`accel_term_mps2`；
-  再确认 `speed_cap_mps` 与 `controller.max_feedforward_mps` 是否一致（不一致时
-  实际能力比规划低，包络会显得保守/激进）。
-- **追运动目标越拉越远**：查 `speed_cap_mps` 是否大于 `|v_t|`，以及
+  再确认 `controller.max_speed_mps` 与 PX4 `MPC_XY_VEL_MAX` 一致（不一致时实际
+  能力低于规划，包络会失真）。
+- **追运动目标越拉越远**：查 `controller.max_speed_mps` 是否大于 `|v_t|`，以及
   `v_catch` 是否被侧向预算削到 0（目标横向速度过大）。
 - **坡/高度超调**：垂直通道与水平解耦，`vertical_margin_m` 与
   `vertical_accel_cap_mps2` 是主要旋钮；水平律修改不应影响垂直。

@@ -37,8 +37,8 @@ struct ApproachSpeedLawConfig {
     double accel_term_mps2 = 1.5;
     /// 指令加速度上限（m/s²，下发力约束）；0=不限制。
     double slew_mps2 = 3.0;
-    /// 机体总速度上限（m/s）。
-    double speed_cap_mps = 10.0;
+    /// 机体总速度上限（m/s）由构造参数 `max_speed_mps` 注入（唯一来源：
+    /// `controller.max_speed_mps`），本结构不重复定义，避免与控制器/PX4 不一致。
     /// 制动安全系数：减速度先除以该值，吸收离散化越界。
     double brake_safety = 1.3;
     /// 末端比例收敛增益（1/s）。
@@ -130,7 +130,9 @@ struct ApproachOutput {
 /// S5 接近段速度律。
 class ApproachSpeedLaw {
 public:
-    explicit ApproachSpeedLaw(const ApproachSpeedLawConfig& config);
+    /// @param config 速度律参数
+    /// @param max_speed_mps 机体水平速度上限（唯一来源：controller.max_speed_mps）
+    ApproachSpeedLaw(const ApproachSpeedLawConfig& config, double max_speed_mps);
 
     /// 单周期计算；now_ms 为单调时钟毫秒（用于 dt 与目标时延）。
     ApproachOutput Update(const ApproachInput& input, std::int64_t now_ms);
@@ -140,6 +142,7 @@ public:
 
 private:
     ApproachSpeedLawConfig cfg_;
+    double max_speed_mps_ = 10.0;  ///< 注入的机体水平速度上限（不重复配置）
     bool initialized_ = false;
     std::int64_t last_now_ms_ = 0;
     // 上一拍目标速度样本（差分目标加速度）

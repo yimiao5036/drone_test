@@ -54,7 +54,8 @@ sitl_web_gcs.py → TCP 5761（只桥机载地面站链路，与上一行是两�
    （需要 `build/drone_control` 与 `build/px4_link_smoke`）；
 4. 无需真实硬件；SITL 参数由装置在启动后设置（`COM_LOW_BAT_ACT=0`、
    `BAT_LOW_THR=0.15`、`SIM_BAT_MIN_PCT=50`、`SIM_BAT_DRAIN=0`；`stack` 设
-   `MPC_XY_VEL_MAX=6.0` 供接近速度律验收，`smoke` 另设 `MPC_XY_VEL_MAX=2.0`）。
+   `MPC_XY_VEL_MAX=10.0` 供接近速度律验收（与 `controller.max_speed_mps=10` 同源），
+   `smoke` 另设 `MPC_XY_VEL_MAX=2.0`）。
 5. **想看 3D（可选）**：需要 WSLg（`/mnt/wslg` 存在、`$DISPLAY` 有值，Windows 11 +
    WSL2 默认自带；缺了先 `wsl --update`），然后
    `SITL_GUI=1 bash tools/sitl_harness.sh stack` —— Gazebo 窗口会直接出现在 Windows
@@ -176,7 +177,7 @@ python3 tools/assignment_sitl.py --connection /tmp/gcs_test \
 | `PX4 SITL 启动失败` | 看 `$LOG_DIR/px4.log` 尾部；确认 `~/PX4-Autopilot` 已构建、Gazebo 可用、无残留 `gz sim`（先 `stop`） |
 | `drone_control 未进入 READY` | 看 `$LOG_DIR/app.log` 与机载日志：PX4 心跳/UDP 端口占用、`ground_station.serial.device` 是否 `/tmp/gcs_app`、桥是否先于 app 启动 |
 | 65014 无 65015 回执 | 地址双字段是否 `1/25`、地面站来源是否 `255/190`；`enable_control=true` 且命令接口已注入 |
-| PX4 拒绝解锁 / `Preflight Fail: No connection to the GCS` | 14550 上有没有 255/190 心跳：`pgrep -af sitl_gcs`、`tail $LOG_DIR/gcs.log`；用 QGC 时确认 `sitl_gcs.py` 已停（端口冲突反而两边都收不到）；再查 `COM_LOW_BAT_ACT=0`；S5 引导速度受 `MPC_XY_VEL_MAX` 约束（`smoke` 已设 2.0） |
+| PX4 拒绝解锁 / `Preflight Fail: No connection to the GCS` | 14550 上有没有 255/190 心跳：`pgrep -af sitl_gcs`、`tail $LOG_DIR/gcs.log`；用 QGC 时确认 `sitl_gcs.py` 已停（端口冲突反而两边都收不到）；再查 `COM_LOW_BAT_ACT=0`；S5 引导速度受 `MPC_XY_VEL_MAX` 约束（`stack` 设 10.0，`smoke` 设 2.0） |
 | 手工清理进程时 shell 自杀 | 不要用 `pkill -f "gz sim"`（会匹配到自己的命令行）；用括号转义 `pkill -f "[g]z sim"`（本装置已按此处理）。**注意**：若同一条命令里既有 `harness stop` 又出现 `gz sim`/`sitl_pty_bridge`/`sitl_gcs` 字样，括号转义仍会命中，导致 shell 被 SIGTERM；杀桥请改用 `tmux kill-session -t bridge` |
 | 围栏恒越界 / 65014 恒被拒 21 | `config/zone.json` 是运行时缓存：换场地或换 SITL 前删除 `config/zone.json` 与 `build/config/zone.json`（旧坐标区域与当前 Home 相距过远会恒越界；机载启动无缓存时会生成 Home 中心 100m 默认区域 1/1，地面站需声明 1/1 或 `--zone-id 0` 不声明） |
 | 场景间状态残留 | 用 `stack`/`smoke` 干净重启；`app` 只重启机载，PX4 侧位置/模式状态保留 |

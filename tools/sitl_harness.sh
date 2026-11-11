@@ -181,9 +181,9 @@ cmd_stack() {
     start_bridge
     start_px4
     set_common_params
-    # stack 是人工/SITL 验收场景：速度上限放到 6，避免上一轮 smoke 持久化的
-    # MPC_XY_VEL_MAX=2 把 S5 接近速度律（speed_cap=6）压成 2 m/s。
-    px4_param MPC_XY_VEL_MAX 6.0
+    # stack 是人工/SITL 验收场景：水平速度上限与 controller.max_speed_mps=10
+    # 同源，避免上一轮 smoke 持久化的 MPC_XY_VEL_MAX=2 把速度律压成 2 m/s。
+    px4_param MPC_XY_VEL_MAX 10.0
     start_gcs
     start_app "$cfg"
     info "环境就绪。验收工具示例："

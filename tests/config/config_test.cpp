@@ -743,16 +743,16 @@ TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
     // 生产配置（2026-11-02 起）已声明 controller/approach 节：逐项核对解析结果。
     const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
     EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
-    EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
+    EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 10.0);
     // P0-2：位置型意图按 position_guide_* 从当前位置推进（限制跳变速度）；
-    // 前馈与上限用于追运动目标。
+    // 前馈与上限用于追运动目标。2026-11-11 起三者缺省同源于 max_speed_mps。
     EXPECT_TRUE(config.controller.enable_position_velocity_feedforward);
-    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 6.0);
-    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 10.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 10.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
     // 2026-11-11：S5 改为接近速度律；旧 speed_mps/lead_time/guide_lowpass 已删除。
+    // 速度上限由 controller.max_speed_mps 注入，speed_law 不重复定义。
     EXPECT_DOUBLE_EQ(config.approach.speed_law.standoff_m, 2.9);
-    EXPECT_DOUBLE_EQ(config.approach.speed_law.speed_cap_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.approach.speed_law.brake_safety, 1.3);
     EXPECT_TRUE(config.approach.speed_law.speed_match);
     EXPECT_TRUE(config.approach.speed_law.auto_boost);
@@ -788,11 +788,9 @@ TEST(ConfigTest, ControllerAndApproachFallBackToDefaultsWhenAbsent) {
     EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
     EXPECT_FALSE(config.controller.enable_position_velocity_feedforward);
     EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
-    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 2.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
-    // 速度律缺席时回退代码默认（standoff 2.9、speed_cap 10、ref_lead 0.3）。
     EXPECT_DOUBLE_EQ(config.approach.speed_law.standoff_m, 2.9);
-    EXPECT_DOUBLE_EQ(config.approach.speed_law.speed_cap_mps, 10.0);
     EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_s, 0.3);
     std::filesystem::remove(path);
 }

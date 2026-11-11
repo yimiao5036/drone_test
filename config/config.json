@@ -162,26 +162,23 @@
         "command_retry_ms": 1000
     },
     "controller": {
-        "_comment": "飞行控制器（阶段四）。max_speed_mps 只约束速度式意图；位置型意图按 position_guide_speed_mps 从当前位置向目标推进（2026-11-02 P0-2，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去）。",
+        "_comment": "飞行控制器（阶段四）。max_speed_mps 是水平速度上限的唯一来源：max_feedforward_mps / position_guide_speed_mps 缺席时自动取该值；速度律 speed_cap 也注入该值。位置型意图按 position_guide 限速推进，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去。",
         "period_ms": 50,
-        "max_speed_mps": 2.0,
-        "max_accel_mps2": 2.0,
-        "max_feedforward_mps": 6.0,
+        "max_speed_mps": 10.0,
+        "max_accel_mps2": 3.0,
         "enable_position_velocity_feedforward": true,
-        "position_guide_speed_mps": 6.0,
         "position_guide_vz_mps": 1.5
     },
     "approach": {
-        "_comment": "S5 接近段速度律（2026-11-11 起唯一 S5 引导方式）：产出 (p_ref, v_ref)，位置环只做速度锚点。旧 speed_mps/lead_time/guide_lowpass 实现已删除。",
+        "_comment": "S5 接近段速度律（2026-11-11 起唯一 S5 引导方式）：产出 (p_ref, v_ref)，位置环只做速度锚点。旧 speed_mps/lead_time/guide_lowpass 实现已删除；速度上限来自 controller.max_speed_mps，本处不重复定义。",
         "speed_law": {
-            "_comment": "来源 docs/接近段速度律-数学分析-2026-11-09.md §6。speed_cap_mps 与 controller.max_feedforward_mps=6 对齐。",
+            "_comment": "来源 docs/接近段速度律-数学分析-2026-11-09.md §6；速度上限由 controller.max_speed_mps 注入。",
             "standoff_m": 2.9,
             "accel_plan_mps2": 3.0,
             "decel_plan_mps2": 3.0,
             "accel_phys_mps2": 9.8,
             "accel_term_mps2": 1.5,
             "slew_mps2": 3.0,
-            "speed_cap_mps": 6.0,
             "brake_safety": 1.3,
             "terminal_gain": 1.5,
             "lead_scaled_k": 0.06,

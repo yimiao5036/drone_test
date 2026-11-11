@@ -58,6 +58,9 @@ struct MissionStateMachineConfig {
     /// 速率上限、目标速度余量与预测提前量；构造期 `ApproachConfig::Validate()`
     /// 兜底。
     config::ApproachConfig approach;
+    /// 机体水平速度上限（`controller.max_speed_mps` 同源注入）。这是速度律
+    /// `speed_cap` 的唯一来源，不在 `approach.speed_law` 里重复配置。
+    double max_speed_mps = 10.0;
     /// 本机拦截功能类别（地面站链路 `ground_station.aircraft_component_id`
     /// 同源注入）：65014 的 `interceptor_type` 必须等于该值，25=捕网、26=火箭、
     /// 27=干扰（2026-11-11 占位）。装配层未显式设置时保持捕网默认值。

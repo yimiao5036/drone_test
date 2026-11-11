@@ -27,7 +27,6 @@ using drone::control::ApproachSpeedLawConfig;
 
 ApproachSpeedLawConfig MakeConfig() {
     ApproachSpeedLawConfig cfg;
-    cfg.speed_cap_mps = 6.0;
     return cfg;
 }
 
@@ -47,7 +46,7 @@ double HorizontalDistance(const ApproachInput& input) {
 }
 
 TEST(ApproachSpeedLawTest, StaticTargetSettlesAtStandoffWithoutPenetration) {
-    ApproachSpeedLaw law(MakeConfig());
+    ApproachSpeedLaw law(MakeConfig(), 6.0);
     ApproachInput input;
     input.own_valid = true;
     input.target_valid = true;
@@ -72,7 +71,7 @@ TEST(ApproachSpeedLawTest, StaticTargetSettlesAtStandoffWithoutPenetration) {
 }
 
 TEST(ApproachSpeedLawTest, MovingTargetSpeedMatchHoldsStandoff) {
-    ApproachSpeedLaw law(MakeConfig());
+    ApproachSpeedLaw law(MakeConfig(), 6.0);
     ApproachInput input;
     input.own_valid = true;
     input.target_valid = true;
@@ -98,8 +97,7 @@ TEST(ApproachSpeedLawTest, MovingTargetSpeedMatchHoldsStandoff) {
 
 TEST(ApproachSpeedLawTest, TargetFasterThanCapDoesNotFakeClosing) {
     ApproachSpeedLawConfig cfg = MakeConfig();
-    cfg.speed_cap_mps = 6.0;
-    ApproachSpeedLaw law(cfg);
+    ApproachSpeedLaw law(cfg, 6.0);
     ApproachInput input;
     input.own_valid = true;
     input.target_valid = true;
@@ -122,7 +120,7 @@ TEST(ApproachSpeedLawTest, TargetFasterThanCapDoesNotFakeClosing) {
 }
 
 TEST(ApproachSpeedLawTest, VerticalChannelPointsUpAndIsLimited) {
-    ApproachSpeedLaw law(MakeConfig());
+    ApproachSpeedLaw law(MakeConfig(), 6.0);
     ApproachInput input;
     input.own_valid = true;
     input.target_valid = true;

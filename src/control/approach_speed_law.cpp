@@ -136,8 +136,6 @@ void ApproachSpeedLawConfig::Validate() const {
             "approach.speed_law.accel_term_mps2 必须为有限正数");
     require(std::isfinite(slew_mps2) && slew_mps2 >= 0.0,
             "approach.speed_law.slew_mps2 必须为有限非负数");
-    require(std::isfinite(speed_cap_mps) && speed_cap_mps > 0.0,
-            "approach.speed_law.speed_cap_mps 必须为有限正数");
     require(std::isfinite(brake_safety) && brake_safety > 1.0,
             "approach.speed_law.brake_safety 必须大于 1");
     require(std::isfinite(terminal_gain) && terminal_gain > 0.0,
@@ -170,9 +168,13 @@ void ApproachSpeedLawConfig::Validate() const {
             "approach.speed_law.vertical_margin_m 必须为有限非负数");
 }
 
-ApproachSpeedLaw::ApproachSpeedLaw(const ApproachSpeedLawConfig& config)
-    : cfg_(config) {
+ApproachSpeedLaw::ApproachSpeedLaw(const ApproachSpeedLawConfig& config,
+                                   double max_speed_mps)
+    : cfg_(config), max_speed_mps_(max_speed_mps) {
     cfg_.Validate();
+    if (!std::isfinite(max_speed_mps_) || max_speed_mps_ <= 0.0) {
+        throw std::invalid_argument("ApproachSpeedLaw max_speed_mps 必须为有限正数");
+    }
 }
 
 void ApproachSpeedLaw::Reset() {
@@ -280,7 +282,7 @@ ApproachOutput ApproachSpeedLaw::Update(const ApproachInput& input,
         const double ry = seen_e - input.own_e_m;
         const double rv = rx * vn + ry * ve;
         const double r2 = rx * rx + ry * ry;
-        const double qa = cfg_.speed_cap_mps * cfg_.speed_cap_mps - vt_abs * vt_abs;
+        const double qa = max_speed_mps_ * max_speed_mps_ - vt_abs * vt_abs;
         const double qb = -2.0 * rv;
         const double qc = -r2;
         double t = std::numeric_limits<double>::quiet_NaN();
@@ -304,12 +306,12 @@ ApproachOutput ApproachSpeedLaw::Update(const ApproachInput& input,
             }
         }
         if (!std::isfinite(t) || t <= 0.0) {
-            t = distance / std::max(1.0, cfg_.speed_cap_mps);
+            t = distance / std::max(1.0, max_speed_mps_);
         }
         t = Clamp(t, 0.0, 4.0);
         const double lead_want =
             std::min({vt_abs * t, 0.5 * distance,
-                      cfg_.speed_cap_mps * cfg_.t_lead_max_s});
+                      max_speed_mps_ * cfg_.t_lead_max_s});
         t_go = vt_abs > 1e-6 ? lead_want / vt_abs : 0.0;
     }
     const double aim_n = seen_n + vn * t_go;
@@ -420,7 +422,7 @@ ApproachOutput ApproachSpeedLaw::Update(const ApproachInput& input,
                                   std::max(0.1, distance);
 
     // ---- 制动包络 ----
-    const double cap_env = cfg_.speed_cap_mps + vt_abs + 1.0;
+    const double cap_env = max_speed_mps_ + vt_abs + 1.0;
     double brake_bound =
         BrakingSpeed(std::max(0.0, distance - cfg_.standoff_m), decel_eff,
                      cap_env, dt);
@@ -438,7 +440,7 @@ ApproachOutput ApproachSpeedLaw::Update(const ApproachInput& input,
                                   std::max(0.0, distance - cfg_.standoff_m));
 
     // ---- 速度预算 + 转弯约束 + 末端匹配 ----
-    const double plateau = cfg_.speed_cap_mps;
+    const double plateau = max_speed_mps_;
     const double v_catch = VelocityBudget(plateau, vt_along, vt_cross,
                                           cfg_.speed_match);
     const double ff_n = cfg_.speed_match ? vn : 0.0;

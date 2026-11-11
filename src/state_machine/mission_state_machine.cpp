@@ -341,7 +341,7 @@ public:
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
-          approach_law_(config.approach.speed_law),
+          approach_law_(config.approach.speed_law, config.max_speed_mps),
           expected_interceptor_type_(config.expected_interceptor_type),
           test_hooks_enabled_(config.test_hooks_enabled),
           azimuth_converter_(config.tracking.camera.fx_px,

@@ -968,11 +968,12 @@ AppConfig LoadAppConfig(const std::string& path,
         controller.value("enable_position_velocity_feedforward",
                          config.controller.enable_position_velocity_feedforward);
     config.controller.max_feedforward_mps = ReadOptionalPositiveDouble(
-        controller, "max_feedforward_mps", config.controller.max_feedforward_mps);
+        controller, "max_feedforward_mps", config.controller.max_speed_mps);
     // 位置引导速率上限（2026-11-02，P0-2）：位置型意图按该速率推进引导点。
+    // 2026-11-11：缺席时与 max_speed_mps 同源，避免三处速度上限各写一遍。
     config.controller.position_guide_speed_mps = ReadOptionalPositiveDouble(
         controller, "position_guide_speed_mps",
-        config.controller.position_guide_speed_mps);
+        config.controller.max_speed_mps);
     config.controller.position_guide_vz_mps = ReadOptionalPositiveDouble(
         controller, "position_guide_vz_mps",
         config.controller.position_guide_vz_mps);
@@ -1170,8 +1171,6 @@ AppConfig LoadAppConfig(const std::string& path,
         speed_law, "accel_term_mps2", law.accel_term_mps2);
     law.slew_mps2 = ReadOptionalNonNegativeDouble(speed_law, "slew_mps2",
                                                   law.slew_mps2);
-    law.speed_cap_mps = ReadOptionalPositiveDouble(speed_law, "speed_cap_mps",
-                                                  law.speed_cap_mps);
     law.brake_safety = ReadOptionalPositiveDouble(speed_law, "brake_safety",
                                                   law.brake_safety);
     law.terminal_gain = ReadOptionalPositiveDouble(speed_law, "terminal_gain",

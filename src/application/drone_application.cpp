@@ -145,6 +145,8 @@ void DroneApplication::BuildComponents() {
         state_machine_config.takeoff = config_.takeoff;
         // 接近段相位策略（approach 节）同源注入：S5/S6 速率上限与预测提前量。
         state_machine_config.approach = config_.approach;
+        // 速度上限单一来源：控制器 / PX4 / 速度律共用 controller.max_speed_mps。
+        state_machine_config.max_speed_mps = config_.controller.max_speed_mps;
         state_machine_config.expected_interceptor_type =
             config_.ground_station.aircraft_component_id;
         // 拦截剖面：由本机功能类别（component ID）在装配期映射，控制回路不查
