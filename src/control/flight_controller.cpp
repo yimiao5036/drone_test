@@ -788,6 +788,11 @@ private:
             fence_source != nullptr ? fence_source->LatestFencePolygon()
                                     : common::FencePolygonNed{};
         const bool zone_active = zone.valid();
+        // 本拍位置目标是否被围栏搬动过（水平或高度）。搬动时必须同时清空速度
+        // 前馈：位置被钳到边界内、前馈却仍指向区域外，两者打架会让飞机在边界
+        // 反复冲出/拉回（2026-11-11 现场：目标跑出围栏后 own 在边界 ±7m 摆动，
+        // 日志伴随 `前馈水平幅值钳制 |v|=10`；设计语义是"贴边悬停"）。
+        bool fence_target_clamped = false;
         if (zone_active) {
             const common::Vec2Ned point{target_x, target_y};
             const common::Vec2Ned clamped =
@@ -797,10 +802,12 @@ private:
             if (moved > 1e-6) {
                 target_x = clamped.north_m;
                 target_y = clamped.east_m;
+                fence_target_clamped = true;
                 const uint64_t count = ++clamped_count_;
                 if (ShouldLogThrottled(count)) {
                     SPDLOG_WARN(
-                        "飞行控制器围栏多边形钳制: zone={}/{} 位移={:.2f}m 累计={}",
+                        "飞行控制器围栏多边形钳制: zone={}/{} 位移={:.2f}m "
+                        "本拍速度前馈已清零 累计={}",
                         zone.zone_id, zone.version, moved, count);
                 }
             }
@@ -833,10 +840,14 @@ private:
                 const double altitude_m = base_z - target_z;
                 if (altitude_m > zone.alt_max_m) {
                     target_z = base_z - zone.alt_max_m;
+                    // 高度同样属于围栏：垂直前馈也要清空，避免"钳在高度带内、
+                    // 前馈继续往上顶"的同类对抗。
+                    fence_target_clamped = true;
                     const uint64_t count = ++clamped_count_;
                     if (ShouldLogThrottled(count)) {
                         SPDLOG_WARN(
-                            "飞行控制器围栏高度钳制: h={:.2f} > 区域上限={:.2f} 基准={} 累计={}",
+                            "飞行控制器围栏高度钳制: h={:.2f} > 区域上限={:.2f} "
+                            "基准={} 本拍速度前馈已清零 累计={}",
                             altitude_m, zone.alt_max_m,
                             zone.altitude_reference == 0U ? "AMSL" : "起飞点", count);
                     }
@@ -916,11 +927,14 @@ private:
         }
 
         // ---- 位置速度前馈（P3）：可选增强，开关关闭时完全忽略 ----
+        // 围栏钳制过的这一拍不转发任何前馈（ff_mask=0）：位置目标已被拉回
+        // 边界，前馈若仍按状态机给出的方向/幅值下发，PX4 的位置环与速度前馈
+        // 会互相顶着，把"贴边悬停"变成边界来回冲（见上方 fence_target_clamped）。
         float ff_vx = 0.f;
         float ff_vy = 0.f;
         float ff_vz = 0.f;
         uint8_t ff_mask = 0;
-        if (config_.enable_position_velocity_feedforward) {
+        if (config_.enable_position_velocity_feedforward && !fence_target_clamped) {
             ff_mask = intent.feedforward_valid_mask & common::kVelocityValidAll;
             if ((intent.feedforward_valid_mask & ~common::kVelocityValidAll) != 0) {
                 const uint64_t count = ++feedforward_dropped_count_;

@@ -1235,8 +1235,8 @@ private:
 
 
     // 65018 围栏区域 payload 的链路层镜像（小端，协议有效 55 字节）。
-    // 顶点用相对参考点的 int16 厘米偏移编码（每顶点 4B），首顶点之外全部相对
-    // 同一个参考点（参考点=首顶点，精度 1cm、范围 ±327m，足够现场场地）。
+    // v1（protocol_version=1，兼容老地面站/老日志）顶点用相对参考点的 int16
+    // 厘米偏移编码（每顶点 4B，范围 ±327m）；v2 见 FenceFramePayloadV2。
     struct FenceZonePayload {
         uint8_t protocol_version = 0;
         uint16_t zone_id = 0;
@@ -1252,9 +1252,51 @@ private:
         uint8_t frame_length_marker = 0;
     };
 
+    // 65018/65022 分帧协议 v2 的链路层镜像（2026-11-11）：
+    //  0 version、1 zone_id、3 version、5 frame_index、6 frame_count、
+    //  7 action、8 altitude_reference、9 alt_min_dm、11 alt_max_dm、
+    //  13 vertex_count_total、14 ref_lat_1e7、18 ref_lon_1e7、
+    //  22+j*8 north_cm(i32)、26+j*8 east_cm(i32)、54 marker。
+    // 每帧最多 kFenceVerticesPerFrame 个顶点；参考点取区域质心，所有帧共用。
+    struct FenceFramePayloadV2 {
+        uint8_t protocol_version = 0;
+        uint16_t zone_id = 0;
+        uint16_t version = 0;
+        uint8_t frame_index = 0;
+        uint8_t frame_count = 0;
+        uint8_t action = 0;
+        uint8_t altitude_reference = 0;
+        int16_t alt_min_dm = 0;
+        int16_t alt_max_dm = 0;
+        uint8_t vertex_count = 0;
+        int32_t ref_lat_1e7 = 0;
+        int32_t ref_lon_1e7 = 0;
+        uint8_t frame_length_marker = 0;
+    };
+
+    /// v2 总顶点数 → 总帧数（向上取整）。
+    static uint8_t FramedFrameCount(uint8_t total_vertices) {
+        return static_cast<uint8_t>(
+            (static_cast<unsigned>(total_vertices) + kFenceVerticesPerFrame - 1U) /
+            kFenceVerticesPerFrame);
+    }
+
+    /// v2 某帧实际携带的顶点数（最后一帧可能不足 4 个）。
+    static uint8_t FramedVertexCount(uint8_t total_vertices,
+                                     uint8_t frame_index) {
+        const int remaining = static_cast<int>(total_vertices) -
+                              static_cast<int>(frame_index) * kFenceVerticesPerFrame;
+        if (remaining <= 0) {
+            return 0U;
+        }
+        return static_cast<uint8_t>(
+            std::min<int>(remaining, kFenceVerticesPerFrame));
+    }
+
     // 处理 ZONE_DEFINE(65018)：来源已在 HandleV2Extension 过滤；地址双字段必须
     // 同时匹配本机（区域是共享快照，但广播帧不得让任意飞机改变自己的执行边界）。
     // 区域语义（顶点数/高度带/动作）留给状态机校验，链路层只做长度与地址校验。
+    // 协议版本分派：v2=分帧（新），v1=单帧（老地面站/老日志兼容）。
     void HandleFenceZone(const mavlink_message_t& message,
                          const mavlink_v2_extension_t& extension) {
         const uint64_t receive_count = ++fence_receive_count_;
@@ -1271,7 +1313,8 @@ private:
             }
             return;
         }
-        const FenceZonePayload payload = DecodeFenceZone(extension.payload);
+        // 地址与尾标记两种版本布局一致（marker 固定在 offset 54），先统一校验。
+        const FenceZonePayload legacy = DecodeFenceZone(extension.payload);
         if (extension.target_system != config_.aircraft_system_id ||
             extension.target_component != config_.aircraft_component_id) {
             const uint64_t mismatch_count = ++fence_address_mismatch_count_;
@@ -1284,28 +1327,43 @@ private:
             }
             return;
         }
-        if (payload.frame_length_marker != kFrameLengthMarker) {
+        if (legacy.frame_length_marker != kFrameLengthMarker) {
             const uint64_t invalid_count = ++fence_invalid_count_;
             if (ShouldLogThrottled(invalid_count)) {
                 SPDLOG_WARN("围栏区域帧长度标记非法: marker={} count={}",
-                            payload.frame_length_marker, invalid_count);
+                            legacy.frame_length_marker, invalid_count);
             }
             return;
         }
+        const uint8_t protocol_version = ReadLe<uint8_t>(extension.payload, 0);
+        if (protocol_version == kFenceZoneFramedProtocolVersion) {
+            HandleFramedFenceZone(extension, receive_count);
+            return;
+        }
+        if (protocol_version != kFenceZoneProtocolVersion) {
+            const uint64_t invalid_count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN("围栏区域协议版本不支持: version={}（支持 {}/{}）count={}",
+                            protocol_version, kFenceZoneProtocolVersion,
+                            kFenceZoneFramedProtocolVersion, invalid_count);
+            }
+            return;
+        }
+        // ---- v1 单帧兼容路径（老地面站/老日志）----
         // 字段级校验：动作码只允许 0/1/2（保持/返航/降落）。越界值必须显式拒收，
         // 不能静默映射成返航——地面站/干扰帧给出非法动作时不应改变执行边界。
         // 高度带必须满足 alt_min <= alt_max；alt_max=0 表示"未限制"，此时不比较。
         const bool altitude_band_invalid =
-            payload.alt_max_dm != 0 && payload.alt_min_dm > payload.alt_max_dm;
-        if (payload.vertex_count < 3U || payload.vertex_count > kFenceMaxVertices ||
-            payload.type != 0U || payload.action > 2U || altitude_band_invalid) {
+            legacy.alt_max_dm != 0 && legacy.alt_min_dm > legacy.alt_max_dm;
+        if (legacy.vertex_count < 3U || legacy.vertex_count > kFenceMaxVertices ||
+            legacy.type != 0U || legacy.action > 2U || altitude_band_invalid) {
             const uint64_t invalid_count = ++fence_invalid_count_;
             if (ShouldLogThrottled(invalid_count)) {
                 SPDLOG_WARN(
                     "围栏区域字段非法: type={} 顶点={}（支持 3~{}）action={} "
                     "高度带={}~{}dm count={}",
-                    payload.type, payload.vertex_count, kFenceMaxVertices,
-                    payload.action, payload.alt_min_dm, payload.alt_max_dm,
+                    legacy.type, legacy.vertex_count, kFenceMaxVertices,
+                    legacy.action, legacy.alt_min_dm, legacy.alt_max_dm,
                     invalid_count);
             }
             return;
@@ -1320,32 +1378,18 @@ private:
         zone.header.source_id = config_.ground_system_id;
         zone.header.health = 1;
         zone.header.frame_id = 0;
-        zone.protocol_version = payload.protocol_version;
-        zone.zone_id = payload.zone_id;
-        zone.version = payload.version;
+        zone.protocol_version = legacy.protocol_version;
+        zone.zone_id = legacy.zone_id;
+        zone.version = legacy.version;
         zone.type = common::FenceZoneType::kPolygon;
-        // 动作码已在上面校验为 0/1/2，这里用显式分支保留语义（不再有 3~255 的兜底）。
-        switch (payload.action) {
-            case 0U:
-                zone.action = common::FenceAction::kHold;
-                break;
-            case 1U:
-                zone.action = common::FenceAction::kReturn;
-                break;
-            case 2U:
-                zone.action = common::FenceAction::kLand;
-                break;
-            default:
-                // 不可达：非法动作在字段校验处已整帧拒收。
-                return;
-        }
-        zone.altitude_reference = payload.altitude_reference;
-        zone.alt_min_m = static_cast<double>(payload.alt_min_dm) * 0.1;
-        zone.alt_max_m = static_cast<double>(payload.alt_max_dm) * 0.1;
-        const double ref_lat = static_cast<double>(payload.ref_lat_1e7) * 1e-7;
-        const double ref_lon = static_cast<double>(payload.ref_lon_1e7) * 1e-7;
-        zone.vertices.reserve(payload.vertex_count);
-        for (uint8_t index = 0; index < payload.vertex_count; ++index) {
+        zone.action = FenceActionFromCode(legacy.action);
+        zone.altitude_reference = legacy.altitude_reference;
+        zone.alt_min_m = static_cast<double>(legacy.alt_min_dm) * 0.1;
+        zone.alt_max_m = static_cast<double>(legacy.alt_max_dm) * 0.1;
+        const double ref_lat = static_cast<double>(legacy.ref_lat_1e7) * 1e-7;
+        const double ref_lon = static_cast<double>(legacy.ref_lon_1e7) * 1e-7;
+        zone.vertices.reserve(legacy.vertex_count);
+        for (uint8_t index = 0; index < legacy.vertex_count; ++index) {
             const int16_t north_cm =
                 ReadLe<int16_t>(extension.payload, 21U + index * 4U);
             const int16_t east_cm =
@@ -1360,9 +1404,199 @@ private:
                     (111320.0 * std::max(0.1, std::cos(ref_lat * kDegToRad)));
             zone.vertices.push_back(vertex);
         }
-        zone.ref_lat_1e7 = payload.ref_lat_1e7;
-        zone.ref_lon_1e7 = payload.ref_lon_1e7;
+        zone.ref_lat_1e7 = legacy.ref_lat_1e7;
+        zone.ref_lon_1e7 = legacy.ref_lon_1e7;
         zone.received_ms = receive_time_ms;
+        PublishFenceZone(zone);
+    }
+
+    /// 处理 65018 v2 分帧：按 frame_index 顺序拼装，最后一帧到达且顶点数
+    /// 与声明一致才发布。任一中途帧非法/序号断档/超时都会丢弃半成品，
+    /// 下一次上传从 frame_index=0 重新开始（地面站可重发，幂等）。
+    void HandleFramedFenceZone(const mavlink_v2_extension_t& extension,
+                               uint64_t receive_count) {
+        const FenceFramePayloadV2 frame = DecodeFenceFrameV2(extension.payload);
+        const uint64_t now_ms = MonotonicMs();
+        // 半成品超时：地面站分帧发送途中停发（掉电/链路断开）时不能一直等，
+        // 否则下一次上传的非 0 帧会被误认为旧序列的一部分。
+        if (fence_assembly_active_ &&
+            now_ms - fence_assembly_last_ms_ > kFenceAssemblyTimeoutMs) {
+            const uint64_t timeout_count = ++fence_assembly_timeout_count_;
+            if (ShouldLogThrottled(timeout_count)) {
+                SPDLOG_WARN(
+                    "围栏区域分帧超时, 丢弃半成品: zone={}/{} 已收 {}/{} 帧 count={}",
+                    fence_assembly_zone_id_, fence_assembly_version_,
+                    fence_assembly_next_index_, fence_assembly_frame_count_,
+                    timeout_count);
+            }
+            ResetFenceAssembly();
+        }
+        const bool altitude_band_invalid =
+            frame.alt_max_dm != 0 && frame.alt_min_dm > frame.alt_max_dm;
+        const uint8_t expected_frame_count = FramedFrameCount(frame.vertex_count);
+        const uint8_t frame_vertices =
+            FramedVertexCount(frame.vertex_count, frame.frame_index);
+        if (frame.vertex_count < 3U || frame.vertex_count > kFenceMaxVertices ||
+            frame.action > 2U || altitude_band_invalid ||
+            frame.frame_count != expected_frame_count ||
+            frame.frame_index >= frame.frame_count || frame_vertices == 0U) {
+            const uint64_t invalid_count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN(
+                    "围栏区域分帧字段非法: zone={}/{} 帧={}/{} 顶点={}（支持 3~{}）"
+                    "动作={} 高度带={}~{}dm count={}",
+                    frame.zone_id, frame.version, frame.frame_index,
+                    frame.frame_count, frame.vertex_count, kFenceMaxVertices,
+                    frame.action, frame.alt_min_dm, frame.alt_max_dm,
+                    invalid_count);
+            }
+            return;
+        }
+        if (frame.frame_index == 0U) {
+            // 首帧（重复发送或新一次上传）总是重启拼装：地面站整组重发是幂等的。
+            ResetFenceAssembly();
+            fence_assembly_active_ = true;
+            fence_assembly_zone_id_ = frame.zone_id;
+            fence_assembly_version_ = frame.version;
+            fence_assembly_action_ = frame.action;
+            fence_assembly_altitude_reference_ = frame.altitude_reference;
+            fence_assembly_alt_min_dm_ = frame.alt_min_dm;
+            fence_assembly_alt_max_dm_ = frame.alt_max_dm;
+            fence_assembly_ref_lat_1e7_ = frame.ref_lat_1e7;
+            fence_assembly_ref_lon_1e7_ = frame.ref_lon_1e7;
+            fence_assembly_frame_count_ = frame.frame_count;
+            fence_assembly_vertex_count_ = frame.vertex_count;
+            fence_assembly_next_index_ = 0U;
+            fence_assembly_last_ms_ = now_ms;
+            fence_assembly_vertices_.clear();
+            fence_assembly_vertices_.reserve(frame.vertex_count);
+            const uint64_t start_count = ++fence_assembly_start_count_;
+            if (ShouldLogThrottled(start_count)) {
+                SPDLOG_INFO(
+                    "围栏区域分帧开始: zone={}/{} 帧数={} 顶点={} count={}",
+                    frame.zone_id, frame.version, frame.frame_count,
+                    frame.vertex_count, start_count);
+            }
+        } else if (!fence_assembly_active_) {
+            // 非 0 帧先到：没有可拼装的半成品（丢帧/被别的区域抢占），丢弃。
+            const uint64_t orphan_count = ++fence_assembly_mismatch_count_;
+            if (ShouldLogThrottled(orphan_count)) {
+                SPDLOG_WARN(
+                    "围栏区域分帧缺首帧, 丢弃该帧: zone={}/{} 帧={}/{} count={}",
+                    frame.zone_id, frame.version, frame.frame_index,
+                    frame.frame_count, orphan_count);
+            }
+            return;
+        } else if (frame.zone_id != fence_assembly_zone_id_ ||
+                   frame.version != fence_assembly_version_ ||
+                   frame.frame_count != fence_assembly_frame_count_ ||
+                   frame.vertex_count != fence_assembly_vertex_count_ ||
+                   frame.action != fence_assembly_action_ ||
+                   frame.altitude_reference !=
+                       fence_assembly_altitude_reference_ ||
+                   frame.alt_min_dm != fence_assembly_alt_min_dm_ ||
+                   frame.alt_max_dm != fence_assembly_alt_max_dm_ ||
+                   frame.ref_lat_1e7 != fence_assembly_ref_lat_1e7_ ||
+                   frame.ref_lon_1e7 != fence_assembly_ref_lon_1e7_) {
+            // 不同区域/不同版本的帧混进来了：不拼接，也不破坏半成品（等首帧重来）。
+            const uint64_t mismatch_count = ++fence_assembly_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN(
+                    "围栏区域分帧元数据不一致, 丢弃该帧: 半成品={}/{} 本帧={}/{} "
+                    "帧={}/{} count={}",
+                    fence_assembly_zone_id_, fence_assembly_version_,
+                    frame.zone_id, frame.version, frame.frame_index,
+                    frame.frame_count, mismatch_count);
+            }
+            return;
+        } else if (frame.frame_index != fence_assembly_next_index_) {
+            const uint64_t mismatch_count = ++fence_assembly_mismatch_count_;
+            if (ShouldLogThrottled(mismatch_count)) {
+                SPDLOG_WARN(
+                    "围栏区域分帧序号不连续, 丢弃半成品: 期望帧={} 收到={} "
+                    "zone={}/{} count={}",
+                    fence_assembly_next_index_, frame.frame_index, frame.zone_id,
+                    frame.version, mismatch_count);
+            }
+            ResetFenceAssembly();
+            return;
+        }
+        // 追加本帧顶点。int32 厘米偏移经双精度换算（1cm 对场地的经纬度误差远小于
+        // GPS 精度），参考点经纬度由地面站给出，不做反向投影。
+        const double ref_lat =
+            static_cast<double>(frame.ref_lat_1e7) * 1e-7;
+        const double ref_lon =
+            static_cast<double>(frame.ref_lon_1e7) * 1e-7;
+        const double lon_scale =
+            111320.0 * std::max(0.1, std::cos(ref_lat * kDegToRad));
+        for (uint8_t index = 0; index < frame_vertices; ++index) {
+            const int32_t north_cm =
+                ReadLe<int32_t>(extension.payload,
+                                static_cast<std::size_t>(22U + index * 8U));
+            const int32_t east_cm =
+                ReadLe<int32_t>(extension.payload,
+                                static_cast<std::size_t>(26U + index * 8U));
+            common::FenceVertex vertex;
+            vertex.latitude_deg =
+                ref_lat + static_cast<double>(north_cm) * 1e-2 / 111320.0;
+            vertex.longitude_deg =
+                ref_lon + static_cast<double>(east_cm) * 1e-2 / lon_scale;
+            fence_assembly_vertices_.push_back(vertex);
+        }
+        fence_assembly_next_index_ = static_cast<uint8_t>(frame.frame_index + 1U);
+        fence_assembly_last_ms_ = now_ms;
+        if (frame.frame_index + 1U < frame.frame_count) {
+            return;
+        }
+        // 最后一帧：累计顶点数必须与首帧声明一致才发布（防丢帧拼出半个区域）。
+        if (fence_assembly_vertices_.size() != frame.vertex_count) {
+            const uint64_t invalid_count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(invalid_count)) {
+                SPDLOG_WARN(
+                    "围栏区域分帧顶点数不符, 丢弃: 收到={} 声明={} zone={}/{} count={}",
+                    fence_assembly_vertices_.size(), frame.vertex_count,
+                    frame.zone_id, frame.version, invalid_count);
+            }
+            ResetFenceAssembly();
+            return;
+        }
+        common::FenceZone zone;
+        zone.header.sequence = receive_count;
+        zone.header.receive_time_ms = now_ms;
+        zone.header.valid_for_ms = 0;  // 区域是持久快照，不按时效失效
+        zone.header.source_id = config_.ground_system_id;
+        zone.header.health = 1;
+        zone.header.frame_id = 0;
+        zone.protocol_version = kFenceZoneFramedProtocolVersion;
+        zone.zone_id = frame.zone_id;
+        zone.version = frame.version;
+        zone.type = common::FenceZoneType::kPolygon;
+        zone.action = FenceActionFromCode(frame.action);
+        zone.altitude_reference = frame.altitude_reference;
+        zone.alt_min_m = static_cast<double>(frame.alt_min_dm) * 0.1;
+        zone.alt_max_m = static_cast<double>(frame.alt_max_dm) * 0.1;
+        zone.ref_lat_1e7 = frame.ref_lat_1e7;
+        zone.ref_lon_1e7 = frame.ref_lon_1e7;
+        zone.vertices = std::move(fence_assembly_vertices_);
+        zone.received_ms = now_ms;
+        ResetFenceAssembly();
+        PublishFenceZone(zone);
+    }
+
+    static common::FenceAction FenceActionFromCode(uint8_t code) {
+        switch (code) {
+            case 0U:
+                return common::FenceAction::kHold;
+            case 2U:
+                return common::FenceAction::kLand;
+            case 1U:
+            default:
+                // 调用方已把 >2 的非法动作整帧拒收；这里按返航兜底。
+                return common::FenceAction::kReturn;
+        }
+    }
+
+    void PublishFenceZone(const common::FenceZone& zone) {
         (void)fence_zone_output_.Publish(
             std::make_shared<const common::FenceZone>(zone));
         const uint64_t publish_count = ++fence_publish_count_;
@@ -1373,6 +1607,23 @@ private:
                 zone.vertices.size(), static_cast<int>(zone.action),
                 publish_count);
         }
+    }
+
+    void ResetFenceAssembly() {
+        fence_assembly_active_ = false;
+        fence_assembly_zone_id_ = 0;
+        fence_assembly_version_ = 0;
+        fence_assembly_action_ = 0;
+        fence_assembly_altitude_reference_ = 0;
+        fence_assembly_alt_min_dm_ = 0;
+        fence_assembly_alt_max_dm_ = 0;
+        fence_assembly_ref_lat_1e7_ = 0;
+        fence_assembly_ref_lon_1e7_ = 0;
+        fence_assembly_frame_count_ = 0;
+        fence_assembly_vertex_count_ = 0;
+        fence_assembly_next_index_ = 0;
+        fence_assembly_last_ms_ = 0;
+        fence_assembly_vertices_.clear();
     }
 
     // 处理 65020 任务指令（地面站主动返航）：帧长/地址双字段/marker 校验后发布。
@@ -1464,6 +1715,25 @@ private:
         payload.ref_lon_1e7 = ReadLe<int32_t>(data, 17);
         payload.frame_length_marker = ReadLe<uint8_t>(data, 54);
         return payload;
+    }
+
+    // 逐字段小端解码 65018/65022 分帧 v2 payload（布局见 FenceFramePayloadV2）。
+    FenceFramePayloadV2 DecodeFenceFrameV2(const uint8_t* data) const {
+        FenceFramePayloadV2 frame;
+        frame.protocol_version = ReadLe<uint8_t>(data, 0);
+        frame.zone_id = ReadLe<uint16_t>(data, 1);
+        frame.version = ReadLe<uint16_t>(data, 3);
+        frame.frame_index = ReadLe<uint8_t>(data, 5);
+        frame.frame_count = ReadLe<uint8_t>(data, 6);
+        frame.action = ReadLe<uint8_t>(data, 7);
+        frame.altitude_reference = ReadLe<uint8_t>(data, 8);
+        frame.alt_min_dm = ReadLe<int16_t>(data, 9);
+        frame.alt_max_dm = ReadLe<int16_t>(data, 11);
+        frame.vertex_count = ReadLe<uint8_t>(data, 13);
+        frame.ref_lat_1e7 = ReadLe<int32_t>(data, 14);
+        frame.ref_lon_1e7 = ReadLe<int32_t>(data, 18);
+        frame.frame_length_marker = ReadLe<uint8_t>(data, 54);
+        return frame;
     }
 
 
@@ -1883,8 +2153,9 @@ private:
         return SendStatusExtension(kMissionStatusMessageType, payload);
     }
 
-    // 发送 65022 围栏区域回读：与 65018 完全同构，把机载生效区域原样回传。
-    // 地面站据此判断"本地定义是否等于机载实况"，并在重连后恢复图层显示。
+    // 发送 65022 围栏区域回读（v2 分帧，2026-11-11）：与 65018 v2 完全同构，
+    // 把机载生效区域按每帧 kFenceVerticesPerFrame 个顶点回传，地面站按帧序号
+    // 拼装。顶点用 int32 厘米偏移，不再有 ±327m 量程限制。
     bool SendFenceZoneReport(const common::FenceZone& zone) {
         // 顶点数越界属上游数据缺陷（区域加载/回填错误），显式失败并节流告警，
         // 不能静默 return false —— 否则地面站永远收不到回读也查不到原因。
@@ -1898,6 +2169,8 @@ private:
             }
             return false;
         }
+        const uint8_t vertex_count = static_cast<uint8_t>(zone.vertices.size());
+        const uint8_t frame_count = FramedFrameCount(vertex_count);
         // 参考点优先用下发时保存的原值；默认区域（本机生成）无原值时取首顶点。
         int32_t ref_lat_1e7 = zone.ref_lat_1e7;
         int32_t ref_lon_1e7 = zone.ref_lon_1e7;
@@ -1911,46 +2184,62 @@ private:
         const double ref_lon = static_cast<double>(ref_lon_1e7) * 1e-7;
         const double lon_scale =
             111320.0 * std::max(0.1, std::cos(ref_lat * kDegToRad));
-        std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
-        WriteLe<uint8_t>(payload, 0, zone.protocol_version);
-        WriteLe<uint16_t>(payload, 1, zone.zone_id);
-        WriteLe<uint16_t>(payload, 3, zone.version);
-        WriteLe<uint8_t>(payload, 5, static_cast<uint8_t>(zone.type));
-        WriteLe<uint8_t>(payload, 6, static_cast<uint8_t>(zone.action));
-        WriteLe<uint8_t>(payload, 7, zone.altitude_reference);
-        // 高度带与顶点偏移用 clamp 转换：超量程夹逼到 int16 边界，NaN 走
-        // ClampRoundedDouble 的非有限分支（→0），避免实现定义回绕。
+        // 高度带用 clamp 转换：超量程夹逼到 int16 边界，NaN 走非有限分支（→0）。
         constexpr int16_t kInt16Min = std::numeric_limits<int16_t>::min();
         constexpr int16_t kInt16Max = std::numeric_limits<int16_t>::max();
-        WriteLe<int16_t>(payload, 8,
-                         ClampRoundedDouble<int16_t>(zone.alt_min_m, 10.0, kInt16Min,
-                                                     kInt16Max));
-        WriteLe<int16_t>(payload, 10,
-                         ClampRoundedDouble<int16_t>(zone.alt_max_m, 10.0, kInt16Min,
-                                                     kInt16Max));
-        WriteLe<uint8_t>(payload, 12, static_cast<uint8_t>(zone.vertices.size()));
-        WriteLe<int32_t>(payload, 13, ref_lat_1e7);
-        WriteLe<int32_t>(payload, 17, ref_lon_1e7);
-        for (size_t index = 0; index < zone.vertices.size(); ++index) {
-            const double north_m =
-                (zone.vertices[index].latitude_deg - ref_lat) * 111320.0;
-            const double east_m = (zone.vertices[index].longitude_deg - ref_lon) * lon_scale;
-            WriteLe<int16_t>(payload, static_cast<size_t>(21U + index * 4U),
-                             ClampRoundedDouble<int16_t>(north_m, 100.0, kInt16Min,
-                                                         kInt16Max));
-            WriteLe<int16_t>(payload, static_cast<size_t>(23U + index * 4U),
-                             ClampRoundedDouble<int16_t>(east_m, 100.0, kInt16Min,
-                                                         kInt16Max));
+        // 顶点偏移 int32 厘米：非有限值→0、超量程夹逼，避免实现定义回绕。
+        constexpr int32_t kInt32Min = std::numeric_limits<int32_t>::min();
+        constexpr int32_t kInt32Max = std::numeric_limits<int32_t>::max();
+        bool all_sent = true;
+        for (uint8_t frame_index = 0; frame_index < frame_count; ++frame_index) {
+            std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+            WriteLe<uint8_t>(payload, 0, kFenceZoneFramedProtocolVersion);
+            WriteLe<uint16_t>(payload, 1, zone.zone_id);
+            WriteLe<uint16_t>(payload, 3, zone.version);
+            WriteLe<uint8_t>(payload, 5, frame_index);
+            WriteLe<uint8_t>(payload, 6, frame_count);
+            WriteLe<uint8_t>(payload, 7, static_cast<uint8_t>(zone.action));
+            WriteLe<uint8_t>(payload, 8, zone.altitude_reference);
+            WriteLe<int16_t>(payload, 9,
+                             ClampRoundedDouble<int16_t>(zone.alt_min_m, 10.0,
+                                                         kInt16Min, kInt16Max));
+            WriteLe<int16_t>(payload, 11,
+                             ClampRoundedDouble<int16_t>(zone.alt_max_m, 10.0,
+                                                         kInt16Min, kInt16Max));
+            WriteLe<uint8_t>(payload, 13, vertex_count);
+            WriteLe<int32_t>(payload, 14, ref_lat_1e7);
+            WriteLe<int32_t>(payload, 18, ref_lon_1e7);
+            const uint8_t frame_vertices =
+                FramedVertexCount(vertex_count, frame_index);
+            for (uint8_t index = 0; index < frame_vertices; ++index) {
+                const std::size_t vertex_index =
+                    static_cast<std::size_t>(frame_index) * kFenceVerticesPerFrame +
+                    index;
+                const double north_m =
+                    (zone.vertices[vertex_index].latitude_deg - ref_lat) * 111320.0;
+                const double east_m =
+                    (zone.vertices[vertex_index].longitude_deg - ref_lon) * lon_scale;
+                WriteLe<int32_t>(
+                    payload, static_cast<std::size_t>(22U + index * 8U),
+                    ClampRoundedDouble<int32_t>(north_m, 100.0, kInt32Min,
+                                                kInt32Max));
+                WriteLe<int32_t>(
+                    payload, static_cast<std::size_t>(26U + index * 8U),
+                    ClampRoundedDouble<int32_t>(east_m, 100.0, kInt32Min,
+                                                kInt32Max));
+            }
+            WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
+            all_sent =
+                SendStatusExtension(kFenceZoneReportMessageType, payload) && all_sent;
         }
-        WriteLe<uint8_t>(payload, 54, kFrameLengthMarker);
-        const bool sent = SendStatusExtension(kFenceZoneReportMessageType, payload);
         const uint64_t count = ++fence_report_send_count_;
         if (ShouldLogThrottled(count)) {
-            SPDLOG_INFO("围栏区域回读发送{}: zone={}/{} 顶点={} 动作={} count={}",
-                        sent ? "" : "失败", zone.zone_id, zone.version,
-                        zone.vertices.size(), static_cast<int>(zone.action), count);
+            SPDLOG_INFO("围栏区域回读发送{}: zone={}/{} 顶点={} 帧数={} 动作={} count={}",
+                        all_sent ? "" : "失败", zone.zone_id, zone.version,
+                        zone.vertices.size(), frame_count,
+                        static_cast<int>(zone.action), count);
         }
-        return sent;
+        return all_sent;
     }
 
     // 发送 65019 围栏状态：以本机身份发往 255/190。状态是周期快照，地面站据此
@@ -2620,6 +2909,26 @@ private:
     uint64_t fence_invalid_count_ = 0;
     uint64_t fence_publish_count_ = 0;
     uint64_t fence_status_send_count_ = 0;
+    // ---- 65018 v2 分帧拼装（2026-11-11，只在通信线程访问）----
+    /// 半成品最长存活时间：超过即丢弃（地面站中途停发时不能无限等）。
+    static constexpr uint64_t kFenceAssemblyTimeoutMs = 2000;
+    bool fence_assembly_active_ = false;
+    uint16_t fence_assembly_zone_id_ = 0;
+    uint16_t fence_assembly_version_ = 0;
+    uint8_t fence_assembly_action_ = 0;
+    uint8_t fence_assembly_altitude_reference_ = 0;
+    int16_t fence_assembly_alt_min_dm_ = 0;
+    int16_t fence_assembly_alt_max_dm_ = 0;
+    int32_t fence_assembly_ref_lat_1e7_ = 0;
+    int32_t fence_assembly_ref_lon_1e7_ = 0;
+    uint8_t fence_assembly_frame_count_ = 0;
+    uint8_t fence_assembly_vertex_count_ = 0;
+    uint8_t fence_assembly_next_index_ = 0;
+    uint64_t fence_assembly_last_ms_ = 0;
+    uint64_t fence_assembly_start_count_ = 0;
+    uint64_t fence_assembly_timeout_count_ = 0;
+    uint64_t fence_assembly_mismatch_count_ = 0;
+    std::vector<common::FenceVertex> fence_assembly_vertices_;
     common::FenceState last_fence_state_ = common::FenceState::kNoZone;
     uint16_t last_fence_zone_id_ = 0;
     uint16_t last_fence_version_ = 0;

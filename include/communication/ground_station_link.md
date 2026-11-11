@@ -133,21 +133,31 @@ Px4Link::StateOutput()
 - `action`只接受 0/1/2（悬停/返航/降落），`> 2` 与顶点数越界、`type != 0`、marker 非法、地址不匹配同属整帧拒收，计入`fence_invalid_count_`并节流 WARN。此前`action=3~255`会被三元表达式静默映射为返航，等于地面站一个坏字节就能触发返航。
 - `alt_max_dm != 0` 时要求`alt_min_dm <= alt_max_dm`（`alt_max_dm=0` 表示不限制高度带，保持原语义），倒置的高度带整帧拒收，避免把无效高度范围交给状态机做越界判定。
 
-### 65022 回读的量程与顶点数（2026-10-30 修正）
+### 65022 回读的量程与顶点数（2026-11-11 改 v2）
 
-- 高度带（`dm`，int16 量程 ±3276.7m）与顶点偏移（`cm`，int16 量程 ±327.67m）改用`ClampRoundedDouble()`：NaN→0、超量程钳到`int16`边界。此前的`static_cast<int16_t>(std::llround(...))`对超量程是未定义回绕，NaN 是未定义行为，回读数据可能变成相反的极端值。
-- 顶点数不在 3~`kFenceMaxVertices=8` 时不再静默`return false`：计入`fence_report_invalid_count_`并节流 WARN 后再返回失败，便于定位"地面站看不到区域回读"的原因。
+- 65022 回读改用 **v2 分帧**（`protocol_version=2`）：顶点为 **int32 厘米**偏移（每帧最多 4 个，`frame_count=ceil(顶点数/4)`），不再受 v1 单帧 ±327.67m 量程限制；`SendFenceZoneReport()` 把该区域的所有帧连续发完，地面站按帧序号拼装。
+- 高度带（`dm`，int16 量程 ±3276.7m）仍用 `ClampRoundedDouble()`：NaN→0、超量程钳到 `int16` 边界，避免未定义回绕。
+- 顶点数不在 3~`kFenceMaxVertices=8` 时不再静默 `return false`：计入 `fence_report_invalid_count_` 并节流 WARN 后再返回失败，便于定位"地面站看不到区域回读"的原因。
+- v1 单帧回读（老固件）仍可被地面站解码；机载本身不再发 v1。
+
+### 65018/65022 分帧协议 v2（2026-11-11 增）
+
+- **动机**：v1 顶点是 int16 厘米，单帧只能表示参考点 ±327m 内的点；把区域画大（例如 800m 见方）时 Web 端直接报"顶点超出编码量程（±300m）"。历史上下发只能一条 55 字节短帧，才用短字段；现改为**分帧上传**，用 int32 厘米换掉量程限制。
+- **布局**：见 `docs/数据接口文档.md` §3.2.3；常量在 `include/communication/ground_station_link.h`（`kFenceZoneFramedProtocolVersion=2`、`kFenceVerticesPerFrame=4`、`kFenceMaxVertices=8`）。
+- **拼装**：`HandleFramedFenceZone()` 只在通信线程访问；`frame_index=0` 开始/重启，要求各帧的 `zone_id/version/frame_count/vertex_count/ref/action/高度带` 一致，`frame_index` 连续；最后一帧到达且累计顶点数==声明值才发布。缺首帧、元数据不一致、序号断档分别计数并节流 WARN；半成品超过 `kFenceAssemblyTimeoutMs=2000ms` 丢弃（地面站中途停发时不会一直等）。
+- **兼容**：`protocol_version=1` 走原单帧路径（老地面站/老日志），`2` 走分帧；其它版本整帧拒收并计数。65019 状态帧仍用 `kFenceZoneProtocolVersion=1`，两者版本号不要混用。
 
 ## 多边形围栏编解码（2026-10-29 增）
 
 | 方向 | 类型 | 处理 |
 |---|---|---|
-| 下行 | 65018 `ZONE_DEFINE` | `HandleFenceZone()`：60B payload、尾部 marker=1、地址双字段（本机）三重校验通过后发布 `FenceZone`；顶点以参考点 + cm 偏移表示，链路层反算成 `latitude_deg/longitude_deg`（`kDegToRad`），`valid_for_ms=0` 表示持久快照 |
-| 上行 | 65019 `ZONE_STATE` | `SetFenceStatusInput()` + 工作线程每拍 `DrainFenceStatuses()`（只留最新一条）→ `SendFenceStatus()` 编码后定向发 255/190；局部位置用 mm（`DistanceMillimeters`，负值与 NaN→INT32_MIN 不崩） |
+| 下行 | 65018 `ZONE_DEFINE` | `HandleFenceZone()`：60B payload、尾部 marker=1、地址双字段（本机）三重校验通过后按 `protocol_version` 分派；**v2 分帧**按帧序号拼装，最后一帧收齐才发布 `FenceZone`；v1 单帧即时发布。顶点以参考点 + cm 偏移表示，链路层反算成 `latitude_deg/longitude_deg`（`kDegToRad`），`valid_for_ms=0` 表示持久快照 |
+| 上行 | 65019 `ZONE_STATE` | `SetFenceStatusInput()` + 工作线程每拍 `DrainFenceStatuses()`（只留最新一条）→ `SendFenceStatus()` 编码后定向发 255/190；局部位置用 mm（`DistanceMillimeters`，负值与 NaN→INT32_MIN 不崩）；协议版本固定 v1 |
 
-版本策略：65014 保持 **v1**、65013 保持 **v2**。围栏字段写在保留区
-（65014 offset 15/17，65013 offset 28/30/50），老地面站忽略即兼容；`kFenceMaxVertices=8`
-（顶点区 21~53，marker 在 54）。帧长/字段非法一律丢弃并计数，不发布半成品。
+版本策略：65014 保持 **v1**、65013 保持 **v2**；65018/65022 区域帧使用
+**v2 分帧**（int32 厘米、每帧 4 顶点、按 `frame_index` 拼装），v1 单帧只用于
+兼容老地面站/老日志。`kFenceMaxVertices=8`（一个区域的总顶点数上限）。帧长/
+字段非法一律丢弃并计数，不发布半成品。
 
 ## 人工任务指令编解码（2026-10-29 增）
 
@@ -171,7 +181,7 @@ Px4Link::StateOutput()
 ## 日志行为
 
 - INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）、串口重连成功（带设备与尝试次数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果；任务分配在第1条及每100条打印65014接收/发布和65015发送结果。
-- WARN：地面站心跳超时、时间同步超时、时间同步抖动超门限降级、串口连续读取错误与进入重连、串口重连失败、`SendIfDue`失败退避重试（由发送失败上层汇总）、目标/任务分配/围栏/指令的地址不匹配与帧长/字段非法、65022 顶点数越界，均按第1条及每100条节流警告。
+- WARN：地面站心跳超时、时间同步超时、时间同步抖动超门限降级、串口连续读取错误与进入重连、串口重连失败、`SendIfDue`失败退避重试（由发送失败上层汇总）、目标/任务分配/围栏/指令的地址不匹配与帧长/字段非法、65018 分帧缺首帧/元数据不一致/序号断档/半成品超时、65022 顶点数越界，均按第1条及每100条节流警告。
 - ERROR：配置/启动/绑定时序错误和发送失败（`RecordError`，含"扩展帧需要 MAVLink 2"）；错误按第1次及每100次节流。
 - 不逐条记录遥测消息，不在高频发送路径打印成功日志；时间同步状态快照按1Hz低频发布，不会因读超时20ms而刷屏。
 
@@ -191,7 +201,7 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、健康/任务状态`V2_EXTENSION`字段与短帧长度（65012 v1、65013 v2 扩展字段）、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启；65014 地址双字段匹配发布、帧头/payload 地址不匹配静默丢弃、语义字段原样发布、截断短帧安全丢弃，以及65015字段/版本/身份编码。2026-10-30 新增用例：`RecoversSerialLinkAfterReadErrors`（关闭 PTY 主端→链路置未连接→换新 PTY 后自动重连并重新等心跳）、`FenceZoneRejectsInvalidActionAndAltitudeBand`（action=3、高度带倒置整帧拒收，action=2 正常发布）、`TrackTargetAcceptsTruncatedAltReference` 与 `TrackTargetUpdateRejectsTruncatedFrame`（65010 的 59/55 字节边界）、`TelemetrySendFailureRetriesWithBackoff`（周期发送失败按 100ms 退避重试）、`TimeSyncDegradesWhenJitterExceedsThreshold`、`TimeSyncStatusPublishIsLowFrequency`、`FenceZoneReportClampsOutOfRangeValues`、`FenceZoneReportRejectsTooManyVertices`。硬件阶段已在香橙派/HM30/Web闭环确认基础链路；TIMESYNC已使用`tools/ground_station_time_sync_responder.py`完成捕网-01实机采样，RTT中位数约78ms，历史最大约203ms，offset jitter常见约20～50ms，主动测量偶发超时率低于1%，忽略包为0。
+`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、健康/任务状态`V2_EXTENSION`字段与短帧长度（65012 v1、65013 v2 扩展字段）、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启；65014 地址双字段匹配发布、帧头/payload 地址不匹配静默丢弃、语义字段原样发布、截断短帧安全丢弃，以及65015字段/版本/身份编码。2026-10-30 新增用例：`RecoversSerialLinkAfterReadErrors`（关闭 PTY 主端→链路置未连接→换新 PTY 后自动重连并重新等心跳）、`FenceZoneRejectsInvalidActionAndAltitudeBand`（action=3、高度带倒置整帧拒收，action=2 正常发布）、`TrackTargetAcceptsTruncatedAltReference` 与 `TrackTargetUpdateRejectsTruncatedFrame`（65010 的 59/55 字节边界）、`TelemetrySendFailureRetriesWithBackoff`（周期发送失败按 100ms 退避重试）、`TimeSyncDegradesWhenJitterExceedsThreshold`、`TimeSyncStatusPublishIsLowFrequency`、`FenceZoneReportEncodesWideOffsetsAsV2Frames`、`FenceZoneFramedAssemblesTwoFrames`、`FenceZoneFramedDropsFrameWithoutFirst`、`FenceZoneFramedRejectsInconsistentFrameCount`、`FenceZoneReportRejectsTooManyVertices`。硬件阶段已在香橙派/HM30/Web闭环确认基础链路；TIMESYNC已使用`tools/ground_station_time_sync_responder.py`完成捕网-01实机采样，RTT中位数约78ms，历史最大约203ms，offset jitter常见约20～50ms，主动测量偶发超时率低于1%，忽略包为0。
 
 ## 排查与修改要点
 

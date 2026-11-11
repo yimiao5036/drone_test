@@ -418,6 +418,64 @@ std::vector<uint8_t> EncodeFenceZone(
     });
 }
 
+// 65018/65022 v2 分帧测试编码器：顶点为 int32 厘米偏移，每帧最多 4 个。
+// 布局见 include/communication/ground_station_link.h 的
+// kFenceZoneFramedProtocolVersion 注释。
+struct FenceFrameV2Fixture {
+    uint8_t protocol_version = kFenceZoneFramedProtocolVersion;
+    uint16_t zone_id = 3;
+    uint16_t version = 1;
+    uint8_t frame_index = 0;
+    uint8_t frame_count = 1;
+    uint8_t action = 1;
+    uint8_t altitude_reference = 1;
+    int16_t alt_min_dm = 100;
+    int16_t alt_max_dm = 500;
+    uint8_t vertex_count = 4;
+    int32_t ref_lat_1e7 = 231230000;
+    int32_t ref_lon_1e7 = 1131230000;
+    std::array<int32_t, 4> north_cm{};
+    std::array<int32_t, 4> east_cm{};
+};
+
+std::vector<uint8_t> EncodeFenceFrameV2(
+    const FenceFrameV2Fixture& frame, uint8_t header_system = 1,
+    uint8_t header_component = kNetCaptureAircraftComponentId) {
+    std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> payload{};
+    WriteLe<uint8_t>(payload, 0, frame.protocol_version);
+    WriteLe<uint16_t>(payload, 1, frame.zone_id);
+    WriteLe<uint16_t>(payload, 3, frame.version);
+    WriteLe<uint8_t>(payload, 5, frame.frame_index);
+    WriteLe<uint8_t>(payload, 6, frame.frame_count);
+    WriteLe<uint8_t>(payload, 7, frame.action);
+    WriteLe<uint8_t>(payload, 8, frame.altitude_reference);
+    WriteLe<int16_t>(payload, 9, frame.alt_min_dm);
+    WriteLe<int16_t>(payload, 11, frame.alt_max_dm);
+    WriteLe<uint8_t>(payload, 13, frame.vertex_count);
+    WriteLe<int32_t>(payload, 14, frame.ref_lat_1e7);
+    WriteLe<int32_t>(payload, 18, frame.ref_lon_1e7);
+    const int remaining = std::max(
+        0, static_cast<int>(frame.vertex_count) -
+               static_cast<int>(frame.frame_index) * 4);
+    const int vertices_here = std::min(remaining, 4);
+    for (int index = 0; index < vertices_here; ++index) {
+        WriteLe<int32_t>(payload, static_cast<std::size_t>(22U + index * 8U),
+                         frame.north_cm[static_cast<std::size_t>(index)]);
+        WriteLe<int32_t>(payload, static_cast<std::size_t>(26U + index * 8U),
+                         frame.east_cm[static_cast<std::size_t>(index)]);
+    }
+    WriteLe<uint8_t>(payload, 54, 1);
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    return encoder.Encode([&payload, header_system, header_component](
+                              mavlink_status_t* status, mavlink_message_t* message) {
+        return mavlink_msg_v2_extension_pack_status(
+            kGroundStationSystemId, kGroundStationComponentId, status, message, 0,
+            header_system, header_component, kFenceZoneMessageType,
+            payload.data());
+    });
+}
+
+
 void EstablishTimeSync(PseudoTerminal& terminal, GroundStationLink& link,
                        int64_t offset_ns = 40LL * 1000LL * 1000LL) {
     ASSERT_TRUE(terminal.Write(EncodeGcsHeartbeat()));
@@ -1419,6 +1477,166 @@ TEST(GroundStationLinkTest, RecoversSerialLinkAfterReadErrors) {
     link.Stop();
 }
 
+// 2026-11-11：65018 v2 分帧——5 个顶点拆成 2 帧，最后一帧到达才发布。
+TEST(GroundStationLinkTest, FenceZoneFramedAssemblesTwoFrames) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto zone_subscription = link.FenceZoneOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    FenceFrameV2Fixture first;
+    first.zone_id = 7;
+    first.version = 3;
+    first.frame_count = 2;
+    first.vertex_count = 5;
+    first.north_cm = {0, 1000, 1000, 0};
+    first.east_cm = {0, 0, 1000, 1000};
+
+    FenceFrameV2Fixture second = first;
+    second.frame_index = 1;  // 最后一帧只带第 5 个顶点
+    second.north_cm = {500, 0, 0, 0};
+    second.east_cm = {500, 0, 0, 0};
+
+    // 只有首帧：区域不完整，不得发布。
+    ASSERT_TRUE(terminal.Write(EncodeFenceFrameV2(first)));
+    EXPECT_FALSE(zone_subscription.WaitTakeFor(150ms).has_value());
+
+    ASSERT_TRUE(terminal.Write(EncodeFenceFrameV2(second)));
+    auto published = zone_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(published.has_value());
+    const auto& zone = **published;
+    EXPECT_EQ(zone.protocol_version, kFenceZoneFramedProtocolVersion);
+    EXPECT_EQ(zone.zone_id, 7);
+    EXPECT_EQ(zone.version, 3);
+    EXPECT_EQ(zone.action, common::FenceAction::kReturn);
+    ASSERT_EQ(zone.vertices.size(), 5u);
+    const double ref_lat = static_cast<double>(231230000) * 1e-7;
+    const double ref_lon = static_cast<double>(1131230000) * 1e-7;
+    const double lon_scale =
+        111320.0 * std::cos(ref_lat * 3.14159265358979323846 / 180.0);
+    EXPECT_NEAR(zone.vertices[1].latitude_deg, ref_lat + 10.0 / 111320.0, 1e-9);
+    EXPECT_NEAR(zone.vertices[2].longitude_deg, ref_lon + 10.0 / lon_scale, 1e-9);
+    EXPECT_NEAR(zone.vertices[3].latitude_deg, ref_lat, 1e-9);
+    EXPECT_NEAR(zone.vertices[4].latitude_deg, ref_lat + 5.0 / 111320.0, 1e-9);
+    EXPECT_NEAR(zone.vertices[4].longitude_deg, ref_lon + 5.0 / lon_scale, 1e-9);
+    link.Stop();
+}
+
+// 缺首帧的非 0 帧必须丢弃；补齐首帧后按序拼装才发布。
+TEST(GroundStationLinkTest, FenceZoneFramedDropsFrameWithoutFirst) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto zone_subscription = link.FenceZoneOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    FenceFrameV2Fixture first;
+    first.zone_id = 8;
+    first.frame_count = 2;
+    first.vertex_count = 5;
+    FenceFrameV2Fixture second = first;
+    second.frame_index = 1;
+    second.north_cm = {500, 0, 0, 0};
+    second.east_cm = {500, 0, 0, 0};
+
+    ASSERT_TRUE(terminal.Write(EncodeFenceFrameV2(second)));
+    EXPECT_FALSE(zone_subscription.WaitTakeFor(150ms).has_value());
+
+    ASSERT_TRUE(terminal.Write(EncodeFenceFrameV2(first)));
+    EXPECT_FALSE(zone_subscription.WaitTakeFor(150ms).has_value());
+    ASSERT_TRUE(terminal.Write(EncodeFenceFrameV2(second)));
+    auto published = zone_subscription.WaitTakeFor(300ms);
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ((**published).vertices.size(), 5u);
+    link.Stop();
+}
+
+// 与 Web 地面站编码器逐字节对拍（2026-11-11）：下面两帧 55 字节 payload 由
+// tools/web平台 的 EncodeFenceZoneFrames 生成（zone=1/v2、action=1、alt_ref=1、
+// alt_min=0、alt_max=30、5 顶点，ref=(23.1205,113.1205)），机载解码后顶点经纬度
+// 必须落在 0.001° 网格上——这是跨语言（TS 编码 ↔ C++ 解码）唯一性的回归网。
+namespace {
+uint8_t HexNibble(char value) {
+    return static_cast<uint8_t>(value <= '9' ? value - '0' : value - 'a' + 10);
+}
+std::vector<uint8_t> HexToBytes(const char* hex) {
+    std::vector<uint8_t> bytes;
+    const std::size_t length = std::strlen(hex);
+    for (std::size_t index = 0; index + 1 < length; index += 2) {
+        bytes.push_back(static_cast<uint8_t>(HexNibble(hex[index]) * 16U +
+                                             HexNibble(hex[index + 1])));
+    }
+    return bytes;
+}
+std::vector<uint8_t> WrapV2Extension(uint16_t message_type,
+                                     const std::vector<uint8_t>& payload) {
+    std::array<uint8_t, MAVLINK_MSG_V2_EXTENSION_FIELD_PAYLOAD_LEN> buffer{};
+    std::copy(payload.begin(), payload.end(), buffer.begin());
+    MavlinkHandler encoder(MavlinkVersion::kV2);
+    return encoder.Encode([&buffer, message_type](mavlink_status_t* status,
+                                                  mavlink_message_t* message) {
+        return mavlink_msg_v2_extension_pack_status(
+            kGroundStationSystemId, kGroundStationComponentId, status, message, 0,
+            1, kNetCaptureAircraftComponentId, message_type, buffer.data());
+    });
+}
+}  // namespace
+
+TEST(GroundStationLinkTest, FenceZoneFramedDecodesWebEncoderBytes) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto zone_subscription = link.FenceZoneOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    const std::vector<uint8_t> frame0 = HexToBytes(
+        "02010002000002010100002c010588e8c70d88d16c4342eaffff01ecffffbe15000001"
+        "ecffffbe150000ff13000042eaffffff13000001");
+    const std::vector<uint8_t> frame1 = HexToBytes(
+        "02010002000102010100002c010588e8c70d88d16c4300000000000000000000000000"
+        "0000000000000000000000000000000000000001");
+    ASSERT_EQ(frame0.size(), 55U);
+    ASSERT_EQ(frame1.size(), 55U);
+    ASSERT_TRUE(terminal.Write(WrapV2Extension(kFenceZoneMessageType, frame0)));
+    ASSERT_TRUE(terminal.Write(WrapV2Extension(kFenceZoneMessageType, frame1)));
+
+    auto published = zone_subscription.WaitTakeFor(500ms);
+    ASSERT_TRUE(published.has_value());
+    const auto& zone = **published;
+    EXPECT_EQ(zone.protocol_version, kFenceZoneFramedProtocolVersion);
+    EXPECT_EQ(zone.action, common::FenceAction::kReturn);
+    ASSERT_EQ(zone.vertices.size(), 5u);
+    EXPECT_NEAR(zone.vertices[0].latitude_deg, 23.12, 1e-7);
+    EXPECT_NEAR(zone.vertices[0].longitude_deg, 113.12, 1e-7);
+    EXPECT_NEAR(zone.vertices[2].latitude_deg, 23.121, 1e-7);
+    EXPECT_NEAR(zone.vertices[2].longitude_deg, 113.121, 1e-7);
+    EXPECT_NEAR(zone.vertices[4].latitude_deg, 23.1205, 1e-7);
+    EXPECT_NEAR(zone.vertices[4].longitude_deg, 113.1205, 1e-7);
+    link.Stop();
+}
+
+// 总帧数与顶点数不自洽（ceil(5/4)=2，却声明 1 帧）必须整帧拒收。
+TEST(GroundStationLinkTest, FenceZoneFramedRejectsInconsistentFrameCount) {
+    PseudoTerminal terminal;
+    common::Topic<common::FlightStateSnapshot> flight_state;
+    GroundStationLink link(MakeConfig(terminal.SlaveName()));
+    auto zone_subscription = link.FenceZoneOutput().Subscribe(2);
+    link.SetFlightStateInput(flight_state);
+    ASSERT_TRUE(link.Start());
+
+    FenceFrameV2Fixture bad;
+    bad.vertex_count = 5;
+    bad.frame_count = 1;  // 应为 2
+    ASSERT_TRUE(terminal.Write(EncodeFenceFrameV2(bad)));
+    EXPECT_FALSE(zone_subscription.WaitTakeFor(200ms).has_value());
+    link.Stop();
+}
+
+
 // A-03：动作码只允许 0/1/2；越界值必须显式拒收整帧，不能静默当返航执行。
 TEST(GroundStationLinkTest, FenceZoneRejectsInvalidActionAndAltitudeBand) {
     PseudoTerminal terminal;
@@ -1599,8 +1817,9 @@ TEST(GroundStationLinkTest, TimeSyncStatusPublishIsLowFrequency) {
     link.Stop();
 }
 
-// A-09：65022 回读时高度带与顶点偏移必须做量程钳制与 NaN 保护，不能回绕。
-TEST(GroundStationLinkTest, FenceZoneReportClampsOutOfRangeValues) {
+// A-09（2026-11-11 改 v2）：65022 回读用 int32 厘米，±327m 之外的顶点不再被
+// 钳制；高度带仍做 int16 量程钳制与 NaN 保护（NaN→0、超量程→int16 上限）。
+TEST(GroundStationLinkTest, FenceZoneReportEncodesWideOffsetsAsV2Frames) {
     PseudoTerminal terminal;
     common::Topic<common::FlightStateSnapshot> flight_state;
     common::Topic<common::FenceZone> report_input;
@@ -1613,6 +1832,7 @@ TEST(GroundStationLinkTest, FenceZoneReportClampsOutOfRangeValues) {
     zone.zone_id = 4;
     zone.version = 2;
     zone.action = common::FenceAction::kReturn;
+    zone.altitude_reference = 0;
     zone.alt_min_m = std::numeric_limits<double>::quiet_NaN();
     zone.alt_max_m = 1.0e6;
     zone.ref_lat_1e7 = 231230000;
@@ -1635,19 +1855,28 @@ TEST(GroundStationLinkTest, FenceZoneReportClampsOutOfRangeValues) {
         }, 500ms, &report));
     mavlink_v2_extension_t extension{};
     mavlink_msg_v2_extension_decode(&report, &extension);
-    // NaN 高度下限按 0 处理；超量程上限钳到 int16 最大值。
-    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 8), 0);
-    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 10),
+    EXPECT_EQ(report.len, 60);
+    EXPECT_EQ(ReadLe<uint8_t>(extension.payload, 0),
+              kFenceZoneFramedProtocolVersion);
+    EXPECT_EQ(ReadLe<uint8_t>(extension.payload, 5), 0);  // frame_index
+    EXPECT_EQ(ReadLe<uint8_t>(extension.payload, 6), 1);  // frame_count
+    EXPECT_EQ(ReadLe<uint8_t>(extension.payload, 13), 3);  // 总顶点数
+    // NaN 高度下限按 0 处理；超量程上限仍钳到 int16 最大值。
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 9), 0);
+    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 11),
               std::numeric_limits<int16_t>::max());
-    // 顶点 0 落在参考点；顶点 1 的北向偏移约 +1113m（厘米量纲 111300）应钳到上限。
-    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 21), 0);
-    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 23), 0);
-    EXPECT_EQ(ReadLe<int16_t>(extension.payload, 25),
-              std::numeric_limits<int16_t>::max());
+    // 顶点 0 落在参考点；顶点 1 北向 +1113m（111320cm）不再被钳制。
+    EXPECT_EQ(ReadLe<int32_t>(extension.payload, 22), 0);
+    EXPECT_EQ(ReadLe<int32_t>(extension.payload, 26), 0);
+    EXPECT_NEAR(ReadLe<int32_t>(extension.payload, 30), 111320, 2);
+    EXPECT_EQ(ReadLe<int32_t>(extension.payload, 34), 0);
+    // 顶点 2：东向约 +1024m（经度按参考纬度缩放）。
+    EXPECT_EQ(ReadLe<int32_t>(extension.payload, 38), 0);
+    EXPECT_NEAR(ReadLe<int32_t>(extension.payload, 42), 102400, 800);
     link.Stop();
 }
 
-// A-11：顶点数超过协议上限时回读必须显式失败（计告警），不能静默丢弃。
+// 顶点数超过协议上限时回读必须显式失败（计告警），不能静默丢弃。
 TEST(GroundStationLinkTest, FenceZoneReportRejectsTooManyVertices) {
     PseudoTerminal terminal;
     common::Topic<common::FlightStateSnapshot> flight_state;

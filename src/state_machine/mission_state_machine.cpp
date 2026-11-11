@@ -4397,6 +4397,19 @@ private:
         const double horizontal_speed_mps =
             std::hypot(static_cast<double>(flight.vx_mps),
                        static_cast<double>(flight.vy_mps));
+        // 返航速度摘要（2026-11-11，1Hz）：给出"距目标/地速/指令上限"三件套，
+        // 现场核对"返航是不是太慢"时不必再从两个状态跳变时刻反推平均值。
+        if (now_ms - return_diag_last_ms_ >= 1000) {
+            return_diag_last_ms_ = now_ms;
+            const double command_mps = return_climb_phase_
+                                           ? return_home_.climb_rate_mps
+                                           : return_home_.cruise_speed_mps;
+            SPDLOG_INFO(
+                "S12 返航摘要: 距目标={:.1f}m 垂直差={:.2f}m 地速={:.2f}m/s "
+                "指令上限={:.2f}m/s 爬升段={} 相对高度={:.1f}m",
+                horizontal_m, vertical_m, horizontal_speed_mps, command_mps,
+                return_climb_phase_ ? "是" : "否", relative_alt_m);
+        }
         const bool inside = horizontal_m <= return_home_.arrival_radius_m &&
                             vertical_m <= return_home_.arrival_vertical_m &&
                             horizontal_speed_mps <= return_home_.arrival_speed_mps;
@@ -4566,6 +4579,7 @@ private:
                 return_best_distance_m_ = std::numeric_limits<double>::max();
                 return_progress_ms_ = 0;
                 return_stall_warned_ms_ = 0;
+                return_diag_last_ms_ = 0;
                 return_altitude_clamped_ = false;
                 arrival_stable_since_ms_ = 0;
                 SPDLOG_INFO("返航开始: 水平目标={}（起飞原点优先，Home 经纬度仅兜底），"
@@ -4947,6 +4961,9 @@ private:
     double return_best_distance_m_ = std::numeric_limits<double>::max();
     uint64_t return_progress_ms_ = 0;       ///< 最近一次"靠近"的时刻
     uint64_t return_stall_warned_ms_ = 0;   ///< 最近一次停滞告警时刻（节流）
+    /// S12 返航速度摘要 1Hz 节流（2026-11-11）：返航段此前没有周期日志，
+    /// 只能靠"进入 S12 / 到达"两个时刻反推平均速度，无法核对配置上限与实际地速。
+    uint64_t return_diag_last_ms_ = 0;
     bool return_altitude_clamped_ = false;  ///< 返航高度被区域上限压低的告警已打印
     uint64_t arrival_stable_since_ms_ = 0;  ///< 到达判据连续成立起点
     bool landing_command_sent_ = false;     ///< AUTO.LAND 曾成功入队

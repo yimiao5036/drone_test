@@ -46,8 +46,16 @@ constexpr uint16_t kFenceStatusMessageType = 65019;
 /// 围栏区域回读（机载 → 地面站，2026-10-29）：与 65018 完全同构，
 /// 把机载当前生效的区域原样回传，供地面站比对"本地定义 vs 机载实况"。
 constexpr uint16_t kFenceZoneReportMessageType = 65022;
+/// 65019 围栏状态帧的协议版本（布局是状态快照，与区域帧无关，保持 v1）。
 constexpr uint8_t kFenceZoneProtocolVersion = 1;
-constexpr uint8_t kFenceMaxVertices = 8;  ///< 单帧上限：顶点区 21~53（marker 在 54）
+/// 65018/65022 的分帧协议版本（2026-11-11）：顶点改为 int32 厘米偏移
+/// （±21474km，1cm 精度），每帧最多 `kFenceVerticesPerFrame` 个顶点，区域按
+/// 帧序号拼装——解决"区域跨度过大时 int16 厘米越界（±327m）"的问题。
+/// v1 单帧（int16 厘米）仍被解码兼容，供老地面站/老日志使用；机载回读
+/// 65022 一律发 v2。两种版本的帧长相同（55 字节有效载荷）。
+constexpr uint8_t kFenceZoneFramedProtocolVersion = 2;
+constexpr uint8_t kFenceVerticesPerFrame = 4;  ///< v2 单帧顶点上限（22+4*8=54，marker 在 54）
+constexpr uint8_t kFenceMaxVertices = 8;       ///< 一个区域的总顶点上限（与帧数无关）
 /// 地面站任务指令（65020，地面站 → 指定飞机）与回执（65021，飞机 → 地面站）。
 /// 与 65014 的分工：65014 是"分配任务"，65020 是对已起飞任务的即时人工指令
 /// （当前只有主动返航 kReturnHome）；中止后的任务分配以 65015 aborted

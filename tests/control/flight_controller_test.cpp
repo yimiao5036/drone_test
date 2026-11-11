@@ -973,6 +973,39 @@ TEST_F(FlightControllerFeedforwardTest, PositionFeedforwardPassthrough) {
     EXPECT_EQ(controller_.FeedforwardDroppedCount(), 0u);
 }
 
+TEST_F(FlightControllerFeedforwardTest, FenceClampDropsFeedforward) {
+    // 2026-11-11 现场回归（docs/故障排查手册 §17）：目标跑出围栏后，控制器
+    // 把位置目标钳到边界内，但速度前馈仍指向区域外 —— PX4 位置环与前馈
+    // 对抗，飞机在边界反复冲出/拉回（日志 own 摆动 ±7m、`|v|=10` 前馈钳制）。
+    // 语义应是"贴边悬停"：钳制发生的这一拍必须清零前馈。
+    StubFenceSource fence;
+    fence.SetSquare(100.0, 30.0);
+    controller_.SetFencePolygonSource(&fence);
+    auto intent = MakePositionIntent(150.f, 0.f, -5.f);  // 北向越界
+    intent.feedforward_vx_mps = 1.0f;                    // 指向界外
+    intent.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(intent);
+    Tick();
+    auto out = TakeOutput();
+    ASSERT_TRUE(out.has_value());
+    EXPECT_NEAR(out->x, 99.f, 1e-3);  // 位置仍钳到边界内 1m
+    EXPECT_FLOAT_EQ(out->z, -5.f);
+    EXPECT_EQ(out->feedforward_valid_mask, 0U);  // 本拍前馈清零
+    EXPECT_FLOAT_EQ(out->feedforward_vx_mps, 0.f);
+    EXPECT_GT(controller_.ClampedCount(), 0u);
+
+    // 目标回到区域内、不再钳制 → 前馈恢复，不再被误清。
+    auto inside = MakePositionIntent(10.f, 0.f, -5.f);
+    inside.feedforward_vx_mps = 1.0f;
+    inside.feedforward_valid_mask = common::kVelocityValidAll;
+    PublishIntent(inside);
+    Tick();
+    auto second = TakeOutput();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->feedforward_valid_mask, common::kVelocityValidAll);
+    EXPECT_FLOAT_EQ(second->feedforward_vx_mps, 1.0f);
+}
+
 TEST_F(FlightControllerFeedforwardTest, HorizontalAndVerticalClampedIndependently) {
     auto intent = MakePositionIntent(0.f, 0.f, -1.f);
     intent.feedforward_vx_mps = 3.f;   // 水平模长 5 → 等比缩放到 1
