@@ -14,6 +14,10 @@ namespace drone::communication {
 
 constexpr uint8_t kNetCaptureAircraftComponentId = 25;
 constexpr uint8_t kRocketAircraftComponentId = 26;
+/// 干扰类飞机（2026-11-11 维护者确认，占用预留值 27）。当前仅身份与
+/// 视觉剖面占位：视觉段与捕网共用实现，干扰载荷接口尚未实现，S9/S10 仍
+/// 要求可用的拦截设备（kHold 实现待接入）。
+constexpr uint8_t kJammerAircraftComponentId = 27;
 constexpr uint8_t kGroundStationSystemId = 255;
 constexpr uint8_t kGroundStationComponentId = 190;
 constexpr uint16_t kTrackTargetUpdateMessageType = 65010;

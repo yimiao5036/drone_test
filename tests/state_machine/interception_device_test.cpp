@@ -7,11 +7,11 @@
 #include "../common/log_capture.h"
 #include "../communication/fake_command_sender.h"
 #include "config/config.h"
-#include "state_machine/net_actuator.h"
+#include "state_machine/interception_device.h"
 
 namespace {
 using drone::common::CommandAckStatus;
-using drone::state_machine::ActuatorFeedback;
+using drone::state_machine::InterceptFeedback;
 using drone::test::FakeCommandSender;
 using namespace std::chrono_literals;
 
@@ -29,7 +29,7 @@ drone::config::ActuatorConfig MakeConfig(int64_t reset_delay_ms = 1500,
     return config;
 }
 
-ActuatorFeedback Feedback(const FakeCommandSender& sender, bool connected,
+InterceptFeedback Feedback(const FakeCommandSender& sender, bool connected,
                           uint64_t now_ms) {
     return {connected, sender.AckStatus(), now_ms};
 }
@@ -55,38 +55,38 @@ private:
     uint64_t ack_time_ms_;
 };
 
-TEST(NetActuatorTest, InitialStateReadyWithOneShot) {
+TEST(InterceptionDeviceTest, InitialStateReadyWithOneShot) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(), &sender);
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(), &sender);
     ASSERT_NE(actuator, nullptr);
     EXPECT_TRUE(actuator->Ready());
-    EXPECT_EQ(actuator->RemainingShots(), 1u);
-    EXPECT_FALSE(actuator->Fired());
+    EXPECT_EQ(actuator->RemainingUses(), 1u);
+    EXPECT_FALSE(actuator->Triggered());
     EXPECT_FALSE(actuator->Faulted());
 }
 
-TEST(NetActuatorTest, TriggerSendsFireAndConsumesShot) {
+TEST(InterceptionDeviceTest, TriggerSendsFireAndConsumesShot) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(), &sender);
-    ASSERT_TRUE(actuator->Trigger());
-    EXPECT_TRUE(actuator->Fired());
-    EXPECT_EQ(actuator->RemainingShots(), 0u);
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(), &sender);
+    ASSERT_TRUE(actuator->Execute());
+    EXPECT_TRUE(actuator->Triggered());
+    EXPECT_EQ(actuator->RemainingUses(), 0u);
     EXPECT_FALSE(actuator->Ready());
     ASSERT_EQ(sender.CallCount(), 1u);
     EXPECT_EQ(sender.LastCommand(), kDoSetActuator);
     EXPECT_FLOAT_EQ(sender.LastParams()[0], -0.7F);  // Set 1 → p1
     EXPECT_TRUE(std::isnan(sender.LastParams()[1]));
     EXPECT_FLOAT_EQ(sender.LastParams()[6], 0.0F);
-    EXPECT_FALSE(actuator->Trigger());
+    EXPECT_FALSE(actuator->Execute());
 }
 
-TEST(NetActuatorTest, FireAckStartsHoldThenSendsReset) {
+TEST(InterceptionDeviceTest, FireAckStartsHoldThenSendsReset) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(1500, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(1500, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kAccepted, 50);
     actuator->Update(Feedback(sender, true, 50));
@@ -102,11 +102,11 @@ TEST(NetActuatorTest, FireAckStartsHoldThenSendsReset) {
 
 // 回归：ACK 在 SendCommand() 返回前到达时，基线若在入队后才抓取会把该
 // ACK 当成旧 ACK 吞掉，执行器永久停在 FireQueued/ResetQueued。
-TEST(NetActuatorTest, AckArrivingBeforeSendReturnsStillAdvances) {
+TEST(InterceptionDeviceTest, AckArrivingBeforeSendReturnsStillAdvances) {
     AckDuringSendSender sender(50);
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());  // 触发 ACK 在 SendCommand 内到达
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());  // 触发 ACK 在 SendCommand 内到达
 
     actuator->Update(Feedback(sender, true, 50));
     EXPECT_EQ(sender.CallCount(), 2u) << "入队前到达的 ACK 不得被基线吞掉";
@@ -118,11 +118,11 @@ TEST(NetActuatorTest, AckArrivingBeforeSendReturnsStillAdvances) {
     EXPECT_EQ(sender.CallCount(), 2u);
 }
 
-TEST(NetActuatorTest, ResetAckAndSettleMakesReady) {
+TEST(InterceptionDeviceTest, ResetAckAndSettleMakesReady) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 200), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 200), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kAccepted, 10);
     actuator->Update(Feedback(sender, true, 10));
@@ -137,14 +137,14 @@ TEST(NetActuatorTest, ResetAckAndSettleMakesReady) {
 
     actuator->Update(Feedback(sender, true, 220));
     EXPECT_TRUE(actuator->Ready());
-    EXPECT_EQ(actuator->RemainingShots(), 0u);
+    EXPECT_EQ(actuator->RemainingUses(), 0u);
 }
 
-TEST(NetActuatorTest, InProgressKeepsWaiting) {
+TEST(InterceptionDeviceTest, InProgressKeepsWaiting) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kInProgress, 10);
     actuator->Update(Feedback(sender, true, 10));
@@ -155,26 +155,26 @@ TEST(NetActuatorTest, InProgressKeepsWaiting) {
     EXPECT_EQ(sender.CallCount(), 2u);
 }
 
-TEST(NetActuatorTest, RejectedAckFaultsWithoutReset) {
+TEST(InterceptionDeviceTest, RejectedAckFaultsWithoutReset) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kDenied, 10);
     actuator->Update(Feedback(sender, true, 10));
     EXPECT_TRUE(actuator->Faulted());
     EXPECT_EQ(sender.CallCount(), 1u);
-    EXPECT_FALSE(actuator->Reset());
+    EXPECT_FALSE(actuator->Stop());
     actuator->Update(Feedback(sender, true, 1000));
     EXPECT_EQ(sender.CallCount(), 1u);
 }
 
-TEST(NetActuatorTest, FireAckTimeoutFaultsAndLateAckDoesNotAdvance) {
+TEST(InterceptionDeviceTest, FireAckTimeoutFaultsAndLateAckDoesNotAdvance) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateTimeout(kDoSetActuator);
     actuator->Update(Feedback(sender, true, 1000));
@@ -188,11 +188,11 @@ TEST(NetActuatorTest, FireAckTimeoutFaultsAndLateAckDoesNotAdvance) {
     EXPECT_EQ(sender.CallCount(), 1u);
 }
 
-TEST(NetActuatorTest, DisconnectWhileHoldingFaults) {
+TEST(InterceptionDeviceTest, DisconnectWhileHoldingFaults) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(1500, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(1500, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kAccepted, 10);
     actuator->Update(Feedback(sender, true, 10));
@@ -206,11 +206,11 @@ TEST(NetActuatorTest, DisconnectWhileHoldingFaults) {
     EXPECT_EQ(sender.CallCount(), 1u);
 }
 
-TEST(NetActuatorTest, ResetEnqueueFailureRetriesWithoutFire) {
+TEST(InterceptionDeviceTest, ResetEnqueueFailureRetriesWithoutFire) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.FailNextCalls(2);
     sender.SimulateAck(kDoSetActuator, kAccepted, 10);
@@ -227,22 +227,22 @@ TEST(NetActuatorTest, ResetEnqueueFailureRetriesWithoutFire) {
     }
 }
 
-TEST(NetActuatorTest, DisconnectWhileWaitingFaults) {
+TEST(InterceptionDeviceTest, DisconnectWhileWaitingFaults) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     actuator->Update(Feedback(sender, false, 100));
     EXPECT_TRUE(actuator->Faulted());
     EXPECT_EQ(sender.CallCount(), 1u);
 }
 
-TEST(NetActuatorTest, UnrelatedAckDoesNotAdvanceOrFault) {
+TEST(InterceptionDeviceTest, UnrelatedAckDoesNotAdvanceOrFault) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(176, kAccepted, 10);  // AUTO.LAND
     actuator->Update(Feedback(sender, true, 10));
@@ -256,11 +256,11 @@ TEST(NetActuatorTest, UnrelatedAckDoesNotAdvanceOrFault) {
 // 回归（最终评审 Important 1）：复位等待跨越 S12~S14 时，同一决策拍内
 // AUTO.LAND(176)/DISARM(400) 的 ACK 不得覆盖 187 专用终态；否则执行器会
 // 停在 ResetQueued 且不故障（静默挂死）。
-TEST(NetActuatorTest, InterleavedAckDoesNotSwallow187) {
+TEST(InterceptionDeviceTest, InterleavedAckDoesNotSwallow187) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kAccepted, 10);
     sender.SimulateAck(176, kAccepted, 11);  // AUTO.LAND，与 187 同拍到达
@@ -273,11 +273,11 @@ TEST(NetActuatorTest, InterleavedAckDoesNotSwallow187) {
 
 // 回归（最终评审 Important 1）：无关命令超时只更新全局 last_timeout_command，
 // 不得让执行器 Faulted；随后真正的 187 ACK 仍能推进。
-TEST(NetActuatorTest, UnrelatedCommandTimeoutDoesNotFault) {
+TEST(InterceptionDeviceTest, UnrelatedCommandTimeoutDoesNotFault) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(0, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(0, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateTimeout(176);  // AUTO.LAND ACK 超时
     actuator->Update(Feedback(sender, true, 10));
@@ -292,46 +292,46 @@ TEST(NetActuatorTest, UnrelatedCommandTimeoutDoesNotFault) {
 
 // 回归（最终评审 Important 3）：手动 Reset() 取消保持/稳定计时、回到 Ready，
 // 但不恢复发数，且此后不得再补发命令。
-TEST(NetActuatorTest, ManualResetCancelsCycleKeepsShotsConsumed) {
+TEST(InterceptionDeviceTest, ManualResetCancelsCycleKeepsShotsConsumed) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(1500, 0), &sender);
-    ASSERT_TRUE(actuator->Trigger());
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(1500, 0), &sender);
+    ASSERT_TRUE(actuator->Execute());
 
     sender.SimulateAck(kDoSetActuator, kAccepted, 10);
     actuator->Update(Feedback(sender, true, 10));
     ASSERT_EQ(sender.CallCount(), 1u);  // 保持中，尚未复位
 
-    ASSERT_TRUE(actuator->Reset());
+    ASSERT_TRUE(actuator->Stop());
     ASSERT_EQ(sender.CallCount(), 2u);
     EXPECT_FLOAT_EQ(sender.LastParams()[0], 0.0F);
     EXPECT_TRUE(actuator->Ready());
-    EXPECT_EQ(actuator->RemainingShots(), 0u);
+    EXPECT_EQ(actuator->RemainingUses(), 0u);
 
     // 手动复位后保持/稳定计时已取消，不再产生任何命令。
     actuator->Update(Feedback(sender, true, 5000));
     EXPECT_EQ(sender.CallCount(), 2u);
-    EXPECT_FALSE(actuator->Trigger());  // 发数已扣，不能再次触发
+    EXPECT_FALSE(actuator->Execute());  // 发数已扣，不能再次触发
 }
 
-TEST(NetActuatorTest, EnqueueFailureRetriesWithoutConsumingShot) {
+TEST(InterceptionDeviceTest, EnqueueFailureRetriesWithoutConsumingShot) {
     FakeCommandSender sender;
     auto actuator =
-        drone::state_machine::CreateNetActuator(MakeConfig(), &sender);
+        drone::state_machine::CreateInterceptionDevice(MakeConfig(), &sender);
     sender.FailNextCalls(1);
-    EXPECT_FALSE(actuator->Trigger());
-    EXPECT_FALSE(actuator->Fired());
-    EXPECT_EQ(actuator->RemainingShots(), 1u);
+    EXPECT_FALSE(actuator->Execute());
+    EXPECT_FALSE(actuator->Triggered());
+    EXPECT_EQ(actuator->RemainingUses(), 1u);
 
-    EXPECT_TRUE(actuator->Trigger());
-    EXPECT_TRUE(actuator->Fired());
-    EXPECT_EQ(actuator->RemainingShots(), 0u);
+    EXPECT_TRUE(actuator->Execute());
+    EXPECT_TRUE(actuator->Triggered());
+    EXPECT_EQ(actuator->RemainingUses(), 0u);
 }
 
-TEST(NetActuatorTest, WarnsWhenResetDelayOutsideManualRange) {
+TEST(InterceptionDeviceTest, WarnsWhenResetDelayOutsideManualRange) {
     drone::test::LogCapture logs;
     FakeCommandSender sender;
-    (void)drone::state_machine::CreateNetActuator(MakeConfig(500, 0), &sender);
+    (void)drone::state_machine::CreateInterceptionDevice(MakeConfig(500, 0), &sender);
     EXPECT_EQ(logs.Count("reset_delay_ms"), 1);
 }
 

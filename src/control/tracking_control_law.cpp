@@ -70,8 +70,10 @@ PidParams BuildDistancePidParams(const TrackingConfig& cfg) {
 
 }  // namespace
 
-TrackingControlLaw::TrackingControlLaw(const TrackingConfig& cfg)
+TrackingControlLaw::TrackingControlLaw(const TrackingConfig& cfg,
+                                       VisualProfile profile)
     : cfg_(cfg),
+      profile_(profile),
       pixel_to_beta_(cfg.camera.fx_px, cfg.camera.cx_px),
       pixel_to_alpha_(cfg.camera.fy_px, cfg.camera.cy_px),
       distance_pid_(BuildDistancePidParams(cfg)),

@@ -148,9 +148,9 @@ target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 # ---- state_machine 模块（任务状态机接口） ----
 add_library(drone_state_machine STATIC
     src/state_machine/gcs_net_fire.cpp
+    src/state_machine/interception_device.cpp
     src/state_machine/mission_assignment.cpp
-    src/state_machine/mission_state_machine.cpp
-    src/state_machine/net_actuator.cpp)
+    src/state_machine/mission_state_machine.cpp)
 target_include_directories(drone_state_machine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_state_machine PUBLIC cxx_std_17)
@@ -170,6 +170,7 @@ add_library(drone_control_core STATIC
     src/control/pid_controller.cpp
     src/control/tracking_config.cpp
     src/control/tracking_control_law.cpp
+    src/control/visual_control_law.cpp
     src/control/visual_tracking_shadow.cpp)
 target_include_directories(drone_control_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -417,6 +418,7 @@ if(BUILD_TESTING)
                 frame_transform_test
                 tracking_config_test
                 tracking_control_law_test
+                visual_control_law_test
                 visual_tracking_shadow_test
                 flight_controller_test
                 flight_controller_link_contract_test
@@ -491,22 +493,22 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(mission_state_machine_test)
 
-        # 捕网执行器内部时序测试：触发 ACK 保持、复位 ACK/稳定、故障与重试
-        add_executable(net_actuator_test
-            tests/state_machine/net_actuator_test.cpp)
-        target_link_libraries(net_actuator_test PRIVATE
+        # 通用拦截设备内部时序测试：触发 ACK 保持、复位 ACK/稳定、故障与重试
+        add_executable(interception_device_test
+            tests/state_machine/interception_device_test.cpp)
+        target_link_libraries(interception_device_test PRIVATE
             drone_common
             drone_state_machine
             spdlog::spdlog
             GTest::gtest_main)
         if(MSVC)
-            target_compile_options(net_actuator_test PRIVATE /W4 /permissive-)
+            target_compile_options(interception_device_test PRIVATE /W4 /permissive-)
         else()
-            target_compile_options(net_actuator_test PRIVATE -Wall -Wextra -Wpedantic)
+            target_compile_options(interception_device_test PRIVATE -Wall -Wextra -Wpedantic)
         endif()
 
         include(GoogleTest)
-        gtest_discover_tests(net_actuator_test)
+        gtest_discover_tests(interception_device_test)
 
         # 地面站直控发射服务：门禁拒绝、受理→完成回执、command_id 幂等与冷却
         add_executable(gcs_net_fire_test

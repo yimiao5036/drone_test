@@ -3,6 +3,7 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -11,6 +12,7 @@
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "control/flight_controller.h"
+#include "control/visual_control_law.h"
 #include "control/visual_tracking_shadow.h"
 #include "perception/detection_backend.h"
 #include "perception/stereo_ranger.h"
@@ -145,6 +147,29 @@ void DroneApplication::BuildComponents() {
         state_machine_config.approach = config_.approach;
         state_machine_config.expected_interceptor_type =
             config_.ground_station.aircraft_component_id;
+        // 拦截剖面：由本机功能类别（component ID）在装配期映射，控制回路不查
+        // 身份。25=捕网 / 27=干扰（与捕网共用视觉律，参数各配）/ 26=撞击
+        // （预留：工厂 fail-fast，避免撞击机静默套用捕网“保持距离”律）。
+        switch (config_.ground_station.aircraft_component_id) {
+            case communication::kNetCaptureAircraftComponentId:
+                state_machine_config.visual_profile =
+                    control::VisualProfile::kNetCapture;
+                break;
+            case communication::kJammerAircraftComponentId:
+                state_machine_config.visual_profile =
+                    control::VisualProfile::kJammer;
+                break;
+            case communication::kRocketAircraftComponentId:
+                state_machine_config.visual_profile =
+                    control::VisualProfile::kImpact;
+                break;
+            default:
+                throw std::invalid_argument(
+                    "地面站身份 component 不在已定义的拦截剖面内（期望 25/26/27）");
+        }
+        SPDLOG_INFO("拦截剖面: {}（component={}）",
+                    control::VisualProfileName(state_machine_config.visual_profile),
+                    config_.ground_station.aircraft_component_id);
         mission_state_machine_ =
             std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
     }

@@ -3,7 +3,7 @@
 ## 功能职责
 
 `GcsNetFire` 消费地面站 `65016 NET_FIRE` 指令，经落地/未解锁门禁后占用捕网执行器
-（`INetActuator`，当前 `single_pwm`），并把 `65017 NET_FIRE_ACK` 回执交回
+（`IInterceptionDevice`，当前 `single_pwm`），并把 `65017 NET_FIRE_ACK` 回执交回
 `GroundStationLink` 下行给地面站。
 
 **做什么**：
@@ -29,14 +29,14 @@
 ```text
 地面站 255/190 ──65016──▶ GroundStationLink ──kNetFireCommand──▶ GcsNetFire
                                                                    │ 门禁
-                                                    INetActuator::Trigger（DO_SET_ACTUATOR 187）
+                                                    IInterceptionDevice::Execute（DO_SET_ACTUATOR 187）
                                                                    │
 GcsNetFire ──kNetFireAck──▶ GroundStationLink ──65017──▶ 地面站 255/190
 ```
 
 | 接口 | 说明 |
 |---|---|
-| `GcsNetFire(config::ActuatorConfig, communication::IPx4CommandSender*)` | 构造即按 `actuator.type` 经 `CreateNetActuator` 创建执行器；`sender==nullptr` 时执行器缺席，全部请求按 `kActuatorUnavailable` 拒绝 |
+| `GcsNetFire(config::ActuatorConfig, communication::IPx4CommandSender*)` | 构造即按 `actuator.type` 经 `CreateInterceptionDevice` 创建设备（kPulse）；`sender==nullptr` 时执行器缺席，全部请求按 `kActuatorUnavailable` 拒绝 |
 | `SetFlightStateInput(Topic<FlightStateSnapshot>&)` | 绑定 `Px4Link::StateOutput()`，必须 `Start()` 前调用 |
 | `SetCommandInput(Topic<NetFireCommand>&)` | 绑定 `GroundStationLink::NetFireCommandOutput()`，必须 `Start()` 前调用 |
 | `AckOutput()` | `Topic<NetFireAck>`，接 `GroundStationLink::SetNetFireAckInput()` |
@@ -58,10 +58,10 @@ GcsNetFire ──kNetFireAck──▶ GroundStationLink ──65017──▶ 地
 5. 飞行状态缺失/超龄（>1s）/`landed_state_valid=false` → `kFlightStateStale`；
 6. `armed=true` → `kArmed`；`landed=false` → `kNotLanded`；
 7. 执行器缺席 → `kActuatorUnavailable`；终态故障 → `kActuatorFaulted`；
-   未 Ready（时序中）→ `kActuatorBusy`；发数耗尽 → `kNoRemainingShots`；
+   未 Ready（时序中）→ `kActuatorBusy`；发数耗尽 → `kNoRemainingUses`；
 8. 距上次成功触发不足 `gcs_fire_cooldown` → `kCooldown`（单发实现发数先耗尽，
    该门禁实际由多发实现触发）；
-9. `Trigger()` 入队失败 → `kActuatorUnavailable`（链路未就绪/队列满）。
+9. `Execute()` 入队失败 → `kActuatorUnavailable`（链路未就绪/队列满）。
 
 受理成功后：立即回 `ACCEPTED`，`last_fire_ms` 与 `pending_completion_` 记账；
 执行器走完 `FireQueued → Hold → ResetQueued → Settle → Ready` 后，服务补发
@@ -73,7 +73,7 @@ GcsNetFire ──kNetFireAck──▶ GroundStationLink ──65017──▶ 地
 - **线程模型**：单工作线程，`steady_clock` 单调时钟，20ms 节拍；每拍先清空
   飞行状态订阅（容量 2，只留最新），再消费指令（容量 8，丢最旧），最后
   `UpdateActuator()` 推进时序并检查完成/故障。指令是人工低频操作，不设阻塞等待。
-- **时钟同源**：判定使用本机单调时钟，与 `ActuatorFeedback.now_ms` 同源；
+- **时钟同源**：判定使用本机单调时钟，与 `InterceptFeedback.now_ms` 同源；
   65016 不携带地面站时间戳（`source_time_ms=0`），链路层收帧时打
   `received_ms`/`receive_time_ms`。
 - **与装配门禁的关系**：`DroneApplication::BuildComponents()` 仅在

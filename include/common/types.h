@@ -504,7 +504,7 @@ struct MissionAssignment {
     uint8_t protocol_version = 1;  ///< 分配协议版本，当前固定 1
     uint32_t assignment_id = 0;    ///< 地面站生成的分配编号
     uint32_t target_id = 0;        ///< 指定目标编号；0 非法
-    uint8_t interceptor_type = 0;  ///< 25=捕网 26=火箭，必须等于本机 component
+    uint8_t interceptor_type = 0;  ///< 25=捕网 26=火箭 27=干扰，必须等于本机 component
     uint8_t flags = 0;             ///< bit0=授权自动起飞 bit1=取消当前分配
     uint32_t valid_for_ms = 0;     ///< 分配有效期（毫秒）
     /// 65014 v3 扩展（2026-10-29 多边形围栏）：分配时地面站声明的区域编号/版本。
@@ -540,7 +540,7 @@ struct MissionStatus {
     uint32_t assignment_id = 0;                ///< 当前分配编号
     uint32_t target_id = 0;                    ///< 当前目标编号
     MissionAvailability availability = MissionAvailability::kUnavailable;  ///< 可用状态
-    uint8_t interceptor_type = 0;              ///< 25=捕网 26=火箭；未知为 0
+    uint8_t interceptor_type = 0;              ///< 25=捕网 26=火箭 27=干扰；未知为 0
     /// 65013 v3 扩展字段（2026-10-29，多边形围栏）：未装载区域时 id/version 为 0。
     uint16_t zone_id = 0;                      ///< 当前生效围栏区域编号
     uint16_t zone_version = 0;                 ///< 当前生效围栏区域版本

@@ -10,7 +10,7 @@
 #include "common/topic.h"
 #include "common/types.h"
 #include "config/config.h"
-#include "state_machine/net_actuator.h"
+#include "state_machine/interception_device.h"
 
 namespace drone {
 
@@ -38,7 +38,7 @@ constexpr uint8_t kGcsNetFireFlagConfirmed = 1U << 0U;
 /// 触发门禁（全部满足才真正入队触发；否则立刻回 65017 拒绝回执）：
 ///   1. 指令新鲜：`received_ms` 距今不超过 `header.valid_for_ms`（链路层置 2000ms）；
 ///   2. 飞行状态新鲜（1s 内）且 `landed_state_valid && landed` 为真、`armed` 为假；
-///   3. 执行器存在、未进入终态故障、`Ready()`、`RemainingShots()>0`；
+///   3. 执行器存在、未进入终态故障、`Ready()`、`RemainingUses()>0`；
 ///   4. 距上一次成功触发不小于 `actuator.gcs_fire_cooldown`（默认 3000ms）；
 ///   5. 同一 `command_id` 只执行一次，重复帧回放上一次结论（不重复触发）。
 ///
@@ -97,7 +97,7 @@ private:
 
     config::ActuatorConfig config_;
     communication::IPx4CommandSender* sender_ = nullptr;
-    std::unique_ptr<INetActuator> actuator_;
+    std::unique_ptr<IInterceptionDevice> actuator_;
 
     common::Topic<common::FlightStateSnapshot>* flight_state_topic_ = nullptr;
     common::Topic<common::NetFireCommand>* command_topic_ = nullptr;

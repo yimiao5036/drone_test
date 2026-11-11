@@ -465,6 +465,22 @@ TEST(ConfigTest, AllowsExplicitVideoOutputWithoutIdentityPlaceholder) {
     std::filesystem::remove(path);
 }
 
+TEST(ConfigTest, AcceptsJammerGroundStationIdentity) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["aircraft_component_id"] = 27;
+    value["ground_station"]["aircraft_type"] = "jammer";
+    value["ground_station"]["callsign"] = "干扰-01";
+    const auto path = WriteTemporaryConfig(value, "drone_config_jammer_identity.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.ground_station.aircraft_component_id, 27);
+    EXPECT_EQ(config.ground_station.aircraft_type, "jammer");
+    EXPECT_EQ(config.ground_station.callsign, "干扰-01");
+    EXPECT_EQ(config.video_sender.encode.url,
+              "rtsp://127.0.0.1:8554/drone_27_1");
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsGroundStationTypeComponentMismatch) {
     json value = ReadSourceConfig();
     value["ground_station"]["aircraft_component_id"] = 26;
@@ -478,7 +494,7 @@ TEST(ConfigTest, RejectsGroundStationTypeComponentMismatch) {
 
 TEST(ConfigTest, RejectsReservedGroundStationComponent) {
     json value = ReadSourceConfig();
-    value["ground_station"]["aircraft_component_id"] = 27;
+    value["ground_station"]["aircraft_component_id"] = 28;
     value["ground_station"]["aircraft_type"] = "rocket";
     const auto path = WriteTemporaryConfig(value, "drone_config_reserved_identity.json");
 

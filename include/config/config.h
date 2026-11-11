@@ -102,7 +102,7 @@ struct FlightControllerConfig {
 /// `Peripheral via Actuator Set 1`，故 net_channel=1。
 struct ActuatorConfig {
     /// 执行器实现类型：当前 `single_pwm`=单发舵机式；后续多发实现通过该键
-    /// 在工厂切换，状态机只依赖 INetActuator 抽象接口。
+    /// 在工厂切换，状态机只依赖 IInterceptionDevice 抽象接口。
     std::string type = "single_pwm";
     int32_t net_channel = 1;        ///< PX4 Actuator Set N（1..6）
     /// 归一化控制量：PX4 按该输出通道的 PWM_MAIN_MINn/MAXn（或 AUX）线性

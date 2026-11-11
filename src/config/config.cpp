@@ -359,7 +359,7 @@ communication::GroundStationLinkConfig ParseGroundStationConfig(
     const json& target_input = ground.at("target_input");
 
     communication::GroundStationLinkConfig config;
-    // 飞机二元身份：system=同类型编号，component=功能类别（网捕25/火箭26）。
+    // 飞机二元身份：system=同类型编号，component=功能类别（网捕25/火箭26/干扰27）。
     config.aircraft_system_id = ReadUint8(ground, "aircraft_system_id");
     config.aircraft_component_id = ReadUint8(ground, "aircraft_component_id");
     config.aircraft_type = ground.at("aircraft_type").get<std::string>();
@@ -1173,7 +1173,7 @@ AppConfig LoadAppConfig(const std::string& path,
         approach, "guide_lowpass_ms", config.approach.guide_lowpass_ms);
     config.approach.Validate();
 
-    // 捕网执行器（actuator 节，阶段四控制接入 Task 10）：机载只保存
+    // 拦截设备（actuator 节，阶段四控制接入 Task 10）：机载只保存
     // Actuator Set N 与归一化控制量；PWM 输出功能/区间/舵机行程在 PX4 侧配置。
     const json actuator = root.value("actuator", json::object());
     config.actuator.type =

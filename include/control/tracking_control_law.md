@@ -27,11 +27,13 @@
 kControlIntent 当前无消费者，不产生真实控制输出。**
 
 **第二调用点（阶段四 Task 9）**：`MissionStateMachine` 的 S7 视觉伺服协作者
-直接持有 `TrackingControlLaw` 实例（配置来自 `visual_tracking` 节同源注入），
+**经 `IVisualControlLaw` 接口**持有控制律（2026-11-11 起；当前实现仍为
+`TrackingControlLaw`，配置来自 `visual_tracking` 节同源注入），
 在 10Hz 决策周期内组装快照并调用 `Update`（控制律按实际时钟差推算 dt，
 配置频率仅作首拍兜底），输出映射为状态机 `ControlIntent`（`control_source=1`
 带 bit31，接 `FlightController`——正式控制链）。影子与状态机的意图输出是两个
 独立 Topic，互不干扰；影子保留供观察（见 `visual_tracking_shadow.h` 并存说明）。
+接口与剖面选择见 [`visual_control_law.md`](visual_control_law.md)。
 
 不做什么：不接 Px4Link；不做多目标选举；不做 NED 空间转换（属
 TargetEstimator 融合阶段）。距离通道仅在注入 `StereoTargetDistance` 且该帧

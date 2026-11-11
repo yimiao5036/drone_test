@@ -255,8 +255,13 @@ void GroundStationLinkConfig::Validate() const {
         if (aircraft_component_id != kRocketAircraftComponentId) {
             throw std::invalid_argument("rocket 必须使用 aircraft_component_id=26");
         }
+    } else if (aircraft_type == "jammer") {
+        if (aircraft_component_id != kJammerAircraftComponentId) {
+            throw std::invalid_argument("jammer 必须使用 aircraft_component_id=27");
+        }
     } else {
-        throw std::invalid_argument("未知地面站飞机类型，当前仅支持 net_capture 或 rocket");
+        throw std::invalid_argument(
+            "未知地面站飞机类型，当前仅支持 net_capture、rocket 或 jammer");
     }
     if (ground_system_id != kGroundStationSystemId ||
         ground_component_id != kGroundStationComponentId) {

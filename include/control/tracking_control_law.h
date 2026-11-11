@@ -23,14 +23,22 @@
 #include "control/rate_limiter.h"
 #include "control/tracking_config.h"
 #include "control/tracking_types.h"
+#include "control/visual_control_law.h"
 
 namespace drone::control {
 
-/// 视觉跟踪主控律：消费控制快照，输出限幅后的控制意图
-class TrackingControlLaw {
+/// 视觉跟踪主控律：消费控制快照，输出限幅后的控制意图。
+///
+/// 2026-11-11 起实现 IVisualControlLaw：捕网与干扰共用本实现（剖面只做
+/// 日志/诊断标注，不改变数学），撞击剖面由独立实现后续接入。状态机只依赖
+/// 接口，不再直接持有本类型。
+class TrackingControlLaw final : public IVisualControlLaw {
 public:
     /// cfg：启动期加载的全量配置（值拷贝持有，运行期不再触碰配置源）
-    explicit TrackingControlLaw(const TrackingConfig& cfg);
+    /// profile：所属剖面；默认捕网，保持既有直接构造点的行为不变
+    explicit TrackingControlLaw(
+        const TrackingConfig& cfg,
+        VisualProfile profile = VisualProfile::kNetCapture);
 
     /// 单周期控制计算（§7.1 固定周期持续运行）。
     /// now_ms：当前单调时钟毫秒；内部据此推算 dt 并做超龄判定。
@@ -39,10 +47,14 @@ public:
     ControlOutput Update(const ControlSnapshot& snapshot, std::int64_t now_ms);
 
     /// 停止视觉闭环时清全部状态（积分、限幅器历史、节拍时钟，§6.4）
-    void Reset();
+    void Reset() override;
+
+    /// 所属拦截剖面（仅日志/诊断；控制回路不得据此分支）
+    VisualProfile Profile() const override { return profile_; }
 
 private:
     TrackingConfig cfg_;  // 配置值拷贝（运行期只读）
+    VisualProfile profile_;  // 剖面标注（不参与数学）
 
     // ---- 预计算构件（构造期完成，热路径零分配） ----
     PixelToAngle pixel_to_beta_;   // 水平：x_offset → β（§4.1）

@@ -397,7 +397,7 @@ G5 是**第一次真机室外飞行**，目标不是打靶，而是回答三个�
 另立场次；**G5-1h 任一时刻不通过 → 立即停飞整改**。
 
 **G5-2（另立，不在首飞范围）**：视觉跟踪与拦截——双目锁定、S7 伺服到 `d_exp=10m`、
-S9 射程窗口、187 发射。需 `interception.enabled=true` + `net_actuator` 真机装配，
+S9 射程窗口、187 发射。需 `interception.enabled=true` + `interception_device` 真机装配，
 且解决「`d_exp_m=10.0` 与 `interception.max_range_m=8.0` 稳态不重合」的设计缺口，
 再单独立清单。
 

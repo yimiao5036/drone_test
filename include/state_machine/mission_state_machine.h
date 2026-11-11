@@ -36,6 +36,7 @@
 #include "common/types.h"
 #include "config/config.h"
 #include "control/tracking_config.h"
+#include "control/visual_control_law.h"
 
 namespace drone::communication {
 class IPx4CommandSender;
@@ -58,8 +59,8 @@ struct MissionStateMachineConfig {
     /// 兜底。
     config::ApproachConfig approach;
     /// 本机拦截功能类别（地面站链路 `ground_station.aircraft_component_id`
-    /// 同源注入）：65014 的 `interceptor_type` 必须等于该值，25=捕网、26=火箭。
-    /// 装配层未显式设置时保持捕网默认值。
+    /// 同源注入）：65014 的 `interceptor_type` 必须等于该值，25=捕网、26=火箭、
+    /// 27=干扰（2026-11-11 占位）。装配层未显式设置时保持捕网默认值。
     uint8_t expected_interceptor_type = 25;
     /// 控制意图有效期（valid_for_ms 与 valid_until_ms 基准）。必须与
     /// FlightController 的 controller.intent_timeout 对齐，由装配层从同一来源传入。
@@ -69,19 +70,23 @@ struct MissionStateMachineConfig {
     config::HandoverConfig handover;
     /// 视觉跟踪控制律全量配置（visual_tracking 节整节同源注入）：
     /// `tracking.camera` 供视线角与视场半角换算（S6 进入判据）、
-    /// S7 视觉伺服协作者构造 TrackingControlLaw（阈值与增益同源）。
+    /// S7 视觉伺服经工厂按 visual_profile 构造控制律（阈值与增益同源）。
     /// 分辨率与内参绑定，换档位必须重新标定（见 control/tracking_config.h）。
     control::TrackingConfig tracking;
+    /// 拦截剖面（2026-11-11）：装配层由本机功能类别映射后注入，决定 S7 视觉
+    /// 控制律实现。默认 kNetCapture；kJammer 与捕网共用实现（参数各配），
+    /// kImpact 预留（工厂 fail-fast）。本字段不参与寻址，只决定控制律形态。
+    control::VisualProfile visual_profile = control::VisualProfile::kNetCapture;
     /// 视觉稳定性状态超龄阈值（visual_tracking.control.visual_stale_ms 同源）。
     /// VisualTargetStatus 头不设置 valid_for_ms，新鲜度按 receive_time + 该阈值判定。
     std::chrono::milliseconds visual_stale{200};
     /// 双目测距超龄阈值（visual_tracking.control.distance_stale_ms 同源）。
     std::chrono::milliseconds distance_stale{500};
     /// 捕网执行器配置（actuator 配置节同源注入，阶段四 Task 10）：状态机只
-    /// 通过 INetActuator 抽象接口每拍 `Update()` 并观察状态，S10 触发；触发
-    /// ACK 后的保持/复位/稳定时序由执行器按配置自行推进（Task 5）。当前
-    /// `type=single_pwm` 发送归一化 -0.7/0.0，PWM 映射在 PX4/QGC 侧配置。
-    /// 未注入命令接口（enable_control=false 装配语义）时本功能物理缺席。
+    /// 通过 IInterceptionDevice 通用接口每拍 `Update()` 并观察状态，S10 发起
+    /// 一次拦截动作；触发 ACK 后的保持/复位/稳定时序由设备按配置自行推进。
+    /// 当前 `type=single_pwm`（kPulse）发送归一化 -0.7/0.0，PWM 映射在
+    /// PX4/QGC 侧配置；干扰（kHold）/撞击（kNone）实现后续接入。
     /// 构造期对其实施 `Validate()` 兜底（程序化构造的非法 Set/归一化值
     /// fail-fast；参照 FlightController 构造期 period 防御先例）。
     config::ActuatorConfig actuator;
@@ -237,7 +242,7 @@ public:
     // ---- 测试入口（生产装配不可达） ----
     /// 强制提交一次状态迁移（单测/SITL 验收入口；Start 后调用，由决策线程消费
     /// 触发/完成动作）。与生产路径共用 TransitionTo 统一迁移挂点（判定语义见
-    /// MaybeTriggerNetActuator/EvaluateInterceptionCompletion），用于验证拦截
+    /// MaybeExecuteInterception/EvaluateInterceptionCompletion），用于验证拦截
     /// 序列 S9/S10/S11 的进入/离开动作。
     /// S9/S10 生产入口已由 `interception` 配置节提供（默认关闭），本入口仍用于
     /// 自动授权之外的场景与测试注入。

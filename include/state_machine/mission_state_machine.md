@@ -45,7 +45,12 @@
 
 **未注入估计器诊断时交接判据不评估**（保持 S5，启动记 ERROR）：无法核验"视觉锁定与卡尔曼航迹是否同一目标"就不允许切进视觉末段。
 
-阶段四新增（Task 9）：**S7（VISUAL_TRACKING）视觉伺服意图迁入状态机**——内部伺服协作者复用`TrackingControlLaw`（配置为`MissionStateMachineConfig.tracking`，即`visual_tracking`节整节注入），逐拍组装控制快照（视觉稳定性状态 + 双目测距 + `FlightStateSnapshot`姿态）计算并发布`control_source=1`的速度航向意图（NED 速度，`reason_code`带 bit31 控制权请求位）。输出→意图映射约定：
+阶段四新增（Task 9）：**S7（VISUAL_TRACKING）视觉伺服意图迁入状态机**——内部伺服协作者经
+`IVisualControlLaw` 接口持有控制律（2026-11-11 起；当前实现为`TrackingControlLaw`，按
+`MissionStateMachineConfig.visual_profile` 装配，配置为`MissionStateMachineConfig.tracking`，
+即`visual_tracking`节整节注入），逐拍组装控制快照（视觉稳定性状态 + 双目测距 +
+`FlightStateSnapshot`姿态）计算并发布`control_source=1`的速度航向意图（NED 速度，
+`reason_code`带 bit31 控制权请求位）。输出→意图映射约定：
 
 | 控制律输出 | 映射意图 |
 |---|---|
@@ -59,12 +64,13 @@
 
 **与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
 
-阶段四新增（Task 10 / Task 5，2026-10-21）：**捕网执行器 `INetActuator`**——注入命令窄接口
+阶段四新增（Task 10 / Task 5，2026-10-21；2026-11-11 泛化）：**通用拦截设备
+`IInterceptionDevice`（当前为 `single_pwm` 捕网执行器）**——注入命令窄接口
 `IPx4CommandSender`后，工厂按 `actuator.type` 创建实现（当前 `single_pwm`）。状态机**每拍**
-调用 `Update(ActuatorFeedback)` 推进执行器内部时序（ACK 确认 → 触发保持 → 复位 → 复位稳定
-→ Ready），并在 **S10（INTERCEPT_EXECUTING）** 调一次 `Trigger()`（执行器 `Fired()` 防重复；
+调用 `Update(InterceptFeedback)` 推进执行器内部时序（ACK 确认 → 触发保持 → 复位 → 复位稳定
+→ Ready），并在 **S10（INTERCEPT_EXECUTING）** 调一次 `Execute()`（执行器 `Triggered()` 防重复；
 入队失败保持 Ready、下拍重试，超过 `return_home.fire_timeout` 判故障）。**S10→S11 以
-`Fired()`（触发命令已入队）为依据，不等发射 ACK**；复位不再由“离开拦截序列”触发——执行器
+`Triggered()`（触发命令已入队）为依据，不等发射 ACK**；复位不再由“离开拦截序列”触发——执行器
 在触发 ACK ACCEPTED 后按 `actuator.reset_delay` 保持，再发复位行程，复位 ACK 后按
 `actuator.reset_settle` 稳定回 Ready；离开拦截序列（S9 未触发）不发任何命令。状态机不感知
 单发/多发、通道数或弹仓结构；后续多发只需实现同一接口并在工厂按 `type` 接入。
@@ -99,14 +105,14 @@
 
 单发捕网在 PX4 标准 `1000/2000µs` 映射下对应 `1150µs 发射 / 1500µs 待机`。机载不再保存
 PWM 微秒或输出区间，避免与 PX4 参数重复维护。接口与工厂见
-`include/state_machine/net_actuator.h` / `.md`。
+`include/state_machine/interception_device.h` / `.md`。
 
 **拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（上限 2026-10-23 冻结为双目测距极限 8m，下限仍占位）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、执行器未触发且 `Ready()`（触发保持/复位/稳定途中不重入）、未进入故障。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
 
 阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
 
-**捕网执行器故障告警位 bit4（Task 5，2026-10-21）**：`MissionStatus.active_warning_bits`
-bit4 =「捕网执行器 ACK 故障」（`kWarningActuatorFault`）。触发条件为执行器 187 ACK 超时/
+**拦截设备故障告警位 bit4（Task 5，2026-10-21）**：`MissionStatus.active_warning_bits`
+bit4 =「拦截设备 ACK 故障」（`kWarningActuatorFault`）。触发条件为执行器 187 ACK 超时/
 非 ACCEPTED/PX4 断连，或 S10 触发命令入队超时；置位同时状态机进入 S16 FAILSAFE（见上段）。
 故障为终态，bit4 持续置位（不再叠加其余告警位）直至重启，供地面站识别“任务已中止、交
 PX4/遥控”。
@@ -296,6 +302,10 @@ struct MissionStateMachineConfig {
     control::TrackingConfig tracking;                 // 视觉跟踪控制律整节（visual_tracking 同源：
                                                       // camera 供视线角/视场换算，control/heading/
                                                       // vertical/distance 供 S7 伺服控制律）
+    control::VisualProfile visual_profile = control::VisualProfile::kNetCapture;
+                                                      // 拦截剖面（装配层按 component 映射：
+                                                      // 25=net_capture 27=jammer 26=impact，
+                                                      // impact 预留 fail-fast）
     std::chrono::milliseconds visual_stale{200};      // 视觉状态超龄（visual_tracking.control.visual_stale_ms 同源）
     std::chrono::milliseconds distance_stale{500};    // 测距超龄（distance_stale_ms 同源）
     config::ActuatorConfig actuator;                  // 捕网执行器（actuator 配置节同源，Task 10）
@@ -664,8 +674,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     （超龄判定在控制律内，阈值取`tracking.control.distance_stale_ms`）；
     姿态取`FlightStateSnapshot`真实值（**正式路径不做虚拟姿态兜底**——影子
     部件的`virtual_attitude_when_absent`属观察开关，不进入正式装配）。
-  - 意图坐标系：速度分量已是**局部 NED**（机体系→NED 旋转在`TrackingControlLaw`
-    内完成），意图`frame_id=3`标注；FlightController 不做二次旋转
+  - 意图坐标系：速度分量已是**局部 NED**（机体系→NED 旋转在视觉控制律
+     内完成），意图`frame_id=3`标注；FlightController 不做二次旋转
     （边界见`include/control/flight_controller.md`）。
   - 降级停发语义：`output.valid=false`（姿态/视觉超龄）→ 不发布意图 + 节流
     WARN（reason 区分姿态超龄/视觉超龄/持续无距离退出）。**不补发零速**：
@@ -686,17 +696,17 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     退出路径 ④ 收口回 S5，不得无限续期）；发出后停发（`StopPositionIntent`）。
     交接段收口（含冻结清空、控制律`Reset`、热备份状态清零）统一在
     `ResetHandoverHysteresis`内完成。
-- **捕网执行器（Task 10 / Task 5，2026-10-21）**（`UpdateNetActuator` /
-  `MaybeTriggerNetActuator` / `HandleMissionFault` / `INetActuator`）：
-  - 每拍顺序：`Evaluate` 开头先 `UpdateNetActuator()`（组装 `ActuatorFeedback`：
+- **通用拦截设备（Task 10 / Task 5，2026-10-21；2026-11-11 泛化）**（`UpdateInterceptionDevice` /
+  `MaybeExecuteInterception` / `HandleMissionFault` / `IInterceptionDevice`）：
+  - 每拍顺序：`Evaluate` 开头先 `UpdateInterceptionDevice()`（组装 `InterceptFeedback`：
     PX4 连接证据取最新飞行快照、ACK 快照取 `IPx4CommandSender::AckStatus()`），
     故障则整拍只维护告警/发布状态并返回；随后 `EvaluateInterceptSequence` →
-    `MaybeTriggerNetActuator` → 其余控制意图评估。
-  - 触发语义：S10 内且执行器未 `Fired()` 时，至少满足 `Ready()` 与
-    `RemainingShots()>0` 才调 `Trigger()`；**无飞行快照不触发**（没有连接证据），
+    `MaybeExecuteInterception` → 其余控制意图评估。
+  - 触发语义：S10 内且执行器未 `Triggered()` 时，至少满足 `Ready()` 与
+    `RemainingUses()>0` 才调 `Execute()`；**无飞行快照不触发**（没有连接证据），
     快照存在但 `connected=false` → 故障；入队失败保持 Ready、下拍重试，
     超过 `return_home.fire_timeout` → 故障。S9 只标记序列开始，不触发。
-  - 完成语义：`EvaluateInterceptionCompletion` 以 `Fired()`（触发命令已入队）
+  - 完成语义：`EvaluateInterceptionCompletion` 以 `Triggered()`（触发命令已入队）
     判 S10→S11，**不等发射 ACK**；V1 不判命中。
   - 复位语义：**由执行器自身计时**——触发 ACK ACCEPTED 后保持
     `reset_delay`，发复位行程；复位 ACK 后稳定 `reset_settle` 回到 Ready。
@@ -707,7 +717,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 命令参数（single_pwm）：只有本 Actuator Set 参数位填归一化值，**其余位
     NaN**（规范"忽略"；0=中位行程会误动其他 Set），p7=0。机载只发 -0.7/0.0，
     PWM 映射在 PX4 侧。
-  - 门禁：`net_actuator_==nullptr`（enable_control=false 装配语义）→ 零调用，
+  - 门禁：`intercept_device_==nullptr`（enable_control=false 装配语义）→ 零调用，
     本功能物理缺席；触发/复位同为控制输出，不另开旁路。
   - 进程退出不补发复位行程（`Stop()` 不触发机构动作）：机构实际位置由
     G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
@@ -716,7 +726,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
   `[min_range_m,max_range_m]`（**上限 2026-10-23 冻结 = 双目测距极限 8m**，
   下限 2.0 仍占位）、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
-  `net_actuator_` 非空且未触发、`Ready()`、未故障、任务未进入 S16；可选
+  `intercept_device_` 非空且未触发、`Ready()`、未故障、任务未进入 S16；可选
   `min_battery_percent>0` 时还要求电池遥测有效且剩余电量达标（**当前生产保持 0，
   实机后冻结**）。满足→S9；
   S9 条件失效→S7；`auto_authorize=true`→S10；false 时等
@@ -727,7 +737,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   S9/S10 仍走 `EvaluateVisualServoIntent`
   保持伺服/瞄准，不因状态切换产生意图空窗。默认关闭（生产安全）。
 - **拦截后返航（S11~S14，2026-10-19 V1 单发口径）**：
-  - **完成判据**：S10 内执行器 `Fired()`（触发命令成功入队，不等 ACK）→ S11；
+  - **完成判据**：S10 内执行器 `Triggered()`（触发命令成功入队，不等 ACK）→ S11；
     **V1 不判断命中**，随后 S11 当拍/下一拍进入 S12。发射入队超时/断连不再走
     “失败返航”，而是 `HandleMissionFault()` 进入 S16。摄像头状态不参与返航判断。
   - **返航水平目标（2026-11-04 现场回归）**：优先用 S3 接受分配时记录的**起飞原点**
@@ -842,7 +852,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   均为状态变化级、每次起飞最多一条。
 - WARN：启动前未绑定输入；目标过期；估计失效导致位置意图停止（节流）；导航状态丢失；
   S7 视觉伺服停发意图（控制律降级，节流，带降级原因）；S7 热备份断粮（节流，不退出 S7）；
-  **捕网执行器触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
+  **拦截设备触发/复位命令已入队**（状态变化级事件，带通道/行程/归一化值摘要）；
   捕网命令入队失败（节流，下拍重试）；**单发发射超时/返航停滞（只告警，检测到
   距返航目标 0.3m 内无进展且持续 `return_home.timeout`）/返航高度被区域上限压低/
   Home 或锚点无效/PX4 接管返航/AUTO.LAND 或 DISARM 入队失败**（S11~S14，节流）；
@@ -1109,7 +1119,7 @@ ctest --test-dir build --output-on-failure
   `docs/数据接口文档.md` §3.2.3，并保持 65014 保持 v1、65013 保持 v2（新字段只占保留区）。
 
 - **S10 发射后不返航**：查 `MissionStateMachineConfig::return_home.enabled`
-  （默认 true；捕网执行器隔离测试显式 false）、执行器 `Fired()`/发射超时日志；
+  （默认 true；捕网执行器隔离测试显式 false）、执行器 `Triggered()`/发射超时日志；
   若已进入 S16，说明发射入队超时或执行器故障，属故障处置而非返航路径。
 - **S12 原地不动/不飞 Home**：查 `home_valid`/`ned_ref_valid`/
   `local_position_valid`（任一无效按设计原地悬停并 WARN）；查
@@ -1240,7 +1250,7 @@ ctest --test-dir build --output-on-failure
   bit3（S7 伺服停发中）——置位说明伺服尚未启动或控制律降级停发，实际输出要么是
   冻结位置意图、要么无意图（控制器意图超时刹停）；服务器侧诊断先用该位区分
   "状态机在跟踪"与"实际控制输出在跟"，再查 WARN"视觉伺服停发意图"的降级原因。
-- 捕网不触发（日志无「捕网执行器触发命令已入队」）：先确认是否**根本不满足触发条件**——
+- 捕网不触发（日志无「拦截设备触发命令已入队」）：先确认是否**根本不满足触发条件**——
   ① 整机当前**无拦截序列入口**（S9/S10 进入判据属后续任务，`DroneApplication`
   不驱动），状态达不到 S10，属本任务交付边界而非缺陷；② `SetCommandSender`
   未注入（只有 `enable_control=true` 装配分支注入）→ 本功能物理缺席（零调用）；
@@ -1257,7 +1267,7 @@ ctest --test-dir build --output-on-failure
   发起，不再由离开 S9/S10 触发。先查 PX4 是否回 187 ACK（无 ACK 会先按超时
   → S16）；查「复位行程命令入队失败（下拍重试）」节流 WARN（连接正常但队列满
   时下拍重试）；若已进 S16，按故障处置（不补发复位）。
-- **进 S16 / 地面站 bit4 置位**：查 ERROR「捕网执行器故障，停止任务控制并交
+- **进 S16 / 地面站 bit4 置位**：查 ERROR「拦截设备故障，停止任务控制并交
   PX4/遥控」的原因串（187 ACK 超时 / 非 ACCEPTED / PX4 断连 / 触发命令未入队
   （发射超时））。S16 为终态，状态机不再发任何控制意图，需人工/维护处置后
   重启程序；`CancelPendingCommands()` 只取消待发命令，不会撤回机构已执行动作。

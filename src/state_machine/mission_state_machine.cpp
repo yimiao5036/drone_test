@@ -1,6 +1,6 @@
 /**
  * @file mission_state_machine.cpp
- * @brief MissionStateMachine 安全影子实现（阶段四：位置意图 + 交接判据 + S7 视觉伺服 + 捕网执行器）
+ * @brief MissionStateMachine 安全影子实现（阶段四：位置意图 + 交接判据 + S7 视觉伺服 + 通用拦截设备）
  *
  * 默认只接入地面站目标与飞行状态，发布 MissionStatus 供链路验证；
  * 经 SetEstimationInputs 绑定估计/视觉/测距输入后，GPS_APPROACH 状态发布
@@ -8,15 +8,16 @@
  * SetEstimationDiagnostics 注入估计器诊断后，交接判据（handover 配置节）生效：
  * S5→S6（LOCKED 连续帧/测距有效/视场余量/创新门限）→ S7 验证、S6 超时回 S5、
  * S7 退出迟滞。S6 驻留期续发进入时刻冻结的最后位置目标（防意图超龄 →
- * 控制器刹车 → 再起步）；S7 由内部视觉伺服协作者（复用 TrackingControlLaw）
+ * 控制器刹车 → 再起步）；S7 由内部视觉伺服协作者（经 IVisualControlLaw
+ * 接口，当前实现 TrackingControlLaw）
  * 发布 control_source=1 的速度意图（输出已是局部 NED），短期 LOST 按控制律
  * 判丢语义映射为零速刹车意图。是否真正输出由 FlightController 授权链与
  * enable_control 装配门禁决定。
  * 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）经
- * INetActuator 抽象接口触发一次，复位由执行器在触发 ACK 后自行计时完成
- * （离开拦截序列不补发复位）；当前 single_pwm 实现
- * 发送 MAV_CMD_DO_SET_ACTUATOR（PWM 微秒 → -1..1 归一化），后续多发实现
- * 通过 actuator.type 工厂切换，状态机不感知通道/弹仓结构。
+ * IInterceptionDevice 通用拦截接口发起一次动作，复位由设备在触发 ACK 后自行
+ * 计时完成（离开拦截序列不补发复位）；当前 single_pwm（kPulse）实现
+ * 发送 MAV_CMD_DO_SET_ACTUATOR（PWM 微秒 → -1..1 归一化），后续多发/干扰/
+ * 撞击实现通过 actuator.type 工厂切换，状态机不感知具体机构。
  */
 #include "state_machine/mission_state_machine.h"
 
@@ -42,13 +43,13 @@
 #include "control/line_of_sight.h"
 #include "control/rate_limiter.h"
 #include "control/staleness_checker.h"
-#include "control/tracking_control_law.h"
 #include "control/tracking_types.h"
+#include "control/visual_control_law.h"
 #include "perception/geodetic_converter.h"
 #include "perception/target_estimator.h"
 #include "state_machine/handover_wait.h"
+#include "state_machine/interception_device.h"
 #include "state_machine/mission_assignment.h"
-#include "state_machine/net_actuator.h"
 
 namespace drone::state_machine {
 namespace {
@@ -81,7 +82,7 @@ constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
 /// 供地面站观测（65013 全量下发；Web UI 渲染待补。T9 评审裁决 I2，
 /// 阶段四 Task 12 落地）。
 constexpr uint32_t kWarningServoSuspended = 1U << 3U;
-/// 告警位：捕网执行器故障（ACK 超时/非 ACCEPTED/PX4 断连/入队超时）。
+/// 告警位：拦截设备故障（ACK 超时/非 ACCEPTED/PX4 断连/入队超时）。
 /// 状态机进入 S16 FAILSAFE：停发一切控制意图、取消待发命令、不重试/不补发
 /// 复位，交 PX4/遥控处置。地面站 65013 全量下发，Web UI 渲染待补。
 constexpr uint32_t kWarningActuatorFault = 1U << 4U;
@@ -331,7 +332,8 @@ public:
           visual_stale_ms_(config.visual_stale.count()),
           distance_stale_ms_(config.distance_stale.count()),
           tracking_config_(config.tracking),
-          tracking_law_(config.tracking),
+          visual_law_(control::CreateVisualControlLaw(config.visual_profile,
+                                                      config.tracking)),
           actuator_config_(config.actuator),
           interception_(config.interception),
           return_home_(config.return_home),
@@ -379,11 +381,13 @@ public:
             "任务状态机创建: shadow=true control_output=false intent_valid_for_ms={} "
             "handover(lock_frames={} exit_lost_frames={} timeout_ms={} "
             "fow_margin_deg={:.1f} innovation_gate_m={:.1f}) "
-            "fov_half(az={:.2f}deg el={:.2f}deg) servo=TrackingControlLaw({:.1f}Hz)",
+            "fov_half(az={:.2f}deg el={:.2f}deg) servo_profile={} servo={:.1f}Hz",
             intent_valid_for_ms_, handover_.lock_frames, handover_.exit_lost_frames,
             handover_timeout_ms_, handover_.fow_margin_deg,
             handover_.innovation_gate_m, fow_half_azimuth_deg_,
-            fow_half_elevation_deg_, tracking_config_.control.frequency_hz);
+            fow_half_elevation_deg_,
+            control::VisualProfileName(visual_law_->Profile()),
+            tracking_config_.control.frequency_hz);
     }
 
     ~Impl() {
@@ -611,13 +615,13 @@ public:
             return;
         }
         command_sender_ = sender;
-        net_actuator_.reset();
+        intercept_device_.reset();
         if (sender != nullptr) {
-            net_actuator_ = CreateNetActuator(actuator_config_, sender);
+            intercept_device_ = CreateInterceptionDevice(actuator_config_, sender);
         }
-        SPDLOG_INFO("任务状态机 PX4 命令接口已注入: sender={} net_type={}",
+        SPDLOG_INFO("任务状态机 PX4 命令接口已注入: sender={} device_type={}",
                     static_cast<const void*>(sender),
-                    net_actuator_ ? net_actuator_->Type() : "disabled");
+                    intercept_device_ ? intercept_device_->Type() : "disabled");
     }
 
     /// 绑定任务分配输入 Topic（65014）。必须在 Start 前调用；未绑定时
@@ -820,10 +824,10 @@ private:
     // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
     void Evaluate(uint64_t now_ms) {
         uint32_t warnings = 0;
-        // 捕网执行器每拍推进（ACK/保持/复位/稳定时序全在执行器内）。
+        // 拦截设备每拍推进（ACK/保持/复位/稳定时序全在设备内）。
         // 故障或已处于 S16：只维护告警位与状态发布，本拍跳过一切任务控制
         // 逻辑（位置/伺服/返航/降落意图全部停发）。
-        if (UpdateNetActuator(now_ms)) {
+        if (UpdateInterceptionDevice(now_ms)) {
             SetWarnings(kWarningActuatorFault);
             if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
                 PublishStatus(now_ms);
@@ -909,7 +913,7 @@ private:
         EvaluateInterceptSequence(now_ms);
         // S9→S10 迁移当拍触发捕网（有连接证据才触发；入队失败下拍重试，
         // 超过 fire_timeout 判故障）。
-        MaybeTriggerNetActuator(now_ms);
+        MaybeExecuteInterception(now_ms);
         if (mission_faulted_) {
             SetWarnings(kWarningActuatorFault);
             if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
@@ -1067,9 +1071,9 @@ private:
         if (!BatteryAboveThreshold(flight)) {
             return common::MissionAssignmentReason::kBatteryLow;
         }
-        // 设备故障：任务故障终态或捕网执行器故障时不允许接受新分配。
+        // 设备故障：任务故障终态或拦截设备故障时不允许接受新分配。
         if (mission_faulted_ ||
-            (net_actuator_ != nullptr && net_actuator_->Faulted())) {
+            (intercept_device_ != nullptr && intercept_device_->Faulted())) {
             return common::MissionAssignmentReason::kMissionFault;
         }
         return common::MissionAssignmentReason::kNone;
@@ -2904,7 +2908,7 @@ private:
     /// 调用方必须已持有 state_mutex_。
     common::MissionAvailability ComputeAvailabilityLocked() const {
         if (command_sender_ == nullptr || mission_faulted_ ||
-            (net_actuator_ != nullptr && net_actuator_->Faulted()) ||
+            (intercept_device_ != nullptr && intercept_device_->Faulted()) ||
             takeoff_unavailable_latched_) {
             // takeoff_unavailable_latched_：起飞中止后 PX4 状态不确定
             // （断连/armed/离地状态不明），per-boot 锁存直到重启，避免
@@ -2984,9 +2988,9 @@ private:
             flight.flight_sub_mode != kPx4SubModeOffboard) {
             return false;
         }
-        if (command_sender_ == nullptr || net_actuator_ == nullptr ||
-            mission_faulted_ || net_actuator_->Faulted() ||
-            net_actuator_->Fired() || !net_actuator_->Ready()) {
+        if (command_sender_ == nullptr || intercept_device_ == nullptr ||
+            mission_faulted_ || intercept_device_->Faulted() ||
+            intercept_device_->Triggered() || !intercept_device_->Ready()) {
             return false;  // 命令接口未注入 / 已触发 / 时序未回到 Ready / 故障
         }
         if (VisualStatusStale(now_ms) || !latest_visual_status_ ||
@@ -3007,8 +3011,8 @@ private:
     }
 
     /// S7→S9（入口条件满足）、S9 条件失效→S7、S9 自动授权→S10 /
-    /// 非自动授权超时→S12。S10 的触发由 MaybeTriggerNetActuator 处理，
-    /// 触发入队（`Fired()`）后由 EvaluateInterceptionCompletion 进入 S11。
+    /// 非自动授权超时→S12。S10 的动作由 MaybeExecuteInterception 处理，
+    /// 动作入队（`Triggered()`）后由 EvaluateInterceptionCompletion 进入 S11。
     void EvaluateInterceptSequence(uint64_t now_ms) {
         if (!interception_.enabled) {
             return;
@@ -3298,7 +3302,7 @@ private:
         servo_intent_active_ = false;  // 交接段收口：背离告警位随段结束清空
         hot_backup_check_ms_ = 0;
         hot_backup_starved_ = false;
-        tracking_law_.Reset();
+        visual_law_->Reset();
     }
 
     /// 交接判据总入口（S5→S6→S7 推进与 S7 退出迟滞）。
@@ -3862,7 +3866,7 @@ private:
         }
 
         const auto output =
-            tracking_law_.Update(snapshot, static_cast<int64_t>(now_ms));
+            visual_law_->Update(snapshot, static_cast<int64_t>(now_ms));
         last_degraded_reason_ = output.degraded_reason;
         if (!output.valid) {
             return std::nullopt;
@@ -3932,12 +3936,12 @@ private:
         return hot_backup_starved_ ? kWarningHotBackupStarved : 0;
     }
 
-    // ---- 捕网执行器（Task 10：MAV_CMD_DO_SET_ACTUATOR 命令窄接口） ----
+    // ---- 通用拦截设备（Task 10：MAV_CMD_DO_SET_ACTUATOR 命令窄接口） ----
 
-    /// 组装执行器每拍反馈：PX4 连接证据（最新飞行快照）与命令 ACK 快照。
-    /// 执行器内部时序只认本次 Update 的反馈，状态机不复制计时逻辑。
-    ActuatorFeedback BuildActuatorFeedback(uint64_t now_ms) const {
-        ActuatorFeedback feedback;
+    /// 组装设备每拍反馈：PX4 连接证据（最新飞行快照）与命令 ACK 快照。
+    /// 设备内部时序只认本次 Update 的反馈，状态机不复制计时逻辑。
+    InterceptFeedback BuildInterceptFeedback(uint64_t now_ms) const {
+        InterceptFeedback feedback;
         feedback.now_ms = now_ms;
         feedback.px4_connected =
             latest_flight_.has_value() && latest_flight_->connected;
@@ -3947,35 +3951,35 @@ private:
         return feedback;
     }
 
-    /// 每拍推进捕网执行器并处理其故障。返回 true 表示已进入/处于故障态，
+    /// 每拍推进拦截设备并处理其故障。返回 true 表示已进入/处于故障态，
     /// 本拍应跳过任务控制逻辑（S16 只维护告警与状态发布）。
-    bool UpdateNetActuator(uint64_t now_ms) {
+    bool UpdateInterceptionDevice(uint64_t now_ms) {
         if (mission_faulted_) {
             return true;
         }
-        if (net_actuator_ == nullptr) {
+        if (intercept_device_ == nullptr) {
             return false;  // 物理缺席（影子/未开控制）：不产生任何命令
         }
-        net_actuator_->Update(BuildActuatorFeedback(now_ms));
-        if (net_actuator_->Faulted()) {
-            HandleMissionFault(net_actuator_->FaultReason());
+        intercept_device_->Update(BuildInterceptFeedback(now_ms));
+        if (intercept_device_->Faulted()) {
+            HandleMissionFault(intercept_device_->FaultReason());
             return true;
         }
         return false;
     }
 
-    /// S10 内触发一次捕网。语义：
-    /// - 无飞行快照 = 没有连接证据（启动早期/测试未注入）→ 不触发；
-    /// - 快照在线才触发；快照存在但 connected=false → 故障；
-    /// - 入队失败由执行器保持 Ready、下拍重试；超过 return_home.fire_timeout
+    /// S10 内发起一次拦截动作。语义：
+    /// - 无飞行快照 = 没有连接证据（启动早期/测试未注入）→ 不发起；
+    /// - 快照在线才发起；快照存在但 connected=false → 故障；
+    /// - 入队失败由设备保持 Ready、下拍重试；超过 return_home.fire_timeout
     ///   仍未入队 → 故障（不再“按失败结果返航”）；
-    /// - 触发成功后由执行器维护 ACK 保持/复位时序，状态机不重复触发。
-    void MaybeTriggerNetActuator(uint64_t now_ms) {
-        if (net_actuator_ == nullptr || mission_faulted_ ||
+    /// - 发起成功后由设备维护 ACK 保持/复位时序，状态机不重复发起。
+    void MaybeExecuteInterception(uint64_t now_ms) {
+        if (intercept_device_ == nullptr || mission_faulted_ ||
             CurrentState() != common::MissionState::kInterceptExecuting) {
             return;
         }
-        if (net_actuator_->Fired()) {
+        if (intercept_device_->Triggered()) {
             return;
         }
         const uint64_t held_ms =
@@ -3991,14 +3995,14 @@ private:
             HandleMissionFault("S10 期间 PX4 连接断开");
             return;
         }
-        if (net_actuator_->Ready() && net_actuator_->RemainingShots() > 0) {
-            if (net_actuator_->Trigger()) {
+        if (intercept_device_->Ready() && intercept_device_->RemainingUses() > 0) {
+            if (intercept_device_->Execute()) {
                 interception_fired_ = true;
             }
         }
     }
 
-    /// 捕网执行器故障 → S16 FAILSAFE：置 bit4、取消待发命令（恰好一次）、
+    /// 拦截设备故障 → S16 FAILSAFE：置 bit4、取消待发命令（恰好一次）、
     /// 停发一切控制意图，交 PX4/遥控处置；不重试、不补发复位。
     void HandleMissionFault(const char* reason) {
         if (mission_faulted_) {
@@ -4012,7 +4016,7 @@ private:
         if (command_sender_ != nullptr) {
             command_sender_->CancelPendingCommands();
         }
-        SPDLOG_ERROR("捕网执行器故障，停止任务控制并交 PX4/遥控: {}", reason);
+        SPDLOG_ERROR("拦截设备故障，停止任务控制并交 PX4/遥控: {}", reason);
         TransitionTo(common::MissionState::kFailsafe, reason);
     }
 
@@ -4161,16 +4165,16 @@ private:
         return static_cast<float>(return_heading_cmd_deg_);
     }
 
-    /// 单发拦截完成：S10 触发命令已入队（`Fired()`，不等 ACK）→ S11 → S12。
+    /// 单发拦截完成：S10 动作已入队（`Triggered()`，不等 ACK）→ S11 → S12。
     /// V1 不判断命中；摄像头状态不参与返航判断。发射超时/断连已由
-    /// MaybeTriggerNetActuator/执行器判故障进入 S16，不再走“失败返航”。
+    /// MaybeExecuteInterception/执行器判故障进入 S16，不再走“失败返航”。
     void EvaluateInterceptionCompletion() {
         if (!return_home_.enabled || mission_faulted_) {
             return;
         }
         const auto state = CurrentState();
         if (state == common::MissionState::kInterceptExecuting) {
-            if (net_actuator_ != nullptr && net_actuator_->Fired()) {
+            if (intercept_device_ != nullptr && intercept_device_->Triggered()) {
                 interception_fired_ = true;
                 SPDLOG_WARN("单发拦截命令已入队，进入 POST_INTERCEPT（V1 不判命中）");
                 TransitionTo(common::MissionState::kPostIntercept,
@@ -4668,9 +4672,9 @@ private:
     /// PX4 命令窄接口（仅 enable_control=true 装配期注入）。当前消费点：
     /// S13 AUTO.LAND / S14 DISARM；未注入时零调用。
     communication::IPx4CommandSender* command_sender_ = nullptr;
-    /// 捕网执行器抽象（随命令接口注入创建；actuator.type 工厂选择单发/未来多发）。
+    /// 通用拦截设备（随命令接口注入创建；actuator.type 工厂选择 kPulse/kHold/kNone）。
     /// 为空=影子/未开控制，触发/复位物理缺席。
-    std::unique_ptr<INetActuator> net_actuator_;
+    std::unique_ptr<IInterceptionDevice> intercept_device_;
     /// 估计器诊断接口（只读；交接创新门限的数据来源，Start 前注入）。
     const perception::ITargetEstimator* estimator_diagnostics_ = nullptr;
 
@@ -4771,7 +4775,7 @@ private:
     /// 单线程约定。控制律内部超龄阈值取 tracking.control.*，生产与状态机侧
     /// visual_stale/distance_stale 同源注入）。
     const control::TrackingConfig tracking_config_;
-    control::TrackingControlLaw tracking_law_;
+    std::unique_ptr<control::IVisualControlLaw> visual_law_;
     /// 标定内参换算器与视场半角（构造期固化；热路径零分配）。
     control::PixelToAngle azimuth_converter_;
     control::PixelToAngle elevation_converter_;
@@ -4808,7 +4812,7 @@ private:
     uint64_t hot_backup_check_ms_ = 0;
     bool hot_backup_starved_ = false;
     uint64_t hot_backup_starved_count_ = 0;
-    /// 捕网执行器配置（构造注入，actuator 配置节同源；装机确认前为默认值）。
+    /// 拦截设备配置（构造注入，actuator 配置节同源；装机确认前为默认值）。
     const config::ActuatorConfig actuator_config_;
     /// 拦截入口/授权与返航配置（构造注入；JSON interception/return_home 节）。
     const config::InterceptionConfig interception_;
@@ -4872,7 +4876,7 @@ private:
     std::optional<uint64_t> last_cancel_action_ms_;
     /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
     const bool test_hooks_enabled_;
-    /// 任务故障（S16 FAILSAFE）：捕网执行器 ACK 超时/非 ACCEPTED/PX4 断连/
+    /// 任务故障（S16 FAILSAFE）：拦截设备 ACK 超时/非 ACCEPTED/PX4 断连/
     /// 入队超时。置位后本拍只维护告警与状态发布，停发一切控制意图；
     /// 故障为终态（需人工/维护处置），Start() 复位。
     bool mission_faulted_ = false;

@@ -1,4 +1,4 @@
-#include "state_machine/net_actuator.h"
+#include "state_machine/interception_device.h"
 
 #include <array>
 #include <chrono>
@@ -15,6 +15,18 @@
 #include "config/config.h"
 
 namespace drone::state_machine {
+
+const char* InterceptModeName(InterceptMode mode) {
+    switch (mode) {
+        case InterceptMode::kPulse:
+            return "pulse";
+        case InterceptMode::kHold:
+            return "hold";
+        case InterceptMode::kNone:
+            return "none";
+    }
+    return "unknown";
+}
 
 namespace {
 
@@ -39,13 +51,13 @@ void WarnIfResetDelayOutsideManualRange(const config::ActuatorConfig& config) {
     }
 }
 
-/// 单发舵机式执行器：PX4 侧把物理输出的 Output Function 配为
+/// 单发舵机式拦截设备（kPulse）：PX4 侧把物理输出的 Output Function 配为
 /// `Peripheral via Actuator Set N`，并把 -1..1 映射到该输出通道的
 /// PWM_MAIN_MINn/MAXn（AUX 输出为 PWM_AUX_*，标准 1000..2000µs）；
 /// 机载只发送归一化控制量。当前装机（2026-10-21）：MAIN5 = Actuator Set 1。
 ///
-/// 内部时序（状态机只转发 ActuatorFeedback，计时全部在本类内推进）：
-///   Ready --Trigger--> FireQueued
+/// 内部时序（调用方只转发 InterceptFeedback，计时全部在本类内推进）：
+///   Ready --Execute--> FireQueued
 ///   FireQueued --187 ACK ACCEPTED--> FireAcked
 ///   FireAcked --(同一拍)--> Holding
 ///   Holding --now>=ACK 时刻+reset_delay--> ResetQueued（发复位行程）
@@ -56,30 +68,32 @@ void WarnIfResetDelayOutsideManualRange(const config::ActuatorConfig& config) {
 /// PX4 断连 → Faulted（终态，不自动恢复、不重试、不补发复位）。
 /// ACK 关联只使用 CommandAckStatus 的 187 专用计数/终态字段：复位等待跨
 /// S12~S14，同期 AUTO.LAND(176)/DISARM(400) 的 ACK 不得覆盖或推进本时序。
-class SinglePwmNetActuator final : public INetActuator {
+class SinglePwmInterceptionDevice final : public IInterceptionDevice {
 public:
-    SinglePwmNetActuator(config::ActuatorConfig config,
-                         communication::IPx4CommandSender* sender)
+    SinglePwmInterceptionDevice(config::ActuatorConfig config,
+                                communication::IPx4CommandSender* sender)
         : config_(std::move(config)), sender_(sender) {}
 
-    bool Trigger() override {
-        if (state_ != State::kReady || remaining_shots_ == 0) {
+    InterceptMode Mode() const override { return InterceptMode::kPulse; }
+
+    bool Execute() override {
+        if (state_ != State::kReady || remaining_uses_ == 0) {
             return false;
         }
         // 基线必须在入队前抓取：PX4 worker 可能在 SendCommand() 返回前就把
         // 该命令的 ACK 写入快照；入队后再抓会把这个 ACK 当成旧 ACK 吞掉，
-        // 执行器将永久停在等待态（既不推进也不故障）。
+        // 设备将永久停在等待态（既不推进也不故障）。
         CaptureAckBaseline();
         if (!SendNorm(config_.net_fire_norm, "触发")) {
             return false;
         }
-        remaining_shots_ = 0;
-        fired_ = true;
+        remaining_uses_ = 0;
+        triggered_ = true;
         state_ = State::kFireQueued;
         return true;
     }
 
-    bool Reset() override {
+    bool Stop() override {
         if (Faulted()) {
             return false;
         }
@@ -90,7 +104,7 @@ public:
         return true;
     }
 
-    void Update(const ActuatorFeedback& feedback) override {
+    void Update(const InterceptFeedback& feedback) override {
         if (state_ == State::kFaulted || state_ == State::kReady) {
             return;
         }
@@ -107,7 +121,7 @@ public:
             state_ = State::kHolding;
         }
         if (state_ == State::kHolding && feedback.now_ms >= hold_deadline_ms_) {
-            // 同 Trigger：复位命令的 ACK 也可能在入队返回前到达，先抓基线。
+            // 同 Execute：复位命令的 ACK 也可能在入队返回前到达，先抓基线。
             CaptureAckBaseline();
             if (!SendNorm(config_.net_idle_norm, "复位行程")) {
                 return;  // 连接正常但队列满：下拍重试
@@ -125,8 +139,8 @@ public:
     }
 
     bool Ready() const override { return state_ == State::kReady; }
-    uint32_t RemainingShots() const override { return remaining_shots_; }
-    bool Fired() const override { return fired_; }
+    uint32_t RemainingUses() const override { return remaining_uses_; }
+    bool Triggered() const override { return triggered_; }
     bool Faulted() const override { return state_ == State::kFaulted; }
     const char* FaultReason() const override { return fault_reason_; }
     const char* Type() const override { return "single_pwm"; }
@@ -144,7 +158,7 @@ private:
     };
 
     /// 抓取 187 专用 ACK/超时计数基线，之后只处理“新到达”的 187 ACK。
-    /// 必须在对应命令入队（SendNorm）之前调用，见 Trigger/Update 中的说明。
+    /// 必须在对应命令入队（SendNorm）之前调用，见 Execute/Update 中的说明。
     void CaptureAckBaseline() {
         const auto ack = sender_->AckStatus();
         ack_baseline_ = ack.do_set_actuator_ack_count;
@@ -152,7 +166,7 @@ private:
     }
 
     /// 处理本拍新到达的 187 ACK/超时。返回 true 表示已判故障、本拍不再推进。
-    bool ProcessAck(const ActuatorFeedback& feedback) {
+    bool ProcessAck(const InterceptFeedback& feedback) {
         const auto& ack = feedback.ack;
         // 只认 187 专用计数：176/400 等命令即使在同一拍到达，也不会推进
         // 本状态机，更不会覆盖 187 的终态。
@@ -213,13 +227,14 @@ private:
             kMavCmdDoSetActuator, params[0], params[1], params[2], params[3],
             params[4], params[5], params[6]);
         if (queued) {
-            SPDLOG_WARN("捕网执行器{}命令已入队: type={} set={} norm={:.2f}",
-                        action, Type(), channel, normalized);
+            SPDLOG_WARN("拦截设备{}命令已入队: type={} mode={} set={} norm={:.2f}",
+                        action, Type(), InterceptModeName(Mode()), channel,
+                        normalized);
             return true;
         }
         const uint64_t count = ++failure_count_;
         if (count == 1 || count % 100 == 0) {
-            SPDLOG_WARN("捕网执行器{}命令入队失败（下拍重试）: type={} set={} "
+            SPDLOG_WARN("拦截设备{}命令入队失败（下拍重试）: type={} set={} "
                         "count={}",
                         action, Type(), channel, count);
         }
@@ -232,15 +247,15 @@ private:
         }
         state_ = State::kFaulted;
         fault_reason_ = reason;
-        SPDLOG_ERROR("捕网执行器故障: type={} set={} reason={}", Type(),
+        SPDLOG_ERROR("拦截设备故障: type={} set={} reason={}", Type(),
                      config_.net_channel, reason);
     }
 
     const config::ActuatorConfig config_;
     communication::IPx4CommandSender* const sender_;
     State state_ = State::kReady;
-    uint32_t remaining_shots_ = 1;
-    bool fired_ = false;
+    uint32_t remaining_uses_ = 1;
+    bool triggered_ = false;
     uint64_t ack_baseline_ = 0;
     uint64_t timeout_baseline_ = 0;
     uint64_t hold_deadline_ms_ = 0;
@@ -251,20 +266,20 @@ private:
 
 }  // namespace
 
-std::unique_ptr<INetActuator> CreateNetActuator(
+std::unique_ptr<IInterceptionDevice> CreateInterceptionDevice(
     const config::ActuatorConfig& config,
     communication::IPx4CommandSender* sender) {
     if (sender == nullptr) {
-        return nullptr;  // 影子/未开控制：执行器物理缺席
+        return nullptr;  // 影子/未开控制：设备物理缺席
     }
     config.Validate();
     WarnIfResetDelayOutsideManualRange(config);
     if (config.type == "single_pwm") {
-        return std::make_unique<SinglePwmNetActuator>(config, sender);
+        return std::make_unique<SinglePwmInterceptionDevice>(config, sender);
     }
     throw std::invalid_argument(
         "不支持的 actuator.type: " + config.type +
-        "（当前支持 single_pwm；多发实现待接入）");
+        "（当前支持 single_pwm；多发/干扰/撞击实现待接入）");
 }
 
 }  // namespace drone::state_machine

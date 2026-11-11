@@ -475,7 +475,7 @@ TEST(GroundStationLinkTest, ConfigRejectsInvalidParameters) {
     config.flight_state_queue_capacity = 0;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
     config.flight_state_queue_capacity = 2;
-    config.aircraft_component_id = 27;
+    config.aircraft_component_id = 28;
     EXPECT_THROW(config.Validate(), std::invalid_argument);
     config.aircraft_component_id = kNetCaptureAircraftComponentId;
     config.ground_component_id = MAV_COMP_ID_ONBOARD_COMPUTER;

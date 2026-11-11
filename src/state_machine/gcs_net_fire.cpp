@@ -45,7 +45,7 @@ GcsNetFire::GcsNetFire(config::ActuatorConfig config,
         SPDLOG_WARN("GcsNetFire: gcs_fire_enabled=false，捕网执行器不创建");
         return;
     }
-    actuator_ = CreateNetActuator(config_, sender_);
+    actuator_ = CreateInterceptionDevice(config_, sender_);
 }
 
 GcsNetFire::~GcsNetFire() { Stop(); }
@@ -130,7 +130,7 @@ void GcsNetFire::UpdateActuator(uint64_t now_ms) {
         return;
     }
 
-    ActuatorFeedback feedback;
+    InterceptFeedback feedback;
     feedback.now_ms = now_ms;
     feedback.px4_connected = latest_state_.has_value() && latest_state_->connected;
     if (sender_ != nullptr) {
@@ -140,7 +140,7 @@ void GcsNetFire::UpdateActuator(uint64_t now_ms) {
 
     if (actuator_->Faulted() && !fault_logged_) {
         fault_logged_ = true;
-        SPDLOG_ERROR("GcsNetFire: 捕网执行器进入终态故障（{}），需人工维护",
+        SPDLOG_ERROR("GcsNetFire: 拦截设备进入终态故障（{}），需人工维护",
                      actuator_->FaultReason());
         if (pending_completion_) {
             // 已受理的触发在执行器时序中失败：补发拒绝回执，地面站可见失败原因。
@@ -154,7 +154,7 @@ void GcsNetFire::UpdateActuator(uint64_t now_ms) {
     }
 
     // 触发-复位周期走完：执行器已可接受下一发，补发 kCompleted。
-    if (pending_completion_ && actuator_->Fired() && actuator_->Ready()) {
+    if (pending_completion_ && actuator_->Triggered() && actuator_->Ready()) {
         common::NetFireCommand command;
         command.command_id = pending_command_id_;
         PublishAck(command, common::NetFireResult::kCompleted,
@@ -246,7 +246,7 @@ void GcsNetFire::HandleCommand(const common::NetFireCommand& command,
         reject(common::NetFireReason::kActuatorBusy);
         return;
     }
-    if (actuator_->RemainingShots() == 0) {
+    if (actuator_->RemainingUses() == 0) {
         reject(common::NetFireReason::kNoRemainingShots);
         return;
     }
@@ -256,7 +256,7 @@ void GcsNetFire::HandleCommand(const common::NetFireCommand& command,
         return;
     }
 
-    if (!actuator_->Trigger()) {
+    if (!actuator_->Execute()) {
         reject(common::NetFireReason::kActuatorUnavailable);
         return;
     }
