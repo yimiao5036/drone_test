@@ -1,4 +1,4 @@
-{
+﻿{
     "log": {
         "dir": "logs/",
         "level": "info"
@@ -162,10 +162,12 @@
         "command_retry_ms": 1000
     },
     "controller": {
-        "_comment": "飞行控制器（阶段四）。max_speed_mps 是水平速度上限的唯一来源：max_feedforward_mps / position_guide_speed_mps 缺席时自动取该值；速度律 speed_cap 也注入该值。位置型意图按 position_guide 限速推进，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去。",
+        "_comment": "飞行控制器（阶段四）。三个水平速度上限显式同值=10（2026-11-11 维护者要求：配置里看得见、不靠派生）：max_speed_mps 约束速度式意图；max_feedforward_mps 约束位置意图前馈；position_guide_speed_mps 约束位置引导点推进。加载期校验前馈不得大于 max_speed。位置型意图按 position_guide 限速推进，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去。",
         "period_ms": 50,
         "max_speed_mps": 10.0,
         "max_accel_mps2": 3.0,
+        "max_feedforward_mps": 10.0,
+        "position_guide_speed_mps": 10.0,
         "enable_position_velocity_feedforward": true,
         "position_guide_vz_mps": 1.5
     },
@@ -173,7 +175,6 @@
         "_comment": "S5 接近段速度律（2026-11-11 起唯一 S5 引导方式）：产出 (p_ref, v_ref)，位置环只做速度锚点。旧 speed_mps/lead_time/guide_lowpass 实现已删除；速度上限来自 controller.max_speed_mps，本处不重复定义。",
         "speed_law": {
             "_comment": "来源 docs/接近段速度律-数学分析-2026-11-09.md §6；速度上限由 controller.max_speed_mps 注入。",
-            "standoff_m": 2.9,
             "accel_plan_mps2": 3.0,
             "decel_plan_mps2": 3.0,
             "accel_phys_mps2": 9.8,
@@ -362,8 +363,8 @@
             "vz_limit_mps": 2.0
         },
         "distance": {
-            "_comment": "d_exp_m=10 为占位期望射程（由拦截设备接口给出，待定）；PID 在该射程整定，d_exp 冻结后须在 SITL 复核零过冲（tune_report.py 硬判据）",
-            "d_exp_m": 10.0,
+            "_comment": "d_exp_m 为 S7 保持距离；必须落在 interception.min_range_m~max_range_m 内（2026-11-11 起加载期校验，interception.enabled=true 时）。当前 6.0，落在 2~8m 射程窗口内；PID 在该射程整定。",
+            "d_exp_m": 6.0,
             "kp": 0.5,
             "ki": 0.05,
             "kd": 0.1,

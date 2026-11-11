@@ -174,12 +174,15 @@ public:
         }
         worker_ = std::thread([this] { Run(); });
         SPDLOG_INFO("飞行控制器启动: period={}ms intent_timeout={}ms coast_timeout={}ms "
-                    "bootstrap_timeout={}ms feedforward={} cap={:.2f}m/s",
+                    "bootstrap_timeout={}ms feedforward={} speed_cap={:.2f} "
+                    "ff_cap={:.2f} guide={:.2f} vz_guide={:.2f}m/s",
                     config_.period.count(), config_.intent_timeout.count(),
                     config_.coast_timeout.count(),
                     config_.bootstrap_timeout.count(),
                     config_.enable_position_velocity_feedforward ? "on" : "off",
-                    config_.max_feedforward_mps);
+                    config_.max_speed_mps, config_.max_feedforward_mps,
+                    config_.position_guide_speed_mps,
+                    config_.position_guide_vz_mps);
         return true;
     }
 

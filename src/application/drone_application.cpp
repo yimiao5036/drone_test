@@ -143,8 +143,14 @@ void DroneApplication::BuildComponents() {
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;
-        // 接近段相位策略（approach 节）同源注入：S5/S6 速率上限与预测提前量。
+        // 接近段速度律（approach 节）同源注入：S5 速率上限与预测提前量。
         state_machine_config.approach = config_.approach;
+        // 控制间距与到点半径同源：standoff = arrival_radius − 0.1（不另配一份）。
+        // 到点半径已由 handover.Validate 保证为正；这里再兜底一个最小正值。
+        const double derived_standoff =
+            config_.handover.arrival_radius_m - 0.1;
+        state_machine_config.approach.speed_law.standoff_m =
+            derived_standoff > 0.1 ? derived_standoff : 0.1;
         // 速度上限单一来源：控制器 / PX4 / 速度律共用 controller.max_speed_mps。
         state_machine_config.max_speed_mps = config_.controller.max_speed_mps;
         state_machine_config.expected_interceptor_type =

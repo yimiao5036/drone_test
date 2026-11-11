@@ -223,8 +223,8 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
 速度前馈叠加到位置 P 输出，消除恒速目标的尾追稳态滞后）。边界：
 
 - **配置**：`controller.enable_position_velocity_feedforward`（默认 `false`）、
-  `controller.max_feedforward_mps`（缺席时取 `max_speed_mps`，可显式覆盖；
-  2026-11-11 起不再要求与 `max_speed_mps` 重复配置）。开关关闭时完全忽略意图前馈，
+  `controller.max_feedforward_mps`（2026-11-11 起生产/SITL 显式写 10，与
+  `max_speed_mps` 同值；加载期校验 `≤ max_speed_mps`）。开关关闭时完全忽略意图前馈，
   输出与旧版逐位等价。
 - **来源**：仅 S5 `kPositionGuide` 使用（状态机从 `TargetState.velocity_valid_mask`
   逐轴填充）；S6 冻结段与 S7 速度意图不带前馈。
@@ -269,8 +269,8 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
 - **终端减速**：`√(2·a·d)` 项在距目标近时自动收速，避免过冲后 PX4 反向追。
 - **日志**：启用时打一条 INFO「位置引导限速启动: cap/vz_cap/起点/目标」；
   非热路径，不节流（每次来源切换一条）。
-- **配置**：`controller.position_guide_speed_mps`（缺席时取 `max_speed_mps`，
-  可显式覆盖）、`controller.position_guide_vz_mps`（默认 1.5）；
+- **配置**：`controller.position_guide_speed_mps`（2026-11-11 起生产/SITL 显式写 10，
+  与 `max_speed_mps` 同值）、`controller.position_guide_vz_mps`（默认 1.5）；
   `controller.max_speed_mps` 仍是速度式意图与相位上限的硬边界。
 - **测试**：`FlightControllerPipelineTest.PositionGuideAdvancesAtPhaseSpeedCap`、
   `PositionGuideSpeedClampedByControllerHardCap`、`VelocityIntentRespectsPhaseSpeedCap`。

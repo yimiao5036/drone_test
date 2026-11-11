@@ -890,6 +890,19 @@ TEST(ConfigTest, RejectsNonPositiveFeedforwardLimit) {
     std::filesystem::remove(path);
 }
 
+TEST(ConfigTest, RejectsFeedforwardAboveMaxSpeed) {
+    // 前馈是水平速度上限的一部分：超过 max_speed 只会被下游钳掉，配置期拒绝。
+    json value = ReadSourceConfig();
+    value["controller"]["max_speed_mps"] = 2.0;
+    value["controller"]["max_feedforward_mps"] = 3.5;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_feedforward_above_speed.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, RejectsZeroVelocityUpdateThreshold) {
     json value = ReadSourceConfig();
     value["target_estimator"]["min_velocity_position_updates"] = 0;
@@ -965,6 +978,22 @@ TEST(ConfigTest, RejectsInvalidInterceptionRange) {
     value["interception"]["max_range_m"] = 5.0;
     const auto path =
         WriteTemporaryConfig(value, "drone_config_interception_range_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsDExpOutsideInterceptionWindow) {
+    // S7 保持距离必须落在 S9 入口窗口内，否则 interception.enabled=true 时
+    // S7 永远停在窗口外、S9 不可达（2026-11-11 审计结论）。
+    json value = ReadSourceConfig();
+    value["interception"]["enabled"] = true;
+    value["interception"]["min_range_m"] = 2.0;
+    value["interception"]["max_range_m"] = 8.0;
+    value["visual_tracking"]["distance"]["d_exp_m"] = 10.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_dexp_outside_window.json");
 
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);

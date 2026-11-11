@@ -549,6 +549,10 @@ void FlightControllerConfig::Validate() const {
     if (max_jerk_mps3 < 0.0) throw std::invalid_argument("controller.max_jerk_mps3 不得为负");
     if (!std::isfinite(max_feedforward_mps) || max_feedforward_mps <= 0.0)
         throw std::invalid_argument("controller.max_feedforward_mps 必须为有限正数");
+    if (max_feedforward_mps > max_speed_mps)
+        throw std::invalid_argument(
+            "controller.max_feedforward_mps 不得大于 max_speed_mps"
+            "（前馈是速度意图上限的一部分，超过只会被下游钳掉）");
     if (intent_timeout.count() <= 0)
         throw std::invalid_argument("controller.intent_timeout_ms 必须为正");
     if (coast_timeout.count() <= intent_timeout.count())
@@ -1437,6 +1441,15 @@ AppConfig LoadAppConfig(const std::string& path,
                 config.visual_tracking_shadow.summary_log_interval);
         config.visual_tracking.Validate();
         config.visual_tracking_shadow.Validate();
+        // S7 保持距离必须落在 S9 入口窗口内；否则 interception.enabled=true 时
+        // S7 永远停在窗口外，S9 不可达（2026-11-11 审计发现的重复定义）。
+        if (config.interception.enabled &&
+            (config.visual_tracking.distance.d_exp_m < config.interception.min_range_m ||
+             config.visual_tracking.distance.d_exp_m > config.interception.max_range_m)) {
+            throw std::invalid_argument(
+                "visual_tracking.distance.d_exp_m 必须落在 "
+                "interception.min_range_m~max_range_m 内（S7 保持距离须在 S9 入口窗口）");
+        }
     }
 
     if (root.find("ground_station") != root.end()) {

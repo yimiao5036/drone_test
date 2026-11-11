@@ -1,4 +1,4 @@
-{
+﻿{
     "log": {
         "dir": "logs/",
         "level": "info"
@@ -131,7 +131,6 @@
     "approach": {
         "_comment": "SITL：S5 接近段速度律打开（2026-11-11），用于验收 S5→S6 交接与制动包络；position_guide/前馈硬上限仍由 controller 默认值兜底。",
         "speed_law": {
-            "standoff_m": 2.9,
             "accel_plan_mps2": 3.0,
             "decel_plan_mps2": 3.0,
             "accel_phys_mps2": 9.8,
@@ -157,10 +156,12 @@
         }
     },
     "controller": {
-        "_comment": "SITL：水平速度上限唯一来源 max_speed_mps=10，与 PX4 MPC_XY_VEL_MAX（harness stack 设 10）和前馈/引导上限同源；max_feedforward_mps / position_guide_speed_mps 缺席时自动取该值。",
+        "_comment": "SITL：三个水平速度上限显式同值=10，与 PX4 MPC_XY_VEL_MAX（harness stack 设 10）一致。",
         "period_ms": 50,
         "max_speed_mps": 10.0,
         "max_accel_mps2": 3.0,
+        "max_feedforward_mps": 10.0,
+        "position_guide_speed_mps": 10.0,
         "enable_position_velocity_feedforward": true,
         "position_guide_vz_mps": 1.5
     },
@@ -326,8 +327,8 @@
             "vz_limit_mps": 2.0
         },
         "distance": {
-            "_comment": "d_exp_m=10 为占位期望射程（由拦截设备接口给出，待定）；PID 在该射程整定，d_exp 冻结后须在 SITL 复核零过冲（tune_report.py 硬判据）",
-            "d_exp_m": 10.0,
+            "_comment": "d_exp_m 为 S7 保持距离；必须落在 interception.min_range_m~max_range_m 内（2026-11-11 起加载期校验，interception.enabled=true 时）。当前 6.0，落在 2~8m 射程窗口内；PID 在该射程整定。",
+            "d_exp_m": 6.0,
             "kp": 0.5,
             "ki": 0.05,
             "kd": 0.1,

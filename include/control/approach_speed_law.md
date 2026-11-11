@@ -80,9 +80,12 @@ config.approach.speed_law（approach 节） ───────┴─► Appro
 
 `approach.speed_law`（全部可选，缺席用默认值；2026-11-11 起 S5 唯一引导方式）。
 
+> `standoff_m` 不在此配置：装配期由 `handover.arrival_radius_m − 0.1` 注入
+> （2026-11-11 起消除重复定义）。`speed_cap_mps` 也不再重复定义，由
+> `controller.max_speed_mps` 构造时注入。
+
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `standoff_m` | 2.9 | 控制间距 R（3.0 到点半径 − 0.1） |
 | `accel_plan_mps2` / `decel_plan_mps2` | 3.0 / 3.0 | 远段规划加/减速度 |
 | `accel_phys_mps2` | 9.8 | 机体物理加速度上限（只封顶） |
 | `accel_term_mps2` | 1.5 | 近段加速度下限 |
