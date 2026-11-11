@@ -136,6 +136,9 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cy_px, 532.07);
     EXPECT_EQ(config.visual_tracking.camera.image_width, 1280);
     EXPECT_EQ(config.visual_tracking.camera.image_height, 720);
+    // 2026-11-11：S7 跟随状态机 10Hz；影子独立 20Hz。
+    EXPECT_DOUBLE_EQ(config.visual_tracking.control.frequency_hz, 10.0);
+    EXPECT_DOUBLE_EQ(config.visual_tracking_shadow.frequency_hz, 20.0);
     EXPECT_TRUE(config.visual_tracking_shadow.virtual_attitude_when_absent);
 }
 
@@ -150,6 +153,8 @@ TEST(ConfigTest, DefaultsVisualTrackingWhenSectionMissing) {
     EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cy_px, 532.07);
     EXPECT_EQ(config.visual_tracking.heading.mode,
               drone::control::HeadingMode::kRate);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.control.frequency_hz, 10.0);
+    EXPECT_DOUBLE_EQ(config.visual_tracking_shadow.frequency_hz, 20.0);
     std::filesystem::remove(path);
 }
 

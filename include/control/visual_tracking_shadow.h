@@ -6,7 +6,7 @@
 // 对应设计：docs/superpowers/specs/2026-09-23-视觉跟踪控制律移植-design.md
 //
 // 职责：
-//   以固定周期（control.frequency_hz）组装控制快照（视觉稳定性状态 +
+//   以固定周期（shadow.frequency_hz，默认 20Hz）组装控制快照（视觉稳定性状态 +
 //   飞行姿态 + 距离占位），驱动 TrackingControlLaw，把 ControlOutput 映射为
 //   ControlIntent 发布到 kControlIntent。纯影子运行：kControlIntent 当前无
 //   消费者，enable_control=false 基线不动，不产生任何真实控制输出。
@@ -62,6 +62,9 @@ namespace drone::control {
 
 /// 影子适配层配置（控制律参数在 TrackingConfig；此处只含影子行为）。
 struct VisualTrackingShadowConfig {
+    /// 影子节拍频率（Hz）。与 S7 视觉伺服的 `TrackingConfig.control.frequency_hz`
+    /// 解耦：S7 跟随状态机 10Hz 决策拍，影子保留 20Hz 观察节拍。
+    double frequency_hz = 20.0;
     /// 姿态缺失/超龄时是否以零姿态继续计算（现场无 PX4 的观察开关）。
     bool virtual_attitude_when_absent = true;
     /// 周期性摘要日志间隔（观察控制律输出趋势）。

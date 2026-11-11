@@ -1432,6 +1432,8 @@ AppConfig LoadAppConfig(const std::string& path,
         config.visual_tracking.accel_limit.az_mps2 = ReadOptionalPositiveDouble(
             accel_limit, "az_mps2", config.visual_tracking.accel_limit.az_mps2);
         const json shadow = visual_tracking.value("shadow", json::object());
+        config.visual_tracking_shadow.frequency_hz = ReadOptionalPositiveDouble(
+            shadow, "frequency_hz", config.visual_tracking_shadow.frequency_hz);
         config.visual_tracking_shadow.virtual_attitude_when_absent =
             shadow.value("virtual_attitude_when_absent",
                          config.visual_tracking_shadow.virtual_attitude_when_absent);

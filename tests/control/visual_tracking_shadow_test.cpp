@@ -51,6 +51,7 @@ TrackingConfig MakeTrackingConfig() {
 
 VisualTrackingShadowConfig MakeShadowConfig() {
     VisualTrackingShadowConfig cfg;
+    cfg.frequency_hz = 50.0;  // 测试节拍与 MakeTrackingConfig 保持一致
     cfg.summary_log_interval = std::chrono::milliseconds(60000);  // 测试不打摘要
     return cfg;
 }

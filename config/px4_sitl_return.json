@@ -6,7 +6,7 @@
     "visual_tracking": {
         "_comment": "2026-10-14 新增：G3/stage4-tune 的 SITL 侧控制律配置（缺席时落到头文件默认值，distance PID=0/0/0 距离通道不工作——必须整节存在）。整定工作值，终值以 config/config.json 为准；camera 为 2026-09-23 左目标定实测内参（1280x720 档）",
         "control": {
-            "frequency_hz": 20.0,
+            "frequency_hz": 10.0,
             "visual_stale_ms": 200,
             "distance_stale_ms": 500,
             "attitude_stale_ms": 300
@@ -48,6 +48,7 @@
             "az_mps2": 1.5
         },
         "shadow": {
+            "frequency_hz": 20.0,
             "virtual_attitude_when_absent": true,
             "summary_log_interval_ms": 10000
         }

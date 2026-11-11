@@ -58,6 +58,9 @@ const char* ModeName(ControlMode mode) {
 }  // namespace
 
 void VisualTrackingShadowConfig::Validate() const {
+    if (!(frequency_hz > 0.0)) {
+        throw std::invalid_argument("visual_tracking.shadow.frequency_hz 必须为正");
+    }
     if (summary_log_interval.count() <= 0) {
         throw std::invalid_argument("视觉跟踪影子摘要日志间隔必须为正数");
     }
@@ -168,7 +171,7 @@ struct VisualTrackingShadow::Impl {
         intent.header.source_time_ms = static_cast<std::uint64_t>(now_ms);
         intent.header.receive_time_ms = static_cast<std::uint64_t>(now_ms);
         intent.header.valid_for_ms = static_cast<std::uint64_t>(
-            2000.0 / tracking_config.control.frequency_hz);  // 两个控制周期
+            2000.0 / shadow_config.frequency_hz);  // 两个影子控制周期
         intent.header.source_id = 0;
         intent.header.health = 1;
         intent.header.frame_id = 0;
@@ -251,7 +254,7 @@ struct VisualTrackingShadow::Impl {
 
     void Run() {
         const auto period = std::chrono::duration<double>(
-            1.0 / tracking_config.control.frequency_hz);
+            1.0 / shadow_config.frequency_hz);
         auto next_tick = std::chrono::steady_clock::now();
         std::int64_t last_summary_ms = 0;
         ControlOutput last_out;
@@ -368,7 +371,7 @@ bool VisualTrackingShadow::Start() {
     impl_->running.store(true);
     impl_->thread = std::thread([this] { impl_->Run(); });
     SPDLOG_INFO("视觉跟踪影子启动: 频率={}Hz 虚拟姿态={} 姿态输入={} 距离输入={}",
-                impl_->tracking_config.control.frequency_hz,
+                impl_->shadow_config.frequency_hz,
                 impl_->shadow_config.virtual_attitude_when_absent,
                 impl_->flight_topic != nullptr,
                 impl_->distance_topic != nullptr);

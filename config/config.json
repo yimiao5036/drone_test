@@ -1,4 +1,4 @@
-﻿{
+{
     "log": {
         "dir": "logs/",
         "level": "info"
@@ -139,6 +139,7 @@
         "gcs_fire_cooldown_ms": 3000
     },
     "interception": {
+        "_comment_lock": "S9 入口锁定帧门限，与 handover.lock_frames / visual_monitor.lock_frames 是三层独立判据，互不同步。",
         "enabled": false,
         "auto_authorize": true,
         "lock_frames": 10,
@@ -234,6 +235,7 @@
         "status_period_ms": 1000
     },
     "handover": {
+        "_comment_lock": "S5→S6 交接锁定帧门限，与 interception.lock_frames / visual_monitor.lock_frames 独立。",
         "lock_frames": 10,
         "fow_margin_deg": 5.0,
         "innovation_gate_m": 3.0,
@@ -250,6 +252,7 @@
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,
         "observation_timeout_ms": 500,
+        "_comment_lock": "视觉模块内部 ACQUIRING→LOCKED 帧门限，与 handover/interception 的同名键独立。",
         "lock_frames": 5,
         "lost_frames": 10,
         "smoothing_alpha": 0.3,
@@ -338,7 +341,7 @@
     "visual_tracking": {
         "_comment": "视觉跟踪控制律（影子运行，不接 Px4Link）。camera 组为 2026-09-23 左目标定实测内参（1280x720 档，cy 偏离画面中心为实测值）；heading/vertical/distance 参数已于 2026-10-14 经 SITL 整定（证据与指标见 include/control/tracking_control_law.md「参数整定记录」；heading.gain 1.0→0.9，vz_gain 与 distance PID 占位值实测达标冻结）。",
         "control": {
-            "frequency_hz": 20.0,
+            "frequency_hz": 10.0,
             "visual_stale_ms": 200,
             "distance_stale_ms": 500,
             "attitude_stale_ms": 300
@@ -382,6 +385,7 @@
             "az_mps2": 1.5
         },
         "shadow": {
+            "frequency_hz": 20.0,
             "_comment": "现场无 PX4 姿态时以零姿态继续计算（仅供观察）；摘要日志 10s",
             "virtual_attitude_when_absent": true,
             "summary_log_interval_ms": 10000

@@ -46,7 +46,7 @@ TargetEstimator 融合阶段）。距离通道仅在注入 `StereoTargetDistance
 ```text
 Topic<VisualTargetStatus> ─┐
                            ├─► VisualTrackingShadow ──► Topic<ControlIntent>(kControlIntent)
-Topic<FlightStateSnapshot>─┘   （固定节拍 control.frequency_hz）
+Topic<FlightStateSnapshot>─┘   （S7 跟随状态机 10Hz 决策拍；影子按 shadow.frequency_hz 独立节拍）
 ```
 
 - 状态映射：`VisualTargetStatus.state==kLocked` → tracked=true，其余 false；

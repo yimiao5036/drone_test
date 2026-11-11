@@ -43,7 +43,7 @@ enum class NoDistanceAction : std::uint8_t {
 
 /// control 组：控制周期与各输入超龄阈值（§7）
 struct TrackingControlGroupConfig {
-    double frequency_hz = 20.0;             // 控制频率（Hz）
+    double frequency_hz = 10.0;             // 控制频率（Hz）：S7 跟随状态机 10Hz 决策拍
     std::int64_t visual_stale_ms = 200;     // 视觉追踪结果超龄阈值（毫秒）
     std::int64_t distance_stale_ms = 500;   // 目标距离超龄阈值（毫秒）
     std::int64_t attitude_stale_ms = 300;   // 自机姿态超龄阈值（毫秒）
