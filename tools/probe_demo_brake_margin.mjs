@@ -57,8 +57,15 @@ function makeContext() {
   vm.runInContext(source[1], context, { filename: 'demo.js' });
   // DOM 桩把所有 input.value 当 '0'，bindRange 会把 P 全清成 0；恢复页面默认值。
   // 各用例仍显式覆盖自己用到的字段（含 aPhys——拆分后 plant 只认它）。
-  vm.runInContext('P.aPhys = 3; P.accel = 3; P.decel = 3; P.slew = 3; P.vcap = 10;' +
-                  ' P.alt = 0; P.vzT = 0; P.criterion = "rel";', context);
+  // 2026-11-10：提前量口径页面默认已改为 scaled（距离自适应）。历史数值断言是在
+  // "只补时延"口径下标定的，所以这里显式固定成 latency，另用 __defaultLeadMode
+  // 单独断言"页面默认确实是 scaled"（见 ㉗）。
+  vm.runInContext('globalThis.__defaultLeadMode = P.leadMode;' +
+                  ' globalThis.__defaultSched = P.sched;' +
+                  ' globalThis.__defaultBoost = P.autoBoost;' +
+                  ' P.aPhys = 3; P.accel = 3; P.decel = 3; P.slew = 3; P.vcap = 10;' +
+                  ' P.alt = 0; P.vzT = 0; P.criterion = "rel"; P.leadMode = "latency";' +
+                  ' P.sched = "off"; P.autoBoost = "off";', context);
   return context;
 }
 
@@ -619,8 +626,10 @@ const sched = new vm.Script(`(function(){
 })`).runInContext(ctx)();
 check(sched.sched.arrived && sched.sched.minD >= 2.85 &&
       sched.sched.t > sched.fixed.t &&
-      sched.sched.capDownNear !== null && sched.sched.capDownNear <= 1.6,
-      `分相位调度：近段 a 降到 ${sched.sched.capDownNear} m/s²，到点 ${sched.sched.t} s`
+      // 2026-11-10：过渡带 w 加了 0.8/s 速率限幅，进入 7.9 m 时 w 还没降到 0，
+      // 所以"近段 capDown"会带一点过渡滞后（实测 1.5→1.83），阈值放到 2.0。
+      sched.sched.capDownNear !== null && sched.sched.capDownNear <= 2.0,
+      `分相位调度：近段 a 降到 ${sched.sched.capDownNear} m/s²（含过渡滞后），到点 ${sched.sched.t} s`
       + `（固定 ${sched.fixed.t} s），minD ${sched.sched.minD} m`,
       `分相位调度异常：${JSON.stringify(sched.sched)}`);
 check(sched.term1.arrived && sched.term1.minD >= 2.85 && sched.term1.t > sched.sched.t,
@@ -630,8 +639,368 @@ check(sched.vec.arrived && sched.vec.minD >= 2.85 && sched.vec.t > sched.fixed.t
       sched.vec.capDownNear < 3,
       `矢量预留 9.5 → 纵向 ${sched.vec.capDownNear} m/s²，到点 ${sched.vec.t} s`,
       `矢量预留未生效：${JSON.stringify(sched.vec)}`);
-check(!sched.sched.theory && sched.fixed.theory,
-      `分相位/矢量下闭式解判不可用（${sched.sched.reason}）`,
-      `分相位仍显示固定剖面理论值：${JSON.stringify(sched.sched)}`);
+check(sched.sched.theory && sched.fixed.theory && !sched.vec.theory,
+      `闭式解按远段 a_plan 给参考值（分相位/固定都可用；矢量预留仍判不可用 ${
+        sched.vec.theory ? '' : '✓'}）`,
+      `闭式解门控异常：${JSON.stringify({s: sched.sched, f: sched.fixed, v: sched.vec})}`);
+
+// ㉑ 绿机 = 纯比例尾追基线（2026-11-10）：原图例把"零余量对照"写成"纯尾追"，
+//    容易被读成"纯尾追也追不上"。这里锁住"真·比例尾追能到点、且比梯形慢"。
+const pursuit = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', sched:'off', aTerm:1.5, aLatRes:0,
+    adaptive:'on', continuous:'on', targetBrake:0};
+  Object.assign(P, base); resetSims(); P.paused = true;
+  let cMinD = 1e9;
+  for (let i = 0; i < 8000; i++) {
+    stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+    cMinD = Math.min(cMinD, C.d);
+    if (A.arrived && C.arrived) break;
+  }
+  return {a:!!A.arrived, at:+(A.arrivedAt ?? -1).toFixed(2), c:!!C.arrived,
+          ct:+(C.arrivedAt ?? -1).toFixed(2),
+          cd:+C.d.toFixed(2), cMinD:+cMinD.toFixed(2), bd:+B.d.toFixed(1)};
+})`).runInContext(ctx)();
+check(pursuit.c && pursuit.cMinD >= 2.85 && pursuit.a && pursuit.ct > pursuit.at
+      && Math.abs(pursuit.cd - 2.9) < 0.15 && pursuit.bd > 40,
+      `纯比例尾追基线能到点（绿 ${pursuit.ct} s / 蓝 ${pursuit.at} s，minD ${pursuit.cMinD} m；`
+      + `零余量对照仍停在 ${pursuit.bd} m）`,
+      `纯比例尾追基线异常：${JSON.stringify(pursuit)}`);
+
+// ㉒ 停滞提示（2026-11-10）：到不了点的工况必须在顶栏直接报出来，不能只写在底部判词
+//    （"末端=减到0 + 动目标"停在 4.23 m、"到点判据=地速 + 动目标"停在 2.9 m 但速度判据永不满足）。
+const stall = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', sched:'off', aTerm:1.5, aLatRes:0,
+    adaptive:'on', continuous:'on', targetBrake:0};
+  const run = (sec, extra) => {
+    Object.assign(P, base, extra); resetSims(); P.paused = true;
+    for (let i = 0; i < Math.round(sec / DT); i++) { stepSim(A, DT); stepSim(B, DT); stepSim(C, DT); }
+    updateHud();
+    return {d:+A.d.toFixed(2), arrived:!!A.arrived, stalled:!!A.stalled,
+            badge:document.getElementById('badgePhase').textContent};
+  };
+  return {ok: run(12, {}), stop: run(20, {end:'stop'}), abs: run(20, {criterion:'abs'})};
+})`).runInContext(ctx)();
+check(!stall.ok.stalled && stall.ok.arrived &&
+      stall.stop.stalled && stall.stop.badge.includes('停滞') &&
+      stall.abs.stalled && stall.abs.badge.includes('停滞'),
+      `停滞提示只在到不了点时亮（正常 ${stall.ok.badge}；停车末端 d=${stall.stop.d} m 报`
+      + `"${stall.stop.badge}"；地速判据 d=${stall.abs.d} m 报"${stall.abs.badge}"）`,
+      `停滞提示口径错误：${JSON.stringify(stall)}`);
+
+// ㉓ 制动示意圆不得画成十万像素半径（2026-11-10）：动态预算吃满时 decelEff→0，
+//    dbrk 会算成 1e5~1e7 m；真实 GPU 浏览器画这个大虚线圆单帧要 100~370 ms
+//    （现象："刹车范围一变大就卡一下"）。锁住"半径超视口就不画"与读数降级。
+const ringGuard = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', sched:'off', aTerm:1.5, aLatRes:0,
+    adaptive:'on', continuous:'on', targetBrake:0, noise:0, vsig:0, measHz:5, latency:200};
+  Object.assign(P, base, {turn:'weave', vt:7});
+  resetSims(); P.paused = true;
+  let peak = 0, peakT = 0;
+  for (let i = 0; i < 4000; i++) {
+    stepSim(A, DT);
+    if (A.dbrk > peak) { peak = A.dbrk; peakT = A.t; }
+  }
+  updateHud();
+  return {peak:+peak.toFixed(0), peakT:+peakT.toFixed(1), infeasible:!!A.brakeInfeasible,
+          sDb:document.getElementById('sDb').innerHTML,
+          ringHuge: brakingRingRadius(peak, 5, 1376, 292),
+          ringSmall: brakingRingRadius(16.93, 5, 1376, 292)};
+})`).runInContext(ctx)();
+check(ringGuard.peak > 1e4 && ringGuard.infeasible && ringGuard.sDb.includes('不可行')
+      && ringGuard.ringHuge === null && ringGuard.ringSmall !== null,
+      `制动示意圆有视口上限（蛇形 7 m/s：dbrk 峰值 ${ringGuard.peak} m @${ringGuard.peakT} s，`
+      + `读数降级为"${ringGuard.sDb}"，16.93 m 仍正常画圆）`,
+      `制动示意圆/读数降级缺失：${JSON.stringify(ringGuard)}`);
+
+// ㉔ "有效加速度"读数必须与 motionLimits() 同口径（2026-11-10）：原来漏了 slew 与矢量预留，
+//    把 a_plan 拖到 5 时读数显示"有效 5.0"，实际被 slew=3 卡在 3.0——维护者因此以为滑块没生效。
+const effReadout = new vm.Script(`(function(){
+  const base = {src:'truth', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:2, heading:90, turn:'straight', startD:40, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', sched:'off', aTerm:1.5, aLatRes:0,
+    adaptive:'on', continuous:'on', targetBrake:0};
+  const read = extra => {
+    Object.assign(P, base, extra);
+    resetSims(); P.paused = true;
+    for (let i = 0; i < 100; i++) stepSim(A, DT);   // 让 motionLimits(A) 有状态
+    syncAphysOut();
+    return {txt:document.getElementById('aPhysOut').textContent,
+            eff:+effectivePlanAccel().toFixed(2), mL:+motionLimits(A).up.toFixed(2)};
+  };
+  return {plan5slew3: read({accel:5, decel:5, slew:3}),
+          plan5slew5: read({accel:5, decel:5, slew:5}),
+          plan5slew0: read({accel:5, decel:5, slew:0}),
+          physCap3:   read({accel:5, decel:5, slew:5, aPhys:3}),
+          latRes9:    read({accel:5, decel:5, slew:5, aLatRes:9})};
+})`).runInContext(ctx)();
+check(effReadout.plan5slew3.txt.includes('有效 3.0') && effReadout.plan5slew3.eff === 3
+      && effReadout.plan5slew5.txt.includes('有效 5.0')
+      && effReadout.plan5slew0.txt.includes('有效 5.0')
+      && effReadout.physCap3.txt.includes('有效 3.0')
+      && effReadout.latRes9.eff < 5,
+      `"有效加速度"读数同口径（a_plan5+slew3 → ${effReadout.plan5slew3.txt}；`
+      + `slew5 → ${effReadout.plan5slew5.txt}；矢量预留 9 → 有效 ${effReadout.latRes9.eff}）`,
+      `有效加速度读数口径错误：${JSON.stringify(effReadout)}`);
+
+// ㉔ 分相位近段下限按"已知目标机动能力"抬升（2026-11-10）：a_term 固定 1.5 时，
+//    蛇形 7.2 m/s（需求 3.80）在近段会把沿视线加速预算算成 0，实测 120 s 到不了点、
+//    最后退到 12.31 m；抬升后应与"固定"同结果，且过渡带上限抖动大幅下降。
+const schedLift = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:5, decel:5, aPhys:9.8,
+    slew:3, vcap:10, vt:7.2, heading:90, turn:'weave', startD:10, jerk:0, lead:0, alt:0, vzT:0,
+    criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, autoBoost:'off', floor:true, margin:1};
+  const run = (sched) => {
+    Object.assign(P, base, {sched}); resetSims(); P.paused = true;
+    let capChanges = 0, capPrev = null, atMax = 0, minD = 1e9;
+    for (let i = 0; i < 8000; i++) {
+      stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+      const h = A.hist.length ? A.hist[A.hist.length - 1] : null;
+      if (h) { if (capPrev !== null && Math.abs(h.aCapUp - capPrev) > 1e-6) capChanges++; capPrev = h.aCapUp; }
+      atMax = Math.max(atMax, aTermEffective(A));
+      if (A.d < minD) minD = A.d;
+      if (A.arrived) break;
+    }
+    return {arrived:!!A.arrived, at:+(A.arrivedAt ?? -1).toFixed(1), minD:+minD.toFixed(2),
+            capChanges, aTermEffMax:+atMax.toFixed(2)};
+  };
+  return {off: run('off'), on: run('on')};
+})`).runInContext(ctx)();
+check(schedLift.on.arrived && schedLift.off.arrived
+      && Math.abs(schedLift.on.at - schedLift.off.at) < 0.5
+      && schedLift.on.capChanges <= 5 && schedLift.on.aTermEffMax > 3,
+      `分相位按目标机动抬升近段下限（蛇形 7.2：固定 ${schedLift.off.at} s / 分相位 ${schedLift.on.at} s，`
+      + `a_term_eff 抬到 ${schedLift.on.aTermEffMax} m/s²，上限抖动 ${schedLift.on.capChanges} 次）`,
+      `分相位抬升未生效：${JSON.stringify(schedLift)}`);
+
+// ㉕ 停滞自动提能力（2026-11-10，默认关）：a_plan 0.8 / slew 关闭时蛇形 7.2 会拖到 42 s，
+//    打开后按 0.5 m/s²/s 抬到物理上限内 → 19 s 级；读数条要写明提了多少。
+const boostSw = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:0.8, decel:0.8,
+    aPhys:9.8, slew:0, vcap:10, vt:7.2, heading:90, turn:'weave', startD:10, jerk:0, lead:0,
+    alt:0, vzT:0, criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'off', floor:true, margin:1};
+  const run = (autoBoost) => {
+    Object.assign(P, base, {autoBoost}); resetSims(); P.paused = true;
+    let boostMax = 0;
+    for (let i = 0; i < 6000; i++) {
+      stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+      boostMax = Math.max(boostMax, A.accelBoost || 0);
+      if (A.arrived) break;
+    }
+    updateHud();
+    return {arrived:!!A.arrived, at:+(A.arrivedAt ?? -1).toFixed(1), boost:+boostMax.toFixed(2),
+            note:document.getElementById('minNote').innerHTML};
+  };
+  return {off: run('off'), on: run('on')};
+})`).runInContext(ctx)();
+check(boostSw.off.arrived && boostSw.off.at > 35
+      && boostSw.on.arrived && boostSw.on.at < 25 && boostSw.on.boost > 1
+      && boostSw.on.note.includes('停滞自动提能力'),
+      `停滞自动提能力（默认关）（蛇形 7.2 / a_plan 0.8：关 ${boostSw.off.at} s → 开 ${boostSw.on.at} s，`
+      + `抬升 +${boostSw.on.boost} m/s²）`,
+      `停滞自动提能力异常：${JSON.stringify(boostSw)}`);
+
+// ㉖ 穿透标记 + 停滞计时粘性（2026-11-10）：蛇形目标"短暂相交一下"会把原来的 0.05 m
+//    进展阈值反复清零，停滞/提能力永远等不到 6 s；真机上 0.07 m 就是撞了。
+const penetration = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8.1, heading:90, turn:'weave', startD:40, jerk:0, lead:0, alt:0, vzT:0,
+    criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'off', autoBoost:'off',
+    leadMode:'latency', floor:true, margin:1};
+  const run = (extra, n) => {
+    Object.assign(P, base, extra); resetSims(); P.paused = true;
+    let passFrames = 0;
+    for (let i = 0; i < n; i++) {
+      stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+      if (A.d < 0.5) passFrames++;
+      if (A.arrived) break;
+    }
+    updateHud();
+    return {penetrated:!!A.penetrated, pmd:+(A.penetratedMinD ?? 9).toFixed(2), passFrames,
+            stalled:!!A.stalled, boostT:+(A.boostT || 0).toFixed(1),
+            boost:+(A.accelBoost || 0).toFixed(2),
+            badge:document.getElementById('badgePhase').textContent,
+            note:document.getElementById('minNote').innerHTML};
+  };
+  return {weave: run({}, 9000), calm: run({vt:2, turn:'straight', startD:40}, 4000)};
+})`).runInContext(ctx)();
+check(penetration.weave.penetrated && penetration.weave.pmd < 0.5
+      && penetration.weave.stalled
+      && penetration.weave.badge.includes('穿透') && penetration.weave.note.includes('已穿透')
+      && !penetration.calm.penetrated && !penetration.calm.stalled,
+      `穿透标记 + 停滞粘性（蛇形 8.1：穿透 ${penetration.weave.pmd} m / ${penetration.weave.passFrames} 帧，`
+      + `停滞计时 ${penetration.weave.boostT} s → 提能力 +${penetration.weave.boost} m/s²，`
+      + `徽标"${penetration.weave.badge}"）`,
+      `穿透/停滞粘性异常：${JSON.stringify(penetration)}`);
+
+// ㉗ 提前量口径（2026-11-10，维护者拍板默认改"距离自适应"）：页面默认值必须是 scaled；
+//    scaled 下的 lead = min(0.06·(d−R), 2 m)，在高速横穿工况能拉开近距穿越的间距。
+const leadMode = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8.1, heading:90, turn:'weave', startD:40, jerk:0, lead:0, alt:0, vzT:0,
+    criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'off', autoBoost:'off', floor:true,
+    margin:1};
+  const run = (mode) => {
+    Object.assign(P, base, {leadMode: mode}); resetSims(); P.paused = true;
+    let minD = 1e9, passFrames = 0;
+    for (let i = 0; i < 9000; i++) {
+      stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+      if (A.d < minD) minD = A.d;
+      if (A.d < 0.5) passFrames++;
+      if (A.arrived) break;
+    }
+    return {minD:+minD.toFixed(2), passFrames};
+  };
+  return {raw: globalThis.__defaultLeadMode, latency: run('latency'), scaled: run('scaled')};
+})`).runInContext(ctx)();
+check(leadMode.raw === 'scaled' && leadMode.scaled.minD > leadMode.latency.minD
+      && leadMode.scaled.passFrames < leadMode.latency.passFrames,
+      `提前量口径默认=距离自适应（蛇形 8.1：只补时延最近 ${leadMode.latency.minD} m / `
+      + `${leadMode.latency.passFrames} 帧 <0.5 m → 距离自适应 ${leadMode.scaled.minD} m / `
+      + `${leadMode.scaled.passFrames} 帧）`,
+      `提前量口径异常：${JSON.stringify(leadMode)}`);
+
+// ㉘ 穿透 = 失败判据（2026-11-10，维护者拍板）：判词必须最先报"判定为撞击（失败）"，
+//    并给出最小间距/次数；正常工况绝不能误报。
+const failVerdict = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8.1, heading:90, turn:'weave', startD:40, jerk:0, lead:0, alt:0, vzT:0,
+    criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'off', autoBoost:'off',
+    leadMode:'latency', floor:true, margin:1};
+  const run = (extra, n) => {
+    Object.assign(P, base, extra); resetSims(); P.paused = true;
+    for (let i = 0; i < n; i++) { stepSim(A, DT); stepSim(B, DT); stepSim(C, DT); if (A.arrived) break; }
+    updateHud();
+    return {penetrated:!!A.penetrated, ep:+(A.penetrationEpisodes||0),
+            pmd:+(A.penetratedMinD ?? 9).toFixed(2),
+            verdict:document.getElementById('verdict').innerHTML};
+  };
+  return {hit: run({}, 9000), calm: run({vt:2, turn:'straight'}, 4000)};
+})`).runInContext(ctx)();
+check(failVerdict.hit.penetrated && failVerdict.hit.ep >= 1
+      && failVerdict.hit.verdict.includes('判定为撞击（失败）')
+      && failVerdict.hit.verdict.includes('最小间距')
+      && !failVerdict.calm.penetrated && !failVerdict.calm.verdict.includes('判定为撞击'),
+      `穿透判为失败（蛇形 8.1：${failVerdict.hit.ep} 次、最近 ${failVerdict.hit.pmd} m，`
+      + `判词"判定为撞击（失败）"；正常工况不误报）`,
+      `穿透失败判据异常：${JSON.stringify(failVerdict)}`);
+
+// ㉙ 加速度调度固定分相位 + 「额外提前量(m)」叠加（2026-11-10 维护者要求）：
+//    面板已删「固定」选项（P.sched 默认 'on'，'off' 只留给回归）；原来的「拦截提前 ms」
+//    改成米制"额外提前量"，叠加在距离自适应之上。
+const uiDefaults = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8, heading:90, turn:'straight', startD:40, jerk:0, alt:0, vzT:0,
+    criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'on', autoBoost:'off',
+    leadMode:'scaled', floor:true, margin:1};
+  const run = (extraM) => {
+    Object.assign(P, base, {leadExtraM: extraM}); resetSims(); P.paused = true;
+    for (let i = 0; i < 5; i++) { stepSim(A, DT); stepSim(B, DT); stepSim(C, DT); }
+    return {leadSec:+(A.est.leadSec||0).toFixed(3), adv:+(A.est.aimAdvance||0).toFixed(3),
+            adaptiveM:+(A.est.leadAdaptiveM||0).toFixed(2)};
+  };
+  return {schedDefault: globalThis.__defaultSched, boostDefault: globalThis.__defaultBoost,
+          zero: run(0), extra: run(4)};
+})`).runInContext(ctx)();
+check(uiDefaults.schedDefault === 'on' && uiDefaults.boostDefault === 'on'
+      && uiDefaults.zero.adaptiveM > 1
+      && Math.abs(uiDefaults.extra.leadSec - uiDefaults.zero.leadSec - 4 / 8) < 0.02,
+      `加速度调度固定分相位、提能力默认开 + 额外提前量按米叠加（调度 ${uiDefaults.schedDefault}；`
+      + `提能力 ${uiDefaults.boostDefault}；自适应 ${uiDefaults.zero.adaptiveM} m；额外 4 m → 提前 `
+      + `${uiDefaults.extra.leadSec} s vs ${uiDefaults.zero.leadSec} s）`,
+      `默认开关/额外提前量异常：${JSON.stringify(uiDefaults)}`);
+
+// ㉚ 提前量随距离收缩（2026-11-10 维护者追问"靠近了为何预测长度没变"）：
+//    画布上「菱形→时延补偿点」是链路时延（恒定），「时延补偿点→瞄准点」才是提前量。
+//    这里锁住后者：40 m 处约 2 m、8 m 处约 0.3 m。
+const leadSplit = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8, heading:90, turn:'straight', startD:40, jerk:0, leadExtraM:0, alt:0,
+    vzT:0, criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'on', autoBoost:'off', leadMode:'scaled'};
+  Object.assign(P, base); resetSims(); P.paused = true;
+  let farLead = null, nearLead = null, nearD = 0;
+  for (let i = 0; i < 6000; i++) {
+    stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+    const e = A.est;
+    if (!e.aim || !e.predLatency) continue;
+    const leadM = Math.hypot(e.aim.x - e.predLatency.x, e.aim.y - e.predLatency.y);
+    if (farLead === null && A.d < 40.5) farLead = leadM;
+    if (nearLead === null && A.d < 8.5) { nearLead = leadM; nearD = A.d; }
+    if (A.arrived) break;
+  }
+  return {far:+(farLead ?? -1).toFixed(2), near:+(nearLead ?? -1).toFixed(2), nearD:+nearD.toFixed(1)};
+})`).runInContext(ctx)();
+check(leadSplit.far > 1.5 && leadSplit.near > 0 && leadSplit.near < 0.6
+      && leadSplit.near < leadSplit.far * 0.3,
+      `提前量随距离收缩（40 m → ${leadSplit.far} m；${leadSplit.nearD} m → ${leadSplit.near} m）`,
+      `提前量未随距离收缩：${JSON.stringify(leadSplit)}`);
+
+// ㉛ 制导线连的是瞄准点、不是目标当前位置（2026-11-10 维护者指出画布只连真值点像纯尾追）：
+//    瞄准点 = 估计点按（时延 + 提前量）前视，与真值目标的偏差应 ≈ 提前时间 × 目标速度。
+const guideLine = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8, heading:90, turn:'straight', startD:40, jerk:0, leadExtraM:0, alt:0,
+    vzT:0, criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'on', autoBoost:'off', leadMode:'scaled'};
+  Object.assign(P, base); resetSims(); P.paused = true;
+  for (let i = 0; i < 20; i++) { stepSim(A, DT); stepSim(B, DT); stepSim(C, DT); }
+  const e = A.est;
+  const dev = Math.hypot(e.aim.x - A.target.x, e.aim.y - A.target.y);
+  // 时延补偿把状态推到"现在"后，再叠提前量才是瞄准点：所以领先真值的距离≈提前量，
+  // 不是"提前时间×目标速度"（时延部分被补偿掉，不再体现为偏差）。
+  return {hasPrev:!!e.aimPrev, dev:+dev.toFixed(2),
+          leadM:+((e.leadAdaptiveM||0) + (e.leadExtraM||0)).toFixed(2)};
+})`).runInContext(ctx)();
+check(guideLine.hasPrev && guideLine.dev > 0.5
+      && Math.abs(guideLine.dev - guideLine.leadM) < 0.6,
+      `制导线连瞄准点而非真值点（瞄准点领先真值 ${guideLine.dev} m ≈ 提前量 ${guideLine.leadM} m）`,
+      `制导线/瞄准点异常：${JSON.stringify(guideLine)}`);
+
+// ㉜ 停滞自动提能力必须在**默认参数**（a_plan 3 = slew 3）下真的生效（2026-11-10 维护者反馈
+//    "触发从来没满足过"）：原来提升目标取 min(a_phys, slew)=3、want 恒为 0；现在目标取 a_phys，
+//    并且提能力生效时 slew 限幅会放宽到提升后的规划值。蛇形 8.1 m/s：关→穿透/不到点；开→到点且不穿透。
+const boostRescue = new vm.Script(`(function(){
+  const base = {src:'vmsg', law:'brake', policy:'fast', end:'match', accel:3, decel:3, aPhys:9.8,
+    slew:3, vcap:10, vt:8.1, heading:90, turn:'weave', startD:40, jerk:0, leadExtraM:0, alt:0,
+    vzT:0, criterion:'rel', aLatRes:0, adaptive:'on', continuous:'on', targetBrake:0,
+    noise:0, vsig:0, measHz:5, latency:200, aTerm:1.5, sched:'on', leadMode:'scaled',
+    floor:true, margin:1};
+  const run = (autoBoost) => {
+    Object.assign(P, base, {autoBoost}); resetSims(); P.paused = true;
+    let upMax = 0, boostMax = 0, boostTMax = 0;
+    for (let i = 0; i < 9000; i++) {
+      stepSim(A, DT); stepSim(B, DT); stepSim(C, DT);
+      upMax = Math.max(upMax, motionLimits(A).up);
+      boostMax = Math.max(boostMax, A.accelBoost || 0);
+      boostTMax = Math.max(boostTMax, A.boostT || 0);
+      if (A.arrived) break;
+    }
+    updateHud();
+    return {arrived:!!A.arrived, at:+(A.arrivedAt ?? -1).toFixed(1), pen:!!A.penetrated,
+            upMax:+upMax.toFixed(2), boost:+boostMax.toFixed(2), boostT:+boostTMax.toFixed(1),
+            note:document.getElementById('minNote').innerHTML};
+  };
+  return {off: run('off'), on: run('on')};
+})`).runInContext(ctx)();
+check(!boostRescue.off.arrived && boostRescue.off.pen
+      && boostRescue.on.arrived && !boostRescue.on.pen
+      && boostRescue.on.boost > 1 && boostRescue.on.upMax > 3.5
+      && boostRescue.on.note.includes('停滞自动提能力'),
+      `提能力在默认参数下生效（蛇形 8.1：关→${boostRescue.off.pen ? '穿透' : '不到点'}；`
+      + `开→${boostRescue.on.at} s 到点、无穿透，抬升 +${boostRescue.on.boost} m/s²、`
+      + `有效加速度上限 ${boostRescue.off.upMax} → ${boostRescue.on.upMax} m/s²）`,
+      `提能力未生效：${JSON.stringify(boostRescue)}`);
 
 process.exit(ok ? 0 : 1);
