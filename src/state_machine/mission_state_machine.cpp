@@ -39,6 +39,7 @@
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "config/zone_store.h"
+#include "control/approach_speed_law.h"
 #include "control/fence_geometry.h"
 #include "control/line_of_sight.h"
 #include "control/rate_limiter.h"
@@ -340,6 +341,7 @@ public:
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
+          approach_law_(config.approach.speed_law),
           expected_interceptor_type_(config.expected_interceptor_type),
           test_hooks_enabled_(config.test_hooks_enabled),
           azimuth_converter_(config.tracking.camera.fx_px,
@@ -3303,6 +3305,7 @@ private:
         hot_backup_check_ms_ = 0;
         hot_backup_starved_ = false;
         visual_law_->Reset();
+        approach_law_.Reset();
     }
 
     /// 交接判据总入口（S5→S6→S7 推进与 S7 退出迟滞）。
@@ -3650,14 +3653,24 @@ private:
         }
         target.max_speed_mps = static_cast<float>(cap);
 
-        if (!with_heading || !latest_flight_.has_value() ||
+        if (!with_heading) {
+            return;
+        }
+        ApplyHeadingToward(target, px, py);
+    }
+
+    /// 机头指向给定局部 NED 点（0=正北，顺时针为正）。目标过近时保持原机头，
+    /// 避免末端原地打转；无有效局部位置时不指定航向。S5 旧位置引导与
+    /// 速度律分支共用。
+    void ApplyHeadingToward(PositionIntentTarget& target, double px, double py) {
+        if (!latest_flight_.has_value() ||
             !latest_flight_->local_position_valid) {
             return;
         }
         const double dn = px - static_cast<double>(latest_flight_->local_x_m);
         const double de = py - static_cast<double>(latest_flight_->local_y_m);
         if (std::hypot(dn, de) < 0.5) {
-            return;  // 已到目标附近：保持现机头，避免末端抖动
+            return;
         }
         target.yaw_valid = true;
         target.yaw_deg = static_cast<float>(
@@ -3692,10 +3705,99 @@ private:
             position_target.feedforward_vz_mps = target.vel_z_mps;
             position_target.feedforward_valid_mask |= common::kVelocityValidDown;
         }
-        // 接近段策略：预测点 + 速率上限 + 机头朝目标（2026-11-02 P0-1/P0-2）。
-        ApplyApproachPolicy(position_target, /*with_heading=*/true);
+        // 接近段速度律（2026-11-11，approach.speed_law.enabled）：
+        // 直接产出 (p_ref, v_ref)，参考点取目标沿视线后退 standoff 的保持点，
+        // 速度前馈即控制律输出；位置环只做 PX4 兜底锚点。
+        bool law_applied = false;
+        if (approach_.speed_law.enabled && target.valid &&
+            target.header.frame_id == kFrameLocalNed &&
+            std::isfinite(target.pos_x_m) && std::isfinite(target.pos_y_m) &&
+            latest_flight_.has_value() &&
+            latest_flight_->local_position_valid) {
+            control::ApproachInput law_input;
+            law_input.own_valid = true;
+            law_input.target_valid = true;
+            law_input.own_n_m = static_cast<double>(latest_flight_->local_x_m);
+            law_input.own_e_m = static_cast<double>(latest_flight_->local_y_m);
+            law_input.own_d_m = static_cast<double>(latest_flight_->local_z_m);
+            law_input.own_vn_mps = std::isfinite(latest_flight_->vx_mps)
+                                       ? static_cast<double>(latest_flight_->vx_mps)
+                                       : 0.0;
+            law_input.own_ve_mps = std::isfinite(latest_flight_->vy_mps)
+                                       ? static_cast<double>(latest_flight_->vy_mps)
+                                       : 0.0;
+            law_input.own_vd_mps = std::isfinite(latest_flight_->vz_mps)
+                                       ? static_cast<double>(latest_flight_->vz_mps)
+                                       : 0.0;
+            law_input.target_n_m = static_cast<double>(target.pos_x_m);
+            law_input.target_e_m = static_cast<double>(target.pos_y_m);
+            law_input.target_d_m =
+                std::isfinite(target.pos_z_m)
+                    ? static_cast<double>(target.pos_z_m)
+                    : law_input.own_d_m;
+            law_input.target_vn_mps = std::isfinite(target.vel_x_mps)
+                                          ? static_cast<double>(target.vel_x_mps)
+                                          : 0.0;
+            law_input.target_ve_mps = std::isfinite(target.vel_y_mps)
+                                          ? static_cast<double>(target.vel_y_mps)
+                                          : 0.0;
+            law_input.target_vd_mps =
+                std::isfinite(target.vel_z_mps)
+                    ? static_cast<double>(target.vel_z_mps)
+                    : 0.0;
+            // 时延补偿用“观测时刻”而不是发布时刻：TargetState.last_observed_ms
+            // 是最近一次有效观测的单调时钟，header.receive_time_ms 只是估计器
+            // 本拍发布时刻（10Hz 刷屏时几乎等于 now，会把时延补偿吃掉）。
+            law_input.target_sample_ms = static_cast<std::int64_t>(
+                target.last_observed_ms > 0 ? target.last_observed_ms
+                                            : target.header.receive_time_ms);
+            const control::ApproachOutput law_out = approach_law_.Update(
+                law_input, static_cast<std::int64_t>(now_ms));
+            if (law_out.valid) {
+                position_target.x = static_cast<float>(law_out.ref_n_m);
+                position_target.y = static_cast<float>(law_out.ref_e_m);
+                position_target.z = static_cast<float>(law_out.ref_d_m);
+                position_target.feedforward_vx_mps =
+                    static_cast<float>(law_out.v_n_mps);
+                position_target.feedforward_vy_mps =
+                    static_cast<float>(law_out.v_e_mps);
+                position_target.feedforward_vz_mps =
+                    static_cast<float>(law_out.v_d_mps);
+                position_target.feedforward_valid_mask =
+                    common::kVelocityValidAll;
+                // 位置引导限速至少覆盖本拍期望速度，并留 0.5 m/s 余量让
+                // 引导点能追上目标；控制器仍有 position_guide_speed_mps 硬上限。
+                const double law_speed =
+                    std::hypot(law_out.v_n_mps, law_out.v_e_mps);
+                position_target.max_speed_mps = static_cast<float>(
+                    std::max(law_speed, 0.5));
+                ApplyHeadingToward(position_target, target.pos_x_m,
+                                   target.pos_y_m);
+                law_applied = true;
+                if (!approach_speed_law_logged_) {
+                    approach_speed_law_logged_ = true;
+                    SPDLOG_INFO(
+                        "S5 接近速度律启动: target_id={} d={:.2f}m closing={:.2f}m/s "
+                        "phase={} ref=({:.2f},{:.2f},{:.2f}) v=({:.2f},{:.2f},"
+                        "{:.2f})",
+                        target.target_id, law_out.distance_m,
+                        law_out.closing_mps,
+                        control::ApproachPhaseName(law_out.phase),
+                        static_cast<double>(position_target.x),
+                        static_cast<double>(position_target.y),
+                        static_cast<double>(position_target.z),
+                        static_cast<double>(position_target.feedforward_vx_mps),
+                        static_cast<double>(position_target.feedforward_vy_mps),
+                        static_cast<double>(position_target.feedforward_vz_mps));
+                }
+            }
+        }
+        // 关闭速度律或本拍输入不足时回退旧位置引导点 + 固定提前策略。
+        if (!law_applied) {
+            ApplyApproachPolicy(position_target, /*with_heading=*/true);
+        }
 
-        const bool content_changed = !last_intent_target_.has_value() ||
+        const bool content_changed = law_applied || !last_intent_target_.has_value() ||
             !FloatContentEqual(last_intent_target_->pos_x_m, target.pos_x_m) ||
             !FloatContentEqual(last_intent_target_->pos_y_m, target.pos_y_m) ||
             !FloatContentEqual(last_intent_target_->pos_z_m, target.pos_z_m) ||
@@ -4798,6 +4900,8 @@ private:
     /// kHold=S5 目标失效保持（目标=PX4 当前局部位置，原因码 9）。
     enum class PositionIntentSource { kNone, kEstimate, kFrozen, kHold };
     PositionIntentSource position_intent_source_ = PositionIntentSource::kNone;
+    /// S5 接近速度律启动日志一次性标记（每进程只打一次，避免热路径刷屏）。
+    bool approach_speed_law_logged_ = false;
     /// S5→S6 冻结的最后位置目标（进入时刻的估计快照；交接段结束清空）。
     std::optional<common::TargetState> frozen_handover_target_;
     /// S7 段内是否已发出首条视觉意图（冻结续发的收口条件）。
@@ -4822,6 +4926,9 @@ private:
     const config::TakeoffConfig takeoff_;
     /// 接近段相位策略（approach 节，2026-11-02）：S5/S6 速率上限、预测提前量。
     const config::ApproachConfig approach_;
+    /// S5 接近段速度律（approach.speed_law 节，2026-11-11）：打开后由本律
+    /// 产出 (p_ref, v_ref)，关闭时保留旧的位置引导点 + 固定提前行为。
+    control::ApproachSpeedLaw approach_law_;
     /// 本机拦截功能类别（ground_station.aircraft_component_id 同源）。
     const uint8_t expected_interceptor_type_;
     /// 任务分配生命周期助手（一次上电一次任务、重复 id 回执、原点记录）。

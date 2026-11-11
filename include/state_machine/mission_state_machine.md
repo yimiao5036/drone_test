@@ -27,11 +27,24 @@
     5Hz 离散观测，估计器每拍把位置修到新观测上；引导点按 `alpha = dt/(tau+dt)` 一阶
     低通，把台阶摊到多个决策周期。进入 S5 时重新对齐，进入 S6（冻结段）时再重置一次，
     保证冻结交接点被精确保持（不继承 S5 的滤波状态）。
-- 配置：`approach` 节（`speed_mps`/`track_speed_margin_mps`/`lead_time_ms`/`guide_lowpass_ms`），
+- 配置：`approach` 节（`speed_mps`/`track_speed_margin_mps`/`lead_time_ms`/`guide_lowpass_ms`，
+  以及 2026-11-11 新增的 `speed_law` 子节），
   字段见 `include/config/配置管理.md`；`ControlIntent.max_speed_mps` 是这条链传导
   相位策略的唯一通道（历史上定义但未被消费，2026-11-02 起生效）。
 - 测试：`GpsApproachPublishesPositionIntent`（断言预测点与相位上限）、
   `GpsApproachFacesPredictedTargetPosition`（机头朝向）、`GpsApproachRepublishesOnFeedforwardChange`。
+
+**S5 接近段速度律（2026-11-11 落机载）**：`approach.speed_law.enabled=true` 时，
+`PublishEstimateGuidedIntent()` 不再调用 `ApplyApproachPolicy`，改由
+`ApproachSpeedLaw` 每拍产出 `(p_ref, v_ref)`：
+
+- 位置落点 `p_ref` = 目标沿当前视线后退 `standoff_m`（默认 2.9m）的保持点；
+- 三轴速度前馈 = 律输出（相对系制动包络 + 速度预算 + 侧向/转弯约束 + 分相位）；
+- `max_speed_mps = max(|v_ref|, 0.5)`，仅用于控制器位置引导限速；
+- 机头仍由 `ApplyHeadingToward` 指向目标；关闭开关时回退上面的旧位置引导。
+- 实现与参数：`include/control/approach_speed_law.md`；测试：
+  `MissionStateMachineTest.GpsApproachSpeedLawProducesStandoffReference`
+  与 `ApproachSpeedLawTest.*`。
 
 
 阶段四新增（Task 8）：经`SetEstimationDiagnostics`注入估计器诊断接口后，**交接判据**（`handover` 配置节）生效，状态在 S5→S6→S7 之间按下列判据推进/回退（`handover` 阈值全部来自配置，无代码字面量）：

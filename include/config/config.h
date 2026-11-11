@@ -8,6 +8,7 @@
 
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
+#include "control/approach_speed_law.h"
 #include "control/tracking_config.h"
 #include "control/visual_tracking_shadow.h"
 #include "perception/stereo_ranger_core.h"
@@ -280,6 +281,9 @@ struct ApproachConfig {
     /// 位置修到新观测上会让引导点跳变（0082 实飞观察到逐拍位置台阶），低通把
     /// 台阶摊到多个决策周期，代价是约一个时间常数的相位滞后。
     int guide_lowpass_ms = 200;
+    /// S5 接近段速度律（2026-11-11 落机载）。打开后 S5 由本律产出
+    /// (p_ref, v_ref)，上面四个旧字段仅在关闭时保留原行为。
+    control::ApproachSpeedLawConfig speed_law;
     void Validate() const;
 };
 

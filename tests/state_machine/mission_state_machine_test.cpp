@@ -301,6 +301,68 @@ TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
     machine.Stop();
 }
 
+// 2026-11-11：approach.speed_law.enabled=true 时 S5 由速度律产出
+// (p_ref, v_ref)：位置落点是目标沿视线后退 standoff 的保持点，前馈三轴有效。
+TEST(MissionStateMachineTest, GpsApproachSpeedLawProducesStandoffReference) {
+    state_machine::MissionStateMachineConfig config;
+    config.approach.speed_law.enabled = true;
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+
+    auto flight = MakeNavigationReadyFlight();
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.local_position_valid = true;
+    flight.local_x_m = 0.f;
+    flight.local_y_m = 0.f;
+    flight.local_z_m = 0.f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight));
+
+    auto estimated = MakeValidEstimatedTarget();
+    estimated.vel_x_mps = 2.5f;
+    estimated.vel_y_mps = -1.5f;
+    estimated.vel_z_mps = 0.5f;
+    estimated.velocity_valid_mask = common::kVelocityValidAll;
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    ASSERT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
+
+    const double distance = std::hypot(12.5, 3.0);
+    const double nx = 12.5 / distance;
+    const double ny = -3.0 / distance;
+    // 位置落点 = 目标沿视线后退 standoff(2.9 m)，不是目标点本身。
+    EXPECT_NEAR(intent->target_x, 12.5 - nx * 2.9, 1e-3);
+    EXPECT_NEAR(intent->target_y, -3.0 - ny * 2.9, 1e-3);
+    EXPECT_FLOAT_EQ(intent->target_z, -8.0f);
+    // 速度律输出三轴前馈（首拍从自机速度零开始按 slew 爬坡，故只校验方向/非零）。
+    EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidAll);
+    EXPECT_GT(intent->feedforward_vx_mps, 0.0f);
+    EXPECT_LT(intent->feedforward_vy_mps, 0.0f);
+    EXPECT_GT(intent->max_speed_mps, 0.4f);
+    EXPECT_TRUE(intent->yaw_valid);
+    EXPECT_EQ(intent->control_source, 0U);
+
+    machine.Stop();
+}
+
 // 2026-11-02 P0-1：S5 起机头指向（预测后的）目标点——网枪固定朝前，机头必须
 // 朝目标；同时校验预测点与相位速率上限。
 TEST(MissionStateMachineTest, GpsApproachFacesPredictedTargetPosition) {

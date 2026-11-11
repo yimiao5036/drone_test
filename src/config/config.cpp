@@ -574,6 +574,7 @@ void ApproachConfig::Validate() const {
         throw std::invalid_argument("approach.lead_time_ms 不得为负");
     if (guide_lowpass_ms < 0)
         throw std::invalid_argument("approach.guide_lowpass_ms 不得为负");
+    speed_law.Validate();
 }
 
 void HandoverConfig::Validate() const {
@@ -1171,6 +1172,52 @@ AppConfig LoadAppConfig(const std::string& path,
         approach, "lead_time_ms", config.approach.lead_time);
     config.approach.guide_lowpass_ms = ReadOptionalNonNegativeInt(
         approach, "guide_lowpass_ms", config.approach.guide_lowpass_ms);
+    // S5 接近段速度律（2026-11-11）：缺席时 enabled=false，保留旧位置引导行为。
+    const json speed_law = approach.value("speed_law", json::object());
+    auto& law = config.approach.speed_law;
+    law.enabled = speed_law.value("enabled", law.enabled);
+    law.standoff_m = ReadOptionalPositiveDouble(speed_law, "standoff_m",
+                                                law.standoff_m);
+    law.accel_plan_mps2 = ReadOptionalPositiveDouble(
+        speed_law, "accel_plan_mps2", law.accel_plan_mps2);
+    law.decel_plan_mps2 = ReadOptionalPositiveDouble(
+        speed_law, "decel_plan_mps2", law.decel_plan_mps2);
+    law.accel_phys_mps2 = ReadOptionalPositiveDouble(
+        speed_law, "accel_phys_mps2", law.accel_phys_mps2);
+    law.accel_term_mps2 = ReadOptionalPositiveDouble(
+        speed_law, "accel_term_mps2", law.accel_term_mps2);
+    law.slew_mps2 = ReadOptionalNonNegativeDouble(speed_law, "slew_mps2",
+                                                  law.slew_mps2);
+    law.speed_cap_mps = ReadOptionalPositiveDouble(speed_law, "speed_cap_mps",
+                                                  law.speed_cap_mps);
+    law.brake_safety = ReadOptionalPositiveDouble(speed_law, "brake_safety",
+                                                  law.brake_safety);
+    law.terminal_gain = ReadOptionalPositiveDouble(speed_law, "terminal_gain",
+                                                   law.terminal_gain);
+    law.lead_scaled_k = ReadOptionalNonNegativeDouble(speed_law, "lead_scaled_k",
+                                                      law.lead_scaled_k);
+    law.lead_scaled_max_m = ReadOptionalNonNegativeDouble(
+        speed_law, "lead_scaled_max_m", law.lead_scaled_max_m);
+    law.lead_extra_m = ReadOptionalNonNegativeDouble(
+        speed_law, "lead_extra_m", law.lead_extra_m);
+    law.t_lead_max_s = ReadOptionalPositiveDouble(speed_law, "t_lead_max_s",
+                                                 law.t_lead_max_s);
+    law.target_brake_guard_mps2 = ReadOptionalNonNegativeDouble(
+        speed_law, "target_brake_guard_mps2", law.target_brake_guard_mps2);
+    law.speed_match = speed_law.value("speed_match", law.speed_match);
+    law.auto_boost = speed_law.value("auto_boost", law.auto_boost);
+    law.boost_delay_s = ReadOptionalNonNegativeDouble(
+        speed_law, "boost_delay_s", law.boost_delay_s);
+    law.boost_rate_mps2_per_s = ReadOptionalNonNegativeDouble(
+        speed_law, "boost_rate_mps2_per_s", law.boost_rate_mps2_per_s);
+    law.target_need_hold =
+        speed_law.value("target_need_hold", law.target_need_hold);
+    law.vertical_speed_cap_mps = ReadOptionalPositiveDouble(
+        speed_law, "vertical_speed_cap_mps", law.vertical_speed_cap_mps);
+    law.vertical_accel_cap_mps2 = ReadOptionalPositiveDouble(
+        speed_law, "vertical_accel_cap_mps2", law.vertical_accel_cap_mps2);
+    law.vertical_margin_m = ReadOptionalNonNegativeDouble(
+        speed_law, "vertical_margin_m", law.vertical_margin_m);
     config.approach.Validate();
 
     // 拦截设备（actuator 节，阶段四控制接入 Task 10）：机载只保存

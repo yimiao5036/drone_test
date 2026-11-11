@@ -1,4 +1,4 @@
-# drone_test
+﻿# drone_test
 
 运行在香橙派 RK3588（ARM64 / Ubuntu）上的反无人机机载 C++17 控制系统：
 地面站目标位置 → YOLO/RKNN 识别 → 轨迹估计 → 控制 PX4 接近/视觉跟踪/拦截 → 返航降落。
@@ -20,7 +20,7 @@
 ```bash
 cmake -S . -B build
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure     # 710/710
+ctest --test-dir build --output-on-failure     # 716/716
 python3 tools/check_docs.py                    # 文档基线/链接检查
 ./build/drone_control                          # 生成 logs/0001_xxx.log
 ```

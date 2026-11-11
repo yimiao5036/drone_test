@@ -164,6 +164,7 @@ target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog drone_control_c
 
 # ---- control 模块（飞行控制接口+视觉跟踪控制律；库名加 _core 避免与可执行 drone_control 冲突） ----
 add_library(drone_control_core STATIC
+    src/control/approach_speed_law.cpp
     src/control/fence_geometry.cpp
     src/control/flight_controller.cpp
     src/control/line_of_sight.cpp
@@ -418,6 +419,7 @@ if(BUILD_TESTING)
                 frame_transform_test
                 tracking_config_test
                 tracking_control_law_test
+                approach_speed_law_test
                 visual_control_law_test
                 visual_tracking_shadow_test
                 flight_controller_test

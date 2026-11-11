@@ -172,12 +172,38 @@
         "position_guide_vz_mps": 1.5
     },
     "approach": {
-        "_comment": "S5/S6 接近段相位策略：静态目标按 speed_mps；目标带速度位时 cap=max(speed_mps, |v|+track_speed_margin_mps)，预测点=pos+v×lead_time。维护者 2026-11-02 先定 3.5，同日按实机观感改为 1.5（固定靶少见；带速度目标仍取 max(1.5, |v|+1.0)）。",
+        "_comment": "S5/S6 接近段相位策略：静态目标按 speed_mps；目标带速度位时 cap=max(speed_mps, |v|+track_speed_margin_mps)，预测点=pos+v×lead_time。维护者 2026-11-02 先定 3.5，同日按实机观感改为 1.5（固定靶少见；带速度目标仍取 max(1.5, |v|+1.0)）。2026-11-11 起 speed_law.enabled=true 时上述旧字段仅作关闭回退，S5 改由速度律产出 (p_ref, v_ref)。",
         "speed_mps": 1.5,
         "track_speed_margin_mps": 1.0,
         "lead_time_ms": 500,
         "_comment_lowpass": "引导点一阶低通时间常数（ms，0=关闭）：地面站目标 5Hz 观测跳变经此摊平，代价约一个时间常数滞后。",
-        "guide_lowpass_ms": 200
+        "guide_lowpass_ms": 200,
+        "speed_law": {
+            "_comment": "S5 接近段速度律（2026-11-11 落机载，来源 docs/接近段速度律-数学分析-2026-11-09.md §6）。speed_cap_mps 与 controller.max_feedforward_mps=6 对齐；关闭 enabled 即回退旧位置引导点。",
+            "enabled": true,
+            "standoff_m": 2.9,
+            "accel_plan_mps2": 3.0,
+            "decel_plan_mps2": 3.0,
+            "accel_phys_mps2": 9.8,
+            "accel_term_mps2": 1.5,
+            "slew_mps2": 3.0,
+            "speed_cap_mps": 6.0,
+            "brake_safety": 1.3,
+            "terminal_gain": 1.5,
+            "lead_scaled_k": 0.06,
+            "lead_scaled_max_m": 2.0,
+            "lead_extra_m": 0.0,
+            "t_lead_max_s": 0.5,
+            "target_brake_guard_mps2": 0.0,
+            "speed_match": true,
+            "auto_boost": true,
+            "boost_delay_s": 4.0,
+            "boost_rate_mps2_per_s": 0.5,
+            "target_need_hold": true,
+            "vertical_speed_cap_mps": 2.0,
+            "vertical_accel_cap_mps2": 2.0,
+            "vertical_margin_m": 0.2
+        }
     },
     "takeoff": {
         "height_m": 2.0,
