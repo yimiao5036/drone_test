@@ -125,13 +125,13 @@ struct ActuatorConfig {
 };
 
 /// 交接缝配置（handover 配置节，阶段四控制接入）。
-/// 视觉锁定↔卡尔曼跟踪的状态切换迟滞：exit_lost_frames 必须大于 lock_frames。
+/// 视觉锁定↔卡尔曼跟踪的状态切换迟滞：exit_lost_frames 必须大于 enter_s6_lock_frames。
 struct HandoverConfig {
-    uint32_t lock_frames = 10;          // S5→S6：LOCKED 连续帧数
+    uint32_t enter_s6_lock_frames = 10;  // S5→S6：LOCKED 连续帧数
     double fow_margin_deg = 5.0;        // 视线角视场余量
     double innovation_gate_m = 3.0;     // 视觉观测与卡尔曼预测创新门限（米）
     std::chrono::milliseconds timeout{3000};  // S6 驻留超时
-    uint32_t exit_lost_frames = 30;     // S7 退出：LOST 连续帧数（必须 > lock_frames）
+    uint32_t exit_lost_frames = 30;     // S7 退出：LOST 连续帧数（必须 > enter_s6_lock_frames）
     /// S7 退出：双目测距失效（invalid 或超龄）连续达该时长即回退——覆盖
     /// "测距丢失但视觉仍锁定"的收口（no_distance_action 不触发 kExit 的档位）
     std::chrono::milliseconds distance_lost_ms{3000};
@@ -159,8 +159,8 @@ struct InterceptionConfig {
     bool enabled = false;
     /// V1 自动授权。false 时 S9 等待授权并最终按超时返航；地面站确认协议尚未实现。
     bool auto_authorize = true;
-    /// 连续 LOCKED 帧门限（拦截质量，与 handover.lock_frames 独立）。
-    uint32_t lock_frames = 10;
+    /// 连续 LOCKED 帧门限（拦截质量，与 handover.enter_s6_lock_frames 独立）。
+    uint32_t enter_s9_lock_frames = 10;
     /// 允许发射的测距窗口（米）。上限已按双目测距极限冻结为 8m（2026-10-23，
     /// 维护者确认：测距极限 8m 即有效射程，进入 ≤8m 才算有效）；下限 2.0 仍为
     /// 占位，待实机最小可用距离确认。

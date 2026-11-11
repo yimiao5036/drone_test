@@ -176,7 +176,7 @@
     "interception": {
         "enabled": false,
         "auto_authorize": true,
-        "lock_frames": 10,
+        "enter_s9_lock_frames": 10,
         "min_range_m": 2.0,
         "max_range_m": 10.0,
         "min_battery_percent": 0.0,
@@ -214,7 +214,7 @@
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,
         "observation_timeout_ms": 500,
-        "lock_frames": 5,
+        "acquire_lock_frames": 5,
         "lost_frames": 10,
         "smoothing_alpha": 0.3,
         "transition_log_interval_ms": 1000,

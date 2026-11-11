@@ -419,12 +419,12 @@ TEST(MissionStateMachineTest, IntentStopsWhenEstimateInvalid) {
 // ---------------------------------------------------------------------------
 // 阶段四 Task 8：交接判据（S5→S6→S7 进入/退出迟滞）
 //
-// 进入（S5→S6）需同时满足：视觉 LOCKED 连续帧达 handover.lock_frames、
+// 进入（S5→S6）需同时满足：视觉 LOCKED 连续帧达 handover.enter_s6_lock_frames、
 // 双目距离有效且未超龄、视线角距视场边缘有余量（handover.fow_margin_deg）、
 // 视觉观测与卡尔曼预测创新在门限内（handover.innovation_gate_m）。
 // S6 驻留超时（handover.timeout_ms）回 S5；S7 退出需 LOST 连续帧达
 // handover.exit_lost_frames（进入/退出门限不同构成迟滞）。
-// 本层计数与 VisualTargetMonitor 内部 lock_frames 判据相互独立。
+// 本层计数与 VisualTargetMonitor 内部 acquire_lock_frames 判据相互独立。
 // ---------------------------------------------------------------------------
 
 /// 视觉稳定性状态快照。默认中心 (640, 532) 位于标定内参下视场余量内：
@@ -525,7 +525,7 @@ state_machine::MissionStateMachineConfig MakeHandoverTestConfig(
     state_machine::MissionStateMachineConfig config;
     config.visual_stale = visual_stale;
     config.distance_stale = distance_stale;
-    config.handover.lock_frames = 3;
+    config.handover.enter_s6_lock_frames = 3;
     config.handover.exit_lost_frames = 6;
     config.handover.fow_margin_deg = 5.0;
     config.handover.innovation_gate_m = 3.0;
@@ -727,7 +727,7 @@ TEST(MissionStateMachineTest, ExitRequiresMoreLostFramesThanEntry) {
     ASSERT_TRUE(f.started);
     f.DriveToVisualTracking();
 
-    // LOST 4 条（> lock_frames=3 但 < exit_lost_frames=6）→ 保持 S7
+    // LOST 4 条（> enter_s6_lock_frames=3 但 < exit_lost_frames=6）→ 保持 S7
     for (uint64_t frame = 5; frame <= 8; ++frame) {
         f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, frame));
     }
@@ -1064,7 +1064,7 @@ TEST(MissionStateMachineTest, VisualLostBrakesThenExitsToGpsApproach) {
     ASSERT_NE(LastIntentOfType(servo, common::ControlIntentType::kVelocityHeading),
               nullptr);
 
-    // LOST 4 条（> lock_frames=3、< exit_lost_frames=6）：保持 S7，意图转零速刹车
+    // LOST 4 条（> enter_s6_lock_frames=3、< exit_lost_frames=6）：保持 S7，意图转零速刹车
     std::vector<common::ControlIntent> lost_intents;
     for (uint64_t frame = 200; frame <= 203; ++frame) {
         f.PublishServoInputs(frame, common::VisualTargetState::kLost);
@@ -2182,7 +2182,7 @@ state_machine::MissionStateMachineConfig MakeInterceptEntryTestConfig() {
     config.test_hooks_enabled = true;
     config.interception.enabled = true;
     config.interception.auto_authorize = true;
-    config.interception.lock_frames = 3;
+    config.interception.enter_s9_lock_frames = 3;
     config.interception.min_range_m = 2.0;
     config.interception.max_range_m = 12.0;
     config.return_home.arrival_hold = 300ms;

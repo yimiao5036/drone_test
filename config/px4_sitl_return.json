@@ -135,7 +135,7 @@
     "interception": {
         "enabled": true,
         "auto_authorize": true,
-        "lock_frames": 10,
+        "enter_s9_lock_frames": 10,
         "min_range_m": 2.0,
         "max_range_m": 12.0,
         "min_battery_percent": 0.0,

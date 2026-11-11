@@ -104,7 +104,7 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.visual_monitor.input_queue_capacity, 2U);
     EXPECT_EQ(config.visual_monitor.publish_interval.count(), 100);
     EXPECT_EQ(config.visual_monitor.observation_timeout.count(), 500);
-    EXPECT_EQ(config.visual_monitor.lock_frames, 5);
+    EXPECT_EQ(config.visual_monitor.acquire_lock_frames, 5);
     EXPECT_EQ(config.visual_monitor.lost_frames, 10);
     EXPECT_DOUBLE_EQ(config.visual_monitor.smoothing_alpha, 0.3);
     EXPECT_EQ(config.visual_monitor.transition_log_interval.count(), 1000);
@@ -352,7 +352,7 @@ TEST(ConfigTest, RejectsVisualMonitorWithoutVideo) {
 
 TEST(ConfigTest, RejectsInvalidVisualMonitorThreshold) {
     json value = ReadSourceConfig();
-    value["visual_monitor"]["lock_frames"] = 0;
+    value["visual_monitor"]["acquire_lock_frames"] = 0;
     const auto path = WriteTemporaryConfig(
         value, "drone_config_visual_monitor_threshold_invalid.json");
 
@@ -483,6 +483,33 @@ TEST(ConfigTest, AcceptsJammerGroundStationIdentity) {
     EXPECT_EQ(config.ground_station.callsign, "干扰-01");
     EXPECT_EQ(config.video_sender.encode.url,
               "rtsp://127.0.0.1:8554/drone_27_1");
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsLegacyHandoverLockFramesKey) {
+    json value = ReadSourceConfig();
+    value["handover"]["lock_frames"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_legacy_handover_lock.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsLegacyInterceptionLockFramesKey) {
+    json value = ReadSourceConfig();
+    value["interception"]["lock_frames"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_legacy_interception_lock.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsLegacyVisualMonitorLockFramesKey) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["lock_frames"] = 5;
+    const auto path = WriteTemporaryConfig(value, "drone_config_legacy_visual_lock.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
     std::filesystem::remove(path);
 }
 
@@ -767,7 +794,7 @@ TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
     // S9/S10 入口默认关闭；返航默认启用以保证发射后有收口。
     EXPECT_FALSE(config.interception.enabled);
     EXPECT_TRUE(config.interception.auto_authorize);
-    EXPECT_EQ(config.interception.lock_frames, 10u);
+    EXPECT_EQ(config.interception.enter_s9_lock_frames, 10u);
     EXPECT_DOUBLE_EQ(config.interception.min_range_m, 2.0);
     EXPECT_DOUBLE_EQ(config.interception.max_range_m, 8.0);
     EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 0.0);
@@ -775,7 +802,7 @@ TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
     EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 5.0);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 2.0);
     EXPECT_EQ(config.return_home.arrival_hold, std::chrono::milliseconds(1000));
-    EXPECT_EQ(config.handover.lock_frames, 10u);
+    EXPECT_EQ(config.handover.enter_s6_lock_frames, 10u);
     EXPECT_EQ(config.handover.exit_lost_frames, 30u);
     EXPECT_EQ(config.handover.distance_lost_ms, std::chrono::milliseconds(3000));
 }
@@ -813,9 +840,9 @@ TEST(ConfigTest, RejectsNonPositiveHandoverDistanceLost) {
 }
 
 TEST(ConfigTest, RejectsHandoverExitNotGreaterThanEnter) {
-    // 迟滞关系强制：lock_frames=20、exit_lost_frames=10 → 拒绝
+    // 迟滞关系强制：enter_s6_lock_frames=20、exit_lost_frames=10 → 拒绝
     json value = ReadSourceConfig();
-    value["handover"]["lock_frames"] = 20;
+    value["handover"]["enter_s6_lock_frames"] = 20;
     value["handover"]["exit_lost_frames"] = 10;
     const auto path = WriteTemporaryConfig(value, "drone_config_handover_bad.json");
 
@@ -923,7 +950,7 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
     json value = ReadSourceConfig();
     value["interception"]["enabled"] = true;
     value["interception"]["auto_authorize"] = false;
-    value["interception"]["lock_frames"] = 7;
+    value["interception"]["enter_s9_lock_frames"] = 7;
     value["interception"]["min_range_m"] = 3.5;
     value["interception"]["max_range_m"] = 14.0;
     value["interception"]["min_battery_percent"] = 35.0;
@@ -945,7 +972,7 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
     const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
     EXPECT_TRUE(config.interception.enabled);
     EXPECT_FALSE(config.interception.auto_authorize);
-    EXPECT_EQ(config.interception.lock_frames, 7u);
+    EXPECT_EQ(config.interception.enter_s9_lock_frames, 7u);
     EXPECT_DOUBLE_EQ(config.interception.min_range_m, 3.5);
     EXPECT_DOUBLE_EQ(config.interception.max_range_m, 14.0);
     EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 35.0);

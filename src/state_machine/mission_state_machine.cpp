@@ -381,10 +381,11 @@ public:
             kRadToDeg;
         SPDLOG_INFO(
             "任务状态机创建: shadow=true control_output=false intent_valid_for_ms={} "
-            "handover(lock_frames={} exit_lost_frames={} timeout_ms={} "
+            "handover(enter_s6_lock_frames={} exit_lost_frames={} timeout_ms={} "
             "fow_margin_deg={:.1f} innovation_gate_m={:.1f}) "
             "fov_half(az={:.2f}deg el={:.2f}deg) servo_profile={} servo={:.1f}Hz",
-            intent_valid_for_ms_, handover_.lock_frames, handover_.exit_lost_frames,
+            intent_valid_for_ms_, handover_.enter_s6_lock_frames,
+            handover_.exit_lost_frames,
             handover_timeout_ms_, handover_.fow_margin_deg,
             handover_.innovation_gate_m, fow_half_azimuth_deg_,
             fow_half_elevation_deg_,
@@ -2999,7 +3000,7 @@ private:
             latest_visual_status_->state != common::VisualTargetState::kLocked) {
             return false;
         }
-        if (consecutive_lock_frames_ < interception_.lock_frames) {
+        if (consecutive_lock_frames_ < interception_.enter_s9_lock_frames) {
             return false;
         }
         if (!latest_distance_ || !latest_distance_->valid ||
@@ -3277,7 +3278,7 @@ private:
         SPDLOG_INFO("位置引导意图停止: {}", reason);
     }
 
-    /// 交接层独立迟滞计数（与 VisualTargetMonitor 内部 lock_frames 判据是两套
+    /// 交接层独立迟滞计数（与 VisualTargetMonitor 内部 acquire_lock_frames 判据是两套
     /// 口径，不得混用：监视器判"视觉是否稳定看到"，这里判"交接是否允许切换"）。
     ///
     /// 计数口径（每条视觉状态消息在抽干时计数一次）：
@@ -3348,13 +3349,13 @@ private:
         }
     }
 
-    /// S5→S6：进入条件全部满足且 LOCKED 连续帧数达 handover.lock_frames。
+    /// S5→S6：进入条件全部满足且 LOCKED 连续帧数达 handover.enter_s6_lock_frames。
     /// 进入当拍冻结最后位置目标（设计 §2.1，取进入时刻的 TargetState 值），
     /// 此后 S6 驻留期由 EvaluatePositionIntent 逐拍续发该冻结位置意图
     /// （valid_until 滚动），直到首条视觉速度意图发出（S7，Task 9）——
     /// 避免位置意图在交接期超龄 → 控制器刹车 → 再起步（设计 §2.5）。
     void TryEnterVisualHandover(uint64_t now_ms) {
-        if (consecutive_lock_frames_ < handover_.lock_frames) {
+        if (consecutive_lock_frames_ < handover_.enter_s6_lock_frames) {
             return;
         }
         if (!HandoverEntrySatisfied(now_ms)) {
@@ -3402,7 +3403,7 @@ private:
     ///    帧序冻结，按超龄直接收口）；
     /// ② 测距失效连续计时达 handover.distance_lost_ms（valid=false 或超龄；
     ///    恢复有效即清零）——覆盖"测距丢失但视觉仍锁定"的收口；
-    /// ③ 视觉 LOST 连续帧数达 handover.exit_lost_frames（进入 lock_frames 与
+    /// ③ 视觉 LOST 连续帧数达 handover.exit_lost_frames（进入 enter_s6_lock_frames 与
     ///    退出 exit_lost_frames 门限不同防抖动）；
     /// ④ 伺服未启动超时：S7 驻留超 handover.timeout_ms 仍未见首条有效视觉意图
     ///    （控制律持续降级，如姿态超龄）——冻结位置续发不得无限续期（S6 有
@@ -4822,7 +4823,7 @@ private:
     double fow_half_azimuth_deg_ = 0.0;
     double fow_half_elevation_deg_ = 0.0;
     /// 交接层独立迟滞计数（仅决策线程访问；与 VisualTargetMonitor 内部
-    /// lock_frames 判据是两套口径，不得混用）。
+    /// acquire_lock_frames 判据是两套口径，不得混用）。
     uint64_t consecutive_lock_frames_ = 0;
     uint64_t consecutive_lost_frames_ = 0;
     std::optional<uint64_t> last_counted_locked_frame_;  ///< 去重：最近计数的锁定帧序号

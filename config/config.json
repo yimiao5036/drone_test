@@ -139,10 +139,10 @@
         "gcs_fire_cooldown_ms": 3000
     },
     "interception": {
-        "_comment_lock": "S9 入口锁定帧门限，与 handover.lock_frames / visual_monitor.lock_frames 是三层独立判据，互不同步。",
+        "_comment_lock": "S9 入口锁定帧门限，与 handover.enter_s6_lock_frames / visual_monitor.acquire_lock_frames 是三层独立判据，互不同步。",
         "enabled": false,
         "auto_authorize": true,
-        "lock_frames": 10,
+        "enter_s9_lock_frames": 10,
         "min_range_m": 2.0,
         "max_range_m": 8.0,
         "min_battery_percent": 0.0,
@@ -235,8 +235,8 @@
         "status_period_ms": 1000
     },
     "handover": {
-        "_comment_lock": "S5→S6 交接锁定帧门限，与 interception.lock_frames / visual_monitor.lock_frames 独立。",
-        "lock_frames": 10,
+        "_comment_lock": "S5→S6 交接锁定帧门限，与 interception.enter_s9_lock_frames / visual_monitor.acquire_lock_frames 独立。",
+        "enter_s6_lock_frames": 10,
         "fow_margin_deg": 5.0,
         "innovation_gate_m": 3.0,
         "timeout_ms": 3000,
@@ -252,8 +252,8 @@
         "input_queue_capacity": 2,
         "publish_interval_ms": 100,
         "observation_timeout_ms": 500,
-        "_comment_lock": "视觉模块内部 ACQUIRING→LOCKED 帧门限，与 handover/interception 的同名键独立。",
-        "lock_frames": 5,
+        "_comment_lock": "视觉模块内部 ACQUIRING→LOCKED 帧门限，与 handover.enter_s6_lock_frames / interception.enter_s9_lock_frames 独立。",
+        "acquire_lock_frames": 5,
         "lost_frames": 10,
         "smoothing_alpha": 0.3,
         "transition_log_interval_ms": 1000,

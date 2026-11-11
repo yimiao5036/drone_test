@@ -574,9 +574,11 @@ void ApproachConfig::Validate() const {
 }
 
 void HandoverConfig::Validate() const {
-    if (lock_frames == 0) throw std::invalid_argument("handover.lock_frames 必须为正");
-    if (exit_lost_frames <= lock_frames)
-        throw std::invalid_argument("handover.exit_lost_frames 必须大于 lock_frames（迟滞）");
+    if (enter_s6_lock_frames == 0)
+        throw std::invalid_argument("handover.enter_s6_lock_frames 必须为正");
+    if (exit_lost_frames <= enter_s6_lock_frames)
+        throw std::invalid_argument(
+            "handover.exit_lost_frames 必须大于 enter_s6_lock_frames（迟滞）");
     if (fow_margin_deg <= 0.0) throw std::invalid_argument("handover.fow_margin_deg 必须为正");
     if (innovation_gate_m <= 0.0) throw std::invalid_argument("handover.innovation_gate_m 必须为正");
     if (timeout.count() <= 0) throw std::invalid_argument("handover.timeout_ms 必须为正");
@@ -597,8 +599,8 @@ void HandoverConfig::Validate() const {
 }
 
 void InterceptionConfig::Validate() const {
-    if (lock_frames == 0) {
-        throw std::invalid_argument("interception.lock_frames 必须为正");
+    if (enter_s9_lock_frames == 0) {
+        throw std::invalid_argument("interception.enter_s9_lock_frames 必须为正");
     }
     if (!std::isfinite(min_range_m) || min_range_m <= 0.0) {
         throw std::invalid_argument("interception.min_range_m 必须为有限正数");
@@ -990,9 +992,14 @@ AppConfig LoadAppConfig(const std::string& path,
     config.controller.Validate();
 
     // 交接缝迟滞参数（handover 节，阶段四控制接入）：exit_lost_frames 必须
-    // 大于 lock_frames，避免 S6/S7 边界抖动。
+    // 大于 enter_s6_lock_frames，避免 S6/S7 边界抖动。
     const json handover = root.value("handover", json::object());
-    config.handover.lock_frames = handover.value("lock_frames", config.handover.lock_frames);
+    if (handover.contains("lock_frames")) {
+        throw std::invalid_argument(
+            "handover.lock_frames 已更名为 handover.enter_s6_lock_frames，请更新配置");
+    }
+    config.handover.enter_s6_lock_frames = handover.value(
+        "enter_s6_lock_frames", config.handover.enter_s6_lock_frames);
     config.handover.fow_margin_deg = ReadOptionalPositiveDouble(
         handover, "fow_margin_deg", config.handover.fow_margin_deg);
     config.handover.innovation_gate_m = ReadOptionalPositiveDouble(
@@ -1025,9 +1032,13 @@ AppConfig LoadAppConfig(const std::string& path,
         interception.value("enabled", config.interception.enabled);
     config.interception.auto_authorize = interception.value(
         "auto_authorize", config.interception.auto_authorize);
-    config.interception.lock_frames = static_cast<uint32_t>(
-        ReadOptionalPositiveSize(interception, "lock_frames",
-                                 config.interception.lock_frames));
+    if (interception.contains("lock_frames")) {
+        throw std::invalid_argument(
+            "interception.lock_frames 已更名为 interception.enter_s9_lock_frames，请更新配置");
+    }
+    config.interception.enter_s9_lock_frames = static_cast<uint32_t>(
+        ReadOptionalPositiveSize(interception, "enter_s9_lock_frames",
+                                 config.interception.enter_s9_lock_frames));
     config.interception.min_range_m = ReadOptionalPositiveDouble(
         interception, "min_range_m", config.interception.min_range_m);
     config.interception.max_range_m = ReadOptionalPositiveDouble(
@@ -1251,8 +1262,13 @@ AppConfig LoadAppConfig(const std::string& path,
     config.visual_monitor.observation_timeout = ReadOptionalPositiveMilliseconds(
         visual_monitor, "observation_timeout_ms",
         config.visual_monitor.observation_timeout);
-    config.visual_monitor.lock_frames = ReadOptionalPositiveInt(
-        visual_monitor, "lock_frames", config.visual_monitor.lock_frames);
+    if (visual_monitor.contains("lock_frames")) {
+        throw std::invalid_argument(
+            "visual_monitor.lock_frames 已更名为 visual_monitor.acquire_lock_frames，请更新配置");
+    }
+    config.visual_monitor.acquire_lock_frames = ReadOptionalPositiveInt(
+        visual_monitor, "acquire_lock_frames",
+        config.visual_monitor.acquire_lock_frames);
     config.visual_monitor.lost_frames = ReadOptionalPositiveInt(
         visual_monitor, "lost_frames", config.visual_monitor.lost_frames);
     config.visual_monitor.smoothing_alpha = ReadOptionalPositiveDouble(

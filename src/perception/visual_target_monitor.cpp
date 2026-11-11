@@ -5,7 +5,7 @@
 //
 //   收到 detected=true 观测：
 //     consecutive_detected++ , consecutive_missed=0
-//     consecutive_detected >= lock_frames  → LOCKED
+//     consecutive_detected >= acquire_lock_frames  → LOCKED
 //     否则                                  → ACQUIRING
 //
 //   收到 detected=false 观测：
@@ -80,7 +80,7 @@ void VisualTargetMonitorConfig::Validate() const {
     if (observation_timeout.count() <= 0) {
         throw std::invalid_argument("视觉稳定性判定观测超时必须为正数");
     }
-    if (lock_frames <= 0) {
+    if (acquire_lock_frames <= 0) {
         throw std::invalid_argument("视觉稳定性判定锁定帧数必须为正数");
     }
     if (lost_frames <= 0) {
@@ -270,7 +270,7 @@ struct VisualTargetMonitor::Impl {
             if (state == common::VisualTargetState::kLocked) {
                 return;
             }
-            SetState(consecutive_detected >= config.lock_frames
+            SetState(consecutive_detected >= config.acquire_lock_frames
                          ? common::VisualTargetState::kLocked
                          : common::VisualTargetState::kAcquiring);
             return;
@@ -463,8 +463,8 @@ struct VisualTargetMonitor::Impl {
 VisualTargetMonitor::VisualTargetMonitor(VisualTargetMonitorConfig config) {
     config.Validate();
     impl_ = std::make_unique<Impl>(std::move(config));
-    SPDLOG_INFO("视觉稳定性判定创建: shadow=true control_output=false lock_frames={} lost_frames={}",
-                impl_->config.lock_frames, impl_->config.lost_frames);
+    SPDLOG_INFO("视觉稳定性判定创建: shadow=true control_output=false acquire_lock_frames={} lost_frames={}",
+                impl_->config.acquire_lock_frames, impl_->config.lost_frames);
 }
 
 VisualTargetMonitor::~VisualTargetMonitor() {

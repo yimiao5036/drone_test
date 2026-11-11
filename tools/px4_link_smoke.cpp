@@ -3601,7 +3601,7 @@ private:
 
     /// 意图轨迹记录（交接验收：交接缝意图无超龄、S7 伺服启动、回退后位置意图恢复）。
     ///
-    /// 交接缝判据口径（T12 评审修复，Critical）：**不按 S6 驻留期取样**——lock_frames
+    /// 交接缝判据口径（T12 评审修复，Critical）：**不按 S6 驻留期取样**——enter_s6_lock_frames
     /// 门限 + 20Hz 注入使 S6 只驻留 1 决策拍（S6→S7 只需再推进 1 个新 LOCKED 帧），
     /// S6 标签样本恒 ≤1 条、间隔恒 0，按间隔断言会把行为正确的系统判 FAIL。改为
     /// 跨缝测量：末条 **S5 位置意图** → 首条 **S7 视觉速度意图** 的间隔必须小于状态机
@@ -4080,7 +4080,7 @@ private:
         }
         if (vision_lock_started_ms_ == 0) {
             vision_lock_started_ms_ = now_ms;
-            std::cout << "[SITL] 注入 LOCKED 帧序列（lock_frames=" << handover_.lock_frames
+            std::cout << "[SITL] 注入 LOCKED 帧序列（enter_s6_lock_frames=" << handover_.enter_s6_lock_frames
                       << "，exit_lost_frames=" << handover_.exit_lost_frames
                       << "，创新门限 " << handover_.innovation_gate_m << "m）" << std::endl;
         }
@@ -7118,7 +7118,7 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
     machine.SetEstimationInputs(estimator.EstimatedOutput(), visual_topic, distance_topic);
     machine.SetEstimationDiagnostics(&estimator);
 
-    std::cout << "  状态机: lock_frames=" << app.handover.lock_frames
+    std::cout << "  状态机: enter_s6_lock_frames=" << app.handover.enter_s6_lock_frames
               << " exit_lost_frames=" << app.handover.exit_lost_frames
               << " handover_timeout=" << app.handover.timeout.count()
               << "ms innovation_gate=" << app.handover.innovation_gate_m

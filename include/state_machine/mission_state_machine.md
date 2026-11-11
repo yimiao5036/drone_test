@@ -23,7 +23,7 @@
 
 | 迁移 | 判据 |
 |---|---|
-| S5→S6 | 视觉 `LOCKED` 连续帧 ≥ `lock_frames` + 双目距离有效且未超龄 + 视线角距视场边缘 ≥ `fow_margin_deg` + 视觉观测与卡尔曼预测创新 ≤ `innovation_gate_m`（四项同时满足） |
+| S5→S6 | 视觉 `LOCKED` 连续帧 ≥ `enter_s6_lock_frames` + 双目距离有效且未超龄 + 视线角距视场边缘 ≥ `fow_margin_deg` + 视觉观测与卡尔曼预测创新 ≤ `innovation_gate_m`（四项同时满足） |
 | S6→S7 | 进入判据持续满足 **且** 视觉链再推进一条新的 `LOCKED` 帧（交接期不断流） |
 | S6→S5 | 进入判据任一失效（撤销交接）；或驻留超 `timeout_ms`（首条视觉指令未生效，防卡死） |
 | S7→S5 | 四条独立路径任一成立：① 视觉状态消息断流超视觉新鲜度阈值（`visual_stale`）；② 测距失效（invalid 或超龄）连续达 `distance_lost_ms`；③ 视觉 `LOST` 连续帧 ≥ `exit_lost_frames`（进入/退出门限不同构成迟滞，防状态抖动）；④ 伺服未启动超时——S7 驻留超 `timeout_ms` 仍未见首条有效视觉意图（控制律持续降级，如姿态超龄），防冻结位置续发无限续期 |
@@ -92,7 +92,7 @@
 PWM 微秒或输出区间，避免与 PX4 参数重复维护。接口与工厂见
 `include/state_machine/interception_device.h` / `.md`。
 
-**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `lock_frames`、测距窗口 `[min_range_m,max_range_m]`（上限 2026-10-23 冻结为双目测距极限 8m，下限仍占位）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、执行器未触发且 `Ready()`（触发保持/复位/稳定途中不重入）、未进入故障。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
+**拦截序列入口（2026-10-19 起配置化）**：S9/S10 入口判据已实现——`interception` 配置节（默认 `enabled=false`）提供连续锁定帧 `enter_s9_lock_frames`、测距窗口 `[min_range_m,max_range_m]`（上限 2026-10-23 冻结为双目测距极限 8m，下限仍占位）与 `auto_authorize`/`authorization_timeout_ms`；运行时还要求视觉 `LOCKED`、PX4 `connected+armed+Offboard(6/0)`、姿态/局部位置有效、命令窄接口已注入、执行器未触发且 `Ready()`（触发保持/复位/稳定途中不重入）、未进入故障。S7→S9→S10（自动授权）；S9 条件失效回 S7；授权超时/发射结束按 S12 返航；S9/S10 继续输出视觉伺服意图保持瞄准。默认关闭时整机仍不自动发射；测试钩子/独立工具可显式开启。
 
 阶段四新增（Task 12，2026-10-13）：**S7 报告状态与实际控制输出背离的可观测位**——`MissionStatus.active_warning_bits` 新增 bit3「S7 伺服停发中」（`kWarningServoSuspended`）：处于 `VISUAL_TRACKING` 且**本拍未发出视觉伺服意图**时置位，覆盖两种背离形态：① 伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图，报告已是 S7 而输出仍是位置式）；② 控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停，报告仍是 S7 而无输出）。伺服意图正常发出即清除；离开 S7 亦不置位。位语义与 bit1（目标过期）/bit2（热备份断粮）并列，映射表见 `docs/数据接口文档.md` §3.4 与 `docs/地面站目标位置与时间同步协议.md` §14.3（65013 `active_warning_bits`）。
 
@@ -119,7 +119,7 @@ bit7 只提示、不改变动作——越界处置仍由 `fence.violation_action
 每拍重算，引导点回到区域内即清除（跃变时打一条 WARN「引导点越出围栏」）。
 地面站消费口径见 `docs/数据接口文档.md` §3.4。
 
-**G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
+**G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`enter_s6_lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
 
 本阶段仍不做以下事情：
 
@@ -357,7 +357,7 @@ Px4Link（IPx4CommandSender）─► SetCommandSender(...)（仅 enable_control=
 `config_.visual_tracking`、`config_.visual_tracking.control.{visual_stale_ms,
 distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.control.*`
 （生产与状态机侧两阈值同源注入，测试可分别收紧）。
-`handover` 的关系校验（`exit_lost_frames > lock_frames` 等）由配置加载期
+`handover` 的关系校验（`exit_lost_frames > enter_s6_lock_frames` 等）由配置加载期
 `HandoverConfig::Validate`强制，状态机构造不重复校验（与 FlightController 同约定）。
 
 **接线现状（T12 裁决后）**：`DroneApplication`**仍未**调用`SetEstimationInputs`
@@ -622,7 +622,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `atan((W−cx)/fx)`、`atan((H−cy)/fy)`。注意主点偏离画面中心（cy≈532@720），
     画面中心不是视线零点；垂直半角取 (H−cy) 侧，对上侧偏保守。
   - **迟滞计数是交接层独立口径**（`consecutive_lock_frames_`/`consecutive_lost_frames_`），
-    与`VisualTargetMonitor`内部的`lock_frames`判据是两套东西，不得混用：
+    与`VisualTargetMonitor`内部的`acquire_lock_frames`判据是两套东西，不得混用：
     LOCKED 仅在新`frame_sequence`到达时计数（监视器会周期重发同一帧，重发不重复计数）；
     LOST 按每条状态消息计数（观测断流时帧序冻结，按帧序去重会让退出永不触发）；
     ACQUIRING/SEARCHING 两个计数都清零。状态迁移（回退/超时）时复位计数，
@@ -708,7 +708,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
 - **S9/S10 入口判据（2026-10-19）**：`EvaluateInterceptSequence` 在 S7 每拍评估
   `InterceptEntrySatisfied`——`interception.enabled`、视觉新鲜且 `LOCKED`、
-  `consecutive_lock_frames_ >= lock_frames`、测距 `valid`+新鲜且
+  `consecutive_lock_frames_ >= enter_s6_lock_frames`、测距 `valid`+新鲜且
   `[min_range_m,max_range_m]`（**上限 2026-10-23 冻结 = 双目测距极限 8m**，
   下限 2.0 仍占位）、`connected+armed+Offboard(6/0)`、姿态/局部位置有效、
   `intercept_device_` 非空且未触发、`Ready()`、未故障、任务未进入 S16；可选
@@ -889,7 +889,7 @@ ctest --test-dir build --output-on-failure
     不放行（像素 x=1240 时方位角约 31.6°，标定内参下水平半角约 33.2°）；
   - `HandoverTimeoutReturnsToGpsApproach`：S6 驻留超 `timeout_ms` 回 S5，
     且不因旧锁定帧立即回跳；
-  - `ExitRequiresMoreLostFramesThanEntry`：S7 中 LOST 连续帧 > `lock_frames`
+  - `ExitRequiresMoreLostFramesThanEntry`：S7 中 LOST 连续帧 > `enter_s6_lock_frames`
     但 < `exit_lost_frames` 保持 S7，达到门限回退 S5；
   - `ExitWhenDistanceLostBeyondThreshold`：S7 中测距 `valid=false` 持续约 250ms
     （未达 300ms 阈值）后恢复有效 → 计时清零不退出；持续失效达阈值 → 回退 S5
@@ -967,7 +967,7 @@ ctest --test-dir build --output-on-failure
   - `MakeNetActuatorTestConfig` 显式 `return_home.enabled=false`，保持捕网
     执行器用例的 S10 停留/显式离开语义不变。
 - S9/S10 入口（2026-10-19；`MakeInterceptEntryTestConfig` 开启
-  `interception.enabled=true`、`lock_frames=3`、窗口 2~12m、自动授权）：
+  `interception.enabled=true`、`enter_s9_lock_frames=3`、窗口 2~12m、自动授权）：
   - `InterceptEntryLockAndRangeThenFiresAndReturns`：强制 S7 + 连续 LOCKED
     帧 + 8m 测距 + Offboard/armed/姿态/位置有效 → S9 → 自动授权 S10 →
     捕网 187 入队 → S11/S12；

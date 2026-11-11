@@ -43,7 +43,7 @@ struct VisualTargetMonitorConfig {
     /// 观测超时：超过该时间未收到任何观测（含无目标观测）判定为数据中断。
     /// 用于区分“本帧无目标”与“YOLO线程已停止或卡死”。
     std::chrono::milliseconds observation_timeout{500};
-    int lock_frames = 5;           ///< 连续检测达到该帧数判定为锁定
+    int acquire_lock_frames = 5;   ///< 连续检测达到该帧数判定为锁定（ACQUIRING→LOCKED）
     int lost_frames = 10;          ///< 连续丢失达到该帧数判定为丢失
     /// 像素中心与置信度的指数滑动平均系数，范围(0,1]；1.0 表示不平滑。
     double smoothing_alpha = 0.3;

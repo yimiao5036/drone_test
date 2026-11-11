@@ -5,7 +5,7 @@
  * 不依赖硬件，直接注入帧级观测验证状态机与线程行为：
  * - 配置校验：非法帧数、周期与平滑系数拒绝构造
  * - 生命周期：未绑定输入时拒绝启动、Start/Stop 幂等、重启复位状态
- * - 锁定：连续检测达到 lock_frames 进入 LOCKED，之前为 ACQUIRING
+ * - 锁定：连续检测达到 acquire_lock_frames 进入 LOCKED，之前为 ACQUIRING
  * - 丢失：锁定后短时漏检保持 LOCKED，达到 lost_frames 进入 LOST
  * - 搜索：从未检测时保持 SEARCHING
  * - 观测超时：有观测后流中断判定 LOST（区别于“本帧无目标”）
@@ -71,7 +71,7 @@ VisualTargetMonitorConfig MakeConfig() {
     config.input_queue_capacity = 32;
     config.publish_interval = std::chrono::milliseconds(10);
     config.observation_timeout = std::chrono::seconds(5);
-    config.lock_frames = 3;
+    config.acquire_lock_frames = 3;
     config.lost_frames = 3;
     config.smoothing_alpha = 1.0;
     return config;
@@ -101,7 +101,7 @@ protected:
 
 TEST(VisualTargetMonitorConfigTest, RejectsInvalidValues) {
     VisualTargetMonitorConfig zero_lock;
-    zero_lock.lock_frames = 0;
+    zero_lock.acquire_lock_frames = 0;
     EXPECT_THROW(VisualTargetMonitor monitor(zero_lock), std::invalid_argument);
 
     VisualTargetMonitorConfig zero_lost;
@@ -319,7 +319,7 @@ TEST(VisualTargetMonitorSummaryTest, SuppressedDuringSilenceResumesWhenLocked) {
     drone::test::LogCapture capture;  // 须在组件启动前构造（见 log_capture.h）
     VisualTargetMonitorConfig config = MakeConfig();
     config.status_log_interval = std::chrono::milliseconds(100);
-    config.lock_frames = 1;    // 单帧检测即锁定
+    config.acquire_lock_frames = 1;    // 单帧检测即锁定
     config.lost_frames = 100;  // 观察期内保持 LOCKED
     VisualTargetMonitor monitor(config);
     common::Topic<common::VisualTargetObservation> topic;
