@@ -26,8 +26,6 @@ namespace drone::control {
 
 /// 接近段速度律配置（approach.speed_law 节；缺席时用默认值）。
 struct ApproachSpeedLawConfig {
-    /// 总开关。代码默认 false（保持既有 S5 行为与测试基线）；生产配置显式打开。
-    bool enabled = false;
     /// 控制间距 R（米）：目标到本机的保持距离，默认 3.0 − 0.1 = 2.9。
     double standoff_m = 2.9;
     /// 远段规划加/减速度（m/s²）；真实下发受 slew 与 a_phys 封顶。
@@ -55,6 +53,11 @@ struct ApproachSpeedLawConfig {
     double target_brake_guard_mps2 = 0.0;
     /// 末端速度匹配：true=末端相对速度收敛到 0（跟住目标）；false=末端停车。
     bool speed_match = true;
+    /// 参考点前瞻：p_ref = 自机 + v_ref × ref_lead_s（上限 ref_lead_max_m）。
+    /// 位置环只做“速度指令的兜底锚点”，不再把目标点本身当成位置目标——
+    /// 否则位置误差会在制动段额外加速，导致冲进控制间距（2026-11-11 实测）。
+    double ref_lead_s = 0.3;
+    double ref_lead_max_m = 6.0;
     /// 停滞自动提能力（演示页默认开）：停滞/能力受限/穿透持续 boost_delay 后，
     /// 规划加速度按 boost_rate 抬向 a_phys。
     bool auto_boost = true;

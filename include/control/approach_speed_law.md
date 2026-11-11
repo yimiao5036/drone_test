@@ -47,12 +47,13 @@ config.approach.speed_law（approach 节） ───────┴─► Appro
   `TargetState.last_observed_ms`（最近有效观测；为 0 时回退
   `header.receive_time_ms`），用于时延补偿与速度差分。**不能用发布时刻**：
   估计器每拍发布、发布时刻几乎等于 now，会把时延补偿吃掉。
-- 输出 `ref_*` 是**目标沿视线后退 `standoff_m`** 的保持点；位置环在该点误差
-  为零，速度前馈与它同源。
+- 输出 `ref_*` 是**自机 + v_ref × ref_lead_s** 的速度锚点（上限 `ref_lead_max_m`）：
+  位置环只追这个点，不再把目标点/目标前 standoff 点当成位置目标——否则位置误差
+  会在制动段额外加速，2026-11-11 SITL 实测冲进控制间距（0.65m）。
 - `max_speed_mps = max(|v_ref|, 0.5)`，只用于控制器“位置引导限速”；控制器
   仍有 `position_guide_speed_mps` 与前馈硬上限兜底。
-- 关闭 `enabled` 时状态机回退旧 `ApplyApproachPolicy`（目标点 + 固定提前），
-  行为与 2026-11-02 版本一致。
+- S5 只有本律一条路径（2026-11-11 已删除旧“目标点 + 固定提前”回退）；输入无效
+  （无局部位置/目标无效）时本拍不发意图并打节流 WARN。
 
 ## 3. 关键实现点
 
@@ -74,11 +75,10 @@ config.approach.speed_law（approach 节） ───────┴─► Appro
 
 ## 4. 配置
 
-`approach.speed_law`（全部可选，缺席用默认值；生产配置显式打开）。
+`approach.speed_law`（全部可选，缺席用默认值；2026-11-11 起 S5 唯一引导方式）。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `enabled` | `false`（代码）/`true`（生产配置） | 总开关；关闭回退旧位置引导 |
 | `standoff_m` | 2.9 | 控制间距 R（3.0 到点半径 − 0.1） |
 | `accel_plan_mps2` / `decel_plan_mps2` | 3.0 / 3.0 | 远段规划加/减速度 |
 | `accel_phys_mps2` | 9.8 | 机体物理加速度上限（只封顶） |
@@ -93,6 +93,7 @@ config.approach.speed_law（approach 节） ───────┴─► Appro
 | `speed_match` | true | 末端相对速度收敛到 0（跟住目标）；false=末端停车 |
 | `auto_boost` / `boost_delay_s` / `boost_rate_mps2_per_s` | true / 4.0 / 0.5 | 停滞自动提能力 |
 | `target_need_hold` | true | 目标机动需求峰值保持 |
+| `ref_lead_s` / `ref_lead_max_m` | 0.3 / 6.0 | 位置锚点前瞻：`p_ref = 自机 + v_ref × 0.3s`（上限 6m） |
 | `vertical_speed_cap_mps` / `vertical_accel_cap_mps2` / `vertical_margin_m` | 2.0 / 2.0 / 0.2 | 垂直通道 |
 
 启动期 `ApproachSpeedLawConfig::Validate()` 非法值直接抛异常（配置加载与
@@ -121,8 +122,8 @@ ctest --test-dir build -R 'ApproachSpeedLaw|SpeedLaw' --output-on-failure
 
 ## 7. 排查/修改要点
 
-- **S5 没走速度律**：先查 `approach.speed_law.enabled`、`latest_flight_->local_position_valid`、
-  `TargetState.header.frame_id == kFrameLocalNed`；任一不满足回退旧逻辑。
+- **S5 没走速度律**：先查 `latest_flight_->local_position_valid`、目标
+  `frame_id == kFrameLocalNed` 与 `target.valid`；任一不满足本拍不发意图（节流 WARN）。
 - **首拍速度很小**：正常——指令从自机速度按 `slew` 爬坡（10 Hz 下 0.3 m/s/拍）；
   不是“没生效”。
 - **到点前冲/回退**：先看 `brake_safety`、`decel_plan_mps2`、`accel_term_mps2`；

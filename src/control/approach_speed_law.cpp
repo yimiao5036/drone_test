@@ -157,6 +157,10 @@ void ApproachSpeedLawConfig::Validate() const {
             "approach.speed_law.boost_delay_s 必须为有限非负数");
     require(std::isfinite(boost_rate_mps2_per_s) && boost_rate_mps2_per_s >= 0.0,
             "approach.speed_law.boost_rate_mps2_per_s 必须为有限非负数");
+    require(std::isfinite(ref_lead_s) && ref_lead_s >= 0.0,
+            "approach.speed_law.ref_lead_s 必须为有限非负数");
+    require(std::isfinite(ref_lead_max_m) && ref_lead_max_m >= 0.0,
+            "approach.speed_law.ref_lead_max_m 必须为有限非负数");
     require(std::isfinite(vertical_speed_cap_mps) && vertical_speed_cap_mps > 0.0,
             "approach.speed_law.vertical_speed_cap_mps 必须为有限正数");
     require(std::isfinite(vertical_accel_cap_mps2) &&
@@ -515,11 +519,17 @@ ApproachOutput ApproachSpeedLaw::Update(const ApproachInput& input,
     out.v_n_mps = cmd_vn_mps_;
     out.v_e_mps = cmd_ve_mps_;
     out.v_d_mps = cmd_vd_mps_;
-    // 参考点 = 目标沿当前视线后退 standoff：位置环在保持距离处误差为零，
-    // 前馈与参考点同源（都来自本拍速度律）。
-    out.ref_n_m = input.target_n_m - nx * cfg_.standoff_m;
-    out.ref_e_m = input.target_e_m - ny * cfg_.standoff_m;
-    out.ref_d_m = input.target_d_m;
+    // 参考点 = 自机 + v_ref × ref_lead_s（沿指令方向，上限 ref_lead_max_m）。
+    // 位置环只追这个“速度锚点”；目标点本身不再作为位置目标，避免制动段
+    // 位置误差额外加速（2026-11-11 SITL 实测冲进 0.65m）。
+    const double ref_speed = std::hypot(cmd_vn_mps_, cmd_ve_mps_);
+    const double ref_lead =
+        std::min(cfg_.ref_lead_max_m, ref_speed * cfg_.ref_lead_s);
+    const double ref_dir_n = ref_speed > 1e-6 ? cmd_vn_mps_ / ref_speed : 1.0;
+    const double ref_dir_e = ref_speed > 1e-6 ? cmd_ve_mps_ / ref_speed : 0.0;
+    out.ref_n_m = input.own_n_m + ref_dir_n * ref_lead;
+    out.ref_e_m = input.own_e_m + ref_dir_e * ref_lead;
+    out.ref_d_m = input.own_d_m + cmd_vd_mps_ * cfg_.ref_lead_s;
     out.distance_m = distance;
     out.closing_mps = closing;
     out.phase = phase;

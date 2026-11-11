@@ -27,7 +27,6 @@ using drone::control::ApproachSpeedLawConfig;
 
 ApproachSpeedLawConfig MakeConfig() {
     ApproachSpeedLawConfig cfg;
-    cfg.enabled = true;
     cfg.speed_cap_mps = 6.0;
     return cfg;
 }

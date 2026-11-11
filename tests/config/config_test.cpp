@@ -750,18 +750,14 @@ TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
     EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
-    // 接近段相位策略：静止目标 3.5 m/s、目标速度余量 1.0、预测 500ms。
-    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 1.5);
-    EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
-    EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
-    EXPECT_EQ(config.approach.guide_lowpass_ms, 200);
-    // 2026-11-11：生产配置显式打开 S5 接近段速度律。
-    EXPECT_TRUE(config.approach.speed_law.enabled);
+    // 2026-11-11：S5 改为接近速度律；旧 speed_mps/lead_time/guide_lowpass 已删除。
     EXPECT_DOUBLE_EQ(config.approach.speed_law.standoff_m, 2.9);
     EXPECT_DOUBLE_EQ(config.approach.speed_law.speed_cap_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.approach.speed_law.brake_safety, 1.3);
     EXPECT_TRUE(config.approach.speed_law.speed_match);
     EXPECT_TRUE(config.approach.speed_law.auto_boost);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_s, 0.3);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_max_m, 6.0);
     EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 5u);
     // S9/S10 入口默认关闭；返航默认启用以保证发射后有收口。
     EXPECT_FALSE(config.interception.enabled);
@@ -794,12 +790,10 @@ TEST(ConfigTest, ControllerAndApproachFallBackToDefaultsWhenAbsent) {
     EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 6.0);
     EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
-    EXPECT_DOUBLE_EQ(config.approach.speed_mps, 1.5);
-    EXPECT_DOUBLE_EQ(config.approach.track_speed_margin_mps, 1.0);
-    EXPECT_EQ(config.approach.lead_time, std::chrono::milliseconds(500));
-    EXPECT_EQ(config.approach.guide_lowpass_ms, 200);
-    // 速度律缺席时默认关闭，保持旧位置引导行为。
-    EXPECT_FALSE(config.approach.speed_law.enabled);
+    // 速度律缺席时回退代码默认（standoff 2.9、speed_cap 10、ref_lead 0.3）。
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.standoff_m, 2.9);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.speed_cap_mps, 10.0);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_s, 0.3);
     std::filesystem::remove(path);
 }
 

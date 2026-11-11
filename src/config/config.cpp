@@ -566,14 +566,6 @@ void FlightControllerConfig::Validate() const {
 }
 
 void ApproachConfig::Validate() const {
-    if (!std::isfinite(speed_mps) || speed_mps <= 0.0)
-        throw std::invalid_argument("approach.speed_mps 必须为有限正数");
-    if (!std::isfinite(track_speed_margin_mps) || track_speed_margin_mps < 0.0)
-        throw std::invalid_argument("approach.track_speed_margin_mps 必须为有限非负数");
-    if (lead_time.count() < 0)
-        throw std::invalid_argument("approach.lead_time_ms 不得为负");
-    if (guide_lowpass_ms < 0)
-        throw std::invalid_argument("approach.guide_lowpass_ms 不得为负");
     speed_law.Validate();
 }
 
@@ -1161,21 +1153,11 @@ AppConfig LoadAppConfig(const std::string& path,
     config.controller.fence_margin_m = config.fence.boundary_margin_m;
     config.controller.Validate();
 
-    // 接近段相位策略（approach 节，2026-11-02）：S5/S6 速率上限与预测提前量。
+    // 接近段速度律（approach.speed_law 节，2026-11-11 起 S5 唯一引导方式）。
     // 全部可选，缺席回退默认值；由 DroneApplication 注入状态机。
     const json approach = root.value("approach", json::object());
-    config.approach.speed_mps = ReadOptionalPositiveDouble(
-        approach, "speed_mps", config.approach.speed_mps);
-    config.approach.track_speed_margin_mps = ReadOptionalNonNegativeDouble(
-        approach, "track_speed_margin_mps", config.approach.track_speed_margin_mps);
-    config.approach.lead_time = ReadOptionalNonNegativeMilliseconds(
-        approach, "lead_time_ms", config.approach.lead_time);
-    config.approach.guide_lowpass_ms = ReadOptionalNonNegativeInt(
-        approach, "guide_lowpass_ms", config.approach.guide_lowpass_ms);
-    // S5 接近段速度律（2026-11-11）：缺席时 enabled=false，保留旧位置引导行为。
     const json speed_law = approach.value("speed_law", json::object());
     auto& law = config.approach.speed_law;
-    law.enabled = speed_law.value("enabled", law.enabled);
     law.standoff_m = ReadOptionalPositiveDouble(speed_law, "standoff_m",
                                                 law.standoff_m);
     law.accel_plan_mps2 = ReadOptionalPositiveDouble(
@@ -1212,6 +1194,10 @@ AppConfig LoadAppConfig(const std::string& path,
         speed_law, "boost_rate_mps2_per_s", law.boost_rate_mps2_per_s);
     law.target_need_hold =
         speed_law.value("target_need_hold", law.target_need_hold);
+    law.ref_lead_s = ReadOptionalNonNegativeDouble(speed_law, "ref_lead_s",
+                                                   law.ref_lead_s);
+    law.ref_lead_max_m = ReadOptionalNonNegativeDouble(
+        speed_law, "ref_lead_max_m", law.ref_lead_max_m);
     law.vertical_speed_cap_mps = ReadOptionalPositiveDouble(
         speed_law, "vertical_speed_cap_mps", law.vertical_speed_cap_mps);
     law.vertical_accel_cap_mps2 = ReadOptionalPositiveDouble(

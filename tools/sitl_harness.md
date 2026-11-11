@@ -53,8 +53,8 @@ sitl_web_gcs.py → TCP 5761（只桥机载地面站链路，与上一行是两�
 3. 本仓库已构建：`cmake -S . -B build && cmake --build build -j$(nproc)`
    （需要 `build/drone_control` 与 `build/px4_link_smoke`）；
 4. 无需真实硬件；SITL 参数由装置在启动后设置（`COM_LOW_BAT_ACT=0`、
-   `BAT_LOW_THR=0.15`、`SIM_BAT_MIN_PCT=50`、`SIM_BAT_DRAIN=0`；`smoke` 另设
-   `MPC_XY_VEL_MAX=2.0`）。
+   `BAT_LOW_THR=0.15`、`SIM_BAT_MIN_PCT=50`、`SIM_BAT_DRAIN=0`；`stack` 设
+   `MPC_XY_VEL_MAX=6.0` 供接近速度律验收，`smoke` 另设 `MPC_XY_VEL_MAX=2.0`）。
 5. **想看 3D（可选）**：需要 WSLg（`/mnt/wslg` 存在、`$DISPLAY` 有值，Windows 11 +
    WSL2 默认自带；缺了先 `wsl --update`），然后
    `SITL_GUI=1 bash tools/sitl_harness.sh stack` —— Gazebo 窗口会直接出现在 Windows

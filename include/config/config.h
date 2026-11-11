@@ -269,20 +269,11 @@ struct TakeoffConfig {
     void Validate() const;
 };
 
-/// 接近段相位策略（approach 节，2026-11-02）：
-/// S5/S6 由状态机填 `ControlIntent.max_speed_mps`（相位速率上限）与预测点
-/// （目标位置 + 目标速度 × lead_time）；控制器按 min(硬上限, 相位上限) 执行。
-/// 目标带速度位时 cap = max(speed_mps, |目标速度| + track_speed_margin_mps)。
+/// 接近段策略（approach 节，2026-11-02 引入；2026-11-11 起只保留速度律）：
+/// S5 由 `control::ApproachSpeedLaw` 产出 `(p_ref, v_ref)`，旧“固定提前 +
+/// 位置引导点”实现已删除，不再保留回退字段。
 struct ApproachConfig {
-    double speed_mps = 1.5;                   ///< S5/S6 位置引导速率上限（静态目标）
-    double track_speed_margin_mps = 1.0;      ///< 目标有速度时的余量（追得上）
-    std::chrono::milliseconds lead_time{500}; ///< 预测提前量（pos + v × lead）
-    /// 引导点一阶低通时间常数（0=关闭）。地面站目标观测是 5Hz 离散点，KF 每拍把
-    /// 位置修到新观测上会让引导点跳变（0082 实飞观察到逐拍位置台阶），低通把
-    /// 台阶摊到多个决策周期，代价是约一个时间常数的相位滞后。
-    int guide_lowpass_ms = 200;
-    /// S5 接近段速度律（2026-11-11 落机载）。打开后 S5 由本律产出
-    /// (p_ref, v_ref)，上面四个旧字段仅在关闭时保留原行为。
+    /// S5 接近段速度律（2026-11-11 落机载，唯一 S5 引导方式）。
     control::ApproachSpeedLawConfig speed_law;
     void Validate() const;
 };

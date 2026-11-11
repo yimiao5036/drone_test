@@ -38,6 +38,15 @@ uint64_t TestMonotonicMs() {
 
 common::FlightStateSnapshot MakeNavigationReadyFlight() {
     common::FlightStateSnapshot flight;
+    // 2026-11-11：S5 接近速度律需要自机局部 NED 位置/速度；真实快照在进入
+    // GPS_APPROACH 前必然有效，测试基线同步补齐（默认原点、静止）。
+    flight.local_position_valid = true;
+    flight.local_x_m = 0.f;
+    flight.local_y_m = 0.f;
+    flight.local_z_m = 0.f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
     flight.header.receive_time_ms = TestMonotonicMs();
     flight.header.valid_for_ms = 1000;
     flight.connected = true;
@@ -251,9 +260,8 @@ void DriveToGpsApproach(
         WaitForState(status_subscription, common::MissionState::kGpsApproach).has_value());
 }
 
-// 阶段四 Task 7：绑定估计/视觉/测距输入后，S5 发布位置引导意图——指向估计目标、
-// control_source=0（位置链）、reason_code 带 bit31 控制权请求位、有效期来自配置。
-TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
+// 2026-11-11：S5 由接近速度律产出位置锚点 + 三轴速度前馈（旧固定提前已删除）。
+TEST(MissionStateMachineTest, GpsApproachPublishesSpeedLawIntent) {
     common::Topic<common::GroundStationTarget> ground_target_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
     common::Topic<common::HealthStatus> health_topic;
@@ -261,58 +269,6 @@ TEST(MissionStateMachineTest, GpsApproachPublishesPositionIntent) {
     common::Topic<common::VisualTargetStatus> visual_status_topic;
     common::Topic<common::StereoTargetDistance> distance_topic;
     state_machine::MissionStateMachine machine;
-    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
-    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
-    auto status_subscription = machine.StatusOutput().Subscribe(16);
-    auto intent_subscription = machine.IntentOutput().Subscribe(8);
-
-    ASSERT_TRUE(machine.Start());
-    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
-    auto estimated = MakeValidEstimatedTarget();
-    estimated.vel_x_mps = 2.5f;
-    estimated.vel_y_mps = -1.5f;
-    estimated.vel_z_mps = 0.5f;
-    estimated.velocity_valid_mask = common::kVelocityValidAll;
-    (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(estimated));
-
-    const auto intent = WaitForIntent(intent_subscription);
-    ASSERT_TRUE(intent.has_value());
-    EXPECT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
-    EXPECT_EQ(intent->control_source, 0U);
-    // 2026-11-02 P0-2：下发的是预测点 = 目标点 + 目标速度 × lead_time(500ms)。
-    EXPECT_FLOAT_EQ(intent->target_x, 12.5f + 2.5f * 0.5f);
-    EXPECT_FLOAT_EQ(intent->target_y, -3.0f + (-1.5f) * 0.5f);
-    EXPECT_FLOAT_EQ(intent->target_z, -8.0f + 0.5f * 0.5f);
-    EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
-    EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl, 0U);
-    EXPECT_EQ(intent->header.valid_for_ms, 300U);
-    EXPECT_EQ(intent->valid_until_ms,
-              intent->header.receive_time_ms + intent->header.valid_for_ms);
-    // P3：S5 位置意图携带逐轴速度前馈。
-    EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidAll);
-    EXPECT_FLOAT_EQ(intent->feedforward_vx_mps, 2.5f);
-    EXPECT_FLOAT_EQ(intent->feedforward_vy_mps, -1.5f);
-    EXPECT_FLOAT_EQ(intent->feedforward_vz_mps, 0.5f);
-    // 相位速率上限 = max(3.5, |v_h| + 1.0)；本机无有效局部位置 → 不指定机头。
-    EXPECT_NEAR(intent->max_speed_mps, std::hypot(2.5f, 1.5f) + 1.0f, 1e-4f);
-    EXPECT_FALSE(intent->yaw_valid);
-
-    machine.Stop();
-}
-
-// 2026-11-11：approach.speed_law.enabled=true 时 S5 由速度律产出
-// (p_ref, v_ref)：位置落点是目标沿视线后退 standoff 的保持点，前馈三轴有效。
-TEST(MissionStateMachineTest, GpsApproachSpeedLawProducesStandoffReference) {
-    state_machine::MissionStateMachineConfig config;
-    config.approach.speed_law.enabled = true;
-    common::Topic<common::GroundStationTarget> ground_target_topic;
-    common::Topic<common::FlightStateSnapshot> flight_topic;
-    common::Topic<common::HealthStatus> health_topic;
-    common::Topic<common::TargetState> estimated_topic;
-    common::Topic<common::VisualTargetStatus> visual_status_topic;
-    common::Topic<common::StereoTargetDistance> distance_topic;
-    state_machine::MissionStateMachine machine(config);
     machine.SetInputs(ground_target_topic, flight_topic, health_topic);
     machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
     auto status_subscription = machine.StatusOutput().Subscribe(16);
@@ -343,29 +299,26 @@ TEST(MissionStateMachineTest, GpsApproachSpeedLawProducesStandoffReference) {
 
     const auto intent = WaitForIntent(intent_subscription);
     ASSERT_TRUE(intent.has_value());
-    ASSERT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
-
-    const double distance = std::hypot(12.5, 3.0);
-    const double nx = 12.5 / distance;
-    const double ny = -3.0 / distance;
-    // 位置落点 = 目标沿视线后退 standoff(2.9 m)，不是目标点本身。
-    EXPECT_NEAR(intent->target_x, 12.5 - nx * 2.9, 1e-3);
-    EXPECT_NEAR(intent->target_y, -3.0 - ny * 2.9, 1e-3);
-    EXPECT_FLOAT_EQ(intent->target_z, -8.0f);
-    // 速度律输出三轴前馈（首拍从自机速度零开始按 slew 爬坡，故只校验方向/非零）。
+    EXPECT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
+    EXPECT_EQ(intent->control_source, 0U);
+    EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
+    EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(intent->header.valid_for_ms, 300U);
+    // 位置锚点 = 自机 + v_ref × ref_lead_s；首拍 v_ref 按 slew 从 0 起步，
+    // 因此锚点仍在自机附近（不是目标点）。
+    EXPECT_NEAR(intent->target_x, 0.0f, 0.2f);
+    EXPECT_NEAR(intent->target_y, 0.0f, 0.2f);
+    EXPECT_NEAR(intent->target_z, 0.0f, 0.2f);
+    // 速度律固定下发三轴前馈（有效位全开）。
     EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidAll);
-    EXPECT_GT(intent->feedforward_vx_mps, 0.0f);
-    EXPECT_LT(intent->feedforward_vy_mps, 0.0f);
     EXPECT_GT(intent->max_speed_mps, 0.4f);
     EXPECT_TRUE(intent->yaw_valid);
-    EXPECT_EQ(intent->control_source, 0U);
 
     machine.Stop();
 }
 
-// 2026-11-02 P0-1：S5 起机头指向（预测后的）目标点——网枪固定朝前，机头必须
-// 朝目标；同时校验预测点与相位速率上限。
-TEST(MissionStateMachineTest, GpsApproachFacesPredictedTargetPosition) {
+// 机头仍指向目标（速度律只改位置/速度锚点，不改相机指向）。
+TEST(MissionStateMachineTest, GpsApproachFacesTargetWithSpeedLaw) {
     common::Topic<common::GroundStationTarget> ground_target_topic;
     common::Topic<common::FlightStateSnapshot> flight_topic;
     common::Topic<common::HealthStatus> health_topic;
@@ -381,184 +334,23 @@ TEST(MissionStateMachineTest, GpsApproachFacesPredictedTargetPosition) {
     ASSERT_TRUE(machine.Start());
     DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
 
-    // 本机在局部原点、朝向任意；让状态机拿到有效局部位置才能算机头。
     auto flight = MakeNavigationReadyFlight();
     flight.header.receive_time_ms = TestMonotonicMs();
     flight.local_position_valid = true;
-    flight.local_x_m = 0.f;
-    flight.local_y_m = 0.f;
-    flight.local_z_m = 0.f;
     (void)flight_topic.Publish(
         std::make_shared<const common::FlightStateSnapshot>(flight));
 
     auto estimated = MakeValidEstimatedTarget();
-    estimated.velocity_valid_mask = common::kVelocityValidAll;
-    estimated.vel_x_mps = 2.5f;
-    estimated.vel_y_mps = -1.5f;
-    estimated.vel_z_mps = 0.f;
     (void)estimated_topic.Publish(
         std::make_shared<const common::TargetState>(estimated));
 
     const auto intent = WaitForIntent(intent_subscription);
     ASSERT_TRUE(intent.has_value());
-    const float predicted_x = 12.5f + 2.5f * 0.5f;
-    const float predicted_y = -3.0f - 1.5f * 0.5f;
-    EXPECT_FLOAT_EQ(intent->target_x, predicted_x);
-    EXPECT_FLOAT_EQ(intent->target_y, predicted_y);
-    // 机头 = atan2(东, 北)（0=正北，顺时针为正）。
     EXPECT_TRUE(intent->yaw_valid);
     EXPECT_NEAR(intent->yaw_deg,
-                static_cast<float>(std::atan2(predicted_y, predicted_x) * 180.0 /
+                static_cast<float>(std::atan2(-3.0f, 12.5f) * 180.0 /
                                    3.14159265358979323846),
                 1e-3f);
-
-    machine.Stop();
-}
-
-// P3：未置位的速度轴必须清零，避免无效 KF 值污染意图；位置照发。
-TEST(MissionStateMachineTest, GpsApproachNormalizesUnsetFeedforwardAxes) {
-    common::Topic<common::GroundStationTarget> ground_target_topic;
-    common::Topic<common::FlightStateSnapshot> flight_topic;
-    common::Topic<common::HealthStatus> health_topic;
-    common::Topic<common::TargetState> estimated_topic;
-    common::Topic<common::VisualTargetStatus> visual_status_topic;
-    common::Topic<common::StereoTargetDistance> distance_topic;
-    state_machine::MissionStateMachine machine;
-    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
-    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
-    auto status_subscription = machine.StatusOutput().Subscribe(16);
-    auto intent_subscription = machine.IntentOutput().Subscribe(8);
-
-    ASSERT_TRUE(machine.Start());
-    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
-    auto estimated = MakeValidEstimatedTarget();
-    estimated.velocity_valid_mask = common::kVelocityValidNorth;  // 仅 N 有效
-    estimated.vel_x_mps = 3.0f;
-    estimated.vel_y_mps = 9.0f;  // E 未置位：必须被清零
-    estimated.vel_z_mps = 9.0f;  // D 未置位：必须被清零
-    (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(estimated));
-
-    const auto intent = WaitForIntent(intent_subscription);
-    ASSERT_TRUE(intent.has_value());
-    EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidNorth);
-    EXPECT_FLOAT_EQ(intent->feedforward_vx_mps, 3.0f);
-    EXPECT_FLOAT_EQ(intent->feedforward_vy_mps, 0.0f);
-    EXPECT_FLOAT_EQ(intent->feedforward_vz_mps, 0.0f);
-
-    machine.Stop();
-}
-
-// P3：位置不变、仅速度/有效位变化时立即重发（不等待 10Hz 节流窗口）。
-TEST(MissionStateMachineTest, GpsApproachRepublishesOnFeedforwardChange) {
-    common::Topic<common::GroundStationTarget> ground_target_topic;
-    common::Topic<common::FlightStateSnapshot> flight_topic;
-    common::Topic<common::HealthStatus> health_topic;
-    common::Topic<common::TargetState> estimated_topic;
-    common::Topic<common::VisualTargetStatus> visual_status_topic;
-    common::Topic<common::StereoTargetDistance> distance_topic;
-    state_machine::MissionStateMachine machine;
-    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
-    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
-    auto status_subscription = machine.StatusOutput().Subscribe(16);
-    auto intent_subscription = machine.IntentOutput().Subscribe(8);
-
-    ASSERT_TRUE(machine.Start());
-    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
-    auto estimated = MakeValidEstimatedTarget();
-    estimated.velocity_valid_mask = common::kVelocityValidNorth;
-    estimated.vel_x_mps = 1.0f;
-    (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(estimated));
-    ASSERT_TRUE(WaitForIntent(intent_subscription).has_value());
-
-    // 位置不变，仅改变前馈速度；决策下一拍应立即发布新内容。
-    estimated.header.sequence += 1;
-    estimated.header.receive_time_ms = TestMonotonicMs();
-    estimated.vel_x_mps = 2.0f;
-    (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(estimated));
-
-    std::optional<common::ControlIntent> updated;
-    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto intent = intent_subscription.WaitTakeFor(50ms);
-        if (!intent) {
-            continue;
-        }
-        if (std::fabs((*intent)->feedforward_vx_mps - 2.0f) < 1e-6f) {
-            updated = **intent;
-            break;
-        }
-    }
-    ASSERT_TRUE(updated.has_value());
-    // 位置随前馈变化（预测点 = 12.5 + 2.0 × 0.5），E 轴未置位不叠加。
-    // 引导点经过 approach.guide_lowpass_ms 一阶低通（默认 200ms），首拍不会直接
-    // 跳到 13.5：继续采集直到收敛（容差 0.05m），验证低通最终对齐预测点。
-    const float expected_x = 12.5f + 2.0f * 0.5f;
-    while (std::fabs(updated->target_x - expected_x) > 0.05f &&
-           std::chrono::steady_clock::now() < deadline) {
-        auto intent = intent_subscription.WaitTakeFor(50ms);
-        if (intent) {
-            updated = **intent;
-        }
-    }
-    EXPECT_NEAR(updated->target_x, expected_x, 0.05f);
-    EXPECT_NEAR(updated->target_y, -3.0f, 0.05f);
-    EXPECT_EQ(updated->feedforward_valid_mask, common::kVelocityValidNorth);
-
-    machine.Stop();
-}
-
-// approach.guide_lowpass_ms：目标位置阶跃时引导点渐进逼近，不逐拍跳变。
-TEST(MissionStateMachineTest, GpsApproachSmoothsTargetPositionSteps) {
-    common::Topic<common::GroundStationTarget> ground_target_topic;
-    common::Topic<common::FlightStateSnapshot> flight_topic;
-    common::Topic<common::HealthStatus> health_topic;
-    common::Topic<common::TargetState> estimated_topic;
-    common::Topic<common::VisualTargetStatus> visual_status_topic;
-    common::Topic<common::StereoTargetDistance> distance_topic;
-    state_machine::MissionStateMachine machine;
-    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
-    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
-    auto status_subscription = machine.StatusOutput().Subscribe(16);
-    auto intent_subscription = machine.IntentOutput().Subscribe(16);
-
-    ASSERT_TRUE(machine.Start());
-    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
-    auto estimated = MakeValidEstimatedTarget();
-    (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(estimated));
-    const auto baseline = WaitForIntent(intent_subscription);
-    ASSERT_TRUE(baseline.has_value());
-    const float base_x = baseline->target_x;
-
-    // 目标向北阶跃 10m：引导点应被低通限制，单拍推进远小于 10m。
-    estimated.header.sequence += 1;
-    estimated.header.receive_time_ms = TestMonotonicMs();
-    estimated.pos_x_m += 10.0f;
-    (void)estimated_topic.Publish(
-        std::make_shared<const common::TargetState>(estimated));
-    auto stepped = WaitForIntent(intent_subscription);
-    ASSERT_TRUE(stepped.has_value());
-    EXPECT_GT(stepped->target_x, base_x);
-    EXPECT_LT(stepped->target_x - base_x, 5.0f);
-
-    // 继续采集：引导点在约 1 秒内收敛到新目标（容差 0.2m）。
-    // 每 50ms 重发一次同一估计，模拟地面站持续 5Hz 观测（否则估计超龄会停发）。
-    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
-    while (std::fabs(stepped->target_x - (base_x + 10.0f)) > 0.2f &&
-           std::chrono::steady_clock::now() < deadline) {
-        estimated.header.sequence += 1;
-        estimated.header.receive_time_ms = TestMonotonicMs();
-        (void)estimated_topic.Publish(
-            std::make_shared<const common::TargetState>(estimated));
-        auto next = intent_subscription.WaitTakeFor(50ms);
-        if (next) {
-            stepped = **next;
-        }
-    }
-    EXPECT_NEAR(stepped->target_x, base_x + 10.0f, 0.2f);
 
     machine.Stop();
 }
@@ -1436,10 +1228,12 @@ TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
     for (const auto& intent : frozen) {
         EXPECT_EQ(intent.type, common::ControlIntentType::kPositionGuide);
         EXPECT_EQ(intent.control_source, 0U);
-        EXPECT_FLOAT_EQ(intent.target_x, 12.5F);  // 冻结值（非更新后的 99）
-        EXPECT_FLOAT_EQ(intent.target_y, -3.0F);
-        EXPECT_FLOAT_EQ(intent.target_z, -8.0F);
-        // P3：S6 冻结段显式无前馈（即使进入时估计带速度位）。
+        // 冻结的是 S5 速度律的位置锚点（交接时刻），不是目标估计点；
+        // 后续估计更新为 99/98/-7 不得改变冻结值。
+        EXPECT_NE(intent.target_x, 99.0F);
+        EXPECT_NE(intent.target_y, 98.0F);
+        EXPECT_LT(std::fabs(intent.target_x), 5.0F);
+        // P3：S6 冻结段显式无前馈（即使 S5 意图带速度前馈）。
         EXPECT_EQ(intent.feedforward_valid_mask, 0U);
         EXPECT_FLOAT_EQ(intent.feedforward_vx_mps, 0.0F);
         EXPECT_FLOAT_EQ(intent.feedforward_vy_mps, 0.0F);
@@ -4269,8 +4063,10 @@ TEST(MissionStateMachineTest, S5TargetIdFilterIgnoresNonMatchingTargets) {
                    (value.reason_code & 0xFFU) == 7U;
         });
     ASSERT_TRUE(intent.has_value());
-    EXPECT_FLOAT_EQ(intent->target_x, 12.5f);
-    EXPECT_FLOAT_EQ(intent->target_y, -3.0f);
+    // 速度律位置锚点在自机附近，不是目标点本身；本用例只验证 target_id 过滤后
+    // 恢复的是“估计引导”（原因码 7），不把 anchor 钉死在具体坐标。
+    EXPECT_LT(intent->target_x, 12.4f);
+    EXPECT_GT(intent->target_y, -2.9f);
     EXPECT_EQ(harness.machine.CurrentState(),
               common::MissionState::kGpsApproach);
 }
@@ -5836,7 +5632,8 @@ TEST(MissionStateMachineTest, S5HoldReleasesAfterThreeFreshFrames) {
                    LowReasonCode(value) == kLowReasonGroundTask;
         });
     ASSERT_TRUE(resumed.has_value()) << "连续 3 拍新鲜后必须回到估计引导";
-    EXPECT_FLOAT_EQ(resumed->target_x, 12.5f);
+    // 速度律位置锚点在自机附近（首拍小速度），不是目标点本身。
+    EXPECT_LT(resumed->target_x, 2.0f);
 }
 
 // 影子兼容：未注入命令接口时不发保持意图（保持仅控制任务语义）。
@@ -6203,8 +6000,8 @@ TEST(MissionStateMachineTest, S5GuideOutsideFenceRaisesWarning) {
                     .accepted);
     ASSERT_TRUE(DriveToGpsApproach(harness, 311));
 
-    // 飞机自身停在原点（界内）：带锚点的快照才能让围栏多边形换算成 NED。
-    auto flight = MakeFenceOffboardFlight(0.f, 0.f, -0.4f);
+    // 飞机在区域边界内侧（29m/30m），速度律锚点会越过边界；目标在 200m 外。
+    auto flight = MakeFenceOffboardFlight(29.f, 0.f, -0.4f);
     ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
 
     bool warning_seen = false;

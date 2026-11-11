@@ -131,7 +131,6 @@
     "approach": {
         "_comment": "SITL：S5 接近段速度律打开（2026-11-11），用于验收 S5→S6 交接与制动包络；position_guide/前馈硬上限仍由 controller 默认值兜底。",
         "speed_law": {
-            "enabled": true,
             "standoff_m": 2.9,
             "accel_plan_mps2": 3.0,
             "decel_plan_mps2": 3.0,
@@ -151,10 +150,22 @@
             "boost_delay_s": 4.0,
             "boost_rate_mps2_per_s": 0.5,
             "target_need_hold": true,
+            "ref_lead_s": 0.3,
+            "ref_lead_max_m": 6.0,
             "vertical_speed_cap_mps": 2.0,
             "vertical_accel_cap_mps2": 2.0,
             "vertical_margin_m": 0.2
         }
+    },
+    "controller": {
+        "_comment": "SITL 补齐 controller 节（2026-11-11）：原配置缺该节时默认为前馈关闭、max_feedforward=2，接近速度律的 v_ref 会被丢弃，表现为“和旧 S5 速度差不多”。此节与生产 config.json 对齐 feedforward/max_feedforward；max_speed 保持 2.0（仅约束速度式意图）。",
+        "period_ms": 50,
+        "max_speed_mps": 2.0,
+        "max_accel_mps2": 3.0,
+        "max_feedforward_mps": 6.0,
+        "enable_position_velocity_feedforward": true,
+        "position_guide_speed_mps": 6.0,
+        "position_guide_vz_mps": 1.5
     },
     "actuator": {
         "type": "single_pwm",

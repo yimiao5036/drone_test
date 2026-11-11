@@ -4,47 +4,19 @@
 
 `MissionStateMachine`负责消费地面站目标、PX4飞行状态和健康状态快照，按任务阶段维护`MissionStatus`。默认仍是安全影子语义：验证`GroundStationTarget`已经能进入任务链路，并在满足导航快照基本条件时进入`GPS_APPROACH`影子状态。
 
-阶段四新增（Task 7）：经`SetEstimationInputs`绑定目标估计/视觉稳定性/双目测距三个输入后，`GPS_APPROACH`（S5）开始发布`kPositionGuide`位置引导意图（指向估计目标 NED，`control_source=0`，`reason_code`带 bit31 控制权请求位`common::kControlIntentReasonRequestControl`）。**未绑定时不出意图、保持原影子行为**。意图是否真正转化为 PX4 输出由`FlightController`授权链与`enable_control`装配门禁决定，状态机侧不做最终裁决。
+阶段四新增（Task 7）：经`SetEstimationInputs`绑定目标估计/视觉稳定性/双目测距三个输入后，`GPS_APPROACH`（S5）开始发布`kPositionGuide`位置引导意图（2026-11-11 起落点为速度律 `p_ref` 锚点，三轴速度前馈同源；`control_source=0`，`reason_code`带 bit31 控制权请求位`common::kControlIntentReasonRequestControl`）。**未绑定时不出意图、保持原影子行为**。意图是否真正转化为 PX4 输出由`FlightController`授权链与`enable_control`装配门禁决定，状态机侧不做最终裁决。
 
-> **注（2026-10-16）**：S5 引导为"目标当前估计位置"的直接位置设定值，对持续运动目标**本质是尾追**（能否跟住取决于速度优势与提前量，不由刷新率决定）；时间前视、位置+速度前馈、S7 比例导引等改进路径见 `docs/S5运动目标追踪改进方案.md`（待排期）。
+**S5 接近段速度律（2026-11-11 落机载，唯一 S5 引导方式）**：
+`PublishEstimateGuidedIntent()` 由 `ApproachSpeedLaw` 每拍产出 `(p_ref, v_ref)`：
 
-**S5/S6 接近策略（P0-1/P0-2，2026-11-02 落地，取代上面的"纯尾追"）**：0082 实机暴露
-两个问题——机头不朝目标（捕网枪固定朝前，打偏）、目标点阶跃下发导致 PX4 用
-`MPC_XY_VEL_MAX=12m/s` 冲刺（实测 8m/s）。修复：
-
-- `ApplyApproachPolicy(PositionIntentTarget&, bool with_heading)`：在
-  `PublishEstimateGuidedIntent()`（S5，带机头）与 `PublishFrozenHandoverIntent()`
-  （S6 冻结段，带机头）里统一调用。
-  - **预测点**：有目标速度时目标点 = 估计位置 + v_h × `approach.lead_time_ms`
-    （默认 500ms），抵消纯尾追的稳态滞后；
-  - **相位限速**：`intent.max_speed_mps = max(approach.speed_mps,
-    |v_target| + approach.track_speed_margin_mps)`（默认 1.5 与 1.0）；无速度时就是
-    1.5m/s 上限。控制器按此上限逐拍推进引导点（见 `include/control/flight_controller.md`）；
-  - **机头**：`yaw = atan2(E_target, N_target)`（局部 NED 朝向目标方位），距目标
-    <0.5m 不转（避免目标脚下原地打转），无有效局部位置时不指定机头；S6 继续沿用。
-    S7 视觉伺服接管后机头由伺服律锁目标，S12 返航才朝飞行方向。
-  - **引导点低通**（`approach.guide_lowpass_ms`，默认 200，`0`=关闭）：地面站目标是
-    5Hz 离散观测，估计器每拍把位置修到新观测上；引导点按 `alpha = dt/(tau+dt)` 一阶
-    低通，把台阶摊到多个决策周期。进入 S5 时重新对齐，进入 S6（冻结段）时再重置一次，
-    保证冻结交接点被精确保持（不继承 S5 的滤波状态）。
-- 配置：`approach` 节（`speed_mps`/`track_speed_margin_mps`/`lead_time_ms`/`guide_lowpass_ms`，
-  以及 2026-11-11 新增的 `speed_law` 子节），
-  字段见 `include/config/配置管理.md`；`ControlIntent.max_speed_mps` 是这条链传导
-  相位策略的唯一通道（历史上定义但未被消费，2026-11-02 起生效）。
-- 测试：`GpsApproachPublishesPositionIntent`（断言预测点与相位上限）、
-  `GpsApproachFacesPredictedTargetPosition`（机头朝向）、`GpsApproachRepublishesOnFeedforwardChange`。
-
-**S5 接近段速度律（2026-11-11 落机载）**：`approach.speed_law.enabled=true` 时，
-`PublishEstimateGuidedIntent()` 不再调用 `ApplyApproachPolicy`，改由
-`ApproachSpeedLaw` 每拍产出 `(p_ref, v_ref)`：
-
-- 位置落点 `p_ref` = 目标沿当前视线后退 `standoff_m`（默认 2.9m）的保持点；
+- 位置锚点 `p_ref` = 自机 + `v_ref × ref_lead_s`（默认 0.3s，上限 6m）；
 - 三轴速度前馈 = 律输出（相对系制动包络 + 速度预算 + 侧向/转弯约束 + 分相位）；
 - `max_speed_mps = max(|v_ref|, 0.5)`，仅用于控制器位置引导限速；
-- 机头仍由 `ApplyHeadingToward` 指向目标；关闭开关时回退上面的旧位置引导。
+- 机头仍由 `ApplyHeadingToward` 指向目标；输入无效（无局部位置/目标无效）时
+  本拍不发意图并打节流 WARN，**不再回退旧位置引导**。
 - 实现与参数：`include/control/approach_speed_law.md`；测试：
-  `MissionStateMachineTest.GpsApproachSpeedLawProducesStandoffReference`
-  与 `ApproachSpeedLawTest.*`。
+  `MissionStateMachineTest.GpsApproachPublishesSpeedLawIntent`、
+  `GpsApproachFacesTargetWithSpeedLaw` 与 `ApproachSpeedLawTest.*`。
 
 
 阶段四新增（Task 8）：经`SetEstimationDiagnostics`注入估计器诊断接口后，**交接判据**（`handover` 配置节）生效，状态在 S5→S6→S7 之间按下列判据推进/回退（`handover` 阈值全部来自配置，无代码字面量）：
@@ -71,7 +43,7 @@
 | `kBrakeHover`（视觉短期 LOST 判丢刹车，valid=true） | `kBrakeHover`零速安全意图（速度分量全零），reason 低位 102；**主链路无预测坐标**（`is_predicted`恒 false，101 Coast 低码不可达）——图像空间 coast 在本链路以判丢刹车形态落地 |
 | `kDegradedHold`（valid=false：姿态/视觉超龄） | **不发布意图**（安全语义：控制律已明确"禁止正常控制"，补发零速与其矛盾）；超龄收口交 FlightController 意图超时门禁（`intent_timeout`）刹停 |
 
-**S6 冻结最后位置目标（评审裁决 (a)，Task 9 落地）**：S5→S6 当拍冻结进入时刻的`TargetState`坐标；S6 驻留期逐拍续发该位置意图（`valid_until`由状态机每拍滚动续期），直到首条视觉速度意图被发出再停（S7 首拍若伺服降级停发，冻结续发继续顶住，不留意图缺口）。此策略对应用户设计 §2.1「进入 S6 后冻结最后位置目标」与 §2.5「位置式→速度式无扰斜坡过渡」——若交接期停发位置意图，控制器在`intent_timeout`(300ms)后 COAST 刹车，真实系统会在交接点先刹停再起步。**P3 决策（2026-10-19）：S6 冻结续发保持纯位置、显式不带速度前馈**（即使冻结快照带速度位），避免固定位置目标 + 持续前馈使飞机越过冻结点；S7 速度伺服接管后自然连续。
+**S6 冻结最后位置目标（评审裁决 (a)，Task 9 落地）**：S5→S6 当拍冻结**进入时刻最后一条 S5 位置意图**（速度律的 p_ref 锚点 + 机头，显式去掉速度前馈），S6 驻留期逐拍续发该位置意图（`valid_until`由状态机每拍滚动续期），直到首条视觉速度意图被发出再停（S7 首拍若伺服降级停发，冻结续发继续顶住，不留意图缺口）。此策略对应用户设计 §2.1「进入 S6 后冻结最后位置目标」与 §2.5「位置式→速度式无扰斜坡过渡」——若交接期停发位置意图，控制器在`intent_timeout`(300ms)后 COAST 刹车，真实系统会在交接点先刹停再起步。**P3 决策（2026-10-19）：S6 冻结续发保持纯位置、显式不带速度前馈**；S7 速度伺服接管后自然连续。2026-11-11 起冻结值不再是目标估计点（旧实现会把位置环拉向目标本身、交接瞬间产生数米跳变）。
 
 **热备份核对（设计 §2.4）**：S7 期间每秒核对卡尔曼状态年龄——`TargetState.header.receive_time_ms`年龄是否超出其自报有效期窗（`valid_for_ms`，与 S5 意图门禁`HasFreshEstimate`同一口径；无快照/`valid=false`亦视为断粮）。断粮 → 节流 WARN「S7 热备份断粮」+ `MissionStatus.active_warning_bits` bit2 置位，**不退出 S7**（S7 去留由四条收口路径决定，热备份告警只提示"假备份"风险）。
 

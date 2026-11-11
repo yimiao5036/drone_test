@@ -3093,7 +3093,7 @@ private:
                 PublishFrozenHandoverIntent(now_ms);
                 return;
             case common::MissionState::kVisualTracking:
-                if (!s7_servo_started_ && frozen_handover_target_.has_value()) {
+                if (!s7_servo_started_ && frozen_position_target_.has_value()) {
                     PublishFrozenHandoverIntent(now_ms);
                     return;
                 }
@@ -3208,39 +3208,58 @@ private:
         fresh_estimate_streak_ = 0;
     }
 
-    /// 冻结最后位置目标（S5→S6 进入时调用，设计 §2.1）：取进入时刻的估计
-    /// 目标坐标（此刻的 TargetState 值），交接期不再随估计更新改变。
+    /// 冻结最后位置目标（S5→S6 进入时调用，设计 §2.1）：取进入时刻最后一条
+    /// S5 位置意图（速度律的 p_ref 锚点），而不是目标估计点——目标点会把
+    /// 位置环拉向目标本身，交接瞬间产生数米级跳变。
     void FreezeHandoverTarget() {
-        frozen_handover_target_ = latest_estimated_;
-        SPDLOG_INFO("交接冻结最后位置目标: pos=({:.2f},{:.2f},{:.2f}) frame_id={}",
-                    static_cast<double>(frozen_handover_target_->pos_x_m),
-                    static_cast<double>(frozen_handover_target_->pos_y_m),
-                    static_cast<double>(frozen_handover_target_->pos_z_m),
-                    frozen_handover_target_->header.frame_id);
+        if (last_s5_position_target_.has_value()) {
+            frozen_position_target_ = *last_s5_position_target_;
+            // P3 决策保持：S6 只冻结位置/航向，不带 S5 速度前馈，避免固定
+            // 位置目标 + 持续前馈越过交接点；速度由 S7 接管。
+            frozen_position_target_->feedforward_vx_mps = 0.f;
+            frozen_position_target_->feedforward_vy_mps = 0.f;
+            frozen_position_target_->feedforward_vz_mps = 0.f;
+            frozen_position_target_->feedforward_valid_mask = 0;
+            frozen_position_target_->max_speed_mps = 2.0f;
+            SPDLOG_INFO(
+                "交接冻结最后位置目标: pos=({:.2f},{:.2f},{:.2f}) frame_id={}",
+                static_cast<double>(frozen_position_target_->x),
+                static_cast<double>(frozen_position_target_->y),
+                static_cast<double>(frozen_position_target_->z),
+                frozen_position_target_->frame_id);
+            return;
+        }
+        // 兜底：没有 S5 意图记忆（测试直接进 S6 等）时用估计点、保守限速。
+        if (!latest_estimated_.has_value()) {
+            return;
+        }
+        PositionIntentTarget target;
+        target.x = latest_estimated_->pos_x_m;
+        target.y = latest_estimated_->pos_y_m;
+        target.z = latest_estimated_->pos_z_m;
+        target.frame_id = latest_estimated_->header.frame_id;
+        target.max_speed_mps = 2.0f;
+        ApplyHeadingToward(target, static_cast<double>(target.x),
+                           static_cast<double>(target.y));
+        frozen_position_target_ = target;
+        SPDLOG_INFO("交接冻结最后位置目标（兜底估计点）: pos=({:.2f},{:.2f},{:.2f})",
+                    static_cast<double>(target.x),
+                    static_cast<double>(target.y),
+                    static_cast<double>(target.z));
     }
 
     /// S6/S7 过渡期冻结位置意图续发：valid_until 逐拍滚动（不做内容节流，
-    /// 续期必须发生在每拍），内容固定为进入时刻的冻结目标。
+    /// 续期必须发生在每拍），内容固定为进入时刻冻结的 p_ref/航向。
     void PublishFrozenHandoverIntent(uint64_t now_ms) {
-        if (!frozen_handover_target_.has_value()) {
-            return;  // 防御：未冻结（不应发生，进入 S6 必有估计快照）
+        if (!frozen_position_target_.has_value()) {
+            return;  // 防御：未冻结（不应发生，进入 S6 必有 S5 意图或估计快照）
         }
         if (position_intent_source_ != PositionIntentSource::kFrozen) {
             position_intent_source_ = PositionIntentSource::kFrozen;
             last_intent_target_.reset();  // 内容节流记忆失效（来源已切换）
             SPDLOG_INFO("交接冻结位置意图续发: 滚动续期直至视觉伺服接续");
         }
-        const auto& frozen = *frozen_handover_target_;
-        PositionIntentTarget position_target;
-        position_target.x = frozen.pos_x_m;
-        position_target.y = frozen.pos_y_m;
-        position_target.z = frozen.pos_z_m;
-        position_target.frame_id = frozen.header.frame_id;
-        // P3 决策：S6 保持冻结语义，不带速度前馈（即使冻结快照有速度位）。
-        // 交接后由 S7 速度伺服接管，避免固定位置目标 + 持续前馈造成越过冻结点。
-        // 仍沿用接近段策略的速率上限与机头（冻结点固定，预测量恒为 0）。
-        ApplyApproachPolicy(position_target, /*with_heading=*/true);
-        PublishPositionIntent(position_target, now_ms);
+        PublishPositionIntent(*frozen_position_target_, now_ms);
     }
 
     /// 停止位置类意图发布（离开位置引导段/交接段）；幂等。
@@ -3296,10 +3315,10 @@ private:
         s6_entered_ms_ = 0;
         s7_entered_ms_ = 0;
         distance_lost_since_ms_.reset();
-        if (frozen_handover_target_.has_value()) {
+        if (frozen_position_target_.has_value()) {
             SPDLOG_INFO("交接段收口: 停止冻结位置续发/视觉伺服意图");
         }
-        frozen_handover_target_.reset();
+        frozen_position_target_.reset();
         s7_servo_started_ = false;
         servo_intent_active_ = false;  // 交接段收口：背离告警位随段结束清空
         hot_backup_check_ms_ = 0;
@@ -3575,93 +3594,8 @@ private:
         float max_speed_mps = 0.f;
     };
 
-    /// 引导点一阶低通（approach.guide_lowpass_ms）：地面站目标是 5Hz 离散观测，
-    /// 估计器每拍把位置修到新观测上，直接下发会让 PX4 逐拍执行台阶；这里按
-    /// alpha = dt/(tau+dt) 把台阶摊到多个决策周期。tau=0 时关闭并退化为直通。
-    void ApplyGuideLowpass(double& x, double& y, double& z, uint64_t now_ms) {
-        const int tau_ms = approach_.guide_lowpass_ms;
-        if (tau_ms <= 0) {
-            guide_filter_valid_ = false;
-            return;
-        }
-        if (!guide_filter_valid_) {
-            guide_filter_x_ = x;
-            guide_filter_y_ = y;
-            guide_filter_z_ = z;
-            guide_filter_valid_ = true;
-            guide_filter_ms_ = now_ms;
-            return;
-        }
-        const uint64_t dt = now_ms > guide_filter_ms_ ? now_ms - guide_filter_ms_ : 0;
-        const double alpha = static_cast<double>(dt) /
-                             (static_cast<double>(tau_ms) + static_cast<double>(dt));
-        guide_filter_x_ += (x - guide_filter_x_) * alpha;
-        guide_filter_y_ += (y - guide_filter_y_) * alpha;
-        guide_filter_z_ += (z - guide_filter_z_) * alpha;
-        guide_filter_ms_ = now_ms;
-        x = guide_filter_x_;
-        y = guide_filter_y_;
-        z = guide_filter_z_;
-    }
-
-    /// 接近段相位策略（2026-11-02 P0-1/P0-2）：把状态机原始的“目标当前点”
-    /// 换算成“引导点 + 速率上限 + 机头方向”。
-    ///  1) 预测点 = 目标位置 + 目标速度 × approach.lead_time（仅有效轴），
-    ///     补偿链路延迟，避免追着落后点跑；
-    ///  2) 速率上限 = max(approach.speed_mps, |目标水平速度| +
-    ///     approach.track_speed_margin_mps)：静止目标按 approach.speed_mps 推进，运动
-    ///     目标自动抬高上限（上限≠目标速度，控制器据此限速推进）；
-    ///  3) 机头 = 指向预测点的 NED 航向（0=正北，顺时针为正），目标与本机
-    ///     水平距离 < 0.5m 时不改机头（避免末端原地打转）。
-    /// with_heading=false 时不指定航向（保持原机头平移）。
-    void ApplyApproachPolicy(PositionIntentTarget& target, bool with_heading) {
-        double px = static_cast<double>(target.x);
-        double py = static_cast<double>(target.y);
-        double pz = static_cast<double>(target.z);
-        const double lead_s =
-            static_cast<double>(approach_.lead_time.count()) / 1000.0;
-        const uint8_t mask = target.feedforward_valid_mask & common::kVelocityValidAll;
-        if ((mask & common::kVelocityValidNorth) != 0 &&
-            std::isfinite(target.feedforward_vx_mps)) {
-            px += static_cast<double>(target.feedforward_vx_mps) * lead_s;
-        }
-        if ((mask & common::kVelocityValidEast) != 0 &&
-            std::isfinite(target.feedforward_vy_mps)) {
-            py += static_cast<double>(target.feedforward_vy_mps) * lead_s;
-        }
-        if ((mask & common::kVelocityValidDown) != 0 &&
-            std::isfinite(target.feedforward_vz_mps)) {
-            pz += static_cast<double>(target.feedforward_vz_mps) * lead_s;
-        }
-        // 引导点低通：摊平 5Hz 目标观测带来的位置台阶（approach.guide_lowpass_ms）。
-        ApplyGuideLowpass(px, py, pz, MonotonicMs());
-
-        target.x = static_cast<float>(px);
-        target.y = static_cast<float>(py);
-        target.z = static_cast<float>(pz);
-
-        double cap = approach_.speed_mps;
-        const bool horizontal_velocity_valid =
-            (mask & (common::kVelocityValidNorth | common::kVelocityValidEast)) ==
-            (common::kVelocityValidNorth | common::kVelocityValidEast);
-        if (horizontal_velocity_valid && std::isfinite(target.feedforward_vx_mps) &&
-            std::isfinite(target.feedforward_vy_mps)) {
-            const double target_speed = std::hypot(
-                static_cast<double>(target.feedforward_vx_mps),
-                static_cast<double>(target.feedforward_vy_mps));
-            cap = std::max(cap, target_speed + approach_.track_speed_margin_mps);
-        }
-        target.max_speed_mps = static_cast<float>(cap);
-
-        if (!with_heading) {
-            return;
-        }
-        ApplyHeadingToward(target, px, py);
-    }
-
     /// 机头指向给定局部 NED 点（0=正北，顺时针为正）。目标过近时保持原机头，
-    /// 避免末端原地打转；无有效局部位置时不指定航向。S5 旧位置引导与
-    /// 速度律分支共用。
+    /// 避免末端原地打转；无有效局部位置时不指定航向。
     void ApplyHeadingToward(PositionIntentTarget& target, double px, double py) {
         if (!latest_flight_.has_value() ||
             !latest_flight_->local_position_valid) {
@@ -3705,15 +3639,19 @@ private:
             position_target.feedforward_vz_mps = target.vel_z_mps;
             position_target.feedforward_valid_mask |= common::kVelocityValidDown;
         }
-        // 接近段速度律（2026-11-11，approach.speed_law.enabled）：
-        // 直接产出 (p_ref, v_ref)，参考点取目标沿视线后退 standoff 的保持点，
-        // 速度前馈即控制律输出；位置环只做 PX4 兜底锚点。
-        bool law_applied = false;
-        if (approach_.speed_law.enabled && target.valid &&
-            target.header.frame_id == kFrameLocalNed &&
-            std::isfinite(target.pos_x_m) && std::isfinite(target.pos_y_m) &&
-            latest_flight_.has_value() &&
-            latest_flight_->local_position_valid) {
+        // 接近段速度律（2026-11-11 起 S5 唯一引导方式）：直接产出
+        // (p_ref, v_ref)，位置环只做速度指令的兜底锚点。
+        if (!target.valid || target.header.frame_id != kFrameLocalNed ||
+            !std::isfinite(target.pos_x_m) || !std::isfinite(target.pos_y_m) ||
+            !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            const uint64_t count = ++approach_law_skip_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("S5 速度律跳过：目标/局部位置无效 count={}", count);
+            }
+            return;
+        }
+        {
             control::ApproachInput law_input;
             law_input.own_valid = true;
             law_input.target_valid = true;
@@ -3773,7 +3711,25 @@ private:
                     std::max(law_speed, 0.5));
                 ApplyHeadingToward(position_target, target.pos_x_m,
                                    target.pos_y_m);
-                law_applied = true;
+                if (now_ms - approach_diag_last_ms_ >= 1000) {
+                    approach_diag_last_ms_ = now_ms;
+                    SPDLOG_INFO(
+                        "S5 速度律: d={:.2f}m |v_ref|={:.2f} max_speed={:.2f} "
+                        "phase={} ref=({:.2f},{:.2f},{:.2f}) own=({:.2f},{:.2f},"
+                        "{:.2f}) v_own=({:.2f},{:.2f},{:.2f})",
+                        law_out.distance_m, law_speed,
+                        static_cast<double>(position_target.max_speed_mps),
+                        control::ApproachPhaseName(law_out.phase),
+                        static_cast<double>(position_target.x),
+                        static_cast<double>(position_target.y),
+                        static_cast<double>(position_target.z),
+                        static_cast<double>(latest_flight_->local_x_m),
+                        static_cast<double>(latest_flight_->local_y_m),
+                        static_cast<double>(latest_flight_->local_z_m),
+                        static_cast<double>(latest_flight_->vx_mps),
+                        static_cast<double>(latest_flight_->vy_mps),
+                        static_cast<double>(latest_flight_->vz_mps));
+                }
                 if (!approach_speed_law_logged_) {
                     approach_speed_law_logged_ = true;
                     SPDLOG_INFO(
@@ -3790,29 +3746,13 @@ private:
                         static_cast<double>(position_target.feedforward_vy_mps),
                         static_cast<double>(position_target.feedforward_vz_mps));
                 }
+            } else {
+                const uint64_t count = ++approach_law_skip_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN("S5 速度律输出无效（输入不完整）count={}", count);
+                }
+                return;
             }
-        }
-        // 关闭速度律或本拍输入不足时回退旧位置引导点 + 固定提前策略。
-        if (!law_applied) {
-            ApplyApproachPolicy(position_target, /*with_heading=*/true);
-        }
-
-        const bool content_changed = law_applied || !last_intent_target_.has_value() ||
-            !FloatContentEqual(last_intent_target_->pos_x_m, target.pos_x_m) ||
-            !FloatContentEqual(last_intent_target_->pos_y_m, target.pos_y_m) ||
-            !FloatContentEqual(last_intent_target_->pos_z_m, target.pos_z_m) ||
-            last_intent_target_->valid != target.valid ||
-            last_intent_target_->velocity_valid_mask != target_ff_mask ||
-            ((target_ff_mask & common::kVelocityValidNorth) != 0 &&
-             !FloatContentEqual(last_intent_target_->vel_x_mps, target.vel_x_mps)) ||
-            ((target_ff_mask & common::kVelocityValidEast) != 0 &&
-             !FloatContentEqual(last_intent_target_->vel_y_mps, target.vel_y_mps)) ||
-            ((target_ff_mask & common::kVelocityValidDown) != 0 &&
-             !FloatContentEqual(last_intent_target_->vel_z_mps, target.vel_z_mps));
-        if (position_intent_source_ == PositionIntentSource::kEstimate &&
-            !content_changed &&
-            now_ms - last_intent_publish_ms_ < kIntentRepublishIntervalMs) {
-            return;
         }
         if (position_intent_source_ != PositionIntentSource::kEstimate) {
             SPDLOG_INFO(
@@ -3827,6 +3767,7 @@ private:
                 static_cast<double>(position_target.feedforward_vz_mps));
             position_intent_source_ = PositionIntentSource::kEstimate;
         }
+        last_s5_position_target_ = position_target;
         PublishPositionIntent(position_target, now_ms);
         last_intent_target_ = target;
     }
@@ -4664,11 +4605,8 @@ private:
                 BeginTargetWatchdog(now_ms);
                 // 到点/未识别计时同拍复位：换一段接近必须重新累计。
                 handover_wait_tracker_.Reset();
-                // 新一段接近：引导点低通从当前目标重新对齐，避免沿用上段状态。
-                guide_filter_valid_ = false;
             } else if (next_state == common::MissionState::kVisualHandover) {
-                // S6 冻结段必须精确保持交接点：低通重新对齐，不继承 S5 的滤波状态。
-                guide_filter_valid_ = false;
+                // S6 冻结段保持交接时刻最后一条 S5 意图（见 FreezeHandoverTarget）。
             }
         }
         PublishStatus(now_ms);
@@ -4902,8 +4840,13 @@ private:
     PositionIntentSource position_intent_source_ = PositionIntentSource::kNone;
     /// S5 接近速度律启动日志一次性标记（每进程只打一次，避免热路径刷屏）。
     bool approach_speed_law_logged_ = false;
+    /// S5 速度律输入无效/输出无效的节流计数。
+    uint64_t approach_law_skip_count_ = 0;
+    /// S5 速度律 1Hz 诊断日志计时（d/v_ref/max_speed/phase/自机状态）。
+    uint64_t approach_diag_last_ms_ = 0;
     /// S5→S6 冻结的最后位置目标（进入时刻的估计快照；交接段结束清空）。
-    std::optional<common::TargetState> frozen_handover_target_;
+    std::optional<PositionIntentTarget> frozen_position_target_;  ///< S6/S7 冻结的 p_ref/航向
+    std::optional<PositionIntentTarget> last_s5_position_target_;  ///< 最后一条 S5 位置意图（交接冻结用）
     /// S7 段内是否已发出首条视觉意图（冻结续发的收口条件）。
     bool s7_servo_started_ = false;
     /// S7 本拍是否实际发出视觉伺服意图（背离告警位 kWarningServoSuspended
@@ -5018,11 +4961,7 @@ private:
     uint64_t last_intent_publish_ms_ = 0;
     uint64_t intent_stale_count_ = 0;
     // ---- 引导点一阶低通（approach.guide_lowpass_ms，2026-11-02）----
-    bool guide_filter_valid_ = false;   ///< 首次进入接近段时直接对齐目标
-    uint64_t guide_filter_ms_ = 0;      ///< 上一拍低通时刻（单调时钟）
-    double guide_filter_x_ = 0.0;       ///< 低通后的引导点（本地 NED）
-    double guide_filter_y_ = 0.0;
-    double guide_filter_z_ = 0.0;
+    // 旧位置引导点低通状态已随 ApplyApproachPolicy 删除（2026-11-11）。
     std::optional<common::TargetState> last_intent_target_;  ///< 上次发布意图对应的目标内容
 
     common::Topic<common::ControlIntent> intent_output_;
