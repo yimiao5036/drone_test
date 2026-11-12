@@ -57,6 +57,27 @@ common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
                                  const common::Vec2Ned& point,
                                  double margin_m);
 
+/// 沿给定方向到多边形边界的**首个交点距离**（米，纯函数）。
+/// 用于"沿飞行方向预测停止点"：飞机在界内、方向单位化后，返回射线第一次
+/// 穿出边界的距离（凹多边形也取第一交点，不会"穿出又穿回"被漏判）。
+/// - 起点在界外：返回 0（调用方按已越界处理）；
+/// - 方向退化/非有限、多边形顶点 < 3：返回 +inf（不限制）。
+double RayDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
+                             const common::Vec2Ned& origin,
+                             const common::Vec2Ned& direction);
+
+/// 停止距离（米）：`v·reaction_s + v²/(2·decel_mps2)`。
+/// `v<=0` 返回 0；`decel<=0` 且 `v>0` 返回 +inf（表示不启用预测）。
+double StopDistance(double speed_mps, double decel_mps2, double reaction_s);
+
+/// 由可用距离反解允许速度（m/s）：解 `v·τ + v²/(2a) = distance`，
+/// 取正根 `v = −aτ + √((aτ)² + 2a·distance)`。
+/// `distance<=0` 返回 0（必须刹车/保持）；`a<=0` 返回 +inf（不限制）。
+/// **返回值可能为 0**：控制器把 `max_speed_mps=0` 解释为"未填相位上限"，
+/// 调用方必须抬到小正数（见 `MissionStateMachine` 的预测限速）。
+double AllowedSpeedForStop(double distance_m, double decel_mps2,
+                           double reaction_s);
+
 /// 多边形质心（顶点算术平均；仅用于内法线方向的兜底判定）。
 common::Vec2Ned Centroid(const std::vector<common::Vec2Ned>& polygon);
 

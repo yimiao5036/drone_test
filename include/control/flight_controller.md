@@ -175,7 +175,15 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
 
 1. 读取 `LatestFencePolygon()`；`vertices.size() >= 3` 才视为生效（否则完全回退旧行为）。
 2. 位置设定值经 `fence::ClampIntoPolygon(vertices, {x,y}, controller.fence_margin_m)` 回拉，
-   位移 > 1e-6m 即计数 `clamped_count_` 并打节流 WARN（带 zone_id/version、位移、累计次数）。
+   位移 > 1e-6m 即计数并打节流 WARN（带 zone_id/version、位移、累计次数）。
+   **计数与日志独立**（2026-11-12）：围栏钳制另计 `FenceClampedCount()`，并使用
+   自己的节流窗口。此前与速度幅值/前馈钳制共用 `ClampedCount()` 与同一份
+   节流（第 1 次 + 每满 100 次），而前馈钳制每拍都可能触发
+   （`前馈水平幅值钳制 |v|=10.00 > max=10.00` 刷屏），把围栏钳制日志完全挤出
+   窗口——现场无法确认"钳制到底有没有生效"（0120 日志实证：全程没有一条
+   `围栏多边形钳制`）。**同时**给前馈幅值比较加 1e-4 余量：速度律指令上限与
+   控制器上限同为 10.0，float 转换误差让 `hypot` 得到 10.0000001，旧实现据此
+   每拍误判成"超限"并钳制。
 3. **没有圆形兜底**（2026-10-29 删除）：多边形不生效时不做水平钳制——围栏
    只有地面站划定的多边形这一种形态，缺区域即无围栏，靠状态机围栏守卫（65019
    上报 `no_zone`）与 PX4 侧参数兜底。
@@ -233,7 +241,10 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   2. 逐轴有限性降级：置位轴非有限 → 只清该轴、值写 0、`FeedforwardDroppedCount+1`，
      **位置照常发布**（前馈是增强项，不因坏值拒绝整条意图）；
   3. 水平有效分量 `hypot` 超 `max_feedforward_mps` → 等比缩放，`ClampedCount+1`；
-     垂直 D 分量按绝对值保号钳制，`ClampedCount+1`；
+     垂直 D 分量按绝对值保号钳制，`ClampedCount+1`。
+     **比较留 1e-4 余量**（2026-11-12）：状态机速度律给出的指令上限与该上限同为
+     10.0，float 往返转换后 `hypot` 会略大于 10.0，旧实现据此每拍触发钳制并
+     刷 `|v|=10.00 > max=10.00`，把同节的围栏钳制日志挤出节流窗口。
   4. 写入 `Px4Setpoint.feedforward_*`。
 - **不做 slew**：与位置通道“透传不 slew”一致；前馈阶跃由 PX4 速度环/倾角限制吸收。
 - **参与位置围栏的方式（2026-11-11 修正）**：围栏只钳制位置目标；前馈是速度量，
@@ -246,7 +257,8 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
   起步”守卫处理，前馈不参与斜坡初值。
 - **坐标系**：前馈为局部 NED（与位置目标同帧），控制器不做二次旋转。
 - **诊断/日志**：`ClampedCount` 现包含速度幅值 + 位置围栏 + 位置前馈钳制；
-  新增 `FeedforwardDroppedCount()`（非有限/未知掩码丢弃轴次）。启动日志带
+  **围栏钳制另计 `FenceClampedCount()`**（2026-11-12，独立节流窗口，避免被
+  前馈刷屏挤出）；新增 `FeedforwardDroppedCount()`（非有限/未知掩码丢弃轴次）。启动日志带
   `feedforward=on/off cap=...`；钳制/丢弃按第 1 次与每满 100 次节流 WARN。
 - **测试**：`FlightControllerPipelineTest.PositionFeedforwardIgnoredWhenSwitchOff`；
   `FlightControllerFeedforwardTest.*`（透传、水平/垂直独立钳制、逐轴非有限降级、

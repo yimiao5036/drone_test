@@ -210,6 +210,8 @@ public:
     uint64_t ErrorCount() const { return error_count_.load(); }
     uint64_t RejectedIntentCount() const { return rejected_intent_count_.load(); }
     uint64_t ClampedCount() const { return clamped_count_.load(); }
+
+    uint64_t FenceClampedCount() const { return fence_clamped_count_.load(); }
     uint64_t FeedforwardDroppedCount() const {
         return feedforward_dropped_count_.load();
     }
@@ -803,7 +805,8 @@ private:
                 target_x = clamped.north_m;
                 target_y = clamped.east_m;
                 fence_target_clamped = true;
-                const uint64_t count = ++clamped_count_;
+                ++clamped_count_;
+                const uint64_t count = ++fence_clamped_count_;
                 if (ShouldLogThrottled(count)) {
                     SPDLOG_WARN(
                         "飞行控制器围栏多边形钳制: zone={}/{} 位移={:.2f}m "
@@ -843,7 +846,8 @@ private:
                     // 高度同样属于围栏：垂直前馈也要清空，避免"钳在高度带内、
                     // 前馈继续往上顶"的同类对抗。
                     fence_target_clamped = true;
-                    const uint64_t count = ++clamped_count_;
+                    ++clamped_count_;
+                    const uint64_t count = ++fence_clamped_count_;
                     if (ShouldLogThrottled(count)) {
                         SPDLOG_WARN(
                             "飞行控制器围栏高度钳制: h={:.2f} > 区域上限={:.2f} "
@@ -967,9 +971,14 @@ private:
             take_axis(common::kVelocityValidEast, intent.feedforward_vy_mps, ff_vy);
             take_axis(common::kVelocityValidDown, intent.feedforward_vz_mps, ff_vz);
             // 水平模长独立钳制（方向不变）；垂直分量保号钳制。
+            // 浮点比较留 1e-4 余量（2026-11-12）：状态机的速度律指令上限与
+            // 控制器上限同为 10.0，float 转换误差会让 hypot 得到 10.0000001，
+            // 旧实现据此每拍触发钳制并刷 `|v|=10.00 > max=10.00` 日志，
+            // 把同节的围栏钳制日志挤出节流窗口。
+            constexpr double kClampEps = 1e-4;
             const double horizontal =
                 std::hypot(static_cast<double>(ff_vx), static_cast<double>(ff_vy));
-            if (horizontal > config_.max_feedforward_mps) {
+            if (horizontal > config_.max_feedforward_mps + kClampEps) {
                 const double scale = config_.max_feedforward_mps / horizontal;
                 ff_vx = static_cast<float>(ff_vx * scale);
                 ff_vy = static_cast<float>(ff_vy * scale);
@@ -982,7 +991,8 @@ private:
             }
             const double ff_vz_before_clamp = static_cast<double>(ff_vz);
             if ((ff_mask & common::kVelocityValidDown) != 0 &&
-                std::fabs(ff_vz_before_clamp) > config_.max_feedforward_mps) {
+                std::fabs(ff_vz_before_clamp) >
+                    config_.max_feedforward_mps + kClampEps) {
                 ff_vz = ff_vz_before_clamp > 0.0
                             ? static_cast<float>(config_.max_feedforward_mps)
                             : static_cast<float>(-config_.max_feedforward_mps);
@@ -1070,6 +1080,9 @@ private:
     std::atomic<uint64_t> rejected_intent_count_{0};
     std::atomic<uint64_t> error_count_{0};
     std::atomic<uint64_t> clamped_count_{0};
+    /// 围栏钳制独立计数（2026-11-12）：与 clamped_count_ 同步递增，但只统计
+    /// 位置目标被多边形水平/高度钳制，供现场确认钳制是否真的在生效。
+    std::atomic<uint64_t> fence_clamped_count_{0};
     std::atomic<uint64_t> feedforward_dropped_count_{0};
 
     // 限幅流水线状态（仅周期线程访问；成员声明在 config_ 之后，
@@ -1119,6 +1132,10 @@ uint64_t FlightController::RejectedIntentCount() const {
 }
 
 uint64_t FlightController::ClampedCount() const { return impl_->ClampedCount(); }
+
+uint64_t FlightController::FenceClampedCount() const {
+    return impl_->FenceClampedCount();
+}
 
 uint64_t FlightController::FeedforwardDroppedCount() const {
     return impl_->FeedforwardDroppedCount();

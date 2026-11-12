@@ -629,6 +629,27 @@ void ReturnHomeConfig::Validate() const {
     if (!std::isfinite(cruise_speed_mps) || cruise_speed_mps <= 0.0) {
         throw std::invalid_argument("return_home.cruise_speed_mps 必须为有限正数");
     }
+    // 返航速度剖面（2026-11-12）：加/减速允许为 0（=该段不做斜坡），但不得为负；
+    // 有斜坡时末端低速档必须不高于巡航顶速，否则剖面自相矛盾。
+    if (!std::isfinite(accel_plan_mps2) || accel_plan_mps2 < 0.0) {
+        throw std::invalid_argument("return_home.accel_plan_mps2 必须为有限非负数");
+    }
+    if (!std::isfinite(decel_plan_mps2) || decel_plan_mps2 < 0.0) {
+        throw std::invalid_argument("return_home.decel_plan_mps2 必须为有限非负数");
+    }
+    if (!std::isfinite(brake_safety) || brake_safety < 1.0) {
+        throw std::invalid_argument("return_home.brake_safety 必须 >= 1");
+    }
+    if (!std::isfinite(final_speed_mps) || final_speed_mps <= 0.0) {
+        throw std::invalid_argument("return_home.final_speed_mps 必须为有限正数");
+    }
+    if (final_speed_mps > cruise_speed_mps) {
+        throw std::invalid_argument(
+            "return_home.final_speed_mps 不得大于 cruise_speed_mps");
+    }
+    if (!std::isfinite(final_zone_m) || final_zone_m < 0.0) {
+        throw std::invalid_argument("return_home.final_zone_m 必须为有限非负数");
+    }
     if (!std::isfinite(arrival_radius_m) || arrival_radius_m <= 0.0) {
         throw std::invalid_argument("return_home.arrival_radius_m 必须为有限正数");
     }
@@ -678,6 +699,32 @@ void FenceConfig::Validate() const {
     if (boundary_warn_m < boundary_margin_m) {
         throw std::invalid_argument(
             "fence.boundary_warn_m 必须 >= fence.boundary_margin_m");
+    }
+    // 越界深度容差与回界滞回（2026-11-12）：零容差是历史行为，允许；负值非法。
+    if (!std::isfinite(violation_depth_m) || violation_depth_m < 0.0) {
+        throw std::invalid_argument("fence.violation_depth_m 必须为有限非负数");
+    }
+    if (!std::isfinite(violation_hysteresis_m) || violation_hysteresis_m < 0.0) {
+        throw std::invalid_argument("fence.violation_hysteresis_m 必须为有限非负数");
+    }
+    // 回界滞回必须落在深度容差带内（2026-11-12）：清除阈值是
+    // −violation_depth_m + violation_hysteresis_m。若滞回大于深度，阈值会跑到
+    // 边界内侧，飞机停在界外但仍在容差内时会被一直判越界、持续累计时长，
+    // 防抖凑满后照样中止——容差形同虚设（见 EvaluateFenceGuard 的实现注释）。
+    if (violation_hysteresis_m > violation_depth_m) {
+        throw std::invalid_argument(
+            "fence.violation_hysteresis_m 不得大于 fence.violation_depth_m"
+            "（回界滞回必须落在容差带内）");
+    }
+    if (!std::isfinite(guide_hold_release_m) || guide_hold_release_m < 0.0) {
+        throw std::invalid_argument("fence.guide_hold_release_m 必须为有限非负数");
+    }
+    // 停止点预测参数（2026-11-12 复审三轮）：0=关闭预测，负值非法。
+    if (!std::isfinite(guard_decel_mps2) || guard_decel_mps2 < 0.0) {
+        throw std::invalid_argument("fence.guard_decel_mps2 必须为有限非负数");
+    }
+    if (!std::isfinite(guard_reaction_s) || guard_reaction_s < 0.0) {
+        throw std::invalid_argument("fence.guard_reaction_s 必须为有限非负数");
     }
     if (status_period.count() <= 0) {
         throw std::invalid_argument("fence.status_period_ms 必须为正");
@@ -1063,6 +1110,17 @@ AppConfig LoadAppConfig(const std::string& path,
         return_home, "climb_rate_mps", config.return_home.climb_rate_mps);
     config.return_home.cruise_speed_mps = ReadOptionalPositiveDouble(
         return_home, "cruise_speed_mps", config.return_home.cruise_speed_mps);
+    // 返航速度剖面（2026-11-12）：起步加速 / 超速减速 / 末端低速档。
+    config.return_home.accel_plan_mps2 = ReadOptionalNonNegativeDouble(
+        return_home, "accel_plan_mps2", config.return_home.accel_plan_mps2);
+    config.return_home.decel_plan_mps2 = ReadOptionalNonNegativeDouble(
+        return_home, "decel_plan_mps2", config.return_home.decel_plan_mps2);
+    config.return_home.brake_safety = ReadOptionalPositiveDouble(
+        return_home, "brake_safety", config.return_home.brake_safety);
+    config.return_home.final_speed_mps = ReadOptionalPositiveDouble(
+        return_home, "final_speed_mps", config.return_home.final_speed_mps);
+    config.return_home.final_zone_m = ReadOptionalNonNegativeDouble(
+        return_home, "final_zone_m", config.return_home.final_zone_m);
     config.return_home.arrival_radius_m = ReadOptionalPositiveDouble(
         return_home, "arrival_radius_m", config.return_home.arrival_radius_m);
     config.return_home.arrival_vertical_m = ReadOptionalPositiveDouble(
@@ -1142,6 +1200,19 @@ AppConfig LoadAppConfig(const std::string& path,
         fence, "boundary_margin_m", config.fence.boundary_margin_m);
     config.fence.boundary_warn_m = ReadOptionalNonNegativeDouble(
         fence, "boundary_warn_m", config.fence.boundary_warn_m);
+    // 越界深度容差 + 回界滞回 + 贴边保持（2026-11-12）。
+    config.fence.violation_depth_m = ReadOptionalNonNegativeDouble(
+        fence, "violation_depth_m", config.fence.violation_depth_m);
+    config.fence.violation_hysteresis_m = ReadOptionalNonNegativeDouble(
+        fence, "violation_hysteresis_m", config.fence.violation_hysteresis_m);
+    config.fence.guide_hold_enabled =
+        fence.value("guide_hold_enabled", config.fence.guide_hold_enabled);
+    config.fence.guide_hold_release_m = ReadOptionalNonNegativeDouble(
+        fence, "guide_hold_release_m", config.fence.guide_hold_release_m);
+    config.fence.guard_decel_mps2 = ReadOptionalNonNegativeDouble(
+        fence, "guard_decel_mps2", config.fence.guard_decel_mps2);
+    config.fence.guard_reaction_s = ReadOptionalNonNegativeDouble(
+        fence, "guard_reaction_s", config.fence.guard_reaction_s);
     config.fence.follow_zone_action =
         fence.value("follow_zone_action", config.fence.follow_zone_action);
     config.fence.violation_action = static_cast<common::FenceAction>(

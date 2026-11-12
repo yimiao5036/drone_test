@@ -228,4 +228,39 @@ TEST(FenceGeometryTest, ValidateZoneAcceptsNegativeAltMin) {
     EXPECT_FALSE(ValidateZone(zone, nullptr));
 }
 
+// 沿飞行方向到边界的首个交点（2026-11-12 复审三轮）：用于停止点预测。
+TEST(FenceGeometryTest, RayDistanceToBoundaryFirstExit) {
+    const auto square = Square();
+    // 中心向东（east 方向 = {0,1}）→ 50m；向北 → 50m。
+    EXPECT_NEAR(RayDistanceToBoundary(square, {0.0, 0.0}, {0.0, 1.0}), 50.0, 1e-9);
+    EXPECT_NEAR(RayDistanceToBoundary(square, {0.0, 0.0}, {1.0, 0.0}), 50.0, 1e-9);
+    // 距东边界 10m、朝东 → 10m。
+    EXPECT_NEAR(RayDistanceToBoundary(square, {0.0, 40.0}, {0.0, 1.0}), 10.0, 1e-9);
+    // 起点已在界外 → 0；方向退化 / 多边形退化 → +inf。
+    EXPECT_DOUBLE_EQ(RayDistanceToBoundary(square, {0.0, 60.0}, {0.0, 1.0}), 0.0);
+    EXPECT_TRUE(std::isinf(RayDistanceToBoundary(square, {0.0, 0.0}, {0.0, 0.0})));
+    EXPECT_TRUE(std::isinf(
+        RayDistanceToBoundary({{0.0, 0.0}, {1.0, 1.0}}, {0.0, 0.0}, {0.0, 1.0})));
+    // 凹多边形：从 (north=40, east=10) 向东，第一交点应在 east=30（L 形缺口前），
+    // 不是穿出又穿回。
+    const auto concave = ConcaveL();
+    EXPECT_NEAR(RayDistanceToBoundary(concave, {40.0, 10.0}, {0.0, 1.0}), 20.0, 1e-9);
+}
+
+// 停止距离与允许速度（2026-11-12 复审三轮）：v·τ + v²/(2a) 的闭式解。
+TEST(FenceGeometryTest, StopDistanceAndAllowedSpeedAreInverse) {
+    // v=10、a=2、τ=0.2 → 2 + 25 = 27m。
+    EXPECT_NEAR(StopDistance(10.0, 2.0, 0.2), 27.0, 1e-9);
+    EXPECT_DOUBLE_EQ(StopDistance(0.0, 2.0, 0.2), 0.0);
+    EXPECT_TRUE(std::isinf(StopDistance(1.0, 0.0, 0.2)));
+    // 可用 27m 反解回 10 m/s。
+    EXPECT_NEAR(AllowedSpeedForStop(27.0, 2.0, 0.2), 10.0, 1e-9);
+    // 可用 8.85m → −0.4 + √(0.16+35.4) = 5.5632。
+    EXPECT_NEAR(AllowedSpeedForStop(8.85, 2.0, 0.2), 5.5632, 1e-3);
+    // 没有可用距离 → 0（调用方必须抬到正数）；a<=0 → +inf（不限制）。
+    EXPECT_DOUBLE_EQ(AllowedSpeedForStop(0.0, 2.0, 0.2), 0.0);
+    EXPECT_DOUBLE_EQ(AllowedSpeedForStop(-1.0, 2.0, 0.2), 0.0);
+    EXPECT_TRUE(std::isinf(AllowedSpeedForStop(10.0, 0.0, 0.2)));
+}
+
 }  // namespace drone::control::fence

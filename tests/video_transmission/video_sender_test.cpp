@@ -142,7 +142,12 @@ TEST_F(VideoSenderTest, SendsFramesToBackend) {
     ASSERT_TRUE(sender->Start());
 
     PublishFrame();
-    EXPECT_TRUE(WaitFor([mock] { return mock->encode_count == 1; }));
+    // 后端 EncodeFrame 返回后发送器还要累计时延、再 ++sent_count。只等
+    // encode_count 会与下面的计数断言竞态（2026-11-12 全量跑偶发失败一次），
+    // 这里把 sent_count 一并作为条件（它是最后一步，能覆盖时延统计）。
+    EXPECT_TRUE(WaitFor([&] {
+        return mock->encode_count == 1 && sender->SentFrameCount() == 1u;
+    }));
     EXPECT_EQ(sender->SentFrameCount(), 1u);
     EXPECT_EQ(sender->EncodeAndPushLatency().total_count, 1u);
     EXPECT_EQ(sender->DroppedFrameCount(), 0u);

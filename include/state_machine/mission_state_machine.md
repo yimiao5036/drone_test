@@ -119,6 +119,48 @@ bit7 只提示、不改变动作——越界处置仍由 `fence.violation_action
 每拍重算，引导点回到区域内即清除（跃变时打一条 WARN「引导点越出围栏」）。
 地面站消费口径见 `docs/数据接口文档.md` §3.4。
 
+**2026-11-12 起 bit7 覆盖贴边保持**：制导层钳制（见下「S5 贴边保持」）会把引导点
+主动拉回界内，若只按"引导点在多边形外"判定，告警会永久消失——而操作员恰恰需要
+知道"目标在区域外、飞机被围栏挡住"。因此新增判据：处于 S5/S6/S7 且
+`guide_edge_hold_=true` 时同样置 bit7。中止/离开跟踪链（S12、S3/S4 等）时清
+`guide_edge_hold_`，避免跨任务沿用旧滞回阈值（2026-11-12 复审）。
+
+**预测越界告警位 bit8（2026-11-12 复审三轮）**：`MissionStatus.active_warning_bits`
+bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）。S5/S6/S7 任一
+路径的预测限速生效即置位；与 bit7（引导点已经在界外）区分，条件解除即清除。
+消费口径见 `docs/数据接口文档.md` §3.1。
+
+**围栏停止点预测（2026-11-12 复审三轮，维护者裁决"两级越界判断"）**：
+第一重仍是 `EvaluateFenceGuard()` 的**当前自身位置**判定（深度容差 + 回界滞回 +
+防抖 + 区域动作）。第二重是**沿实测速度方向的停止点预测**
+（`PredictiveFenceSpeedCap()`）：
+`p_stop = own + v̂·(v·guard_reaction_s + v²/(2·guard_decel_mps2))`；
+用 `fence::RayDistanceToBoundary()` 取到边界的**首个**交点，若 `p_stop` 越过边界
+（含 `boundary_margin_m`）则反解允许速度
+`v = −aτ + √((aτ)² + 2a·(d−margin))` 作为本拍速度上限（下限 0.1 m/s：
+`max_speed_mps=0` 在控制器侧是"未填上限→回退硬上限"）。
+- **只提前限速/保持，不中止**；实际越界仍由第一重处置。
+- 适用 S5/S6（位置引导：`max_speed_mps=min(当前,允许)`）与 S7/S9/S10
+  （速度意图：速度通道没有控制器的位置钳制；允许速度 ≤0.15 m/s 时清零平移
+  速度做**贴边悬停**，偏航跟踪保留并置 bit8）。
+- 方向取**实测速度**（<0.5 m/s 不启用，交几何保持）；减速度取可达值，
+  **不要用接近律当前相位的计划加速度**；`guard_decel_mps2=0` 关闭预测。
+
+**S5 贴边保持（2026-11-12，维护者裁决"贴边保持 + 告警、不中止"）**：
+`ApplyGuideEdgeHold()` 在 `PublishEstimateGuidedIntent()` 组装完速度律输出后执行。
+**先叠加上述停止点预测限速**（与参考点是否被挡住解耦——10 m/s 的物理刹停距离
+约 17 m，等参考点出界才把限速砸到 0.5 已经太晚），再判几何保持：
+参考点距边界不足 `boundary_margin_m`（含界内侧预警带，界外当然也算）→ 进入保持；
+参考点回到界内且距边界超过 `fence.guide_hold_release_m`（默认 2 m）→ 解除（滞回）。
+进入后做三件事，**全部在制导层**：
+1. 位置目标钳到多边形内（`fence::ClampIntoPolygon()` + `boundary_margin_m`）；
+2. 三轴速度前馈与前馈掩码全部清零（不再朝外顶）；
+3. `max_speed_mps` 取 `min(当前, 0.5)`（贴边微调；预测限速可能已压得更低）。
+
+**不改变任务状态、不发 65015**：任务继续在 S5 等待目标回界内。
+`fence.guide_hold_enabled=false` 可回退到 2026-11-11 行为（只靠控制器逐拍钳制）。
+进入/解除各打一条日志（`S5 贴边保持: 目标越出区域…` / `S5 贴边保持解除: 目标回界内…`）。
+
 **G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`enter_s6_lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
 
 本阶段仍不做以下事情：
@@ -398,8 +440,22 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     给地面站对拍。`fence.enabled` 默认已改为 `true`。
   - 判定：`EvaluateFenceGuard()` 排在电池守卫之后、目标看门狗之前（几何安全事件：
     优先级低于电池、高于任务）。用 `PointInPolygon()` 与 `SignedDistanceToBoundary()`
-    得出 `kNormal / kNearBoundary（距离 ≤ boundary_warn_m）/ kViolated（出区或超高度带）`，
+    得出 `kNormal / kNearBoundary（距离 ≤ boundary_warn_m）/ kViolated`，
     越界持续到 `violation_debounce_ms` 才动作，避免单帧抖动触发中止链。
+  - **越界深度容差 + 回界滞回（2026-11-12）**：水平越界不再用零容差。判据改为
+    「飞机自身位置越出边界超过 `violation_depth_m`（默认 1.5 m）才算越界；
+    已判越界后要退到 `−violation_depth_m + violation_hysteresis_m`（默认 −1.0 m）
+    才清除」（实现为 `fence_depth_violated_` 迟滞状态）。
+    **滞回落在容差带内、不在边界内侧**：若把清除阈值放到边界内侧（如 +0.5 m），
+    飞机停在边界外但仍在容差内的位置（如 −0.9 m）会一直判越界并持续累计时长，
+    防抖凑满后照样中止——那等于容差没生效。
+    根因：0120 现场日志显示目标贴边时飞机被位置环顶出边界 1~3 m 又被拉回，
+    零容差把一次 1.4 m 的瞬时穿透判成越界，防抖凑满 1.5 s 后直接中止返航
+    （操作员描述"波动两下就返航"）。两个参数都为 0 时退化为历史零容差语义。
+    65019 的 `distance_to_boundary_m` 仍如实上报带符号距离（内正外负），
+    只是不再据此动作。**65018 区域内容变化（含同 id 新 version）时必须复位
+    `fence_depth_violated_`**：否则新区域会沿用旧回界阈值、把本在容差内的点
+    持续判越界（2026-11-12 复审；用例 `FenceViolationClearNeedsHysteresis` 覆盖）。
   - 高度带语义（2026-10-30 现场日志 0078 修正，**2026-11-04 换基准**）：`altitude_reference=1`
     （相对起飞点，原"相对 Home"）的高度由 **EKF 差分**给出——
     `相对高度基准 − local_z_m`，基准统一取 `common::RelativeAltitudeBaseZ()`：
@@ -745,11 +801,36 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `HomeLocalNed().down_m`，仍无则悬停告警。位置意图 10Hz 重发，
     `reason_code` 低位=8
     （`kReasonReturnHome`），不带速度前馈。**爬升与水平段都带相位速度上限**
-    （2026-11-03）：爬升段 `max_speed_mps=climb_rate_mps`（默认 0.5）、水平段
-    `max_speed_mps=cruise_speed_mps`（默认 3.0），由控制器“位置引导限速”逐拍推进
-    ——此前不带上限，位置目标从当前高度阶跃到 5m，PX4 按自身
+    （2026-11-03）：爬升段 `max_speed_mps=climb_rate_mps`（默认 0.5）；水平段
+    **由返航速度剖面逐拍给出**（2026-11-12，见下条），由控制器“位置引导限速”
+    逐拍推进——此前不带上限，位置目标从当前高度阶跃到 5m，PX4 按自身
     `MPC_Z_VEL_MAX_UP`（3m/s）冲上去，实机反馈“低于 5m 时上升很快”。PX4 离开
     Offboard（failsafe/人工）→ 立即停发、转 S13 仅监控，不与其争控。
+  - **返航速度剖面（2026-11-12，`control::return_speed_law`）**：水平段的
+    `max_speed_mps` 不再是固定 `cruise_speed_mps`，而是纯函数
+    `ComputeReturnSpeed()` 按**分段恒定加速度**给出的本拍速率上限。
+    巡航顶速 `cruise_speed_mps` 定为 **4.0 m/s**，**独立于追踪速度**
+    （`controller.max_speed_mps=10`）——返航是安全收口，顶速不需要跟追踪同量级。
+    剖面覆盖三种必须区分的现场情形：
+    ① **起步加速**：目标未运动/已掉落，飞机被追停到 0 才进返航 → 从实测 0 按
+    `accel_plan_mps2`(1.5) 斜坡升到 4；
+    ② **超速减速**：始终追不上目标而中转返航，飞机速度可能高于 4 → 按
+    `decel_plan_mps2`(2.0) 斜坡先降回 4（指令允许暂时高于 cruise，否则斜坡失效）；
+    ③ **末端制动**：`v ≤ √(2·(decel/brake_safety)·(d−arrival_radius))`，
+    进入 `final_zone_m`(10m) 后顶速降为 `final_speed_mps`(1.0)。
+    **不做 jerk**（不变加速度）、**不做任何"追不上就加速"补偿**——返航目标是固定点，
+    永久可达；停滞只按上一条的 WARN 处理。起点用**实测地速**而非上一拍指令：
+    否则起步段剖面会"以为自己已在巡航"、永远给不出加速段。
+    进入 S12 时 `ResetReturnSpeedState()` 复位（本轮从当前实测速度重新起步）。
+    **输出下限 0.1 m/s**（2026-11-12 复审）：`max_speed_mps=0` 在控制器语义里
+    是"未填相位上限 → 回退硬上限 10 m/s"，末端包络收敛到 0 时若原样下发会把
+    最后几米变成不限速，必须抬到小正数；停车由到达判据 → S13 负责。
+    地速输入逐轴做有限性降级（坏轴按 0），避免 NaN 被当成"实测 0"重新起步。
+    完整口径见 `include/control/return_speed_law.md`。
+  - **无返航基准/无高度基准的悬停意图也限速**（2026-11-12）：`ReturnHorizontalTarget()`
+    或相对高度基准不可用时下发的是"当前位置"悬停意图，以前 `max_speed_mps`
+    传 0（控制器语义 = 回退硬上限 10 m/s）。虽然目标=当前位置本身不推进，但
+    一旦分支行为变动就会按 10 m/s 跑；现统一改传 `cruise_speed_mps`。
   - **到达判据**：水平距返航目标（起飞原点或 Home）≤`arrival_radius_m`（2m）、
     垂直误差 ≤`arrival_vertical_m`（0.5m）、水平速度 ≤`arrival_speed_mps`（0.5m/s）
     持续 `arrival_hold`（1s）→ S13。
@@ -805,16 +886,22 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - INFO：`围栏区域已更新: zone=../.. 顶点=.. 动作=.. 高度带=[..,..]m 基准=..`（仅内容变化时）、
   `围栏区域缓存已装载/已保存`、`任务状态机围栏区域输入已绑定`。
 - WARN：`围栏非法区域已忽略`（节流，带累计计数）、`围栏区域缓存不可用`、
-  `围栏越界保持: zone=../.. 距边界=..m`（节流）、`围栏越界中止: zone=../.. 距边界=..m 持续=..ms → S12 返航`。
+  `围栏越界保持: zone=../.. 距边界=..m`（节流）、`围栏越界中止: zone=../.. 距边界=..m 持续=..ms → S12 返航`、
+  `S5 贴边保持: 目标越出区域 …（保持贴边不中止任务，目标回界内后自动恢复）`（每次进入一条，
+  另有节流的累计次数）、`S5 贴边保持解除: 目标回界内 …`（INFO）。
 - 65019 由 `fence.status_period_ms` 控制上报节拍，本身不打日志（链路层有节流发送日志），
   否则 1Hz 状态会淹没热路径。
 
-返航速度诊断（2026-11-11）：
+返航速度诊断（2026-11-11；**2026-11-12 增剖面分级**）：
 
-- INFO：S12 期间每 1s 一行 `S12 返航摘要: 距目标=..m 垂直差=..m 地速=..m/s 指令上限=..m/s 爬升段=是/否 相对高度=..m`。
-  `指令上限` 爬升段取 `return_home.climb_rate_mps`、水平段取 `return_home.cruise_speed_mps`，
+- INFO：S12 期间每 1s 一行
+  `S12 返航摘要: 距目标=..m 垂直差=..m 地速=..m/s 指令上限=..m/s 剖面=.. 爬升段=是/否 相对高度=..m`。
+  `指令上限` 爬升段取 `return_home.climb_rate_mps`、水平段取**速度剖面本拍输出**；
+  `剖面` 为 `accel/cruise/decel/brake/final`（见 `include/control/return_speed_law.md`）；
   `地速` 是 EKF 水平速度模长。此前 S12 没有任何周期日志，只能靠"进入 S12 / 到达"两个
   时刻反推平均速度（165m/64s≈2.6m/s），无法判断是配置上限、执行滞后还是卡住。
+  判读：`剖面=cruise` 且地速≈指令上限 → 正常；`剖面=decel` 持续出现 → 超速回落
+  （追不上转返航进入）；`剖面=accel` 但地速不涨 → 查逆风/机体限幅。
 
 人工指令相关（2026-10-29）：
 

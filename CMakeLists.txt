@@ -169,6 +169,7 @@ add_library(drone_control_core STATIC
     src/control/flight_controller.cpp
     src/control/line_of_sight.cpp
     src/control/pid_controller.cpp
+    src/control/return_speed_law.cpp
     src/control/tracking_config.cpp
     src/control/tracking_control_law.cpp
     src/control/visual_control_law.cpp
@@ -420,6 +421,7 @@ if(BUILD_TESTING)
                 tracking_config_test
                 tracking_control_law_test
                 approach_speed_law_test
+                return_speed_law_test
                 visual_control_law_test
                 visual_tracking_shadow_test
                 flight_controller_test

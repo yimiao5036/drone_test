@@ -40,6 +40,19 @@ common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
 /// 顶点质心（退化输入返回 {0,0}）。
 common::Vec2Ned Centroid(const std::vector<common::Vec2Ned>& polygon);
 
+/// 沿方向到多边形边界的首个交点距离（界内→出界距离；界外→0；退化→+inf）。
+double RayDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
+                             const common::Vec2Ned& origin,
+                             const common::Vec2Ned& direction);
+
+/// 停止距离：v·τ + v²/(2a)；v<=0→0；a<=0 且 v>0→+inf（不启用）。
+double StopDistance(double speed_mps, double decel_mps2, double reaction_s);
+
+/// 由可用距离反解允许速度：−aτ + √((aτ)² + 2a·distance)；
+/// distance<=0→0（调用方必须抬到小正数）；a<=0→+inf（不限制）。
+double AllowedSpeedForStop(double distance_m, double decel_mps2,
+                           double reaction_s);
+
 /// 区域定义合法性校验（65018 / zone.json 共用）：成功返回 true；
 /// 失败返回 false 并写入中文原因（可为 nullptr）。检查项：
 /// zone_id/version 非 0、顶点 3~256、经纬度数值合法、边长 >= 0.5m、
@@ -54,7 +67,10 @@ bool ValidateZone(const common::FenceZone& zone, std::string* reason);
 数据流：`MissionStateMachine::ApplyFenceZone()` 在收 65018/装 `zone.json` 前调用
 `ValidateZone()` 拒收退化区域；`RebuildFencePolygon()` 得到顶点 NED →
 `FlightController::PublishPosition()` 每拍用 `ClampIntoPolygon()` 钳制位置设定值；
-状态机用 `PointInPolygon()` + `SignedDistanceToBoundary()` 判正常/接近/越界。
+状态机用 `PointInPolygon()` + `SignedDistanceToBoundary()` 判正常/接近/越界；
+S5/S6/S7 用 `RayDistanceToBoundary()` + `StopDistance()` 做"沿飞行方向的停止点
+预测"，越界时用 `AllowedSpeedForStop()` 反解允许速度（见
+`include/state_machine/mission_state_machine.md`「围栏停止点预测」）。
 
 ## 关键实现点
 
@@ -68,6 +84,10 @@ bool ValidateZone(const common::FenceZone& zone, std::string* reason);
   `margin_m`；若推进后仍在体外（凹角/尖锐角），再向质心方向二分退让，
   **最多 8 次、每次减半**，直到同时满足"在内且距边界 ≥ margin"或退让次数用尽。
   这一步是实机最容易出问题的地方：只沿单边法线内缩，凸角处会贴住另一条边（距离 0）。
+- **停止点预测（2026-11-12 复审三轮）**：`RayDistanceToBoundary()` 用射线与各边
+  求交取**首个**交点（凹多边形不会"穿出又穿回"漏判）；`StopDistance()` /
+  `AllowedSpeedForStop()` 是 `v·τ + v²/(2a)` 的正反解。三者都是纯代数；方向、
+  减速度、反应延迟由状态机给出，"0 上限"语义仍在调用方处理。
 - **无全局状态**：全部函数 const 且无分配（除返回 vector 外不建临时容器），
   可在 50ms 控制周期内每拍调用。
 - **区域合法性（2026-10-30 审查修复）**：`ValidateZone()` 把顶点按局部平面米近似

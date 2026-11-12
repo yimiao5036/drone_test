@@ -125,6 +125,70 @@ double SignedDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
     return PointInPolygon(polygon, point) ? distance : -distance;
 }
 
+double RayDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
+                             const common::Vec2Ned& origin,
+                             const common::Vec2Ned& direction) {
+    constexpr double kInf = std::numeric_limits<double>::infinity();
+    if (polygon.size() < 3U) {
+        return kInf;
+    }
+    const double length = std::hypot(direction.north_m, direction.east_m);
+    if (!std::isfinite(length) || length <= 0.0) {
+        return kInf;
+    }
+    if (!PointInPolygon(polygon, origin)) {
+        return 0.0;  // 已在界外：没有"允许的制动距离"
+    }
+    const common::Vec2Ned unit{direction.north_m / length,
+                               direction.east_m / length};
+    double nearest = kInf;
+    const std::size_t count = polygon.size();
+    for (std::size_t i = 0, j = count - 1; i < count; j = i++) {
+        const common::Vec2Ned& a = polygon[j];
+        const common::Vec2Ned& b = polygon[i];
+        const double edge_n = b.north_m - a.north_m;
+        const double edge_e = b.east_m - a.east_m;
+        const double denom = unit.north_m * edge_e - unit.east_m * edge_n;
+        if (std::fabs(denom) < 1e-12) {
+            continue;  // 射线与边平行
+        }
+        const double an = a.north_m - origin.north_m;
+        const double ae = a.east_m - origin.east_m;
+        const double t = (an * edge_e - ae * edge_n) / denom;
+        const double u = (an * unit.east_m - ae * unit.north_m) / denom;
+        if (t > 1e-9 && u >= -1e-9 && u <= 1.0 + 1e-9) {
+            nearest = std::min(nearest, t);
+        }
+    }
+    return nearest;
+}
+
+double StopDistance(double speed_mps, double decel_mps2, double reaction_s) {
+    const double v = std::max(0.0, speed_mps);
+    if (v <= 0.0) {
+        return 0.0;
+    }
+    if (!std::isfinite(decel_mps2) || decel_mps2 <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double tau = std::max(0.0, reaction_s);
+    return v * tau + v * v / (2.0 * decel_mps2);
+}
+
+double AllowedSpeedForStop(double distance_m, double decel_mps2,
+                           double reaction_s) {
+    if (!std::isfinite(decel_mps2) || decel_mps2 <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double usable = std::max(0.0, distance_m);
+    if (usable <= 0.0) {
+        return 0.0;
+    }
+    const double tau = std::max(0.0, reaction_s);
+    const double a_tau = decel_mps2 * tau;
+    return -a_tau + std::sqrt(a_tau * a_tau + 2.0 * decel_mps2 * usable);
+}
+
 common::Vec2Ned Centroid(const std::vector<common::Vec2Ned>& polygon) {
     common::Vec2Ned center;
     if (polygon.empty()) {

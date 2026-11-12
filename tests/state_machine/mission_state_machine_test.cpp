@@ -544,6 +544,8 @@ struct HandoverFixture {
         machine = std::make_unique<state_machine::MissionStateMachine>(config);
         machine->SetInputs(ground, flight, health);
         machine->SetEstimationInputs(estimated, visual, distance);
+        machine->SetFenceInput(fence);
+        intent_subscription = machine->IntentOutput().Subscribe(64);
         if (inject_diagnostics) {
             machine->SetEstimationDiagnostics(&estimator);
         }
@@ -613,7 +615,9 @@ struct HandoverFixture {
     common::Topic<common::TargetState> estimated;
     common::Topic<common::VisualTargetStatus> visual;
     common::Topic<common::StereoTargetDistance> distance;
+    common::Topic<common::FenceZone> fence;
     common::Topic<common::MissionStatus>::Subscription status_subscription;
+    common::Topic<common::ControlIntent>::Subscription intent_subscription;
     FakeEstimator estimator;
     std::unique_ptr<state_machine::MissionStateMachine> machine;
     bool started = false;
@@ -1797,7 +1801,15 @@ TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
     EXPECT_NEAR(return_intent->target_x, 0.0f, 0.05f);   // Home 局部 NED x
     EXPECT_NEAR(return_intent->target_y, 0.0f, 0.05f);
     EXPECT_NEAR(return_intent->target_z, -10.0f, 0.05f); // 保持当前高度
-    EXPECT_FLOAT_EQ(return_intent->max_speed_mps, 3.0f); // 水平巡航相位上限
+    // 返航速度剖面（2026-11-12）：max_speed_mps 不再是固定 cruise，而是
+    // return_speed_law 输出的本拍速率上限。本题地速为 0（静止起步），
+    // 剖面首拍只给出 accel_plan_mps2 × dt 的斜坡起步值，绝不会一步顶到 4 m/s。
+    EXPECT_GT(return_intent->max_speed_mps, 0.0f) << "起步应有非零速率";
+    EXPECT_LE(return_intent->max_speed_mps,
+              static_cast<float>(MakeReturnHomeTestConfig().return_home.cruise_speed_mps))
+        << "返航速率不得超过巡航顶速";
+    EXPECT_LT(return_intent->max_speed_mps, 1.0f)
+        << "静止起步首拍必须走加速斜坡（不得直接给巡航顶速）";
     EXPECT_EQ(return_intent->feedforward_valid_mask, 0U);
 
     // 到达 Home 附近并稳定 300ms → S13；发 AUTO.LAND（176，4/6）。
@@ -2522,7 +2534,11 @@ struct AssignmentHarness {
         status_subscription = machine.StatusOutput().Subscribe(32);
         ack_subscription = machine.AssignmentAckOutput().Subscribe(32);
         intent_subscription = machine.IntentOutput().Subscribe(64);
-        fence_status_subscription = machine.FenceStatusOutput().Subscribe(32);
+        // 围栏状态容量 32 在"20ms 周期 × 用例等待 1s+"的场景下会溢出：
+        // Topic::Publish 在队列满时仍返回 accepted=true 但**静默丢弃**消息，
+        // 表现为队列里的旧状态一直不更新。给足容量，避免用例把夹具缺陷
+        // 误判成业务行为差异。
+        fence_status_subscription = machine.FenceStatusOutput().Subscribe(256);
         mission_command_ack_subscription =
             machine.MissionCommandAckOutput().Subscribe(32);
     }
@@ -4797,6 +4813,393 @@ TEST(MissionStateMachineTest, FenceHoldActionKeepsTaskRunning) {
                      common::MissionAssignmentResult::kCancelledOrAborted,
                      100ms)
                      .has_value());
+}
+
+/// 读取一条"稳定后"的 65019（围栏状态）。
+/// 65019 只在 `PublishStatus()` 里随 65013 每 500ms 上报一次，订阅队列可能
+/// 积压旧值；这里先让状态机消费刚发布的飞行快照（>2 个 100ms 决策拍），再
+/// 排空积压、等下一拍新上报，避免把旧状态当成本次位置的结果。
+std::optional<common::FenceStatus> ReadFenceStatus(AssignmentHarness& harness) {
+    std::this_thread::sleep_for(250ms);
+    while (auto stale = harness.fence_status_subscription.TryTake()) {
+        (void)stale;
+    }
+    for (int i = 0; i < 20; ++i) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(100ms);
+        if (status) {
+            return **status;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 越界**深度容差**（2026-11-12）：飞机越出边界但不到 violation_depth_m
+/// 不算越界，不中止任务。现场 0120 日志就是这样：目标贴边时飞机被位置环
+/// 顶出去 1.4m 又拉回，零容差会判成越界中止（"波动两下就返航"）。
+/// 注意 `MakeSquareZone()` 的米→度用 111320 近似，机载换算是 WGS84 大地线，
+/// 同半径换回的 NED 边界比标称值小约 0.5%（100m 半径约 99.5m）；用例只读
+/// 65019 实测的带符号距离，不写死"半径 100m 边界就在 100m"。
+TEST(MissionStateMachineTest, FenceShallowBreachWithinToleranceDoesNotAbort) {
+    auto config = MakeFenceTestConfig();
+    config.fence.violation_depth_m = 1.5;      // 容差 1.5m
+    config.fence.violation_hysteresis_m = 0.5;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(50, 1, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 越出边界（北侧 100.5m）：实测深度约 1.0m，在 1.5m 容差内 → 不判越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(100.5f, 0.0f, -2.0f)))
+                    .accepted);
+    const auto shallow = ReadFenceStatus(harness);
+    ASSERT_TRUE(shallow.has_value()) << "应收到 65019";
+    EXPECT_LT(shallow->distance_to_boundary_m, 0.0)
+        << "飞机在边界外，65019 应如实上报负的带符号距离";
+    EXPECT_GT(shallow->distance_to_boundary_m, -1.5)
+        << "实测深度应落在 1.5m 容差内（MakeSquareZone 的米→度近似误差不应影响结论）";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "越界深度 < 容差 1.5m，不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value());
+
+    // 越过容差（北侧 103m，实测深度约 3.5m）→ 判越界并中止（debounce=0）。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(103.0f, 0.0f, -2.0f)))
+                    .accepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "越界深度 > 容差 1.5m，应中止到 S12";
+}
+
+/// 越界**回界滞回**（2026-11-12）：已判越界后必须退到
+/// `−violation_depth_m + violation_hysteresis_m`（默认 −1.5 + 0.5 = −1.0m）
+/// 才清除，避免在深度阈值附近抖动反复触发/清除。
+/// 注意清除阈值落在容差带内、不是边界内侧：否则飞机停在边界外但仍在容差内
+/// （如 −0.9m）会一直判越界并持续累计时长，容差形同虚设。
+/// 边界位置由 65019 首条越界状态的 `local_north_m + distance` 反推
+/// （MakeSquareZone 的米→度近似与机载大地线换算有 ~0.5% 偏差，不能写死 100m）。
+TEST(MissionStateMachineTest, FenceViolationClearNeedsHysteresis) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定与 65019，不触发动作
+    config.fence.violation_depth_m = 1.5;
+    config.fence.violation_hysteresis_m = 0.5;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(51, 1, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 越出深 3m 以上 → 判越界，并用"北向位置 + 带符号距离"反推实际边界。
+    constexpr float kDeepNorthM = 103.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(kDeepNorthM, 0.0f, -2.0f)))
+                    .accepted);
+    const auto violated = ReadFenceStatus(harness);
+    ASSERT_TRUE(violated.has_value()) << "应收到 65019";
+    ASSERT_EQ(violated->state, common::FenceState::kViolated)
+        << "越界深度 3m+ 应报 violated";
+    ASSERT_LT(violated->distance_to_boundary_m, -1.5);
+    // distance = boundary − north，故 boundary = north + distance。
+    const double boundary_north_m =
+        static_cast<double>(violated->local_north_m) +
+        static_cast<double>(violated->distance_to_boundary_m);
+
+    // 仍在滞回带内：越出 1.25m（> 清除阈值 1.0m）→ 应保持越界。
+    const float hold_north_m = static_cast<float>(boundary_north_m + 1.25);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(hold_north_m, 0.0f, -2.0f)))
+                    .accepted);
+    const auto held = ReadFenceStatus(harness);
+    ASSERT_TRUE(held.has_value()) << "应收到 65019";
+    EXPECT_NEAR(held->local_north_m, hold_north_m, 0.05)
+        << "读到的应是新快照对应的状态，而不是积压旧值";
+    EXPECT_EQ(held->state, common::FenceState::kViolated)
+        << "越界深度 1.25m 仍在滞回带内（清除阈值 −1.0m），应保持越界";
+    EXPECT_LT(held->distance_to_boundary_m, -1.0);
+    EXPECT_GT(held->distance_to_boundary_m, -1.5);
+
+    // 越过清除阈值：越出 0.4m（< 1.0m）→ 清除越界，65019 转为 near_boundary。
+    const float clear_north_m = static_cast<float>(boundary_north_m + 0.4);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(clear_north_m, 0.0f, -2.0f)))
+                    .accepted);
+    const auto cleared = ReadFenceStatus(harness);
+    ASSERT_TRUE(cleared.has_value()) << "应收到 65019";
+    EXPECT_NEAR(cleared->local_north_m, clear_north_m, 0.05);
+    EXPECT_NE(cleared->state, common::FenceState::kViolated)
+        << "越界深度 0.4m 已过清除阈值 −1.0m，应清除越界";
+    EXPECT_GT(cleared->distance_to_boundary_m, -1.0);
+
+    // 换区（65018 同几何、新 version）必须清掉深度迟滞状态（2026-11-12 复审）：
+    // 先重新制造"深越界 → 回到容差带内仍保持越界"，再下发新区域。若不清状态，
+    // 新区域会沿用旧回界阈值（−1.0m）把 −1.25m 继续判越界；正确行为是按进入
+    // 阈值（−1.5m）判为不越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(kDeepNorthM, 0.0f, -2.0f)))
+                    .accepted);
+    const auto deep_again = ReadFenceStatus(harness);
+    ASSERT_TRUE(deep_again.has_value()) << "应收到 65019";
+    ASSERT_EQ(deep_again->state, common::FenceState::kViolated);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(hold_north_m, 0.0f, -2.0f)))
+                    .accepted);
+    const auto held_again = ReadFenceStatus(harness);
+    ASSERT_TRUE(held_again.has_value()) << "应收到 65019";
+    ASSERT_EQ(held_again->state, common::FenceState::kViolated)
+        << "前提：回界到 1.25m 仍在滞回带内（未清除）";
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(51, 2, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    const auto after_zone_update = ReadFenceStatus(harness);
+    ASSERT_TRUE(after_zone_update.has_value()) << "应收到 65019";
+    EXPECT_NE(after_zone_update->state, common::FenceState::kViolated)
+        << "换区后 −1.25m 在 1.5m 容差内，应按进入阈值判为不越界"
+           "（深度迟滞状态必须随区域更新复位）";
+}
+
+/// 目标跑出区域 → **贴边保持 + 告警、不中止**（2026-11-12 维护者裁决）。
+/// 制导层把引导点钳到边界、清空速度前馈、并把限速降到贴边微调；
+/// 任务状态保持 S5，不产生 65015 aborted。
+TEST(MissionStateMachineTest, S5GuideEdgeHoldDoesNotAbort) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(52, 1, common::FenceAction::kReturn, 30.0);
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 飞机在界内 29m；目标在 200m 外（区域外）。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(29.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    bool hold_intent_seen = false;
+    bool warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            // 贴边保持：位置引导限速被**压到 ≤0.5 m/s**（必须 >0，排除"目标
+            // 失效原地保持"的 0 上限意图）；飞机已近边界，制动包络会把 cap
+            // 进一步压到下限 0.1。且无速度前馈、位置目标被钳在区域内。
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                guide.max_speed_mps > 0.0f &&
+                guide.max_speed_mps <= 0.5f + 1e-6f &&
+                guide.feedforward_valid_mask == 0U) {
+                hold_intent_seen = true;
+                const double guide_distance =
+                    std::hypot(static_cast<double>(guide.target_x),
+                               static_cast<double>(guide.target_y));
+                // 区域半边长 30m；MakeSquareZone 的近似使实际边界约 29.85m，
+                // 钳制再内缩 boundary_margin_m=1m，故引导点应落在 ~25~30m。
+                EXPECT_LE(guide_distance, 30.0)
+                    << "贴边保持必须把位置目标钳在区域边界内";
+                EXPECT_GE(guide_distance, 25.0)
+                    << "贴边保持应停在边界附近，而不是飞回原点";
+            }
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(20ms)) {
+            if (((*status)->active_warning_bits & (1U << 7U)) != 0U) {
+                warning_seen = true;
+            }
+        }
+        if (hold_intent_seen && warning_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen)
+        << "目标在区域外时引导应贴边保持（限速 0.5、前馈清零）";
+    EXPECT_TRUE(warning_seen) << "贴边保持应置 bit7 告警";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "贴边保持不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "贴边保持不得产生 65015 aborted";
+}
+
+/// 贴边保持的**停止点预测限速**（2026-11-12 复审三轮，维护者裁决）：
+/// 沿实测速度方向预测刹停点 `p + v̂·(v·τ + v²/(2a))`，越过边界（含 margin）
+/// 就提前压速度——不能等参考点贴到边界才把限速从 ~10 砸到 0.5。
+/// 本用例：飞机距边界约 10m、以 10 m/s 朝边界飞，`a=2, τ=0.2` 时允许速度
+/// `−0.4 + √(0.16+2·2·8.85) ≈ 5.56 m/s`，引导限速应被压到 ~5.6 而不是 10。
+TEST(MissionStateMachineTest, S5FenceBrakeEnvelopeSlowsBeforeBoundary) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.guard_decel_mps2 = 2.0;
+    config.fence.guard_reaction_s = 0.2;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(53, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 飞机北侧 20m（距边界约 10m）、以 10 m/s 朝北（朝边界）飞；
+    // 目标在 200m 外（区域外）。预测必须基于这个实测速度方向。
+    auto brake_flight = MakeFenceOffboardFlight(20.0f, 0.0f, -0.4f);
+    brake_flight.vx_mps = 10.0f;
+    brake_flight.vy_mps = 0.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        brake_flight))
+                    .accepted);
+    auto feed_estimate = [&] {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+    };
+    // 先喂 4s 让速度律从 0 加速到顶速（slew 3 m/s²，约 3.3s），排空意图。
+    const auto warmup = std::chrono::steady_clock::now() + 4000ms;
+    while (std::chrono::steady_clock::now() < warmup) {
+        feed_estimate();
+        while (harness.intent_subscription.TryTake()) {
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    bool envelope_seen = false;
+    float seen_cap = 0.0f;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline && !envelope_seen) {
+        feed_estimate();
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                guide.max_speed_mps > 1.0f) {
+                seen_cap = guide.max_speed_mps;
+                // 距边界 ~9.85m、余量 1m、a=2、τ=0.2 → 允许 ≈ 5.56。
+                if (guide.max_speed_mps <= 6.5f) {
+                    envelope_seen = true;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(envelope_seen)
+        << "目标出界且飞机距边界约 10m 时，引导限速应被制动包络压到 ~6m/s "
+           "（实测读到 "
+        << seen_cap << " m/s）；若恒为 ~10m/s 说明没有按制动距离提前";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "制动包络限速不得中止任务";
+}
+
+/// S7 视觉速度意图的围栏停止点预测（2026-11-12 复审三轮）：速度通道不受
+/// FlightController 的位置钳制，必须由状态机按实测速度方向预测刹停点。
+/// 飞机贴边、以 6 m/s 朝外飞、已无制动距离 → 速度意图限速到下限并置 bit8。
+TEST(MissionStateMachineTest, VisualServoPredictedFenceBreachHoldsAtEdge) {
+    auto config = MakeHandoverTestConfig();
+    config.fence.enabled = true;
+    config.fence.zone_cache_path.clear();
+    config.fence.guard_decel_mps2 = 2.0;
+    config.fence.guard_reaction_s = 0.2;
+    HandoverFixture f(config);
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    // 区域半边长 30m（实际边界约 29.85m）；飞机在北侧 29m，以 6m/s 朝北飞。
+    (void)f.fence.Publish(std::make_shared<const common::FenceZone>(
+        MakeSquareZone(60, 1, common::FenceAction::kReturn, 30.0)));
+    auto make_edge_flight = [] {
+        auto snapshot = MakeFenceOffboardFlight(29.0f, 0.0f, -2.0f);
+        snapshot.vx_mps = 6.0f;
+        snapshot.vy_mps = 0.0f;
+        snapshot.attitude_valid = true;
+        snapshot.roll_rad = 0.0f;
+        snapshot.pitch_rad = 0.0f;
+        snapshot.yaw_rad = 0.0f;
+        snapshot.header.receive_time_ms = TestMonotonicMs();
+        return snapshot;
+    };
+    (void)f.flight.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(make_edge_flight()));
+
+    // 进入 S6 → S7（手写 DriveToVisualTracking 后半段，避免重发原点飞行快照）。
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 4));
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualTracking)
+                    .has_value());
+
+    bool predicted_cap_seen = false;
+    bool warning_bit_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    uint64_t frame = 5;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)f.flight.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                make_edge_flight()));
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame++));
+        f.PublishDistance(true);
+        while (auto intent = f.intent_subscription.TryTake()) {
+            if ((*intent)->type == common::ControlIntentType::kVelocityHeading &&
+                (*intent)->max_speed_mps > 0.0f &&
+                (*intent)->max_speed_mps <= 0.15f + 1e-6f) {
+                predicted_cap_seen = true;
+            }
+        }
+        while (auto status = f.status_subscription.TryTake()) {
+            if (((*status)->active_warning_bits & (1U << 8U)) != 0U) {
+                warning_bit_seen = true;
+            }
+        }
+        if (predicted_cap_seen && warning_bit_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(predicted_cap_seen)
+        << "S7 速度意图应被停止点预测压到下限（0.1 m/s，非默认 0=不限速）";
+    EXPECT_TRUE(warning_bit_seen) << "预测越界应置 65013 bit8";
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking)
+        << "贴边悬停不得中止任务";
 }
 
 /// 起飞前区域一致性：65014 携带的 zone_id/version 与机载缓存不一致 → 21。

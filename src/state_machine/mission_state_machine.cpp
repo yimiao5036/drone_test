@@ -43,6 +43,7 @@
 #include "control/fence_geometry.h"
 #include "control/line_of_sight.h"
 #include "control/rate_limiter.h"
+#include "control/return_speed_law.h"
 #include "control/staleness_checker.h"
 #include "control/tracking_types.h"
 #include "control/visual_control_law.h"
@@ -68,6 +69,14 @@ using namespace std::chrono_literals;
 constexpr auto kDecisionPeriod = 100ms;
 /// MissionStatus周期回传间隔。状态切换会立即发布，周期发布用于地面站持续显示。
 constexpr uint64_t kStatusPublishIntervalMs = 500;
+/// 贴边保持制动包络的输出下限（m/s）：控制器把 max_speed_mps=0 解释为
+/// "未填相位上限"并回退硬上限（10m/s），包络收敛到 0 时必须抬到小正数。
+constexpr double kGuideHoldMinCapMps = 0.1;
+/// 停止点预测的最小速度（m/s）：低于该速度时速度方向噪声大、刹停距离≈0，
+/// 不启用预测，交给几何保持/第一重判定。
+constexpr double kFencePredictMinSpeedMps = 0.5;
+/// 预测允许速度低于该值时按"贴边悬停"处理（视觉速度意图清零）。
+constexpr double kFenceHoldSpeedMps = 0.15;
 /// MissionStatus有效期，地面站可据此判断状态回传是否过期。
 constexpr uint64_t kStatusValidForMs = 1000;
 /// 告警位：尚未收到满足GPS引导要求的PX4导航快照。
@@ -104,6 +113,10 @@ constexpr uint32_t kWarningHandoverNoVisual = 1U << 6U;
 /// 悬停——原来的状态机对此一无所知（65019 只报"接近边界"、65013 无对应位），
 /// 地面站看起来就像"任务卡住了"。本告警只提示"引导点被围栏挡住"，不改变动作。
 constexpr uint32_t kWarningGuideOutsideFence = 1U << 7U;
+/// 告警位 bit8：**围栏停止点预测**判定按当前速度方向刹停会越界（2026-11-12
+/// 复审三轮）。只提示"围栏制动/贴边保持已介入"，与 bit7（引导点已经在界外）
+/// 区分；实际越界处置仍由 EvaluateFenceGuard 的深度容差 + 防抖决定。
+constexpr uint32_t kWarningPredictedFenceBreach = 1U << 8U;
 /// 到点判据的"停稳"地速门限（m/s）：设计 §4.2 冻结值，不做配置键。
 constexpr double kHandoverArrivalSpeedMps = 0.5;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
@@ -827,6 +840,8 @@ private:
     // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
     void Evaluate(uint64_t now_ms) {
         uint32_t warnings = 0;
+        // 预测越界告警按拍重算（2026-11-12 复审三轮）：S5/S6/S7 任一路径置位。
+        fence_predicted_breach_ = false;
         // 拦截设备每拍推进（ACK/保持/复位/稳定时序全在设备内）。
         // 故障或已处于 S16：只维护告警位与状态发布，本拍跳过一切任务控制
         // 逻辑（位置/伺服/返航/降落意图全部停发）。
@@ -956,6 +971,9 @@ private:
         // 本拍任一评估触发的故障：保留 bit4（其余告警不再覆盖故障位）。
         if (mission_faulted_) {
             warnings |= kWarningActuatorFault;
+        }
+        if (fence_predicted_breach_) {
+            warnings |= kWarningPredictedFenceBreach;
         }
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
@@ -1717,18 +1735,33 @@ private:
     /// WARN；而状态机的 `EvaluateFenceGuard` 只看**飞机自身**位置，于是这件事
     /// 对 65013/65019 都不可见。
     ///
-    /// 判据：本拍下发的引导点（PublishPositionIntent 记录）落在围栏多边形外，
-    /// 且当前处于"跟着目标飞"的 S5/S6/S7。S3/S4 的起飞点是规划好的、S12 的
-    /// 返航点是 HOME，都不该报"被围栏挡住"。
+    /// 判据：处于"跟着目标飞"的 S5/S6/S7，且满足任一：
+    ///   - 本拍下发的引导点（PublishPositionIntent 记录）落在多边形外；
+    ///   - 已进入**贴边保持**（`guide_edge_hold_`，2026-11-12）。制导层钳制后
+    ///     引导点已落在界内，若不额外认这一条，告警会永久消失——而操作员恰恰
+    ///     需要知道"目标在区域外、飞机被围栏挡住"。S3/S4 的起飞点是规划好的、
+    ///     S12 的返航点是 HOME，都不该报"被围栏挡住"。
     ///
-    /// 只抬告警位，不改变任何动作：真正的越界处置仍由 EvaluateFenceGuard
-    /// （按飞机自身位置）决定。
+    /// 只抬告警位，不改变任何动作：越界处置仍由 EvaluateFenceGuard
+    /// （按飞机自身位置 + 深度容差）决定。
     bool EvaluateGuideOutsideFence() {
         const auto state = CurrentState();
         const bool tracking = state == common::MissionState::kGpsApproach ||
                               state == common::MissionState::kVisualHandover ||
                               state == common::MissionState::kVisualTracking;
-        if (!guide_point_valid_ || mission_abort_latched_ || !tracking) {
+        if (mission_abort_latched_ || !tracking) {
+            // 中止/离开跟踪链（S12、S13、S3/S4 等）时清掉贴边保持：它只描述
+            // "本段 S5 制导"，残留会让下一次任务的进入/解除判据沿用旧滞回
+            //（先按 release 而不是 margin 判定）——2026-11-12 复审。
+            guide_edge_hold_ = false;
+            guide_outside_fence_ = false;
+            return false;
+        }
+        if (guide_edge_hold_) {
+            guide_outside_fence_ = true;
+            return true;
+        }
+        if (!guide_point_valid_) {
             guide_outside_fence_ = false;
             return false;
         }
@@ -2088,7 +2121,11 @@ private:
             RecordError("围栏区域缓存写入失败: " + fence_.zone_cache_path);
         }
         // 越界计时按新区域重新起算（区域刚切换时不得沿用旧判定）。
+        // 深度迟滞状态一并清零：否则旧区域的"已越界"状态会让新区域按缓回
+        // 阈值（−depth+hysteresis）而不是进入阈值（−depth）判定，把本应在
+        // 容差内、不构成越界的点持续判越界（2026-11-12 复审）。
         fence_violation_since_ms_.reset();
+        fence_depth_violated_ = false;
     }
 
     /// 65018 区域内容是否变化：id/version 之外还要比较几何（顶点位置，容差
@@ -2303,9 +2340,26 @@ private:
             const auto& flight = *latest_flight_;
             const common::Vec2Ned point{static_cast<double>(flight.local_x_m),
                                         static_cast<double>(flight.local_y_m)};
-            const bool inside = control::fence::PointInPolygon(polygon.vertices, point);
             distance_m =
                 control::fence::SignedDistanceToBoundary(polygon.vertices, point);
+            // 水平越界判定（2026-11-12）：带**深度容差 + 回界滞回**。
+            // 零容差会把位置环被顶出边界 1~3m 又拉回的瞬时穿透判成越界中止
+            // （0119/0120 现场：目标贴边 → 飞机在边界两侧波动两下 → 第三次
+            // 出去凑满 1.5s 防抖 → 直接返航）。判定改为：
+            //   进入越界：distance_m < −violation_depth_m（越出超过深度容差）；
+            //   清除越界：distance_m > −violation_depth_m + violation_hysteresis_m
+            //             （回到"越界阈值的容差侧"即清除）。
+            // **滞回必须落在容差带内，不能放到边界内侧**：否则飞机停在边界外
+            // 但仍在容差内的位置（如 −0.9m）会一直判越界并持续累计时长，防抖
+            // 凑满后照样中止——那等于容差没生效。
+            // 深度容差/滞回都为 0 时退化为历史零容差语义（−0 与 +0 相接）。
+            const double depth = fence_.violation_depth_m;
+            const double hysteresis = fence_.violation_hysteresis_m;
+            const double clear_threshold = -depth + hysteresis;
+            const bool horizontally_violated =
+                fence_depth_violated_ ? (distance_m < clear_threshold)
+                                      : (distance_m < -depth);
+            fence_depth_violated_ = horizontally_violated;
             // 高度带：altitude_reference=1 相对起飞点（EKF 差分）、0 相对 EKF
             // 锚点 AMSL。上限 0 表示不限制。
             // 下限按有效下限（相对起飞点从地面起算、AMSL 保留绝对下限，见
@@ -2332,7 +2386,10 @@ private:
                 }
             }
             fence_altitude_ok_ = altitude_ok;
-            violated = !inside || !altitude_ok;
+            // 水平只用深度容差判定（horizontally_violated，见上），高度沿用
+            // 原有带边界 + 1.5m 迟滞。65019 的"接近边界"提示改用带符号距离
+            // distance_m（界内为正），不再单独调用 PointInPolygon。
+            violated = horizontally_violated || !altitude_ok;
             if (violated) {
                 state = common::FenceState::kViolated;
             } else {
@@ -3260,7 +3317,17 @@ private:
             last_intent_target_.reset();  // 内容节流记忆失效（来源已切换）
             SPDLOG_INFO("交接冻结位置意图续发: 滚动续期直至视觉伺服接续");
         }
-        PublishPositionIntent(*frozen_position_target_, now_ms);
+        // 交接驻留期也要按当前速度方向重算预测限速（2026-11-12 复审三轮）：
+        // 冻结的是"目标点"，飞机仍在动，旧 cap 不能沿用整个交接窗口。
+        PositionIntentTarget target = *frozen_position_target_;
+        if (const common::FencePolygonNed polygon = LatestFencePolygon();
+            polygon.valid()) {
+            if (const auto cap = PredictiveFenceSpeedCap(polygon)) {
+                target.max_speed_mps = std::min(
+                    target.max_speed_mps, static_cast<float>(*cap));
+            }
+        }
+        PublishPositionIntent(target, now_ms);
     }
 
     /// 停止位置类意图发布（离开位置引导段/交接段）；幂等。
@@ -3712,6 +3779,10 @@ private:
                     std::max(law_speed, 0.5));
                 ApplyHeadingToward(position_target, target.pos_x_m,
                                    target.pos_y_m);
+                // 贴边保持（2026-11-12）：目标跑出区域时，把引导点钳到边界内
+                // 并清空速度前馈，飞机停在边界内侧——而不是让控制器逐拍钳制、
+                // 前馈继续朝外顶出"边界来回冲"（§17.10.4 的极限环）。
+                ApplyGuideEdgeHold(position_target, target);
                 if (now_ms - approach_diag_last_ms_ >= 1000) {
                     approach_diag_last_ms_ = now_ms;
                     SPDLOG_INFO(
@@ -3771,6 +3842,143 @@ private:
         last_s5_position_target_ = position_target;
         PublishPositionIntent(position_target, now_ms);
         last_intent_target_ = target;
+    }
+
+    /// 围栏停止点预测（2026-11-12 复审三轮，维护者裁决）：
+    ///   p_stop = own + v̂ · (v·guard_reaction_s + v²/(2·guard_decel_mps2))
+    /// 沿**实测速度方向**取到边界的首个交点，若刹停点越过边界（含
+    /// `boundary_margin_m` 余量）则返回本拍允许速度；否则 `nullopt`（不限速）。
+    /// - 速度 < `kFencePredictMinSpeedMps` 不启用（方向噪声大、刹停距离≈0）；
+    /// - `guard_decel_mps2=0` 关闭预测（回退仅几何保持）；
+    /// - 返回值已抬到 `kGuideHoldMinCapMps`：0 在控制器里是"未填上限"。
+    /// 一旦返回限速即置 `fence_predicted_breach_`（bit8）。
+    std::optional<double> PredictiveFenceSpeedCap(
+        const common::FencePolygonNed& polygon) {
+        if (fence_.guard_decel_mps2 <= 0.0 || !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            return std::nullopt;
+        }
+        const auto& flight = *latest_flight_;
+        const double vx = std::isfinite(flight.vx_mps) ? flight.vx_mps : 0.0;
+        const double vy = std::isfinite(flight.vy_mps) ? flight.vy_mps : 0.0;
+        const double speed = std::hypot(vx, vy);
+        if (speed < kFencePredictMinSpeedMps) {
+            return std::nullopt;
+        }
+        const common::Vec2Ned own{static_cast<double>(flight.local_x_m),
+                                  static_cast<double>(flight.local_y_m)};
+        const common::Vec2Ned direction{vx / speed, vy / speed};
+        const double boundary_m = control::fence::RayDistanceToBoundary(
+            polygon.vertices, own, direction);
+        if (!std::isfinite(boundary_m)) {
+            return std::nullopt;
+        }
+        const double margin = std::max(0.0, fence_.boundary_margin_m);
+        const double usable = boundary_m - margin;
+        const double stop_m = control::fence::StopDistance(
+            speed, fence_.guard_decel_mps2, fence_.guard_reaction_s);
+        if (usable > 0.0 && stop_m <= usable) {
+            return std::nullopt;
+        }
+        const double allowed = control::fence::AllowedSpeedForStop(
+            usable, fence_.guard_decel_mps2, fence_.guard_reaction_s);
+        fence_predicted_breach_ = true;
+        return std::max(allowed, kGuideHoldMinCapMps);
+    }
+
+    /// 贴边保持（2026-11-12，维护者裁决："贴边保持 + 告警、不中止"）。
+    ///
+    /// 现场问题：目标飞出区域后，S5 速度律仍按目标生成参考点与朝外的速度前馈，
+    /// 控制器只把**位置**拉回边界、前馈被逐拍清零又逐拍恢复 —— 飞机在边界两侧
+    /// 波动几米（0119/0120 日志 `own` 在边界 ±7m 摆动），第三次越界凑满 1.5s
+    /// 防抖就中止返航。
+    ///
+    /// 本函数在**制导层**收口（2026-11-12 复审二轮，维护者选"按制动距离提前"）：
+    ///   ① **制动包络限速**：目标贴边/越界时，按飞机到边界的剩余距离给出
+    ///      `v ≤ √(2·decel·(d−margin))`，让位置引导在到达边界前收敛，而不是
+    ///      贴到边界才把限速从 10 砸到 0.5——10 m/s 的物理刹停距离约 17 m，
+    ///      只靠 1 m 余量的几何保持守不住，是"波动两下就返航"的残余路径；
+    ///   ② 参考点距边界不足 `boundary_margin_m` 时把位置目标钳到多边形内；
+    ///   ③ 清空速度前馈与前馈掩码（不再朝外顶）；
+    ///   ④ 位置引导限速降为 0.5 m/s（贴边微调）；
+    ///   ⑤ 抬 `kWarningGuideOutsideFence` 告警，**不改变任务状态、不中止**。
+    /// 目标重新回到区域内、且距边界超过 `guide_hold_release_m` 后自动解除
+    /// （滞回，避免目标贴边时保持/跟随反复切换）。
+    ///
+    /// 制动包络只要目标进入 `boundary_margin_m` 以内（含已越界）就启用，与
+    /// "参考点是否被挡住"解耦——等参考点出界才刹车已经太晚。配置
+    /// `fence.guard_decel_mps2=0` 可关闭预测（回退纯几何保持）。
+    ///
+    /// 只在 S5 生成（S6 冻结续发沿用最后一条钳制后的意图；S7 视觉伺服不经过
+    /// 位置引导；S12 返航目标就是 HOME，不该被这条阻挡）。
+    /// `guide_hold_enabled=false` 时完全不做处理（回退 2026-11-11 行为）。
+    void ApplyGuideEdgeHold(PositionIntentTarget& position_target,
+                            const common::TargetState& target) {
+        if (!fence_.guide_hold_enabled) {
+            return;
+        }
+        const common::FencePolygonNed polygon = LatestFencePolygon();
+        if (!polygon.valid()) {
+            guide_edge_hold_ = false;
+            return;
+        }
+        const double margin = std::max(0.0, fence_.boundary_margin_m);
+        // ① 停止点预测限速（2026-11-12 复审三轮）：沿**实测速度方向**预测
+        //    刹停位置，越过边界（含 margin）时把位置引导速度压到允许值。
+        //    与"参考点是否被挡住"解耦——等参考点出界才刹车已经太晚。
+        if (const auto cap = PredictiveFenceSpeedCap(polygon)) {
+            position_target.max_speed_mps = std::min(
+                position_target.max_speed_mps, static_cast<float>(*cap));
+        }
+        const common::Vec2Ned ref{static_cast<double>(position_target.x),
+                                  static_cast<double>(position_target.y)};
+        const double signed_distance =
+            control::fence::SignedDistanceToBoundary(polygon.vertices, ref);
+        // ② 进入：参考点距边界不足 boundary_margin_m（界内侧预警带与界外都算
+        // "被围栏挡住"）；解除：参考点回到界内且距边界超过释放滞回。两者之间
+        // 保持当前状态（滞回）。
+        // 解除阈值取 max(margin, release)：配置的释放滞回低于进入余量时，
+        // 保持/跟随会在 [release, margin) 区间每拍反复切换（没有滞回），
+        // 实现按不产生振荡的下限收口（2026-11-12 复审）。
+        const double release_m = std::max(margin, fence_.guide_hold_release_m);
+        const bool engaged_now = guide_edge_hold_
+                                     ? signed_distance < release_m
+                                     : signed_distance < margin;
+        if (!engaged_now) {
+            if (guide_edge_hold_) {
+                guide_edge_hold_ = false;
+                SPDLOG_INFO("S5 贴边保持解除: 目标回界内 zone={}/{} 距边界={:.2f}m",
+                            polygon.zone_id, polygon.version, signed_distance);
+            }
+            return;
+        }
+        // ②③④ 制导层钳制：位置拉回边界内、前馈清零、限速降为贴边微调。
+        // 限速取 min：制动包络可能已经把 cap 压得比 0.5 更低，不能覆盖回去。
+        const common::Vec2Ned clamped = control::fence::ClampIntoPolygon(
+            polygon.vertices, ref, margin);
+        position_target.x = static_cast<float>(clamped.north_m);
+        position_target.y = static_cast<float>(clamped.east_m);
+        position_target.feedforward_vx_mps = 0.f;
+        position_target.feedforward_vy_mps = 0.f;
+        position_target.feedforward_vz_mps = 0.f;
+        position_target.feedforward_valid_mask = 0;
+        position_target.max_speed_mps =
+            std::min(position_target.max_speed_mps, 0.5f);
+        if (!guide_edge_hold_) {
+            guide_edge_hold_ = true;
+            const uint64_t count = ++guide_edge_hold_count_;
+            SPDLOG_WARN(
+                "S5 贴边保持: 目标越出区域 target_id={} 目标=({:.2f},{:.2f}) "
+                "引导钳到=({:.2f},{:.2f}) zone={}/{} 距边界={:.2f}m "
+                "—— 保持贴边不中止任务，目标回界内后自动恢复",
+                target.target_id, static_cast<double>(target.pos_x_m),
+                static_cast<double>(target.pos_y_m), clamped.north_m,
+                clamped.east_m, polygon.zone_id, polygon.version,
+                signed_distance);
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("S5 贴边保持累计进入次数={}", count);
+            }
+        }
     }
 
     /// 组装并发布位置引导意图（S5/S6 引导与 S12 返航共用）。
@@ -3841,7 +4049,7 @@ private:
             return;
         }
         servo_intent_active_ = false;  // 本拍默认停发（S7 背离告警位按拍评估）
-        const auto intent = BuildVisualIntent(now_ms);
+        auto intent = BuildVisualIntent(now_ms);
         if (!intent.has_value()) {
             // 控制律降级保持（output.valid=false，姿态/视觉超龄）：不发布意图。
             // 安全语义——控制律已明确"禁止正常控制"，补发零速会与其矛盾；
@@ -3852,6 +4060,26 @@ private:
                             DegradedReasonName(last_degraded_reason_), count);
             }
             return;
+        }
+        // 围栏停止点预测（2026-11-12 复审三轮）：S7 发的是速度意图，
+        // FlightController 的位置钳制不覆盖速度通道，必须在这里按实测速度
+        // 方向预测刹停点。预测越界 → 限速；已无可用制动距离 → 贴边悬停
+        // （清零平移速度，只保留偏航跟踪），并置 bit8。
+        if (const common::FencePolygonNed polygon = LatestFencePolygon();
+            polygon.valid()) {
+            if (const auto cap = PredictiveFenceSpeedCap(polygon)) {
+                const double existing =
+                    intent->max_speed_mps > 0.f
+                        ? static_cast<double>(intent->max_speed_mps)
+                        : std::numeric_limits<double>::infinity();
+                const double applied = std::min(existing, *cap);
+                intent->max_speed_mps = static_cast<float>(applied);
+                if (applied <= kFenceHoldSpeedMps) {
+                    intent->target_x = 0.f;
+                    intent->target_y = 0.f;
+                    intent->target_z = 0.f;
+                }
+            }
         }
         if (!s7_servo_started_) {
             s7_servo_started_ = true;
@@ -4151,7 +4379,7 @@ private:
     /// 发布返航位置意图（低位原因码 8；不带目标速度前馈）。
     /// heading_valid 时附带航向（S12 机头朝飞行方向，2026-10-29）。
     /// S12 返航位置意图（2026-11-03）：`max_speed_mps` 交给控制器位置引导限速，
-    /// 爬升段传 `climb_rate_mps`、水平段传 `cruise_speed_mps`；悬停收口传 0（不推进）。
+    /// 爬升段传 `climb_rate_mps`、水平段传本拍速度剖面输出；悬停收口传 0（不推进）。
     void PublishReturnHomeIntent(float x, float y, float z, uint64_t now_ms,
                                  bool heading_valid = false,
                                  float heading_deg = 0.f,
@@ -4165,6 +4393,52 @@ private:
         target.yaw_deg = heading_deg;
         target.max_speed_mps = max_speed_mps;
         PublishPositionIntent(target, now_ms, kReasonReturnHome);
+    }
+
+    /// 返航速度剖面参数（return_home 节 → 纯函数配置，构造期固化）。
+    control::ReturnSpeedLawConfig ReturnSpeedConfig() const {
+        control::ReturnSpeedLawConfig law;
+        law.cruise_mps = return_home_.cruise_speed_mps;
+        law.accel_mps2 = return_home_.accel_plan_mps2;
+        law.decel_mps2 = return_home_.decel_plan_mps2;
+        law.brake_safety = return_home_.brake_safety;
+        law.final_speed_mps = return_home_.final_speed_mps;
+        law.final_zone_m = return_home_.final_zone_m;
+        law.arrival_radius_m = return_home_.arrival_radius_m;
+        return law;
+    }
+
+    /// 推进一拍返航速度剖面（2026-11-12）。
+    ///
+    /// 调用前提：S12 水平段且局部位置/返航目标已可用（调用方保证，进入本函数
+    /// 前已做过分支判定）。输入全部取实时测量：`remaining_m` 为到返航水平目标
+    /// 的剩余距离，`ground_speed_mps` 为 PX4 实测水平地速。用实测值而非上一拍
+    /// 指令的原因：
+    ///   - 起步段（目标未运动/已掉落，飞机已被追停到 0）必须靠实测 0 才能
+    ///     生成加速斜坡；按指令积分会让剖面"以为自己在巡航"，永远不加速；
+    ///   - 超速进入（始终追不上目标转返航，飞机可能 6~10 m/s）必须靠实测
+    ///     才能生成减速斜坡，否则指令一直高于实际、退不回来。
+    float UpdateReturnSpeed(float remaining_m, float ground_speed_mps,
+                            uint64_t now_ms) {
+        control::ReturnSpeedInput input;
+        input.valid = true;
+        input.remaining_m = static_cast<double>(remaining_m);
+        input.ground_speed_mps = static_cast<double>(ground_speed_mps);
+        double dt_s = static_cast<double>(kDecisionPeriod.count()) / 1000.0;
+        if (return_speed_last_ms_ != 0 && now_ms > return_speed_last_ms_) {
+            dt_s = static_cast<double>(now_ms - return_speed_last_ms_) / 1000.0;
+            // 节拍异常（调度抖动/系统卡顿）时钳住 dt：过大的 dt 会让斜坡
+            // 一步跨到顶速，过小会让斜坡停滞。
+            dt_s = std::clamp(dt_s, 0.02, 0.5);
+        }
+        return_speed_last_ms_ = now_ms;
+        input.dt_s = dt_s;
+        const control::ReturnSpeedOutput out =
+            control::ComputeReturnSpeed(ReturnSpeedConfig(), input,
+                                        return_speed_state_);
+        // brake_limited 只用于诊断（phase=brake 已能表达），不额外存一份状态。
+        return_speed_phase_ = out.valid ? out.phase : control::ReturnSpeedPhase::kIdle;
+        return out.valid ? static_cast<float>(out.speed_mps) : 0.f;
     }
 
     /// 返航航向（机头朝飞行方向）：方位角 = atan2(东, 北)，按
@@ -4278,9 +4552,12 @@ private:
                 SPDLOG_WARN("返航等待起飞原点/Home/EKF 锚点有效（无局部返航基准）");
                 return_home_wait_logged_ = true;
             }
-            // 无基准时原地悬停，不盲目返航。
+            // 无基准时原地悬停，不盲目返航。**仍要限速**：目标=当前位置本身
+            // 不推进，但 max_speed_mps=0 在控制器语义里是"回退硬上限 10m/s"，
+            // 一旦分支行为变动就会按 10m/s 跑（2026-11-12 收口为 cruise）。
             PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
-                                    flight.local_z_m, now_ms);
+                                    flight.local_z_m, now_ms, false, 0.f,
+                                    static_cast<float>(return_home_.cruise_speed_mps));
             return;
         }
         // 返航高度基准（2026-11-04）：优先与围栏/65011 同口径的 EKF 差分，
@@ -4301,8 +4578,11 @@ private:
                 SPDLOG_WARN("返航等待相对高度基准（HOME_POSITION/起飞快照/Home）");
                 return_home_wait_logged_ = true;
             }
+            // 同上：无高度基准也只做水平悬停等待，但仍按 cruise 限速，
+            // 避免 max_speed_mps=0 落回控制器硬上限（2026-11-12）。
             PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
-                                    flight.local_z_m, now_ms);
+                                    flight.local_z_m, now_ms, false, 0.f,
+                                    static_cast<float>(return_home_.cruise_speed_mps));
             return;
         }
 
@@ -4352,13 +4632,33 @@ private:
                                       static_cast<float>(target_x),
                                       static_cast<float>(target_y), now_ms)
                 : 0.f;
+        // 返航速度指令（2026-11-12）：爬升段用 climb_rate_mps（垂直通道，
+        // 水平目标=当前位置不推进）；水平段走速度剖面——起步加速、超速减速、
+        // 末端制动包络与低速档，全部由 return_speed_law 纯函数给出。
+        float return_speed_mps = static_cast<float>(return_home_.climb_rate_mps);
+        if (!return_climb_phase_) {
+            const double remaining_m = std::hypot(
+                static_cast<double>(home_xy->north_m) -
+                    static_cast<double>(flight.local_x_m),
+                static_cast<double>(home_xy->east_m) -
+                    static_cast<double>(flight.local_y_m));
+            // 逐轴有限性降级：坏轴按 0 处理。若直接 hypot 出 NaN，剖面会被
+            // 当成"实测 0"从静止重新加速（std::max(0, NaN) 取 0），与实况背离。
+            const double ground_speed_mps =
+                std::hypot(std::isfinite(flight.vx_mps)
+                               ? static_cast<double>(flight.vx_mps)
+                               : 0.0,
+                           std::isfinite(flight.vy_mps)
+                               ? static_cast<double>(flight.vy_mps)
+                               : 0.0);
+            return_speed_mps = UpdateReturnSpeed(
+                static_cast<float>(remaining_m),
+                static_cast<float>(ground_speed_mps), now_ms);
+        }
         PublishReturnHomeIntent(static_cast<float>(target_x),
                                 static_cast<float>(target_y),
                                 static_cast<float>(target_z), now_ms,
-                                heading_valid, heading_deg,
-                                static_cast<float>(return_climb_phase_
-                                                       ? return_home_.climb_rate_mps
-                                                       : return_home_.cruise_speed_mps));
+                                heading_valid, heading_deg, return_speed_mps);
 
         if (return_climb_phase_) {
             return;
@@ -4399,15 +4699,18 @@ private:
                        static_cast<double>(flight.vy_mps));
         // 返航速度摘要（2026-11-11，1Hz）：给出"距目标/地速/指令上限"三件套，
         // 现场核对"返航是不是太慢"时不必再从两个状态跳变时刻反推平均值。
+        // 2026-11-12：补速度剖面分级（accel/cruise/decel/brake/final），
+        // 用于核对"起步加速/超速回落/末端制动"是否按预期推进。
         if (now_ms - return_diag_last_ms_ >= 1000) {
             return_diag_last_ms_ = now_ms;
-            const double command_mps = return_climb_phase_
-                                           ? return_home_.climb_rate_mps
-                                           : return_home_.cruise_speed_mps;
+            const double command_mps =
+                return_climb_phase_ ? return_home_.climb_rate_mps
+                                    : static_cast<double>(return_speed_mps);
             SPDLOG_INFO(
                 "S12 返航摘要: 距目标={:.1f}m 垂直差={:.2f}m 地速={:.2f}m/s "
-                "指令上限={:.2f}m/s 爬升段={} 相对高度={:.1f}m",
+                "指令上限={:.2f}m/s 剖面={} 爬升段={} 相对高度={:.1f}m",
                 horizontal_m, vertical_m, horizontal_speed_mps, command_mps,
+                control::ReturnSpeedPhaseName(return_speed_phase_),
                 return_climb_phase_ ? "是" : "否", relative_alt_m);
         }
         const bool inside = horizontal_m <= return_home_.arrival_radius_m &&
@@ -4582,6 +4885,11 @@ private:
                 return_diag_last_ms_ = 0;
                 return_altitude_clamped_ = false;
                 arrival_stable_since_ms_ = 0;
+                // 返航速度剖面复位（2026-11-12）：本轮返航从当前实测地速
+                // 重新起步（可能是 0=目标未动，也可能高于巡航=追不上转返航）。
+                control::ResetReturnSpeedState(return_speed_state_);
+                return_speed_last_ms_ = 0;
+                return_speed_phase_ = control::ReturnSpeedPhase::kIdle;
                 SPDLOG_INFO("返航开始: 水平目标={}（起飞原点优先，Home 经纬度仅兜底），"
                             "高度基准=EKF 差分，返航高度 {:.1f}m，到达半径 {:.1f}m，"
                             "不设总时长上限",
@@ -4790,6 +5098,19 @@ private:
     double return_heading_cmd_deg_ = 0.0;
     double return_heading_rate_dps_ = 0.0;
     uint64_t return_heading_last_ms_ = 0;
+    // 返航速度剖面（2026-11-12）：分段恒定加速度，覆盖起步加速/超速减速/末端制动。
+    control::ReturnSpeedState return_speed_state_;
+    uint64_t return_speed_last_ms_ = 0;
+    control::ReturnSpeedPhase return_speed_phase_ = control::ReturnSpeedPhase::kIdle;
+    /// 围栏越界判定的"深层越界"状态（2026-11-12，violation_depth_m 容差）：
+    /// true 表示当前已判定越界（超过深度容差），回界需越过滞回才清除。
+    bool fence_depth_violated_ = false;
+    /// 贴边保持（2026-11-12）：目标跑出区域后，S5/S6 引导点被围栏挡住时，
+    /// 改为"贴边保持 + 告警"，不中止任务；目标回到区域内足够远才解除。
+    bool guide_edge_hold_ = false;
+    uint64_t guide_edge_hold_count_ = 0;  ///< 进入贴边保持的累计次数（节流日志）
+    /// 本拍围栏停止点预测是否已介入（S5/S6/S7 任一路径置位；bit8）。
+    bool fence_predicted_breach_ = false;
 
     std::atomic<bool> running_{false};
     std::thread worker_;

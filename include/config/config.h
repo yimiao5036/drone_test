@@ -185,7 +185,25 @@ struct ReturnHomeConfig {
     /// 实机反馈“低于 5m 时上升很快”即此原因。
     double climb_rate_mps = 0.5;
     /// 水平返航速度上限（m/s）：爬升完成后朝 Home 推进的最大速度。
-    double cruise_speed_mps = 3.0;
+    /// **独立于追踪速度**（`controller.max_speed_mps=10`）：返航是安全收口，
+    /// 顶速不需要跟追踪同量级（2026-11-12 维护者裁决：4.0）。
+    double cruise_speed_mps = 4.0;
+    /// 返航水平速度剖面的加/减速度（m/s²，2026-11-12）。
+    /// 状态机在 S12 内按“分段恒定加速度”生成速度指令（无 jerk），两种情况
+    /// 都必须有斜坡：①进入返航时飞机可能静止（目标未运动/已掉落），需要
+    /// 加速到 cruise；②追不上目标转返航时飞机速度可能高于 cruise，需要先
+    /// 减速。**不复用 `controller.max_accel_mps2`**（那是追踪/位置引导共用的
+    /// 限幅参数），返航有自己的安全收口节奏。
+    /// `accel_plan_mps2=0` 或 `decel_plan_mps2=0` 表示该段不做斜坡（直通）。
+    double accel_plan_mps2 = 1.5;
+    double decel_plan_mps2 = 2.0;
+    /// 末端制动包络的规划减速度余量：巡航段按 v ≤ √(2·decel·d) 收敛即可，
+    /// 该值只用于末端包络的安全系数（1.0=不加余量）。
+    double brake_safety = 1.3;
+    /// 末端低速档（m/s）：距目标进入 `final_zone_m` 后巡航顶速降为该值，
+    /// 使末端平顺、到达判据（`arrival_speed_mps`）自然满足。
+    double final_speed_mps = 1.0;
+    double final_zone_m = 10.0;
     /// 到达判据：水平半径、垂直误差、水平速度与稳定保持时长。
     double arrival_radius_m = 2.0;
     double arrival_vertical_m = 0.5;
@@ -217,10 +235,39 @@ struct FenceConfig {
     std::string zone_cache_path = "config/zone.json";
     /// 越界判定防抖：连续处于区域外达该时长才判定越界并执行动作。
     std::chrono::milliseconds violation_debounce{1500};
+    /// 越界**深度**容差（m，2026-11-12）：飞机自身位置必须越出多边形边界
+    /// 超过该深度才算越界。0=零容差（历史行为）。现场 0119/0120 日志显示
+    /// 目标贴边时飞机会被位置环推出去 1~3m 又被拉回，零容差会把一次瞬时
+    /// 穿透判成越界中止（`波动两下就返航`）。建议 1.0~2.0。
+    double violation_depth_m = 1.5;
+    /// 越界恢复滞回（m，2026-11-12）：已判越界后，带符号距离必须回到
+    /// `−violation_depth_m + violation_hysteresis_m`（默认 −1.0m）以上才清除，
+    /// 即越界深度收敛到 1.0m 以内（仍在边界外也可以，配合 depth 避免抖动）。
+    /// **必须 ≤ 本值对应的 violation_depth_m**：滞回要落在容差带内，不能放到
+    /// 边界内侧——否则飞机停在界外但仍在容差内时会一直累计越界时长，容差失效。
+    double violation_hysteresis_m = 0.5;
     /// 位置意图钳制内缩余量：钳制落点距边界至少这么多米（>0）。
     double boundary_margin_m = 1.0;
     /// 接近边界告警距离（m）：区域内但距边界小于该值报 kNearBoundary。
     double boundary_warn_m = 10.0;
+    /// 目标跑出区域时的制导策略（2026-11-12 维护者裁决）：
+    /// true=S5 引导点被围栏挡住时改为“贴边保持 + 告警、不中止任务”
+    /// （S6 冻结续发沿用最后一条 S5 意图），
+    /// 目标回到区域内（带 `guide_hold_release_m` 滞回）后自动恢复跟随；
+    /// false=只依赖控制器逐拍钳制（2026-11-11 之前行为，会在边界来回冲）。
+    bool guide_hold_enabled = true;
+    /// 贴边保持的解除滞回（m）：目标重新回到区域内、且距边界超过该距离，
+    /// 才恢复正常的接近制导（避免目标贴边时保持/跟随反复切换）。
+    /// 实现取 `max(boundary_margin_m, 本值)`：低于进入余量时不产生滞回，
+    /// 保持/跟随会每拍切换，故按进入余量兜底（2026-11-12 复审）。
+    double guide_hold_release_m = 2.0;
+    /// **围栏停止点预测**（2026-11-12 复审三轮，维护者裁决）：沿飞机当前
+    /// 速度方向做停止点预测 `p + v̂·(v·reaction + v²/(2·decel))`，预测点越界
+    /// 就提前压速度/贴边保持。`decel=0` 关闭预测（回退仅几何保持）。
+    /// 用可达最大减速度，**不要用接近律当前相位的计划加速度**。
+    double guard_decel_mps2 = 2.0;
+    /// 停止点预测的反应/姿态延迟（秒）：`v·reaction` 计入刹停距离。
+    double guard_reaction_s = 0.2;
     /// 越界动作：follow_zone_action=true 时以 65018 下发的动作为准，
     /// 否则固定使用本字段。
     bool follow_zone_action = true;

@@ -959,6 +959,11 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
     value["return_home"]["altitude_m"] = 6.5;
     value["return_home"]["climb_rate_mps"] = 0.8;
     value["return_home"]["cruise_speed_mps"] = 4.5;
+    value["return_home"]["accel_plan_mps2"] = 2.0;
+    value["return_home"]["decel_plan_mps2"] = 2.5;
+    value["return_home"]["brake_safety"] = 1.4;
+    value["return_home"]["final_speed_mps"] = 1.2;
+    value["return_home"]["final_zone_m"] = 8.0;
     value["return_home"]["arrival_radius_m"] = 1.5;
     value["return_home"]["arrival_vertical_m"] = 0.4;
     value["return_home"]["arrival_speed_mps"] = 0.3;
@@ -982,6 +987,11 @@ TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
     EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 6.5);
     EXPECT_DOUBLE_EQ(config.return_home.climb_rate_mps, 0.8);
     EXPECT_DOUBLE_EQ(config.return_home.cruise_speed_mps, 4.5);
+    EXPECT_DOUBLE_EQ(config.return_home.accel_plan_mps2, 2.0);
+    EXPECT_DOUBLE_EQ(config.return_home.decel_plan_mps2, 2.5);
+    EXPECT_DOUBLE_EQ(config.return_home.brake_safety, 1.4);
+    EXPECT_DOUBLE_EQ(config.return_home.final_speed_mps, 1.2);
+    EXPECT_DOUBLE_EQ(config.return_home.final_zone_m, 8.0);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 1.5);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_vertical_m, 0.4);
     EXPECT_DOUBLE_EQ(config.return_home.arrival_speed_mps, 0.3);
@@ -1245,6 +1255,13 @@ TEST(ConfigTest, FenceDefaultsApplyWhenSectionMissing) {
     EXPECT_EQ(config.fence.violation_debounce.count(), 1500);
     EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 1.0);
     EXPECT_DOUBLE_EQ(config.fence.boundary_warn_m, 10.0);
+    // 越界深度容差/回界滞回/S5 贴边保持（2026-11-12）。
+    EXPECT_DOUBLE_EQ(config.fence.violation_depth_m, 1.5);
+    EXPECT_DOUBLE_EQ(config.fence.violation_hysteresis_m, 0.5);
+    EXPECT_TRUE(config.fence.guide_hold_enabled);
+    EXPECT_DOUBLE_EQ(config.fence.guide_hold_release_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.fence.guard_decel_mps2, 2.0);
+    EXPECT_DOUBLE_EQ(config.fence.guard_reaction_s, 0.2);
     EXPECT_TRUE(config.fence.follow_zone_action);
     EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kReturn);
     EXPECT_EQ(config.fence.status_period.count(), 1000);
@@ -1259,6 +1276,12 @@ TEST(ConfigTest, FenceSectionOverridesDefaults) {
     value["fence"]["violation_debounce_ms"] = 800;
     value["fence"]["boundary_margin_m"] = 2.5;
     value["fence"]["boundary_warn_m"] = 15.0;
+    value["fence"]["violation_depth_m"] = 2.0;
+    value["fence"]["violation_hysteresis_m"] = 0.8;
+    value["fence"]["guide_hold_enabled"] = false;
+    value["fence"]["guide_hold_release_m"] = 3.0;
+    value["fence"]["guard_decel_mps2"] = 2.5;
+    value["fence"]["guard_reaction_s"] = 0.3;
     value["fence"]["violation_action"] = 2;  // land
     const auto path = WriteTemporaryConfig(value, "drone_config_fence_override.json");
     const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
@@ -1266,6 +1289,12 @@ TEST(ConfigTest, FenceSectionOverridesDefaults) {
     EXPECT_EQ(config.fence.violation_debounce.count(), 800);
     EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 2.5);
     EXPECT_DOUBLE_EQ(config.controller.fence_margin_m, 2.5);
+    EXPECT_DOUBLE_EQ(config.fence.violation_depth_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.fence.violation_hysteresis_m, 0.8);
+    EXPECT_FALSE(config.fence.guide_hold_enabled);
+    EXPECT_DOUBLE_EQ(config.fence.guide_hold_release_m, 3.0);
+    EXPECT_DOUBLE_EQ(config.fence.guard_decel_mps2, 2.5);
+    EXPECT_DOUBLE_EQ(config.fence.guard_reaction_s, 0.3);
     EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kLand);
     std::filesystem::remove(path);
 }
@@ -1295,11 +1324,36 @@ TEST(ConfigTest, FenceInvalidDefaultsNormalized) {
     std::filesystem::remove(path);
 }
 
+// 2026-11-12：回界滞回必须落在越界深度容差带内。滞回 > 深度会让清除阈值
+// 跑到边界内侧，飞机停在界外但仍在容差内时一直累计越界时长，容差形同虚设。
+TEST(ConfigTest, FenceHysteresisExceedsDepthRejected) {
+    json value = ReadSourceConfig();
+    value["fence"]["violation_depth_m"] = 1.0;
+    value["fence"]["violation_hysteresis_m"] = 1.5;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_fence_hysteresis.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ConfigTest, FenceWarnDistanceBelowMarginRejected) {
     json value = ReadSourceConfig();
     value["fence"]["boundary_margin_m"] = 5.0;
     value["fence"]["boundary_warn_m"] = 2.0;
     const auto path = WriteTemporaryConfig(value, "drone_config_fence_warn.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 2026-11-12：末端低速档顶速不得高于巡航顶速（否则剖面自相矛盾）。
+TEST(ConfigTest, ReturnHomeFinalSpeedAboveCruiseRejected) {
+    json value = ReadSourceConfig();
+    value["return_home"]["cruise_speed_mps"] = 2.0;
+    value["return_home"]["final_speed_mps"] = 3.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_return_final_speed.json");
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);
     std::filesystem::remove(path);
