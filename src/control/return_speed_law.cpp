@@ -13,8 +13,9 @@ namespace {
 /// 斜坡步长下限保护：dt<=0（时钟回退/首拍）时不推进斜坡，也不做跳变。
 constexpr double kMinDt = 1e-6;
 /// 顶速比较的死区：低于该速率的差异不触发加速/减速分级，避免在巡航顶速
-/// 附近反复 accel/decel 抖动。
-constexpr double kSpeedDeadbandMps = 1e-2;
+/// 附近反复 accel/decel 抖动（0121 SITL 实测 PX4 地速噪声 ±0.04m/s，
+/// 1e-2 会让 `剖面=cruise/decel/accel` 每秒翻转；5e-2 足够吸收且不影响斜坡）。
+constexpr double kSpeedDeadbandMps = 5e-2;
 
 }  // namespace
 

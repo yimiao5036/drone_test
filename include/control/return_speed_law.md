@@ -84,8 +84,9 @@ PX4 位置环
 
 ### 3.3 死区与零值语义
 
-- 顶速比较死区 `kSpeedDeadbandMps = 1e-2`：避免在 cruise 附近每拍
-  accel/decel 反复切换分级（诊断日志抖动）。
+- 顶速比较死区 `kSpeedDeadbandMps = 5e-2`：0121 SITL 实测 PX4 地速噪声
+  ±0.04 m/s，1e-2 会让巡航段 `剖面=cruise/decel/accel` 每秒翻转；5e-2 既不
+  影响斜坡步长，也让 `S12 返航摘要` 的剖面具可读性。
 - `accel_mps2 = 0` 或 `decel_mps2 = 0`：该方向不设斜坡（直通）。
   `decel_mps2 = 0` 时制动包络也**不启用**——包络本身就是减速能力，
   减速为 0 时谈包络没有物理意义。

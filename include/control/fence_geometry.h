@@ -49,9 +49,13 @@ double DistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
 double SignedDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
                                 const common::Vec2Ned& point);
 
-/// 把点钳制为"至少距边界 margin_m 且位于多边形内"的点：
-/// - 已满足（在内且距边界 >= margin）时原样返回；
-/// - 否则取最近的边界点，再沿边界指向区域内部的法线内缩 margin。
+/// 把点钳制为"位于多边形内、尽量距边界 margin_m"的点：
+/// - **已在界内（不论余量是否够）原样返回**：margin 是期望值，不是安全硬约束。
+///   旧实现会为凑余量把点向质心退让，凹多边形/尖角处曾把目标拉出 413m
+///   （0121 SITL），造成位置目标瞬移；
+/// - 界外：投影到最近边界点，沿内法线内缩 margin；尖角/凹角不足 margin 时
+///   沿"候选点→质心"做**有界**局部搜索（≤max(4·margin,4m)），找不到就停在
+///   边界点，绝不向质心跳。
 /// margin_m <= 0 按 0 处理；多边形退化（顶点 < 3）时原样返回 point。
 common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
                                  const common::Vec2Ned& point,

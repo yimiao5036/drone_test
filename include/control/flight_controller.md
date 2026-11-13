@@ -176,6 +176,8 @@ PX4 进入 Offboard 前必须已有 setpoint 流。状态机 S3 每决策拍发�
 1. 读取 `LatestFencePolygon()`；`vertices.size() >= 3` 才视为生效（否则完全回退旧行为）。
 2. 位置设定值经 `fence::ClampIntoPolygon(vertices, {x,y}, controller.fence_margin_m)` 回拉，
    位移 > 1e-6m 即计数并打节流 WARN（带 zone_id/version、位移、累计次数）。
+   **界内点原样保留**（2026-11-13）：旧实现为凑 margin 会把界内点向质心推移，
+   0121 SITL 实测一次位移 **413.10m**；现在只有界外点才回拉。
    **计数与日志独立**（2026-11-12）：围栏钳制另计 `FenceClampedCount()`，并使用
    自己的节流窗口。此前与速度幅值/前馈钳制共用 `ClampedCount()` 与同一份
    节流（第 1 次 + 每满 100 次），而前馈钳制每拍都可能触发

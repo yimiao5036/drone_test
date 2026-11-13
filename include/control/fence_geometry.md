@@ -32,7 +32,8 @@ double DistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
 double SignedDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
                                 const common::Vec2Ned& point);
 
-/// 把点回拉进多边形并保留 margin_m 的安全边距；已在内部且余量足够时原样返回。
+/// 把点回拉进多边形：界内点原样返回（不为了凑 margin 推移）；
+/// 界外点回拉到最近边界内缩 margin（尖角处做有界局部搜索）。
 common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
                                  const common::Vec2Ned& point,
                                  double margin_m);
@@ -84,6 +85,10 @@ S5/S6/S7 用 `RayDistanceToBoundary()` + `StopDistance()` 做"沿飞行方向的
   `margin_m`；若推进后仍在体外（凹角/尖锐角），再向质心方向二分退让，
   **最多 8 次、每次减半**，直到同时满足"在内且距边界 ≥ margin"或退让次数用尽。
   这一步是实机最容易出问题的地方：只沿单边法线内缩，凸角处会贴住另一条边（距离 0）。
+  **2026-11-13 修正（0121 SITL）**：旧实现在候选点不满足 margin 时连续 8 次向质心
+  退让（每次减半），凹多边形/尖角下会把目标拉到质心附近（日志实测位移 **413.10m**），
+  造成位置目标瞬移。现改为：① 界内点原样返回；② 界外点用有界局部搜索
+  （≤max(4·margin,4m)），找不到就停在边界点，**绝不向质心跳**。
 - **停止点预测（2026-11-12 复审三轮）**：`RayDistanceToBoundary()` 用射线与各边
   求交取**首个**交点（凹多边形不会"穿出又穿回"漏判）；`StopDistance()` /
   `AllowedSpeedForStop()` 是 `v·τ + v²/(2a)` 的正反解。三者都是纯代数；方向、

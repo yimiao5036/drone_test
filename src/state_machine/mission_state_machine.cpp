@@ -3884,6 +3884,15 @@ private:
         const double allowed = control::fence::AllowedSpeedForStop(
             usable, fence_.guard_decel_mps2, fence_.guard_reaction_s);
         fence_predicted_breach_ = true;
+        // 现场可观测（节流：首次 + 每 100 次）：0121 里只能从 max_speed 变化
+        // 反推预测是否介入，加上这条日志后可直接核对速度/距边界/余量。
+        const uint64_t count = ++fence_predict_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN(
+                "围栏停止点预测: 速度={:.2f}m/s 允许={:.2f}m/s 距边界={:.2f}m "
+                "余量={:.1f}m 累计={}",
+                speed, allowed, boundary_m, margin, count);
+        }
         return std::max(allowed, kGuideHoldMinCapMps);
     }
 
@@ -5112,6 +5121,7 @@ private:
     uint64_t guide_edge_hold_count_ = 0;  ///< 进入贴边保持的累计次数（节流日志）
     /// 本拍围栏停止点预测是否已介入（S5/S6/S7 任一路径置位；bit8）。
     bool fence_predicted_breach_ = false;
+    uint64_t fence_predict_count_ = 0;  ///< 预测限速日志节流计数
 
     std::atomic<bool> running_{false};
     std::thread worker_;

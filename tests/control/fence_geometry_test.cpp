@@ -81,6 +81,33 @@ TEST(FenceGeometryTest, ClampKeepsInsidePointUnchanged) {
     EXPECT_NEAR(clamped.east_m, point.east_m, 1e-9);
 }
 
+// 0121 SITL 回归：界内但距边界不足 margin 的点必须原样返回。旧实现会为凑
+// margin 从候选点连续向质心退让，凹多边形/尖角下把目标拉出几百米。
+TEST(FenceGeometryTest, ClampLeavesInsideWithinMarginUnchanged) {
+    const auto square = Square();
+    const common::Vec2Ned point{-49.6, 0.0};  // 距北边界 0.4m < margin 1m
+    EXPECT_LT(SignedDistanceToBoundary(square, point), 1.0);
+    const auto clamped = ClampIntoPolygon(square, point, 1.0);
+    EXPECT_NEAR(clamped.north_m, point.north_m, 1e-9);
+    EXPECT_NEAR(clamped.east_m, point.east_m, 1e-9);
+}
+
+TEST(FenceGeometryTest, ClampOutsideStaysLocalNearConcaveCorner) {
+    // 大 L 形，质心在 (73,73) 附近；点在凹角 (20,20) 外的缺口里。
+    // 旧实现会向质心退让到数十米外；新实现应停在边界附近（局部）。
+    const std::vector<common::Vec2Ned> polygon{{0.0, 0.0},   {0.0, 200.0},
+                                               {20.0, 200.0}, {20.0, 20.0},
+                                               {200.0, 20.0}, {200.0, 0.0}};
+    const common::Vec2Ned point{21.0, 21.0};  // 在 L 的缺口内（区域外）
+    EXPECT_FALSE(PointInPolygon(polygon, point));
+    const auto clamped = ClampIntoPolygon(polygon, point, 1.0);
+    EXPECT_TRUE(PointInPolygon(polygon, clamped));
+    EXPECT_LT(std::hypot(clamped.north_m - point.north_m,
+                         clamped.east_m - point.east_m),
+              5.0)
+        << "回拉必须局部，不能跳到质心";
+}
+
 TEST(FenceGeometryTest, ClampPullsOutsidePointInsideByMargin) {
     const auto square = Square();
     // 北侧越界 10m：应回拉到距边界 margin=1m 处（north=-49）。

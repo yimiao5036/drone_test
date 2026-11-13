@@ -212,8 +212,12 @@ common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
     }
     const double margin = margin_m > 0.0 ? margin_m : 0.0;
     const double signed_distance = SignedDistanceToBoundary(polygon, point);
-    if (signed_distance >= margin) {
-        return point;  // 已在内侧且余量足够，不干预
+    // 点在界内（含余量不足）：**原样返回**。margin 是期望值，不是安全硬约束；
+    // 旧实现为凑 margin 会从"边界点+法线"逐步向质心退让，在凹多边形/尖角处
+    // 曾把目标拉出 413m（0121 SITL：控制器日志"围栏多边形钳制 位移=413.10m"），
+    // 造成位置目标瞬移。界内点不动，安全上仍是"在围栏内"。
+    if (signed_distance >= 0.0) {
+        return point;
     }
     // 找最近的边界点（用于构造内缩基准）。
     ClosestOnSegment nearest;
@@ -230,21 +234,41 @@ common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
     }
     const common::Vec2Ned inward =
         InwardNormal(nearest.point, nearest.direction, polygon);
-    common::Vec2Ned clamped{nearest.point.north_m + inward.north_m * margin,
-                            nearest.point.east_m + inward.east_m * margin};
-    // 凸角情形：最近边界点常是顶点，沿单条边法线内缩会贴着另一条边（余量仍为
-    // 0）。这里以质心为目标逐步退让，直到既在体内又满足 margin；多边形本身
-    // 小于 margin 时退到质心为止（系统下限，调用方以 valid() 保证 ≥3 顶点）。
-    const common::Vec2Ned center = Centroid(polygon);
-    for (int step = 0; step < 8; ++step) {
-        const bool inside = PointInPolygon(polygon, clamped);
-        if (inside && DistanceToBoundaryImpl(polygon, clamped) >= margin) {
-            break;
-        }
-        clamped.north_m += (center.north_m - clamped.north_m) * 0.5;
-        clamped.east_m += (center.east_m - clamped.east_m) * 0.5;
+    const common::Vec2Ned candidate{nearest.point.north_m + inward.north_m * margin,
+                                    nearest.point.east_m + inward.east_m * margin};
+    const auto valid = [&](const common::Vec2Ned& p) {
+        return PointInPolygon(polygon, p) &&
+               DistanceToBoundaryImpl(polygon, p) >= margin;
+    };
+    if (valid(candidate)) {
+        return candidate;
     }
-    return clamped;
+    // 尖角/凹角：沿"候选点 → 质心"方向做**有界**局部搜索（最多 4·margin 且
+    // 不小于 4m），找到第一个"在内且距边界 ≥ margin"的点即返回。绝不像旧实现
+    // 那样 8 次半步趋向质心——那会把目标拉到数百米外。
+    const common::Vec2Ned center = Centroid(polygon);
+    const double span =
+        std::hypot(center.north_m - candidate.north_m,
+                   center.east_m - candidate.east_m);
+    const double max_step = std::max(4.0 * margin, 4.0);
+    if (span > 1e-9) {
+        const double t_cap = std::min(1.0, max_step / span);
+        constexpr int kSamples = 32;
+        for (int i = 1; i <= kSamples; ++i) {
+            const double t = t_cap * static_cast<double>(i) / kSamples;
+            const common::Vec2Ned sample{
+                candidate.north_m + (center.north_m - candidate.north_m) * t,
+                candidate.east_m + (center.east_m - candidate.east_m) * t};
+            if (valid(sample)) {
+                return sample;
+            }
+        }
+    }
+    // 兜底：候选点仍在界内就返回它；否则返回最近边界点（边上的点按"内"处理）。
+    if (PointInPolygon(polygon, candidate)) {
+        return candidate;
+    }
+    return nearest.point;
 }
 
 namespace {
