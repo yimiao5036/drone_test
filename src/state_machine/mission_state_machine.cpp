@@ -69,8 +69,9 @@ using namespace std::chrono_literals;
 constexpr auto kDecisionPeriod = 100ms;
 /// MissionStatus周期回传间隔。状态切换会立即发布，周期发布用于地面站持续显示。
 constexpr uint64_t kStatusPublishIntervalMs = 500;
-/// 贴边保持制动包络的输出下限（m/s）：控制器把 max_speed_mps=0 解释为
-/// "未填相位上限"并回退硬上限（10m/s），包络收敛到 0 时必须抬到小正数。
+/// 围栏停止点预测/贴边保持的输出下限（m/s）：控制器把 max_speed_mps=0
+/// 解释为"未填相位上限"并回退硬上限（10m/s），预测/保持收敛到 0 时
+/// 必须抬到小正数。
 constexpr double kGuideHoldMinCapMps = 0.1;
 /// 停止点预测的最小速度（m/s）：低于该速度时速度方向噪声大、刹停距离≈0，
 /// 不启用预测，交给几何保持/第一重判定。
@@ -3893,25 +3894,25 @@ private:
     /// 波动几米（0119/0120 日志 `own` 在边界 ±7m 摆动），第三次越界凑满 1.5s
     /// 防抖就中止返航。
     ///
-    /// 本函数在**制导层**收口（2026-11-12 复审二轮，维护者选"按制动距离提前"）：
-    ///   ① **制动包络限速**：目标贴边/越界时，按飞机到边界的剩余距离给出
-    ///      `v ≤ √(2·decel·(d−margin))`，让位置引导在到达边界前收敛，而不是
-    ///      贴到边界才把限速从 10 砸到 0.5——10 m/s 的物理刹停距离约 17 m，
-    ///      只靠 1 m 余量的几何保持守不住，是"波动两下就返航"的残余路径；
+    /// 本函数在**制导层**收口（2026-11-12 复审三轮，维护者裁决"两级越界判断"）：
+    ///   ① **停止点预测限速**：沿实测速度方向预测刹停点
+    ///      `p + v̂·(v·τ + v²/(2a))`，越过边界（含 margin）就把位置引导速度压到
+    ///      允许值 `−aτ + √((aτ)² + 2a·(d − margin))`——10 m/s 的物理刹停距离
+    ///      约 17 m，等贴到边界才把限速从 10 砸到 0.5 守不住；
     ///   ② 参考点距边界不足 `boundary_margin_m` 时把位置目标钳到多边形内；
     ///   ③ 清空速度前馈与前馈掩码（不再朝外顶）；
-    ///   ④ 位置引导限速降为 0.5 m/s（贴边微调）；
+    ///   ④ 位置引导限速取 `min(当前, 0.5)`（贴边微调；预测可能已压得更低）；
     ///   ⑤ 抬 `kWarningGuideOutsideFence` 告警，**不改变任务状态、不中止**。
     /// 目标重新回到区域内、且距边界超过 `guide_hold_release_m` 后自动解除
     /// （滞回，避免目标贴边时保持/跟随反复切换）。
     ///
-    /// 制动包络只要目标进入 `boundary_margin_m` 以内（含已越界）就启用，与
-    /// "参考点是否被挡住"解耦——等参考点出界才刹车已经太晚。配置
-    /// `fence.guard_decel_mps2=0` 可关闭预测（回退纯几何保持）。
+    /// 预测与几何保持解耦：只要预测刹停点会越界就限速，不等参考点出界；
+    /// `fence.guard_decel_mps2=0` 关闭预测（回退纯几何保持）。
     ///
-    /// 只在 S5 生成（S6 冻结续发沿用最后一条钳制后的意图；S7 视觉伺服不经过
-    /// 位置引导；S12 返航目标就是 HOME，不该被这条阻挡）。
-    /// `guide_hold_enabled=false` 时完全不做处理（回退 2026-11-11 行为）。
+    /// 本函数只在 S5 生成；S6 冻结续发在 `PublishFrozenHandoverIntent()` 里
+    /// **每拍按当前速度重算**预测 cap（不沿用旧值）；S7/S9/S10 的速度意图在
+    /// `EvaluateVisualServoIntent()` 里单独做预测限速/贴边悬停；S12 返航目标
+    /// 就是 HOME，不经过本函数。`guide_hold_enabled=false` 时完全不做处理。
     void ApplyGuideEdgeHold(PositionIntentTarget& position_target,
                             const common::TargetState& target) {
         if (!fence_.guide_hold_enabled) {
@@ -3953,7 +3954,7 @@ private:
             return;
         }
         // ②③④ 制导层钳制：位置拉回边界内、前馈清零、限速降为贴边微调。
-        // 限速取 min：制动包络可能已经把 cap 压得比 0.5 更低，不能覆盖回去。
+        // 限速取 min：停止点预测可能已经把 cap 压得比 0.5 更低，不能覆盖回去。
         const common::Vec2Ned clamped = control::fence::ClampIntoPolygon(
             polygon.vertices, ref, margin);
         position_target.x = static_cast<float>(clamped.north_m);

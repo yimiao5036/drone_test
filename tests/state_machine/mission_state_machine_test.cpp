@@ -5014,7 +5014,7 @@ TEST(MissionStateMachineTest, S5GuideEdgeHoldDoesNotAbort) {
             std::make_shared<const common::TargetState>(estimate));
         if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
             // 贴边保持：位置引导限速被**压到 ≤0.5 m/s**（必须 >0，排除"目标
-            // 失效原地保持"的 0 上限意图）；飞机已近边界，制动包络会把 cap
+            // 失效原地保持"的 0 上限意图）；飞机已近边界，停止点预测会把 cap
             // 进一步压到下限 0.1。且无速度前馈、位置目标被钳在区域内。
             const auto& guide = **intent;
             if (guide.type == common::ControlIntentType::kPositionGuide &&
@@ -5061,7 +5061,7 @@ TEST(MissionStateMachineTest, S5GuideEdgeHoldDoesNotAbort) {
 /// 就提前压速度——不能等参考点贴到边界才把限速从 ~10 砸到 0.5。
 /// 本用例：飞机距边界约 10m、以 10 m/s 朝边界飞，`a=2, τ=0.2` 时允许速度
 /// `−0.4 + √(0.16+2·2·8.85) ≈ 5.56 m/s`，引导限速应被压到 ~5.6 而不是 10。
-TEST(MissionStateMachineTest, S5FenceBrakeEnvelopeSlowsBeforeBoundary) {
+TEST(MissionStateMachineTest, S5FenceStopPredictionSlowsBeforeBoundary) {
     auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
     config.fence.guard_decel_mps2 = 2.0;
     config.fence.guard_reaction_s = 0.2;
@@ -5119,12 +5119,12 @@ TEST(MissionStateMachineTest, S5FenceBrakeEnvelopeSlowsBeforeBoundary) {
         }
     }
     EXPECT_TRUE(envelope_seen)
-        << "目标出界且飞机距边界约 10m 时，引导限速应被制动包络压到 ~6m/s "
+        << "目标出界且飞机距边界约 10m 时，引导限速应被停止点预测压到 ~6m/s "
            "（实测读到 "
         << seen_cap << " m/s）；若恒为 ~10m/s 说明没有按制动距离提前";
     EXPECT_EQ(harness.machine.CurrentState(),
               common::MissionState::kGpsApproach)
-        << "制动包络限速不得中止任务";
+        << "停止点预测限速不得中止任务";
 }
 
 /// S7 视觉速度意图的围栏停止点预测（2026-11-12 复审三轮）：速度通道不受
