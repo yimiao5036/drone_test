@@ -23,19 +23,43 @@ add_subdirectory(third_party/spdlog)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 
+# RGA DMA-BUF转存（香橙派默认开启，开发机默认关闭）。视频解码和RKNN预处理共用librga。
+set(DRONE_HAVE_RGA_DMA_DEFAULT OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(DRONE_HAVE_RGA_DMA_DEFAULT ON)
+endif()
+option(DRONE_HAVE_RGA_DMA "启用RGA DMA-BUF到NV12内存池硬件复制"
+       ${DRONE_HAVE_RGA_DMA_DEFAULT})
+set(DRONE_RGA_DIR "/usr/include" CACHE PATH "RGA头文件父目录（其下包含rga/im2d.hpp）")
+if(DRONE_HAVE_RGA_DMA)
+    find_library(DRONE_RGA_LIBRARY NAMES rga)
+    if(NOT DRONE_RGA_LIBRARY)
+        message(FATAL_ERROR "DRONE_HAVE_RGA_DMA=ON但未找到librga.so")
+    endif()
+endif()
+message(STATUS "RGA DMA-BUF转存: ${DRONE_HAVE_RGA_DMA}")
+
 # ---- video 模块（帧句柄、内存池、摄像头接收、解码、叠加） ----
 add_library(drone_video STATIC
     src/video/video_frame_pool.cpp
+    src/video/drm_nv12_transfer.cpp
     src/video/camera_receiver.cpp
     src/video/camera_receiver_stub.cpp
+    src/video/uvc_camera_receiver.cpp
     src/video/video_decoder.cpp
     src/video/video_decoder_stub.cpp
+    src/video/stereo_frame_splitter.cpp
     src/video/frame_compositor.cpp)
 target_include_directories(drone_video PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_video PUBLIC cxx_std_17)
 # 关键路径日志使用 spdlog；FFmpeg 依赖仅实现内部使用（PIMPL 不泄漏到头文件）
 target_link_libraries(drone_video PRIVATE spdlog::spdlog PkgConfig::FFMPEG)
+if(DRONE_HAVE_RGA_DMA)
+    target_compile_definitions(drone_video PRIVATE DRONE_HAVE_RGA_DMA=1)
+    target_include_directories(drone_video PRIVATE ${DRONE_RGA_DIR})
+    target_link_libraries(drone_video PRIVATE ${DRONE_RGA_LIBRARY})
+endif()
 
 # ---- video_transmission 模块（图传发送接口 + 编码后端） ----
 add_library(drone_video_transmission STATIC
@@ -63,7 +87,6 @@ option(DRONE_HAVE_RKNN "启用 RKNN 推理后端（需香橙派 RKNN runtime 与
        ${DRONE_HAVE_RKNN_DEFAULT})
 message(STATUS "RKNN 推理后端: ${DRONE_HAVE_RKNN}（目标架构=${CMAKE_SYSTEM_PROCESSOR}）")
 set(DRONE_RKNN_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn/include" CACHE PATH "RKNN API 头文件目录（含 rknn_api.h）")
-set(DRONE_RGA_DIR "/usr/include/rga" CACHE PATH "RGA 头文件目录（含 rga.h / im2d.hpp）")
 
 set(PERCEPTION_SOURCES
     src/perception/yolo_detector.cpp
@@ -72,15 +95,23 @@ set(PERCEPTION_SOURCES
     src/perception/optical_flow_estimator.cpp
     src/perception/laser_range_finder.cpp
     src/perception/perception_fusion.cpp
-    src/perception/target_estimator.cpp)
+    src/perception/geodetic_converter.cpp
+    src/perception/visual_ned_converter.cpp
+    src/perception/linear_target_kalman_filter.cpp
+    src/perception/target_estimator.cpp
+    src/perception/stereo_ranger_core.cpp
+    src/perception/stereo_ranger.cpp
+    src/perception/visual_target_monitor.cpp)
 if(DRONE_HAVE_RKNN)
     find_library(DRONE_RKNN_LIBRARY NAMES rknnrt)
     if(NOT DRONE_RKNN_LIBRARY)
         message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librknnrt.so（香橙派需安装 RKNN runtime）")
     endif()
-    find_library(DRONE_RGA_LIBRARY NAMES rga)
     if(NOT DRONE_RGA_LIBRARY)
-        message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librga.so（香橙派需安装 librga）")
+        find_library(DRONE_RGA_LIBRARY NAMES rga)
+        if(NOT DRONE_RGA_LIBRARY)
+            message(FATAL_ERROR "DRONE_HAVE_RKNN=ON 但未找到 librga.so（香橙派需安装 librga）")
+        endif()
     endif()
     list(APPEND PERCEPTION_SOURCES src/perception/rknn_detection_backend.cpp)
 endif()
@@ -101,28 +132,52 @@ endif()
 # ---- communication 模块（串口封装、PX4/地面站链路接口） ----
 add_library(drone_communication STATIC
     src/communication/serial_port.cpp
+    src/communication/communication_transport.cpp
+    src/communication/mavlink_handler.cpp
     src/communication/px4_link.cpp
     src/communication/ground_station_link.cpp)
 target_include_directories(drone_communication PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+# MAVLink 为生成的第三方 C 头文件，按 SYSTEM 传播以屏蔽其 packed/匿名结构体警告；
+# 项目自身代码仍保持 -Wall -Wextra -Wpedantic。
+target_include_directories(drone_communication SYSTEM PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/c_library_v2-master>)
 target_compile_features(drone_communication PUBLIC cxx_std_17)
 target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
 # ---- state_machine 模块（任务状态机接口） ----
 add_library(drone_state_machine STATIC
+    src/state_machine/gcs_net_fire.cpp
+    src/state_machine/interception_device.cpp
+    src/state_machine/mission_assignment.cpp
     src/state_machine/mission_state_machine.cpp)
 target_include_directories(drone_state_machine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_state_machine PUBLIC cxx_std_17)
-target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog)
+# control 模块：交接判据复用 PixelToAngle 视线角换算（Task 9 起还复用
+# TrackingControlLaw）。config 模块：捕网执行器配置（Task 10 起复用
+# ActuatorConfig；归一化量直接下发，PX4 负责 PWM 映射）。perception：返航
+# Home 局部 NED 换算（GeodeticToLocalNed，S11~S14）。静态库依赖经 LINK_ONLY
+# 传播给最终可执行文件。
+target_link_libraries(drone_state_machine PRIVATE spdlog::spdlog drone_control_core
+    drone_config drone_perception)
 
-# ---- control 模块（飞行控制接口；库名加 _core 避免与可执行 drone_control 冲突） ----
+# ---- control 模块（飞行控制接口+视觉跟踪控制律；库名加 _core 避免与可执行 drone_control 冲突） ----
 add_library(drone_control_core STATIC
-    src/control/flight_controller.cpp)
+    src/control/approach_speed_law.cpp
+    src/control/fence_geometry.cpp
+    src/control/flight_controller.cpp
+    src/control/line_of_sight.cpp
+    src/control/pid_controller.cpp
+    src/control/return_speed_law.cpp
+    src/control/tracking_config.cpp
+    src/control/tracking_control_law.cpp
+    src/control/visual_control_law.cpp
+    src/control/visual_tracking_shadow.cpp)
 target_include_directories(drone_control_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(drone_control_core PUBLIC cxx_std_17)
-target_link_libraries(drone_control_core PRIVATE spdlog::spdlog)
+target_link_libraries(drone_control_core PUBLIC drone_common PRIVATE spdlog::spdlog)
 
 # ---- health 模块（健康管理接口） ----
 add_library(drone_health STATIC
@@ -132,24 +187,95 @@ target_include_directories(drone_health PUBLIC
 target_compile_features(drone_health PUBLIC cxx_std_17)
 target_link_libraries(drone_health PRIVATE spdlog::spdlog)
 
+# ---- config 模块（正式主程序强类型配置） ----
+add_library(drone_config STATIC
+    src/config/config.cpp
+    src/config/zone_store.cpp)
+target_include_directories(drone_config PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_config PUBLIC cxx_std_17)
+target_link_libraries(drone_config PUBLIC
+    drone_common
+    drone_communication
+    drone_control_core
+    drone_video
+    drone_perception
+    drone_video_transmission)
+# 区域缓存（zone.json）读写需要日志（WARN/ERROR 定位缓存损坏）；config 主流程
+# 仍然只抛异常不打印，日志仅来自 ZoneStore。
+target_link_libraries(drone_config PRIVATE spdlog::spdlog)
+
+# ---- application 模块（正式主程序组件所有权、Topic 接线与生命周期） ----
+add_library(drone_application STATIC
+    src/application/drone_application.cpp)
+target_include_directories(drone_application PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_features(drone_application PUBLIC cxx_std_17)
+target_link_libraries(drone_application PUBLIC
+    drone_config
+    drone_communication
+    drone_control_core
+    drone_video
+    drone_perception
+    drone_video_transmission
+    drone_state_machine
+    drone_health
+    spdlog::spdlog)
+
 add_executable(drone_control
     main.cpp
     src/common/logger.cpp)
 
-# 编译后复制模型到可执行文件旁，匹配 main.cpp 按 /proc/self/exe 解析 models/ 的约定。
-add_custom_command(TARGET drone_control POST_BUILD
+# 每次构建都同步模型和配置到可执行文件旁，匹配 /proc/self/exe 路径解析约定。
+# 不能只使用 drone_control 的 POST_BUILD：当只修改 JSON/模型而可执行文件无需重链时，
+# POST_BUILD 不会触发，容易继续读取 build/config 下的旧配置。
+add_custom_target(drone_runtime_assets
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/models"
             "${CMAKE_BINARY_DIR}/models"
-    COMMENT "复制 models/ 到构建目录"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/config"
+            "${CMAKE_BINARY_DIR}/config"
+    COMMENT "同步 models/ 和 config/ 到构建目录"
     VERBATIM)
+add_dependencies(drone_control drone_runtime_assets)
+
+# 香橙派视频链路延迟探针：复用正式装配，仅启用视频并输出阶段P50/P95/P99。
+add_executable(video_latency_probe
+    tools/video_latency_probe.cpp
+    src/common/logger.cpp)
+target_link_libraries(video_latency_probe PRIVATE
+    drone_common
+    drone_application
+    spdlog::spdlog
+    PkgConfig::FFMPEG)
+if(MSVC)
+    target_compile_options(video_latency_probe PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(video_latency_probe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_dependencies(video_latency_probe drone_runtime_assets)
+
+# 双目测距开发机性能基准（手动运行，不注册 ctest；见文件头说明）。
+# 合成图 + 预置校正矩阵，输出核心各阶段 avg/p95 耗时，用于定位热点与验证优化。
+add_executable(stereo_ranger_bench
+    tools/stereo_ranger_bench.cpp)
+target_link_libraries(stereo_ranger_bench PRIVATE
+    drone_common
+    drone_perception
+    spdlog::spdlog)
+if(MSVC)
+    target_compile_options(stereo_ranger_bench PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(stereo_ranger_bench PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_dependencies(stereo_ranger_bench drone_runtime_assets)
+
 # 视频链路装配：拉流/解码(video)、识别(perception)、叠加(video)、编码推流(video_transmission)。
 # drone_video 的 FFmpeg 依赖为 PRIVATE，需在此补链 FFmpeg 以解析解码/接收符号。
 target_link_libraries(drone_control PRIVATE
     drone_common
-    drone_video
-    drone_perception
-    drone_video_transmission
+    drone_application
     spdlog::spdlog
     PkgConfig::FFMPEG)
 
@@ -159,8 +285,39 @@ else()
     target_compile_options(drone_control PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# PX4 串口冒烟与强制UDP的SITL分级测试：独立于正式主程序。
+add_executable(px4_link_smoke
+    tools/px4_link_smoke.cpp
+    src/common/logger.cpp)
+# drone_control_core：stage4 装配真实 FlightController（G2 执行层门禁）；
+# drone_state_machine/drone_perception：stage4-mission 装配状态机全链（G3，
+# 含真实 TargetEstimator 视觉融合与 GeodeticToLocalNed 装配回验）。
+target_link_libraries(px4_link_smoke PRIVATE
+    drone_common
+    drone_communication
+    drone_control_core
+    drone_state_machine
+    drone_perception
+    spdlog::spdlog)
+if(MSVC)
+    target_compile_options(px4_link_smoke PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(px4_link_smoke PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_custom_command(TARGET px4_link_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/config"
+            "${CMAKE_BINARY_DIR}/config"
+    COMMENT "复制 config/ 到 PX4 冒烟测试构建目录"
+    VERBATIM)
+
 include(CTest)
 if(BUILD_TESTING)
+    # 工具离线自检（G3 意图分类等纯逻辑；不依赖 SITL/配置/硬件）：px4_link_smoke
+    # 自身不在 GoogleTest 覆盖内，而这类断言曾连漏两次（2026-10-14 终审 Critical
+    # = S7 伺服/刹车意图被原因码过滤误丢），故抽成纯函数并纳入 ctest 回归。
+    add_test(NAME px4_link_smoke_selftest COMMAND px4_link_smoke --selftest)
+
     find_package(GTest QUIET)
     if(GTest_FOUND)
         add_executable(topic_test tests/common/topic_test.cpp)
@@ -173,6 +330,16 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(topic_test)
+
+        add_executable(latency_statistics_test tests/common/latency_statistics_test.cpp)
+        target_link_libraries(latency_statistics_test PRIVATE drone_common GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(latency_statistics_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(latency_statistics_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(latency_statistics_test)
 
         add_executable(video_frame_test tests/video/video_frame_test.cpp)
         target_link_libraries(video_frame_test PRIVATE drone_common GTest::gtest_main)
@@ -196,6 +363,17 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(video_frame_pool_test)
 
+        add_executable(drm_nv12_transfer_test tests/video/drm_nv12_transfer_test.cpp)
+        target_link_libraries(drm_nv12_transfer_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(drm_nv12_transfer_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(drm_nv12_transfer_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(drm_nv12_transfer_test)
+
         # 解码器软解测试：用 libx264 编码测试码流，验证 VideoDecoder 输出 NV12 帧
         add_executable(video_decoder_test tests/video/video_decoder_test.cpp)
         target_link_libraries(video_decoder_test PRIVATE
@@ -208,6 +386,61 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(video_decoder_test)
+
+        # 双目拆分测试：SBS 全幅→左右目 NV12 裁剪、元数据语义、丢帧与错误计数
+        add_executable(stereo_frame_splitter_test tests/video/stereo_frame_splitter_test.cpp)
+        target_link_libraries(stereo_frame_splitter_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(stereo_frame_splitter_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(stereo_frame_splitter_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(stereo_frame_splitter_test)
+
+        # UVC 接收器测试：配置校验、设备不存在错误路径与生命周期（采集正确性板上验收）
+        add_executable(uvc_camera_receiver_test tests/video/uvc_camera_receiver_test.cpp)
+        target_link_libraries(uvc_camera_receiver_test PRIVATE
+            drone_common drone_video GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(uvc_camera_receiver_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(uvc_camera_receiver_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        include(GoogleTest)
+        gtest_discover_tests(uvc_camera_receiver_test)
+
+        # 视觉跟踪控制律测试（自 visual_track_control 移植 + 内参/影子新增用例）
+        foreach(control_test IN ITEMS
+                line_of_sight_test
+                pid_controller_test
+                rate_limiter_test
+                staleness_checker_test
+                frame_transform_test
+                tracking_config_test
+                tracking_control_law_test
+                approach_speed_law_test
+                return_speed_law_test
+                visual_control_law_test
+                visual_tracking_shadow_test
+                flight_controller_test
+                flight_controller_link_contract_test
+                fence_geometry_test)
+            add_executable(${control_test} tests/control/${control_test}.cpp)
+            target_link_libraries(${control_test} PRIVATE
+                drone_common drone_control_core spdlog::spdlog GTest::gtest_main)
+            if(MSVC)
+                target_compile_options(${control_test} PRIVATE /W4 /permissive-)
+            else()
+                target_compile_options(${control_test} PRIVATE -Wall -Wextra -Wpedantic)
+            endif()
+            include(GoogleTest)
+            gtest_discover_tests(${control_test})
+        endforeach()
+        # 跨模块契约用例需要真实 Px4Link（PTY 伪终端对端），额外链接通信模块。
+        target_link_libraries(flight_controller_link_contract_test PRIVATE
+            drone_communication)
 
         # 骨架冒烟测试：验证各部件接口抽象与占位实现可构造、可启停
         add_executable(stub_smoke_test tests/skeleton/stub_smoke_test.cpp)
@@ -230,6 +463,189 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(stub_smoke_test)
+
+        # 健康管理测试：数据源注册、新鲜度超时/恢复、位汇总和生命周期
+        add_executable(health_manager_test tests/health/health_manager_test.cpp)
+        target_link_libraries(health_manager_test PRIVATE
+            drone_common
+            drone_health
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(health_manager_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(health_manager_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(health_manager_test)
+
+        # 任务状态机测试：验证地面站目标进入GPS_APPROACH影子状态且不输出控制意图
+        add_executable(mission_state_machine_test
+            tests/state_machine/mission_state_machine_test.cpp)
+        target_link_libraries(mission_state_machine_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mission_state_machine_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mission_state_machine_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mission_state_machine_test)
+
+        # 通用拦截设备内部时序测试：触发 ACK 保持、复位 ACK/稳定、故障与重试
+        add_executable(interception_device_test
+            tests/state_machine/interception_device_test.cpp)
+        target_link_libraries(interception_device_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(interception_device_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(interception_device_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(interception_device_test)
+
+        # 地面站直控发射服务：门禁拒绝、受理→完成回执、command_id 幂等与冷却
+        add_executable(gcs_net_fire_test
+            tests/state_machine/gcs_net_fire_test.cpp)
+        target_link_libraries(gcs_net_fire_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(gcs_net_fire_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(gcs_net_fire_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(gcs_net_fire_test)
+
+        # 任务分配助手测试：接受/阶段迁移/一次上电/中止/目标过滤/result 重发
+        add_executable(mission_assignment_test
+            tests/state_machine/mission_assignment_test.cpp)
+        target_link_libraries(mission_assignment_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mission_assignment_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mission_assignment_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mission_assignment_test)
+
+        # 到点/到点后视觉未识别等待计时测试：迟滞、保持门槛、
+        # 告警与中止阈值、视觉锁定清零（2026-11-05，S5 到点不告警）
+        add_executable(handover_wait_test
+            tests/state_machine/handover_wait_test.cpp)
+        target_link_libraries(handover_wait_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(handover_wait_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(handover_wait_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(handover_wait_test)
+
+        # 串口测试：使用 Linux 伪终端验证 poll 超时、双向收发与重启，不依赖真实硬件
+        add_executable(serial_port_test tests/communication/serial_port_test.cpp)
+        target_link_libraries(serial_port_test PRIVATE
+            drone_communication spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(serial_port_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(serial_port_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(serial_port_test)
+
+        # 通信传输测试：UDP 双向数据报、动态学习对端和配置校验（供 PX4 SITL）
+        add_executable(communication_transport_test
+            tests/communication/communication_transport_test.cpp)
+        target_link_libraries(communication_transport_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(communication_transport_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(communication_transport_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(communication_transport_test)
+
+        # MAVLink 字节流测试：验证 v1/v2、半包、粘包、坏 CRC 恢复和实例隔离
+        add_executable(mavlink_handler_test tests/communication/mavlink_handler_test.cpp)
+        target_link_libraries(mavlink_handler_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(mavlink_handler_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(mavlink_handler_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(mavlink_handler_test)
+
+        # PX4 链路基础测试：PTY 串口、本机/PX4 心跳、连接超时、快照发布与重启
+        add_executable(px4_link_test tests/communication/px4_link_test.cpp)
+        target_link_libraries(px4_link_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(px4_link_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(px4_link_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(px4_link_test)
+
+        # 地面站链路测试：PTY串口、MAVLink 2遥测、GCS心跳、TIMESYNC与重启
+        add_executable(ground_station_link_test
+            tests/communication/ground_station_link_test.cpp)
+        target_link_libraries(ground_station_link_test PRIVATE
+            drone_communication GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(ground_station_link_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(ground_station_link_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(ground_station_link_test)
+
+        # 正式主程序配置测试：生产配置解析和控制安全门禁
+        add_executable(config_test tests/config/config_test.cpp)
+        target_link_libraries(config_test PRIVATE drone_config GTest::gtest_main)
+        target_compile_definitions(config_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MSVC)
+            target_compile_options(config_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(config_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(config_test)
 
         # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
         add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)
@@ -256,6 +672,80 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(yolo_detector_test)
+
+        # 单目标估计第一阶段：WGS84→NED、线性卡尔曼和地面站/PX4影子接线。
+        add_executable(target_estimator_test
+            tests/perception/target_estimator_test.cpp)
+        target_link_libraries(target_estimator_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(target_estimator_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(target_estimator_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(target_estimator_test)
+
+        # 单目标视觉稳定性判定：帧级观测驱动的锁定/丢失影子状态机
+        add_executable(visual_target_monitor_test
+            tests/perception/visual_target_monitor_test.cpp)
+        target_link_libraries(visual_target_monitor_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(visual_target_monitor_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(visual_target_monitor_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(visual_target_monitor_test)
+
+        # 双目测距纯算法核心：StereoRangerConfig 校验 + 贪心匹配器
+        add_executable(stereo_ranger_core_test
+            tests/perception/stereo_ranger_core_test.cpp)
+        target_link_libraries(stereo_ranger_core_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        target_compile_definitions(stereo_ranger_core_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MSVC)
+            target_compile_options(stereo_ranger_core_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(stereo_ranger_core_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(stereo_ranger_core_test)
+
+        # 双目测距组件壳：帧/检测批次配对 + 发布语义 + 摘要日志
+        add_executable(stereo_ranger_test
+            tests/perception/stereo_ranger_test.cpp)
+        target_link_libraries(stereo_ranger_test PRIVATE
+            drone_common drone_video drone_perception spdlog::spdlog GTest::gtest_main)
+        target_compile_definitions(stereo_ranger_test PRIVATE
+            TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(MSVC)
+            target_compile_options(stereo_ranger_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(stereo_ranger_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(stereo_ranger_test)
+
+        # 视觉观测 → 局部 NED 纯函数转换（轴置换/姿态 RPY/mount 外参）
+        add_executable(visual_ned_converter_test
+            tests/perception/visual_ned_converter_test.cpp)
+        target_link_libraries(visual_ned_converter_test PRIVATE
+            drone_common drone_perception spdlog::spdlog GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(visual_ned_converter_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(visual_ned_converter_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(visual_ned_converter_test)
 
         # 叠加器测试：验证 NV12 帧 + 检测 → 标注帧（不依赖硬件）
         add_executable(frame_compositor_test tests/video/frame_compositor_test.cpp)
@@ -296,6 +786,20 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(video_encoder_integration_test)
+
+        # 主程序集成装配回归：裁剪配置（探针场景）下构造不得段错误
+        add_executable(drone_application_test
+            tests/application/drone_application_test.cpp)
+        target_link_libraries(drone_application_test PRIVATE
+            drone_application GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(drone_application_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(drone_application_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(drone_application_test)
     else()
         message(STATUS "GoogleTest not found; topic tests will not be built")
     endif()

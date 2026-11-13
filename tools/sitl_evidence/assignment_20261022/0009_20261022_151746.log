@@ -1,0 +1,138 @@
+[2026-10-22 15:17:46.011] [info] [t:8566] 异步文件日志已初始化: /root/drone_test/build/logs/0009_20261022_151746.log (等级=info)
+[2026-10-22 15:17:46.011] [info] [t:8566] 正式主程序加载配置: path=../config/px4_sitl_assignment.json log_level=info
+[2026-10-22 15:17:46.011] [info] [t:8566] UVC摄像头接收器创建: /dev/video0 2560x720@30 缓冲=4
+[2026-10-22 15:17:46.012] [info] [t:8566] 视频解码器创建: 池容量=16 预置分辨率=2560x720 硬解优先=true RGA_DMA优先=true RGA_DMA可用=false
+[2026-10-22 15:17:46.012] [info] [t:8566] 视频帧内存池创建: 容量=8 槽位大小=1382400B 对齐=64B 总内存=10.5MB 格式=1
+[2026-10-22 15:17:46.012] [info] [t:8566] 视频帧内存池创建: 容量=8 槽位大小=1382400B 对齐=64B 总内存=10.5MB 格式=1
+[2026-10-22 15:17:46.012] [info] [t:8566] 双目拆分输出池创建: 容量=8x2 单目=1280x720 水平stride=1280 槽位=1382400B
+[2026-10-22 15:17:46.012] [info] [t:8566] 双目拆分器创建: 全幅=2560x720 池容量=8x2 RGA=无（memcpy）
+[2026-10-22 15:17:46.012] [info] [t:8566] YOLO 检测器创建: 模型=/root/drone_test/build/models/yolov26_ReLU6_09_13-rk3588_384_640.rknn 置信度阈值=0.3 NMS阈值=0.45 订阅队列=1 NPU核心=all 内部性能统计=false 逐层性能报告=false 细分延迟统计=true 后端=缺失(启动将失败)
+[2026-10-22 15:17:46.049] [info] [t:8566] 双目测距v2创建: shadow=true 基准图=SBS右半(物理左目) fx_rect=1057.33px 基线=60.120mm fxB=63.57m·px 视差=[8,160]px
+[2026-10-22 15:17:46.049] [info] [t:8566] 叠加器创建: 池容量=8 线宽=2 文字=开
+[2026-10-22 15:17:46.049] [info] [t:8566] 图传发送器创建: 编码=h264 地址=rtsp://127.0.0.1:8554/drone_25_1 分辨率=1280x720@25fps
+[2026-10-22 15:17:46.049] [info] [t:8566] 视觉稳定性判定创建: shadow=true control_output=false lock_frames=5 lost_frames=10
+[2026-10-22 15:17:46.049] [info] [t:8566] PX4 通信部件创建: firmware=1.17.0 transport=udp:127.0.0.1:14540 onboard=1/191 target=1/1 mavlink=2
+[2026-10-22 15:17:46.049] [info] [t:8566] 串口对象创建: device=/tmp/gcs_app baud=115200 数据位=8 停止位=1 校验=N
+[2026-10-22 15:17:46.049] [info] [t:8566] 地面站通信部件创建: serial=/tmp/gcs_app@115200 aircraft=1/25 type=net_capture callsign=捕网-01 gcs=255/190 mavlink=2 timesync=true
+[2026-10-22 15:17:46.049] [info] [t:8566] 目标估计器创建: model=linear_cv shadow=true control_output=false
+[2026-10-22 15:17:46.049] [info] [t:8566] 健康管理部件创建: cpu_sample_period_ms=1000 startup_grace_ms=5000
+[2026-10-22 15:17:46.049] [info] [t:8566] 任务状态机创建: shadow=true control_output=false intent_valid_for_ms=300 handover(lock_frames=10 exit_lost_frames=30 timeout_ms=3000 fow_margin_deg=5.0 innovation_gate_m=3.0) fov_half(az=33.19deg el=10.56deg) servo=TrackingControlLaw(20.0Hz)
+[2026-10-22 15:17:46.049] [info] [t:8566] 飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线+控制权三态+Home 围栏已接入）
+[2026-10-22 15:17:46.049] [info] [t:8566] 任务状态机估计器诊断接口已注入: estimator=0x5ab59f753c70
+[2026-10-22 15:17:46.049] [info] [t:8566] 任务状态机 PX4 命令接口已注入: sender=0x5ab59f753810 net_type=single_pwm
+[2026-10-22 15:17:46.049] [warning] [t:8566] 正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint
+[2026-10-22 15:17:46.049] [info] [t:8566] 主程序集成创建: video=true px4=true ground_station=true target_estimator=true control=true camera_source=uvc stereo_split=true stereo_ranging=true
+[2026-10-22 15:17:46.049] [info] [t:8566] 视觉稳定性判定启动: shadow=true
+[2026-10-22 15:17:46.049] [info] [t:8566] 视觉跟踪影子启动: 频率=20Hz 虚拟姿态=true 姿态输入=true 距离输入=true
+[2026-10-22 15:17:46.049] [info] [t:8576] 视觉跟踪影子：姿态缺失/超龄，启用虚拟零姿态（仅供观察控制律行为，不产生真实控制输出）
+[2026-10-22 15:17:46.050] [info] [t:8576] 视觉跟踪影子摘要: 模式=降级保持 有效=false vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=true 距离=--(有效=0)
+[2026-10-22 15:17:46.050] [info] [t:8566] 双目测距启动: shadow=true 配对窗=20ms 批次闭合=50ms 帧缓冲=4 队列容量=2
+[2026-10-22 15:17:46.050] [info] [t:8566] 图传无 rkmpp 硬编码器（h264_rkmpp），使用软编码
+[2026-10-22 15:17:46.067] [error] [t:8566] 图传 RTSP 写头失败(推流地址不可达?): Connection refused
+[2026-10-22 15:17:46.067] [error] [t:8566] 图传发送器后端启动失败（推流地址不可达或无可用编码器）
+[2026-10-22 15:17:46.067] [error] [t:8566] 主程序图传发送启动失败，视频链路降级
+[2026-10-22 15:17:46.067] [info] [t:8566] 叠加器启动
+[2026-10-22 15:17:46.067] [error] [t:8566] YOLO 检测器启动失败: 无推理后端（未启用 RKNN 编译或未注入后端）
+[2026-10-22 15:17:46.067] [error] [t:8566] 主程序YOLO启动失败，检测链路降级
+[2026-10-22 15:17:46.067] [info] [t:8566] 双目拆分器启动
+[2026-10-22 15:17:46.067] [info] [t:8566] 视频帧内存池创建: 容量=16 槽位大小=2764800B 对齐=64B 总内存=42.2MB 格式=1
+[2026-10-22 15:17:46.067] [info] [t:8566] 解码帧内存池创建: 容量=16 分辨率=2560x720 水平stride=2560 槽位=2764800B
+[2026-10-22 15:17:46.067] [info] [t:8566] 视频解码器启动
+[2026-10-22 15:17:46.067] [error] [t:8566] UVC摄像头打开失败: /dev/video0 open: No such file or directory，累计 1
+[2026-10-22 15:17:46.067] [error] [t:8566] 主程序摄像头接收启动失败，视频链路降级
+[2026-10-22 15:17:46.067] [info] [t:8566] 目标估计器启动: shadow=true visual_fusion=false
+[2026-10-22 15:17:46.067] [info] [t:8566] 飞行控制器启动: period=50ms intent_timeout=300ms coast_timeout=1000ms bootstrap_timeout=6000ms feedforward=off cap=2.00m/s
+[2026-10-22 15:17:46.067] [info] [t:8566] 任务状态机启动: shadow=true
+[2026-10-22 15:17:46.067] [info] [t:8605] 任务状态转移: BOOT -> SELF_CHECK reason=初始化完成
+[2026-10-22 15:17:46.067] [info] [t:8566] 串口打开成功: device=/tmp/gcs_app baud=115200
+[2026-10-22 15:17:46.067] [info] [t:8566] 地面站通信启动: serial=/tmp/gcs_app@115200
+[2026-10-22 15:17:46.067] [info] [t:8566] 健康管理部件启动: source_count=6
+[2026-10-22 15:17:46.067] [warning] [t:8608] 健康数据源活动错误: camera
+[2026-10-22 15:17:46.067] [warning] [t:8608] 健康数据源活动错误: yolo
+[2026-10-22 15:17:46.067] [warning] [t:8608] 健康数据源活动错误: video
+[2026-10-22 15:17:46.069] [info] [t:8575] 视觉稳定性摘要: state=SEARCHING valid=false 连续检测=0 连续丢失=0 置信度=0.00 中心=(0,0) 框=0x0px 画面速度=均0.0/峰0.0(n=0) 从未检测 近期检测率=0.0%(0/0) 累计检测率=0.0% 累计观测=0 累计转换=0
+[2026-10-22 15:17:46.070] [info] [t:8566] UDP 传输打开: udp:127.0.0.1:14540
+[2026-10-22 15:17:46.070] [info] [t:8566] PX4 通信启动: transport=udp:127.0.0.1:14540
+[2026-10-22 15:17:46.070] [info] [t:8566] 主程序启动完成: degraded=true
+[2026-10-22 15:17:46.070] [info] [t:8566] 正式主程序运行中，按Ctrl+C停止
+[2026-10-22 15:17:46.100] [info] [t:8576] [ControlLaw] 状态切换: 降级保持 -> 零速刹车 (判丢，零速刹车)
+[2026-10-22 15:17:46.100] [info] [t:8576] 视觉跟踪影子摘要: 模式=零速刹车 有效=true vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=true 距离=--(有效=0)
+[2026-10-22 15:17:46.200] [info] [t:8576] 视觉跟踪影子摘要: 模式=零速刹车 有效=true vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=false 距离=--(有效=0)
+[2026-10-22 15:17:46.469] [info] [t:8609] PX4 心跳已连接: source=1/1 mode=4/3 armed=false
+[2026-10-22 15:17:46.469] [info] [t:8609] PX4 遥测请求已入队: one_shot=3 intervals=9
+[2026-10-22 15:17:46.470] [info] [t:8609] PX4 电池参数读取完成: BAT_LOW_THR=50.0% COM_LOW_BAT_ACT=0
+[2026-10-22 15:17:46.470] [info] [t:8609] PX4 固件版本上报: reported=1.17.0 configured=1.17.0 capabilities=59647
+[2026-10-22 15:17:46.472] [info] [t:8609] PX4 命令 ACK: sequence=1 command=512 result=0 internal=true progress=0
+[2026-10-22 15:17:46.476] [info] [t:8609] PX4 命令 ACK: sequence=2 command=512 result=0 internal=true progress=0
+[2026-10-22 15:17:46.480] [info] [t:8609] PX4 命令 ACK: sequence=3 command=512 result=0 internal=true progress=0
+[2026-10-22 15:17:46.489] [info] [t:8609] PX4 命令 ACK: sequence=4 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.496] [info] [t:8609] PX4 命令 ACK: sequence=5 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.504] [info] [t:8609] PX4 命令 ACK: sequence=6 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.512] [info] [t:8609] PX4 命令 ACK: sequence=7 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.520] [info] [t:8609] PX4 命令 ACK: sequence=8 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.529] [info] [t:8609] PX4 命令 ACK: sequence=9 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.536] [info] [t:8609] PX4 命令 ACK: sequence=10 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.544] [info] [t:8609] PX4 命令 ACK: sequence=11 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.552] [info] [t:8609] PX4 命令 ACK: sequence=12 command=511 result=0 internal=true progress=0
+[2026-10-22 15:17:46.568] [info] [t:8605] 任务状态转移: SELF_CHECK -> READY reason=PX4导航快照满足GPS引导前置条件
+[2026-10-22 15:17:51.076] [warning] [t:8607] 健康数据源超时: ground_station
+[2026-10-22 15:17:51.076] [warning] [t:8607] 健康数据源超时: video
+[2026-10-22 15:17:51.076] [warning] [t:8607] 健康数据源超时: yolo
+[2026-10-22 15:17:51.076] [warning] [t:8607] 健康数据源超时: video_decoder
+[2026-10-22 15:17:51.076] [warning] [t:8607] 健康数据源超时: camera
+[2026-10-22 15:17:56.055] [info] [t:8577] 双目测距摘要: 帧=0 匹配帧=0 批次=0 发布=0 有效测距=0 有效占比=0.0% 跳过=0 帧未配=0 截断=0 处理avg=0.00ms max=0.00ms
+[2026-10-22 15:17:56.924] [error] [t:8606] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 1
+[2026-10-22 15:17:56.924] [error] [t:8606] 地面站 MAVLink 帧发送失败，累计 1
+[2026-10-22 15:17:56.984] [warning] [t:8608] 健康数据源活动错误: ground_station
+[2026-10-22 15:17:57.412] [info] [t:8606] 地面站心跳建立: system=255 component=190
+[2026-10-22 15:17:57.412] [info] [t:8606] 收到地面站V2_EXTENSION: type=65014 target=1/25 count=1
+[2026-10-22 15:17:57.412] [info] [t:8606] 收到任务分配: target=1/25 len=60 count=1
+[2026-10-22 15:17:57.412] [info] [t:8606] 任务分配已发布: version=1 assignment_id=10 target_id=7 type=25 flags=1 valid_for_ms=5000 count=1
+[2026-10-22 15:17:57.412] [info] [t:8606] 收到目标UPDATE: target=1/25 count=1
+[2026-10-22 15:17:57.412] [info] [t:8606] 目标ACK发送成功: result=REJECTED_TIME_SYNC_UNAVAILABLE reason=TIME_SYNC_UNAVAILABLE boot=1792653477 seq=1 target_id=7 age_ms=0 rtt_ms=0 count=1
+[2026-10-22 15:17:57.482] [info] [t:8605] 状态机收到任务分配: assignment_id=10 target_id=7 type=25 flags=0x01 valid_for_ms=5000 count=1
+[2026-10-22 15:17:57.482] [info] [t:8605] 任务分配已接受: assignment_id=10 target_id=7 origin=(0.02,-0.04,-0.04) → S3 ARMING
+[2026-10-22 15:17:57.482] [info] [t:8605] 任务状态转移: READY -> ARMING reason=接受任务分配
+[2026-10-22 15:17:57.482] [info] [t:8605] S3 自动起飞开始: origin=(0.02,-0.04,-0.04) bootstrap_lead=300ms mode_timeout=2000ms arm_timeout=3000ms
+[2026-10-22 15:17:57.484] [info] [t:8608] 健康数据源恢复: ground_station
+[2026-10-22 15:17:57.484] [info] [t:8608] 健康数据源活动错误恢复: ground_station
+[2026-10-22 15:17:57.487] [info] [t:8606] 任务分配ACK发送成功: assignment_id=10 target_id=7 result=0 reason=0 state=2 availability=2 count=1
+[2026-10-22 15:17:57.517] [warning] [t:8604] 飞行控制器控制权迁移: IDLE -> BOOTSTRAP (起飞预授权门禁全通)
+[2026-10-22 15:17:57.783] [info] [t:8605] S3 起飞模式命令已入队: DO_SET_MODE(176) p1=1 p2=6 p3=0（本次起飞仅一次）
+[2026-10-22 15:17:57.788] [info] [t:8609] PX4 命令 ACK: sequence=13 command=176 result=0 internal=false progress=0
+[2026-10-22 15:17:58.250] [info] [t:8606] 地面站时间同步建立: offset_ms=0.080 rtt_ms=0.371 jitter_ms=8.623 samples=5
+[2026-10-22 15:17:58.427] [info] [t:8606] 目标UPDATE已发布: boot=1792653477 seq=3 target_id=7 age_ms=0 remaining_ms=5000 count=1
+[2026-10-22 15:17:58.427] [info] [t:8603] 目标估计已接受地面站观测: target_id=7 seq=3 N=19.99 E=0.01 D=-1.80 VN=1.00 VE=-0.50 altitude_valid=true count=1
+[2026-10-22 15:17:58.483] [info] [t:8605] 状态机收到地面站目标: boot=1792653477 seq=3 target_id=7 valid_for_ms=5000 age_ms=0 count=1
+[2026-10-22 15:17:58.483] [info] [t:8605] S3 已进入 Offboard(6/0)，解锁命令已入队: ARM_DISARM(400) p1=1（本次起飞仅一次）
+[2026-10-22 15:17:58.505] [info] [t:8609] PX4 命令 ACK: sequence=14 command=400 result=0 internal=false progress=0
+[2026-10-22 15:17:59.485] [info] [t:8605] 重复任务分配只重发65015: assignment_id=10 result=0 reason=0 count=1
+[2026-10-22 15:17:59.485] [info] [t:8605] 任务状态转移: ARMING -> TAKEOFF reason=PX4 已解锁且处于 Offboard
+[2026-10-22 15:17:59.485] [info] [t:8605] S4 自动爬升开始: 高度 2.00m 爬升率 0.50m/s 到达判据 z±0.20m xy±0.50m vz≤0.30m/s 稳定 1000ms
+[2026-10-22 15:17:59.517] [warning] [t:8604] 飞行控制器控制权迁移: BOOTSTRAP -> ACTIVE (armed+Offboard，bootstrap 完成)
+[2026-10-22 15:17:59.522] [warning] [t:8603] PX4 Home变化（诊断记录，估计器不重置）: 旧=(47.3979712,8.5461637,0.200m) 新=(47.3979711,8.5461636,0.235m) gps_fix=3 卫星=10 eph=0.70m epv=1.10m 锚点ref=(47.3979711,8.5461638,0.20m,收1) 局部位置=(0.01,0.00,-0.04)
+[2026-10-22 15:18:10.627] [info] [t:8605] 起飞到达任务高度: z=-1.92（原点 z0=-0.04，高度 2.00m），进入 GPS_APPROACH
+[2026-10-22 15:18:10.627] [info] [t:8605] 任务状态转移: TAKEOFF -> GPS_APPROACH reason=起飞到达任务高度
+[2026-10-22 15:18:10.627] [info] [t:8605] S5 目标看门狗启动: target_id=7 wait_timeout=10000ms lost_timeout=10000ms
+[2026-10-22 15:18:10.627] [info] [t:8605] GPS_APPROACH 位置引导意图启动: target_id=7 pos=(20.24,-0.12,-1.80) ff_mask=0x07 ff=(1.00,-0.50,0.00)
+[2026-10-22 15:18:14.532] [warning] [t:8605] 飞行中电池中止: reason=15 detail=电池剩余电量不高于 PX4 BAT_LOW_THR state=GPS_APPROACH → S12 返航
+[2026-10-22 15:18:14.532] [info] [t:8605] 任务状态转移: GPS_APPROACH -> RETURN_HOME reason=电池低电/遥测失效，中止任务并返航
+[2026-10-22 15:18:14.532] [info] [t:8605] 返航开始: Home 局部NED 由 Home+EKF锚点换算，返航高度 5.0m，到达半径 2.0m
+[2026-10-22 15:18:14.532] [info] [t:8605] 位置引导意图停止: 离开位置引导段
+[2026-10-22 15:18:16.735] [info] [t:8605] 返航爬升完成（相对 Home 5.0m），开始水平返航
+[2026-10-22 15:18:23.044] [info] [t:8605] 任务状态转移: RETURN_HOME -> LANDING reason=到达 Home 附近，进入降落
+[2026-10-22 15:18:23.044] [info] [t:8605] 降落阶段: 发 AUTO.LAND（4/6）
+[2026-10-22 15:18:23.044] [info] [t:8605] S13 AUTO.LAND 命令已入队
+[2026-10-22 15:18:23.058] [info] [t:8609] PX4 命令 ACK: sequence=15 command=176 result=0 internal=false progress=0
+[2026-10-22 15:18:23.347] [warning] [t:8604] 飞行控制器拒绝意图(意图持有期超龄): 累计=1
+[2026-10-22 15:18:23.347] [warning] [t:8604] 飞行控制器控制权迁移: ACTIVE -> COAST (意图持有期超龄)
+[2026-10-22 15:18:23.447] [warning] [t:8604] 飞行控制器控制权迁移: COAST -> IDLE (COAST 中授权链断开)
+[2026-10-22 15:18:32.455] [info] [t:8605] S14 前 DISARM 命令已入队
+[2026-10-22 15:18:32.478] [info] [t:8609] PX4 命令 ACK: sequence=16 command=400 result=0 internal=false progress=0
+[2026-10-22 15:18:33.456] [info] [t:8605] 任务状态转移: LANDING -> DISARMED reason=PX4 已确认 landed + disarmed，任务结束
+[2026-10-22 15:18:33.556] [info] [t:8605] 任务结束: S14 DISARMED，拦截结果=未发射
+[2026-10-22 15:18:34.445] [warning] [t:8603] PX4 Home变化窗口汇总（周期）: 窗口=0.0s 变化=1次 首=(47.3979712,8.5461636,0.225m) 末=(47.3979712,8.5461636,0.225m) 水平范围=0.0x0.0m 净漂移=0.0m 高度净漂移=+0.00m 高度范围=0.00m 最大单步=0.01m gps_fix=3 卫星=10 eph=0.70m epv=1.10m 锚点ref=(47.3979711,8.5461638,0.20m,收1) 局部位置=(0.06,-0.00,-0.06)
+[2026-10-22 15:18:43.620] [info] [t:8606] 收到地面站V2_EXTENSION: type=65014 target=1/25 count=100
+[2026-10-22 15:18:55.692] [warning] [t:8606] 地面站心跳超时: timeout_ms=3000
+[2026-10-22 15:18:58.270] [warning] [t:8603] 目标估计状态已过期: target_id=7 last_observed_ms=1522471
+[2026-10-22 15:18:58.619] [warning] [t:8607] 健康数据源超时: ground_station

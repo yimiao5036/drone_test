@@ -33,9 +33,17 @@ namespace drone::video {
 
 namespace {
 
+// 叠加数据流：解码 NV12 帧 + 异步 DetectionResult → 独立输出池副本 → 标注帧 Topic。
+// 输出不修改共享输入帧，避免 YOLO/RGA 与绘制线程并发访问同一缓冲。
+
 /// 异常日志节流：第 1 次与每满 100 次才打印。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
+}
+
+std::int64_t MonotonicUs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 /// 像素对齐（向上取整）。
@@ -268,6 +276,9 @@ struct FrameCompositor::Impl {
     std::atomic<uint64_t> annotated_count{0};
     std::atomic<uint64_t> dropped_count{0};
     std::atomic<uint64_t> error_count{0};
+    common::LatencyStatistics input_queue_latency;
+    common::LatencyStatistics compose_latency;
+    common::LatencyStatistics ingress_to_annotated_latency;
 
     void CreatePool(std::uint32_t width, std::uint32_t height) {
         VideoFrameInfo tmpl;
@@ -284,6 +295,7 @@ struct FrameCompositor::Impl {
 
     /// 拉取检测结果，只保留最新 frame_sequence 的整组目标。
     /// 旧实现持续 push_back 且从不清空，导致历史位置的框被每帧重复绘制。
+    // 同一 frame_sequence 的多目标保留，较旧序号的迟到结果直接忽略。
     void DrainDetections() {
         for (;;) {
             auto msg = detection_sub.TryTake();
@@ -305,6 +317,7 @@ struct FrameCompositor::Impl {
     }
 
     /// 连续无检测时按帧序号清除旧框，避免目标消失后最后一个框永久停留。
+    // 该清理依赖解码帧序号而非墙上时钟，能适应输入帧率变化。
     void ExpireStaleDetections(std::uint64_t current_frame_sequence) {
         if (pending_detections.empty() || !has_detection_frame_sequence ||
             current_frame_sequence <= latest_detection_frame_sequence) {
@@ -319,6 +332,7 @@ struct FrameCompositor::Impl {
     }
 
     /// 消费线程主循环。
+    // 取帧前后各拉取一次检测，尽量让等待期间到达的检测应用到当前帧。
     void Run() {
         while (!stop_requested.load()) {
             DrainDetections();
@@ -340,13 +354,19 @@ struct FrameCompositor::Impl {
             // 期间到达的新检测在本帧立即生效，而不是延迟到下一帧。
             DrainDetections();
             ExpireStaleDetections(in_handle.Info().sequence);
+            if (config.collect_detailed_latency && in_handle.Info().timestamp_ms > 0) {
+                input_queue_latency.Add(static_cast<double>(
+                    MonotonicUs() / 1000 - in_handle.Info().timestamp_ms));
+            }
             Compose(in_handle, pending_detections);
         }
     }
 
     /// 拷贝输入帧 → 新池帧 → 叠加 → 发布。
+    // 先复制 Y/UV 两个平面，再在副本上绘制框和文字，确保输出帧可独立归还。
     void Compose(const FrameHandle& in,
                  const std::vector<common::DetectionResult>& dets) {
+        const std::int64_t compose_start_us = MonotonicUs();
         const VideoFrameInfo& src = in.Info();
         const std::uint32_t w = src.width;
         const std::uint32_t h = src.height;
@@ -363,7 +383,7 @@ struct FrameCompositor::Impl {
             }
         }
 
-        auto out = pool->Acquire();
+        auto out = pool->Acquire(src.pipeline_ingress_time_ms);
         if (!out.Valid()) {
             ++dropped_count;
             if (ShouldLogThrottled(dropped_count)) {
@@ -392,7 +412,7 @@ struct FrameCompositor::Impl {
             }
         }
 
-        // 叠加检测框 + 文字
+        // 叠加检测框 + 文字；每个检测结果独立绘制，同帧多目标不会互相覆盖状态。
         Nv12Surface surface{out.Data(), out_stride, h};
         for (const auto& d : dets) {
             DrawBox(surface, d.bbox_x, d.bbox_y, d.bbox_w, d.bbox_h,
@@ -411,10 +431,22 @@ struct FrameCompositor::Impl {
             }
         }
 
+        const std::int64_t completed_us = MonotonicUs();
+        const std::int64_t completed_ms = completed_us / 1000;
+        out.SetTiming(completed_ms, src.pipeline_ingress_time_ms);
+        if (config.collect_detailed_latency) {
+            compose_latency.Add(
+                static_cast<double>(completed_us - compose_start_us) / 1000.0);
+        }
+        if (src.pipeline_ingress_time_ms > 0) {
+            ingress_to_annotated_latency.Add(static_cast<double>(
+                completed_ms - src.pipeline_ingress_time_ms));
+        }
         (void)annotated_output.Emplace(std::move(out));
         ++annotated_count;
     }
 
+    // 停止通过 Reset 订阅唤醒 WaitTakeFor，再等待唯一消费线程退出。
     void Stop() {
         if (!thread.joinable()) {
             return;
@@ -490,6 +522,18 @@ std::uint64_t FrameCompositor::DroppedFrameCount() const {
 
 std::uint64_t FrameCompositor::ErrorCount() const {
     return impl_->error_count.load();
+}
+
+common::LatencySummary FrameCompositor::InputQueueLatency() const {
+    return impl_->input_queue_latency.Snapshot();
+}
+
+common::LatencySummary FrameCompositor::ComposeLatency() const {
+    return impl_->compose_latency.Snapshot();
+}
+
+common::LatencySummary FrameCompositor::IngressToAnnotatedLatency() const {
+    return impl_->ingress_to_annotated_latency.Snapshot();
 }
 
 }  // namespace drone::video

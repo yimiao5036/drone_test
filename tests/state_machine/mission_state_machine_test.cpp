@@ -1,0 +1,6719 @@
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
+
+#include <unistd.h>
+
+#include <gtest/gtest.h>
+
+#include "communication/ground_station_link.h"
+#include "communication/px4_link.h"
+#include "config/config.h"
+#include "config/zone_store.h"
+#include "perception/target_estimator.h"
+#include "state_machine/mission_state_machine.h"
+
+#include "../common/log_capture.h"
+#include "../communication/fake_command_sender.h"
+
+namespace {
+
+using namespace drone;
+using namespace std::chrono_literals;
+using drone::test::FakeCommandSender;
+
+uint64_t TestMonotonicMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+common::FlightStateSnapshot MakeNavigationReadyFlight() {
+    common::FlightStateSnapshot flight;
+    // 2026-11-11：S5 接近速度律需要自机局部 NED 位置/速度；真实快照在进入
+    // GPS_APPROACH 前必然有效，测试基线同步补齐（默认原点、静止）。
+    flight.local_position_valid = true;
+    flight.local_x_m = 0.f;
+    flight.local_y_m = 0.f;
+    flight.local_z_m = 0.f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.header.valid_for_ms = 1000;
+    flight.connected = true;
+    flight.gps_state_valid = true;
+    flight.gps_fix = true;
+    flight.gps_fix_type = 3;
+    flight.global_position_valid = true;
+    flight.latitude_1e7 = 231230000;
+    flight.longitude_1e7 = 1131230000;
+    flight.altitude_mm = 120000;
+    flight.home_valid = true;
+    flight.home_lat_1e7 = 231200000;
+    flight.home_lon_1e7 = 1131200000;
+    flight.home_altitude_mm = 100000;
+    // 健康 PX4 电池基线（Task 8）：BAT_LOW_THR=15%、COM_LOW_BAT_ACT=0、
+    // 遥测有效且剩余 80%。飞行中电池守卫对所有派生夹具生效，避免旧用例
+    // 因“遥测缺失”被误判为电池失效。
+    flight.battery_valid = true;
+    flight.battery_remaining_valid = true;
+    flight.battery_remaining_pct = 80.f;
+    flight.battery_low_threshold_valid = true;
+    flight.battery_low_threshold_pct = 15.f;
+    flight.low_battery_action_valid = true;
+    flight.low_battery_action = 0;
+    return flight;
+}
+
+common::GroundStationTarget MakeFreshGroundTarget() {
+    common::GroundStationTarget target;
+    target.header.sequence = 1;
+    target.header.source_time_ms = TestMonotonicMs();
+    target.header.receive_time_ms = TestMonotonicMs();
+    target.header.valid_for_ms = 1000;
+    target.header.source_id = 255;
+    target.header.health = 1;
+    target.header.frame_id = 1;
+    target.ground_station_boot_id = 42;
+    target.update_seq = 1;
+    target.target_id = 7;
+    target.latitude_1e7 = 231230000;
+    target.longitude_1e7 = 1131230000;
+    target.altitude_mm = 120000;
+    target.alt_reference = 1;
+    target.protocol_version = 1;
+    target.transport_age_ms = 50;
+    return target;
+}
+
+// 局部 NED 坐标系编码（frame_id=3，见 types.h 文件头约定）。
+constexpr uint8_t kFrameLocalNed = 3;
+
+/// 有效目标估计快照（TargetEstimator 影子输出语义：valid=true 且剩余有效期充足）。
+common::TargetState MakeValidEstimatedTarget() {
+    common::TargetState state;
+    state.header.sequence = 1;
+    state.header.source_time_ms = TestMonotonicMs();
+    state.header.receive_time_ms = TestMonotonicMs();
+    state.header.valid_for_ms = 1000;
+    state.header.source_id = 0;
+    state.header.health = 1;
+    state.header.frame_id = kFrameLocalNed;
+    state.target_id = 7;
+    state.pos_x_m = 12.5f;
+    state.pos_y_m = -3.0f;
+    state.pos_z_m = -8.0f;
+    state.valid = true;
+    return state;
+}
+
+/// 估计失效快照（valid=false，例如地面站目标过期后 TargetEstimator 发布的过期态）。
+common::TargetState MakeInvalidEstimatedTarget() {
+    common::TargetState state = MakeValidEstimatedTarget();
+    state.header.sequence = 2;
+    state.header.receive_time_ms = TestMonotonicMs();
+    state.header.valid_for_ms = 0;
+    state.header.health = 2;
+    state.valid = false;
+    return state;
+}
+
+std::optional<common::MissionStatus> WaitForState(
+    common::Topic<common::MissionStatus>::Subscription& subscription,
+    common::MissionState expected,
+    std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if ((*message)->state == expected) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+TEST(MissionStateMachineTest, StartFailsBeforeInputsAreBound) {
+    state_machine::MissionStateMachine machine;
+
+    EXPECT_FALSE(machine.Start());
+    EXPECT_FALSE(machine.IsRunning());
+    EXPECT_GT(machine.ErrorCount(), 0U);
+}
+
+TEST(MissionStateMachineTest, PublishesBootAndSelfCheckOnStart) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    EXPECT_TRUE(WaitForState(status_subscription, common::MissionState::kBoot).has_value());
+    EXPECT_TRUE(WaitForState(status_subscription, common::MissionState::kSelfCheck).has_value());
+
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, NavigationReadyFlightMovesToReady) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(MakeNavigationReadyFlight()));
+
+    const auto ready_status = WaitForState(status_subscription, common::MissionState::kReady);
+    ASSERT_TRUE(ready_status.has_value());
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kReady);
+
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, FreshGroundTargetMovesToGpsApproachShadowState) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(2);
+
+    ASSERT_TRUE(machine.Start());
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(MakeNavigationReadyFlight()));
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReady).has_value());
+
+    (void)ground_target_topic.Publish(
+        std::make_shared<const common::GroundStationTarget>(MakeFreshGroundTarget()));
+
+    const auto gps_status =
+        WaitForState(status_subscription, common::MissionState::kGpsApproach);
+    ASSERT_TRUE(gps_status.has_value());
+    EXPECT_EQ(gps_status->control_source, 0U);
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(150ms).has_value());
+
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, TargetWithoutNavigationDoesNotLeaveSelfCheck) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kSelfCheck).has_value());
+    (void)ground_target_topic.Publish(
+        std::make_shared<const common::GroundStationTarget>(MakeFreshGroundTarget()));
+
+    EXPECT_FALSE(WaitForState(status_subscription, common::MissionState::kGpsApproach, 300ms)
+                     .has_value());
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kSelfCheck);
+
+    machine.Stop();
+}
+
+/// 等待一条控制意图；超时返回 nullopt。
+std::optional<common::ControlIntent> WaitForIntent(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 驱动状态机进入 GPS_APPROACH（导航就绪 + 新鲜地面站目标）。
+void DriveToGpsApproach(
+    common::Topic<common::FlightStateSnapshot>& flight_topic,
+    common::Topic<common::GroundStationTarget>& ground_target_topic,
+    common::Topic<common::MissionStatus>::Subscription& status_subscription) {
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(MakeNavigationReadyFlight()));
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReady).has_value());
+    (void)ground_target_topic.Publish(
+        std::make_shared<const common::GroundStationTarget>(MakeFreshGroundTarget()));
+    ASSERT_TRUE(
+        WaitForState(status_subscription, common::MissionState::kGpsApproach).has_value());
+}
+
+// 2026-11-11：S5 由接近速度律产出位置锚点 + 三轴速度前馈（旧固定提前已删除）。
+TEST(MissionStateMachineTest, GpsApproachPublishesSpeedLawIntent) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+
+    auto flight = MakeNavigationReadyFlight();
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.local_position_valid = true;
+    flight.local_x_m = 0.f;
+    flight.local_y_m = 0.f;
+    flight.local_z_m = 0.f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight));
+
+    auto estimated = MakeValidEstimatedTarget();
+    estimated.vel_x_mps = 2.5f;
+    estimated.vel_y_mps = -1.5f;
+    estimated.vel_z_mps = 0.5f;
+    estimated.velocity_valid_mask = common::kVelocityValidAll;
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_EQ(intent->type, common::ControlIntentType::kPositionGuide);
+    EXPECT_EQ(intent->control_source, 0U);
+    EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
+    EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(intent->header.valid_for_ms, 300U);
+    // 位置锚点 = 自机 + v_ref × ref_lead_s；首拍 v_ref 按 slew 从 0 起步，
+    // 因此锚点仍在自机附近（不是目标点）。
+    EXPECT_NEAR(intent->target_x, 0.0f, 0.2f);
+    EXPECT_NEAR(intent->target_y, 0.0f, 0.2f);
+    EXPECT_NEAR(intent->target_z, 0.0f, 0.2f);
+    // 速度律固定下发三轴前馈（有效位全开）。
+    EXPECT_EQ(intent->feedforward_valid_mask, common::kVelocityValidAll);
+    EXPECT_GT(intent->max_speed_mps, 0.4f);
+    EXPECT_TRUE(intent->yaw_valid);
+
+    machine.Stop();
+}
+
+// 机头仍指向目标（速度律只改位置/速度锚点，不改相机指向）。
+TEST(MissionStateMachineTest, GpsApproachFacesTargetWithSpeedLaw) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+
+    auto flight = MakeNavigationReadyFlight();
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.local_position_valid = true;
+    (void)flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(flight));
+
+    auto estimated = MakeValidEstimatedTarget();
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(estimated));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_TRUE(intent->yaw_valid);
+    EXPECT_NEAR(intent->yaw_deg,
+                static_cast<float>(std::atan2(-3.0f, 12.5f) * 180.0 /
+                                   3.14159265358979323846),
+                1e-3f);
+
+    machine.Stop();
+}
+
+// 意图有效期必须来自注入的配置（与 controller.intent_timeout 对齐），不写死字面量。
+TEST(MissionStateMachineTest, IntentValidityComesFromConfig) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachineConfig config;
+    config.intent_valid_for = 450ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeValidEstimatedTarget()));
+
+    const auto intent = WaitForIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_EQ(intent->header.valid_for_ms, 450U);
+    EXPECT_EQ(intent->valid_until_ms, intent->header.receive_time_ms + 450U);
+
+    machine.Stop();
+}
+
+// 估计失效（TargetState.valid=false，如地面站目标过期）后停止发布位置引导意图；
+// 超龄收口由 FlightController 意图超时门禁接管。
+TEST(MissionStateMachineTest, IntentStopsWhenEstimateInvalid) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_status_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    state_machine::MissionStateMachine machine;
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_status_topic, distance_topic);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(8);
+
+    ASSERT_TRUE(machine.Start());
+    DriveToGpsApproach(flight_topic, ground_target_topic, status_subscription);
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeValidEstimatedTarget()));
+    ASSERT_TRUE(WaitForIntent(intent_subscription).has_value());
+
+    (void)estimated_topic.Publish(
+        std::make_shared<const common::TargetState>(MakeInvalidEstimatedTarget()));
+    // 等待至少两个决策周期，确保状态机已观测到失效估计并停发。
+    std::this_thread::sleep_for(250ms);
+    while (intent_subscription.TryTake().has_value()) {
+    }
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(300ms).has_value());
+
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// 阶段四 Task 8：交接判据（S5→S6→S7 进入/退出迟滞）
+//
+// 进入（S5→S6）需同时满足：视觉 LOCKED 连续帧达 handover.enter_s6_lock_frames、
+// 双目距离有效且未超龄、视线角距视场边缘有余量（handover.fow_margin_deg）、
+// 视觉观测与卡尔曼预测创新在门限内（handover.innovation_gate_m）。
+// S6 驻留超时（handover.timeout_ms）回 S5；S7 退出需 LOST 连续帧达
+// handover.exit_lost_frames（进入/退出门限不同构成迟滞）。
+// 本层计数与 VisualTargetMonitor 内部 acquire_lock_frames 判据相互独立。
+// ---------------------------------------------------------------------------
+
+/// 视觉稳定性状态快照。默认中心 (640, 532) 位于标定内参下视场余量内：
+/// 标定主点 cy=532.07 偏离画面中心，画面中心 (640, 360) 反而贴近视场边缘。
+common::VisualTargetStatus MakeVisualStatus(common::VisualTargetState state,
+                                            uint64_t frame_sequence,
+                                            float center_x = 640.0F,
+                                            float center_y = 532.0F) {
+    common::VisualTargetStatus status;
+    status.header.sequence = frame_sequence;
+    status.header.source_time_ms = TestMonotonicMs();
+    status.header.receive_time_ms = TestMonotonicMs();
+    status.header.source_id = 0;
+    status.header.health = 1;
+    status.state = state;
+    status.frame_sequence = frame_sequence;
+    status.last_seen_ms = TestMonotonicMs();
+    status.consecutive_detected_frames = static_cast<int>(frame_sequence);
+    status.confidence = 0.9F;
+    status.center_pixel_x = center_x;
+    status.center_pixel_y = center_y;
+    status.frame_width = 1280;
+    status.frame_height = 720;
+    status.valid = state == common::VisualTargetState::kLocked;
+    return status;
+}
+
+/// 双目测距快照（StereoTargetDistance 头不含 valid_for_ms，
+/// 新鲜度由状态机按注入的超龄阈值判定）。valid=false 时距离字段为 NaN。
+common::StereoTargetDistance MakeFreshDistance(uint64_t frame_sequence,
+                                               bool valid = true,
+                                               float forward_m = 10.0F) {
+    common::StereoTargetDistance msg;
+    msg.header.sequence = frame_sequence;
+    msg.header.source_time_ms = TestMonotonicMs();
+    msg.header.receive_time_ms = TestMonotonicMs();
+    msg.frame_sequence = frame_sequence;
+    msg.valid = valid;
+    msg.confidence = 0.9F;
+    if (valid) {
+        msg.forward_distance_m = forward_m;
+        msg.camera_x_m = 0.0F;
+        msg.camera_y_m = 0.0F;
+    }
+    return msg;
+}
+
+/// 交接测试用估计快照：有效期足够长，覆盖用例全程。
+common::TargetState MakeHandoverEstimate() {
+    common::TargetState state = MakeValidEstimatedTarget();
+    state.header.valid_for_ms = 5000;
+    state.header.receive_time_ms = TestMonotonicMs();
+    // P3：交接测试带速度前馈，用于证明 S6 冻结段显式丢弃前馈。
+    state.vel_x_mps = 1.5f;
+    state.vel_y_mps = -0.5f;
+    state.vel_z_mps = 0.0f;
+    state.velocity_valid_mask = common::kVelocityValidAll;
+    return state;
+}
+
+/// 估计器诊断假件：只提供交接创新门限所需的值（其余接口占位）。
+/// 用假件而不是真估计器，使创新值可精确注入，状态机测试不依赖感知内部时序。
+class FakeEstimator final : public perception::ITargetEstimator {
+public:
+    bool Start() override { return true; }
+    void Stop() override {}
+    bool IsRunning() const override { return true; }
+    void SetGroundTargetInput(
+        common::Topic<common::GroundStationTarget>& /*ground*/) override {}
+    void SetFlightStateInput(
+        common::Topic<common::FlightStateSnapshot>& /*flight*/) override {}
+    void SetVisualDistanceInput(
+        common::Topic<common::StereoTargetDistance>& /*visual*/) override {}
+    common::Topic<common::TargetState>& EstimatedOutput() override {
+        return output_;
+    }
+    common::TargetState LastState() const override { return {}; }
+    uint64_t UpdateCount() const override { return 0; }
+    uint64_t VisualUpdateCount() const override { return 0; }
+    uint64_t ErrorCount() const override { return 0; }
+    double LastVisualInnovationM() const override { return innovation_m_; }
+
+    void SetInnovation(double value) { innovation_m_ = value; }
+
+private:
+    common::Topic<common::TargetState> output_;
+    double innovation_m_ = std::numeric_limits<double>::quiet_NaN();
+};
+
+/// 交接测试默认配置：交接阈值取小值（lock=3、exit=6、超时 2s、测距失效 3s）
+/// 压缩用例时长；视觉/测距超龄阈值默认放宽（5s），避免用例时序被调度抖动影响，
+/// 需要验证超龄门禁的用例单独收紧。
+state_machine::MissionStateMachineConfig MakeHandoverTestConfig(
+    std::chrono::milliseconds handover_timeout = 2000ms,
+    std::chrono::milliseconds distance_lost = 3000ms,
+    std::chrono::milliseconds visual_stale = 5000ms,
+    std::chrono::milliseconds distance_stale = 5000ms) {
+    state_machine::MissionStateMachineConfig config;
+    config.visual_stale = visual_stale;
+    config.distance_stale = distance_stale;
+    config.handover.enter_s6_lock_frames = 3;
+    config.handover.exit_lost_frames = 6;
+    config.handover.fow_margin_deg = 5.0;
+    config.handover.innovation_gate_m = 3.0;
+    config.handover.timeout = handover_timeout;
+    config.handover.distance_lost_ms = distance_lost;
+    return config;
+}
+
+/// 交接判据测试夹具：状态机 + 四路输入 + 假估计器诊断。
+struct HandoverFixture {
+    explicit HandoverFixture(
+        const state_machine::MissionStateMachineConfig& custom_config,
+        bool inject_diagnostics = true)
+        : config(custom_config) {
+        estimator.SetInnovation(0.5);  // 默认创新在门限内
+        machine = std::make_unique<state_machine::MissionStateMachine>(config);
+        machine->SetInputs(ground, flight, health);
+        machine->SetEstimationInputs(estimated, visual, distance);
+        machine->SetFenceInput(fence);
+        intent_subscription = machine->IntentOutput().Subscribe(64);
+        if (inject_diagnostics) {
+            machine->SetEstimationDiagnostics(&estimator);
+        }
+        status_subscription = machine->StatusOutput().Subscribe(64);
+        started = machine->Start();
+    }
+
+    explicit HandoverFixture(bool inject_diagnostics = true)
+        : HandoverFixture(MakeHandoverTestConfig(), inject_diagnostics) {}
+
+    ~HandoverFixture() { machine->Stop(); }
+
+    /// 驱动到 S5（导航就绪 → 新鲜地面站目标 → 估计/测距有效）。
+    void DriveToGpsApproach() {
+        (void)flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight()));
+        ASSERT_TRUE(
+            WaitForState(status_subscription, common::MissionState::kReady).has_value());
+        (void)ground.Publish(std::make_shared<const common::GroundStationTarget>(
+            MakeFreshGroundTarget()));
+        ASSERT_TRUE(WaitForState(status_subscription,
+                                 common::MissionState::kGpsApproach)
+                        .has_value());
+        PublishEstimateAndDistance();
+    }
+
+    void PublishEstimateAndDistance() {
+        (void)estimated.Publish(
+            std::make_shared<const common::TargetState>(MakeHandoverEstimate()));
+        (void)distance.Publish(std::make_shared<const common::StereoTargetDistance>(
+            MakeFreshDistance(++distance_sequence)));
+    }
+
+    /// 发布一条视觉状态并等待决策周期消费（决策周期 100ms，留余量）。
+    void PublishVisual(const common::VisualTargetStatus& status) {
+        (void)visual.Publish(
+            std::make_shared<const common::VisualTargetStatus>(status));
+        std::this_thread::sleep_for(120ms);
+    }
+
+    /// 发布一条测距快照（valid=false 为测距失效）并等待决策周期消费。
+    void PublishDistance(bool valid) {
+        (void)distance.Publish(std::make_shared<const common::StereoTargetDistance>(
+            MakeFreshDistance(++distance_sequence, valid)));
+        std::this_thread::sleep_for(120ms);
+    }
+
+    /// 驱动进入 S7：S5 → 连续 3 帧 LOCKED → S6 → 再推进一帧新 LOCKED → S7。
+    void DriveToVisualTracking() {
+        DriveToGpsApproach();
+        for (uint64_t frame = 1; frame <= 3; ++frame) {
+            PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+        }
+        ASSERT_TRUE(WaitForState(status_subscription,
+                                 common::MissionState::kVisualHandover)
+                        .has_value());
+        PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 4));
+        ASSERT_TRUE(WaitForState(status_subscription,
+                                 common::MissionState::kVisualTracking)
+                        .has_value());
+    }
+
+    state_machine::MissionStateMachineConfig config;
+    common::Topic<common::GroundStationTarget> ground;
+    common::Topic<common::FlightStateSnapshot> flight;
+    common::Topic<common::HealthStatus> health;
+    common::Topic<common::TargetState> estimated;
+    common::Topic<common::VisualTargetStatus> visual;
+    common::Topic<common::StereoTargetDistance> distance;
+    common::Topic<common::FenceZone> fence;
+    common::Topic<common::MissionStatus>::Subscription status_subscription;
+    common::Topic<common::ControlIntent>::Subscription intent_subscription;
+    FakeEstimator estimator;
+    std::unique_ptr<state_machine::MissionStateMachine> machine;
+    bool started = false;
+    uint64_t distance_sequence = 0;
+};
+
+// LOCKED 断续不累计：N-1 条连续 LOCKED 被中断后不进入 S6；再补齐连续 N 条才进 S6。
+TEST(MissionStateMachineTest, HandoverRequiresConsecutiveLockFrames) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    // LOCKED(1) LOCKED(2) LOST(3) LOCKED(4) LOCKED(5)：任一刻连续锁定 < 3
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 1));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 2));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 3));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 4));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 5));
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+
+    // 第 3 条连续 LOCKED（断续累计是第 5 条，必须不生效）→ 进入 S6
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 6));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+}
+
+// 创新门限：无有效创新（NaN）或观测-预测水平距离超门限均不放行交接（防错锁伪目标）。
+TEST(MissionStateMachineTest, HandoverRejectsInnovationBeyondGate) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    f.estimator.SetInnovation(std::numeric_limits<double>::quiet_NaN());
+    for (uint64_t frame = 1; frame <= 4; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    // 连续锁定帧数已超门限，但创新无值 → 不放行
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+
+    f.estimator.SetInnovation(5.0);  // 超 innovation_gate_m=3.0
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 5));
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+
+    f.estimator.SetInnovation(0.5);  // 回到门限内 → 连续锁定条件已满足，进入 S6
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+}
+
+// 视场余量：目标视线角距视场边缘不足 fow_margin_deg 时不进入 S6。
+TEST(MissionStateMachineTest, HandoverRejectsTargetNearFovEdge) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    // 像素 x=1240 → 视线方位角约 31.6°，标定内参下视场半角约 33.2°，
+    // 余量不足 5° → 不放行
+    for (uint64_t frame = 1; frame <= 4; ++frame) {
+        f.PublishVisual(
+            MakeVisualStatus(common::VisualTargetState::kLocked, frame, 1240.0F));
+    }
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+
+    // 目标回到画面中部（余量充足）→ 进入 S6
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 5));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+}
+
+// S6 驻留超时：进入 S6 后视觉链未再推进新帧（首条视觉指令未生效）→ 回 S5。
+TEST(MissionStateMachineTest, HandoverTimeoutReturnsToGpsApproach) {
+    // 超时 300ms 先于视觉/测距超龄（5s）发生，确保走超时路径而非超龄撤销路径
+    HandoverFixture f(MakeHandoverTestConfig(/*handover_timeout=*/300ms));
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    // 驻留期：进入条件仍有效（输入未超龄），仅因超时回 S5
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach, 1500ms)
+                    .has_value());
+    // 超时回退后不因旧锁定帧立刻回跳 S6
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 400ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+}
+
+// S7 退出迟滞：LOST 连续帧超过进入门限但未达 exit_lost_frames 保持 S7；
+// 达到 exit_lost_frames 才回退（进入/退出门限不同防止两状态抖动）。
+TEST(MissionStateMachineTest, ExitRequiresMoreLostFramesThanEntry) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+
+    // LOST 4 条（> enter_s6_lock_frames=3 但 < exit_lost_frames=6）→ 保持 S7
+    for (uint64_t frame = 5; frame <= 8; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, frame));
+    }
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kGpsApproach, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+
+    // 补足 6 条连续 LOST → 回退 S5
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 9));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 10));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+}
+
+// S6 撤销：驻留期进入条件失效（视觉丢失）→ 立即撤销回 S5。
+TEST(MissionStateMachineTest, HandoverAbortsWhenLockLostInHandover) {
+    HandoverFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 4));
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+}
+
+// 未注入估计器诊断接口时不放行交接：创新门限无法核验，保守保持 S5（并记 ERROR）。
+TEST(MissionStateMachineTest, HandoverRequiresEstimatorDiagnostics) {
+    HandoverFixture f(/*inject_diagnostics=*/false);
+    ASSERT_TRUE(f.started);
+    EXPECT_GT(f.machine->ErrorCount(), 0U);
+    f.DriveToGpsApproach();
+
+    for (uint64_t frame = 1; frame <= 5; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kVisualHandover, 300ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+}
+
+// S7 测距失效退出：双目测距失效（invalid 或超龄）连续达 handover.distance_lost_ms
+// → 退出 S7 回退 S5；期间一旦恢复有效则计时清零（不得误退）。
+TEST(MissionStateMachineTest, ExitWhenDistanceLostBeyondThreshold) {
+    HandoverFixture f(MakeHandoverTestConfig(/*handover_timeout=*/2000ms,
+                                             /*distance_lost=*/300ms,
+                                             /*visual_stale=*/5000ms,
+                                             /*distance_stale=*/2000ms));
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+
+    // 距离失效（invalid）持续约 250ms（未达 300ms 阈值）后恢复有效：
+    // 计时必须清零——若未清零，恢复后再等 400ms（累计 > 阈值）就会退出。
+    f.PublishDistance(false);
+    std::this_thread::sleep_for(120ms);
+    f.PublishDistance(true);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+
+    // 距离持续失效（仍按期发布，排除超龄路径，纯 invalid 路径）→ 达阈值退出
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline &&
+           f.machine->CurrentState() == common::MissionState::kVisualTracking) {
+        f.PublishDistance(false);
+    }
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach, 1000ms)
+                    .has_value());
+    // 测距失效推出后停在 S5（锁定计数已复位，不因旧帧回跳 S6）
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+}
+
+// S7 视觉断流退出：监视器线程死亡/链路中断时无 LOST 状态消息可计数、帧序冻结，
+// 状态消息接收年龄超过 S6 进入判据所用的同一视觉新鲜度阈值即按断流退出。
+TEST(MissionStateMachineTest, ExitWhenVisualStreamStalls) {
+    HandoverFixture f(MakeHandoverTestConfig(/*handover_timeout=*/2000ms,
+                                             /*distance_lost=*/3000ms,
+                                             /*visual_stale=*/400ms,
+                                             /*distance_stale=*/5000ms));
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+
+    // 不再发布任何视觉状态（等价监视器线程死亡）：未到超龄阈值时不退出
+    EXPECT_FALSE(WaitForState(f.status_subscription,
+                              common::MissionState::kGpsApproach, 150ms)
+                     .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+    // 超龄（visual_stale=400ms）→ 按断流退出回 S5
+    EXPECT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach, 1500ms)
+                    .has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kGpsApproach);
+}
+
+// ---------------------------------------------------------------------------
+// 阶段四 Task 9：S7 视觉伺服意图（TrackingControlLaw 迁入状态机）+ coast +
+// 热备份核对
+//
+// S7（VISUAL_TRACKING）期间状态机是唯一的视觉意图生产者：以 VisualTargetStatus
+// （LOCKED→tracked）、StereoTargetDistance 与 FlightStateSnapshot 姿态组装
+// ControlSnapshot，驱动 TrackingControlLaw（含机体系→NED 旋转），把输出映射为
+// control_source=1 的 ControlIntent（带 bit31 控制权请求位）。
+// 主链路无预测坐标（is_predicted 恒 false）：短期 LOST 按控制律判丢语义映射为
+// 零速刹车意图（kBrakeHover）；控制律降级保持（姿态/视觉超龄）时不发布意图
+// （安全语义：超龄收口交 FlightController 意图超时门禁刹停）。
+// S6 驻留期由状态机续发进入时刻冻结的最后位置目标（valid_until 逐拍滚动，
+// 设计 §2.1/§2.5 无扰衔接：避免交接点意图超龄刹车再起步），首条视觉速度
+// 意图发出即停。
+// ---------------------------------------------------------------------------
+
+constexpr double kPi = 3.14159265358979323846;
+
+/// 默认跟踪配置（visual_tracking 节默认值）下的伺服期望输出基准：
+///   航向 β = atan((px − cx)/fx)，速率式 yaw_rate = gain·β（gain 默认 1.0）
+///   垂直 α = atan((py − cy)/fy)，vz = vz_gain·α（vz_gain 默认 0.1）
+///   距离 Δd = 15 − d_exp，vx = kp·Δd（kp 用例注入 0.1，占位默认 0 无法验证映射）
+constexpr double kDefaultFx = 1007.82;
+constexpr double kDefaultFy = 1008.02;
+constexpr double kDefaultCx = 620.73;
+constexpr double kDefaultCy = 532.07;
+constexpr double kDefaultVzGain = 0.1;
+constexpr double kServoDistanceKp = 0.1;
+constexpr double kDefaultDExpM = 10.0;
+constexpr double kServoDistanceM = 15.0;
+constexpr double kServoVisualX = 640.0;
+constexpr double kServoVisualY = 532.0;
+
+/// 期望航向角速度（度/秒）：β 由标定内参算出，约 1.0955°/s。
+double ServoExpectedBetaDeg() {
+    return std::atan((kServoVisualX - kDefaultCx) / kDefaultFx) * 180.0 / kPi;
+}
+
+/// 期望垂直速度（米/秒）：α≈−0.004°（像素 y=532 略高于主点 cy=532.07）。
+double ServoExpectedVz() {
+    const double alpha_deg =
+        std::atan((kServoVisualY - kDefaultCy) / kDefaultFy) * 180.0 / kPi;
+    return kDefaultVzGain * alpha_deg;
+}
+
+/// 期望前向速度（米/秒）：Δd=15−10=5m、kp=0.1 → 0.5m/s（加速度限幅收敛后）。
+double ServoExpectedVx() {
+    return kServoDistanceKp * (kServoDistanceM - kDefaultDExpM);
+}
+
+/// 导航就绪 + 新鲜姿态的飞行快照（S7 伺服要求姿态在控制律超龄阈值内，
+/// 用例需按期重发刷新接收时间）。
+common::FlightStateSnapshot MakeFlightWithAttitude(double yaw_rad) {
+    common::FlightStateSnapshot flight = MakeNavigationReadyFlight();
+    flight.header.receive_time_ms = TestMonotonicMs();
+    flight.attitude_valid = true;
+    flight.roll_rad = 0.0F;
+    flight.pitch_rad = 0.0F;
+    flight.yaw_rad = static_cast<float>(yaw_rad);
+    return flight;
+}
+
+/// 收集一段时间内的全部意图（按发布顺序）。
+std::vector<common::ControlIntent> CollectIntents(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    std::chrono::milliseconds duration) {
+    std::vector<common::ControlIntent> intents;
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message) {
+            intents.push_back(**message);
+        }
+    }
+    return intents;
+}
+
+/// 返回序列中最后一条指定类型的意图；不存在返回 nullptr。
+const common::ControlIntent* LastIntentOfType(
+    const std::vector<common::ControlIntent>& intents,
+    common::ControlIntentType type) {
+    const common::ControlIntent* found = nullptr;
+    for (const auto& intent : intents) {
+        if (intent.type == type) {
+            found = &intent;
+        }
+    }
+    return found;
+}
+
+/// 等待一条带指定告警位的任务状态（超时返回 nullopt）。
+std::optional<common::MissionStatus> WaitForWarningBit(
+    common::Topic<common::MissionStatus>::Subscription& subscription,
+    uint32_t mask,
+    std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message && ((*message)->active_warning_bits & mask) != 0U) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 视觉伺服用例配置：交接阈值同 HandoverFixture（取小值压缩用例时长）；
+/// 距离环比例增益取非零——占位默认 kp=0 会让前向速度恒为零，无法验证
+/// "距离通道输出 → 意图映射"。
+state_machine::MissionStateMachineConfig MakeServoTestConfig() {
+    auto config = MakeHandoverTestConfig();
+    config.tracking.distance.kp = kServoDistanceKp;
+    return config;
+}
+
+/// 视觉伺服测试夹具：交接驱动复用 HandoverFixture，附加 S7 输入泵与意图订阅。
+/// 控制律内部超龄阈值（视觉 200ms/姿态 300ms/测距 500ms，跟踪配置默认值）
+/// 要求用例按期刷新三路输入，否则控制律降级保持、停止发布意图。
+struct VisualServoFixture : HandoverFixture {
+    explicit VisualServoFixture(
+        double yaw_rad = 0.0,
+        const state_machine::MissionStateMachineConfig& custom = MakeServoTestConfig())
+        : HandoverFixture(custom), yaw_rad_(yaw_rad) {
+        intent_subscription = machine->IntentOutput().Subscribe(64);
+    }
+
+    /// 发布一轮伺服输入：新鲜姿态 + 指定视觉状态 + 测距 15m（射程 10m 之外）。
+    /// with_attitude=false 时不发布飞行快照（最新快照保持无姿态）——用于构造
+    /// "控制律姿态超龄持续降级、伺服永不启动"的场景。
+    void PublishServoInputs(
+        uint64_t frame,
+        common::VisualTargetState visual_state = common::VisualTargetState::kLocked,
+        bool with_attitude = true) {
+        if (with_attitude) {
+            (void)flight.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                MakeFlightWithAttitude(yaw_rad_)));
+        }
+        (void)visual.Publish(std::make_shared<const common::VisualTargetStatus>(
+            MakeVisualStatus(visual_state, frame)));
+        (void)distance.Publish(std::make_shared<const common::StereoTargetDistance>(
+            MakeFreshDistance(frame, /*valid=*/true, /*forward_m=*/kServoDistanceM)));
+    }
+
+    /// 按期泵输入并收集期间的意图（每轮约 120ms）。
+    std::vector<common::ControlIntent> PumpAndCollect(int rounds) {
+        std::vector<common::ControlIntent> intents;
+        for (int round = 0; round < rounds; ++round) {
+            PublishServoInputs(++frame_);
+            auto batch = CollectIntents(intent_subscription, 120ms);
+            intents.insert(intents.end(), batch.begin(), batch.end());
+        }
+        return intents;
+    }
+
+    /// 清空意图队列（跳过交接驱动期已发出的意图）。
+    void DrainIntents() {
+        while (intent_subscription.TryTake().has_value()) {
+        }
+    }
+
+    double yaw_rad_ = 0.0;
+    uint64_t frame_ = 100;  ///< 帧序号：避开交接驱动帧 1..4 的迟滞去重记忆
+    common::Topic<common::ControlIntent>::Subscription intent_subscription;
+};
+
+// S7：视觉 LOCKED + 测距有效 + 姿态新鲜 → 发布 control_source=1 的速度航向意图，
+// 速度分量与 TrackingControlLaw 输出一致（注入已知几何，对拍控制律单测期望值）。
+TEST(MissionStateMachineTest, VisualTrackingPublishesVelocityIntent) {
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    f.DrainIntents();
+
+    const auto intents = f.PumpAndCollect(/*rounds=*/10);
+    const common::ControlIntent* last = LastIntentOfType(
+        intents, common::ControlIntentType::kVelocityHeading);
+    ASSERT_NE(last, nullptr);
+
+    EXPECT_EQ(last->control_source, 1U);  // 1=视觉
+    EXPECT_NE(last->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(last->reason_code & 0xFFU, 100U);  // 视觉跟踪：正常跟踪
+    EXPECT_EQ(last->header.frame_id, kFrameLocalNed);
+    EXPECT_EQ(last->header.valid_for_ms, 300U);
+    EXPECT_EQ(last->valid_until_ms, last->header.receive_time_ms + 300U);
+
+    // 距离通道：Δd = 15−10 = 5m、kp=0.1 → 前向 0.5m/s（加速度限幅收敛后）
+    EXPECT_NEAR(last->target_x, ServoExpectedVx(), 1e-3);
+    // 姿态 yaw=0：机体系侧向恒 0，NED 东向 0
+    EXPECT_NEAR(last->target_y, 0.0, 1e-6);
+    // 垂直通道：α 由标定内参算出
+    EXPECT_NEAR(last->target_z, ServoExpectedVz(), 1e-6);
+    // 航向通道（速率式）：增益×视线角
+    EXPECT_NEAR(last->yaw_rate_dps, ServoExpectedBetaDeg(), 1e-3);
+    EXPECT_FLOAT_EQ(last->yaw_deg, 0.0F);  // 速率式不使用 yaw_deg
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+}
+
+// 意图速度已是局部 NED：姿态 yaw=90°（机头朝东）时，机体前向速度映射为 NED
+// 东向速度、北向≈0 —— 状态机内完成机体系→NED 旋转，FlightController 不做
+// 二次旋转（控制边界见 flight_controller.md）。
+TEST(MissionStateMachineTest, VisualTrackingIntentIsLocalNed) {
+    VisualServoFixture f(kPi / 2.0);
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    f.DrainIntents();
+
+    const auto intents = f.PumpAndCollect(/*rounds=*/10);
+    const common::ControlIntent* last = LastIntentOfType(
+        intents, common::ControlIntentType::kVelocityHeading);
+    ASSERT_NE(last, nullptr);
+
+    EXPECT_NEAR(last->target_x, 0.0, 1e-6);                // 北向≈0
+    EXPECT_NEAR(last->target_y, ServoExpectedVx(), 1e-3);  // 东向=机体前向
+    EXPECT_NEAR(last->target_z, ServoExpectedVz(), 1e-6);
+    // 速率式航向通道与自机航向无关：仍为增益×视线角
+    EXPECT_NEAR(last->yaw_rate_dps, ServoExpectedBetaDeg(), 1e-3);
+}
+
+// S7 视觉短期 LOST：主链路无预测坐标（is_predicted 恒 false），控制律按判丢
+// 语义输出零速刹车（valid=true）→ 意图映射为零速 kBrakeHover 安全意图
+//（图像空间 coast 在本链路的退化形态，见实现文档）；LOST 连续帧达
+// exit_lost_frames 才退出 S7 回退 S5，回退后位置引导链接管。
+TEST(MissionStateMachineTest, VisualLostBrakesThenExitsToGpsApproach) {
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    f.DrainIntents();
+
+    // 先确认伺服已启动（S7 期收到过速度意图）
+    const auto servo = f.PumpAndCollect(/*rounds=*/4);
+    ASSERT_NE(LastIntentOfType(servo, common::ControlIntentType::kVelocityHeading),
+              nullptr);
+
+    // LOST 4 条（> enter_s6_lock_frames=3、< exit_lost_frames=6）：保持 S7，意图转零速刹车
+    std::vector<common::ControlIntent> lost_intents;
+    for (uint64_t frame = 200; frame <= 203; ++frame) {
+        f.PublishServoInputs(frame, common::VisualTargetState::kLost);
+        auto batch = CollectIntents(f.intent_subscription, 120ms);
+        lost_intents.insert(lost_intents.end(), batch.begin(), batch.end());
+    }
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+    const common::ControlIntent* brake =
+        LastIntentOfType(lost_intents, common::ControlIntentType::kBrakeHover);
+    ASSERT_NE(brake, nullptr);
+    EXPECT_EQ(brake->control_source, 1U);
+    EXPECT_NE(brake->reason_code & common::kControlIntentReasonRequestControl, 0U);
+    EXPECT_EQ(brake->reason_code & 0xFFU, 102U);  // 判丢零速刹车
+    EXPECT_FLOAT_EQ(brake->target_x, 0.0F);
+    EXPECT_FLOAT_EQ(brake->target_y, 0.0F);
+    EXPECT_FLOAT_EQ(brake->target_z, 0.0F);
+
+    // 补足 6 条连续 LOST → 退出 S7 回退 S5
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 204));
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLost, 205));
+    ASSERT_TRUE(
+        WaitForState(f.status_subscription, common::MissionState::kGpsApproach)
+            .has_value());
+    // 回退后位置引导链接管（估计仍新鲜）
+    const auto after_exit = CollectIntents(f.intent_subscription, 400ms);
+    const common::ControlIntent* position =
+        LastIntentOfType(after_exit, common::ControlIntentType::kPositionGuide);
+    ASSERT_NE(position, nullptr);
+    EXPECT_EQ(position->control_source, 0U);
+}
+
+// S7 伺服永不启动（控制律持续降级，如姿态超龄）时，冻结位置续发不得无限
+// 续期：S6 有 handover.timeout_ms 封顶，S7 需等价封顶——驻留超时仍未见
+// 首条有效视觉意图 → 收口回退 S5（复用既有退出机制，中文 reason 区分路径）。
+TEST(MissionStateMachineTest, S7ServoNotStartedFallsBackAfterTimeout) {
+    drone::test::LogCapture logs;  // 必须在组件启动前挂载（见 log_capture.h 约束）
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();  // 飞行快照无姿态 → 控制律姿态超龄降级
+    f.DrainIntents();
+    logs.Clear();
+
+    // S7 驻留：按期刷新视觉/测距（不提供姿态），冻结位置续发持续滚动续期
+    std::vector<common::ControlIntent> intents;
+    uint64_t frame = 300;
+    for (int round = 0; round < 14; ++round) {
+        f.PublishServoInputs(++frame, common::VisualTargetState::kLocked,
+                             /*with_attitude=*/false);
+        auto batch = CollectIntents(f.intent_subscription, 200ms);
+        intents.insert(intents.end(), batch.begin(), batch.end());
+        if (f.machine->CurrentState() != common::MissionState::kVisualTracking) {
+            break;
+        }
+    }
+    // 回退前伺服从未启动：无速度/刹车意图；冻结位置续发在生效
+    EXPECT_EQ(LastIntentOfType(intents, common::ControlIntentType::kVelocityHeading),
+              nullptr);
+    EXPECT_EQ(LastIntentOfType(intents, common::ControlIntentType::kBrakeHover),
+              nullptr);
+    EXPECT_NE(LastIntentOfType(intents, common::ControlIntentType::kPositionGuide),
+              nullptr);
+    // 超时收口回 S5（reason 中文可查，区别于 S6 超时与其它三条 S7 退出路径）
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+    EXPECT_EQ(logs.Count("S7伺服未启动超时"), 1);
+}
+
+// S7 报告状态与实际控制输出背离的可观测位（T9 评审裁决 I2，Task 12）：
+// S7 期间本拍未发出视觉伺服意图——伺服尚未启动（仍在续发冻结位置意图）
+// 或控制律降级停发（姿态/视觉超龄）——MissionStatus 告警位 bit3 置位；
+// 伺服意图正常发出即清除（同一 S7 驻留内）。
+TEST(MissionStateMachineTest, ServoSuspendedBitTracksVisualServoOutput) {
+    auto config = MakeServoTestConfig();
+    config.handover.timeout = 8000ms;  // 放宽 S7 伺服未启动超时，专测告警位
+    VisualServoFixture f(/*yaw_rad=*/0.0, config);
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();  // 飞行快照无姿态 → 控制律姿态超龄降级、伺服未启动
+    constexpr uint32_t kWarningServoSuspended = 1U << 3U;  // 见 mission_state_machine.md
+
+    // 伺服未启动：S7 无视觉意图输出（冻结位置意图在续发）→ 背离位置位
+    const auto suspended =
+        WaitForWarningBit(f.status_subscription, kWarningServoSuspended, 3000ms);
+    ASSERT_TRUE(suspended.has_value());
+    EXPECT_EQ(suspended->state, common::MissionState::kVisualTracking);
+
+    // 姿态恢复新鲜 + 持续伺服输入 → 首条视觉意图发出 → 位清除（仍在 S7）
+    bool cleared = false;
+    uint64_t frame = 400;  // 避开交接驱动帧 1..4 与既有用例帧段
+    const auto deadline = std::chrono::steady_clock::now() + 3000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        f.PublishServoInputs(++frame);
+        auto message = f.status_subscription.WaitTakeFor(100ms);
+        if (message && (*message)->state == common::MissionState::kVisualTracking &&
+            ((*message)->active_warning_bits & kWarningServoSuspended) == 0U) {
+            cleared = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(cleared);
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+}
+
+// S7 热备份核对（设计 §2.4）：每秒核对卡尔曼状态年龄（TargetState 接收时刻 +
+// 自报有效期窗），断粮 → 节流 WARN「热备份断粮」+ MissionStatus 告警位 bit2，
+// 不退出 S7（停 S7 由四条收口路径决定，热备份告警只提示"假备份"风险）。
+TEST(MissionStateMachineTest, HotBackupKalmanStarvedWarnsInS7) {
+    drone::test::LogCapture logs;  // 必须在组件启动前挂载（见 log_capture.h 约束）
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToVisualTracking();
+    logs.Clear();
+
+    // 卡尔曼断粮：估计失效快照（valid=false、有效期为 0）
+    (void)f.estimated.Publish(
+        std::make_shared<const common::TargetState>(MakeInvalidEstimatedTarget()));
+
+    // 核对周期 1s：等待告警位置位（MissionStatus 500ms 周期回传）
+    constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;  // 见 mission_state_machine.md
+    const auto starved =
+        WaitForWarningBit(f.status_subscription, kWarningHotBackupStarved, 3000ms);
+    ASSERT_TRUE(starved.has_value());
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking);
+    EXPECT_GE(logs.Count("热备份断粮"), 1);
+}
+
+// 设计 §2.1「进入 S6 后冻结最后位置目标」+ §2.5 无扰衔接（评审裁决 (a)）：
+// S6 驻留期由状态机逐拍续发进入时刻冻结的位置意图（valid_until 滚动续期），
+// 避免意图超龄 → 控制器 COAST 刹车 → 再起步的"交接点先刹停"；冻结坐标取
+// 进入时刻的 TargetState（此后估计更新不影响冻结值）；首条视觉速度意图
+// 发出（S7）后冻结续发停止。
+TEST(MissionStateMachineTest, HandoverPublishesFrozenPositionUntilServoStarts) {
+    VisualServoFixture f;
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    f.DrainIntents();
+
+    // S6 驻留期估计更新为新位置（仍新鲜有效）——冻结续发必须仍指向进入时刻的值
+    common::TargetState updated = MakeHandoverEstimate();
+    updated.header.sequence += 1;
+    updated.pos_x_m = 99.0F;
+    updated.pos_y_m = 98.0F;
+    updated.pos_z_m = -7.0F;
+    (void)f.estimated.Publish(std::make_shared<const common::TargetState>(updated));
+
+    std::vector<common::ControlIntent> frozen;
+    for (int round = 0; round < 3; ++round) {
+        // 重复同一锁定帧：不推进锁定计数（停留 S6），只刷新状态新鲜度
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 3));
+        auto batch = CollectIntents(f.intent_subscription, 120ms);
+        frozen.insert(frozen.end(), batch.begin(), batch.end());
+    }
+    ASSERT_EQ(f.machine->CurrentState(), common::MissionState::kVisualHandover);
+    ASSERT_GE(frozen.size(), 2U);
+    for (const auto& intent : frozen) {
+        EXPECT_EQ(intent.type, common::ControlIntentType::kPositionGuide);
+        EXPECT_EQ(intent.control_source, 0U);
+        // 冻结的是 S5 速度律的位置锚点（交接时刻），不是目标估计点；
+        // 后续估计更新为 99/98/-7 不得改变冻结值。
+        EXPECT_NE(intent.target_x, 99.0F);
+        EXPECT_NE(intent.target_y, 98.0F);
+        EXPECT_LT(std::fabs(intent.target_x), 5.0F);
+        // P3：S6 冻结段显式无前馈（即使 S5 意图带速度前馈）。
+        EXPECT_EQ(intent.feedforward_valid_mask, 0U);
+        EXPECT_FLOAT_EQ(intent.feedforward_vx_mps, 0.0F);
+        EXPECT_FLOAT_EQ(intent.feedforward_vy_mps, 0.0F);
+        EXPECT_FLOAT_EQ(intent.feedforward_vz_mps, 0.0F);
+        // 滚动续期：valid_until 按 300ms 窗逐拍推进
+        EXPECT_EQ(intent.valid_until_ms, intent.header.receive_time_ms + 300U);
+    }
+    // 续期确实发生：至少两条意图的截止时刻不同（逐拍滚动，非一次性发布）
+    bool renewed = false;
+    for (size_t index = 1; index < frozen.size(); ++index) {
+        if (frozen[index].valid_until_ms != frozen.front().valid_until_ms) {
+            renewed = true;
+        }
+    }
+    EXPECT_TRUE(renewed);
+
+    // 视觉链推进一条新 LOCKED 帧（附姿态/测距输入）→ S7 首条视觉速度意图发出
+    f.PublishServoInputs(4);
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualTracking)
+                    .has_value());
+    const auto servo = f.PumpAndCollect(/*rounds=*/4);
+    const common::ControlIntent* first_velocity = nullptr;
+    for (const auto& intent : servo) {
+        if (intent.type == common::ControlIntentType::kVelocityHeading) {
+            first_velocity = &intent;
+            break;
+        }
+    }
+    ASSERT_NE(first_velocity, nullptr);
+    // 冻结续发停止：位置意图不得出现在首条视觉速度意图之后
+    //（迁移当拍允许同拍续发一条，控制器保留最新=视觉意图）
+    for (const auto& intent : servo) {
+        if (intent.type == common::ControlIntentType::kPositionGuide) {
+            EXPECT_LE(intent.header.receive_time_ms,
+                      first_velocity->header.receive_time_ms);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 阶段四 Task 10：捕网执行器命令（MAV_CMD_DO_SET_ACTUATOR=187）
+//
+// 状态机在进入 S10 INTERCEPT_EXECUTING 时经命令窄接口 IPx4CommandSender 发
+// 一次触发命令（执行器 `Fired()` 防重复；入队失败下拍重试）。Task 5 起复位
+// 由执行器在触发 ACK 后按 reset_delay 自行发起（不再由离开拦截序列触发），
+// ACK 超时/断连/入队超时 → S16 故障。
+// 通道号/行程来自 actuator 配置节；PWM 微秒按 PX4 输出映射区间换算为
+// MAV_CMD_DO_SET_ACTUATOR 的归一化参数（-1..1），未用参数位 NaN（规范语义
+// 为"忽略"，0 会误动其他执行器组）；p7=执行器组序号（PX4 仅处理 0）。
+// 未注入命令接口（enable_control=false 装配语义）→ 零调用（物理缺席）。
+//
+// 拦截序列（S9/S10/S11）当前尚无生产入口——入口判据（授权策略/射程门限）
+// 属后续任务，本任务不发明；用例经 ForceStateForTest 测试入口驱动状态迁移，
+// 与生产路径共用同一 TransitionTo/决策线程挂点，触发/复位语义等同生产。
+// ---------------------------------------------------------------------------
+
+/// 单发捕网触发行程 1150µs、待机/复位 1500µs、输出映射区间 1000..2000µs
+/// 的归一化期望值：norm = 2·(pwm − 1000)/1000 − 1。
+constexpr float kNetFireNormalized = -0.7F;
+constexpr float kNetIdleNormalized = 0.0F;
+
+/// 捕网执行器用例配置：通道 3（验证通道号落在 p3 而非 p1），行程取默认值；
+/// 显式开启测试钩子（拦截序列无生产入口，用例经 `ForceStateForTest` 驱动）。
+state_machine::MissionStateMachineConfig MakeNetActuatorTestConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.actuator.net_channel = 3;
+    config.test_hooks_enabled = true;
+    // 本组用例只验证捕网执行器触发/复位语义；关闭单发自动返航，
+    // 保持 S10 停留/离开由测试显式强制。
+    config.return_home.enabled = false;
+    return config;
+}
+
+/// 等待发送器累计调用数达到期望值（决策周期 100ms，留足余量）。
+bool WaitForCallCount(const FakeCommandSender& sender, uint64_t expected,
+                      std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (sender.CallCount() >= expected) {
+            return true;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return sender.CallCount() >= expected;
+}
+
+/// 等待状态机完成启动首个迁移（BOOT→SELF_CHECK）再强制状态；否则工作线程
+/// 的初始迁移会把测试入口强制写入的状态覆盖掉。
+bool WaitForSelfCheck(const state_machine::MissionStateMachine& machine,
+                      std::chrono::milliseconds timeout = 1000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (machine.CurrentState() == common::MissionState::kSelfCheck) {
+            return true;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    return machine.CurrentState() == common::MissionState::kSelfCheck;
+}
+
+// 进入 S10 → 恰好一次触发命令；停留多拍不重复触发。触发前置是 PX4 在线
+// （Task 5 起状态机要求连接证据，见 MaybeTriggerNetActuator）。
+TEST(MissionStateMachineTest, InterceptExecutingFiresOnce) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight())).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
+    EXPECT_EQ(sender.LastCommand(), 187U);  // MAV_CMD_DO_SET_ACTUATOR
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetFireNormalized);
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(sender.CallCount(), 1U);  // 单发不重复触发
+    machine.Stop();
+}
+
+// 入队失败不置位、下拍重试：PX4 未连接/命令队列满（SendCommand 返回 false）
+// 时触发命令不得丢失，也不得因"已尝试"而停产。
+TEST(MissionStateMachineTest, NetActuatorFiringRetriesWhenEnqueueFails) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    // Task 5 起无连接证据不触发：先发布在线快照（PX4 connected）。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight())).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    sender.FailNextCalls(2);  // 前两次入队失败
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 3)) << "入队失败应下拍重试直至成功";
+    {
+        const auto params = sender.LastParams();
+        EXPECT_FLOAT_EQ(params[2], kNetFireNormalized);  // 重试用同一条命令
+        EXPECT_FLOAT_EQ(params[6], 0.0F);
+    }
+    // 成功入队后不再补发
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(sender.CallCount(), 3U);
+
+    machine.Stop();
+}
+
+// 未触发即离开拦截序列：不发任何命令。Task 5 起复位由执行器在触发 ACK 后
+// 按自身计时推进（不再由“离开 S9/S10”触发），未发射过的机构无需归位行程。
+TEST(MissionStateMachineTest, LeavingInterceptWithoutFireSendsNoCommand) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeNavigationReadyFlight())).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptReady);
+    std::this_thread::sleep_for(300ms);
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(sender.CallCount(), 0U);  // 未发射 → 无复位命令
+    machine.Stop();
+}
+
+// 未注入命令接口（enable_control=false 装配语义）：即使进入拦截态也零调用，
+// 本功能物理缺席（命令发不出去）。
+TEST(MissionStateMachineTest, NoCommandSenderNeverFires) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;  // 不注入
+    state_machine::MissionStateMachine machine(MakeNetActuatorTestConfig());
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    machine.ForceStateForTest(common::MissionState::kInterceptReady);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    std::this_thread::sleep_for(300ms);
+    machine.ForceStateForTest(common::MissionState::kPostIntercept);
+    std::this_thread::sleep_for(300ms);
+
+    EXPECT_EQ(sender.CallCount(), 0U);
+
+    machine.Stop();
+}
+
+// 测试入口门控（2026-10-14 终审）：`ForceStateForTest` 在
+// `MissionStateMachineConfig::test_hooks_enabled=false`（默认＝生产装配语义，
+// DroneApplication 不置位）时必须拒绝并记 ERROR——强推到 S10 会在
+// enable_control=true 装配下经命令窄接口发出**不可逆的捕网触发命令**，
+// 生产路径不得可达；而拦截序列当前无生产入口，该入口是唯一的误触路径。
+TEST(MissionStateMachineTest, ForceStateForTestRejectedWithoutTestHooks) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;  // 已注入命令接口：验证"拒绝发生在任何命令之前"
+    auto config = MakeNetActuatorTestConfig();
+    config.test_hooks_enabled = false;  // 生产装配默认值
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    const uint64_t errors_before = machine.ErrorCount();
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    std::this_thread::sleep_for(300ms);  // 留出决策线程消费（若放行会触发捕网）
+
+    EXPECT_GT(machine.ErrorCount(), errors_before);  // 拒绝并记 ERROR
+    EXPECT_NE(machine.CurrentState(), common::MissionState::kInterceptExecuting);
+    EXPECT_EQ(sender.CallCount(), 0U);  // 任何命令都不得发出
+
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// S11~S14 单发拦截后返航（2026-10-19 V1 口径）
+// 强制 S10 模拟“发射”，走：S10→S11→S12 算力板位置返航→S13 AUTO.LAND→
+// S14 DISARMED。Home 局部 NED 由 Home 经纬度 + EKF 锚点换算（Home=锚点时
+// Home 局部坐标应为 0,0,0）。
+// ---------------------------------------------------------------------------
+
+common::FlightStateSnapshot MakeReturnHomeFlight(float x_m, float y_m, float z_m,
+                                                 float vx_mps = 0.0f,
+                                                 float vy_mps = 0.0f,
+                                                 float vz_mps = 0.0f,
+                                                 bool armed = true,
+                                                 bool landed = false,
+                                                 uint8_t main_mode = 6,
+                                                 uint8_t sub_mode = 0,
+                                                 bool home_valid = true,
+                                                 bool ned_ref_valid = true) {
+    common::FlightStateSnapshot flight = MakeNavigationReadyFlight();
+    flight.armed = armed;
+    flight.landed = landed;
+    flight.landed_state_valid = true;
+    flight.flight_mode = main_mode;
+    flight.flight_sub_mode = sub_mode;
+    flight.attitude_valid = true;
+    flight.local_position_valid = true;
+    flight.local_x_m = x_m;
+    flight.local_y_m = y_m;
+    flight.local_z_m = z_m;
+    flight.vx_mps = vx_mps;
+    flight.vy_mps = vy_mps;
+    flight.vz_mps = vz_mps;
+    flight.home_valid = home_valid;
+    flight.ned_ref_valid = ned_ref_valid;
+    flight.ned_ref_lat_1e7 = flight.home_lat_1e7;
+    flight.ned_ref_lon_1e7 = flight.home_lon_1e7;
+    flight.ned_ref_alt_mm = flight.home_altitude_mm;
+    return flight;
+}
+
+state_machine::MissionStateMachineConfig MakeReturnHomeTestConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.test_hooks_enabled = true;
+    // 不读不写 config/zone.json：返航用例不应受工作目录里残留区域影响
+    // （2026-11-04 曾有用例注入 alt_max=3 的区域落盘，导致后续用例误判）。
+    config.fence.zone_cache_path.clear();
+    // 默认 return_home.enabled=true；缩短稳定/重试时间便于测试。
+    config.return_home.arrival_hold = 300ms;
+    config.return_home.command_retry = 100ms;
+    config.return_home.fire_timeout = 1000ms;
+    return config;
+}
+
+bool WaitForCommand(const FakeCommandSender& sender, uint16_t command,
+                    std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (const auto& call : sender.History()) {
+            if (call.command == command) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+std::optional<common::ControlIntent> WaitForReturnIntent(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& intent = **message;
+        if (intent.type == common::ControlIntentType::kPositionGuide &&
+            (intent.reason_code & 0xFFU) == 8U) {
+            return intent;
+        }
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Task 5：执行器 ACK 驱动复位 / 故障 S16（2026-10-21）
+// 复位不再由“离开拦截序列”触发：触发 ACK 后执行器按 reset_delay 自身计时
+// 发复位，复位 ACK 后再稳定 reset_settle 回到 Ready；等待 ACK 期间超时、
+// 非 ACCEPTED、PX4 断连均进入故障 S16（停发一切控制意图、取消待发命令、
+// 不重试/不补发复位）。
+// ---------------------------------------------------------------------------
+
+TEST(MissionStateMachineTest, ResetRunsAfterFireAckWithoutLeavingS10) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
+    EXPECT_EQ(sender.LastCommand(), 187U);
+
+    sender.SimulateAck(187U, 0U, TestMonotonicMs());
+    ASSERT_TRUE(WaitForCallCount(sender, 2));
+    EXPECT_FLOAT_EQ(sender.LastParams()[2], kNetIdleNormalized);
+    EXPECT_EQ(machine.CurrentState(),
+              common::MissionState::kInterceptExecuting);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, FireAckTimeoutEntersFailsafeAndCancelsCommands) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));
+
+    sender.SimulateTimeout(187U);
+    const auto failsafe = WaitForState(
+        status_subscription, common::MissionState::kFailsafe, 2000ms);
+    ASSERT_TRUE(failsafe.has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+    // 故障后不得补发复位
+    EXPECT_EQ(sender.CallCount(), 1U);
+    EXPECT_NE(failsafe->active_warning_bits & (1U << 4U), 0U);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, DisconnectDuringFireWaitFaults) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    const auto connected = MakeReturnHomeFlight(10.f, 5.f, -10.f);
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(connected))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));  // 触发已入队，等待 ACK
+
+    auto disconnected = connected;
+    disconnected.connected = false;
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(disconnected))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+    EXPECT_EQ(sender.CallCount(), 1U);  // 不得补发复位
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, FireEnqueueTimeoutFaults) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.return_home.fire_timeout = 300ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(100ms);
+    sender.FailNextCalls(1000);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ResetRunsDuringReturnAfterFireAck) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeReturnHomeTestConfig();
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+    ASSERT_EQ(sender.CallCount(), 1u);  // 触发已入队
+
+    // 已在 S12 返航；ACK 到达后执行器仍按计时发复位（通道 1 → p1）。
+    sender.SimulateAck(187U, 0U, TestMonotonicMs());
+    ASSERT_TRUE(WaitForCallCount(sender, 2));
+    EXPECT_FLOAT_EQ(sender.LastParams()[0], kNetIdleNormalized);
+    machine.Stop();
+}
+
+// 回归（最终评审 Important 3）：S16 故障后不得再发布任何控制意图。
+// 故障前必须先真正进入会持续出意图的状态（S12 返航），否则“无意图”断言无意义。
+TEST(MissionStateMachineTest, NoIntentsAfterActuatorFault) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(32);
+    auto intent_subscription = machine.IntentOutput().Subscribe(32);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.f, 5.f, -10.f))).accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1));  // 触发已入队，等待 ACK
+
+    // 先进入 S12 并确认返航意图在持续发布，再制造执行器 ACK 超时。
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForReturnIntent(intent_subscription).has_value());
+
+    sender.SimulateTimeout(187U);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value());
+    EXPECT_EQ(sender.CancelCount(), 1U);
+
+    // 清空故障前已排队的意图，之后 300ms 内不得再出现新意图。
+    while (intent_subscription.WaitTakeFor(20ms).has_value()) {
+    }
+    std::this_thread::sleep_for(300ms);
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(100ms).has_value());
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 当前在 Home 北 10m/东 5m、高 10m（≥5m → 保持当前高度返航）。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(10.0f, 5.0f, -10.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto return_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(return_intent.has_value());
+    EXPECT_EQ(return_intent->control_source, 0U);
+    EXPECT_NE(return_intent->reason_code & common::kControlIntentReasonRequestControl,
+              0U);
+    EXPECT_NEAR(return_intent->target_x, 0.0f, 0.05f);   // Home 局部 NED x
+    EXPECT_NEAR(return_intent->target_y, 0.0f, 0.05f);
+    EXPECT_NEAR(return_intent->target_z, -10.0f, 0.05f); // 保持当前高度
+    // 返航速度剖面（2026-11-12）：max_speed_mps 不再是固定 cruise，而是
+    // return_speed_law 输出的本拍速率上限。本题地速为 0（静止起步），
+    // 剖面首拍只给出 accel_plan_mps2 × dt 的斜坡起步值，绝不会一步顶到 4 m/s。
+    EXPECT_GT(return_intent->max_speed_mps, 0.0f) << "起步应有非零速率";
+    EXPECT_LE(return_intent->max_speed_mps,
+              static_cast<float>(MakeReturnHomeTestConfig().return_home.cruise_speed_mps))
+        << "返航速率不得超过巡航顶速";
+    EXPECT_LT(return_intent->max_speed_mps, 1.0f)
+        << "静止起步首拍必须走加速斜坡（不得直接给巡航顶速）";
+    EXPECT_EQ(return_intent->feedforward_valid_mask, 0U);
+
+    // 到达 Home 附近并稳定 300ms → S13；发 AUTO.LAND（176，4/6）。
+    for (int round = 0; round < 8; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(0.5f, 0.0f, -10.0f))).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kLanding, 2500ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForCommand(sender, 176U));
+    {
+        const auto history = sender.History();
+        bool found = false;
+        for (const auto& call : history) {
+            if (call.command == 176U) {
+                found = true;
+                EXPECT_FLOAT_EQ(call.params[0], 1.0f);  // custom mode enabled
+                EXPECT_FLOAT_EQ(call.params[1], 4.0f);  // AUTO
+                EXPECT_FLOAT_EQ(call.params[2], 6.0f);  // LAND
+            }
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // 落地但仍 armed → DISARM（400，param1=0）。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(0.0f, 0.0f, 0.0f, 0,0,0, /*armed=*/true,
+                                 /*landed=*/true, 4, 6))).accepted);
+    ASSERT_TRUE(WaitForCommand(sender, 400U));
+
+    // 确认 disarmed → S14。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(0.0f, 0.0f, 0.0f, 0,0,0, /*armed=*/false,
+                                 /*landed=*/true, 4, 6))).accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kDisarmed, 2500ms)
+                    .has_value());
+    machine.Stop();
+}
+
+// 定义在文件后部（S12 用例区之前先用，这里前向声明）。
+common::MissionAssignment MakeAssignment(uint32_t assignment_id);
+
+// 返航水平目标优先用**起飞原点**（2026-11-04 现场回归）：PX4 Home 经纬度随
+// GPS 漂移（实测 25 分钟 5~16 m），用 Home 换算会把返航点带偏，表现就是
+// “飞到起飞点附近又拐一个弯、最后落到坡上”。这里让 Home 北漂 ~10 m，
+// 断言返航意图仍指向 S3 记录的起飞原点。
+TEST(MissionStateMachineTest, ReturnHomeTargetsTakeoffOriginNotDriftedHome) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 起飞点：北 10 m / 东 5 m（S3 接受分配时记为返航原点）。
+    ASSERT_TRUE(flight_topic.Publish(
+                    std::make_shared<const common::FlightStateSnapshot>(
+                        MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    // 决策周期 100 ms：等至少两个周期，确保 latest_flight_ 已就绪再预置分配
+    // （否则起点记不下来，返航会退回 Home 经纬度换算）。
+    std::this_thread::sleep_for(250ms);
+    machine.SeedAcceptedAssignmentForTest(MakeAssignment(91));
+
+    // Home 经纬度北漂 ~10 m（900 × 1e-7° ≈ 10 m）。
+    auto drifted = MakeReturnHomeFlight(10.0f, 5.0f, -10.0f);
+    drifted.home_lat_1e7 += 900;
+    ASSERT_TRUE(flight_topic.Publish(
+                    std::make_shared<const common::FlightStateSnapshot>(drifted))
+                    .accepted);
+    std::this_thread::sleep_for(80ms);
+
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto return_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(return_intent.has_value());
+    // 目标 = 起飞原点 (10, 5)；若仍用漂移后的 Home 换算，东向会变成 ~0。
+    EXPECT_NEAR(return_intent->target_x, 10.0f, 0.3f);
+    EXPECT_NEAR(return_intent->target_y, 5.0f, 0.3f);
+    // 相对高度 10 m ≥ 返航高度 5 m → 保持当前高度。
+    EXPECT_NEAR(return_intent->target_z, -10.0f, 0.1f);
+    machine.Stop();
+}
+
+// 2026-11-04：返航取消总时长上限。旧实现"进 S12 满 timeout_ms 就原地悬停"，
+// 现场 128m/1.5m/s 需 85s、配置 60s，直接卡死。现在 timeout_ms 只作停滞告警
+// 间隔：即使超过它，也必须继续朝返航目标飞，绝不把"当前位置"当目标。
+TEST(MissionStateMachineTest, ReturnHomeIgnoresLegacyTotalTimeout) {
+    auto config = MakeReturnHomeTestConfig();
+    config.return_home.timeout = 300ms;  // 旧的"总时长"；现为停滞告警间隔
+    config.fence.zone_cache_path.clear();  // 不写盘，避免污染工作目录
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 距返航点（Home=局部原点）60 m，相对高度 10 m ≥ 返航高度 5 m → 直接巡航。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(60.0f, 0.0f, -10.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReturnHome,
+                             2000ms)
+                    .has_value());
+
+    // 远超旧超时（4×300ms）：必须仍在返航，并持续朝返航点飞。
+    std::this_thread::sleep_for(1200ms);
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kReturnHome)
+        << "取消总时长上限后不得因超时改变状态";
+
+    common::ControlIntent last{};
+    bool have_intent = false;
+    while (auto message = intent_subscription.WaitTakeFor(100ms)) {
+        const auto& intent = **message;
+        if (intent.type == common::ControlIntentType::kPositionGuide &&
+            (intent.reason_code & 0xFFU) == 8U) {
+            last = intent;
+            have_intent = true;
+        }
+    }
+    ASSERT_TRUE(have_intent) << "返航应持续发布位置意图";
+    EXPECT_NEAR(last.target_x, 0.0f, 0.5f) << "目标必须仍是返航点，不是悬停用的当前位置";
+    EXPECT_NEAR(last.target_y, 0.0f, 0.5f);
+    machine.Stop();
+}
+
+// 返航高度受区域高度带上限约束（2026-11-04）：区域上限 3 m 时，返航高度从
+// 5 m 收敛到 2.5 m；否则飞控把设定值钳在上限、垂直差永远超限，S12 永远等不到
+// "到达"。用例断言爬升目标 z = 基准 − 2.5。
+TEST(MissionStateMachineTest, ReturnHomeAltitudeCappedByZoneCeiling) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::FenceZone> fence_topic;
+    FakeCommandSender sender;
+    auto config = MakeReturnHomeTestConfig();
+    // 注入的区域会被落盘；测试里关掉缓存路径，避免污染工作目录并影响其它用例
+    // （2026-11-04 曾因此让 ReturnHomeClimbsToFiveMetersBeforeCruise 读到 alt_max=3）。
+    config.fence.zone_cache_path.clear();
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetFenceInput(fence_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 以 Home（23.120°N/113.120°E）为心的 ±500 m 方形区域，高度带上限 3 m。
+    common::FenceZone zone;
+    zone.header.receive_time_ms = TestMonotonicMs();
+    zone.header.valid_for_ms = 0;
+    zone.header.health = 1;
+    zone.protocol_version = 1;
+    zone.zone_id = 7;
+    zone.version = 2;
+    zone.type = common::FenceZoneType::kPolygon;
+    zone.action = common::FenceAction::kReturn;
+    zone.altitude_reference = 1;  // 相对起飞点
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 3.0;
+    {
+        const double lat0 = 23.120;
+        const double lon0 = 113.120;
+        const double dlat = 500.0 / 111320.0;
+        const double dlon = 500.0 / (111320.0 * std::cos(lat0 * 3.14159265358979323846 / 180.0));
+        zone.vertices = {
+            {lat0 - dlat, lon0 - dlon},
+            {lat0 + dlat, lon0 - dlon},
+            {lat0 + dlat, lon0 + dlon},
+            {lat0 - dlat, lon0 + dlon},
+        };
+    }
+    zone.received_ms = TestMonotonicMs();
+    ASSERT_TRUE(fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    // 本机在地面（相对高度 0）→ 需要爬升到 min(5, 3−0.5)=2.5 m。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(0.0f, 0.0f, 0.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForState(status_subscription, common::MissionState::kReturnHome,
+                             2000ms)
+                    .has_value());
+
+    const auto intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(intent.has_value()) << "返航应发布爬升意图";
+    EXPECT_NEAR(intent->target_z, -2.5f, 0.1f)
+        << "返航高度应被区域上限收敛到 2.5 m（3 − 0.5）";
+    machine.Stop();
+}
+
+// S5 无目标停发后 PX4 已自行 RTL 落地/上锁、模式又恢复 Offboard：// S12 不得继续发返航设定值（会卡到返航超时），直接 S13→S14 收口。
+TEST(MissionStateMachineTest, ReturnHomeAlreadyLandedDisarmedCloses) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(
+                                             0.0f, 0.0f, 0.0f, 0, 0, 0,
+                                             /*armed=*/false, /*landed=*/true)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+
+    machine.ForceStateForTest(common::MissionState::kReturnHome);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kLanding, 2500ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kDisarmed, 2500ms)
+                    .has_value());
+    EXPECT_FALSE(intent_subscription.WaitTakeFor(100ms).has_value())
+        << "已落地/上锁不得继续发布返航位置意图";
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ReturnHomeClimbsToFiveMetersBeforeCruise) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 相对 Home 仅 2m：先原地爬到 5m，再水平返航。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(10.0f, 5.0f, -2.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto climb_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(climb_intent.has_value());
+    EXPECT_NEAR(climb_intent->target_x, 10.0f, 0.05f);  // 原地爬升
+    EXPECT_NEAR(climb_intent->target_y, 5.0f, 0.05f);
+    EXPECT_NEAR(climb_intent->target_z, -5.0f, 0.05f);  // Home 上方 5m
+    // 爬升段带相位速度上限：控制器位置引导限速据此按 climb_rate 推进，
+    // 否则位置阶跃会被 PX4 按自身 MPC_Z_VEL_MAX_UP（3m/s）冲上去。
+    EXPECT_FLOAT_EQ(climb_intent->max_speed_mps, 0.5f);
+
+    // 到达 5m、垂速归零 → 进入水平巡航（目标 Home x/y）。
+    for (int round = 0; round < 8; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -5.0f))).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    std::optional<common::ControlIntent> cruise_intent;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto intent = WaitForReturnIntent(intent_subscription, 100ms);
+        if (!intent) {
+            continue;
+        }
+        if (std::fabs(intent->target_x) < 0.05f &&
+            std::fabs(intent->target_y) < 0.05f) {
+            cruise_intent = intent;
+            break;
+        }
+    }
+    ASSERT_TRUE(cruise_intent.has_value());
+    EXPECT_NEAR(cruise_intent->target_z, -5.0f, 0.05f);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ReturnHomeHoldsWhenHomeInvalid) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f, 0,0,0, true, false, 6, 0,
+                                 /*home_valid=*/false))).accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    const auto hold_intent = WaitForReturnIntent(intent_subscription);
+    ASSERT_TRUE(hold_intent.has_value());
+    EXPECT_NEAR(hold_intent->target_x, 10.0f, 0.05f);
+    EXPECT_NEAR(hold_intent->target_y, 5.0f, 0.05f);
+    EXPECT_NEAR(hold_intent->target_z, -10.0f, 0.05f);
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kReturnHome);
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, ReturnHomeYieldsWhenPx4LeavesOffboard) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeReturnHomeTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(10.0f, 5.0f, -10.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kReturnHome, 2500ms)
+                    .has_value());
+
+    // PX4 自主切到 AUTO.RTL（4/5）：状态机停止返航设定值，转 S13 仅监控。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f, 0,0,0, true, false, 4, 5)))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kLanding, 2500ms)
+                    .has_value());
+    // PX4 接管时不得再发 AUTO.LAND（176）。
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : sender.History()) {
+        EXPECT_NE(call.command, 176U);
+    }
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// S9/S10 生产入口（2026-10-19）：LOCKED 连续帧 + 测距窗口 + Offboard/armed/
+// 姿态/位置有效 + 命令接口就绪 → S9 → 自动授权 → S10 发射。
+// ---------------------------------------------------------------------------
+
+state_machine::MissionStateMachineConfig MakeInterceptEntryTestConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.test_hooks_enabled = true;
+    config.interception.enabled = true;
+    config.interception.auto_authorize = true;
+    config.interception.enter_s9_lock_frames = 3;
+    config.interception.min_range_m = 2.0;
+    config.interception.max_range_m = 12.0;
+    config.return_home.arrival_hold = 300ms;
+    config.return_home.command_retry = 100ms;
+    return config;
+}
+
+TEST(MissionStateMachineTest, InterceptEntryLockAndRangeThenFiresAndReturns) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeInterceptEntryTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_topic, distance_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(32);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    // 先投一拍飞行状态快照：电池守卫在中止态要求飞行中遥测有效，否则首拍即判
+    // 遥测失效并中止到 S12（本例直接 force 到 S7，必须先有快照）。
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    std::this_thread::sleep_for(40ms);
+    machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    bool saw_ready = false;
+    bool saw_executing = false;
+    bool saw_return = false;
+    for (uint64_t frame = 1; frame <= 20 && !saw_return; ++frame) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+        ASSERT_TRUE(visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)))
+                        .accepted);
+        ASSERT_TRUE(distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 8.0F))).accepted);
+        // 每帧给状态机留三个 20ms 切片（共 60ms，覆盖一个决策周期）。
+        for (int slice = 0; slice < 3; ++slice) {
+            std::this_thread::sleep_for(20ms);
+            while (auto status = status_subscription.TryTake()) {
+                switch ((*status)->state) {
+                    case common::MissionState::kInterceptReady:
+                        saw_ready = true;
+                        break;
+                    case common::MissionState::kInterceptExecuting:
+                        saw_executing = true;
+                        break;
+                    case common::MissionState::kReturnHome:
+                        saw_return = true;
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+    // 收尾兜底：机器负载高时状态机可能晚一两拍才走完 S9→S12。这里继续以 20ms
+    // 节拍**重发新鲜**的锁定帧与测距（避免视觉超龄把 S7 打回），最多再等 500ms。
+    for (int tail = 0; tail < 25 && !saw_return; ++tail) {
+        std::this_thread::sleep_for(20ms);
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+        ASSERT_TRUE(visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked,
+                                 static_cast<uint64_t>(100 + tail)))).accepted);
+        ASSERT_TRUE(distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(static_cast<uint64_t>(100 + tail), true, 8.0F))).accepted);
+        while (auto status = status_subscription.TryTake()) {
+            switch ((*status)->state) {
+                case common::MissionState::kInterceptReady: saw_ready = true; break;
+                case common::MissionState::kInterceptExecuting:
+                    saw_executing = true;
+                    break;
+                case common::MissionState::kReturnHome: saw_return = true; break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_ready) << "锁定+测距窗口满足后应进入 S9";
+    EXPECT_TRUE(saw_executing) << "自动授权后应进入 S10";
+    EXPECT_TRUE(saw_return) << "单发发射后应进入 S12 返航";
+    EXPECT_TRUE(WaitForCommand(sender, 187U)) << "S10 应发捕网触发命令";
+    machine.Stop();
+}
+
+TEST(MissionStateMachineTest, InterceptEntryRejectsDistanceOutsideWindow) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeInterceptEntryTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_topic, distance_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    // 先发布一帧健康飞行快照再强制迁移：电池守卫要求遥测新鲜，否则首拍即判
+    // "飞行中缺少飞行状态快照"并把状态打回 S12（与本用例意图无关）。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+        MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    std::this_thread::sleep_for(40ms);
+    machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    // 测距 20m 超出 2~12m 窗口：LOCKED 再多也不得进入 S9/发射。
+    for (uint64_t frame = 1; frame <= 15; ++frame) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+        ASSERT_TRUE(visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)))
+                        .accepted);
+        ASSERT_TRUE(distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 20.0F))).accepted);
+        std::this_thread::sleep_for(60ms);
+    }
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kVisualTracking);
+    EXPECT_EQ(sender.CallCount(), 0U);
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// 多机任务分配：65014 输入、S2 预检与 65015 回执（2026-10-22，Task 4）
+// ---------------------------------------------------------------------------
+
+/// 地面待飞快照：导航就绪 + 落地状态有效且已落地 + 未 armed + 局部位置/姿态
+/// 有效。S2 分配预检要求这些前置条件全部成立。
+common::FlightStateSnapshot MakeGroundedFlight() {
+    common::FlightStateSnapshot flight = MakeNavigationReadyFlight();
+    flight.landed_state_valid = true;
+    flight.landed = true;
+    flight.armed = false;
+    flight.local_position_valid = true;
+    flight.local_x_m = 1.5f;
+    flight.local_y_m = -2.5f;
+    flight.local_z_m = 0.1f;
+    flight.attitude_valid = true;
+    // 电池门禁默认满足（Task 8）：PX4 BAT_LOW_THR=15%、COM_LOW_BAT_ACT=0、
+    // 遥测有效且剩余 80%。用例只按需覆写单项字段。
+    flight.battery_valid = true;
+    flight.battery_remaining_valid = true;
+    flight.battery_remaining_pct = 80.f;
+    flight.battery_low_threshold_valid = true;
+    flight.battery_low_threshold_pct = 15.f;
+    flight.low_battery_action_valid = true;
+    flight.low_battery_action = 0;
+    return flight;
+}
+
+/// 65014 分配消息（默认字段全部合法：授权、目标 7、捕网 25、有效期 5s）。
+common::MissionAssignment MakeAssignment(uint32_t assignment_id) {
+    common::MissionAssignment assignment;
+    assignment.header.sequence = assignment_id;
+    assignment.header.source_time_ms = TestMonotonicMs();
+    assignment.header.receive_time_ms = TestMonotonicMs();
+    assignment.header.valid_for_ms = 5000;
+    assignment.header.source_id = 255;
+    assignment.header.health = 1;
+    assignment.protocol_version = 1;
+    assignment.assignment_id = assignment_id;
+    assignment.target_id = 7;
+    assignment.interceptor_type = 25;
+    assignment.flags = 1;  // bit0=授权自动起飞
+    assignment.valid_for_ms = 5000;
+    assignment.received_ms = TestMonotonicMs();
+    return assignment;
+}
+
+/// 65014 取消当前分配（flags.bit1；取消不要求 bit0 授权位）。
+common::MissionAssignment MakeCancel(uint32_t assignment_id) {
+    common::MissionAssignment assignment = MakeAssignment(assignment_id);
+    assignment.flags = communication::kMissionAssignFlagCancel;
+    return assignment;
+}
+
+std::optional<common::MissionAssignmentAck> WaitForAssignmentAck(
+    common::Topic<common::MissionAssignmentAck>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        return **message;
+    }
+    return std::nullopt;
+}
+
+/// 任务分配用例默认起飞时序：bootstrap/mode/arm 超时放宽到远大于 Task 4
+/// 用例时长，保证只验证“分配入口与 S2 预检”的用例不会被 S3 超时中止。
+/// S3/S4 用例显式传入 `MakeTakeoffTestConfig()`（缩短时序）。
+state_machine::MissionStateMachineConfig MakeAssignmentHarnessConfig() {
+    state_machine::MissionStateMachineConfig config;
+    config.takeoff.bootstrap_lead = 5000ms;
+    config.takeoff.mode_timeout = 5000ms;
+    config.takeoff.arm_timeout = 5000ms;
+    config.takeoff.bootstrap_timeout = 16000ms;
+    return config;
+}
+
+/// S3/S4 用例配置：缩短各超时以便在单测内驱动完整时序。
+/// bootstrap_timeout 必须严格大于 lead+mode+arm（TakeoffConfig::Validate）。
+state_machine::MissionStateMachineConfig MakeTakeoffTestConfig(
+    std::chrono::milliseconds lead = 100ms,
+    std::chrono::milliseconds mode_timeout = 1000ms,
+    std::chrono::milliseconds arm_timeout = 1000ms,
+    std::chrono::milliseconds height_timeout = 3000ms,
+    double height_m = 0.5, double climb_rate_mps = 0.5) {
+    state_machine::MissionStateMachineConfig config;
+    auto& takeoff = config.takeoff;
+    takeoff.bootstrap_lead = lead;
+    takeoff.mode_timeout = mode_timeout;
+    takeoff.arm_timeout = arm_timeout;
+    takeoff.bootstrap_timeout =
+        lead + mode_timeout + arm_timeout + 1000ms;
+    takeoff.height_timeout = height_timeout;
+    takeoff.height_m = height_m;
+    takeoff.climb_rate_mps = climb_rate_mps;
+    takeoff.stable_time = 100ms;
+    takeoff.z_tolerance_m = 0.2;
+    takeoff.xy_tolerance_m = 0.5;
+    takeoff.max_vz_mps = 0.3;
+    return config;
+}
+
+/// 等待指定结果的 65015（跳过队列里更早的回执，如 accepted）。
+std::optional<common::MissionAssignmentAck> WaitForAckWithResult(
+    common::Topic<common::MissionAssignmentAck>::Subscription& subscription,
+    common::MissionAssignmentResult result,
+    std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if ((*message)->result == result) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 等待满足条件的控制意图（跳过队列里更早的意图）。
+template <typename Predicate>
+std::optional<common::ControlIntent> WaitForIntent(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    Predicate predicate, std::chrono::milliseconds timeout = 1500ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if (predicate(**message)) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 清空意图订阅积压（中止后检查“无残留意图”前先丢掉中止前的意图）。
+void DrainIntents(
+    common::Topic<common::ControlIntent>::Subscription& subscription) {
+    while (auto message = subscription.TryTake()) {
+    }
+}
+
+bool PublishFlight(common::Topic<common::FlightStateSnapshot>& topic,
+                   const common::FlightStateSnapshot& flight) {
+    return topic
+        .Publish(std::make_shared<const common::FlightStateSnapshot>(flight))
+        .accepted;
+}
+
+/// Offboard(6/0) 快照：armed/landed 由参数指定（地面待飞或空中）。
+common::FlightStateSnapshot MakeOffboardFlight(bool armed, bool landed) {
+    common::FlightStateSnapshot flight = MakeGroundedFlight();
+    flight.armed = armed;
+    flight.landed = landed;
+    flight.landed_state_valid = true;
+    flight.flight_mode = 6;
+    flight.flight_sub_mode = 0;
+    return flight;
+}
+
+/// 起飞原点为 (1.5,-2.5,0.1)（MakeGroundedFlight），height=0.5 时目标 z=-0.4。
+constexpr float kTakeoffOriginX = 1.5f;
+constexpr float kTakeoffOriginY = -2.5f;
+constexpr float kTakeoffOriginZ = 0.1f;
+
+/// 分配用例夹具：统一装配输入/分配 Topic、命令接口与估计输入，并驱动到 S2。
+struct AssignmentHarness {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    common::Topic<common::MissionAssignment> assignment_topic;
+    common::Topic<common::FenceZone> fence_topic;
+    common::Topic<common::MissionCommand> mission_command_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine;
+    common::Topic<common::MissionStatus>::Subscription status_subscription;
+    common::Topic<common::MissionAssignmentAck>::Subscription ack_subscription;
+    common::Topic<common::ControlIntent>::Subscription intent_subscription;
+    common::Topic<common::FenceStatus>::Subscription fence_status_subscription;
+    common::Topic<common::MissionCommandAck>::Subscription
+        mission_command_ack_subscription;
+
+    AssignmentHarness() : AssignmentHarness(MakeAssignmentHarnessConfig()) {}
+
+    explicit AssignmentHarness(state_machine::MissionStateMachineConfig config)
+        : machine(config) {
+        machine.SetInputs(ground_topic, flight_topic, health_topic);
+        machine.SetAssignmentInput(assignment_topic);
+        // 围栏输入始终绑定：fence.enabled=false 时状态机不消费该 Topic。
+        machine.SetFenceInput(fence_topic);
+        // 人工指令输入同理始终绑定，用例按需发布 65020。
+        machine.SetMissionCommandInput(mission_command_topic);
+        status_subscription = machine.StatusOutput().Subscribe(32);
+        ack_subscription = machine.AssignmentAckOutput().Subscribe(32);
+        intent_subscription = machine.IntentOutput().Subscribe(64);
+        // 围栏状态容量 32 在"20ms 周期 × 用例等待 1s+"的场景下会溢出：
+        // Topic::Publish 在队列满时仍返回 accepted=true 但**静默丢弃**消息，
+        // 表现为队列里的旧状态一直不更新。给足容量，避免用例把夹具缺陷
+        // 误判成业务行为差异。
+        fence_status_subscription = machine.FenceStatusOutput().Subscribe(256);
+        mission_command_ack_subscription =
+            machine.MissionCommandAckOutput().Subscribe(32);
+    }
+
+    /// 装配并启动；with_control=false 模拟影子装配（不注入命令接口）。
+    bool Start(bool with_control, bool with_estimation,
+               common::FlightStateSnapshot flight = MakeGroundedFlight()) {
+        if (with_estimation) {
+            machine.SetEstimationInputs(estimated_topic, visual_topic,
+                                        distance_topic);
+        }
+        if (with_control) {
+            machine.SetCommandSender(&sender);
+        }
+        if (!machine.Start()) {
+            return false;
+        }
+        if (!flight_topic
+                 .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                     flight))
+                 .accepted) {
+            return false;
+        }
+        return WaitForState(status_subscription, common::MissionState::kReady)
+            .has_value();
+    }
+
+    bool Send(const common::MissionAssignment& assignment) {
+        return assignment_topic
+            .Publish(std::make_shared<const common::MissionAssignment>(
+                assignment))
+            .accepted;
+    }
+};
+
+/// 清空 65015 订阅积压（检查“无重复 aborted”前先丢掉中止前的回执）。
+void DrainAcks(
+    common::Topic<common::MissionAssignmentAck>::Subscription& subscription) {
+    while (auto message = subscription.TryTake()) {
+    }
+}
+
+/// 驱动夹具从 S2 经 S3/S4 到 S5（GPS_APPROACH）。要求 harness 使用
+/// MakeTakeoffTestConfig（height=0.5，原点 z=0.1 → 目标 z=-0.4）。
+bool DriveToGpsApproach(AssignmentHarness& harness, uint32_t assignment_id) {
+    if (!harness.Send(MakeAssignment(assignment_id))) {
+        return false;
+    }
+    if (!WaitForState(harness.status_subscription,
+                      common::MissionState::kArming)
+             .has_value()) {
+        return false;
+    }
+    if (!WaitForCallCount(harness.sender, 1)) {  // 176
+        return false;
+    }
+    if (!PublishFlight(harness.flight_topic,
+                       MakeOffboardFlight(/*armed=*/false, /*landed=*/true))) {
+        return false;
+    }
+    if (!WaitForCallCount(harness.sender, 2)) {  // 400
+        return false;
+    }
+    if (!PublishFlight(harness.flight_topic,
+                       MakeOffboardFlight(/*armed=*/true, /*landed=*/false))) {
+        return false;
+    }
+    if (!WaitForState(harness.status_subscription,
+                      common::MissionState::kTakeoff)
+             .has_value()) {
+        return false;
+    }
+    auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    arrived.local_x_m = kTakeoffOriginX;
+    arrived.local_y_m = kTakeoffOriginY;
+    arrived.local_z_m = kTakeoffOriginZ - 0.5f;
+    arrived.vz_mps = 0.f;
+    if (!PublishFlight(harness.flight_topic, arrived)) {
+        return false;
+    }
+    return WaitForState(harness.status_subscription,
+                        common::MissionState::kGpsApproach, 4000ms)
+        .has_value();
+}
+
+// 未注入命令接口（enable_control=false 影子装配）：分配必须拒绝
+// control_disabled，状态保持 S2，availability=unavailable（不可被调度）。
+TEST(MissionStateMachineTest, AssignmentRejectedWithoutCommandSender) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(1)));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->assignment_id, 1U);
+    EXPECT_EQ(ack->target_id, 7U);
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kControlDisabled);
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(ack->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+}
+
+// 有命令接口但未绑定估计输入：控制链不完整，拒绝 preflight_failed，保持 S2。
+TEST(MissionStateMachineTest, AssignmentRejectedWithoutEstimationInputs) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/false));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(2)));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kPreflightFailed);
+    EXPECT_EQ(ack->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+// 字段级校验：版本/未知 flags/未授权/target 0/类型不匹配/有效期非法或过期
+// 全部 rejected，且保持 S2（预检拒绝不消耗任务机会）。
+TEST(MissionStateMachineTest, AssignmentInvalidFieldsRejected) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    struct Case {
+        common::MissionAssignment assignment;
+        common::MissionAssignmentReason expected_reason;
+    };
+    std::vector<Case> cases;
+    {
+        auto assignment = MakeAssignment(10);
+        assignment.protocol_version = 2;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kUnsupportedVersion});
+    }
+    {
+        auto assignment = MakeAssignment(11);
+        assignment.flags = 1U | 0x80U;  // 未知位
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(12);
+        assignment.flags = 0;  // 未授权 bit0
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(13);
+        assignment.target_id = 0;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(14);
+        assignment.interceptor_type = 26;  // 火箭类，与本机捕网 25 不匹配
+        cases.push_back({assignment,
+                         common::MissionAssignmentReason::kUnsupportedInterceptorType});
+    }
+    {
+        auto assignment = MakeAssignment(15);
+        assignment.valid_for_ms = 0;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+    {
+        auto assignment = MakeAssignment(16);
+        assignment.received_ms = TestMonotonicMs() - 5000;  // 已过期
+        assignment.valid_for_ms = 1000;
+        cases.push_back(
+            {assignment, common::MissionAssignmentReason::kInvalidMessage});
+    }
+
+    for (const auto& test_case : cases) {
+        ASSERT_TRUE(harness.Send(test_case.assignment));
+        const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_EQ(ack->assignment_id, test_case.assignment.assignment_id);
+        EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+        EXPECT_EQ(ack->reason, test_case.expected_reason);
+        EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    }
+}
+
+// 合法分配 + 地面/未 armed/导航有效 → accepted、65015 availability=assigned、
+// S2→S3；65013 写入 assignment_id/target_id/availability/interceptor_type。
+// S3 入口动作（Task 5）：立即发布 kTakeoff 意图；176 必须等 bootstrap_lead。
+TEST(MissionStateMachineTest, AssignmentAcceptedEntersArming) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    const uint64_t transitions_before = harness.machine.TransitionCount();
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(42)));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->assignment_id, 42U);
+    EXPECT_EQ(ack->target_id, 7U);
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kNone);
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(ack->availability, common::MissionAvailability::kAssigned);
+
+    const auto status = WaitForState(harness.status_subscription,
+                                     common::MissionState::kArming);
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status->assignment_id, 42U);
+    EXPECT_EQ(status->target_id, 7U);
+    EXPECT_EQ(status->availability, common::MissionAvailability::kAssigned);
+    EXPECT_EQ(status->interceptor_type, 25U);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+    EXPECT_EQ(harness.machine.TransitionCount(), transitions_before + 1);
+    // S3 每拍发布起飞意图（原点、bit31）；默认用例 bootstrap_lead=5s，
+    // 断言窗口内不得提前发 176/400。
+    const auto intent = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kTakeoff;
+        });
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_FLOAT_EQ(intent->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(intent->target_y, kTakeoffOriginY);
+    EXPECT_FLOAT_EQ(intent->target_z, kTakeoffOriginZ);
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "bootstrap_lead 内不得提前发 176/400";
+}
+
+// 重复 assignment_id：只重发原 65015，不再预检/迁移。先用“已 armed”
+// 让首次分配被拒绝（保持 S2），恢复地面状态后重发同一 id 仍必须重发原
+// 拒绝回执且不进入 S3；换新 id 才允许接受。
+// 已 accepted 后、S3 执行期间再次收到同一 assignment_id：必须重发 accepted
+// 回执，不重新预检、不重复迁移；新的 assignment_id 则拒绝。
+TEST(MissionStateMachineTest, AcceptedAssignmentDuplicateWhileArmingResendsAck) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(43)));
+    const auto first = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    const uint64_t transitions_after_accept = harness.machine.TransitionCount();
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(43)));
+    const auto duplicate = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(duplicate.has_value());
+    EXPECT_EQ(duplicate->assignment_id, 43U);
+    EXPECT_EQ(duplicate->result, common::MissionAssignmentResult::kAccepted);
+    EXPECT_EQ(duplicate->availability, common::MissionAvailability::kAssigned);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+    EXPECT_EQ(harness.machine.TransitionCount(), transitions_after_accept);
+
+    // 任务执行中的新分配必须拒绝，不打断当前任务。
+    ASSERT_TRUE(harness.Send(MakeAssignment(44)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->assignment_id, 44U);
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason,
+              common::MissionAssignmentReason::kAlreadyAssigned);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+}
+
+TEST(MissionStateMachineTest, DuplicateAssignmentResendsAckWithoutReentry) {
+    AssignmentHarness harness;
+    auto armed_flight = MakeGroundedFlight();
+    armed_flight.armed = true;  // 地面未上锁前置不满足
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, armed_flight));
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(7)));
+    auto first = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(first->reason, common::MissionAssignmentReason::kPreflightFailed);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 重复 id：同一条 65015 重发，不重复预检。
+    ASSERT_TRUE(harness.Send(MakeAssignment(7)));
+    auto second = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(second->reason, common::MissionAssignmentReason::kPreflightFailed);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 恢复地面状态后重发同一 id：WasHandled 命中，仍只重发原回执。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeGroundedFlight()))
+                    .accepted);
+    std::this_thread::sleep_for(300ms);
+    ASSERT_TRUE(harness.Send(MakeAssignment(7)));
+    auto third = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(third.has_value());
+    EXPECT_EQ(third->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(third->reason, common::MissionAssignmentReason::kPreflightFailed);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "重复 assignment_id 不得重新进入 S3";
+
+    // 新 id 才允许接受（预检拒绝不消耗任务机会）。
+    ASSERT_TRUE(harness.Send(MakeAssignment(8)));
+    auto fourth = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(fourth.has_value());
+    EXPECT_EQ(fourth->result, common::MissionAssignmentResult::kAccepted);
+    // 65015 先于状态迁移发布：以状态 Topic 的 S3 为准（避免测试线程抢在
+    // TransitionTo 之前读取 CurrentState 的竞态）。
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+}
+
+// 注入命令接口后，65010 地面站目标不得单独把 S2 推到 S5；必须由 65014
+// 分配进入 S3（生产控制路径语义）。
+TEST(MissionStateMachineTest, GroundTargetDoesNotEnterGpsApproachWithControl) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    const uint64_t transitions_before = harness.machine.TransitionCount();
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(500ms);
+
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "有控制路径时 65010 目标不得单独进入 GPS_APPROACH";
+    EXPECT_EQ(harness.machine.TransitionCount(), transitions_before);
+}
+
+// 影子兼容：绑定分配输入但未注入命令接口时，既有 S2→S5 影子路径原样保留。
+TEST(MissionStateMachineTest, ShadowGroundTargetStillEntersGpsApproach) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/false));
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+}
+
+// ---------------------------------------------------------------------------
+// S3 解锁/Offboard 与 S4 自动爬升（2026-10-22，Task 5）
+// ---------------------------------------------------------------------------
+
+// S3 入口每拍发布 kTakeoff 意图（原点、bit31、局部 NED）；bootstrap_lead
+// 之前不得发 176，满足后恰好发一次 176（p1=1/p2=6/p3=0），停留不重复。
+TEST(MissionStateMachineTest, TakeoffArmingPublishesIntentAndSendsModeOnce) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/500ms, 2000ms, 2000ms, 3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(101)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+
+    const auto intent = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kTakeoff;
+        });
+    ASSERT_TRUE(intent.has_value());
+    EXPECT_FLOAT_EQ(intent->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(intent->target_y, kTakeoffOriginY);
+    EXPECT_FLOAT_EQ(intent->target_z, kTakeoffOriginZ);
+    EXPECT_EQ(intent->header.frame_id, kFrameLocalNed);
+    EXPECT_NE(intent->reason_code & common::kControlIntentReasonRequestControl,
+              0U);
+    EXPECT_GT(intent->valid_until_ms, intent->header.receive_time_ms);
+
+    // bootstrap_lead 内不得提前发 176（进入 S3 约 100ms）。
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 1U);
+    EXPECT_EQ(history[0].command, 176U);
+    EXPECT_FLOAT_EQ(history[0].params[0], 1.0f);
+    EXPECT_FLOAT_EQ(history[0].params[1], 6.0f);
+    EXPECT_FLOAT_EQ(history[0].params[2], 0.0f);
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.sender.CallCount(), 1U) << "176 只发一次，不重发";
+}
+
+// 实际 6/0 之前不发 400；实际进入 Offboard 后恰好发一次 400（p1=1）；
+// armed 且 Offboard → S4；到达任务高度后 → S5（availability=engaged）。
+TEST(MissionStateMachineTest, TakeoffOffboardThenArmEntersS4AndReachesS5) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    4000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(102)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // 未到 6/0：不得发 400。
+    std::this_thread::sleep_for(150ms);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    auto history = harness.sender.History();
+    ASSERT_GE(history.size(), 2U);
+    EXPECT_EQ(history[1].command, 400U);
+    EXPECT_FLOAT_EQ(history[1].params[0], 1.0f);
+
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "400 只发一次，不重发";
+
+    // 实际 armed 且 Offboard → S4。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    // 到达任务高度（z0 - height = -0.4，水平保持原点）→ S5。
+    auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    arrived.local_z_m = kTakeoffOriginZ - 0.5f;
+    arrived.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, arrived));
+    const auto approach = WaitForState(harness.status_subscription,
+                                       common::MissionState::kGpsApproach,
+                                       4000ms);
+    ASSERT_TRUE(approach.has_value());
+    EXPECT_EQ(approach->availability, common::MissionAvailability::kEngaged);
+}
+
+// 176 等待 Offboard 超时：65015 aborted mode_timeout、回 S2 READY、
+// 不重发 176、不留残余起飞/位置意图；重复 65014 重发最新 aborted 结果。
+TEST(MissionStateMachineTest, TakeoffModeTimeoutAbortsWithoutRetry) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/300ms,
+                              /*arm=*/2000ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(103)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->assignment_id, 103U);
+    EXPECT_EQ(aborted->target_id, 7U);
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 1U) << "失败不重发 176/400";
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+
+    // 中止后不得残留 takeoff/position 意图。
+    DrainIntents(harness.intent_subscription);
+    std::this_thread::sleep_for(250ms);
+    EXPECT_FALSE(WaitForIntent(harness.intent_subscription,
+                               [](const common::ControlIntent&) { return true; },
+                               50ms)
+                     .has_value())
+        << "中止后不得继续发布控制意图";
+
+    // 重复 assignment_id：重发最新结果（aborted，原因不变）。
+    ASSERT_TRUE(harness.Send(MakeAssignment(103)));
+    const auto duplicate = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(duplicate.has_value());
+    EXPECT_EQ(duplicate->assignment_id, 103U);
+    EXPECT_EQ(duplicate->reason, common::MissionAssignmentReason::kModeTimeout);
+}
+
+// 400 等待实际 armed 超时：65015 aborted arm_timeout、回 READY；未 armed
+// 不在地面发 DISARM；不重发 400。
+TEST(MissionStateMachineTest, TakeoffArmTimeoutAbortsWithoutRetry) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/2000ms,
+                              /*arm=*/300ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(104)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kArmTimeout);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 2U);
+
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "失败不重发 400";
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f)
+                << "未 armed 时地面中止不得发 DISARM";
+        }
+    }
+}
+
+// 地面中止时若 PX4 仍 armed+landed：只发一次 DISARM（param1=0），不重试。
+TEST(MissionStateMachineTest, TakeoffGroundArmedAbortSendsDisarmOnce) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(105)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // 地面 armed（未进入 Offboard），176 明确失败 → 中止。
+    auto armed_ground = MakeGroundedFlight();
+    armed_ground.armed = true;  // landed=true，模式保持 0/0
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, armed_ground));
+    harness.sender.SimulateAck(176U, 4U, TestMonotonicMs());  // MAV_RESULT_FAILED
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 2U);
+    EXPECT_EQ(history[1].command, 400U);
+    EXPECT_FLOAT_EQ(history[1].params[0], 0.0f) << "地面中止发 DISARM";
+
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "DISARM 只发一次";
+}
+
+// 400 ACK 已 accepted、armed 快照尚未刷新时地面取消：仍补发一次 DISARM，
+// 避免飞机被留在 armed（SITL 2026-10-22 实测竞态）。
+TEST(MissionStateMachineTest, TakeoffGroundCancelAfterArmAckSendsDisarm) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(150)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));  // ARM 已入队
+    harness.sender.SimulateAck(400U, 0U, TestMonotonicMs());  // ACCEPTED
+
+    ASSERT_TRUE(harness.Send(MakeCancel(150)));
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 3));
+    const auto history = harness.sender.History();
+    ASSERT_FALSE(history.empty());
+    EXPECT_EQ(history.back().command, 400U);
+    EXPECT_FLOAT_EQ(history.back().params[0], 0.0f)
+        << "ARM ACK accepted 后地面取消必须补发 DISARM";
+}
+
+// 已离地中止（PX4 断连）：不空中 disarm，tracker AbortAirborne → S12；
+// 状态不确定 → availability=unavailable（不错误回到 ready）。
+TEST(MissionStateMachineTest, TakeoffAirborneAbortReturnsHomeWithoutDisarm) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    4000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(106)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    auto disconnected = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    disconnected.connected = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, disconnected));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kPx4Disconnected);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // 已离地：不得发 DISARM（历史里只有 176 与 ARM 400）。
+    std::this_thread::sleep_for(400ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+    }
+}
+
+// S4 爬升（2026-11-02）：远段发速度型意图（vz=-climb_rate，恒定爬升率），
+// 末段切位置保持到目标高度；到达判据满足并稳定后进 S5。
+TEST(MissionStateMachineTest, TakeoffClimbRampsPositionWithVerticalFeedforward) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms, /*height=*/0.5,
+                                                    /*climb=*/0.5));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(107)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    const float goal_z = kTakeoffOriginZ - 0.5f;
+
+    // 1) 远段：位置目标逐拍向目标高度推进，并携带垂直速度前馈
+    //    （vz=-climb_rate，NED 向下为正）。前馈让 PX4 直接拿到爬升率，
+    //    避免位置台阶被位置环执行成加速→到位→减速的抖动。
+    bool saw_feedforward = false;
+    bool saw_position_intent = false;
+    const auto climb_deadline = std::chrono::steady_clock::now() + 700ms;
+    while (std::chrono::steady_clock::now() < climb_deadline) {
+        auto message = harness.intent_subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& value = **message;
+        if (value.type != common::ControlIntentType::kTakeoff) {
+            continue;
+        }
+        saw_position_intent = true;
+        EXPECT_NEAR(value.target_x, kTakeoffOriginX, 1e-4f);
+        EXPECT_NEAR(value.target_y, kTakeoffOriginY, 1e-4f);
+        // 位置目标只向目标高度推进，不越过。
+        EXPECT_LE(value.target_z, kTakeoffOriginZ + 1e-4f);
+        EXPECT_GE(value.target_z, goal_z - 1e-3f);
+        if ((value.feedforward_valid_mask & common::kVelocityValidDown) != 0) {
+            EXPECT_NEAR(value.feedforward_vz_mps, -0.5f, 1e-4f);
+            saw_feedforward = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_position_intent) << "S4 应持续发 kTakeoff 位置意图";
+    EXPECT_TRUE(saw_feedforward)
+        << "爬升远段应携带垂直速度前馈（vz=-climb_rate）";
+
+    // 2) 末段：到达目标高度附近后撤掉前馈，位置环自行收敛。
+    auto arrived = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    arrived.local_x_m = kTakeoffOriginX;
+    arrived.local_y_m = kTakeoffOriginY;
+    arrived.local_z_m = goal_z;
+    arrived.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, arrived));
+    bool saw_handover = false;
+    const auto hold_deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < hold_deadline) {
+        auto message = harness.intent_subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& value = **message;
+        if (value.type != common::ControlIntentType::kTakeoff) {
+            continue;
+        }
+        // 末段不再带垂直前馈，交给位置环把最后一段收掉。
+        EXPECT_EQ(value.feedforward_valid_mask & common::kVelocityValidDown, 0);
+        EXPECT_NEAR(value.target_z, goal_z, 0.05f);
+        saw_handover = true;
+        break;
+    }
+    EXPECT_TRUE(saw_handover) << "末段应撤掉垂直前馈并由位置环收敛到目标高度";
+    const auto approach = WaitForState(harness.status_subscription,
+                                       common::MissionState::kGpsApproach,
+                                       4000ms);
+    ASSERT_TRUE(approach.has_value());
+    EXPECT_EQ(approach->availability, common::MissionAvailability::kEngaged);
+}
+
+// S4 地面超时：停流；armed+landed 只发一次 DISARM；回 S2 READY。
+TEST(MissionStateMachineTest, TakeoffClimbGroundTimeoutDisarmsAndReturnsReady) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/400ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(108)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    // 地面 armed + Offboard → 进入 S4；高度目标不可达 → 地面超时。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTakeoffTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 3));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 3U);
+    EXPECT_EQ(history[2].command, 400U);
+    EXPECT_FLOAT_EQ(history[2].params[0], 0.0f);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 3U) << "DISARM 只发一次";
+}
+
+// S4 空中超时且 PX4 仍在 Offboard：S13 由现有降落链发 AUTO.LAND(4/6)。
+TEST(MissionStateMachineTest, TakeoffClimbAirTimeoutLandsInPlace) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/400ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(109)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    // 空中 armed + Offboard → S4；高度目标不可达 → 空中超时。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 3000ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 3));
+    auto history = harness.sender.History();
+    ASSERT_EQ(history.size(), 3U);
+    EXPECT_EQ(history[2].command, 176U);
+    EXPECT_FLOAT_EQ(history[2].params[1], 4.0f);  // AUTO
+    EXPECT_FLOAT_EQ(history[2].params[2], 6.0f);  // AUTO.LAND
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTakeoffTimeout);
+}
+
+// S4 爬升中 PX4 离开 Offboard（非等到 height_timeout）：当拍停发让权，
+// 转 S13 仅监控，不发 AUTO.LAND，65015 aborted(mode_timeout)。
+TEST(MissionStateMachineTest, TakeoffClimbOffboardLossYieldsImmediately) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/3000ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(111)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    // PX4 人工/failsafe 接管：离开 Offboard，但仍在空中。
+    auto takeover = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    takeover.flight_mode = 4;
+    takeover.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, takeover));
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 1500ms)
+                    .has_value());
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kModeTimeout);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U)
+        << "离开 Offboard 后不得争控发 AUTO.LAND";
+}
+
+// S4 空中超时且 PX4 已离开 Offboard：停发让权，转 S13 仅监控，不发 AUTO.LAND。
+TEST(MissionStateMachineTest, TakeoffClimbAirTimeoutYieldsWhenOffboardLost) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    /*height_timeout=*/400ms,
+                                                    /*height=*/5.0));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(110)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    // PX4 已被接管（4/5），S4 超时后只监控。
+    auto takeover = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    takeover.flight_mode = 4;
+    takeover.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, takeover));
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 3000ms)
+                    .has_value());
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U)
+        << "PX4 已离开 Offboard 时不得争控发 AUTO.LAND";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kLanding);
+}
+
+// 中止时离地状态不明（landed_state_valid=false）：即使回到 S2 也锁存
+// unavailable，新分配回 not_ready，不错误回到 ready。
+TEST(MissionStateMachineTest, TakeoffUncertainStateLatchesUnavailable) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/300ms,
+                              /*arm=*/2000ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(112)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // 离地状态不明（未 armed、landed_state_valid=false）→ 模式超时中止后
+    // 不可判定是否仍在地面，置 per-boot 不可调度标志。
+    auto uncertain = MakeGroundedFlight();
+    uncertain.landed_state_valid = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, uncertain));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 1U) << "状态不明不得发 DISARM";
+
+    // 新分配被拒 not_ready（不是 ready），availability 仍 unavailable。
+    ASSERT_TRUE(harness.Send(MakeAssignment(113)));
+    const auto rejected = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kRejected);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->reason, common::MissionAssignmentReason::kNotReady);
+    EXPECT_EQ(rejected->availability, common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+}
+
+// 176 ACK IN_PROGRESS(5) 不中止；明确失败(4) 立即中止（不等 mode_timeout）。
+TEST(MissionStateMachineTest, TakeoffAckFailureAbortsImmediately) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 3000ms, 3000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(111)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    const auto accepted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(accepted.has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+
+    // IN_PROGRESS 只作过程反馈，不中止。
+    harness.sender.SimulateAck(176U, 5U, TestMonotonicMs());
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming);
+    EXPECT_FALSE(WaitForAckWithResult(harness.ack_subscription,
+                                      common::MissionAssignmentResult::
+                                          kCancelledOrAborted,
+                                      100ms)
+                     .has_value());
+
+    // 明确失败立即中止（mode_timeout 原因、无重发）。
+    harness.sender.SimulateAck(176U, 4U, TestMonotonicMs());
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kModeTimeout);
+    EXPECT_EQ(harness.sender.CallCount(), 1U);
+}
+
+// ---------------------------------------------------------------------------
+// 电池守卫：S2 预检、地面 availability、飞行中低电/遥测失效 S12（2026-10-22，Task 8）
+// ---------------------------------------------------------------------------
+
+// PX4 低电参数不可用（阈值/动作无效、动作非 0、阈值 0 或 100）→ S2 拒绝
+// battery_config_unknown，保持 READY。
+TEST(MissionStateMachineTest, BatteryPreflightRejectsInvalidParameters) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    struct Case {
+        bool threshold_valid;
+        float threshold_pct;
+        bool action_valid;
+        uint8_t action;
+    };
+    const Case cases[] = {
+        {false, 15.f, true, 0},   // BAT_LOW_THR 未读到
+        {true, 15.f, false, 0},   // COM_LOW_BAT_ACT 未读到
+        {true, 15.f, true, 1},    // 动作非 0（非 Warning Only）
+        {true, 0.f, true, 0},     // 阈值越界（0）
+        {true, 100.f, true, 0},   // 阈值越界（100）
+    };
+    uint32_t assignment_id = 201;
+    for (const auto& item : cases) {
+        auto flight = MakeGroundedFlight();
+        flight.battery_low_threshold_valid = item.threshold_valid;
+        flight.battery_low_threshold_pct = item.threshold_pct;
+        flight.low_battery_action_valid = item.action_valid;
+        flight.low_battery_action = item.action;
+        ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+        std::this_thread::sleep_for(150ms);
+
+        ASSERT_TRUE(harness.Send(MakeAssignment(assignment_id++)));
+        const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+        EXPECT_EQ(ack->reason,
+                  common::MissionAssignmentReason::kBatteryConfigUnknown);
+        EXPECT_EQ(ack->availability,
+                  common::MissionAvailability::kUnavailable);
+        EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    }
+}
+
+// 电池遥测无效（battery_valid=false / remaining_valid=false / 百分比非有限）
+// → S2 拒绝 battery_telemetry_invalid。
+TEST(MissionStateMachineTest, BatteryPreflightRejectsInvalidTelemetry) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    std::vector<common::FlightStateSnapshot> cases;
+    {
+        auto flight = MakeGroundedFlight();
+        flight.battery_valid = false;
+        cases.push_back(flight);
+    }
+    {
+        auto flight = MakeGroundedFlight();
+        flight.battery_remaining_valid = false;
+        cases.push_back(flight);
+    }
+    {
+        auto flight = MakeGroundedFlight();
+        flight.battery_remaining_pct =
+            std::numeric_limits<float>::quiet_NaN();
+        cases.push_back(flight);
+    }
+    uint32_t assignment_id = 211;
+    for (const auto& flight : cases) {
+        ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+        std::this_thread::sleep_for(150ms);
+        ASSERT_TRUE(harness.Send(MakeAssignment(assignment_id++)));
+        const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+        EXPECT_EQ(ack->reason,
+                  common::MissionAssignmentReason::kBatteryTelemetryInvalid);
+        EXPECT_EQ(ack->availability,
+                  common::MissionAvailability::kUnavailable);
+        EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    }
+}
+
+// 地面电量不高于阈值（pct == BAT_LOW_THR 也算低电）→ rejected battery_low、
+// availability=unavailable；恢复且未执行空中任务后自然回到 ready，可接受
+// 新分配（不锁存为 terminal）。
+TEST(MissionStateMachineTest, BatteryLowOnGroundUnavailableThenRecovers) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    auto low = MakeGroundedFlight();
+    low.battery_remaining_pct = 15.f;  // == BAT_LOW_THR，pct <= 阈值即低电
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    std::this_thread::sleep_for(150ms);
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(221)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_EQ(rejected->availability,
+              common::MissionAvailability::kUnavailable);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+
+    // 地面恢复（未执行空中任务）：availability 自然回 ready，可接受新分配。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, MakeGroundedFlight()));
+    std::this_thread::sleep_for(150ms);
+    ASSERT_TRUE(harness.Send(MakeAssignment(222)));
+    const auto accepted = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(accepted->result, common::MissionAssignmentResult::kAccepted);
+    EXPECT_EQ(accepted->availability,
+              common::MissionAvailability::kAssigned);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+}
+
+// S3 地面低电（持续防抖）→ 中止，65015 aborted battery_low，回 READY；
+// 不进入 S9/S10 发射（无 187），也不发 176/400（bootstrap_lead 未到）。
+TEST(MissionStateMachineTest, BatteryLowInArmingAbortsOnGround) {
+    auto config = MakeTakeoffTestConfig(/*lead=*/5000ms, 5000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(231)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+
+    auto low = MakeGroundedFlight();
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "低电中止不得再发 176/400";
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "低电不得触发发射";
+    }
+}
+
+// S4 已离地低电（持续防抖）→ 65015 aborted battery_low → S12 机载位置返航，
+// 不空中 disarm、不走 PX4 RTL、不触发 187。
+TEST(MissionStateMachineTest, BatteryLowAirborneInTakeoffReturnsHome) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 4000ms);
+    config.takeoff.battery_low_debounce = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(241)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    auto low = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // 空中中止不 disarm（400 只有 param1=1 的解锁命令），不触发 187。
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+        EXPECT_NE(call.command, 187U) << "低电不得触发发射";
+    }
+}
+
+// S5 低电：不足防抖不触发；持续超过防抖 → 65015 aborted battery_low → S12；
+// 之后不再重复 aborted（一次任务只中止一次），且无 187。
+TEST(MissionStateMachineTest, BatteryLowInGpsApproachDebouncesThenReturnsHome) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 800ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 251));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    auto low = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "不足 battery_low_debounce 不得中止";
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kBatteryLow);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // S12 起不再重复触发/重复 65015。
+    DrainAcks(harness.ack_subscription);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    std::this_thread::sleep_for(500ms);
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "S12 不得重复 aborted";
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "低电不得触发发射";
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+    }
+}
+
+// S5 电池遥测失效 → 立即 65015 aborted battery_telemetry_invalid → S12，
+// 不等防抖、不触发 187。
+TEST(MissionStateMachineTest, BatteryTelemetryLossInGpsApproachReturnsImmediately) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 5000ms;  // 遥测失效不等防抖
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 261));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    auto lost = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    lost.battery_valid = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, lost));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 1500ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kBatteryTelemetryInvalid);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "遥测失效不得触发发射";
+    }
+}
+
+// 电池空中中止后落地：S12→S13→S14 沿用现有链路，tracker 进入 terminal，
+// 65013 availability=terminal，本次上电不再分配（新 65014 被拒）。
+TEST(MissionStateMachineTest, BatteryAbortLandsThenTerminal) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.battery_low_debounce = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 271));
+
+    auto low = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    low.battery_remaining_pct = 10.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, low));
+    ASSERT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 3000ms)
+                    .has_value());
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    // PX4 接管（离开 Offboard）→ S13；落地且 disarmed → S14。
+    auto takeover = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    takeover.flight_mode = 4;
+    takeover.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, takeover));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding)
+                    .has_value());
+
+    auto landed = MakeOffboardFlight(/*armed=*/false, /*landed=*/true);
+    landed.flight_mode = 4;
+    landed.flight_sub_mode = 5;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, landed));
+    const auto disarmed = WaitForState(harness.status_subscription,
+                                       common::MissionState::kDisarmed,
+                                       2000ms);
+    ASSERT_TRUE(disarmed.has_value());
+    EXPECT_EQ(disarmed->availability,
+              common::MissionAvailability::kTerminal);
+
+    // terminal：新分配不再接受（状态非 READY 与 tracker terminal 双重拒绝）。
+    ASSERT_TRUE(harness.Send(MakeAssignment(272)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason,
+              common::MissionAssignmentReason::kAlreadyAssigned);
+    EXPECT_EQ(rejected->availability,
+              common::MissionAvailability::kTerminal);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+}
+
+// ---------------------------------------------------------------------------
+// 65014 取消、S5 target_id 过滤与目标等待/丢失收口（2026-10-22，Task 10）
+// ---------------------------------------------------------------------------
+
+// 地面 S3（未 armed）取消：65015 cancelled(cancelled_by_gcs)、回 READY、
+// 不产生 176/400（bootstrap_lead 未到）、无 187；重复取消重发同一结果。
+TEST(MissionStateMachineTest, CancelOnGroundInArmingReturnsReady) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(/*lead=*/5000ms, 5000ms,
+                                                    5000ms, 5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(301)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+
+    ASSERT_TRUE(harness.Send(MakeCancel(301)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->assignment_id, 301U);
+    EXPECT_EQ(cancelled->target_id, 7U);
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(cancelled->availability, common::MissionAvailability::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "bootstrap_lead 内地面取消不得发 176/400";
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U);
+    }
+
+    // 重复取消：同一 assignment_id 重发最近 cancelled 结果，不再迁移/发命令。
+    DrainAcks(harness.ack_subscription);
+    ASSERT_TRUE(harness.Send(MakeCancel(301)));
+    const auto duplicate = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(duplicate.has_value());
+    EXPECT_EQ(duplicate->assignment_id, 301U);
+    EXPECT_EQ(duplicate->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(duplicate->availability, common::MissionAvailability::kReady);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+// 地面取消且 PX4 仍 armed+landed：只发一次 DISARM(param1=0)，不重试；
+// 重复取消不重复下发命令。
+TEST(MissionStateMachineTest, CancelGroundArmedSendsDisarmOnce) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 3000ms, 3000ms,
+                                                    3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(302)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));  // 176
+
+    // 地面 armed（landed=true，模式仍 0/0）→ 取消按地面中止处置。
+    auto armed_ground = MakeGroundedFlight();
+    armed_ground.armed = true;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, armed_ground));
+
+    ASSERT_TRUE(harness.Send(MakeCancel(302)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    auto history = harness.sender.History();
+    ASSERT_GE(history.size(), 2U);
+    EXPECT_EQ(history[1].command, 400U);
+    EXPECT_FLOAT_EQ(history[1].params[0], 0.0f) << "地面取消发 DISARM";
+
+    // 重复取消：只重发结果，不再发 DISARM。
+    DrainAcks(harness.ack_subscription);
+    ASSERT_TRUE(harness.Send(MakeCancel(302)));
+    ASSERT_TRUE(WaitForAckWithResult(harness.ack_subscription,
+                                     common::MissionAssignmentResult::
+                                         kCancelledOrAborted,
+                                     2000ms)
+                    .has_value());
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(harness.sender.CallCount(), 2U) << "DISARM 只发一次";
+}
+
+// 已离地（S4）取消：tracker AbortAirborne → S12，65015 cancelled；不空中
+// disarm、不触发 187。
+TEST(MissionStateMachineTest, CancelAirborneInTakeoffReturnsHomeWithoutDisarm) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(harness.Send(MakeAssignment(303)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2));
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true,
+                                                 /*landed=*/false)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kTakeoff)
+                    .has_value());
+
+    ASSERT_TRUE(harness.Send(MakeCancel(303)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->assignment_id, 303U);
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReturnHome);
+    EXPECT_EQ(cancelled->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中取消不得 disarm";
+        }
+        EXPECT_NE(call.command, 187U) << "取消不得触发发射";
+    }
+}
+
+// 已离地（S5）取消：中止分配 → S12；停发任务位置引导，无 disarm/187。
+TEST(MissionStateMachineTest, CancelAirborneInGpsApproachReturnsHome) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 304));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    ASSERT_TRUE(harness.Send(MakeCancel(304)));
+    const auto cancelled = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->reason,
+              common::MissionAssignmentReason::kCancelledByGcs);
+    EXPECT_EQ(cancelled->mission_state, common::MissionState::kReturnHome);
+    EXPECT_EQ(cancelled->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+
+    std::this_thread::sleep_for(300ms);
+    for (const auto& call : harness.sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中取消不得 disarm";
+        }
+        EXPECT_NE(call.command, 187U) << "取消不得触发发射";
+    }
+}
+
+// 无活动分配且 assignment_id 从未处理：取消回 rejected(not_ready)，保持 S2。
+TEST(MissionStateMachineTest, CancelWithoutActiveAssignmentRejected) {
+    AssignmentHarness harness;
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.Send(MakeCancel(401)));
+    const auto rejected = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(rejected->assignment_id, 401U);
+    EXPECT_EQ(rejected->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(rejected->reason, common::MissionAssignmentReason::kNotReady);
+    EXPECT_EQ(rejected->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+}
+
+// 控制任务 S5：非本分配 target_id 的 65010/估计不得更新位置引导，也不进入
+// 交接；匹配 target_id 后才发布位置意图。
+TEST(MissionStateMachineTest, S5TargetIdFilterIgnoresNonMatchingTargets) {
+    AssignmentHarness harness(MakeTakeoffTestConfig(100ms, 2000ms, 2000ms,
+                                                    5000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 305));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+    DrainIntents(harness.intent_subscription);
+
+    // 非匹配 65010（target_id=99）与估计：不得进入引导（不能飞向别人的目标）；
+    // 控制任务下目标不可用按“原地保持”续流（原因码 9），不是停发。
+    auto foreign_ground = MakeFreshGroundTarget();
+    foreign_ground.target_id = 99;
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        foreign_ground))
+                    .accepted);
+    auto foreign_estimate = MakeValidEstimatedTarget();
+    foreign_estimate.target_id = 99;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        foreign_estimate))
+                    .accepted);
+    const auto hold = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kPositionGuide &&
+                   (value.reason_code & 0xFFU) == 9U;
+        });
+    ASSERT_TRUE(hold.has_value())
+        << "非匹配 target_id 不得进入引导，但应按原地保持续流";
+    EXPECT_FLOAT_EQ(hold->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(hold->target_y, kTakeoffOriginY);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 匹配 target_id=7 的估计 → 连续 3 拍恢复后回到 S5 位置引导（原因码 7）。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    const auto intent = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return value.type == common::ControlIntentType::kPositionGuide &&
+                   (value.reason_code & 0xFFU) == 7U;
+        });
+    ASSERT_TRUE(intent.has_value());
+    // 速度律位置锚点在自机附近，不是目标点本身；本用例只验证 target_id 过滤后
+    // 恢复的是“估计引导”（原因码 7），不把 anchor 钉死在具体坐标。
+    EXPECT_LT(intent->target_x, 12.4f);
+    EXPECT_GT(intent->target_y, -2.9f);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// 控制任务 S5 无匹配目标：超过 target_wait_timeout → 65015
+// aborted(target_wait_timeout)，tracker 转 returning，S12 返航；无 187。
+TEST(MissionStateMachineTest, S5TargetWaitTimeoutReturnsHome) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 306));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->assignment_id, 306U);
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTargetWaitTimeout);
+    EXPECT_EQ(aborted->mission_state, common::MissionState::kReturnHome);
+    EXPECT_EQ(aborted->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "目标等待超时不得触发发射";
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "空中中止不得 disarm";
+        }
+    }
+
+    // 一次任务只中止一次：S12 后不再重复 65015 aborted。
+    DrainAcks(harness.ack_subscription);
+    std::this_thread::sleep_for(500ms);
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "S12 不得重复 aborted";
+}
+
+// 控制任务 S5：已获得匹配目标后失效，短暂丢失不触发；恢复后计时清零；
+// 再次持续失效超过 target_lost_timeout → 65015 aborted(target_lost) + S12。
+TEST(MissionStateMachineTest, S5TargetLostTimeoutWithRecovery) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 400ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 307));
+
+    // 先获得匹配目标（位置意图出现即说明已进入引导）。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return value.type ==
+                               common::ControlIntentType::kPositionGuide;
+                    })
+                    .has_value());
+
+    // 短暂丢失（200ms < 400ms）后恢复：不得中止，丢失计时清零。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "短暂丢失并恢复不得中止任务";
+
+    // 再次持续失效超过 400ms → 中止返航。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kTargetLost);
+    EXPECT_EQ(aborted->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome)
+                    .has_value());
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "目标丢失中止不得触发发射";
+    }
+}
+
+// 影子兼容：未注入命令接口时 S5 保持既有行为——不按 target_id 过滤，
+// target_wait_timeout 不生效（不自动中止）。
+TEST(MissionStateMachineTest, ShadowS5IgnoresFilterAndWaitTimeout) {
+    auto config = MakeAssignmentHarnessConfig();
+    config.takeoff.target_wait_timeout = 200ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 影子不过滤：target_id=99 的估计仍发布位置意图（既有行为）。
+    auto foreign_estimate = MakeValidEstimatedTarget();
+    foreign_estimate.target_id = 99;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        foreign_estimate))
+                    .accepted);
+    EXPECT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return value.type ==
+                               common::ControlIntentType::kPositionGuide;
+                    })
+                    .has_value())
+        << "影子模式不得按 target_id 过滤";
+
+    // 影子不启用目标看门狗：超过 200ms 仍停在 S5。
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// ---------------------------------------------------------------------------
+// S5 目标失效“原地保持”（2026-10-22）
+// 目标失效不再直接停发：控制任务以 PX4 当前局部位置续流（原因码 9、无前馈、
+// 10Hz），保证控制器与 PX4 Offboard 不断流，10s 看门狗到点后由 S12 无缝接管。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool IsPositionIntent(const common::ControlIntent& value) {
+    return value.type == common::ControlIntentType::kPositionGuide;
+}
+
+/// 低位原因码（bit31 为控制权请求位，需剥离）。
+uint32_t LowReasonCode(const common::ControlIntent& value) {
+    return value.reason_code & 0xFFU;
+}
+
+constexpr uint32_t kLowReasonGroundTask = 7U;
+constexpr uint32_t kLowReasonTargetHold = 9U;
+
+// ---------------------------------------------------------------------------
+// 多边形围栏（2026-10-29）：区域输入、越界动作与起飞前版本一致性预检
+// ---------------------------------------------------------------------------
+
+/// 围栏用例的 EKF 局部锚点（与 MakeFenceFlight 的 ned_ref 一致）。
+constexpr int32_t kFenceAnchorLat1e7 = 231200000;
+constexpr int32_t kFenceAnchorLon1e7 = 1131200000;
+constexpr int32_t kFenceAnchorAltMm = 100000;
+
+/// 落地待飞快照 + EKF 局部锚点：多边形顶点按该锚点换算成局部 NED。
+common::FlightStateSnapshot MakeFenceFlight() {
+    common::FlightStateSnapshot flight = MakeGroundedFlight();
+    flight.ned_ref_valid = true;
+    flight.ned_ref_lat_1e7 = kFenceAnchorLat1e7;
+    flight.ned_ref_lon_1e7 = kFenceAnchorLon1e7;
+    flight.ned_ref_alt_mm = kFenceAnchorAltMm;
+    return flight;
+}
+
+/// 空中快照（Offboard）覆盖局部位置与锚点，用于制造越界/回界。
+/// 起飞基准取 0m（解锁瞬间 local_z=0）：相对起飞点高度 = −z，与用例里
+/// “抬高到相对锚点 N 米”的写法一一对应。
+common::FlightStateSnapshot MakeFenceOffboardFlight(float x_m, float y_m,
+                                                    float z_m) {
+    common::FlightStateSnapshot flight = MakeOffboardFlight(true, false);
+    flight.ned_ref_valid = true;
+    flight.ned_ref_lat_1e7 = kFenceAnchorLat1e7;
+    flight.ned_ref_lon_1e7 = kFenceAnchorLon1e7;
+    flight.ned_ref_alt_mm = kFenceAnchorAltMm;
+    flight.local_position_valid = true;
+    flight.local_x_m = x_m;
+    flight.local_y_m = y_m;
+    flight.local_z_m = z_m;
+    flight.takeoff_ref_valid = true;
+    flight.takeoff_ref_local_z_m = 0.f;
+    return flight;
+}
+
+/// 以锚点为心的方形区域（±radius_m），顶点按 23.12° 纬度做米→度近似换算。
+common::FenceZone MakeSquareZone(uint16_t zone_id, uint16_t version,
+                                 common::FenceAction action,
+                                 double radius_m) {
+    common::FenceZone zone;
+    zone.header.receive_time_ms = TestMonotonicMs();
+    zone.header.valid_for_ms = 0;  // 持久快照
+    zone.header.health = 1;
+    zone.protocol_version = 1;
+    zone.zone_id = zone_id;
+    zone.version = version;
+    zone.type = common::FenceZoneType::kPolygon;
+    zone.action = action;
+    zone.altitude_reference = 1;  // Home 相对高度
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 0.0;  // 不限制高度带
+    const double lat0 = static_cast<double>(kFenceAnchorLat1e7) * 1e-7;
+    const double lon0 = static_cast<double>(kFenceAnchorLon1e7) * 1e-7;
+    const double dlat = radius_m / 111320.0;
+    const double dlon = radius_m / (111320.0 * 0.91965);  // cos(23.12°)
+    zone.vertices = {
+        {lat0 - dlat, lon0 - dlon},
+        {lat0 + dlat, lon0 - dlon},
+        {lat0 + dlat, lon0 + dlon},
+        {lat0 - dlat, lon0 + dlon},
+    };
+    zone.received_ms = TestMonotonicMs();
+    return zone;
+}
+
+/// 围栏用例配置：缩短起飞时序 + 启用围栏（无防抖、快速上报状态）。
+state_machine::MissionStateMachineConfig MakeFenceTestConfig(
+    common::FenceAction violation_action = common::FenceAction::kReturn) {
+    state_machine::MissionStateMachineConfig config = MakeTakeoffTestConfig();
+    config.fence.enabled = true;
+    config.fence.violation_debounce = 0ms;
+    config.fence.boundary_margin_m = 1.0;
+    config.fence.boundary_warn_m = 10.0;
+    config.fence.follow_zone_action = true;
+    config.fence.violation_action = violation_action;
+    config.fence.status_period = 20ms;
+    // 清空缓存路径：用例只验证在线 65018 与越界逻辑，不落盘、不读历史缓存。
+    config.fence.zone_cache_path.clear();
+    return config;
+}
+
+/// 越界返回动作：S5 中被拖到区域外 → 65019 先报 violated，随后中止到 S12 返航。
+/// 默认配置（fence.enabled=false）下也应当照常计算并上报 65019：
+/// 否则地面站只能看到 state=3(no_zone)，无法判断“区域是否已装载、形状是否合理”。
+TEST(MissionStateMachineTest, FenceStateReportedEvenWhenDisabled) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 默认生产配置
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(7, 3, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(500.0f, 0.0f, -2.0f)))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "enabled=false 时仍应上报真实围栏状态";
+    // 但不得产生动作：状态机应留在 S5，不转 S12。
+    std::this_thread::sleep_for(200ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "enabled=false 不得触发越界动作";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 高度带“相对起飞点”必须是 EKF 差分（解锁瞬间 local_z − 当前 local_z），
+/// **不得**用 `MSL − HOME_POSITION.alt`：Home 高度是 GNSS 绝对海拔，现场
+/// 0083/0084 在 25 分钟内漂了 38.81m（341.775→248.159），把相对高度整体抬高
+/// 18~21m，起飞 4.83m 就撞 20m 上限被判越界（docs/故障排查手册.md §17.9.1）。
+TEST(MissionStateMachineTest, FenceAltitudeUsesTakeoffReference) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    // 面积给足（±100m），高度带 [0,10]m 相对起飞点。
+    auto zone = MakeSquareZone(5, 2, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 起飞基准 0m、当前 z=-8m → 相对起飞 8m，未超 10m；同时把 Home 高度造出
+    // 20m 漂移（100000→80000）：旧实现会算成 (100+8)−80=28m 误判越界。
+    auto high = MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f);
+    high.home_valid = true;
+    high.home_altitude_mm = 80000;
+    high.ned_ref_alt_mm = 100000;
+    high.takeoff_ref_local_z_m = 0.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(high))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto calm_deadline = std::chrono::steady_clock::now() + 400ms;
+    while (std::chrono::steady_clock::now() < calm_deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (status && (*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_FALSE(saw_violated)
+        << "相对起飞 8m 未超上限 10m，Home 漂移 20m 不得影响判定";
+
+    // 抬到相对起飞 12m：超上限 10m → 越界。
+    auto too_high = MakeFenceOffboardFlight(5.0f, 5.0f, -12.0f);
+    too_high.home_valid = true;
+    too_high.home_altitude_mm = 80000;
+    too_high.ned_ref_alt_mm = 100000;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        too_high))
+                    .accepted);
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "相对起飞高度 12m 超上限 10m，应判越界";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 相对高度基准优先 HOME_POSITION.z：PX4 在 EKF 位置漂移超阈值时会重设 Home，
+/// 基准与 local_z 同属一个局部坐标系、一起平移，差分因此对 EKF 高度重置免疫。
+/// 用例还顺手证明“冻结在解锁瞬间的 takeoff 快照”不再是首选（否则第二阶段会误判）。
+TEST(MissionStateMachineTest, FenceAltitudeFollowsHomeReanchor) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定与 65019，不执行中止动作
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(6, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 阶段一：Home 的 EKF 局部 z=-21m、当前 z=-23m → 相对起飞 2m，未超上限。
+    auto base = MakeFenceOffboardFlight(5.0f, 5.0f, -23.0f);
+    base.home_local_z_valid = true;
+    base.home_local_z_m = -21.0f;
+    base.takeoff_ref_valid = true;
+    base.takeoff_ref_local_z_m = -21.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(base))
+                    .accepted);
+
+    auto saw_violated = [&harness](std::chrono::milliseconds window) {
+        bool violated = false;
+        const auto deadline = std::chrono::steady_clock::now() + window;
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+            if (status && (*status)->state == common::FenceState::kViolated) {
+                violated = true;
+            }
+        }
+        return violated;
+    };
+    EXPECT_FALSE(saw_violated(400ms))
+        << "相对起飞 2m 未超上限 10m，不得判越界";
+
+    // 阶段二：模拟 EKF 高度重置后 PX4 重设 Home——Home 与 local_z 同时平移 15m
+    // （Home -21→-6、z -23→-8），相对高度仍是 2m。此时旧的解锁快照仍是 -21，
+    // 若还按快照算会得到 -21-(-8)=13m 而误判越界，因此这一阶段区分了两种基准。
+    auto shifted = MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f);
+    shifted.home_local_z_valid = true;
+    shifted.home_local_z_m = -6.0f;
+    shifted.takeoff_ref_valid = true;
+    shifted.takeoff_ref_local_z_m = -21.0f;  // 故意保留旧快照
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        shifted))
+                    .accepted);
+    EXPECT_FALSE(saw_violated(400ms))
+        << "Home 重设后基准应随之平移，相对起飞 2m 不得判越界";
+
+    // 阶段三：同一基准下抬到相对 12m → 超上限 10m，应判越界。
+    auto too_high = MakeFenceOffboardFlight(5.0f, 5.0f, -18.0f);
+    too_high.home_local_z_valid = true;
+    too_high.home_local_z_m = -6.0f;
+    too_high.takeoff_ref_valid = true;
+    too_high.takeoff_ref_local_z_m = -21.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        too_high))
+                    .accepted);
+    EXPECT_TRUE(saw_violated(2000ms))
+        << "Home 重设后相对起飞 12m 超上限 10m，应判越界";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 高度基准不可用（未解锁过/断连后失效）时只判水平：不拿 GNSS 绝对海拔兜底。
+/// 现场就是被“AMSL − Home”这条兜底路径误判的，宁可少判高度也不能误中止。
+TEST(MissionStateMachineTest, FenceAltitudeUnavailableJudgesHorizontalOnly) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定与 65019，不执行中止动作
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(11, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // z=-30m 若按相对高度算必越界；基准不可用 → 只判水平（仍在区域内）。
+    auto no_base = MakeFenceOffboardFlight(5.0f, 5.0f, -30.0f);
+    no_base.takeoff_ref_valid = false;
+    no_base.takeoff_ref_local_z_m = 0.f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(no_base))
+                    .accepted);
+    bool saw_violated = false;
+    bool saw_any = false;
+    const auto deadline = std::chrono::steady_clock::now() + 600ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status || (*status)->zone_id != 11U) {
+            continue;
+        }
+        saw_any = true;
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_TRUE(saw_any) << "65019 仍须上报";
+    EXPECT_FALSE(saw_violated) << "基准不可用时不判高度带，只判水平";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 高度带迟滞 1.5m：越界后必须回到带内 1.5m 才算恢复，避免贴边抖动反复
+/// 触发越界（配合 violation_debounce 使用；本用例关闭动作只看判定）。
+TEST(MissionStateMachineTest, FenceAltitudeHysteresisAwaitsClearance) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定，避免越界即中止
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(12, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 10.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    auto wait_state = [&](common::FenceState expected, bool expected_violated) {
+        const auto limit = std::chrono::steady_clock::now() + 1500ms;
+        while (std::chrono::steady_clock::now() < limit) {
+            auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+            if (!status || (*status)->zone_id != 12U) {
+                continue;
+            }
+            const bool violated = (*status)->state == common::FenceState::kViolated;
+            if (violated == expected_violated) {
+                return true;
+            }
+        }
+        (void)expected;
+        return false;
+    };
+
+    // 10.5m：刚超上限 0.5m → 越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(5.0f, 5.0f, -10.5f)))
+                    .accepted);
+    EXPECT_TRUE(wait_state(common::FenceState::kViolated, true));
+    // 9.5m：已回到带内 0.5m，仍在 1.5m 迟滞区内 → 保持越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(5.0f, 5.0f, -9.5f)))
+                    .accepted);
+    EXPECT_TRUE(wait_state(common::FenceState::kViolated, true))
+        << "回到带内 0.5m 不应立即恢复（迟滞 1.5m）";
+    // 8.0m：低于 10−1.5=8.5m → 恢复非越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(5.0f, 5.0f, -8.0f)))
+                    .accepted);
+    EXPECT_TRUE(wait_state(common::FenceState::kNormal, false))
+        << "回到 8.0m（<8.5m）应恢复";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 2026-10-30 现场日志 0078 回归：相对起飞点的高度带不设下限（从地面起算）。
+/// 地面静止时相对起飞点≈0m，alt_min=10m 在旧实现下会报 violated，且解锁/爬升后
+/// 会触发越界中止（S3/S4 都在围栏动作生效态）。现在必须报非越界。
+/// 2026-11-04：高度基准由 GNSS Home 海拔改为 EKF 差分（起飞基准 local_z），
+/// 该用例的语义不变。
+TEST(MissionStateMachineTest, FenceHomeRelativeIgnoresAltMin) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(41, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 1;  // 相对起飞点（原“相对 Home”，基准已改）
+    zone.alt_min_m = 10.0;
+    zone.alt_max_m = 0.0;  // 上限不限
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    // 地面静止：相对起飞点≈0.4m，水平在区域内 → 旧实现会报 0.4<10 越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(1.5f, -2.5f, -0.4f)))
+                    .accepted);
+
+    bool saw_any = false;
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status || (*status)->zone_id != 41U) {
+            continue;
+        }
+        saw_any = true;
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_TRUE(saw_any) << "65019 应按 status_period 上报";
+    EXPECT_FALSE(saw_violated)
+        << "相对 Home 的下限恒为 0，地面静止不应判越界（0078 现场日志）";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    DrainAcks(harness.ack_subscription);
+}
+
+/// AMSL 参考时绝对海拔下限仍生效：空中 AMSL≈100m 低于下限 150m → 越界并中止。
+TEST(MissionStateMachineTest, FenceAmslLowerBoundEnforcedWhenAirborne) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    auto zone = MakeSquareZone(42, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 0;  // AMSL
+    zone.alt_min_m = 150.0;
+    zone.alt_max_m = 0.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    // 空中 AMSL≈100.4m（Home 海拔 100m），低于 AMSL 下限 150m。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(1.5f, -2.5f, -0.4f)))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status || (*status)->zone_id != 42U) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "AMSL 下限 150m，空中 100m 应判越界";
+    const auto abort_deadline = std::chrono::steady_clock::now() + 2000ms;
+    bool returned = false;
+    while (std::chrono::steady_clock::now() < abort_deadline) {
+        if (harness.machine.CurrentState() == common::MissionState::kReturnHome) {
+            returned = true;
+            break;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(returned) << "AMSL 下限越界应中止并转 S12 返航";
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 起飞前不判下限：AMSL 下限 150m 时，S3 地面静止（AMSL≈100m）不得中止；
+/// 否则解锁后就会被自家围栏打断，正常起飞无法开始。
+TEST(MissionStateMachineTest, FenceTakeoffIgnoresAmslLowerBound) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(43, 1, common::FenceAction::kReturn, 100.0);
+    zone.altitude_reference = 0;  // AMSL
+    zone.alt_min_m = 150.0;
+    zone.alt_max_m = 0.0;
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(1)));
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                            common::MissionState::kArming)
+                    .has_value());
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1));  // 176
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)));
+    std::this_thread::sleep_for(200ms);
+
+    bool saw_violated = false;
+    while (auto status = harness.fence_status_subscription.TryTake()) {
+        if ((*status)->zone_id == 43U &&
+            (*status)->state == common::FenceState::kViolated) {
+            saw_violated = true;
+        }
+    }
+    EXPECT_FALSE(saw_violated) << "S3（未起飞）不得判 AMSL 高度带下限越界";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kArming)
+        << "起飞前不得因高度带下限中止";
+    DrainAcks(harness.ack_subscription);
+}
+
+TEST(MissionStateMachineTest, FenceViolationAbortsToReturnHome) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(7, 3, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 区域外 500m：先看 65019 的 violated 上报，再看状态机中止。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(500.0f, 0.0f, -2.0f)))
+                    .accepted);
+
+    bool saw_violated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(50ms);
+        if (!status) {
+            continue;
+        }
+        if ((*status)->state == common::FenceState::kViolated &&
+            (*status)->zone_id == 7U && (*status)->version == 3U) {
+            saw_violated = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_violated) << "65019 应上报越界";
+
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "越界返回动作应转 S12";
+    // 2026-10-30：围栏中止回专用原因码 22（不再误报 target_lost=14）。
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 2000ms);
+    ASSERT_TRUE(aborted.has_value()) << "围栏中止必须发 65015 aborted";
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kFenceViolation);
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 越界保持动作：不中止任务，只把位置意图钉在当前点（S5 保持不变）。
+TEST(MissionStateMachineTest, FenceHoldActionKeepsTaskRunning) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(9, 2, common::FenceAction::kHold, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 2));
+
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(400.0f, 0.0f, -2.0f)))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "hold 动作不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value());
+}
+
+/// 读取一条"稳定后"的 65019（围栏状态）。
+/// 65019 只在 `PublishStatus()` 里随 65013 每 500ms 上报一次，订阅队列可能
+/// 积压旧值；这里先让状态机消费刚发布的飞行快照（>2 个 100ms 决策拍），再
+/// 排空积压、等下一拍新上报，避免把旧状态当成本次位置的结果。
+std::optional<common::FenceStatus> ReadFenceStatus(AssignmentHarness& harness) {
+    std::this_thread::sleep_for(250ms);
+    while (auto stale = harness.fence_status_subscription.TryTake()) {
+        (void)stale;
+    }
+    for (int i = 0; i < 20; ++i) {
+        auto status = harness.fence_status_subscription.WaitTakeFor(100ms);
+        if (status) {
+            return **status;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 越界**深度容差**（2026-11-12）：飞机越出边界但不到 violation_depth_m
+/// 不算越界，不中止任务。现场 0120 日志就是这样：目标贴边时飞机被位置环
+/// 顶出去 1.4m 又拉回，零容差会判成越界中止（"波动两下就返航"）。
+/// 注意 `MakeSquareZone()` 的米→度用 111320 近似，机载换算是 WGS84 大地线，
+/// 同半径换回的 NED 边界比标称值小约 0.5%（100m 半径约 99.5m）；用例只读
+/// 65019 实测的带符号距离，不写死"半径 100m 边界就在 100m"。
+TEST(MissionStateMachineTest, FenceShallowBreachWithinToleranceDoesNotAbort) {
+    auto config = MakeFenceTestConfig();
+    config.fence.violation_depth_m = 1.5;      // 容差 1.5m
+    config.fence.violation_hysteresis_m = 0.5;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(50, 1, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 越出边界（北侧 100.5m）：实测深度约 1.0m，在 1.5m 容差内 → 不判越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(100.5f, 0.0f, -2.0f)))
+                    .accepted);
+    const auto shallow = ReadFenceStatus(harness);
+    ASSERT_TRUE(shallow.has_value()) << "应收到 65019";
+    EXPECT_LT(shallow->distance_to_boundary_m, 0.0)
+        << "飞机在边界外，65019 应如实上报负的带符号距离";
+    EXPECT_GT(shallow->distance_to_boundary_m, -1.5)
+        << "实测深度应落在 1.5m 容差内（MakeSquareZone 的米→度近似误差不应影响结论）";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "越界深度 < 容差 1.5m，不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value());
+
+    // 越过容差（北侧 103m，实测深度约 3.5m）→ 判越界并中止（debounce=0）。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(103.0f, 0.0f, -2.0f)))
+                    .accepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "越界深度 > 容差 1.5m，应中止到 S12";
+}
+
+/// 越界**回界滞回**（2026-11-12）：已判越界后必须退到
+/// `−violation_depth_m + violation_hysteresis_m`（默认 −1.5 + 0.5 = −1.0m）
+/// 才清除，避免在深度阈值附近抖动反复触发/清除。
+/// 注意清除阈值落在容差带内、不是边界内侧：否则飞机停在边界外但仍在容差内
+/// （如 −0.9m）会一直判越界并持续累计时长，容差形同虚设。
+/// 边界位置由 65019 首条越界状态的 `local_north_m + distance` 反推
+/// （MakeSquareZone 的米→度近似与机载大地线换算有 ~0.5% 偏差，不能写死 100m）。
+TEST(MissionStateMachineTest, FenceViolationClearNeedsHysteresis) {
+    auto config = MakeFenceTestConfig();
+    config.fence.enabled = false;  // 只验证判定与 65019，不触发动作
+    config.fence.violation_depth_m = 1.5;
+    config.fence.violation_hysteresis_m = 0.5;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(51, 1, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 越出深 3m 以上 → 判越界，并用"北向位置 + 带符号距离"反推实际边界。
+    constexpr float kDeepNorthM = 103.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(kDeepNorthM, 0.0f, -2.0f)))
+                    .accepted);
+    const auto violated = ReadFenceStatus(harness);
+    ASSERT_TRUE(violated.has_value()) << "应收到 65019";
+    ASSERT_EQ(violated->state, common::FenceState::kViolated)
+        << "越界深度 3m+ 应报 violated";
+    ASSERT_LT(violated->distance_to_boundary_m, -1.5);
+    // distance = boundary − north，故 boundary = north + distance。
+    const double boundary_north_m =
+        static_cast<double>(violated->local_north_m) +
+        static_cast<double>(violated->distance_to_boundary_m);
+
+    // 仍在滞回带内：越出 1.25m（> 清除阈值 1.0m）→ 应保持越界。
+    const float hold_north_m = static_cast<float>(boundary_north_m + 1.25);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(hold_north_m, 0.0f, -2.0f)))
+                    .accepted);
+    const auto held = ReadFenceStatus(harness);
+    ASSERT_TRUE(held.has_value()) << "应收到 65019";
+    EXPECT_NEAR(held->local_north_m, hold_north_m, 0.05)
+        << "读到的应是新快照对应的状态，而不是积压旧值";
+    EXPECT_EQ(held->state, common::FenceState::kViolated)
+        << "越界深度 1.25m 仍在滞回带内（清除阈值 −1.0m），应保持越界";
+    EXPECT_LT(held->distance_to_boundary_m, -1.0);
+    EXPECT_GT(held->distance_to_boundary_m, -1.5);
+
+    // 越过清除阈值：越出 0.4m（< 1.0m）→ 清除越界，65019 转为 near_boundary。
+    const float clear_north_m = static_cast<float>(boundary_north_m + 0.4);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(clear_north_m, 0.0f, -2.0f)))
+                    .accepted);
+    const auto cleared = ReadFenceStatus(harness);
+    ASSERT_TRUE(cleared.has_value()) << "应收到 65019";
+    EXPECT_NEAR(cleared->local_north_m, clear_north_m, 0.05);
+    EXPECT_NE(cleared->state, common::FenceState::kViolated)
+        << "越界深度 0.4m 已过清除阈值 −1.0m，应清除越界";
+    EXPECT_GT(cleared->distance_to_boundary_m, -1.0);
+
+    // 换区（65018 同几何、新 version）必须清掉深度迟滞状态（2026-11-12 复审）：
+    // 先重新制造"深越界 → 回到容差带内仍保持越界"，再下发新区域。若不清状态，
+    // 新区域会沿用旧回界阈值（−1.0m）把 −1.25m 继续判越界；正确行为是按进入
+    // 阈值（−1.5m）判为不越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(kDeepNorthM, 0.0f, -2.0f)))
+                    .accepted);
+    const auto deep_again = ReadFenceStatus(harness);
+    ASSERT_TRUE(deep_again.has_value()) << "应收到 65019";
+    ASSERT_EQ(deep_again->state, common::FenceState::kViolated);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(hold_north_m, 0.0f, -2.0f)))
+                    .accepted);
+    const auto held_again = ReadFenceStatus(harness);
+    ASSERT_TRUE(held_again.has_value()) << "应收到 65019";
+    ASSERT_EQ(held_again->state, common::FenceState::kViolated)
+        << "前提：回界到 1.25m 仍在滞回带内（未清除）";
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(51, 2, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    const auto after_zone_update = ReadFenceStatus(harness);
+    ASSERT_TRUE(after_zone_update.has_value()) << "应收到 65019";
+    EXPECT_NE(after_zone_update->state, common::FenceState::kViolated)
+        << "换区后 −1.25m 在 1.5m 容差内，应按进入阈值判为不越界"
+           "（深度迟滞状态必须随区域更新复位）";
+}
+
+/// 目标跑出区域 → **贴边保持 + 告警、不中止**（2026-11-12 维护者裁决）。
+/// 制导层把引导点钳到边界、清空速度前馈、并把限速降到贴边微调；
+/// 任务状态保持 S5，不产生 65015 aborted。
+TEST(MissionStateMachineTest, S5GuideEdgeHoldDoesNotAbort) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    auto zone = MakeSquareZone(52, 1, common::FenceAction::kReturn, 30.0);
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 飞机在界内 29m；目标在界内但贴边（29.6m，距边界约 0.25m）。
+    // 目标本身没出区 → 不触发“目标出区保持”；但速度律前导点会越过
+    // boundary_margin_m → 触发贴边保持（bit7）。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(29.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    bool hold_intent_seen = false;
+    bool warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 29.6;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            // 贴边保持：位置引导限速被**压到 ≤0.5 m/s**（必须 >0，排除"目标
+            // 失效原地保持"的 0 上限意图）；飞机已近边界，停止点预测会把 cap
+            // 进一步压到下限 0.1。且无速度前馈、位置目标被钳在区域内。
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                guide.max_speed_mps > 0.0f &&
+                guide.max_speed_mps <= 0.5f + 1e-6f &&
+                guide.feedforward_valid_mask == 0U) {
+                hold_intent_seen = true;
+                const double guide_distance =
+                    std::hypot(static_cast<double>(guide.target_x),
+                               static_cast<double>(guide.target_y));
+                // 区域半边长 30m；MakeSquareZone 的近似使实际边界约 29.85m，
+                // 钳制再内缩 boundary_margin_m=1m，故引导点应落在 ~25~30m。
+                EXPECT_LE(guide_distance, 30.0)
+                    << "贴边保持必须把位置目标钳在区域边界内";
+                EXPECT_GE(guide_distance, 25.0)
+                    << "贴边保持应停在边界附近，而不是飞回原点";
+            }
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(20ms)) {
+            if (((*status)->active_warning_bits & (1U << 7U)) != 0U) {
+                warning_seen = true;
+            }
+        }
+        if (hold_intent_seen && warning_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen)
+        << "目标在区域外时引导应贴边保持（限速 0.5、前馈清零）";
+    EXPECT_TRUE(warning_seen) << "贴边保持应置 bit7 告警";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "贴边保持不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "贴边保持不得产生 65015 aborted";
+}
+
+/// 贴边保持的**停止点预测限速**（2026-11-12 复审三轮，维护者裁决）：
+/// 沿实测速度方向预测刹停点 `p + v̂·(v·τ + v²/(2a))`，越过边界（含 margin）
+/// 就提前压速度——不能等参考点贴到边界才把限速从 ~10 砸到 0.5。
+/// 本用例：飞机距边界约 10m、以 10 m/s 朝边界飞，`a=2, τ=0.2` 时允许速度
+/// `−0.4 + √(0.16+2·2·8.85) ≈ 5.56 m/s`，引导限速应被压到 ~5.6 而不是 10。
+TEST(MissionStateMachineTest, S5FenceStopPredictionSlowsBeforeBoundary) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.guard_decel_mps2 = 2.0;
+    config.fence.guard_reaction_s = 0.2;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(53, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+
+    // 飞机北侧 20m（距边界约 10m）、以 10 m/s 朝北（朝边界）飞；
+    // 目标在区内 28m（靠边界但仍在区内，不触发“目标出区保持”）。
+    // 预测必须基于这个实测速度方向。
+    auto brake_flight = MakeFenceOffboardFlight(20.0f, 0.0f, -0.4f);
+    brake_flight.vx_mps = 10.0f;
+    brake_flight.vy_mps = 0.0f;
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        brake_flight))
+                    .accepted);
+    auto feed_estimate = [&] {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 28.0;  // 区内靠边界，不触发目标出区保持
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+    };
+    // 先喂 4s 让速度律从 0 加速到顶速（slew 3 m/s²，约 3.3s），排空意图。
+    const auto warmup = std::chrono::steady_clock::now() + 4000ms;
+    while (std::chrono::steady_clock::now() < warmup) {
+        feed_estimate();
+        while (harness.intent_subscription.TryTake()) {
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    bool envelope_seen = false;
+    float seen_cap = 0.0f;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    while (std::chrono::steady_clock::now() < deadline && !envelope_seen) {
+        feed_estimate();
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                guide.max_speed_mps > 1.0f) {
+                seen_cap = guide.max_speed_mps;
+                // 距边界 ~9.85m、余量 1m、a=2、τ=0.2 → 允许 ≈ 5.56。
+                if (guide.max_speed_mps <= 6.5f) {
+                    envelope_seen = true;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(envelope_seen)
+        << "目标出界且飞机距边界约 10m 时，引导限速应被停止点预测压到 ~6m/s "
+           "（实测读到 "
+        << seen_cap << " m/s）；若恒为 ~10m/s 说明没有按制动距离提前";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "停止点预测限速不得中止任务";
+}
+
+/// S7 视觉速度意图的围栏停止点预测（2026-11-12 复审三轮）：速度通道不受
+/// FlightController 的位置钳制，必须由状态机按实测速度方向预测刹停点。
+/// 飞机贴边、以 6 m/s 朝外飞、已无制动距离 → 速度意图限速到下限并置 bit8。
+TEST(MissionStateMachineTest, VisualServoPredictedFenceBreachHoldsAtEdge) {
+    auto config = MakeHandoverTestConfig();
+    config.fence.enabled = true;
+    config.fence.zone_cache_path.clear();
+    config.fence.guard_decel_mps2 = 2.0;
+    config.fence.guard_reaction_s = 0.2;
+    HandoverFixture f(config);
+    ASSERT_TRUE(f.started);
+    f.DriveToGpsApproach();
+
+    // 区域半边长 30m（实际边界约 29.85m）；飞机在北侧 29m，以 6m/s 朝北飞。
+    (void)f.fence.Publish(std::make_shared<const common::FenceZone>(
+        MakeSquareZone(60, 1, common::FenceAction::kReturn, 30.0)));
+    auto make_edge_flight = [] {
+        auto snapshot = MakeFenceOffboardFlight(29.0f, 0.0f, -2.0f);
+        snapshot.vx_mps = 6.0f;
+        snapshot.vy_mps = 0.0f;
+        snapshot.attitude_valid = true;
+        snapshot.roll_rad = 0.0f;
+        snapshot.pitch_rad = 0.0f;
+        snapshot.yaw_rad = 0.0f;
+        snapshot.header.receive_time_ms = TestMonotonicMs();
+        return snapshot;
+    };
+    (void)f.flight.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(make_edge_flight()));
+
+    // 进入 S6 → S7（手写 DriveToVisualTracking 后半段，避免重发原点飞行快照）。
+    for (uint64_t frame = 1; frame <= 3; ++frame) {
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame));
+    }
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualHandover)
+                    .has_value());
+    f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, 4));
+    ASSERT_TRUE(WaitForState(f.status_subscription,
+                             common::MissionState::kVisualTracking)
+                    .has_value());
+
+    bool predicted_cap_seen = false;
+    bool warning_bit_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    uint64_t frame = 5;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)f.flight.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                make_edge_flight()));
+        f.PublishVisual(MakeVisualStatus(common::VisualTargetState::kLocked, frame++));
+        f.PublishDistance(true);
+        while (auto intent = f.intent_subscription.TryTake()) {
+            if ((*intent)->type == common::ControlIntentType::kVelocityHeading &&
+                (*intent)->max_speed_mps > 0.0f &&
+                (*intent)->max_speed_mps <= 0.15f + 1e-6f) {
+                predicted_cap_seen = true;
+            }
+        }
+        while (auto status = f.status_subscription.TryTake()) {
+            if (((*status)->active_warning_bits & (1U << 8U)) != 0U) {
+                warning_bit_seen = true;
+            }
+        }
+        if (predicted_cap_seen && warning_bit_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(predicted_cap_seen)
+        << "S7 速度意图应被停止点预测压到下限（0.1 m/s，非默认 0=不限速）";
+    EXPECT_TRUE(warning_bit_seen) << "预测越界应置 65013 bit8";
+    EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking)
+        << "贴边悬停不得中止任务";
+}
+
+/// 目标出区保持（2026-11-13，维护者裁决）：目标 NED 在围栏外 → 立即停止
+/// 追击、位置保持。飞机在区内深处（离边界 30m）也立即悬停，不改任务状态、
+/// 不执行 return/land，并置 bit9。
+TEST(MissionStateMachineTest, S5TargetOutsideHoldsInPlace) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(60, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    // 飞机在区域中心（距边界 ~30m，深处）；目标在 200m 外。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(0.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    bool hold_intent_seen = false;
+    bool warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                (guide.reason_code & 0xFFU) == 11U) {
+                hold_intent_seen = true;
+                // 保持点 = 进入保持瞬间的位置（区域中心附近），不是追向目标。
+                EXPECT_LE(std::hypot(static_cast<double>(guide.target_x),
+                                     static_cast<double>(guide.target_y)),
+                          1.0)
+                    << "区内目标出区应原地悬停，不得继续追击";
+            }
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(20ms)) {
+            if (((*status)->active_warning_bits & (1U << 9U)) != 0U) {
+                warning_seen = true;
+            }
+        }
+        if (hold_intent_seen && warning_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen) << "目标出区应发位置保持意图（原因码 11）";
+    EXPECT_TRUE(warning_seen) << "目标出区保持应置 bit9";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标出区保持不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     200ms)
+                     .has_value())
+        << "目标出区保持不得产生 65015 aborted";
+}
+
+/// 目标出区 + 飞机已越界（减速没减完）：保持点钳回区域内，飞机飞回后悬停；
+/// 越界持续 >1.5s 也不执行区域动作（return），不产生 65015。
+TEST(MissionStateMachineTest, S5TargetOutsideWhenOwnOutsideHoldsAndDoesNotReturn) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.violation_debounce = 0ms;  // 逼出"若未抑制就会立即返航"
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(61, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    // 飞机在北边界外约 10m（40m），目标在 200m 外。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(40.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    bool hold_intent_seen = false;
+    double hold_north_m = 0.0;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                (guide.reason_code & 0xFFU) == 11U) {
+                hold_intent_seen = true;
+                hold_north_m = static_cast<double>(guide.target_x);
+            }
+        }
+        if (hold_intent_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen) << "目标出区 + 自机越界应发位置保持意图";
+    EXPECT_LT(hold_north_m, 30.0)
+        << "保持点必须在区域内（飞回后悬停），不能保持越界位置";
+    // 再等 1.5s：第一重防抖=0，若未被抑制会立即返航。
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标在区外时不得执行 return/land（无超时兜底）";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     200ms)
+                     .has_value())
+        << "目标在区外时不得产生 65015 aborted";
+}
+
+/// 目标出区保持解除：目标回到区内 ≥target_outside_release_m 且持续
+/// target_outside_release_hold，并且飞机自身在区内，才恢复跟随。
+TEST(MissionStateMachineTest, S5TargetOutsideHoldReleasesAfterHysteresis) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.target_outside_release_m = 5.0;
+    config.fence.target_outside_release_hold = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(62, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(0.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    auto feed_estimate = [&](double north) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = static_cast<float>(north);
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+    };
+    // 读最新 65013 告警位（先排空积压，再等下一条新状态）。
+    auto read_bits = [&]() -> std::optional<uint32_t> {
+        while (auto stale = harness.status_subscription.TryTake()) {
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(700ms)) {
+            return (*status)->active_warning_bits;
+        }
+        return std::nullopt;
+    };
+    // 目标出区 → 进入保持（bit9 置位）。
+    bool entered = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline && !entered) {
+            feed_estimate(200.0);
+            if (auto bits = read_bits()) {
+                entered = ((*bits) & (1U << 9U)) != 0U;
+            }
+        }
+    }
+    ASSERT_TRUE(entered) << "目标出区应进入保持并置 bit9";
+    // 目标回区但深度不足 5m（26m，距边界约 3.85m）：bit9 必须保持。
+    bool still_held = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 1200ms;
+        while (std::chrono::steady_clock::now() < deadline) {
+            feed_estimate(26.0);
+            if (auto bits = read_bits()) {
+                still_held = ((*bits) & (1U << 9U)) != 0U;
+            }
+        }
+    }
+    EXPECT_TRUE(still_held) << "目标回区深度不足 release_m 时不得解除保持";
+    // 目标深入区内（24m，距边界约 5.85m）并保持 300ms → bit9 清除。
+    bool released = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+        while (std::chrono::steady_clock::now() < deadline && !released) {
+            feed_estimate(24.0);
+            if (auto bits = read_bits()) {
+                released = ((*bits) & (1U << 9U)) == 0U;
+            }
+        }
+    }
+    EXPECT_TRUE(released) << "目标回区内 ≥release_m 持续 hold_ms 且自机在区内后应解除";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+/// 视觉锁定（S7）同样执行目标出区保持（2026-11-13，维护者裁决）：
+/// 目标 NED 出区 → 位置保持意图（原因码 11）覆盖视觉速度意图，置 bit9；
+/// 不改任务状态、不中止。本用例用测试钩子直接摆到 S7，并喂视觉/测距保持。
+TEST(MissionStateMachineTest, S7TargetOutsideSwitchesToPositionHold) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.test_hooks_enabled = true;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(63, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(0.0f, 0.0f, -0.4f)))
+                    .accepted);
+    harness.machine.SeedAcceptedAssignmentForTest(MakeAssignment(1));
+    harness.machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    bool hold_intent_seen = false;
+    bool warning_seen = false;
+    common::MissionState state_at_hold = common::MissionState::kBoot;
+    uint64_t frame = 1;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)harness.visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)));
+        (void)harness.distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 8.0F)));
+        ++frame;
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                (guide.reason_code & 0xFFU) == 11U) {
+                hold_intent_seen = true;
+                state_at_hold = harness.machine.CurrentState();
+            }
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(20ms)) {
+            if (((*status)->active_warning_bits & (1U << 9U)) != 0U) {
+                warning_seen = true;
+            }
+        }
+        if (hold_intent_seen && warning_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen)
+        << "S7 目标出区应发位置保持意图（覆盖视觉速度意图）";
+    EXPECT_TRUE(warning_seen) << "S7 目标出区保持应置 bit9";
+    EXPECT_EQ(state_at_hold, common::MissionState::kVisualTracking)
+        << "保持意图必须在 S7 视觉锁定态发出（不是回退后的 S5）";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     200ms)
+                     .has_value())
+        << "目标出区保持不得产生 65015 aborted";
+}
+
+/// 起飞前区域一致性：65014 携带的 zone_id/version 与机载缓存不一致 → 21。
+TEST(MissionStateMachineTest, FenceZoneMismatchRejectsAssignment) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(7, 3, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+
+    // 版本不一致（缓存 3，分配 9）→ rejected/zone_mismatch，保持 S2。
+    common::MissionAssignment mismatched = MakeAssignment(11);
+    mismatched.zone_id = 7;
+    mismatched.zone_version = 9;
+    ASSERT_TRUE(harness.Send(mismatched));
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kZoneMismatch);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    EXPECT_EQ(harness.sender.CallCount(), 0U);
+
+    // zone_id=0（未声明区域的老地面站）按机载缓存放行，通过预检。
+    common::MissionAssignment legacy = MakeAssignment(12);
+    ASSERT_TRUE(harness.Send(legacy));
+    const auto legacy_ack = WaitForAckWithResult(
+        harness.ack_subscription, common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(legacy_ack.has_value());
+    EXPECT_EQ(legacy_ack->assignment_id, 12U);
+}
+
+/// 重启装载：Start 时从 zone.json 缓存恢复区域，起飞前预检即可用。
+TEST(MissionStateMachineTest, FenceZoneCacheLoadedAtStart) {
+    namespace fs = std::filesystem;
+    const fs::path cache_path =
+        fs::temp_directory_path() /
+        ("drone_zone_cache_" + std::to_string(::getpid()) + ".json");
+    ASSERT_TRUE(config::ZoneStore::Save(
+        cache_path.string(),
+        MakeSquareZone(11, 4, common::FenceAction::kReturn, 100.0)));
+
+    state_machine::MissionStateMachineConfig config = MakeFenceTestConfig();
+    config.fence.zone_cache_path = cache_path.string();
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    std::this_thread::sleep_for(120ms);
+
+    // 缓存已转为 NED 多边形（zone_id/version 保留）。
+    const common::FencePolygonNed polygon = harness.machine.LatestFencePolygon();
+    EXPECT_TRUE(polygon.valid());
+    EXPECT_EQ(polygon.zone_id, 11U);
+    EXPECT_EQ(polygon.version, 4U);
+
+    // 缓存生效的证据：版本一致的分配通过预检。
+    common::MissionAssignment matched = MakeAssignment(21);
+    matched.zone_id = 11;
+    matched.zone_version = 4;
+    ASSERT_TRUE(harness.Send(matched));
+    const auto ack = WaitForAckWithResult(harness.ack_subscription,
+                                          common::MissionAssignmentResult::kAccepted);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->assignment_id, 21U);
+
+    std::error_code ignored;
+    fs::remove(cache_path, ignored);
+}
+
+// ---------------------------------------------------------------------------
+// 2026-10-30 审查修复回归：围栏退化几何/内容版本、围栏降落动作、S9 授权超时
+// ---------------------------------------------------------------------------
+
+/// 轮询等待围栏区域生效（65018 在机载决策拍消费，固定 sleep 易抖动）。
+bool WaitForFenceZone(state_machine::MissionStateMachine& machine,
+                      uint16_t zone_id,
+                      std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (machine.LatestFencePolygon().zone_id == zone_id) {
+            return true;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+/// 围栏 land 动作（2026-10-30 审查修复）：必须与 return 走同一中止入口——
+/// 停发位置引导、tracker 收口、发 65015 aborted、转 S13 降落；旧实现直接
+/// 转 S12，而 S12 入口无任何意图发布，飞机会在界外刹车保持、到点不降落。
+TEST(MissionStateMachineTest, FenceLandActionAbortsToLanding) {
+    AssignmentHarness harness(MakeFenceTestConfig(common::FenceAction::kLand));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    // 在线下发区域（action=land）后进入 S5。
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(8, 2, common::FenceAction::kLand, 100.0)))
+                    .accepted);
+    ASSERT_TRUE(WaitForFenceZone(harness.machine, 8));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 3));
+    ASSERT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 把飞机拖到区域外 500m（Offboard 空中快照）→ 立刻判定越界。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(500.0f, 0.0f, -2.0f)))
+                    .accepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kLanding, 3000ms)
+                    .has_value())
+        << "land 动作应直接转 S13 降落（旧实现转 S12 并卡住）";
+    // 中止回执：与 return 动作同一入口，必须补发 65015 aborted。
+    EXPECT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
+                    .has_value())
+        << "围栏中止必须发 65015 aborted";
+    // 越界中止不得触发发射（187）。
+    std::this_thread::sleep_for(200ms);
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "围栏中止不得触发发射";
+    }
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 区域几何/高度带非法必须拒绝并保留上一份可用区域（A-03）：自交、共线零
+/// 面积、重复点（零长边）、高度带倒挂、非法高度基准都不得进入越界判定。
+TEST(MissionStateMachineTest, FenceRejectsDegenerateZoneAndKeepsPrevious) {
+    AssignmentHarness harness(MakeFenceTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    const double lat0 = static_cast<double>(kFenceAnchorLat1e7) * 1e-7;
+    const double lon0 = static_cast<double>(kFenceAnchorLon1e7) * 1e-7;
+
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(21, 1, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    ASSERT_TRUE(WaitForFenceZone(harness.machine, 21));
+
+    auto expect_rejected = [&](const common::FenceZone& zone) {
+        EXPECT_TRUE(harness.fence_topic
+                        .Publish(std::make_shared<const common::FenceZone>(zone))
+                        .accepted);
+        // 决策拍 100ms：等两拍，给拒绝日志/区域替换留出窗口。
+        std::this_thread::sleep_for(300ms);
+        EXPECT_EQ(harness.machine.LatestFencePolygon().zone_id, 21U)
+            << "非法区域 zone=" << zone.zone_id << " 必须被拒绝并保留旧区域";
+    };
+
+    // 自交（蝴蝶结）：交换两顶点使边 0 与边 2 交叉。
+    auto bowtie = MakeSquareZone(99, 2, common::FenceAction::kReturn, 100.0);
+    const common::FenceVertex keep = bowtie.vertices[1];
+    bowtie.vertices[1] = bowtie.vertices[2];
+    bowtie.vertices[2] = keep;
+    expect_rejected(bowtie);
+
+    // 共线零面积。
+    auto collinear = MakeSquareZone(98, 2, common::FenceAction::kReturn, 100.0);
+    collinear.vertices = {{lat0, lon0},
+                          {lat0, lon0 + 0.002},
+                          {lat0, lon0 + 0.003},
+                          {lat0, lon0 + 0.004}};
+    expect_rejected(collinear);
+
+    // 重复点（零长边）。
+    auto duplicate = MakeSquareZone(97, 2, common::FenceAction::kReturn, 100.0);
+    duplicate.vertices = {{lat0, lon0},
+                          {lat0, lon0},
+                          {lat0 + 0.001, lon0},
+                          {lat0, lon0 + 0.001}};
+    expect_rejected(duplicate);
+
+    // 高度带倒挂（min > max > 0）。
+    auto inverted = MakeSquareZone(96, 2, common::FenceAction::kReturn, 100.0);
+    inverted.alt_min_m = 20.0;
+    inverted.alt_max_m = 10.0;
+    expect_rejected(inverted);
+
+    // 非法高度基准（只允许 0=AMSL / 1=Home）。
+    auto bad_reference = MakeSquareZone(95, 2, common::FenceAction::kReturn, 100.0);
+    bad_reference.altitude_reference = 2;
+    expect_rejected(bad_reference);
+
+    // 合法区域仍须更新：拒绝逻辑不得把好区域一起挡掉。
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(22, 1, common::FenceAction::kReturn, 120.0)))
+                    .accepted);
+    EXPECT_TRUE(WaitForFenceZone(harness.machine, 22));
+    DrainAcks(harness.ack_subscription);
+}
+
+/// 同 zone_id/version 但内容变化也必须落盘（A-02）：地面站改了形状却忘递增
+/// 版本号时，旧实现只在内存生效，重启后回滚到 zone.json 里的旧区域——
+/// 飞机按旧（可能完全错位的）区域飞行。
+TEST(MissionStateMachineTest, FenceSameIdVersionGeometryChangeRewritesCache) {
+    namespace fs = std::filesystem;
+    const fs::path cache_path =
+        fs::temp_directory_path() /
+        ("drone_zone_content_" + std::to_string(::getpid()) + ".json");
+
+    state_machine::MissionStateMachineConfig config = MakeFenceTestConfig();
+    config.fence.zone_cache_path = cache_path.string();
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(31, 2, common::FenceAction::kReturn, 100.0)))
+                    .accepted);
+    ASSERT_TRUE(WaitForFenceZone(harness.machine, 31));
+    // 同 id/version，只改几何（半边长 100m → 300m）。
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(31, 2, common::FenceAction::kReturn, 300.0)))
+                    .accepted);
+    // 内容变化检测在建帧后落盘，多等几拍再读缓存。
+    std::this_thread::sleep_for(300ms);
+
+    const auto loaded = config::ZoneStore::Load(cache_path.string());
+    ASSERT_TRUE(loaded.has_value()) << "区域缓存应已落盘";
+    ASSERT_EQ(loaded->vertices.size(), 4U);
+    const double lat0 = static_cast<double>(kFenceAnchorLat1e7) * 1e-7;
+    const double expected_dlat = 300.0 / 111320.0;
+    EXPECT_NEAR(loaded->vertices[0].latitude_deg, lat0 - expected_dlat, 2e-6)
+        << "同 id/version 的几何变化必须写入缓存（否则重启回滚旧区域）";
+
+    std::error_code ignored;
+    fs::remove(cache_path, ignored);
+}
+
+/// S9 授权超时按任务中止收口（2026-10-30 审查修复）：停发视觉伺服、
+/// tracker AbortAirborne、发 65015 reason=target_wait_timeout、转 S12。
+/// 旧实现只做 TransitionTo，S12 起无任何意图发布 → 到点不返航。
+TEST(MissionStateMachineTest, InterceptAuthorizationTimeoutAbortsAndReturns) {
+    auto config = MakeInterceptEntryTestConfig();
+    config.interception.auto_authorize = false;
+    config.interception.authorization_timeout = 150ms;
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::TargetState> estimated_topic;
+    common::Topic<common::VisualTargetStatus> visual_topic;
+    common::Topic<common::StereoTargetDistance> distance_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetEstimationInputs(estimated_topic, visual_topic, distance_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(64);
+    auto ack_subscription = machine.AssignmentAckOutput().Subscribe(16);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+    ASSERT_TRUE(flight_topic.Publish(
+        std::make_shared<const common::FlightStateSnapshot>(
+            MakeReturnHomeFlight(10.0f, 5.0f, -10.0f))).accepted);
+    std::this_thread::sleep_for(40ms);
+    machine.SeedAcceptedAssignmentForTest(MakeAssignment(88));
+    machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    auto feed = [&](uint64_t frame) {
+        (void)flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(10.0f, 5.0f, -10.0f)));
+        (void)visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)));
+        (void)distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 8.0F)));
+        std::this_thread::sleep_for(20ms);
+    };
+
+    bool saw_ready = false;
+    for (uint64_t frame = 1; frame <= 30 && !saw_ready; ++frame) {
+        feed(frame);
+        while (auto status = status_subscription.TryTake()) {
+            if ((*status)->state == common::MissionState::kInterceptReady) {
+                saw_ready = true;
+            }
+        }
+    }
+    ASSERT_TRUE(saw_ready) << "LOCKED+测距满足后应进入 S9";
+
+    // 持续喂新鲜输入保持 S9 入口条件，等待授权超时（150ms）→ S12。
+    bool saw_return = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+    uint64_t frame = 100;
+    while (std::chrono::steady_clock::now() < deadline && !saw_return) {
+        feed(frame++);
+        while (auto status = status_subscription.TryTake()) {
+            if ((*status)->state == common::MissionState::kReturnHome) {
+                saw_return = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_return) << "授权超时应中止到 S12（旧实现只转状态，无中止回执）";
+    const auto ack = WaitForAckWithResult(
+        ack_subscription, common::MissionAssignmentResult::kCancelledOrAborted,
+        2000ms);
+    ASSERT_TRUE(ack.has_value()) << "授权超时必须补发 65015 aborted";
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kTargetWaitTimeout);
+    for (const auto& call : sender.History()) {
+        EXPECT_NE(call.command, 187U) << "授权超时前不得发射";
+    }
+    machine.Stop();
+}
+
+/// 构造一条 65020 主动返航指令；默认版本/类型合法。
+common::MissionCommand MakeMissionCommand(uint32_t command_id) {
+    common::MissionCommand command;
+    command.protocol_version = 1;
+    command.command_id = command_id;
+    command.type = common::MissionCommandType::kReturnHome;
+    command.received_ms = 1;
+    return command;
+}
+
+/// 等待一条 65021 任务指令回执（超时返回空）。
+std::optional<common::MissionCommandAck> WaitForMissionCommandAck(
+    common::Topic<common::MissionCommandAck>::Subscription& subscription,
+    std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (message) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 65020 主动返航：S5 中收到指令 → 回执 accepted + 中止任务转 S12 + 65015 同步中止。
+TEST(MissionStateMachineTest, MissionCommandReturnHomeAbortsToReturnHome) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 41));
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9001)))
+                    .accepted);
+
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "应回 65021";
+    EXPECT_EQ(ack->command_id, 9001U);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "主动返航应转 S12";
+    // 任务分配同步中止（reason=kCancelledByGcs），地面站据此清任务卡片。
+    EXPECT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
+                    .has_value());
+}
+
+/// 65020 主动返航在 S12 中再次下发：按"继续返航"回执受理（2026-11-04）。
+/// 旧行为回 kCompleted/kAlreadyReturning，Web 显示"目标状态已达成"，容易被误读成
+/// 已到达；S12 已无总时长上限，操作员需要一个明确的"我在等你回来"入口。
+TEST(MissionStateMachineTest, MissionCommandReturnHomeWhileReturningAcksAccepted) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 45));
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9101)))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value());
+    (void)WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+
+    // 仍在 S12 时再下发一条（新 command_id）→ 回执 accepted 且状态不变。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9102)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "应回 65021";
+    EXPECT_EQ(ack->command_id, 9102U);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReturnHome)
+        << "继续返航不应改变状态";
+}
+
+/// 测试钩子：未启用 `test_hooks_enabled` 时拒绝预置任务分配（生产装配语义），
+/// 保证这个"让机载以为已接单"的入口不会被误开。
+TEST(MissionStateMachineTest, SeedAcceptedAssignmentRejectedWithoutTestHooks) {
+    common::Topic<common::GroundStationTarget> ground_target_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.test_hooks_enabled = false;  // 生产装配默认值
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_target_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    machine.SeedAcceptedAssignmentForTest(MakeAssignment(77));
+    EXPECT_GT(machine.ErrorCount(), 0U) << "未启用测试钩子时必须记错误并拒绝";
+    machine.Stop();
+}
+
+/// 测试钩子预置分配后，65020 主动返航应补发 65015 reason=cancelled_by_gcs
+/// （中止回执的前置门槛是 accepted_assignment_ 有值）。
+TEST(MissionStateMachineTest, SeededAssignmentThenCommandEmitsCancelledAck) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 78));
+    // 预置一份"已接受"的分配（SITL 的 command-assigned 场景走同一入口）。
+    harness.machine.SeedAcceptedAssignmentForTest(MakeAssignment(78));
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9101)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "应回 65021";
+    EXPECT_EQ(ack->command_id, 9101U);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value());
+    EXPECT_TRUE(WaitForAckWithResult(
+                    harness.ack_subscription,
+                    common::MissionAssignmentResult::kCancelledOrAborted, 2000ms)
+                    .has_value())
+        << "已接受分配 + 65020 必须补发 65015 cancelled_by_gcs";
+}
+
+/// 65020 重复 command_id：第二次必须被拒（防重放），且状态不再变化。
+TEST(MissionStateMachineTest, MissionCommandDuplicateIdRejected) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 42));
+    const common::MissionCommand command = MakeMissionCommand(9002);
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(command))
+                    .accepted);
+    const auto first =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionCommandResult::kAccepted);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(command))
+                    .accepted);
+    const auto second =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(second->reason, common::MissionCommandReason::kDuplicateCommand);
+}
+
+/// 65020 幂等顺序（2026-10-30）：被状态守卫拒绝的 command_id 不得占用幂等槽位，
+/// 地面站修正后可用同一 id 重发并真正执行。
+TEST(MissionStateMachineTest, MissionCommandRejectedIdCanBeReusedAfterStateChanges) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 地面态下发 → 状态守卫拒绝（not_airborne）；旧实现此时已登记 id。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9501)))
+                    .accepted);
+    const auto rejected =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(rejected.has_value()) << "应回 65021";
+    EXPECT_EQ(rejected->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(rejected->reason, common::MissionCommandReason::kNotAirborne);
+
+    // 进入 S5 后同一 command_id 重发：必须执行而不是判 duplicate。
+    ASSERT_TRUE(DriveToGpsApproach(harness, 52));
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9501)))
+                    .accepted);
+    const auto accepted =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(accepted.has_value()) << "应回 65021";
+    EXPECT_NE(accepted->reason, common::MissionCommandReason::kDuplicateCommand)
+        << "被拒 id 不得占用幂等槽位";
+    EXPECT_EQ(accepted->result, common::MissionCommandResult::kAccepted);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "同一 id 修正状态后重发应真正执行返航";
+}
+
+/// 65020 版本不符：回执 unsupported_version，任务状态不变。
+TEST(MissionStateMachineTest, MissionCommandUnsupportedVersionRejected) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 43));
+    common::MissionCommand command = MakeMissionCommand(9003);
+    command.protocol_version = 9;
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(command))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kUnsupportedVersion);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "非法指令不得改变任务状态";
+}
+
+/// 65020 未起飞（S2 地面待命）：回执 not_airborne，不得推状态。
+TEST(MissionStateMachineTest, MissionCommandOnGroundRejected) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9004)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotAirborne);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+/// 65021 回执 header.sequence 逐条递增 1（2026-10-30 审查修复）：旧实现
+/// 同一条回执把 mission_command_ack_count_ 自增两次，地面站看到序号跳 2。
+TEST(MissionStateMachineTest, MissionCommandAckSequenceIncrementsOnce) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    // 地面待命收到两条 65020 都被拒绝（not_airborne），但仍须逐条回 65021。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9200)))
+                    .accepted);
+    const auto first =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->result, common::MissionCommandResult::kRejected);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9201)))
+                    .accepted);
+    const auto second =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(first->header.sequence + 1U, second->header.sequence)
+        << "65021 序号必须逐条递增 1";
+}
+
+// ---------------------------------------------------------------------------
+// 65020 重置任务状态（2026-11-04）：S14 DISARMED → S2 READY，免重启机载程序
+// ---------------------------------------------------------------------------
+
+/// 构造一条 65020 重置任务状态指令。
+common::MissionCommand MakeResetStateCommand(uint32_t command_id) {
+    common::MissionCommand command = MakeMissionCommand(command_id);
+    command.type = common::MissionCommandType::kResetState;
+    return command;
+}
+
+/// S14（落地上锁、任务已结束）收到重置 → 回执 accepted，状态回 S2 READY。
+/// 旧实现 S14 没有回 S2 的路径，现场只能重启机载程序才能再接任务。
+TEST(MissionStateMachineTest, MissionCommandResetStateReturnsDisarmedToReady) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;  // 用例需把状态机摆到 S14
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false, /*landed=*/true)));
+    std::this_thread::sleep_for(80ms);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9300)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "重置指令应回 65021";
+    EXPECT_EQ(ack->type, common::MissionCommandType::kResetState);
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReady, 2000ms)
+                    .has_value())
+        << "重置后应回到 S2 READY";
+}
+
+/// 未上锁（armed=true）时拒绝重置：回执 kNotOnGround，状态保持 S14。
+/// 清状态会让控制意图与 tracker 断裂，必须等落地 disarm。
+TEST(MissionStateMachineTest, MissionCommandResetStateRejectedWhenArmed) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()));
+    harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/true, /*landed=*/false)));
+    std::this_thread::sleep_for(80ms);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9301)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
+        << "拒绝时不得改变任务状态";
+}
+
+/// 只在 S14 受理：空中任务态（S5）重置被拒绝（kNotOnGround），任务状态不变。
+TEST(MissionStateMachineTest, MissionCommandResetStateRejectedOutsideDisarmed) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 44));
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9302)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "飞行中不得重置任务状态";
+}
+
+/// 已在 S2 READY 时重置是幂等完成（kCompleted/kNone），不重复执行清理。
+TEST(MissionStateMachineTest, MissionCommandResetStateIdempotentInReady) {
+    AssignmentHarness harness(MakeTakeoffTestConfig());
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()));
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9303)))
+                    .accepted);
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kCompleted);
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+}
+
+}  // namespace
+
+// 目标失效：保持意图以 PX4 当前位置为目标（绝不用过期目标）、无前馈、
+// 10Hz 续流，65013 置 bit5；保持期间不中止任务。
+TEST(MissionStateMachineTest, S5TargetLossHoldsCurrentPosition) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 3000ms;
+    config.takeoff.target_lost_timeout = 3000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 308));
+
+    // 先获得匹配目标：估计引导（原因码 7）。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    const auto guided = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return IsPositionIntent(value) &&
+                   LowReasonCode(value) == kLowReasonGroundTask;
+        });
+    ASSERT_TRUE(guided.has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 目标失效：保持意图（原因码 9），目标=PX4 当前局部位置、无前馈。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    const auto hold = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return IsPositionIntent(value) &&
+                   LowReasonCode(value) == kLowReasonTargetHold;
+        });
+    ASSERT_TRUE(hold.has_value());
+    EXPECT_EQ(hold->header.frame_id, kFrameLocalNed);
+    EXPECT_FLOAT_EQ(hold->target_x, kTakeoffOriginX);
+    EXPECT_FLOAT_EQ(hold->target_y, kTakeoffOriginY);
+    EXPECT_FLOAT_EQ(hold->target_z, kTakeoffOriginZ - 0.5f);
+    EXPECT_EQ(hold->feedforward_valid_mask, 0U)
+        << "保持意图不得携带目标速度前馈";
+    EXPECT_NE(hold->reason_code & common::kControlIntentReasonRequestControl, 0U)
+        << "保持意图必须继续携带控制权请求位";
+
+    // 10Hz 续流：500ms 内应出现多条保持意图（而不是停发）。
+    DrainIntents(harness.intent_subscription);
+    std::this_thread::sleep_for(500ms);
+    int hold_count = 0;
+    while (auto message = harness.intent_subscription.TryTake()) {
+        if (IsPositionIntent(**message) &&
+            LowReasonCode(**message) == kLowReasonTargetHold) {
+            ++hold_count;
+        }
+    }
+    EXPECT_GE(hold_count, 3) << "目标失效期间必须持续发送保持意图";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "保持期间不得中止任务";
+
+    // 65013 告警位 bit5：目标保持中（状态周期 500ms，留 1.5s）。
+    bool hold_warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status = harness.status_subscription.WaitTakeFor(50ms);
+        if (status && ((*status)->active_warning_bits & (1U << 5U)) != 0U) {
+            hold_warning_seen = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_warning_seen) << "65013 应置位目标保持告警 bit5";
+}
+
+// 恢复迟滞：不足 3 拍的新鲜估计不退出保持；持续新鲜到第 3 拍才回到引导。
+TEST(MissionStateMachineTest, S5HoldReleasesAfterThreeFreshFrames) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 4000ms;
+    config.takeoff.target_lost_timeout = 4000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 309));
+
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonTargetHold;
+                    })
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 只新鲜 150ms（< 3 个决策拍）：仍保持，不得立刻回到引导。
+    auto brief = MakeValidEstimatedTarget();
+    brief.header.valid_for_ms = 150;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(brief))
+                    .accepted);
+    std::this_thread::sleep_for(250ms);
+    int guided_during_brief = 0;
+    while (auto message = harness.intent_subscription.TryTake()) {
+        if (IsPositionIntent(**message) &&
+            LowReasonCode(**message) == kLowReasonGroundTask) {
+            ++guided_during_brief;
+        }
+    }
+    EXPECT_EQ(guided_during_brief, 0)
+        << "不足 3 拍的新鲜估计不得退出保持";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+
+    // 持续新鲜：第一拍仍是保持（恢复确认），第 3 拍后回到引导。
+    auto persistent = MakeValidEstimatedTarget();
+    persistent.header.valid_for_ms = 2000;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        persistent))
+                    .accepted);
+    const auto first = WaitForIntent(
+        harness.intent_subscription, IsPositionIntent);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(LowReasonCode(*first), kLowReasonTargetHold)
+        << "恢复确认的第一拍仍应为保持";
+    const auto resumed = WaitForIntent(
+        harness.intent_subscription, [](const common::ControlIntent& value) {
+            return IsPositionIntent(value) &&
+                   LowReasonCode(value) == kLowReasonGroundTask;
+        });
+    ASSERT_TRUE(resumed.has_value()) << "连续 3 拍新鲜后必须回到估计引导";
+    // 速度律位置锚点在自机附近（首拍小速度），不是目标点本身。
+    EXPECT_LT(resumed->target_x, 2.0f);
+}
+
+// 影子兼容：未注入命令接口时不发保持意图（保持仅控制任务语义）。
+TEST(MissionStateMachineTest, ShadowS5DoesNotHoldOnTargetLoss) {
+    auto config = MakeAssignmentHarnessConfig();
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/false,
+                              /*with_estimation=*/true));
+
+    ASSERT_TRUE(harness.ground_topic
+                    .Publish(std::make_shared<const common::GroundStationTarget>(
+                        MakeFreshGroundTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kGpsApproach)
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_FALSE(WaitForIntent(harness.intent_subscription, IsPositionIntent,
+                               200ms)
+                     .has_value())
+        << "影子模式不得发保持意图";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// 保持能力门禁：PX4 局部位置无效时不得发保持意图（停发交兜底链），
+// 且任务在看门狗到点前不中止。
+TEST(MissionStateMachineTest, S5HoldRequiresValidLocalPosition) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 3000ms;
+    config.takeoff.target_lost_timeout = 3000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 310));
+
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+    DrainIntents(harness.intent_subscription);
+
+    // 局部位置失效（连接/armed/Offboard 仍在）。
+    auto no_position = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    no_position.local_position_valid = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, no_position));
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_FALSE(WaitForIntent(harness.intent_subscription, IsPositionIntent,
+                               200ms)
+                     .has_value())
+        << "局部位置无效时不得发保持意图";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+// 累计保持上限（已获得目标）：丢失计时被抖动清零也不得无限悬停，
+// 累计超 target_hold_max → 65015 aborted(target_lost) + S12。
+TEST(MissionStateMachineTest, S5HoldMaxAbortsAfterTargetAcquired) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 5000ms;
+    config.takeoff.target_hold_max = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+
+    // 先获得目标（assigned_target_acquired_ 置位），再持续失效。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeValidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason, common::MissionAssignmentReason::kTargetLost)
+        << "已获得目标后超时按目标丢失回执";
+    EXPECT_EQ(aborted->availability,
+              common::MissionAvailability::kReturning);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome);
+    for (const auto& call : harness.sender.History()) {
+        EXPECT_NE(call.command, 187U) << "目标保持超时不得触发发射";
+    }
+}
+
+// 累计保持上限（从未获得目标）：早于 target_wait_timeout 收口，
+// 回执按等待超时（未获得目标）语义。
+TEST(MissionStateMachineTest, S5HoldMaxAbortsBeforeTargetWaitTimeout) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 5000ms;
+    config.takeoff.target_hold_max = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 312));
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kTargetWaitTimeout)
+        << "从未获得目标时按等待超时回执";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome);
+}
+
+// 累计上限只在“目标当前不可用”时收口：短暂丢失累计未超限后恢复引导，
+// 不得因历史累计立刻中止；再次失效时按累计上限收口。
+TEST(MissionStateMachineTest, S5HoldMaxDoesNotAbortWhileGuiding) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 5000ms;
+    config.takeoff.target_lost_timeout = 5000ms;
+    config.takeoff.target_hold_max = 1000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 313));
+
+    auto persistent = MakeValidEstimatedTarget();
+    persistent.header.valid_for_ms = 2000;
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        persistent))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value());
+
+    // 短暂丢失 400ms（< 1000ms 上限）→ 保持，随后恢复引导。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonTargetHold;
+                    })
+                    .has_value());
+    std::this_thread::sleep_for(400ms);
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        persistent))
+                    .accepted);
+    ASSERT_TRUE(WaitForIntent(
+                    harness.intent_subscription,
+                    [](const common::ControlIntent& value) {
+                        return IsPositionIntent(value) &&
+                               LowReasonCode(value) == kLowReasonGroundTask;
+                    })
+                    .has_value())
+        << "目标恢复后必须回到引导";
+
+    // 引导期间不得因历史累计中止。
+    DrainAcks(harness.ack_subscription);
+    std::this_thread::sleep_for(800ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标恢复引导中不得因累计保持中止";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     100ms)
+                     .has_value())
+        << "引导期间不得回 aborted";
+
+    // 再次失效：累计（约 400ms + 本次）到 1000ms 后按上限收口。
+    ASSERT_TRUE(harness.estimated_topic
+                    .Publish(std::make_shared<const common::TargetState>(
+                        MakeInvalidEstimatedTarget()))
+                    .accepted);
+    const auto aborted2 = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted, 3000ms);
+    ASSERT_TRUE(aborted2.has_value());
+    EXPECT_EQ(aborted2->reason,
+              common::MissionAssignmentReason::kTargetLost);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome);
+}
+
+
+// 默认区域（2026-10-29）：围栏启用、无缓存、未收到 65018 时，机载应以 Home 为中心
+// 生成默认方形区域，保证"开机即有围栏"，并把 zone_id/版本落成配置里的默认值。
+TEST(MissionStateMachineTest, FenceDefaultZoneGeneratedFromHome) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.zone_cache_path.clear();  // 不写盘，避免污染工作目录
+    config.fence.default_half_side_m = 50.0;
+    config.fence.default_zone_id = 7;
+    config.fence.default_version = 3;
+
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true, /*with_estimation=*/true,
+                              MakeFenceFlight()));
+
+    common::FencePolygonNed polygon;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        polygon = harness.machine.LatestFencePolygon();
+        if (polygon.valid()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(polygon.valid());
+    EXPECT_EQ(polygon.zone_id, 7U);
+    EXPECT_EQ(polygon.version, 3U);
+    EXPECT_EQ(polygon.vertices.size(), 4U);
+    double min_north = polygon.vertices.front().north_m;
+    double max_north = polygon.vertices.front().north_m;
+    for (const auto& vertex : polygon.vertices) {
+        min_north = std::min(min_north, vertex.north_m);
+        max_north = std::max(max_north, vertex.north_m);
+    }
+    EXPECT_NEAR(max_north - min_north, 100.0, 2.0);
+}
+
+// 到点后视觉未识别（2026-11-05）：目标持续新鲜、飞机悬停在目标点正上方、
+// 视觉始终没有 LOCKED —— 目标看门狗的三条计时器都不会启动（这正是现场
+// 0100 记录里悬停 3.5 分钟不返航的原因），但必须抬 65013 warning bit6
+// 让地面站看到"已到点、没识别"。
+// visual_wait_abort_ms=0（现场默认）：只提示，不得中止任务。
+TEST(MissionStateMachineTest, S5ArrivedWithoutVisualRaisesHandoverWarning) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 20000ms;
+    config.takeoff.target_lost_timeout = 20000ms;
+    config.takeoff.target_hold_max = 60000ms;
+    config.handover.arrival_hold_ms = 100ms;
+    config.handover.visual_wait_warn_ms = 300ms;
+    config.handover.visual_wait_abort_ms = 0ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+
+    // 悬停在目标点正上方：本机局部位置 (1.5,-2.5,-0.4)，地速 0。
+    auto flight = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    flight.local_x_m = kTakeoffOriginX;
+    flight.local_y_m = kTakeoffOriginY;
+    flight.local_z_m = kTakeoffOriginZ - 0.5f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+
+    bool warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        // 目标估计与自身位置重合：水平/垂直距离均为 0，满足到点半径。
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = kTakeoffOriginX;
+        estimate.pos_y_m = kTakeoffOriginY;
+        estimate.pos_z_m = kTakeoffOriginZ - 0.5f;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        auto status = harness.status_subscription.WaitTakeFor(50ms);
+        if (status && (((*status)->active_warning_bits & (1U << 6U)) != 0U)) {
+            warning_seen = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(warning_seen) << "已到点但视觉未锁定超过 visual_wait_warn_ms 应置 bit6";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "visual_wait_abort_ms=0 时不得自动中止（只提示）";
+}
+
+// 同一判据把 visual_wait_abort_ms 配成非 0：越过阈值即中止到 S12（与目标
+// 看门狗同一收口路径），回执按目标等待超时。
+TEST(MissionStateMachineTest, S5ArrivedWithoutVisualAbortsWhenConfigured) {
+    auto config = MakeTakeoffTestConfig(100ms, 2000ms, 2000ms, 5000ms);
+    config.takeoff.target_wait_timeout = 20000ms;
+    config.takeoff.target_lost_timeout = 20000ms;
+    config.takeoff.target_hold_max = 60000ms;
+    config.handover.arrival_hold_ms = 100ms;
+    config.handover.visual_wait_warn_ms = 200ms;
+    config.handover.visual_wait_abort_ms = 400ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+
+    auto flight = MakeOffboardFlight(/*armed=*/true, /*landed=*/false);
+    flight.local_x_m = kTakeoffOriginX;
+    flight.local_y_m = kTakeoffOriginY;
+    flight.local_z_m = kTakeoffOriginZ - 0.5f;
+    flight.vx_mps = 0.f;
+    flight.vy_mps = 0.f;
+    flight.vz_mps = 0.f;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+
+    const auto deadline = std::chrono::steady_clock::now() + 3000ms;
+    while (std::chrono::steady_clock::now() < deadline &&
+           harness.machine.CurrentState() ==
+               common::MissionState::kGpsApproach) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = kTakeoffOriginX;
+        estimate.pos_y_m = kTakeoffOriginY;
+        estimate.pos_z_m = kTakeoffOriginZ - 0.5f;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kReturnHome)
+        << "visual_wait_abort_ms 非 0 时应中止到 S12";
+}
+
+// 引导点被围栏挡住（2026-11-05，围栏钳制无提示）：目标跑出区域、飞机自身
+// 仍在界内时，FlightController 会把越界设定值钳到边界，飞机贴边悬停；状态机
+// 的围栏守卫只看飞机自身位置，所以这件事原本对 65013 不可见。本用例验证
+// bit7 随"引导点是否在区域内"置位与清除。
+/// 目标出区的新告警语义（2026-11-13）：目标出区走"目标出区保持"，置 bit9；
+/// bit7 只表示"引导点/贴边保持"（目标贴边但仍在区内时）。本用例锁死两条位的
+/// 分工：目标在区外时 bit9=1、bit7=0。
+TEST(MissionStateMachineTest, S5TargetOutsideUsesBit9NotBit7) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kHold);
+    config.takeoff.target_wait_timeout = 20000ms;
+    config.takeoff.target_lost_timeout = 20000ms;
+    config.takeoff.target_hold_max = 60000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true));
+    auto zone = MakeSquareZone(7, 1, common::FenceAction::kHold, 30.0);
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(zone))
+                    .accepted);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 311));
+    auto flight = MakeFenceOffboardFlight(29.f, 0.f, -0.4f);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
+
+    bool bit9_seen = false;
+    bool bit7_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;  // 目标出区
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        auto status = harness.status_subscription.WaitTakeFor(50ms);
+        if (status) {
+            const uint32_t bits = (*status)->active_warning_bits;
+            if ((bits & (1U << 9U)) != 0U) {
+                bit9_seen = true;
+            }
+            if ((bits & (1U << 7U)) != 0U) {
+                bit7_seen = true;
+            }
+            if (bit9_seen) {
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(bit9_seen) << "目标出区应置 bit9（目标出区保持）";
+    EXPECT_FALSE(bit7_seen)
+        << "目标出区保持时引导点是保持点（区内），不应再报 bit7";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标出区保持不得中止任务";
+}
+
+}  // namespace

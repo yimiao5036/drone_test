@@ -1,26 +1,1638 @@
-/**
- * @file px4_link.cpp
- * @brief IPx4Link 骨架占位实现
- *
- * 骨架期仅保证生命周期可运行与装配验证；业务逻辑（MAVLink 解析、串口
- * 收发、ACK 关联、飞行状态快照维护）在实现期接入。
- */
 #include "communication/px4_link.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
 
 #include <spdlog/spdlog.h>
+
+#include "communication/mavlink_handler.h"
 
 namespace drone::communication {
 
 namespace {
 
-/// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
+// ============================================================================
+// Px4Link —— PX4 MAVLink 链路唯一拥有者（真实实现）。
+//
+// 职责：
+//   - 按 transport 打开 PX4 串口或 SITL UDP，启动一条独占通信线程；
+//   - 通过 MavlinkHandler 增量解析 MAVLink 1/2，只处理目标 PX4 身份的消息；
+//   - 定期发送机载电脑 HEARTBEAT，维护 connected/armed/mode/system_status；
+//   - 解析 PX4 飞行遥测（落地/全局/局部位置、姿态、GPS、电池、Home、RC、固件），
+//     按 telemetry_timeout 独立判新，发布 FlightStateSnapshot；
+//   - 可靠 COMMAND_LONG 命令队列 + ACK 匹配/超时，以及安全遥测请求；
+//   - 本地 NED 位置/速度设定值发送与过期保护；
+//   - 串口连续读错误时关闭端口并按 reconnect_interval 自动重开（UDP 不重连）。
+// 边界：不实现姿态/机体系/全局设定值。
+// 线程模型：WorkerLoop 独占读写 transport，其它线程只能经 Topic/有界队列间接发送。
+// ============================================================================
+
+/// 串口连续读错误达到该次数即判定设备/链路丢失，进入重连。
+/// 单次 EIO/EINTR 不触发，避免把瞬时错误当成拔线。
+constexpr uint32_t kSerialReadErrorReconnectThreshold = 3;
+/// 命令发送失败后的重试退避：避免写失败时在同一轮循环里死循环重试同一条命令。
+constexpr uint64_t kCommandSendRetryBackoffMs = 50;
+// 内部遥测请求写失败被丢弃后的重新排队周期：低频重排，既不堵关键命令，又保证
+// 首次建链时 SET_MESSAGE_INTERVAL 偶发丢失后能自愈（否则遥测流永不开启）。
+constexpr uint64_t kTelemetryRequestRetryMs = 1000;
+// 设定值下发速率统计周期（2026-11-02）：0082 实飞 ULG 里 PX4 记录到的位置设定值
+// 间隔中位数 0.21s（≈5Hz），与配置的 50ms 不符；需要机载侧自行计数对齐，判断是
+// “真的只发了 5Hz”还是“记录抽稀”。
+constexpr uint64_t kSetpointStatPeriodMs = 10000;
+/// 同一条队首命令连续发送失败上限；超过即丢弃，避免坏链路永久堵住命令队列。
+constexpr uint32_t kMaxCommandSendAttempts = 10;
+/// 重连失败日志：首次 + 每 10 次，避免设备长期不在时刷屏。
+bool ShouldLogReconnectAttempt(uint64_t attempts) {
+    return attempts == 1 || attempts % 10 == 0;
+}
+
+// 异常日志节流：第 1 次与每满 100 次打印，防止高频刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+// 单调时钟毫秒，用于心跳/遥测/ACK/设定值时效判断。
+uint64_t MonotonicMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// 电池守卫读取的 PX4 参数名（自动分配/起飞门禁使用，见设计文档 §9）。
+constexpr char kParamBatteryLowThreshold[] = "BAT_LOW_THR";
+constexpr char kParamLowBatteryAction[] = "COM_LOW_BAT_ACT";
+
+// MAVLink param_id 为 char[16]：长度恰为 16 时没有 NUL 结尾，不能直接用 strcmp。
+bool ParamIdMatches(const char (&param_id)[16], const char* expected) {
+    const std::size_t expected_length = std::strlen(expected);
+    if (expected_length > sizeof(param_id)) {
+        return false;
+    }
+    if (std::memcmp(param_id, expected, expected_length) != 0) {
+        return false;
+    }
+    return expected_length == sizeof(param_id) || param_id[expected_length] == '\0';
+}
+
 }  // namespace
+
+// PX4 配置校验：传输方式、身份、版本、周期与超时、队列容量与请求 ID 范围。
+void Px4LinkConfig::Validate() const {
+    if (transport == "serial") {
+        serial.Validate();
+    } else if (transport == "udp") {
+        udp.Validate();
+    } else {
+        throw std::invalid_argument("PX4 transport 必须是 serial 或 udp");
+    }
+    if (firmware_version.empty()) {
+        throw std::invalid_argument("PX4 固件版本标识不能为空");
+    }
+    if (onboard_system_id == 0 || onboard_component_id == 0) {
+        throw std::invalid_argument("机载电脑 MAVLink system/component ID 不能为 0");
+    }
+    if (target_system_id == 0 || target_component_id == 0) {
+        throw std::invalid_argument("PX4 MAVLink system/component ID 不能为 0");
+    }
+    if (mavlink_version != 1 && mavlink_version != 2) {
+        throw std::invalid_argument("MAVLink 版本必须是 1 或 2");
+    }
+    if (serial.read_timeout.count() <= 0 ||
+        heartbeat_send_interval.count() <= 0 || heartbeat_timeout.count() <= 0 ||
+        telemetry_timeout.count() <= 0 || state_publish_interval.count() <= 0 ||
+        reconnect_interval.count() <= 0 || command_ack_timeout.count() <= 0 ||
+        setpoint_send_interval.count() <= 0 || setpoint_timeout.count() <= 0) {
+        throw std::invalid_argument("PX4 链路读取、遥测、命令 ACK、设定值周期与超时必须为正数");
+    }
+    if (parameter_request_interval.count() <= 0 || parameter_timeout.count() <= 0) {
+        throw std::invalid_argument("PX4 参数请求周期与超时必须为正数");
+    }
+    if (setpoint_queue_capacity == 0 || command_queue_capacity == 0) {
+        throw std::invalid_argument("PX4 设定值和命令队列容量必须大于 0");
+    }
+    for (uint32_t message_id : one_shot_message_requests) {
+        if (message_id > 0xFFFFFFU) {
+            throw std::invalid_argument("MAVLink 单次请求消息 ID 超出 24 位范围");
+        }
+    }
+    for (const auto& request : message_interval_requests) {
+        if (request.message_id > 0xFFFFFFU || request.interval_us <= 0) {
+            throw std::invalid_argument("MAVLink 消息频率请求 ID 必须为 24 位且周期必须为正数");
+        }
+    }
+}
+
+// PIMPL：把 Px4Link 的复杂状态与线程封装在 Impl，对外暴露稳定接口。
+class Px4Link::Impl final {
+public:
+    explicit Impl(Px4LinkConfig config)
+        : config_(std::move(config)),
+          transport_(config_.transport == "serial"
+                         ? CreateSerialTransport(config_.serial)
+                         : CreateUdpTransport(config_.udp)),
+          mavlink_(config_.mavlink_version == 1 ? MavlinkVersion::kV1
+                                                : MavlinkVersion::kV2) {
+        config_.Validate();
+        SPDLOG_INFO("PX4 通信部件创建: firmware={} transport={} onboard={}/{} target={}/{} mavlink={}",
+                    config_.firmware_version, transport_->Description(),
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    config_.target_system_id, config_.target_component_id,
+                    config_.mavlink_version);
+    }
+
+    ~Impl() {
+        Stop();
+        SPDLOG_INFO("PX4 通信部件销毁: transport={}", transport_->Description());
+    }
+
+    // 启动：打开传输并复位 MAVLink/状态/命令缓存，订阅设定值，启动工作线程。幂等。
+    bool Start() {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        try {
+            transport_->Open();
+            transport_->Flush();
+            mavlink_.Reset();  // 清半包/序号，避免重连后残留污染
+
+            state_ = common::FlightStateSnapshot{};
+            {
+                std::lock_guard<std::mutex> state_lock(state_mutex_);
+                latest_state_snapshot_ = common::FlightStateSnapshot{};
+            }
+            state_sequence_ = 0;
+            last_heartbeat_time_ms_ = 0;
+            ResetTelemetryTimes();
+            InvalidateBatteryParameters();
+            ClearCommands();
+            cached_setpoint_.reset();
+            next_command_sequence_.store(1, std::memory_order_relaxed);
+            telemetry_requests_queued_ = false;
+            firmware_version_logged_ = false;
+            reconnect_pending_ = false;
+            read_error_streak_ = 0;
+            next_reconnect_ms_ = 0;
+            reconnect_attempts_ = 0;
+            connected_.store(false, std::memory_order_release);
+
+            if (setpoint_topic_ != nullptr) {
+                setpoint_subscription_ = setpoint_topic_->Subscribe(
+                    config_.setpoint_queue_capacity,
+                    common::Topic<common::Px4Setpoint>::OverflowPolicy::kDropOldest);
+            }
+
+            running_.store(true, std::memory_order_release);
+            worker_ = std::thread(&Impl::WorkerLoop, this);
+        } catch (const std::exception& error) {
+            running_.store(false, std::memory_order_release);
+            connected_.store(false, std::memory_order_release);
+            setpoint_subscription_.Reset();
+            ClearCommands();
+            transport_->Close();
+            const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_ERROR("PX4 通信启动失败: transport={} error={}，累计 {}",
+                             transport_->Description(), error.what(), count);
+            }
+            return false;
+        }
+
+        SPDLOG_INFO("PX4 通信启动: transport={}", transport_->Description());
+        return true;
+    }
+
+    // 停止：清运行标志并等待线程退出，再关闭传输、清命令/设定值缓存。幂等。
+    void Stop() {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (!running_.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        setpoint_subscription_.Reset();
+        ClearCommands();
+        cached_setpoint_.reset();
+        transport_->Close();
+        connected_.store(false, std::memory_order_release);
+        SPDLOG_INFO("PX4 通信停止: transport={}", transport_->Description());
+    }
+
+    bool IsRunning() const {
+        return running_.load(std::memory_order_acquire);
+    }
+
+    bool IsConnected() const {
+        return connected_.load(std::memory_order_acquire);
+    }
+
+    // 绑定设定值输入。必须在 Start 前调用，运行中不允许改绑。
+    void SetInput(common::Topic<common::Px4Setpoint>& setpoint) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_ERROR("PX4 设定值 Topic 必须在 Start 前绑定，累计 {}", count);
+            }
+            return;
+        }
+        setpoint_topic_ = &setpoint;
+    }
+
+    common::Topic<common::FlightStateSnapshot>& StateOutput() {
+        return state_output_;
+    }
+
+    // 外部命令入口：要求已运行且已连接；成功仅表示入队，不代表 PX4 已接受。
+    bool SendCommand(uint16_t command, float param1, float param2, float param3,
+                     float param4, float param5, float param6, float param7) {
+        if (!running_.load(std::memory_order_acquire) ||
+            !connected_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        CommandRequest request;
+        request.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+        request.command = command;
+        request.params = {param1, param2, param3, param4, param5, param6, param7};
+        request.internal = false;
+        return EnqueueCommand(std::move(request));
+    }
+
+    uint64_t SetpointSendCount() const {
+        return setpoint_send_count_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t ReceiveCount() const {
+        return receive_count_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t AckMatchCount() const {
+        return ack_match_count_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t AckTimeoutCount() const {
+        return ack_timeout_count_.load(std::memory_order_relaxed);
+    }
+
+    // 最近 ACK/超时状态快照；由通信线程写、其它线程只读，互斥量保护一次结构拷贝。
+    common::CommandAckStatus AckStatus() const {
+        std::lock_guard<std::mutex> lock(ack_status_mutex_);
+        return ack_status_;
+    }
+
+    // 取消排队与在途命令：只置原子标志，由通信线程在下一轮循环执行 ClearCommands()，
+    // 避免跨线程直接修改通信线程独占的 in_flight_command_。
+    void CancelPendingCommands() {
+        cancel_pending_.store(true, std::memory_order_release);
+    }
+
+    uint64_t ErrorCount() const {
+        return error_count_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t MessageReceiveCount(uint32_t message_id) const {
+        if (message_id >= message_receive_counts_.size()) {
+            return 0;
+        }
+        return message_receive_counts_[message_id].load(std::memory_order_relaxed);
+    }
+
+    // 最近发布快照的只读拷贝；未发布过时返回默认快照（connected=false）。
+    common::FlightStateSnapshot LatestState() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return latest_state_snapshot_;
+    }
+
+private:
+    using SetpointSubscription = common::Topic<common::Px4Setpoint>::Subscription;
+
+    // 一条待发送命令：自带递增序号、MAV_CMD、7 参数与是否内部（自动遥测请求）。
+    struct CommandRequest {
+        uint64_t sequence = 0;
+        uint16_t command = 0;
+        std::array<float, 7> params{};
+        bool internal = false;
+    };
+
+    // 在途单条命令及其发送时刻，用于 ACK 超时判断。
+    struct InFlightCommand {
+        CommandRequest request;
+        uint64_t sent_time_ms = 0;
+    };
+
+    // 当前缓存并重复发送的设定值与接收时刻，用于过期保护。
+    struct CachedSetpoint {
+        common::Px4Setpoint value;
+        uint64_t accepted_time_ms = 0;
+    };
+
+    // 命令入队（有界队列）：外部单次命令进关键队列，内部遥测请求（可重放、
+    // 非控制指令）进独立的遥测队列，避免遥测请求挤占关键命令名额或堵住队头。
+    bool EnqueueCommand(CommandRequest request) {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        auto& queue = request.internal ? telemetry_command_queue_ : command_queue_;
+        if (queue.size() >= config_.command_queue_capacity) {
+            const uint64_t count = error_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("PX4 命令队列已满: capacity={} command={} internal={}，累计错误 {}",
+                            config_.command_queue_capacity, request.command,
+                            request.internal, count);
+            }
+            return false;
+        }
+        queue.push_back(std::move(request));
+        return true;
+    }
+
+    // 清空排队与在途命令；在心跳断开/Stop/启动异常时调用，禁止重连后恢复旧命令。
+    void ClearCommands() {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        command_queue_.clear();
+        telemetry_command_queue_.clear();
+        in_flight_command_.reset();
+        // 重试状态一并复位：否则重连后仍会继承上一次链路的退避与失败计数。
+        command_send_attempts_ = 0;
+        next_command_send_ms_ = 0;
+    }
+
+    // 首次建立心跳后，按 JSON 自动排队单次请求与频率请求（internal 命令）。
+    void QueueTelemetryRequests() {
+        for (uint32_t message_id : config_.one_shot_message_requests) {
+            CommandRequest request;
+            request.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+            request.command = MAV_CMD_REQUEST_MESSAGE;
+            request.params[0] = static_cast<float>(message_id);
+            request.internal = true;
+            (void)EnqueueCommand(std::move(request));
+        }
+        for (const auto& interval : config_.message_interval_requests) {
+            CommandRequest request;
+            request.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+            request.command = MAV_CMD_SET_MESSAGE_INTERVAL;
+            request.params[0] = static_cast<float>(interval.message_id);
+            request.params[1] = static_cast<float>(interval.interval_us);
+            request.internal = true;
+            (void)EnqueueCommand(std::move(request));
+        }
+        if (!config_.one_shot_message_requests.empty() ||
+            !config_.message_interval_requests.empty()) {
+            SPDLOG_INFO("PX4 遥测请求已入队: one_shot={} intervals={}",
+                        config_.one_shot_message_requests.size(),
+                        config_.message_interval_requests.size());
+        }
+    }
+
+    /// 串口读错误达到阈值：立即置断开、清命令/遥测，关闭 fd，并按
+    /// reconnect_interval 重开。该函数只由 WorkerLoop 调用；UDP 不重连。
+    void EnterSerialReconnect(const char* reason, uint64_t now_ms) {
+        if (config_.transport != "serial" || reconnect_pending_) {
+            return;
+        }
+        reconnect_pending_ = true;
+        reconnect_attempts_ = 0;
+        read_error_streak_ = 0;
+        connected_.store(false, std::memory_order_release);
+        state_.connected = false;
+        telemetry_requests_queued_ = false;
+        ClearCommands();
+        cached_setpoint_.reset();
+        InvalidateVolatileState();
+        next_reconnect_ms_ = now_ms + static_cast<uint64_t>(
+                                          config_.reconnect_interval.count());
+        try {
+            transport_->Close();
+        } catch (const std::exception& error) {
+            SPDLOG_WARN("PX4 串口关闭失败（继续重连）: {}", error.what());
+        }
+        SPDLOG_WARN("PX4 串口链路中断，关闭端口准备重连: reason={} device={} "
+                    "interval_ms={}",
+                    reason, config_.serial.device,
+                    config_.reconnect_interval.count());
+        // 立即发布断开快照，FlightController 授权链随之撤权停发。
+        PublishState(now_ms);
+    }
+
+    /// 按 reconnect_interval 尝试重开串口；成功后重置解析器/遥测并等待心跳，
+    /// 失败只记录节流 WARN，工作线程保持运行。
+    void TrySerialReconnect(uint64_t now_ms) {
+        if (!reconnect_pending_ || config_.transport != "serial" ||
+            now_ms < next_reconnect_ms_) {
+            return;
+        }
+        ++reconnect_attempts_;
+        try {
+            transport_->Open();
+            transport_->Flush();
+            mavlink_.Reset();
+            state_ = common::FlightStateSnapshot{};
+            last_heartbeat_time_ms_ = 0;
+            ResetTelemetryTimes();
+            InvalidateBatteryParameters();
+            ClearCommands();
+            cached_setpoint_.reset();
+            telemetry_requests_queued_ = false;
+            firmware_version_logged_ = false;
+            rc_link_present_ = false;
+            connected_.store(false, std::memory_order_release);
+            reconnect_pending_ = false;
+            read_error_streak_ = 0;
+            SPDLOG_INFO("PX4 串口重连成功: device={} attempts={}，等待心跳",
+                        config_.serial.device, reconnect_attempts_);
+            // 重置后的快照必须是断开态；收到新心跳后才重新 connected。
+            PublishState(now_ms);
+        } catch (const std::exception& error) {
+            try {
+                transport_->Close();
+            } catch (...) {
+            }
+            next_reconnect_ms_ = now_ms + static_cast<uint64_t>(
+                                              config_.reconnect_interval.count());
+            if (ShouldLogReconnectAttempt(reconnect_attempts_)) {
+                SPDLOG_WARN("PX4 串口重连失败: device={} attempts={} error={}"
+                            "（下次 {} ms 后重试）",
+                            config_.serial.device, reconnect_attempts_, error.what(),
+                            config_.reconnect_interval.count());
+            }
+        }
+    }
+
+    // 通信线程主循环：读传输 → 解析 MAVLink → 消费设定值 → 检查心跳/命令超时 →
+    // 发送下一条命令与到期的心跳/设定值/状态快照。
+    void WorkerLoop() {
+        auto next_heartbeat = std::chrono::steady_clock::now();
+        auto next_state_publish = next_heartbeat;
+        auto next_setpoint_send = next_heartbeat;
+        last_setpoint_stat_ms_ = MonotonicMs();
+        std::array<uint8_t, 512> read_buffer{};
+
+        while (running_.load(std::memory_order_acquire)) {
+            const uint64_t loop_now_ms = MonotonicMs();
+            if (reconnect_pending_) {
+                TrySerialReconnect(loop_now_ms);
+                // 重连期间不读旧 fd、不发心跳/setpoint；短暂睡眠避免空转。
+                const auto wait = std::min(config_.reconnect_interval,
+                                           std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(wait);
+                continue;
+            }
+
+            const std::ptrdiff_t count = transport_->Read(read_buffer.data(), read_buffer.size());
+            if (count > 0) {
+                read_error_streak_ = 0;
+                mavlink_.Feed(
+                    read_buffer.data(), static_cast<std::size_t>(count),
+                    [this](const mavlink_message_t& message) { HandleMessage(message); });
+            } else if (count < 0) {
+                error_count_.fetch_add(1, std::memory_order_relaxed);
+                if (config_.transport == "serial" &&
+                    ++read_error_streak_ >= kSerialReadErrorReconnectThreshold) {
+                    EnterSerialReconnect("连续串口读取错误", loop_now_ms);
+                    continue;
+                }
+                // 串口持续异常时避免通信线程无等待自旋；UDP 仍只按读超时退避。
+                const auto retry_delay = config_.transport == "serial"
+                                             ? config_.serial.read_timeout
+                                             : config_.udp.read_timeout;
+                std::this_thread::sleep_for(retry_delay);
+            } else {
+                read_error_streak_ = 0;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t now_ms = MonotonicMs();
+            DrainSetpointInput(now_ms);   // 消费控制器新设定值
+            CheckHeartbeatTimeout(now_ms); // 心跳超时断连
+            SendParameterRequestsIfDue(now_ms);  // 重试未读到的电池参数
+            CheckCommandTimeout(now_ms);   // 在途命令 ACK 超时
+            // 外部取消请求（状态机线程置标志）：在本线程清空排队与在途命令，
+            // 保证发送前生效，旧命令不会在本轮被发出。
+            if (cancel_pending_.exchange(false, std::memory_order_acq_rel)) {
+                ClearCommands();
+            }
+            SendNextCommand(now_ms);       // 发送下一条排队命令
+            // 遥测请求写失败被丢弃后低频重排（不影响关键命令队列与退避）。
+            if (connected_.load(std::memory_order_acquire) &&
+                !telemetry_requests_queued_ && now_ms >= next_telemetry_retry_ms_) {
+                telemetry_requests_queued_ = true;
+                next_telemetry_retry_ms_ = now_ms + kTelemetryRequestRetryMs;
+                QueueTelemetryRequests();
+            }
+
+            if (now >= next_setpoint_send) {
+                SendSetpointIfDue(now_ms);
+                next_setpoint_send = now + config_.setpoint_send_interval;
+            }
+            if (now_ms - last_setpoint_stat_ms_ >= kSetpointStatPeriodMs) {
+                ReportSetpointRate(now_ms);
+            }
+            if (now >= next_heartbeat) {
+                SendHeartbeat();
+                next_heartbeat = now + config_.heartbeat_send_interval;
+            }
+            if (now >= next_state_publish) {
+                PublishState(now_ms);
+                next_state_publish = now + config_.state_publish_interval;
+            }
+        }
+
+        if (connected_.exchange(false, std::memory_order_acq_rel)) {
+            SPDLOG_INFO("PX4 通信线程停止，连接状态置为断开");
+        }
+        state_.connected = false;
+        InvalidateVolatileState();
+        cached_setpoint_.reset();
+        PublishState(MonotonicMs());
+    }
+
+    // 设定值结构合法性：必须有效、本地 NED(frame_id=3)、位置/速度类型、数值有限，
+    // 且不能同时启用 yaw 与 yaw_rate。
+    bool IsSetpointStructurallyValid(const common::Px4Setpoint& setpoint) const {
+        if (!setpoint.valid || setpoint.header.frame_id != 3 ||
+            (setpoint.type != common::SetpointType::kPosition &&
+             setpoint.type != common::SetpointType::kVelocity) ||
+            !std::isfinite(setpoint.x) || !std::isfinite(setpoint.y) ||
+            !std::isfinite(setpoint.z) ||
+            (setpoint.use_yaw && !std::isfinite(setpoint.yaw_deg)) ||
+            (setpoint.use_yaw_rate && !std::isfinite(setpoint.yaw_rate_dps)) ||
+            (setpoint.use_yaw && setpoint.use_yaw_rate)) {
+            return false;
+        }
+        // 位置前馈（P3）：只允许位置型；掩码合法且置位轴有限。
+        // 掩码为 0 时（所有旧生产者）不改变任何既有接受条件。
+        const uint8_t ff_mask = setpoint.feedforward_valid_mask;
+        if ((ff_mask & static_cast<uint8_t>(~common::kVelocityValidAll)) != 0) {
+            return false;
+        }
+        if (ff_mask != 0) {
+            if (setpoint.type != common::SetpointType::kPosition) {
+                return false;
+            }
+            if ((ff_mask & common::kVelocityValidNorth) != 0 &&
+                !std::isfinite(setpoint.feedforward_vx_mps)) {
+                return false;
+            }
+            if ((ff_mask & common::kVelocityValidEast) != 0 &&
+                !std::isfinite(setpoint.feedforward_vy_mps)) {
+                return false;
+            }
+            if ((ff_mask & common::kVelocityValidDown) != 0 &&
+                !std::isfinite(setpoint.feedforward_vz_mps)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 设定值最大生存期 = min(配置超时, 头部自带有效期)，头部未给则用配置上限。
+    uint64_t SetpointMaxAgeMs(const common::Px4Setpoint& setpoint) const {
+        const uint64_t configured =
+            static_cast<uint64_t>(config_.setpoint_timeout.count());
+        if (setpoint.header.valid_for_ms == 0) {
+            return configured;
+        }
+        return std::min(configured, setpoint.header.valid_for_ms);
+    }
+
+    // 判断缓存设定值是否仍在有效期；无头部时间则用接收时刻。
+    bool IsSetpointFresh(const CachedSetpoint& cached, uint64_t now_ms) const {
+        const uint64_t timestamp = cached.value.header.receive_time_ms != 0
+                                       ? cached.value.header.receive_time_ms
+                                       : cached.accepted_time_ms;
+        return now_ms >= timestamp &&
+               now_ms - timestamp <= SetpointMaxAgeMs(cached.value);
+    }
+
+    // 设定值拒绝统计与节流警告。
+    void RejectSetpoint(const char* reason) {
+        const uint64_t count =
+            setpoint_reject_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("PX4 设定值拒绝: reason={}，累计 {}", reason, count);
+        }
+    }
+
+    // 消费设定值队列：无效即清缓存停发；结构非法/已过期则拒绝并清缓存。
+    void DrainSetpointInput(uint64_t now_ms) {
+        while (auto message = setpoint_subscription_.TryTake()) {
+            const common::Px4Setpoint& setpoint = **message;
+            if (!setpoint.valid) {
+                cached_setpoint_.reset();
+                continue;
+            }
+            if (!IsSetpointStructurallyValid(setpoint)) {
+                RejectSetpoint("类型、坐标系、数值或 yaw 选择非法");
+                cached_setpoint_.reset();
+                continue;
+            }
+
+            CachedSetpoint candidate{setpoint, now_ms};
+            if (!IsSetpointFresh(candidate, now_ms)) {
+                RejectSetpoint("收到时已过期或时间戳在未来");
+                cached_setpoint_.reset();
+                continue;
+            }
+            cached_setpoint_ = std::move(candidate);
+        }
+    }
+
+    // 依据设定值类型构造严格的目标 type mask：始终忽略加速度，位置型忽略速度、
+    // 速度型忽略位置，未启用的 yaw/yaw_rate 置忽略位。
+    uint16_t BuildSetpointTypeMask(const common::Px4Setpoint& setpoint) const {
+        uint16_t mask = POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                        POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                        POSITION_TARGET_TYPEMASK_AZ_IGNORE;
+        if (setpoint.type == common::SetpointType::kPosition) {
+            // P3：位置始终有效；速度轴按前馈掩码逐轴放行。
+            // 掩码为 0 时三个 IGNORE 全置位，与旧行为逐位一致。
+            const uint8_t ff_mask = setpoint.feedforward_valid_mask;
+            if ((ff_mask & common::kVelocityValidNorth) == 0) {
+                mask |= POSITION_TARGET_TYPEMASK_VX_IGNORE;
+            }
+            if ((ff_mask & common::kVelocityValidEast) == 0) {
+                mask |= POSITION_TARGET_TYPEMASK_VY_IGNORE;
+            }
+            if ((ff_mask & common::kVelocityValidDown) == 0) {
+                mask |= POSITION_TARGET_TYPEMASK_VZ_IGNORE;
+            }
+        } else {
+            mask |= POSITION_TARGET_TYPEMASK_X_IGNORE |
+                    POSITION_TARGET_TYPEMASK_Y_IGNORE |
+                    POSITION_TARGET_TYPEMASK_Z_IGNORE;
+        }
+        if (!setpoint.use_yaw) {
+            mask |= POSITION_TARGET_TYPEMASK_YAW_IGNORE;
+        }
+        if (!setpoint.use_yaw_rate) {
+            mask |= POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE;
+        }
+        return mask;
+    }
+
+    // 按周期重复发送当前缓存设定值；过期则停止并清缓存。只在心跳连接期间发送。
+    // 每 kSetpointStatPeriodMs 汇总一次设定值实际下发速率（只读计数，热路径无锁）。
+    void ReportSetpointRate(uint64_t now_ms) {
+        const uint64_t total = setpoint_send_count_.load(std::memory_order_relaxed);
+        const uint64_t rejects =
+            setpoint_reject_count_.load(std::memory_order_relaxed);
+        const uint64_t errors = error_count_.load(std::memory_order_relaxed);
+        const uint64_t window = now_ms - last_setpoint_stat_ms_;
+        const uint64_t sent = total - last_setpoint_stat_count_;
+        const double rate = window > 0 ? static_cast<double>(sent) * 1000.0 /
+                                            static_cast<double>(window)
+                                      : 0.0;
+        SPDLOG_INFO(
+            "PX4 设定值下发统计: 窗口={}ms 本次={} 速率={:.1f}Hz 累计={} 拒绝={} "
+            "写错误={}",
+            window, sent, rate, total, rejects, errors);
+        last_setpoint_stat_ms_ = now_ms;
+        last_setpoint_stat_count_ = total;
+    }
+
+    void SendSetpointIfDue(uint64_t now_ms) {
+        if (!connected_.load(std::memory_order_acquire) || !cached_setpoint_) {
+            return;
+        }
+        if (!IsSetpointFresh(*cached_setpoint_, now_ms)) {
+            RejectSetpoint("缓存设定值已过期，停止发送");
+            cached_setpoint_.reset();
+            return;
+        }
+
+        const common::Px4Setpoint& setpoint = cached_setpoint_->value;
+        const bool position = setpoint.type == common::SetpointType::kPosition;
+        constexpr float kDegreesToRadians = 0.01745329251994329577f;
+        const float yaw = setpoint.use_yaw ? setpoint.yaw_deg * kDegreesToRadians : 0.f;
+        const float yaw_rate = setpoint.use_yaw_rate
+                                   ? setpoint.yaw_rate_dps * kDegreesToRadians
+                                   : 0.f;
+        const uint16_t type_mask = BuildSetpointTypeMask(setpoint);
+        // 位置+速度前馈（P3）：位置型按掩码逐轴填速度字段；未置位轴写 0
+        //（type mask 同时忽略该轴）。速度型仍用 x/y/z 作为速度。
+        const uint8_t ff_mask = setpoint.feedforward_valid_mask;
+        const float position_x = position ? setpoint.x : 0.f;
+        const float position_y = position ? setpoint.y : 0.f;
+        const float position_z = position ? setpoint.z : 0.f;
+        const float velocity_x = position
+            ? (((ff_mask & common::kVelocityValidNorth) != 0)
+                   ? setpoint.feedforward_vx_mps
+                   : 0.f)
+            : setpoint.x;
+        const float velocity_y = position
+            ? (((ff_mask & common::kVelocityValidEast) != 0)
+                   ? setpoint.feedforward_vy_mps
+                   : 0.f)
+            : setpoint.y;
+        const float velocity_z = position
+            ? (((ff_mask & common::kVelocityValidDown) != 0)
+                   ? setpoint.feedforward_vz_mps
+                   : 0.f)
+            : setpoint.z;
+        const auto frame = mavlink_.Encode(
+            [this, now_ms, type_mask, position_x, position_y, position_z,
+             velocity_x, velocity_y, velocity_z, yaw, yaw_rate](
+                mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_set_position_target_local_ned_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, static_cast<uint32_t>(now_ms),
+                    config_.target_system_id, config_.target_component_id,
+                    MAV_FRAME_LOCAL_NED, type_mask,
+                    position_x, position_y, position_z,
+                    velocity_x, velocity_y, velocity_z,
+                    0.f, 0.f, 0.f, yaw, yaw_rate);
+            });
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        mavlink_.RecordSentFrame(frame.size());
+        setpoint_send_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // 分发 PX4 消息：先按目标二元身份过滤，再按 msgid 路由到各解码处理器。
+    void HandleMessage(const mavlink_message_t& message) {
+        if (message.sysid != config_.target_system_id ||
+            message.compid != config_.target_component_id) {
+            return;
+        }
+
+        receive_count_.fetch_add(1, std::memory_order_relaxed);
+        if (message.msgid < message_receive_counts_.size()) {
+            message_receive_counts_[message.msgid].fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t now_ms = MonotonicMs();
+        switch (message.msgid) {
+            case MAVLINK_MSG_ID_HEARTBEAT:
+                HandleHeartbeat(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_EXTENDED_SYS_STATE:
+                HandleExtendedSystemState(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
+                HandleGlobalPosition(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_LOCAL_POSITION_NED:
+                HandleLocalPosition(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_ATTITUDE:
+                HandleAttitude(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_GPS_RAW_INT:
+                HandleGps(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_SYS_STATUS:
+                HandleSystemStatus(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_BATTERY_STATUS:
+                HandleBatteryStatus(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_HOME_POSITION:
+                HandleHomePosition(message);
+                break;
+            case MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN:
+                HandleGpsGlobalOrigin(message);
+                break;
+            case MAVLINK_MSG_ID_RC_CHANNELS:
+                HandleRcChannels(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_AUTOPILOT_VERSION:
+                HandleAutopilotVersion(message);
+                break;
+            case MAVLINK_MSG_ID_COMMAND_ACK:
+                HandleCommandAck(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_PARAM_VALUE:
+                HandleParamValue(message, now_ms);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // 心跳处理：仅接受 PX4 autopilot；解析 armed/mode/system_status，
+    // 首次连接时排队安全遥测请求。custom_mode 高位为 main/sub mode。
+    void HandleHeartbeat(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_heartbeat_t heartbeat{};
+        mavlink_msg_heartbeat_decode(&message, &heartbeat);
+        if (heartbeat.autopilot != MAV_AUTOPILOT_PX4) {
+            return;
+        }
+
+        last_heartbeat_time_ms_ = now_ms;
+        state_.connected = true;
+        // 解锁上升沿抓取起飞基准（2026-11-04）：相对高度改由 EKF 局部高度差分
+        // 计算，基准必须在解锁那一刻取，之后 local_z 的绝对偏置（锚点比地面高
+        // 数米）也不影响差分。上一次上锁后的旧基准在建链/解锁时一并失效。
+        const bool was_armed = state_.armed;
+        state_.armed =
+            (heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0;
+        if (state_.armed && !was_armed) {
+            state_.takeoff_ref_valid = false;
+            takeoff_ref_pending_ = true;
+            CaptureTakeoffReference();
+        }
+        state_.base_mode = heartbeat.base_mode;
+        state_.custom_mode = heartbeat.custom_mode;
+        state_.flight_mode = static_cast<uint8_t>((heartbeat.custom_mode >> 16U) & 0xFFU);
+        state_.flight_sub_mode = static_cast<uint8_t>((heartbeat.custom_mode >> 24U) & 0xFFU);
+        state_.system_status = heartbeat.system_status;
+
+        // 先发布快照再置连接原子标志：保证观察到 IsConnected()==true 的线程
+        // 经 LatestState() 必能读到 connected=true 的快照（happens-before）。
+        PublishState(now_ms);
+        if (!connected_.exchange(true, std::memory_order_acq_rel)) {
+            // 连接起点用于 parameter_timeout 判据；断连时由
+            // InvalidateBatteryParameters() 清零。
+            connected_since_ms_ = now_ms;
+            SPDLOG_INFO("PX4 心跳已连接: source={}/{} mode={}/{} armed={}",
+                        message.sysid, message.compid, state_.flight_mode,
+                        state_.flight_sub_mode, state_.armed);
+            if (!telemetry_requests_queued_) {
+                telemetry_requests_queued_ = true;
+                next_telemetry_retry_ms_ = now_ms + kTelemetryRequestRetryMs;
+                QueueTelemetryRequests();
+            }
+        }
+    }
+
+    // 落地状态：仅当非 UNDEFINED 才算有效。
+    void HandleExtendedSystemState(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_extended_sys_state_t extended{};
+        mavlink_msg_extended_sys_state_decode(&message, &extended);
+        state_.landed_state_valid =
+            extended.landed_state != MAV_LANDED_STATE_UNDEFINED;
+        state_.landed = extended.landed_state == MAV_LANDED_STATE_ON_GROUND;
+        last_landed_time_ms_ = now_ms;
+    }
+
+    // 全局位置：经纬度 1e7，速度 cm/s → m/s。
+    void HandleGlobalPosition(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_global_position_int_t position{};
+        mavlink_msg_global_position_int_decode(&message, &position);
+        state_.latitude_1e7 = position.lat;
+        state_.longitude_1e7 = position.lon;
+        state_.altitude_mm = position.alt;
+        state_.vx_mps = static_cast<float>(position.vx) / 100.f;
+        state_.vy_mps = static_cast<float>(position.vy) / 100.f;
+        state_.vz_mps = static_cast<float>(position.vz) / 100.f;
+        state_.global_position_valid = true;
+        last_global_position_time_ms_ = now_ms;
+    }
+
+    // 局部 NED 位置与速度（m / m/s）。
+    void HandleLocalPosition(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_local_position_ned_t position{};
+        mavlink_msg_local_position_ned_decode(&message, &position);
+        state_.local_x_m = position.x;
+        state_.local_y_m = position.y;
+        state_.local_z_m = position.z;
+        state_.vx_mps = position.vx;
+        state_.vy_mps = position.vy;
+        state_.vz_mps = position.vz;
+        state_.local_position_valid = true;
+        last_local_position_time_ms_ = now_ms;
+        // 解锁时若尚无局部位置，这里补抓（基准只能取解锁后第一帧，不能延后）。
+        CaptureTakeoffReference();
+    }
+
+    // 抓取起飞基准（解锁上升沿或其后第一帧局部位置）。
+    // 只取一次：pending 在成功写入后清零；未上锁时不应有 pending。
+    void CaptureTakeoffReference() {
+        if (!takeoff_ref_pending_ || !state_.local_position_valid) {
+            return;
+        }
+        state_.takeoff_ref_local_z_m = state_.local_z_m;
+        state_.takeoff_ref_valid = true;
+        takeoff_ref_pending_ = false;
+        SPDLOG_INFO("起飞高度基准已锁定: local_z={:.2f}m（相对高度=EKF 差分）",
+                    static_cast<double>(state_.takeoff_ref_local_z_m));
+    }
+
+    // EKF 投影参考锚点（GPS_GLOBAL_ORIGIN，内容为 LOCAL_POSITION_NED.ref_*）。
+    // 该消息为变化触发式（PX4 仅在锚点变化 >1.1cm 或收到请求时发送一条），
+    // 无周期新鲜度语义：valid 在连接期间保持，收到计数用于判读锚点稳定性。
+    void HandleGpsGlobalOrigin(const mavlink_message_t& message) {
+        mavlink_gps_global_origin_t origin{};
+        mavlink_msg_gps_global_origin_decode(&message, &origin);
+        // (0,0) 视为未初始化锚点（与 Home 同口径的显式防护）。
+        if (origin.latitude == 0 && origin.longitude == 0) {
+            return;
+        }
+        state_.ned_ref_lat_1e7 = origin.latitude;
+        state_.ned_ref_lon_1e7 = origin.longitude;
+        state_.ned_ref_alt_mm = origin.altitude;
+        state_.ned_ref_valid = true;
+        ++state_.ned_ref_received_count;
+    }
+
+    // 姿态欧拉角（弧度）。
+    void HandleAttitude(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_attitude_t attitude{};
+        mavlink_msg_attitude_decode(&message, &attitude);
+        state_.roll_rad = attitude.roll;
+        state_.pitch_rad = attitude.pitch;
+        state_.yaw_rad = attitude.yaw;
+        state_.attitude_valid = true;
+        last_attitude_time_ms_ = now_ms;
+    }
+
+    // GPS：记录 fix_type 与是否达到 3D fix。
+    void HandleGps(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_gps_raw_int_t gps{};
+        mavlink_msg_gps_raw_int_decode(&message, &gps);
+        state_.gps_state_valid = true;
+        state_.gps_fix_type = gps.fix_type;
+        state_.gps_fix = gps.fix_type >= GPS_FIX_TYPE_3D_FIX;
+        // MAVLink 约定：satellites_visible=255、eph/epv=UINT16_MAX 表示未知，
+        // 不伪装成有效数值；eph/epv 单位 cm，换算为米。
+        state_.gps_satellites_valid =
+            gps.satellites_visible != std::numeric_limits<uint8_t>::max();
+        if (state_.gps_satellites_valid) {
+            state_.gps_satellites_visible = gps.satellites_visible;
+        }
+        state_.gps_accuracy_valid =
+            gps.eph != std::numeric_limits<uint16_t>::max() &&
+            gps.epv != std::numeric_limits<uint16_t>::max();
+        if (state_.gps_accuracy_valid) {
+            state_.gps_eph_m = static_cast<float>(gps.eph) / 100.f;
+            state_.gps_epv_m = static_cast<float>(gps.epv) / 100.f;
+        }
+        last_gps_time_ms_ = now_ms;
+    }
+
+    // 系统状态：总压 mV→V、电流 cA→A、剩余 %；无效值（UINT16_MAX/-1）保持标志为假。
+    void HandleSystemStatus(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_sys_status_t status{};
+        mavlink_msg_sys_status_decode(&message, &status);
+        if (status.voltage_battery != std::numeric_limits<uint16_t>::max()) {
+            state_.battery_voltage_v =
+                static_cast<float>(status.voltage_battery) / 1000.f;
+            state_.battery_valid = true;
+            last_battery_time_ms_ = now_ms;
+        }
+        state_.battery_current_valid = status.current_battery >= 0;
+        if (state_.battery_current_valid) {
+            state_.battery_current_a =
+                static_cast<float>(status.current_battery) / 100.f;
+        }
+        state_.battery_remaining_valid = status.battery_remaining >= 0;
+        if (state_.battery_remaining_valid) {
+            state_.battery_remaining_pct =
+                static_cast<float>(status.battery_remaining);
+        }
+    }
+
+    // 电池状态：累加各电芯电压求总压，仅处理动力电池 id=0。
+    void HandleBatteryStatus(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_battery_status_t battery{};
+        mavlink_msg_battery_status_decode(&message, &battery);
+        if (battery.id != 0) {
+            return;  // V1 仅使用动力电池 0，避免多电池状态互相覆盖。
+        }
+
+        uint32_t voltage_mv = 0;
+        for (std::size_t index = 0; index < 10; ++index) {
+            const uint16_t cell_voltage = battery.voltages[index];
+            if (cell_voltage != std::numeric_limits<uint16_t>::max()) {
+                voltage_mv += cell_voltage;
+            }
+        }
+        for (std::size_t index = 0; index < 4; ++index) {
+            const uint16_t cell_voltage = battery.voltages_ext[index];
+            if (cell_voltage > 0) {
+                voltage_mv += cell_voltage;
+            }
+        }
+        if (voltage_mv > 0) {
+            state_.battery_voltage_v = static_cast<float>(voltage_mv) / 1000.f;
+            state_.battery_valid = true;
+            last_battery_time_ms_ = now_ms;
+        }
+        state_.battery_current_valid = battery.current_battery >= 0;
+        if (state_.battery_current_valid) {
+            state_.battery_current_a =
+                static_cast<float>(battery.current_battery) / 100.f;
+        }
+        state_.battery_remaining_valid = battery.battery_remaining >= 0;
+        if (state_.battery_remaining_valid) {
+            state_.battery_remaining_pct =
+                static_cast<float>(battery.battery_remaining);
+        }
+    }
+
+    // Home 点：经纬度 1e7、MSL 高度与 EKF 局部高度（NED z）；到达后保持有效直到断连。
+    // home.z 参与相对起飞点高度计算（`common::RelativeAltitudeBaseZ`）——PX4 会在
+    // EKF 位置相对 Home 漂移超阈值时重设 Home，此时 z 与本条一起平移，差分自愈。
+    void HandleHomePosition(const mavlink_message_t& message) {
+        mavlink_home_position_t home{};
+        mavlink_msg_home_position_decode(&message, &home);
+        state_.home_lat_1e7 = home.latitude;
+        state_.home_lon_1e7 = home.longitude;
+        state_.home_altitude_mm = home.altitude;
+        state_.home_local_z_m = home.z;
+        state_.home_local_z_valid = true;
+        state_.home_valid = true;
+    }
+
+    // RC 通道：记录 RSSI 与链路有效性；不自动等同于人工接管。
+    void HandleRcChannels(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_rc_channels_t rc{};
+        mavlink_msg_rc_channels_decode(&message, &rc);
+        state_.rc_rssi = rc.rssi;
+        state_.rc_state_valid = true;
+        rc_link_present_ = rc.chancount > 0 &&
+                           (rc.rssi == std::numeric_limits<uint8_t>::max() || rc.rssi > 0);
+        state_.rc_connected = rc_link_present_;
+        last_rc_time_ms_ = now_ms;
+    }
+
+    // 固件版本与能力：从 flight_sw_version 主/次/补丁；与配置比对并在不一致时告警。
+    void HandleAutopilotVersion(const mavlink_message_t& message) {
+        mavlink_autopilot_version_t version{};
+        mavlink_msg_autopilot_version_decode(&message, &version);
+        state_.flight_sw_version = version.flight_sw_version;
+        state_.firmware_major =
+            static_cast<uint8_t>((version.flight_sw_version >> 24U) & 0xFFU);
+        state_.firmware_minor =
+            static_cast<uint8_t>((version.flight_sw_version >> 16U) & 0xFFU);
+        state_.firmware_patch =
+            static_cast<uint8_t>((version.flight_sw_version >> 8U) & 0xFFU);
+        state_.autopilot_capabilities = version.capabilities;
+        state_.autopilot_version_valid = true;
+
+        if (!firmware_version_logged_) {
+            firmware_version_logged_ = true;
+            const std::string reported =
+                std::to_string(state_.firmware_major) + "." +
+                std::to_string(state_.firmware_minor) + "." +
+                std::to_string(state_.firmware_patch);
+            SPDLOG_INFO("PX4 固件版本上报: reported={} configured={} capabilities={}",
+                        reported, config_.firmware_version,
+                        state_.autopilot_capabilities);
+            if (reported != config_.firmware_version) {
+                SPDLOG_WARN("PX4 固件版本与配置不一致: reported={} configured={}",
+                            reported, config_.firmware_version);
+            }
+        }
+    }
+
+    // 命令 ACK：更新快照最近 ACK；匹配在途命令时按结果决定保持/收起。
+    // IN_PROGRESS 刷新超时；ACCEPTED/拒绝则结束该条在途命令。
+    void HandleCommandAck(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_command_ack_t ack{};
+        mavlink_msg_command_ack_decode(&message, &ack);
+        state_.last_ack_command = ack.command;
+        state_.last_ack_result = ack.result;
+        state_.last_ack_time_ms = now_ms;
+
+        if (!in_flight_command_ ||
+            in_flight_command_->request.command != ack.command) {
+            return;
+        }
+
+        ack_match_count_.fetch_add(1, std::memory_order_relaxed);
+        {
+            // 快照与匹配计数同口径：先更新计数再发布快照。
+            std::lock_guard<std::mutex> lock(ack_status_mutex_);
+            ack_status_.matched_count =
+                ack_match_count_.load(std::memory_order_relaxed);
+            ack_status_.last_command = ack.command;
+            ack_status_.last_result = ack.result;
+            ack_status_.last_time_ms = now_ms;
+            // 187 专用关联：捕网执行器的复位等待可能跨 S12~S14，同期
+            // AUTO.LAND/DISARM 的 ACK 会覆盖全局 last_*，这里独立累计。
+            if (ack.command == MAV_CMD_DO_SET_ACTUATOR) {
+                ++ack_status_.do_set_actuator_ack_count;
+                ack_status_.do_set_actuator_last_result = ack.result;
+                ack_status_.do_set_actuator_last_time_ms = now_ms;
+            }
+        }
+        const bool in_progress = ack.result == MAV_RESULT_IN_PROGRESS;
+        if (ack.result == MAV_RESULT_ACCEPTED || in_progress) {
+            SPDLOG_INFO("PX4 命令 ACK: sequence={} command={} result={} internal={} progress={}",
+                        in_flight_command_->request.sequence, ack.command, ack.result,
+                        in_flight_command_->request.internal, ack.progress);
+        } else {
+            SPDLOG_WARN("PX4 命令被拒绝/失败: sequence={} command={} result={} internal={} progress={}",
+                        in_flight_command_->request.sequence, ack.command, ack.result,
+                        in_flight_command_->request.internal, ack.progress);
+        }
+        if (in_progress) {
+            in_flight_command_->sent_time_ms = now_ms;
+        } else {
+            in_flight_command_.reset();
+        }
+        PublishState(now_ms);
+    }
+
+    // PX4 参数回包：仅按名称匹配 BAT_LOW_THR / COM_LOW_BAT_ACT，其它参数忽略。
+    // 参数属于静态配置而非遥测流：收到即更新数值/有效位/时间，并立即发布快照，
+    // 让状态机尽快看到；不参与 telemetry_timeout，只在断连/Stop 时失效。
+    void HandleParamValue(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_param_value_t parameter{};
+        mavlink_msg_param_value_decode(&message, &parameter);
+        if (!std::isfinite(parameter.param_value)) {
+            return;  // 非法数值不伪造有效值。
+        }
+
+        bool matched = false;
+        if (ParamIdMatches(parameter.param_id, kParamBatteryLowThreshold)) {
+            // PX4 BAT_LOW_THR 为归一化比例（module.yaml：unit=norm，默认 0.15=15%），
+            // 机载快照统一为百分比，避免与 battery_remaining_pct(0~100) 混用。
+            state_.battery_low_threshold_pct = parameter.param_value * 100.0f;
+            state_.battery_low_threshold_valid = true;
+            matched = true;
+        } else if (ParamIdMatches(parameter.param_id, kParamLowBatteryAction)) {
+            // PX4 以 float 返回枚举，四舍五入并夹紧到 uint8 范围。
+            const long rounded = std::lround(parameter.param_value);
+            state_.low_battery_action =
+                static_cast<uint8_t>(std::clamp(rounded, 0L, 255L));
+            state_.low_battery_action_valid = true;
+            matched = true;
+        }
+        if (!matched) {
+            return;
+        }
+
+        state_.battery_parameter_time_ms = now_ms;
+        if (!parameter_read_logged_ && state_.battery_low_threshold_valid &&
+            state_.low_battery_action_valid) {
+            parameter_read_logged_ = true;
+            SPDLOG_INFO("PX4 电池参数读取完成: BAT_LOW_THR={:.1f}% COM_LOW_BAT_ACT={}",
+                        state_.battery_low_threshold_pct,
+                        state_.low_battery_action);
+        }
+        PublishState(now_ms);
+    }
+
+    // 在途命令 ACK 超时：丢弃当前命令并继续队列。
+    void CheckCommandTimeout(uint64_t now_ms) {
+        if (!in_flight_command_ || now_ms < in_flight_command_->sent_time_ms) {
+            return;
+        }
+        const uint64_t timeout_ms =
+            static_cast<uint64_t>(config_.command_ack_timeout.count());
+        if (now_ms - in_flight_command_->sent_time_ms <= timeout_ms) {
+            return;
+        }
+
+        const auto timed_out = in_flight_command_->request;
+        in_flight_command_.reset();
+        const uint64_t count =
+            ack_timeout_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        {
+            std::lock_guard<std::mutex> lock(ack_status_mutex_);
+            ack_status_.timeout_count =
+                ack_timeout_count_.load(std::memory_order_relaxed);
+            ack_status_.last_timeout_command = timed_out.command;
+            // 187 专用超时计数：执行器只据此判故障，不受其它命令超时影响。
+            if (timed_out.command == MAV_CMD_DO_SET_ACTUATOR) {
+                ++ack_status_.do_set_actuator_timeout_count;
+            }
+        }
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("PX4 命令 ACK 超时: sequence={} command={} internal={} timeout_ms={}，累计 {}",
+                        timed_out.sequence, timed_out.command, timed_out.internal,
+                        config_.command_ack_timeout.count(), count);
+        }
+    }
+
+    // 发送路径按语义分三类，失败处理各不相同：
+    // - 关键单次命令（internal=false，ARM/DISARM/LAND/DO_SET_ACTUATOR 等）：
+    //   保序、写失败放回队首并按 50ms 退避重试，连续失败达上限才丢弃（丢弃打 ERROR）；
+    // - 内部遥测请求（internal=true，REQUEST_MESSAGE/SET_MESSAGE_INTERVAL）：
+    //   可重放且非控制指令，写失败直接丢弃、不重试、不占退避窗口，避免堵住队头
+    //   延迟关键命令；下次建链会自动重新排队；
+    // - 流式设定值不走本队列：它是最新值缓存（cached_setpoint_），写失败只跳过本
+    //   周期，下一周期发送最新值，绝不重放旧值。
+    // 只有写成功才置 in_flight 并开始 ACK 超时计时。
+    void SendNextCommand(uint64_t now_ms) {
+        if (in_flight_command_ || !connected_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        CommandRequest request;
+        bool telemetry = false;
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            if (!command_queue_.empty()) {
+                // 关键命令优先；退避窗口未到时不抢占遥测队列，保持关键命令队头语义。
+                if (now_ms < next_command_send_ms_) {
+                    return;
+                }
+                request = std::move(command_queue_.front());
+                command_queue_.pop_front();
+            } else if (!telemetry_command_queue_.empty()) {
+                request = std::move(telemetry_command_queue_.front());
+                telemetry_command_queue_.pop_front();
+                telemetry = true;
+            } else {
+                command_send_attempts_ = 0;
+                return;
+            }
+        }
+
+        const uint16_t command = request.command;
+        const auto frame = mavlink_.Encode(
+            [this, &request](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_command_long_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, config_.target_system_id,
+                    config_.target_component_id, request.command, 0,
+                    request.params[0], request.params[1], request.params[2],
+                    request.params[3], request.params[4], request.params[5],
+                    request.params[6]);
+            });
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            if (telemetry) {
+                // 内部遥测请求直接丢弃：不重试、不设置退避，避免队头阻塞关键命令；
+                // 标记待重新排队，由 WorkerLoop 以 kTelemetryRequestRetryMs 低频重排，
+                // 保证 SET_MESSAGE_INTERVAL 偶发丢失后遥测流仍能自愈。
+                telemetry_requests_queued_ = false;
+                next_telemetry_retry_ms_ = now_ms + kTelemetryRequestRetryMs;
+                const uint64_t drop_count = ++telemetry_drop_count_;
+                if (ShouldLogThrottled(drop_count)) {
+                    SPDLOG_WARN("PX4 遥测请求发送失败，已丢弃（{} ms 后重排）: command={} 累计 {}",
+                                kTelemetryRequestRetryMs, command, drop_count);
+                }
+                return;
+            }
+            const uint64_t failure_count = ++command_send_failure_count_;
+            const uint32_t attempts = ++command_send_attempts_;
+            const bool dropped = attempts >= kMaxCommandSendAttempts;
+            if (dropped) {
+                // 丢弃后复位尝试计数，后续命令不再被这条坏命令阻塞。
+                command_send_attempts_ = 0;
+                SPDLOG_ERROR("PX4 关键命令发送连续失败，已达上限丢弃: command={} "
+                             "attempts={} 累计失败 {}",
+                             command, attempts, failure_count);
+            } else {
+                // 保序重试：放回队首，后续命令不得越过它，保证命令先后语义不变。
+                std::lock_guard<std::mutex> lock(command_mutex_);
+                command_queue_.push_front(std::move(request));
+            }
+            next_command_send_ms_ = now_ms + kCommandSendRetryBackoffMs;
+            if (ShouldLogThrottled(failure_count)) {
+                SPDLOG_WARN("PX4 命令发送失败{}: command={} attempts={} backoff_ms={} "
+                            "累计 {}",
+                            dropped ? "（已达重试上限，丢弃）" : "，已放回队首重试",
+                            command, attempts, kCommandSendRetryBackoffMs,
+                            failure_count);
+            }
+            return;
+        }
+
+        mavlink_.RecordSentFrame(frame.size());
+        if (!telemetry) {
+            command_send_attempts_ = 0;
+        }
+        in_flight_command_ = InFlightCommand{std::move(request), now_ms};
+    }
+
+    // 遥测新鲜度：距最后接收不超过 telemetry_timeout 且时间戳非 0/不超前。
+    bool IsTelemetryFresh(uint64_t timestamp_ms, uint64_t now_ms) const {
+        if (timestamp_ms == 0 || now_ms < timestamp_ms) {
+            return false;
+        }
+        return now_ms - timestamp_ms <=
+               static_cast<uint64_t>(config_.telemetry_timeout.count());
+    }
+
+    // 按各自接收时间刷新各遥测的 valid 标志；超时清除 valid，保留最后数值供排查。
+    void RefreshTelemetryValidity(uint64_t now_ms) {
+        state_.landed_state_valid =
+            state_.landed_state_valid && IsTelemetryFresh(last_landed_time_ms_, now_ms);
+        state_.global_position_valid =
+            IsTelemetryFresh(last_global_position_time_ms_, now_ms);
+        state_.local_position_valid =
+            IsTelemetryFresh(last_local_position_time_ms_, now_ms);
+        state_.attitude_valid = IsTelemetryFresh(last_attitude_time_ms_, now_ms);
+        state_.gps_state_valid = IsTelemetryFresh(last_gps_time_ms_, now_ms);
+        state_.gps_fix = state_.gps_state_valid &&
+                         state_.gps_fix_type >= GPS_FIX_TYPE_3D_FIX;
+        if (!state_.gps_state_valid) {
+            state_.gps_satellites_valid = false;
+            state_.gps_accuracy_valid = false;
+        }
+        state_.battery_valid = IsTelemetryFresh(last_battery_time_ms_, now_ms);
+        if (!state_.battery_valid) {
+            state_.battery_current_valid = false;
+            state_.battery_remaining_valid = false;
+        }
+        state_.rc_state_valid = IsTelemetryFresh(last_rc_time_ms_, now_ms);
+        state_.rc_connected = state_.rc_state_valid && rc_link_present_;
+    }
+
+    // 断连/Stop 时统一失效全部易变遥测与 Home。
+    void InvalidateVolatileState() {
+        ResetTelemetryTimes();
+        state_.landed_state_valid = false;
+        state_.global_position_valid = false;
+        state_.local_position_valid = false;
+        state_.attitude_valid = false;
+        state_.gps_state_valid = false;
+        state_.gps_fix = false;
+        state_.gps_satellites_valid = false;
+        state_.gps_accuracy_valid = false;
+        state_.battery_valid = false;
+        state_.battery_current_valid = false;
+        state_.battery_remaining_valid = false;
+        state_.rc_state_valid = false;
+        state_.rc_connected = false;
+        state_.home_valid = false;
+        state_.home_local_z_valid = false;
+        state_.home_local_z_m = 0.f;
+        state_.ned_ref_valid = false;
+        state_.ned_ref_received_count = 0;
+        // 起飞基准同属易变状态：断连后重新解锁必须重新抓取（否则沿途 local_z
+        // 已被 EKF 重置，旧基准会给出错误相对高度）。
+        state_.takeoff_ref_valid = false;
+        state_.takeoff_ref_local_z_m = 0.f;
+        takeoff_ref_pending_ = false;
+        rc_link_present_ = false;
+        InvalidateBatteryParameters();
+    }
+
+    // 电池参数属于静态配置而非遥测流：断连/Stop 时直接失效并清请求簿记，
+    // 重连后由 WorkerLoop 重新发送 PARAM_REQUEST_READ。保留最后数值仅供排查
+    // （valid=false 时上层不得使用，也不参与 telemetry_timeout）。
+    void InvalidateBatteryParameters() {
+        state_.battery_low_threshold_valid = false;
+        state_.low_battery_action_valid = false;
+        state_.battery_parameter_time_ms = 0;
+        last_parameter_request_ms_ = 0;
+        connected_since_ms_ = 0;
+        parameter_read_logged_ = false;
+        parameter_timeout_count_ = 0;
+    }
+
+    // 清空各遥测接收时间，使后续新鲜度判断立即失效。
+    void ResetTelemetryTimes() {
+        last_landed_time_ms_ = 0;
+        last_global_position_time_ms_ = 0;
+        last_local_position_time_ms_ = 0;
+        last_attitude_time_ms_ = 0;
+        last_gps_time_ms_ = 0;
+        last_battery_time_ms_ = 0;
+        last_rc_time_ms_ = 0;
+    }
+
+    // 心跳超时：置断开、清命令与易变遥测，并发布最终快照。
+    void CheckHeartbeatTimeout(uint64_t now_ms) {
+        if (!connected_.load(std::memory_order_acquire) || last_heartbeat_time_ms_ == 0) {
+            return;
+        }
+        const uint64_t timeout_ms = static_cast<uint64_t>(config_.heartbeat_timeout.count());
+        if (now_ms - last_heartbeat_time_ms_ <= timeout_ms) {
+            return;
+        }
+
+        connected_.store(false, std::memory_order_release);
+        state_.connected = false;
+        telemetry_requests_queued_ = false;
+        ClearCommands();
+        InvalidateVolatileState();
+        SPDLOG_WARN("PX4 心跳超时: source={}/{} timeout_ms={}",
+                    config_.target_system_id, config_.target_component_id,
+                    config_.heartbeat_timeout.count());
+        PublishState(now_ms);
+    }
+
+    // 发送一条 PARAM_REQUEST_READ（param_index=-1，按名称读取）。参数请求是静态
+    // 读取，直接写 transport，不进入 COMMAND_LONG 命令队列，避免占用 ACK 通道。
+    // 仅由通信线程调用。
+    bool SendParamRequestRead(const char* param_id) {
+        // 生成库按 char[16] 整块复制，必须提供定长缓冲，避免读取字符串字面量越界。
+        char param_id_buffer[16] = {};
+        std::strncpy(param_id_buffer, param_id, sizeof(param_id_buffer));
+        const auto frame = mavlink_.Encode(
+            [this, &param_id_buffer](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_param_request_read_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, config_.target_system_id,
+                    config_.target_component_id, param_id_buffer, -1);
+            });
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            // 参数读取属于"可重放内部请求"：不入命令队列、失败不重试，由下一次
+            // parameter_request_interval 自然重排；补一条节流日志让失败可见，避免静默。
+            const uint64_t failure_count = ++parameter_send_failure_count_;
+            if (ShouldLogThrottled(failure_count)) {
+                SPDLOG_WARN("PX4 参数读取请求发送失败（{} ms 后自然重排）: param={} 累计 {}",
+                            config_.parameter_request_interval.count(), param_id,
+                            failure_count);
+            }
+            return false;
+        }
+        mavlink_.RecordSentFrame(frame.size());
+        return true;
+    }
+
+    // 连接期间按 parameter_request_interval 重发缺失的电池参数请求；两个参数都
+    // 有效后停止请求，避免周期性刷屏。超过 parameter_timeout 仍缺失时保持
+    // valid=false（不得用 0 冒充真实阈值），并按首次 + 每 100 次节流 WARN。
+    void SendParameterRequestsIfDue(uint64_t now_ms) {
+        if (!connected_.load(std::memory_order_acquire)) {
+            return;
+        }
+        const bool need_threshold = !state_.battery_low_threshold_valid;
+        const bool need_action = !state_.low_battery_action_valid;
+        if (!need_threshold && !need_action) {
+            return;
+        }
+
+        const uint64_t interval_ms =
+            static_cast<uint64_t>(config_.parameter_request_interval.count());
+        if (last_parameter_request_ms_ != 0 && now_ms >= last_parameter_request_ms_ &&
+            now_ms - last_parameter_request_ms_ < interval_ms) {
+            return;
+        }
+        last_parameter_request_ms_ = now_ms;
+        if (need_threshold) {
+            (void)SendParamRequestRead(kParamBatteryLowThreshold);
+        }
+        if (need_action) {
+            (void)SendParamRequestRead(kParamLowBatteryAction);
+        }
+
+        const uint64_t timeout_ms =
+            static_cast<uint64_t>(config_.parameter_timeout.count());
+        if (connected_since_ms_ != 0 && now_ms >= connected_since_ms_ &&
+            now_ms - connected_since_ms_ > timeout_ms) {
+            const uint64_t count = ++parameter_timeout_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("PX4 电池参数读取超时: BAT_LOW_THR_valid={} "
+                            "COM_LOW_BAT_ACT_valid={} timeout_ms={}，累计 {}",
+                            state_.battery_low_threshold_valid,
+                            state_.low_battery_action_valid, timeout_ms, count);
+            }
+        }
+    }
+
+    // 周期发送机载电脑 HEARTBEAT，声明本链路为 onboard computer。
+    void SendHeartbeat() {
+        const auto frame = mavlink_.Encode(
+            [this](mavlink_status_t* status, mavlink_message_t* message) {
+                return mavlink_msg_heartbeat_pack_status(
+                    config_.onboard_system_id, config_.onboard_component_id,
+                    status, message, MAV_TYPE_ONBOARD_CONTROLLER,
+                    MAV_AUTOPILOT_INVALID, 0, 0, MAV_STATE_ACTIVE);
+            });
+        if (frame.empty() || !transport_->Write(frame.data(), frame.size())) {
+            error_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        mavlink_.RecordSentFrame(frame.size());
+    }
+
+    // 发布飞行状态快照：先刷新 valid，再填充快照头（序列号/时间/源/健康/坐标）。
+    void PublishState(uint64_t now_ms) {
+        RefreshTelemetryValidity(now_ms);
+        common::FlightStateSnapshot snapshot = state_;
+        // connected 取自 state_：各发布点 state_.connected 与 connected_ 原子标志一致，
+        // 且心跳处理先发布再置标志，保证 LatestState() 与 IsConnected() 观察顺序一致。
+        snapshot.connected = state_.connected;
+        snapshot.header.sequence = ++state_sequence_;
+        snapshot.header.source_time_ms = 0;
+        snapshot.header.receive_time_ms = now_ms;
+        snapshot.header.valid_for_ms =
+            static_cast<uint64_t>(config_.heartbeat_timeout.count());
+        snapshot.header.source_id = config_.target_system_id;
+        snapshot.header.health = snapshot.connected ? 1 : 3;
+        snapshot.header.frame_id =
+            (snapshot.local_position_valid || snapshot.global_position_valid) ? 3 : 0;
+        {
+            // 供 LatestState() 只读门禁查询：锁粒度为一次结构拷贝。
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            latest_state_snapshot_ = snapshot;
+        }
+        (void)state_output_.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(std::move(snapshot)));
+    }
+
+    Px4LinkConfig config_;
+    std::unique_ptr<ICommunicationTransport> transport_;
+    MavlinkHandler mavlink_;
+
+    mutable std::mutex lifecycle_mutex_;
+    std::thread worker_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> connected_{false};
+
+    common::Topic<common::Px4Setpoint>* setpoint_topic_ = nullptr;
+    SetpointSubscription setpoint_subscription_;
+    common::Topic<common::FlightStateSnapshot> state_output_;
+    common::FlightStateSnapshot state_;
+    mutable std::mutex state_mutex_;
+    common::FlightStateSnapshot latest_state_snapshot_;
+    uint64_t state_sequence_ = 0;
+    uint64_t last_heartbeat_time_ms_ = 0;
+    uint64_t last_landed_time_ms_ = 0;
+    uint64_t last_global_position_time_ms_ = 0;
+    uint64_t last_local_position_time_ms_ = 0;
+    uint64_t last_attitude_time_ms_ = 0;
+    uint64_t last_gps_time_ms_ = 0;
+    uint64_t last_battery_time_ms_ = 0;
+    uint64_t last_rc_time_ms_ = 0;
+    bool rc_link_present_ = false;
+    /// 解锁上升沿已置位、等待第一帧局部位置来锁定起飞基准（见 CaptureTakeoffReference）。
+    bool takeoff_ref_pending_ = false;
+    bool firmware_version_logged_ = false;
+    bool telemetry_requests_queued_ = false;
+
+    // 电池参数请求簿记（仅通信线程访问）：上次请求时刻、连接起点、是否已打印
+    // 成功日志、超时告警节流计数。
+    uint64_t last_parameter_request_ms_ = 0;
+    uint64_t connected_since_ms_ = 0;
+    uint64_t parameter_timeout_count_ = 0;
+    uint64_t parameter_send_failure_count_ = 0;
+    bool parameter_read_logged_ = false;
+
+    // 串口重连（仅 WorkerLoop 访问）：读错误连续计数、待重连标志与重试时刻。
+    bool reconnect_pending_ = false;
+    uint32_t read_error_streak_ = 0;
+    uint64_t next_reconnect_ms_ = 0;
+    uint64_t reconnect_attempts_ = 0;
+
+    std::mutex command_mutex_;
+    std::deque<CommandRequest> command_queue_;            // 关键单次命令（保序重试）
+    std::deque<CommandRequest> telemetry_command_queue_;  // 内部遥测请求（可丢弃）
+    std::optional<InFlightCommand> in_flight_command_;
+    // 命令发送失败重试：退避截止时刻、队首命令连续失败次数与累计失败计数。
+    uint64_t next_command_send_ms_ = 0;
+    uint32_t command_send_attempts_ = 0;
+    uint64_t command_send_failure_count_ = 0;
+    uint64_t telemetry_drop_count_ = 0;
+    // 内部遥测请求被丢弃后的重新排队时刻（仅通信线程访问）。
+    uint64_t next_telemetry_retry_ms_ = 0;
+    std::atomic<uint64_t> next_command_sequence_{1};
+    mutable std::mutex ack_status_mutex_;
+    common::CommandAckStatus ack_status_;
+    std::atomic<bool> cancel_pending_{false};
+    std::optional<CachedSetpoint> cached_setpoint_;
+
+    std::atomic<uint64_t> setpoint_send_count_{0};
+    // 设定值速率统计（仅通信线程访问，非原子）。
+    uint64_t last_setpoint_stat_ms_ = 0;
+    uint64_t last_setpoint_stat_count_ = 0;
+    std::atomic<uint64_t> receive_count_{0};
+    std::atomic<uint64_t> ack_match_count_{0};
+    std::atomic<uint64_t> ack_timeout_count_{0};
+    std::atomic<uint64_t> error_count_{0};
+    std::atomic<uint64_t> setpoint_reject_count_{0};
+    std::array<std::atomic<uint64_t>, 256> message_receive_counts_{};
+};
+
+Px4Link::Px4Link(Px4LinkConfig config)
+    : impl_(std::make_unique<Impl>(std::move(config))) {}
+
+Px4Link::~Px4Link() = default;
+
+bool Px4Link::Start() { return impl_->Start(); }
+void Px4Link::Stop() { impl_->Stop(); }
+bool Px4Link::IsRunning() const { return impl_->IsRunning(); }
+bool Px4Link::IsConnected() const { return impl_->IsConnected(); }
+void Px4Link::SetInput(common::Topic<common::Px4Setpoint>& setpoint) {
+    impl_->SetInput(setpoint);
+}
+common::Topic<common::FlightStateSnapshot>& Px4Link::StateOutput() {
+    return impl_->StateOutput();
+}
+bool Px4Link::SendCommand(uint16_t command, float param1, float param2,
+                          float param3, float param4, float param5,
+                          float param6, float param7) {
+    return impl_->SendCommand(command, param1, param2, param3, param4,
+                              param5, param6, param7);
+}
+uint64_t Px4Link::SetpointSendCount() const { return impl_->SetpointSendCount(); }
+uint64_t Px4Link::ReceiveCount() const { return impl_->ReceiveCount(); }
+uint64_t Px4Link::AckMatchCount() const { return impl_->AckMatchCount(); }
+uint64_t Px4Link::AckTimeoutCount() const { return impl_->AckTimeoutCount(); }
+common::CommandAckStatus Px4Link::AckStatus() const { return impl_->AckStatus(); }
+void Px4Link::CancelPendingCommands() { impl_->CancelPendingCommands(); }
+uint64_t Px4Link::ErrorCount() const { return impl_->ErrorCount(); }
+common::FlightStateSnapshot Px4Link::LatestState() const {
+    return impl_->LatestState();
+}
+uint64_t Px4Link::MessageReceiveCount(uint32_t message_id) const {
+    return impl_->MessageReceiveCount(message_id);
+}
 
 Px4LinkStub::Px4LinkStub() {
     SPDLOG_INFO("PX4 通信部件骨架创建");
@@ -49,22 +1661,16 @@ bool Px4LinkStub::IsRunning() const {
 }
 
 bool Px4LinkStub::IsConnected() const {
-    // 骨架期未实现 MAVLink 心跳解析，恒为 false
     return false;
 }
 
-void Px4LinkStub::SetInput(common::Topic<common::Px4Setpoint>& /*setpoint*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动发送
-}
+void Px4LinkStub::SetInput(common::Topic<common::Px4Setpoint>&) {}
 
 common::Topic<common::FlightStateSnapshot>& Px4LinkStub::StateOutput() {
     return state_output_;
 }
 
-bool Px4LinkStub::SendCommand(uint16_t /*mavlink_command*/, float /*param1*/,
-                              float /*param2*/, float /*param3*/, float /*param4*/,
-                              float /*param5*/, float /*param6*/, float /*param7*/) {
-    // 骨架期未实现命令发送，返回失败并节流记录
+bool Px4LinkStub::SendCommand(uint16_t, float, float, float, float, float, float, float) {
     ++error_count_;
     if (ShouldLogThrottled(error_count_)) {
         SPDLOG_WARN("PX4 通信部件 SendCommand 未实现（骨架占位），累计调用 {}", error_count_);
@@ -72,24 +1678,16 @@ bool Px4LinkStub::SendCommand(uint16_t /*mavlink_command*/, float /*param1*/,
     return false;
 }
 
-uint64_t Px4LinkStub::SetpointSendCount() const {
-    return setpoint_send_count_;
-}
+uint64_t Px4LinkStub::SetpointSendCount() const { return setpoint_send_count_; }
+uint64_t Px4LinkStub::ReceiveCount() const { return receive_count_; }
+uint64_t Px4LinkStub::AckMatchCount() const { return ack_match_count_; }
+uint64_t Px4LinkStub::AckTimeoutCount() const { return ack_timeout_count_; }
+common::CommandAckStatus Px4LinkStub::AckStatus() const { return {}; }
+void Px4LinkStub::CancelPendingCommands() {}
+uint64_t Px4LinkStub::ErrorCount() const { return error_count_; }
 
-uint64_t Px4LinkStub::ReceiveCount() const {
-    return receive_count_;
-}
-
-uint64_t Px4LinkStub::AckMatchCount() const {
-    return ack_match_count_;
-}
-
-uint64_t Px4LinkStub::AckTimeoutCount() const {
-    return ack_timeout_count_;
-}
-
-uint64_t Px4LinkStub::ErrorCount() const {
-    return error_count_;
+common::FlightStateSnapshot Px4LinkStub::LatestState() const {
+    return common::FlightStateSnapshot{};
 }
 
 }  // namespace drone::communication

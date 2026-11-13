@@ -1,0 +1,816 @@
+#include "application/drone_application.h"
+
+#include <chrono>
+#include <exception>
+#include <memory>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+
+#include <spdlog/spdlog.h>
+
+#include "communication/ground_station_link.h"
+#include "communication/px4_link.h"
+#include "control/flight_controller.h"
+#include "control/visual_control_law.h"
+#include "control/visual_tracking_shadow.h"
+#include "perception/detection_backend.h"
+#include "perception/stereo_ranger.h"
+#include "perception/target_estimator.h"
+#include "perception/visual_target_monitor.h"
+#include "perception/yolo_detector.h"
+#include "state_machine/gcs_net_fire.h"
+#include "state_machine/mission_state_machine.h"
+#include "video/camera_receiver.h"
+#include "video/frame_compositor.h"
+#include "video/stereo_frame_splitter.h"
+#include "video/uvc_camera_receiver.h"
+#include "video/video_decoder.h"
+#include "video_transmission/video_sender.h"
+
+namespace drone::application {
+
+// ============================================================================
+// DroneApplication —— 正式进程的组件所有者与装配根。
+//
+// 负责根据 AppConfig 创建组件、在启动前完成 Topic 接线，并按数据依赖顺序
+// 启动/停止各模块。main.cpp 不承载业务装配逻辑，只负责配置、日志、信号和等待。
+// 安全基线：enable_control=false 时 FlightController 影子运行（不绑定
+// Px4Setpoint、不注入 PX4 快照源与命令接口）；只有 enable_control=true 才在
+// BindTopics 门禁分支完成控制输出接线（见函数内注释）。
+// ============================================================================
+
+DroneApplication::DroneApplication(config::AppConfig config)
+    : config_(std::move(config)) {
+    BuildComponents();
+    BindTopics();
+    SPDLOG_INFO("主程序集成创建: video={} px4={} ground_station={} target_estimator={} control={} camera_source={} stereo_split={} stereo_ranging={}",
+                config_.runtime.enable_video, config_.runtime.enable_px4,
+                config_.runtime.enable_ground_station,
+                config_.runtime.enable_target_estimator,
+                config_.runtime.enable_control, config_.video_source.camera_source,
+                config_.video_source.stereo_split,
+                config_.runtime.enable_stereo_ranging);
+}
+
+DroneApplication::~DroneApplication() {
+    Stop();
+    SPDLOG_INFO("主程序集成销毁");
+}
+
+// 根据 runtime 开关创建组件。这里只负责所有权，不在此处启动线程或连接设备。
+void DroneApplication::BuildComponents() {
+    if (config_.runtime.enable_video) {
+        // 输入源二选一：UVC 双目（USB）与 RTSP 单目共用 ICameraReceiver 接口，
+        // 下游解码/健康/启停接线对具体类型无感。
+        if (config_.video_source.camera_source == "uvc") {
+            camera_ = std::make_unique<video::UvcCameraReceiver>(config_.uvc_camera);
+        } else {
+            camera_ = std::make_unique<video::CameraReceiver>(config_.camera);
+        }
+        decoder_ = std::make_unique<video::VideoDecoder>(config_.decoder);
+        if (config_.video_source.stereo_split) {
+            stereo_splitter_ =
+                std::make_unique<video::StereoFrameSplitter>(config_.stereo_splitter);
+        }
+        detector_ = std::make_unique<perception::YoloDetector>(config_.yolo);
+        // 双目测距 v2（影子）：配置校验已保证 stereo_split 与视觉跟踪就位。
+        // 只在基准图（左目）跑检测，无右目检测实例；测距组件不注册健康源。
+        // 构造期加载预置校正矩阵，失败抛异常（启用测距时属配置错误）。
+        if (config_.runtime.enable_stereo_ranging) {
+            stereo_ranger_ = std::make_unique<perception::StereoRanger>(
+                config_.stereo_ranger, config_.stereo_rectify);
+        }
+        compositor_ = std::make_unique<video::FrameCompositor>(config_.compositor);
+        video_sender_ =
+            std::make_unique<video_transmission::VideoSender>(config_.video_sender);
+    }
+
+    // 视觉稳定性判定只消费YOLO帧级观测，属纯影子输出：不接状态机、不接控制。
+    if (config_.runtime.enable_visual_monitor && detector_ != nullptr) {
+        visual_monitor_ = std::make_unique<perception::VisualTargetMonitor>(
+            config_.visual_monitor);
+    }
+
+    // 视觉跟踪控制律影子：消费视觉稳定性状态（+ PX4 姿态，可选）发布影子
+    // ControlIntent；kControlIntent 无消费者，不产生真实控制输出。
+    if (config_.runtime.enable_visual_tracking && visual_monitor_ != nullptr) {
+        visual_tracking_shadow_ = std::make_unique<control::VisualTrackingShadow>(
+            config_.visual_tracking, config_.visual_tracking_shadow);
+    }
+
+    if (config_.runtime.enable_px4) {
+        px4_link_ = std::make_unique<communication::Px4Link>(config_.px4);
+    }
+    if (config_.runtime.enable_ground_station) {
+        ground_station_link_ = std::make_unique<communication::GroundStationLink>(
+            config_.ground_station);
+    }
+
+    // 第一阶段目标估计器只消费地面站单目标和PX4 Home，以局部NED线性卡尔曼
+    // 发布影子TargetState；不创建控制器、不产生ControlIntent或Px4Setpoint。
+    if (config_.runtime.enable_target_estimator && px4_link_ != nullptr &&
+        ground_station_link_ != nullptr) {
+        target_estimator_ = std::make_unique<perception::TargetEstimator>(
+            config_.target_estimator);
+    }
+
+    // 健康管理器独立于具体数据链路；只注册实际创建的生产模块。
+    health_manager_ = std::make_unique<health::HealthManager>(
+        std::unique_ptr<health::ICpuLoadProvider>{}, config_.health.cpu_sample_period,
+        config_.health.startup_grace_period);
+    RegisterHealthSources();
+
+    // 影子状态机只在PX4状态源与地面站目标源同时存在时创建。
+    // 意图有效期与 FlightController 的 controller.intent_timeout 同源注入，
+    // 保证状态机 valid_until_ms 与控制器超龄门禁一致；交接判据阈值来自
+    // handover 节；visual_tracking 整节注入（相机内参供视线角换算，
+    // 控制律参数/阈值供 S7 视觉伺服），不在此写死；actuator 节（捕网执行器，
+    // Task 10）同源注入——是否发得出命令由命令接口注入门禁决定
+    // （enable_control=true 才注入，见下方 BindTopics 门禁分支）。
+    if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
+        state_machine::MissionStateMachineConfig state_machine_config;
+        state_machine_config.intent_valid_for = config_.controller.intent_timeout;
+        state_machine_config.handover = config_.handover;
+        state_machine_config.tracking = config_.visual_tracking;
+        state_machine_config.visual_stale = std::chrono::milliseconds(
+            config_.visual_tracking.control.visual_stale_ms);
+        state_machine_config.distance_stale = std::chrono::milliseconds(
+            config_.visual_tracking.control.distance_stale_ms);
+        state_machine_config.actuator = config_.actuator;
+        state_machine_config.interception = config_.interception;
+        state_machine_config.return_home = config_.return_home;
+        // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
+        // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
+        state_machine_config.takeoff = config_.takeoff;
+        // 接近段速度律（approach 节）同源注入：S5 速率上限与预测提前量。
+        state_machine_config.approach = config_.approach;
+        // 控制间距与到点半径同源：standoff = arrival_radius − 0.1（不另配一份）。
+        // 到点半径已由 handover.Validate 保证为正；这里再兜底一个最小正值。
+        const double derived_standoff =
+            config_.handover.arrival_radius_m - 0.1;
+        state_machine_config.approach.speed_law.standoff_m =
+            derived_standoff > 0.1 ? derived_standoff : 0.1;
+        // 速度上限单一来源：控制器 / PX4 / 速度律共用 controller.max_speed_mps。
+        state_machine_config.max_speed_mps = config_.controller.max_speed_mps;
+        state_machine_config.expected_interceptor_type =
+            config_.ground_station.aircraft_component_id;
+        // 拦截剖面：由本机功能类别（component ID）在装配期映射，控制回路不查
+        // 身份。25=捕网 / 27=干扰（与捕网共用视觉律，参数各配）/ 26=撞击
+        // （预留：工厂 fail-fast，避免撞击机静默套用捕网“保持距离”律）。
+        switch (config_.ground_station.aircraft_component_id) {
+            case communication::kNetCaptureAircraftComponentId:
+                state_machine_config.visual_profile =
+                    control::VisualProfile::kNetCapture;
+                break;
+            case communication::kJammerAircraftComponentId:
+                state_machine_config.visual_profile =
+                    control::VisualProfile::kJammer;
+                break;
+            case communication::kRocketAircraftComponentId:
+                state_machine_config.visual_profile =
+                    control::VisualProfile::kImpact;
+                break;
+            default:
+                throw std::invalid_argument(
+                    "地面站身份 component 不在已定义的拦截剖面内（期望 25/26/27）");
+        }
+        SPDLOG_INFO("拦截剖面: {}（component={}）",
+                    control::VisualProfileName(state_machine_config.visual_profile),
+                    config_.ground_station.aircraft_component_id);
+        mission_state_machine_ =
+            std::make_unique<state_machine::MissionStateMachine>(state_machine_config);
+    }
+
+    // 地面站直控发射服务（G4-4）：只在 gcs_fire_enabled=true 时装配，与自动拦截
+    // 链互斥（配置加载期 fail-fast）。它不接任务状态机，只消费 65016 指令、
+    // 门禁通过后占用捕网执行器，并把 65017 回执交回地面站链路。
+    if (config_.actuator.gcs_fire_enabled &&
+        px4_link_ != nullptr && ground_station_link_ != nullptr) {
+        gcs_net_fire_ = std::make_unique<state_machine::GcsNetFire>(
+            config_.actuator, px4_link_.get());
+        SPDLOG_WARN(
+            "地面站直控发射已装配（actuator.gcs_fire_enabled=true）：65016 → 捕网执行器，"
+            "仍要求落地且未解锁");
+    }
+
+    // 飞行控制器（阶段四正式实现）：状态机装配即创建，与 enable_control 无关——
+    // enable_control=false 时影子运行：周期线程跑真实门禁链与限幅流水线，
+    // 但不注入 PX4 快照源（SetPx4LinkSource），授权链恒不通过、保持 IDLE 停发，
+    // SetpointOutput 无消费者；enable_control=true 的绑定见 BindTopics 门禁分支。
+    if (mission_state_machine_ != nullptr) {
+        // bootstrap 停流兜底时长由 takeoff 节注入（局部副本，不回写配置成员）：
+        // 状态机 S3 的模式/解锁超时是权威，控制器只负责防卡死兜底。
+        config::FlightControllerConfig flight_controller_config = config_.controller;
+        flight_controller_config.bootstrap_timeout = config_.takeoff.bootstrap_timeout;
+        flight_controller_ =
+            std::make_unique<control::FlightController>(flight_controller_config);
+        control_assembly_.flight_controller_created = true;
+        control_assembly_.controller_bootstrap_timeout =
+            flight_controller_config.bootstrap_timeout;
+    }
+}
+
+// 注册运行期健康源。阈值全部来自 AppConfig，禁止在装配层写死业务超时。
+void DroneApplication::RegisterHealthSources() {
+    const auto register_source = [this](const char* name,
+                                         std::chrono::milliseconds max_age) {
+        if (!health_manager_->RegisterSource(name,
+                                             static_cast<std::uint64_t>(max_age.count()))) {
+            SPDLOG_ERROR("主程序健康源注册失败: {}", name);
+        }
+    };
+
+    if (camera_ != nullptr) {
+        register_source(health::source_names::kCamera, config_.health.camera_max_age);
+    }
+    if (decoder_ != nullptr) {
+        register_source(health::source_names::kVideoDecoder,
+                       config_.health.decoder_max_age);
+    }
+    if (detector_ != nullptr) {
+        register_source(health::source_names::kYolo, config_.health.yolo_max_age);
+    }
+    if (video_sender_ != nullptr) {
+        register_source(health::source_names::kVideo, config_.health.video_max_age);
+    }
+    if (px4_link_ != nullptr) {
+        register_source(health::source_names::kPx4, config_.health.px4_max_age);
+    }
+    if (ground_station_link_ != nullptr) {
+        register_source(health::source_names::kGroundStation,
+                       config_.health.ground_station_max_age);
+    }
+}
+
+// 在所有组件 Start 前完成 Topic 接线；生产者/消费者的启动顺序由 Start 控制。
+void DroneApplication::BindTopics() {
+    if (config_.runtime.enable_video) {
+        decoder_->SetInput(camera_->StreamOutput());
+        if (stereo_splitter_ != nullptr) {
+            // 双目拆分链路：YOLO/叠加改消费拆分后左目（与 RTSP 解码帧同为
+            // 1280×720 NV12，下游无差异）；右目默认仅统计，启用双目测距时
+            // 接右目检测器。
+            stereo_splitter_->SetInput(decoder_->FrameOutput());
+            detector_->SetInput(stereo_splitter_->LeftOutput());
+            compositor_->SetDecodedInput(stereo_splitter_->LeftOutput());
+            if (stereo_ranger_ != nullptr) {
+                // v2 稀疏匹配：检测只在基准图（左目）跑；测距组件消费左目检测框
+                // 与左右目原始帧（基准=SBS右半=左目输出，辅助=SBS左半=右目输出）。
+                stereo_ranger_->SetDetectionInput(detector_->DetectionOutput());
+                stereo_ranger_->SetLeftFrameInput(stereo_splitter_->LeftOutput());
+                stereo_ranger_->SetRightFrameInput(stereo_splitter_->RightOutput());
+                // 距离输出只接视觉跟踪影子（影子，无真实控制）；视觉跟踪未装配时
+                // （如探针裁剪配置）距离通道仅由测距组件统计，不允许空指针解引用。
+                if (visual_tracking_shadow_ != nullptr) {
+                    visual_tracking_shadow_->SetDistanceInput(
+                        stereo_ranger_->DistanceOutput());
+                }
+            }
+        } else {
+            detector_->SetInput(decoder_->FrameOutput());
+            compositor_->SetDecodedInput(decoder_->FrameOutput());
+        }
+        compositor_->SetDetectionInput(detector_->DetectionOutput());
+        video_sender_->SetInput(compositor_->AnnotatedOutput());
+    }
+
+    if (visual_monitor_ != nullptr && detector_ != nullptr) {
+        visual_monitor_->SetInput(detector_->ObservationOutput());
+    }
+
+    if (visual_tracking_shadow_ != nullptr && visual_monitor_ != nullptr) {
+        visual_tracking_shadow_->SetVisualInput(visual_monitor_->StatusOutput());
+        if (px4_link_ != nullptr) {
+            visual_tracking_shadow_->SetFlightInput(px4_link_->StateOutput());
+        }
+    }
+
+    if (ground_station_link_ != nullptr && px4_link_ != nullptr) {
+        ground_station_link_->SetFlightStateInput(px4_link_->StateOutput());
+    }
+
+    if (ground_station_link_ != nullptr && health_manager_ != nullptr) {
+        ground_station_link_->SetHealthInput(health_manager_->Output());
+    }
+
+    if (target_estimator_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr) {
+        target_estimator_->SetGroundTargetInput(
+            ground_station_link_->TargetOutput());
+        target_estimator_->SetFlightStateInput(px4_link_->StateOutput());
+        // 视觉融合（影子）：双目距离 → 局部NED 观测接入同一滤波器；
+        // 开关关闭或未装配测距时不接线，估计器行为与第一阶段一致。
+        if (config_.runtime.enable_visual_position_fusion &&
+            stereo_ranger_ != nullptr) {
+            target_estimator_->SetVisualDistanceInput(
+                stereo_ranger_->DistanceOutput());
+        }
+    }
+
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr && health_manager_ != nullptr) {
+        mission_state_machine_->SetInputs(ground_station_link_->TargetOutput(),
+                                          px4_link_->StateOutput(),
+                                          health_manager_->Output());
+        ground_station_link_->SetMissionStatusInput(
+            mission_state_machine_->StatusOutput());
+    }
+
+    // 多边形围栏（2026-10-29）：65018 区域 → 状态机（机载自治执行）；状态机
+    // 65019 状态 → 地面站链路；状态机同时作为 FlightController 的只读多边形源
+    // （位置意图钳制）。区域缓存 config/zone.json 由状态机启动时装载。
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_->SetFenceInput(
+            ground_station_link_->FenceZoneOutput());
+        ground_station_link_->SetFenceStatusInput(
+            mission_state_machine_->FenceStatusOutput());
+        // 65022 区域回读：机载当前生效区域 → 地面站（比对 + 重连后恢复图层）。
+        ground_station_link_->SetFenceZoneReportInput(
+            mission_state_machine_->FenceZoneReportOutput());
+        if (flight_controller_ != nullptr) {
+            flight_controller_->SetFencePolygonSource(
+                mission_state_machine_.get());
+        }
+    }
+
+    // 人工任务指令（2026-10-29）：65020 主动返航 → 状态机；65021 回执 → 地面站。
+    // 与 65014 分工：65014 分配任务，65020 对已起飞任务下即时指令。
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_->SetMissionCommandInput(
+            ground_station_link_->MissionCommandOutput());
+        ground_station_link_->SetMissionCommandAckInput(
+            mission_state_machine_->MissionCommandAckOutput());
+    }
+
+    // 多机任务分配：65014 解析结果 → 状态机；65015 回执 → 地面站链路。
+    // 分配输入/回执不依赖 enable_control：无控制装配时状态机仍接收 65014，
+    // 预检回 control_disabled，地面站可据此获知不可调度。
+    if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
+        mission_state_machine_->SetAssignmentInput(
+            ground_station_link_->MissionAssignmentOutput());
+        ground_station_link_->SetMissionAssignmentAckInput(
+            mission_state_machine_->AssignmentAckOutput());
+        control_assembly_.assignment_input_bound = true;
+        control_assembly_.assignment_ack_bound = true;
+    }
+
+    // 地面站直控发射接线（G4-4）：65016 指令 → GcsNetFire → 捕网执行器；
+    // 65017 回执 → 地面站链路。只在启用直控发射时接线，未装配时 65016 由链路
+    // 丢弃并记日志（不会触发任何动作）。
+    if (gcs_net_fire_ != nullptr && ground_station_link_ != nullptr &&
+        px4_link_ != nullptr) {
+        gcs_net_fire_->SetFlightStateInput(px4_link_->StateOutput());
+        gcs_net_fire_->SetCommandInput(
+            ground_station_link_->NetFireCommandOutput());
+        ground_station_link_->SetNetFireAckInput(gcs_net_fire_->AckOutput());
+    }
+    if (ground_station_link_ != nullptr) {
+        // 未装配 GcsNetFire（gcs_fire_enabled=false，生产默认）时告知链路层：
+        // 65016 仍会解码发布，但无人消费，需要打一条节流 WARN 便于现场判读。
+        ground_station_link_->SetNetFireConsumerPresent(gcs_net_fire_ != nullptr);
+    }
+
+    // S5 位置引导输入：估计器/视觉稳定性/双目测距三者必须作为一组同时装配，
+    // 缺一不绑定（状态机保持影子行为，不会假装执行自动任务）。
+    if (mission_state_machine_ != nullptr && target_estimator_ != nullptr &&
+        visual_monitor_ != nullptr && stereo_ranger_ != nullptr) {
+        mission_state_machine_->SetEstimationInputs(
+            target_estimator_->EstimatedOutput(), visual_monitor_->StatusOutput(),
+            stereo_ranger_->DistanceOutput());
+        control_assembly_.estimation_inputs_bound = true;
+    }
+
+    // 交接判据的创新门限读取估计器最近一次视觉创新（只读诊断接口）。
+    // 未装配估计器时不注入：交接判据不评估（保持 GPS_APPROACH 影子行为）。
+    if (mission_state_machine_ != nullptr && target_estimator_ != nullptr) {
+        mission_state_machine_->SetEstimationDiagnostics(target_estimator_.get());
+    }
+
+    // 飞行控制器接线（阶段四装配门禁）。意图输入纪律：只接
+    // MissionStateMachine::IntentOutput()——VisualTrackingShadow 的影子意图不带
+    // 授权请求位（common::kControlIntentReasonRequestControl，reason_code bit31），
+    // 若接入控制器会每拍清锁存压死授权门禁，故影子输出永不接 FlightController。
+    if (flight_controller_ != nullptr && mission_state_machine_ != nullptr) {
+        flight_controller_->SetInput(mission_state_machine_->IntentOutput());
+        control_assembly_.intent_input_bound = true;
+    }
+
+    // enable_control 门禁：只有显式打开才把控制输出接到 PX4 链路并注入授权
+    // 数据源；false 时保持物理隔离——不绑定 Px4Setpoint、不注入快照源、
+    // 不注入命令接口，控制器留在 IDLE 影子运行。
+    if (config_.runtime.enable_control && flight_controller_ != nullptr &&
+        px4_link_ != nullptr) {
+        flight_controller_->SetPx4LinkSource(px4_link_.get());
+        px4_link_->SetInput(flight_controller_->SetpointOutput());
+        // 阶段四装配门禁分支（Task 6）内注入 PX4 命令窄接口（调用启用归 Task 7，
+        // 仅 enable_control=true 可达；false 时命令接口物理缺席）。
+        mission_state_machine_->SetCommandSender(px4_link_.get());
+        control_assembly_.command_sender_injected = true;
+        control_assembly_.px4_snapshot_source_injected = true;
+        control_assembly_.setpoint_bound_to_px4 = true;
+        SPDLOG_WARN("正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint");
+    }
+}
+
+// 启动独立模块。单个模块失败时记录降级并继续尝试其他模块；只要有一个模块
+// 成功启动就返回 true，避免视频、遥测等相互独立的数据链路被连带阻断。
+bool DroneApplication::Start() {
+    if (running_) {
+        return true;
+    }
+
+    bool any_started = false;
+    bool degraded = false;
+
+    // 视觉稳定性判定是YOLO帧级观测的消费者，必须先于检测器启动；
+    // 它只是影子状态，失败不影响视频链路本身。
+    if (visual_monitor_ != nullptr) {
+        if (!visual_monitor_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序视觉稳定性判定启动失败，视觉影子状态不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 视觉跟踪影子是视觉稳定性状态的消费者，紧随其启动；纯影子输出，
+    // 失败不影响任何数据链路。
+    if (visual_tracking_shadow_ != nullptr) {
+        if (!visual_tracking_shadow_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序视觉跟踪影子启动失败，控制律影子观察不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 双目测距是左右检测结果的消费者，必须先于检测器启动；纯影子，失败不阻断。
+    if (stereo_ranger_ != nullptr) {
+        if (!stereo_ranger_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序双目测距启动失败，距离通道影子不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    if (video_sender_ != nullptr) {
+        if (video_sender_->Start()) {
+            any_started = true;
+        } else {
+            degraded = true;
+            SPDLOG_ERROR("主程序图传发送启动失败，视频链路降级");
+        }
+        if (!compositor_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序叠加器启动失败，视频链路降级");
+        } else {
+            any_started = true;
+        }
+        try {
+            if (!detector_->Start()) {
+                degraded = true;
+                SPDLOG_ERROR("主程序YOLO启动失败，检测链路降级");
+            } else {
+                any_started = true;
+            }
+        } catch (const std::exception& error) {
+            degraded = true;
+            SPDLOG_ERROR("主程序YOLO启动异常: {}", error.what());
+        }
+        // 拆分器是解码器的消费者、YOLO/叠加的生产者：在二者之后、解码器之前启动。
+        if (stereo_splitter_ != nullptr) {
+            if (!stereo_splitter_->Start()) {
+                degraded = true;
+                SPDLOG_ERROR("主程序双目拆分器启动失败，视频链路降级");
+            } else {
+                any_started = true;
+            }
+        }
+        if (!decoder_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序视频解码启动失败，视频链路降级");
+        } else {
+            any_started = true;
+        }
+        if (!camera_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序摄像头接收启动失败，视频链路降级");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 影子目标估计器必须先于地面站/PX4生产者启动，避免漏掉首个Home或目标。
+    if (target_estimator_ != nullptr) {
+        if (!target_estimator_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序目标估计器启动失败，TargetState影子输出不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 飞行控制器是状态机意图的消费者，必须先于状态机启动；影子/正式语义由
+    // 装配期 enable_control 门禁决定（见 BindTopics），失败不阻断其他链路。
+    if (flight_controller_ != nullptr) {
+        if (!flight_controller_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序飞行控制器启动失败，控制链路不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    if (mission_state_machine_ != nullptr) {
+        if (!mission_state_machine_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序任务状态机启动失败，任务状态回传降级");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 直控发射服务消费 PX4 飞行状态与地面站指令，启动顺序在两者之前即可
+    // （订阅不依赖生产者先启动）；失败不阻断其他链路。
+    if (gcs_net_fire_ != nullptr) {
+        if (!gcs_net_fire_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序直控发射服务启动失败，捕网远程点火不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    // 地面站是PX4状态消费者，必须先于PX4生产者启动。
+    if (ground_station_link_ != nullptr) {
+        if (!ground_station_link_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序地面站链路启动失败，地面站遥测下行不可用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    if (health_manager_ != nullptr) {
+        if (!health_manager_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序健康管理启动失败，健康状态汇总不可用");
+        } else {
+            StartHealthReporter();
+        }
+    }
+
+    if (px4_link_ != nullptr) {
+        if (!px4_link_->Start()) {
+            degraded = true;
+            SPDLOG_ERROR("主程序PX4链路启动失败，飞行状态保持不可用，控制未启用");
+        } else {
+            any_started = true;
+        }
+    }
+
+    running_ = any_started;
+    if (!any_started) {
+        StopHealthReporter();
+        if (health_manager_ != nullptr) {
+            health_manager_->Stop();
+        }
+        SPDLOG_ERROR("主程序没有任何模块成功启动");
+        return false;
+    }
+    SPDLOG_INFO("主程序启动完成: degraded={}", degraded);
+    return true;
+}
+
+void DroneApplication::StartHealthReporter() {
+    if (health_report_running_.exchange(true)) {
+        return;
+    }
+    health_report_thread_ = std::thread([this] { HealthReportLoop(); });
+}
+
+void DroneApplication::StopHealthReporter() {
+    if (!health_report_running_.exchange(false)) {
+        return;
+    }
+    if (health_report_thread_.joinable()) {
+        health_report_thread_.join();
+    }
+}
+
+void DroneApplication::HealthReportLoop() {
+    std::uint64_t last_camera_bytes = 0;
+    std::uint64_t last_decoder_frames = 0;
+    std::uint64_t last_yolo_frames = 0;
+    std::uint64_t last_video_frames = 0;
+    std::uint64_t last_camera_errors = 0;
+    std::uint64_t last_decoder_errors = 0;
+    std::uint64_t last_yolo_errors = 0;
+    std::uint64_t last_video_errors = 0;
+    std::uint64_t last_px4_errors = 0;
+    std::uint64_t last_ground_station_errors = 0;
+
+    const auto now_ms = [] {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+    };
+
+    while (health_report_running_.load()) {
+        const std::uint64_t timestamp_ms = now_ms();
+        const auto report_if_changed = [this, timestamp_ms](const char* source,
+                                                             std::uint64_t value,
+                                                             std::uint64_t& last) {
+            if (value != last) {
+                last = value;
+                health_manager_->ReportData(source, timestamp_ms);
+            }
+        };
+        const auto report_error_increase = [this, timestamp_ms](
+                                               const char* source,
+                                               std::uint64_t value,
+                                               std::uint64_t& last) {
+            if (value > last) {
+                health_manager_->ReportError(source, timestamp_ms);
+            }
+            last = value;
+        };
+
+        if (camera_ != nullptr) {
+            report_if_changed(health::source_names::kCamera,
+                              camera_->ReceivedBytes(), last_camera_bytes);
+            report_error_increase(health::source_names::kCamera,
+                                  camera_->ErrorCount(), last_camera_errors);
+        }
+        if (decoder_ != nullptr) {
+            report_if_changed(health::source_names::kVideoDecoder,
+                              decoder_->DecodedFrameCount(), last_decoder_frames);
+            report_error_increase(health::source_names::kVideoDecoder,
+                                  decoder_->ErrorCount(), last_decoder_errors);
+        }
+        if (detector_ != nullptr) {
+            report_if_changed(health::source_names::kYolo,
+                              detector_->ProcessedFrameCount(), last_yolo_frames);
+            report_error_increase(health::source_names::kYolo,
+                                  detector_->ErrorCount(), last_yolo_errors);
+        }
+        if (video_sender_ != nullptr) {
+            report_if_changed(health::source_names::kVideo,
+                              video_sender_->SentFrameCount(), last_video_frames);
+            report_error_increase(health::source_names::kVideo,
+                                  video_sender_->ErrorCount(), last_video_errors);
+        }
+        if (px4_link_ != nullptr) {
+            // PX4健康只接受已通过目标身份校验的心跳连接，不以任意接收包计数代替。
+            if (px4_link_->IsConnected()) {
+                health_manager_->ReportData(health::source_names::kPx4, timestamp_ms);
+            }
+            report_error_increase(health::source_names::kPx4,
+                                  px4_link_->ErrorCount(), last_px4_errors);
+        }
+        if (ground_station_link_ != nullptr) {
+            // 地面站健康只接受255/190 GCS心跳建立后的连接状态，过滤任意/错误来源消息。
+            if (ground_station_link_->IsConnected()) {
+                health_manager_->ReportData(health::source_names::kGroundStation,
+                                            timestamp_ms);
+            }
+            report_error_increase(health::source_names::kGroundStation,
+                                  ground_station_link_->ErrorCount(),
+                                  last_ground_station_errors);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// 停止顺序与数据流相反：先停止状态生产者，再停止消费者，最后关闭视频链路。
+// Stop 幂等，析构阶段可以安全重复调用。
+void DroneApplication::Stop() {
+    if (!running_) {
+        return;
+    }
+
+    SPDLOG_INFO("主程序开始停止");
+    // 注意：PX4 链路是飞行快照与电池等遥测的生产者，必须在状态机/控制器
+    // （消费者）之后停止。若先停 PX4，状态机在停机窗口内会看到遥测陈旧，
+    // 触发“飞行中电池中止”并打 RETURN_HOME/LANDING 告警（2026-11-02 P1：
+    // 0082 实机 Ctrl+C 时复现，reason=16）。这里先停止视频等其余生产者。
+    if (camera_ != nullptr) {
+        camera_->Stop();
+        decoder_->Stop();
+        if (stereo_splitter_ != nullptr) {
+            stereo_splitter_->Stop();
+        }
+        detector_->Stop();
+        compositor_->Stop();
+        video_sender_->Stop();
+    }
+
+    // 检测生产者已停止，再停止测距消费者。
+    if (stereo_ranger_ != nullptr) {
+        stereo_ranger_->Stop();
+    }
+
+    // 视频生产者已停止，再停止其观测消费者。
+    if (visual_monitor_ != nullptr) {
+        visual_monitor_->Stop();
+    }
+
+    // 视觉跟踪影子在视觉状态源停止后停止。
+    if (visual_tracking_shadow_ != nullptr) {
+        visual_tracking_shadow_->Stop();
+    }
+
+    StopHealthReporter();
+    if (health_manager_ != nullptr) {
+        health_manager_->Stop();
+    }
+
+    // 健康生产者停止后再停止其消费者；状态机意图的消费者（飞行控制器）先停。
+    if (flight_controller_ != nullptr) {
+        flight_controller_->Stop();
+    }
+    if (mission_state_machine_ != nullptr) {
+        mission_state_machine_->Stop();
+    }
+    if (target_estimator_ != nullptr) {
+        target_estimator_->Stop();
+    }
+    // 直控发射服务是地面站指令的消费者、回执的生产者，先于地面站链路停止。
+    if (gcs_net_fire_ != nullptr) {
+        gcs_net_fire_->Stop();
+    }
+    if (ground_station_link_ != nullptr) {
+        ground_station_link_->Stop();
+    }
+    // PX4 链路最后停止：它是遥测生产者，状态机/控制器/健康上报都已退出后
+    // 再关闭，停机窗口内不会再产生“遥测陈旧”推导出的中止（P1，2026-11-02）。
+    if (px4_link_ != nullptr) {
+        px4_link_->Stop();
+    }
+
+    running_ = false;
+    SPDLOG_INFO("主程序停止完成");
+}
+
+bool DroneApplication::IsRunning() const {
+    return running_;
+}
+
+VideoPipelineLatencySnapshot DroneApplication::VideoLatencySnapshot() const {
+    VideoPipelineLatencySnapshot snapshot;
+    if (decoder_ != nullptr) {
+        snapshot.input_codec = decoder_->ActiveCodec();
+        snapshot.hardware_decoder = decoder_->IsHardwareDecoder();
+        snapshot.encoded_frame_count = decoder_->EncodedFrameCount();
+        snapshot.encoded_bytes = decoder_->EncodedBytes();
+        snapshot.key_frame_count = decoder_->KeyFrameCount();
+        snapshot.hardware_transfer_buffer_build_count =
+            decoder_->HardwareTransferBufferBuildCount();
+        snapshot.rga_dma_transfer_count = decoder_->RgaDmaTransferCount();
+        snapshot.rga_dma_fallback_count = decoder_->RgaDmaFallbackCount();
+        snapshot.decode_queue = decoder_->InputQueueLatency();
+        snapshot.decode = decoder_->DecodeLatency();
+        snapshot.ingress_to_decoded = decoder_->IngressToDecodedLatency();
+        snapshot.packet_prepare = decoder_->PacketPrepareLatency();
+        snapshot.send_packet = decoder_->SendPacketLatency();
+        snapshot.receive_frame = decoder_->ReceiveFrameLatency();
+        snapshot.hardware_transfer_prepare =
+            decoder_->HardwareTransferPrepareLatency();
+        snapshot.hardware_transfer = decoder_->HardwareTransferLatency();
+        snapshot.rga_dma_transfer = decoder_->RgaDmaTransferLatency();
+        snapshot.frame_copy = decoder_->FrameCopyLatency();
+    }
+    if (detector_ != nullptr) {
+        snapshot.yolo_queue = detector_->InputQueueLatency();
+        snapshot.yolo_inference = detector_->InferenceLatency();
+        snapshot.ingress_to_inference = detector_->IngressToInferenceLatency();
+        const auto backend = detector_->BackendLatencySnapshot();
+        snapshot.yolo_preprocess_total = backend.preprocess_total;
+        snapshot.yolo_rga_resize_color = backend.rga_resize_color;
+        snapshot.yolo_letterbox_copy = backend.letterbox_copy;
+        snapshot.yolo_npu_run = backend.npu_run;
+        snapshot.yolo_npu_internal_run = backend.npu_internal_run;
+        snapshot.yolo_npu_wall_overhead = backend.npu_wall_overhead;
+        snapshot.yolo_npu_perf_query = backend.npu_perf_query;
+        snapshot.yolo_output_layout = backend.output_layout;
+        snapshot.yolo_postprocess = backend.postprocess;
+    }
+    if (compositor_ != nullptr) {
+        snapshot.compositor_queue = compositor_->InputQueueLatency();
+        snapshot.compositor = compositor_->ComposeLatency();
+        snapshot.ingress_to_annotated = compositor_->IngressToAnnotatedLatency();
+    }
+    if (video_sender_ != nullptr) {
+        snapshot.sender_queue = video_sender_->InputQueueLatency();
+        snapshot.frame_prepare = video_sender_->FramePrepareLatency();
+        snapshot.encode_and_push = video_sender_->EncodeAndPushLatency();
+        snapshot.packet_write = video_sender_->PacketWriteLatency();
+        snapshot.ingress_to_rtsp = video_sender_->IngressToRtspLatency();
+    }
+    return snapshot;
+}
+
+}  // namespace drone::application

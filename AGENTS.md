@@ -11,6 +11,8 @@
 - **主要功能**：接收地面站目标位置 → YOLOv26 目标识别 → 轨迹预测 → 控制 PX4 无人机跟踪/反制
 - **通信协议**：MAVLink（与 PX4 飞控和地面站通信）
 
+**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定）；要回纯影子把它改回 `false` 重启即可。两个发射闸门仍关：`interception.enabled=false`（S9/S10 自动拦截不可达）、`actuator.gcs_fire_enabled=false`（65016 直控不装配）。控制链由 `MissionStateMachine` 的 `kControlIntent` 经 `FlightController` → `Px4Setpoint` 下发 PX4；只有 `TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 仍是影子（跑真实算法、无控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home）；阶段四控制接入路径代码已全部落地，`enable_control=true` 时绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口，`false` 时影子停发。门禁 G1~G4 已完成（G4-1 电机怠速 2026-10-21 人工确认、G4-2 机体方向 2026-10-28 遥控器飞行确认、G4-3 机构/参数/时序 2026-10-23 冻结、G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过），下一步是 G5 首飞（科目见 [`docs/PX4实链验证清单.md`](docs/PX4实链验证清单.md) §7.5）。
+
 ## 开发与构建环境（强制规则）
 
 - **运行目标**：代码最终在香橙派（RK3588，ARM64，Ubuntu）上编译、部署和运行。
@@ -20,11 +22,33 @@
 - 在 WSL2 Ubuntu 24.04 中的标准构建流程：
 
   ```bash
+  # 主工程
   cmake -S . -B build
   cmake --build build -j$(nproc)
-  ./build/drone_control        # 生成 logs/0001_xxx.log 日志
+  ctest --test-dir build --output-on-failure     # 基线 678/678
+  python3 tools/check_docs.py                    # 文档基线/链接/模块文档检查
+  ./build/drone_control                          # 生成 logs/0001_xxx.log
+  ./build/drone_control --config /路径/config.json
+
+  # 运行单个测试（二选一）
+  ctest --test-dir build -R <测试名> --output-on-failure
+  ./build/<test_executable> --gtest_filter='Suite.Case'
+
+  # 切换 RKNN / RGA 后端（CMakeCache 会记住旧值，需 -U 清除）
+  cmake -S . -B build -U DRONE_HAVE_RKNN -DDRONE_HAVE_RKNN=ON
+  cmake -S . -B build -U DRONE_HAVE_RGA_DMA -DDRONE_HAVE_RGA_DMA=ON
+  # ARM64 原生构建两者默认 ON，x86_64 开发机默认 OFF；香橙派需 ffmpeg-rockchip、librknnrt、librga
+
+  # 独立子库（与主工程解耦，单独构建，未接入 DroneApplication）
+  cmake -S target_tracker -B target_tracker/build && cmake --build target_tracker/build
+  ctest --test-dir target_tracker/build --output-on-failure
+  cmake -S visual_track_control -B build_vtc -DBUILD_TESTING=OFF && cmake --build build_vtc
+
+  # Web 开发版地面站（Vue3 + Node，tools/web平台/）
+  cd tools/web平台 && npm run dev
   ```
 
+- 工具：`tools/sitl_harness.sh`（**SITL 验收装置**：PX4 SITL + PTY 桥 + GCS 心跳 + 生产程序，子命令 `stack`/`app`/`smoke`/`stop`/`status`；文档 `tools/sitl_harness.md`）、`px4_link_smoke`（PX4 串口冒烟/SITL 分级测试；G4 台架 `--bench-stage4-controller --bench-ack-props-off`，仅串口、必须拆桨）、`video_latency_probe`（视频链路延迟探针）、`tools/*.py`（地面站 TIMESYNC/目标发送测试、`assignment_sitl.py` 任务分配验收）。
 - 提交代码前必须保证在 WSL2 Ubuntu 24.04 中编译通过；香橙派上执行最终部署验证。
 
 ## 架构设计
@@ -36,44 +60,96 @@
 - 线程间通过消息队列或通知机制通信
 - 各模块可独立编译、独立测试
 
-### 7 个线程
+### 主要线程
 
 | 线程 | 职责 |
 |------|------|
-| 摄像头采集线程 | 网口采集原始画面 → 内存池 A |
-| YOLO 识别线程 | 从内存池 A 取画面识别目标 → 内存池 B |
-| 图传发送线程 | 从内存池 B 取图像 → 网口发送给图传 |
+| 摄像头采集线程 | RTSP/UVC 采集原始画面 → 解码 → 内存池 |
+| YOLO 识别线程 | 取解码帧识别目标 → 检测结果 |
+| 图传发送线程 | 叠加帧 → 编码 → RTSP 推送 |
 | PX4 串口通信线程 | 与 PX4 飞控 MAVLink 双向通信 |
 | 电台数传线程 | 与地面站 MAVLink 双向通信 |
-| 激光测距雷达线程 | 串口读取距离数据 |
-| 状态机与控制线程 | 消费各线程数据，轨迹预测、状态机决策、生成控制指令 |
+| 双目深度线程 | 消费左右目帧与检测框，输出带质量/时间戳的稀疏 Census 距离（影子，无控制输出） |
+| 状态机与控制线程 | 消费各线程数据，状态机决策并生成控制意图；装配门禁：`enable_control=true` 绑定 `Px4Setpoint` 下发，`false` 回影子停发 |
+
+### 架构要点（装配、数据流与边界）
+
+**装配模型**：`main.cpp` → 解析 config → `DroneApplication`（`src/application/drone_application.cpp`）只做三件事：`BuildComponents()` 创建组件、`BindTopics()` 连接 Topic、`Start()/Stop()` 按依赖序管理生命周期。**禁止把业务算法写进 main.cpp 或 DroneApplication**。
+
+**模块间通信**：发布订阅 `Topic<T>`（`include/common/topic.h`），公共消息类型与 Topic 名称常量在 `include/common/types.h`。跨线程数据必须带时间戳、序号、有效期和来源健康状态；图像经内存池零拷贝传递，队列有界、优先最新帧。
+
+**主数据流**（正式装配）：
+
+```text
+摄像头 RTSP/H.265 → CameraReceiver → kCameraStream → VideoDecoder → kDecodedFrame
+  → YoloDetector → kDetection（每目标一条）+ kVisualTarget（每帧一条）
+  → VisualTargetMonitor（影子）→ kVisualTargetStatus
+  → FrameCompositor → kAnnotatedFrame → VideoSender → H.264 → MediaMTX/HM30
+PX4 /dev/ttyS1 → Px4Link → kFlightState → GroundStationLink → /dev/ttyS6 → 地面站
+地面站目标 UPDATE/ACK：MAVLink2 V2_EXTENSION message_type 65010/65011，
+  健康 65012、任务状态 65013
+```
+
+**模块库**：`drone_video`（拉流/解码/叠加）、`drone_video_transmission`（编码+图传）、`drone_perception`（YOLO/坐标换算/卡尔曼/目标估计）、`drone_communication`（串口/MAVLink/PX4/地面站）、`drone_state_machine`、`drone_control_core`、`drone_health`、`drone_config`、`drone_application`。FFmpeg 经 PIMPL 隔离不泄漏到头文件；MAVLink 头以 SYSTEM include 传播压警告。
+
+**状态标记**（文档与代码边界）：正式 / 影子 / Stub / 独立 / 阻塞——改动前确认目标模块当前处于哪种状态，不要把规划能力当成已实现。
+
+**路径约定**：部署为目录式绿色软件，所有路径经 `/proc/self/exe` 相对可执行文件解析（`config/`、`models/`、`logs/`）；CMake 每次构建自动同步 `models/` 和 `config/` 到 build 目录。配置查找顺序：`--config` 参数 → 可执行文件旁 `config/config.json` → `./config/config.json`。
 
 ## 目录结构
 
 ```
 drone_test/
 ├── CMakeLists.txt
-├── README.md
-├── docs/                    # 全部设计文档（含 开发思路.md、状态机设计.md）
-├── include/
-│   ├── communication/       # serial_port.h, px4_link.h, ground_station_link.h
-│   ├── perception/          # yolo_detector.h, optical_flow_estimator.h, laser_range_finder.h,
-│   │                        #   perception_fusion.h, target_estimator.h
-│   ├── control/             # flight_controller.h
-│   ├── state_machine/       # mission_state_machine.h
-│   ├── video/               # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h
-│   ├── video_transmission/  # video_sender.h
+├── main.cpp                 # 唯一正式入口：配置/日志/信号 + DroneApplication
+├── README.md / AGENTS.md
+├── docs/                    # 文档入口 + 当前设计/进度/排查 + archive/ 历史材料
+├── include/                 # 与 src/ 镜像；每个模块同级维护 *.md 实现文档
+│   ├── application/         # drone_application.h（组件装配根）
+│   ├── common/              # topic.h, types.h, logger.h, latency_statistics.h
+│   ├── video/               # RTSP/UVC 接收、解码、帧池、SBS 拆分、RGA 转存、叠加
+│   ├── video_transmission/  # 编码 + 图传
+│   ├── perception/          # YOLO/RKNN、双目测距、WGS84→NED、目标估计、视觉稳定性
+│   ├── communication/       # serial_port.h, mavlink_handler.h, px4_link.h, ground_station_link.h
+│   ├── control/             # flight_controller.h, tracking_control_law.h, shadow 等
+│   ├── state_machine/       # mission_state_machine.h（S0~S16）
 │   ├── health/              # health_manager.h
-│   ├── common/              # logger.h, topic.h, types.h
-│   └── config/              # config.h（配置文件解析与参数管理）
-├── src/                     # 对应的 .cpp 实现文件 + main.cpp
-├── tests/                   # 单元测试（含 tests/skeleton/ 骨架冒烟测试），与 src/ 结构对应
-├── config/                  # 配置文件（JSON/YAML）
-└── third_party/
-    ├── mavlink/             # MAVLink 库
-    ├── spdlog/              # spdlog 日志库
-    └── nlohmann/            # JSON 库
+│   └── config/              # config.h（AppConfig 解析与校验）
+├── src/                     # 与 include/ 对应的 .cpp 实现
+├── tests/                   # Google Test，目录与 src/ 对应
+├── config/                  # JSON 配置 + 相机标定/立体校正矩阵
+├── tools/                   # SITL/冒烟、探针、标定、Web 地面站、证据目录
+├── models/                  # RKNN 模型（生产文件名见 config.json）
+├── third_party/             # spdlog / mavlink / nlohmann / rknn 头文件
+├── target_tracker/          # 独立多目标追踪库（不接入主应用）
+├── visual_track_control/    # 独立视觉控制律库（核心律已移植主工程）
+├── stereo_depth/            # 独立双目深度子工程（不接入）
+├── yolo_pt/                 # 模型训练与 pt→RKNN 导出（Python；本地工作区，不入库）
+├── videoPart/               # 视频/RKNN 历史验证原型
+└── deploy/ logs/            # 部署文件 / 运行时日志（logs 不入库）
 ```
+
+### 目录边界
+
+| 目录 | 性质 |
+|---|---|
+| `src/`、`include/`、`main.cpp` | 正式工程（镜像结构，模块一一对应） |
+| `tests/` | Google Test，结构对应 `src/`；`tests/skeleton/` 为骨架冒烟 |
+| `target_tracker/`、`visual_track_control/` | 独立子工程（自有 CMakeLists），未接入主应用，保持独立构建 |
+| `videoPart/` | 视频/RKNN 历史验证原型，不进正式装配 |
+| `yolo_pt/` | 模型训练与 pt→RKNN 导出（Python）；本地工作区，父仓库不跟踪，内部单独 git |
+| `tools/` | 冒烟/探针/地面站测试工具 + `web平台/`（Vue3 开发版地面站）+ 证据目录 |
+| `docs/` | 当前文档入口 + `archive/`/`superpowers/` 历史材料（中文文件名） |
+
+## 维护文档入口（排查/改动前先读）
+
+1. `docs/README.md` — **文档唯一入口**：文档地图、单一事实来源、更新矩阵、基线位置
+2. `docs/项目总览与数据流.md` — 正式/影子/Stub 边界、全部数据流、线程模型
+3. `docs/模块索引.md` — 按类名/Topic/配置/测试定位代码
+4. `docs/故障排查手册.md` — 按现象定位（无画面、无检测、无 ACK 等）
+5. `docs/新增设备接入指南.md` — 替换/新增硬件的固定步骤
+6. `docs/开发进度.md` — 当前状态/门禁/最近变更；`docs/开发历史.md` — 历史时间线
+7. 各模块头文件同级的实现文档
 
 ## 语言、命名与信息核实规则
 
@@ -98,6 +174,10 @@ drone_test/
 - **头文件保护统一使用 `#pragma once`**；已有头文件（如 `topic.h`、
   `logger.h`、`video_frame.h`）沿用原 include guard，不再改动，新头文件
   一律使用 `#pragma once`
+- **行尾统一为 LF**，由根 `.gitattributes` 强制（`text=auto eol=lf`）：Windows 侧
+  编辑器会把文件改写成 CRLF，产生大量“忽略空白后 diff 为空”的假改动并淹没真实改动。
+  禁止用编辑器批量转换行尾；`third_party/` 必须保持上游原始行尾不变。
+  判断文件是否真的改动以 `git diff` 是否为空为准，不看 `git status`（见 `.gitattributes` 内排查提示）。
 
 ### 命名规范
 - 类名：大驼峰，如 `SerialPort`、`YoloDetector`
@@ -139,6 +219,9 @@ drone_test/
 - 硬件相关的模块测试使用 mock 替代真实设备
 
 ### 实现文档规范（强制规则）
+- **文档入口**：`docs/README.md` 是唯一入口，包含文档地图、单一事实来源和
+  「改代码时至少更新哪些文档」矩阵；当前状态看 `docs/开发进度.md`，历史时间线看
+  `docs/开发历史.md`。不要在两处重复维护同一状态。
 - **每个功能模块实现完成后，必须编写对应的实现文档**，供查看、后期排查与修改参考。
 - **文档写在对应功能实现的文件夹内**，与头文件同级（如 `include/video/video_decoder.md`、
   `include/common/logger.md`），文件名与功能对应、使用中文名；沿用 `include/common/topic.md` 先例。
@@ -151,6 +234,22 @@ drone_test/
   - **排查/修改要点**：常见问题现象与定位方法、修改时需要注意的关联点。
 - 修改代码时必须同步更新对应实现文档；新增功能同样在实现时补文档，不得只写代码不留文档。
 - 基础设施已有文档的（如 `include/common/topic.md`），实现文档中引用即可，不重复抄录。
+- 提交前必须运行：
+
+  ```bash
+  python3 tools/check_docs.py
+  python3 tools/check_docs.py --changed
+  ```
+
+  前者校验基线数字、当前文档相对链接和模块实现文档是否存在；后者按 git 改动列出
+  应核对的文档。测试数量变化时，先改 `docs/README.md` 的「当前基线」，再同步脚本列出的
+  7 个文件（`docs/archive/` 与 `docs/superpowers/` 为历史材料，已冻结、不参与同步）。
+- 改动前先看 `docs/README.md` §4「改代码时至少更新哪些文档」；改动后按性质更新：
+  行为/门禁变化 → `docs/开发进度.md`；里程碑 → `docs/开发历史.md` 顶部追加；
+  消息/Topic 变化 → `docs/数据接口文档.md`；故障现象 → `docs/故障排查手册.md`；
+  配置键 → `include/config/配置管理.md` + `docs/部署与打包.md`。
+- 历史/过时文档移入 `docs/archive/`（在 `docs/archive/README.md` 登记），不要留在当前
+  文档入口；当前维护文档不得指向不存在的路径。
 
 ### C++ 设计规范
 - 遵守 C++17 标准，优先使用现代 C++ 特性

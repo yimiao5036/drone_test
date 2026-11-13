@@ -21,13 +21,13 @@
 #include <memory>
 #include <string>
 
+#include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
+#include "perception/detection_backend.h"
 #include "video/video_frame.h"
 
 namespace drone::perception {
-
-class IDetectionBackend;
 
 /// YOLO 目标识别部件抽象接口。
 class IYoloDetector {
@@ -47,16 +47,28 @@ public:
     virtual void SetInput(common::Topic<video::FrameHandle>& input) = 0;
 
     // ---- 输出 ----
-    /// 检测结果输出主题：common::DetectionResult。
+    /// 检测结果输出主题：common::DetectionResult（每目标一条，供叠加器使用）。
     virtual common::Topic<common::DetectionResult>& DetectionOutput() = 0;
+    /// 帧级单目标观测输出主题：common::VisualTargetObservation。
+    /// 每个成功推理的帧发布且仅发布一条，允许 detected=false；
+    /// 供视觉稳定性判定和后续视觉跟踪区分“本帧无目标”与“本帧未推理完”。
+    virtual common::Topic<common::VisualTargetObservation>& ObservationOutput() = 0;
 
     // ---- 状态查询 ----
     /// 累计处理帧数。
     virtual uint64_t ProcessedFrameCount() const = 0;
+    /// 累计发布的帧级观测数（等于成功推理帧数）。
+    virtual uint64_t ObservationCount() const = 0;
+    /// 累计发布的“检测到目标”观测数。
+    virtual uint64_t DetectedObservationCount() const = 0;
     /// 最近推理平均耗时（毫秒）；未启动或未推理时为 0。
     virtual float InferenceTimeMsAvg() const = 0;
     /// 累计错误次数（模型推理失败等）。
     virtual uint64_t ErrorCount() const = 0;
+    virtual common::LatencySummary InputQueueLatency() const = 0;
+    virtual common::LatencySummary InferenceLatency() const = 0;
+    virtual common::LatencySummary IngressToInferenceLatency() const = 0;
+    virtual DetectionBackendLatencySnapshot BackendLatencySnapshot() const = 0;
 };
 
 /// YOLO 检测器配置。
@@ -65,6 +77,10 @@ struct YoloDetectorConfig {
     float conf_threshold = 0.25f;         ///< 检测置信度阈值 [0,1]
     float nms_threshold = 0.45f;          ///< NMS IoU 阈值 [0,1]
     std::size_t input_queue_capacity = 2; ///< 解码帧订阅队列容量（丢最旧）
+    std::string npu_core_mode = "all";   ///< auto/core0/core01/core012/all
+    bool collect_npu_internal_perf = false; ///< 仅诊断：查询RKNN内部推理时间
+    bool collect_npu_perf_detail = false;   ///< 仅诊断：采集一次RKNN逐层性能报告
+    bool collect_detailed_latency = true;   ///< 中间阶段延迟细分统计；false=只留ingress→推理完成链（探针首尾模式）
 };
 
 /// YOLO 检测器（实现 IYoloDetector）。
@@ -75,8 +91,11 @@ struct YoloDetectorConfig {
 ///
 /// 检测结果发布约定：
 /// - 每个检测目标发布一条 DetectionResult，同一帧的多目标共享
-///   frame_sequence（= 帧 Info().sequence）与 inference_time_ms。
-/// - 一帧无检测时不发布（融合侧按帧超时判断跟踪丢失）。
+///   frame_sequence（= 帧 Info().sequence）与 inference_time_ms；
+///   一帧无检测时 DetectionResult 不发布。
+/// - 每个成功推理的帧另外发布且仅发布一条 VisualTargetObservation
+///   （detected 标志 + 置信度最高的唯一目标），一帧无目标时同样发布，
+///   作为视觉链路的帧级节拍供下游可靠判定丢失。
 ///
 /// 日志约定：创建/销毁（INFO）、启动失败/后端加载失败（ERROR）、
 /// 推理失败（ERROR 节流：第 1 次 + 每满 100 次）、无效帧跳过（WARN 节流）。
@@ -101,10 +120,17 @@ public:
     void SetInput(common::Topic<video::FrameHandle>& input) override;
 
     common::Topic<common::DetectionResult>& DetectionOutput() override;
+    common::Topic<common::VisualTargetObservation>& ObservationOutput() override;
 
     uint64_t ProcessedFrameCount() const override;
+    uint64_t ObservationCount() const override;
+    uint64_t DetectedObservationCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override;
+    common::LatencySummary InferenceLatency() const override;
+    common::LatencySummary IngressToInferenceLatency() const override;
+    DetectionBackendLatencySnapshot BackendLatencySnapshot() const override;
 
 private:
     struct Impl;
@@ -127,10 +153,17 @@ public:
     void SetInput(common::Topic<video::FrameHandle>& input) override;
 
     common::Topic<common::DetectionResult>& DetectionOutput() override;
+    common::Topic<common::VisualTargetObservation>& ObservationOutput() override;
 
     uint64_t ProcessedFrameCount() const override;
+    uint64_t ObservationCount() const override;
+    uint64_t DetectedObservationCount() const override;
     float InferenceTimeMsAvg() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override { return {}; }
+    common::LatencySummary InferenceLatency() const override { return {}; }
+    common::LatencySummary IngressToInferenceLatency() const override { return {}; }
+    DetectionBackendLatencySnapshot BackendLatencySnapshot() const override { return {}; }
 
 private:
     bool running_ = false;
@@ -138,6 +171,7 @@ private:
     float inference_time_ms_avg_ = 0.f;
     uint64_t error_count_ = 0;
     common::Topic<common::DetectionResult> detection_output_;
+    common::Topic<common::VisualTargetObservation> observation_output_;
 };
 
 }  // namespace drone::perception

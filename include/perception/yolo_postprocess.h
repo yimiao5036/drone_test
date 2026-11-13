@@ -81,15 +81,16 @@ struct NormalizedXywhTensor {
 /// 解码单分支：遍历网格、量化阈值过滤，输出候选（模型坐标系 xywh，未去 pad）。
 ///
 /// @param branch 单分支输出（box/score/score_sum）
-/// @param stride 该分支下采样步长 = model_size / grid_h
+/// @param stride_x X 方向下采样步长 = model_width / grid_w
+/// @param stride_y Y 方向下采样步长 = model_height / grid_h
 /// @param num_classes 类别数（score 张量通道数）
 /// @param threshold 置信度阈值（浮点，内部换算为量化阈值）
 /// @param boxes_xywh 输出候选框（模型坐标，x1/y1/w/h 依次连续 4 个）
 /// @param obj_probs 输出候选置信度（与 boxes_xywh、class_ids 对齐）
 /// @param class_ids 输出候选类别
 /// @return 本分支新增候选数量
-int DecodeBranch(const BranchOutput& branch, int stride, int num_classes,
-                 float threshold, std::vector<float>& boxes_xywh,
+int DecodeBranch(const BranchOutput& branch, int stride_x, int stride_y,
+                 int num_classes, float threshold, std::vector<float>& boxes_xywh,
                  std::vector<float>& obj_probs, std::vector<int>& class_ids);
 
 /// 按置信度降序排序（同时重排 indices，与 scores 一一对应）。
@@ -105,16 +106,18 @@ int Nms(int valid_count, const std::vector<float>& boxes_xywh,
 /// 完整后处理：多分支解码 → 排序 → 按类 NMS → letterbox 逆变换。
 ///
 /// @param branches 全部输出分支（YOLO26 通常 3 个：P3/P4/P5）
-/// @param model_size 模型输入边长（像素，正方形）
+/// @param model_width 模型输入宽（像素，支持矩形输入）
+/// @param model_height 模型输入高（像素，支持矩形输入）
 /// @param conf_threshold 置信度阈值
 /// @param nms_threshold NMS IoU 阈值
 /// @param num_classes 类别数
 /// @param letterbox 预处理填充信息（x_pad/y_pad/scale）
 /// @param out 输出检测列表（letterbox 前源图坐标系）；为空指针时仅返回数量
 /// @return 输出检测数量（<= kMaxPostProcessResults）
-int PostProcess(const std::vector<BranchOutput>& branches, int model_size,
-                float conf_threshold, float nms_threshold, int num_classes,
-                const LetterBox& letterbox, std::vector<YoloDetection>* out);
+int PostProcess(const std::vector<BranchOutput>& branches, int model_width,
+                int model_height, float conf_threshold, float nms_threshold,
+                int num_classes, const LetterBox& letterbox,
+                std::vector<YoloDetection>* out);
 
 /// 单输出 `[1,5,N]` 后处理：反量化 → 归一化 xywh 解码 → 单类别 NMS →
 /// letterbox 逆变换。模型不输出类别，结果统一使用 class_id。

@@ -1,15 +1,5570 @@
 /**
  * @file mission_state_machine.cpp
- * @brief IMissionStateMachine 骨架占位实现
+ * @brief MissionStateMachine 安全影子实现（阶段四：位置意图 + 交接判据 + S7 视觉伺服 + 通用拦截设备）
  *
- * 骨架期仅保证生命周期可运行与装配验证；业务逻辑（S0~S16 状态转移规则、
- * 控制意图生成）在实现期按状态机设计文档接入。
+ * 默认只接入地面站目标与飞行状态，发布 MissionStatus 供链路验证；
+ * 经 SetEstimationInputs 绑定估计/视觉/测距输入后，GPS_APPROACH 状态发布
+ * kPositionGuide 控制意图（带 bit31 控制权请求位）；再经
+ * SetEstimationDiagnostics 注入估计器诊断后，交接判据（handover 配置节）生效：
+ * S5→S6（LOCKED 连续帧/测距有效/视场余量/创新门限）→ S7 验证、S6 超时回 S5、
+ * S7 退出迟滞。S6 驻留期续发进入时刻冻结的最后位置目标（防意图超龄 →
+ * 控制器刹车 → 再起步）；S7 由内部视觉伺服协作者（经 IVisualControlLaw
+ * 接口，当前实现 TrackingControlLaw）
+ * 发布 control_source=1 的速度意图（输出已是局部 NED），短期 LOST 按控制律
+ * 判丢语义映射为零速刹车意图。是否真正输出由 FlightController 授权链与
+ * enable_control 装配门禁决定。
+ * 阶段四 Task 10：注入命令窄接口后，进入 S10（INTERCEPT_EXECUTING）经
+ * IInterceptionDevice 通用拦截接口发起一次动作，复位由设备在触发 ACK 后自行
+ * 计时完成（离开拦截序列不补发复位）；当前 single_pwm（kPulse）实现
+ * 发送 MAV_CMD_DO_SET_ACTUATOR（PWM 微秒 → -1..1 归一化），后续多发/干扰/
+ * 撞击实现通过 actuator.type 工厂切换，状态机不感知具体机构。
  */
 #include "state_machine/mission_state_machine.h"
 
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+
 #include <spdlog/spdlog.h>
 
+#include "communication/ground_station_link.h"
+#include "communication/px4_link.h"
+#include "config/zone_store.h"
+#include "control/approach_speed_law.h"
+#include "control/fence_geometry.h"
+#include "control/line_of_sight.h"
+#include "control/rate_limiter.h"
+#include "control/return_speed_law.h"
+#include "control/staleness_checker.h"
+#include "control/tracking_types.h"
+#include "control/visual_control_law.h"
+#include "perception/geodetic_converter.h"
+#include "perception/target_estimator.h"
+#include "state_machine/handover_wait.h"
+#include "state_machine/interception_device.h"
+#include "state_machine/mission_assignment.h"
+
 namespace drone::state_machine {
+namespace {
+
+// 当前实现默认是安全影子状态机：只消费目标/飞行/健康快照并发布 MissionStatus，
+// 不生成真实 ControlIntent，也不连接 PX4 控制输出。所有决策运行在独立线程中。
+// 绑定估计/视觉/测距输入后，S5 开始发布位置引导意图（EvaluatePositionIntent），
+// S6 续发冻结位置目标，S7 由伺服协作者发布速度意图
+// （EvaluateVisualServoIntent → BuildVisualIntent）。
+
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+/// 状态机工作周期。当前影子阶段只做状态/新鲜度判断，100ms足够且不会造成CPU压力。
+constexpr auto kDecisionPeriod = 100ms;
+/// MissionStatus周期回传间隔。状态切换会立即发布，周期发布用于地面站持续显示。
+constexpr uint64_t kStatusPublishIntervalMs = 500;
+/// 围栏停止点预测/贴边保持的输出下限（m/s）：控制器把 max_speed_mps=0
+/// 解释为"未填相位上限"并回退硬上限（10m/s），预测/保持收敛到 0 时
+/// 必须抬到小正数。
+constexpr double kGuideHoldMinCapMps = 0.1;
+/// 停止点预测的最小速度（m/s）：低于该速度时速度方向噪声大、刹停距离≈0，
+/// 不启用预测，交给几何保持/第一重判定。
+constexpr double kFencePredictMinSpeedMps = 0.5;
+/// 预测允许速度低于该值时按"贴边悬停"处理（视觉速度意图清零）。
+constexpr double kFenceHoldSpeedMps = 0.15;
+/// MissionStatus有效期，地面站可据此判断状态回传是否过期。
+constexpr uint64_t kStatusValidForMs = 1000;
+/// 告警位：尚未收到满足GPS引导要求的PX4导航快照。
+constexpr uint32_t kWarningNavigationUnavailable = 1U << 0U;
+/// 告警位：已经进入GPS_APPROACH影子状态，但最新目标超过剩余有效期。
+constexpr uint32_t kWarningGroundTargetStale = 1U << 1U;
+/// 告警位：VISUAL_TRACKING 期间热备份断粮（卡尔曼状态年龄超窗，设计 §2.4）。
+/// 只提示"假备份"风险，不触发退出（退出由 S7 四条收口路径决定）。
+constexpr uint32_t kWarningHotBackupStarved = 1U << 2U;
+/// 告警位：VISUAL_TRACKING 期间本拍未发出视觉伺服意图——伺服尚未启动
+/// （S6/S7 过渡期仍在续发冻结位置意图）或控制律降级停发（姿态/视觉超龄，
+/// 控制器意图超时门禁接手刹停）。标注"S7 报告状态与实际控制输出背离"，
+/// 供地面站观测（65013 全量下发；Web UI 渲染待补。T9 评审裁决 I2，
+/// 阶段四 Task 12 落地）。
+constexpr uint32_t kWarningServoSuspended = 1U << 3U;
+/// 告警位：拦截设备故障（ACK 超时/非 ACCEPTED/PX4 断连/入队超时）。
+/// 状态机进入 S16 FAILSAFE：停发一切控制意图、取消待发命令、不重试/不补发
+/// 复位，交 PX4/遥控处置。地面站 65013 全量下发，Web UI 渲染待补。
+constexpr uint32_t kWarningActuatorFault = 1U << 4U;
+/// 告警位：S5 目标失效后处于"原地保持"（不发过期目标，只发 PX4 当前位置）。
+/// 地面站可据此显示"悬停等待目标"；累计保持超过 `takeoff.target_hold_max_ms`
+/// 会中止任务并转 S12 返航（65013 全量下发，Web UI 渲染待补）。
+constexpr uint32_t kWarningTargetHold = 1U << 5U;
+/// 告警位：已到点但视觉迟迟未锁定（2026-11-05，S5 到点不告警）。
+/// 判据见 state_machine/handover_wait.h：水平/垂直进入 handover.arrival_* 半径
+/// 且地速足够小并保持 arrival_hold_ms 之后，视觉未锁定累计超过
+/// handover.visual_wait_warn_ms 即置位。本告警只提示不处置；
+/// 只有 handover.visual_wait_abort_ms 非 0 时才由同一判据中止任务
+/// （现场默认 0，交地面站人工决定返航）。
+constexpr uint32_t kWarningHandoverNoVisual = 1U << 6U;
+/// 告警位：本拍发布的位置引导点落在围栏多边形之外（2026-11-05，围栏钳制无提示）。
+/// FlightController 会把越界的设定值按 `controller.fence_margin_m` 回拉到边界
+/// （src/control/flight_controller.cpp:791），于是目标跑到区域外时飞机会贴着边界
+/// 悬停——原来的状态机对此一无所知（65019 只报"接近边界"、65013 无对应位），
+/// 地面站看起来就像"任务卡住了"。本告警只提示"引导点被围栏挡住"，不改变动作。
+constexpr uint32_t kWarningGuideOutsideFence = 1U << 7U;
+/// 告警位 bit8：**围栏停止点预测**判定按当前速度方向刹停会越界（2026-11-12
+/// 复审三轮）。只提示"围栏制动/贴边保持已介入"，与 bit7（引导点已经在界外）
+/// 区分；实际越界处置仍由 EvaluateFenceGuard 的深度容差 + 防抖决定。
+constexpr uint32_t kWarningPredictedFenceBreach = 1U << 8U;
+/// 告警位 bit9：**目标出区保持**（2026-11-13，维护者裁决）。目标 NED 位置
+/// 落在围栏多边形外时立即停止追击、位置保持（区内保持进入点；区外钳回边界内
+/// 飞回），**不中止任务、不执行 return/land**。与 bit7（引导点/贴边）、bit8
+/// （停止点预测）区分。
+constexpr uint32_t kWarningTargetOutsideFence = 1U << 9U;
+/// 到点判据的"停稳"地速门限（m/s）：设计 §4.2 冻结值，不做配置键。
+constexpr double kHandoverArrivalSpeedMps = 0.5;
+/// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
+/// 内容无变化时按该间隔重发，内容变化立即发。
+constexpr uint64_t kIntentRepublishIntervalMs = 100;
+/// 位置引导意图低位原因码：地面站任务下发（docs/数据接口文档.md §3.5 编码 7），
+/// 与 bit31 控制权请求位正交叠加。
+constexpr uint32_t kReasonGroundStationTask = 7;
+/// 视觉伺服意图低位原因码（复用 100 段视觉跟踪语义，docs/数据接口文档.md §3.5
+/// 编码 100/102）：100=正常跟踪，102=判丢零速刹车。主链路无预测坐标
+/// （is_predicted 恒 false），101（Coast 预测跟踪）在本链路不可达；短时丢失
+/// 按控制律判丢语义映射为 102。
+constexpr uint32_t kReasonVisualTracking = 100;
+constexpr uint32_t kReasonVisualBrake = 102;
+/// 拦截后返航位置意图低位原因码（8 在 0~7 规划语义之外；S11~S14 V1 口径）。
+constexpr uint32_t kReasonReturnHome = 8;
+/// 目标失效"原地保持"位置意图低位原因码（9）：目标取 PX4 当前局部位置、
+/// 不携带前馈；目标恢复后回到编码 7（地面站任务）。
+constexpr uint32_t kReasonTargetHold = 9;
+/// 围栏越界中止位置意图低位原因码（10，紧接保持码；S12 返航时仍用 8）。
+constexpr uint32_t kReasonFenceViolation = 10;
+/// 目标出区保持位置意图低位原因码（11）：目标 NED 在围栏外，保持点=进入点
+/// 或钳回边界内；不中止任务。
+constexpr uint32_t kReasonTargetOutsideFence = 11;
+/// 地面站任务指令（65020）协议版本（与 GroundStationLink 同源约定）。
+constexpr uint8_t kMissionCommandProtocolVersion = 1;
+/// 目标恢复迟滞：连续 N 个决策拍看到新鲜估计才退出保持（防抖动来回切换；
+/// 100ms 决策周期下 N=3 即 300ms，与控制器的意图超龄门限同量级）。
+constexpr uint32_t kHoldReleaseFreshFrames = 3;
+/// MAVLink 命令号/模式编码（状态机不引 MAVLink 头，与 Px4Link/工具同源）。
+constexpr uint16_t kMavCmdDoSetMode = 176;          // MAV_CMD_DO_SET_MODE
+constexpr uint16_t kMavCmdComponentArmDisarm = 400; // MAV_CMD_COMPONENT_ARM_DISARM
+constexpr float kMavModeFlagCustomModeEnabled = 1.0F;
+constexpr float kPx4MainModeOffboard = 6.0F;
+constexpr float kPx4SubModeOffboard = 0.0F;
+constexpr float kPx4MainModeAuto = 4.0F;
+constexpr float kPx4SubModeAutoLand = 6.0F;
+constexpr uint8_t kPx4FlightMainModeOffboard = 6;
+constexpr uint8_t kPx4FlightSubModeOffboard = 0;
+constexpr uint8_t kPx4FlightMainModeAuto = 4;
+constexpr uint8_t kPx4FlightSubModeAutoLand = 6;
+/// 局部 NED 坐标系编码（types.h 文件头约定：3=局部NED）。
+/// 视觉伺服输出（机体系→NED 旋转在控制律内完成）按该坐标系标注。
+constexpr uint8_t kFrameLocalNed = 3;
+/// 热备份年龄核对周期（设计 §2.4「S7 期间每秒核对」）。
+constexpr uint64_t kHotBackupCheckIntervalMs = 1000;
+/// S4 爬升：距目标高度小于该值即从速度型切回位置保持（末段收敛）。
+/// 与到达判据容差取较大者，避免切回位置时离目标仍太远。
+constexpr double kClimbHandoverMeters = 0.20;
+/// MAV_CMD_DO_SET_ACTUATOR（MAVLink common.xml #187，Task 10 捕网触发）。
+/// 弧度 → 度换算（视线角与视场半角比较统一用度，与配置项单位一致）。
+constexpr double kRadToDeg = 57.29577951308232;
+/// 交接状态迁移原因（状态转移日志用，中文可读）。
+constexpr const char* kReasonEnterHandover =
+    "交接进入判据满足（连续锁定/测距有效/视场余量/创新门限）";
+constexpr const char* kReasonHandoverVerified =
+    "交接验证通过（视觉链持续推进），进入VISUAL_TRACKING";
+constexpr const char* kReasonHandoverRevoked =
+    "交接验证失败（进入判据失效），撤销回GPS_APPROACH";
+constexpr const char* kReasonHandoverTimeout =
+    "S6驻留超时（首条视觉指令未生效），回GPS_APPROACH";
+constexpr const char* kReasonVisualTrackingExit =
+    "视觉连续丢失达退出迟滞门限，回退GPS_APPROACH";
+constexpr const char* kReasonVisionStreamLost =
+    "视觉状态断流超龄（监视器/链路中断），退出VISUAL_TRACKING回GPS_APPROACH";
+constexpr const char* kReasonDistanceLostExit =
+    "双目测距失效达距离丢失门限，退出VISUAL_TRACKING回GPS_APPROACH";
+constexpr const char* kReasonServoNotStartedTimeout =
+    "S7伺服未启动超时（首条视觉伺服意图未生效），回GPS_APPROACH";
+
+/// 交接进入判据输入（阶段四 Task 8；纯数据，供判定函数与 Task 9 复用）。
+struct HandoverInputs {
+    common::VisualTargetStatus visual;  ///< 最新视觉稳定性状态（state/置信度/中心）
+    bool distance_valid = false;        ///< 双目距离有效（StereoTargetDistance.valid）
+    bool distance_fresh = false;        ///< 双目距离未超龄（receive_time + 超龄阈值）
+    double los_azimuth_deg = 0.0;       ///< 视线方位角（像素中心 + 标定内参）
+    double los_elevation_deg = 0.0;     ///< 视线俯仰角（下正）
+    double fow_half_azimuth_deg = 0.0;  ///< 视场水平半角（内参推）
+    double fow_half_elevation_deg = 0.0;///< 视场垂直半角（内参推）
+    double innovation_distance_m =
+        std::numeric_limits<double>::quiet_NaN();  ///< 视觉观测与预测水平距离
+};
+
+/// 交接进入判据（S5→S6 的必要条件，全部满足才放行；连续帧迟滞由调用方计数）。
+/// 纯函数便于单测与 Task 9 复用；不满足即返回 false，不区分原因（原因由调用方
+/// 的诊断计数与日志承担）。
+bool HandoverEntryConditionsMet(const HandoverInputs& in,
+                                const config::HandoverConfig& cfg) {
+    // 视觉必须处于稳定锁定（LOCKED），且测距有效且未超龄
+    if (in.visual.state != common::VisualTargetState::kLocked) {
+        return false;
+    }
+    if (!in.distance_valid || !in.distance_fresh) {
+        return false;
+    }
+    // 视线角余量：目标视线角距视场边缘至少 fow_margin_deg
+    // （内参式视线角以标定主点为基准，视场按主点对称半角建模：
+    //  垂直半角取 (H−cy) 侧，对上侧偏保守，宁可晚交接不可交接即丢目标）
+    if (std::fabs(in.los_azimuth_deg) + cfg.fow_margin_deg >
+        in.fow_half_azimuth_deg) {
+        return false;
+    }
+    if (std::fabs(in.los_elevation_deg) + cfg.fow_margin_deg >
+        in.fow_half_elevation_deg) {
+        return false;
+    }
+    // 创新门限：NaN（无有效视觉创新）不得当作"一致"放行
+    if (!std::isfinite(in.innovation_distance_m) ||
+        in.innovation_distance_m > cfg.innovation_gate_m) {
+        return false;
+    }
+    return true;
+}
+
+/// 返回当前进程单调时钟毫秒，用于内部Topic时间戳和新鲜度判断。
+uint64_t MonotonicMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now().time_since_epoch())
+            .count());
+}
+
+/// 异常/诊断日志节流规则：第1次与每满100次打印一次，避免周期线程刷屏。
+bool ShouldLogThrottled(uint64_t count) {
+    return count == 1 || count % 100 == 0;
+}
+
+/// 浮点内容比较：NaN 与 NaN 视为相等（高度无效时 pos_z_m 恒为 NaN，
+/// 不得因此被当成"内容变化"每拍立即重发）。
+bool FloatContentEqual(float a, float b) {
+    return a == b || (std::isnan(a) && std::isnan(b));
+}
+
+/// 任务状态枚举转中文可读名称，供状态转移日志定位。
+const char* MissionStateName(common::MissionState state) {
+    switch (state) {
+        case common::MissionState::kBoot:
+            return "BOOT";
+        case common::MissionState::kSelfCheck:
+            return "SELF_CHECK";
+        case common::MissionState::kReady:
+            return "READY";
+        case common::MissionState::kArming:
+            return "ARMING";
+        case common::MissionState::kTakeoff:
+            return "TAKEOFF";
+        case common::MissionState::kGpsApproach:
+            return "GPS_APPROACH";
+        case common::MissionState::kVisualHandover:
+            return "VISUAL_HANDOVER";
+        case common::MissionState::kVisualTracking:
+            return "VISUAL_TRACKING";
+        case common::MissionState::kObstacleHold:
+            return "OBSTACLE_HOLD";
+        case common::MissionState::kInterceptReady:
+            return "INTERCEPT_READY";
+        case common::MissionState::kInterceptExecuting:
+            return "INTERCEPT_EXECUTING";
+        case common::MissionState::kPostIntercept:
+            return "POST_INTERCEPT";
+        case common::MissionState::kReturnHome:
+            return "RETURN_HOME";
+        case common::MissionState::kLanding:
+            return "LANDING";
+        case common::MissionState::kDisarmed:
+            return "DISARMED";
+        case common::MissionState::kManualOverride:
+            return "MANUAL_OVERRIDE";
+        case common::MissionState::kFailsafe:
+            return "FAILSAFE";
+        case common::MissionState::kCount:
+            return "COUNT";
+    }
+    return "UNKNOWN";
+}
+
+/// 把任务状态映射为简洁阶段号，便于地面站还没有完整枚举表时显示。
+uint8_t TaskPhase(common::MissionState state) {
+    return static_cast<uint8_t>(state);
+}
+
+/// 控制律降级原因中文名（仅降级停发日志用）。
+const char* DegradedReasonName(control::DegradedReason reason) {
+    switch (reason) {
+        case control::DegradedReason::kNone:
+            return "无";
+        case control::DegradedReason::kAttitudeStale:
+            return "姿态超龄";
+        case control::DegradedReason::kVisionStale:
+            return "视觉超龄";
+        case control::DegradedReason::kNoDistanceExit:
+            return "持续无距离退出";
+    }
+    return "未知";
+}
+
+/// 控制意图类型中文名（仅意图切换日志用）。
+const char* IntentTypeName(common::ControlIntentType type) {
+    switch (type) {
+        case common::ControlIntentType::kNone:
+            return "无";
+        case common::ControlIntentType::kPositionGuide:
+            return "位置引导";
+        case common::ControlIntentType::kVelocityHeading:
+            return "速度航向";
+        case common::ControlIntentType::kBrakeHover:
+            return "零速刹车";
+        case common::ControlIntentType::kTakeoff:
+            return "起飞";
+        case common::ControlIntentType::kLand:
+            return "降落";
+        case common::ControlIntentType::kRtl:
+            return "返航";
+        case common::ControlIntentType::kManualOverride:
+            return "人工接管";
+    }
+    return "未知";
+}
+
+}  // namespace
+
+/// MissionStateMachine的实际状态与线程实现，隐藏在PIMPL中保持头文件稳定。
+class MissionStateMachine::Impl final {
+public:
+    explicit Impl(const MissionStateMachineConfig& config)
+        : intent_valid_for_ms_(
+              static_cast<uint64_t>(config.intent_valid_for.count())),
+          handover_(config.handover),
+          handover_timeout_ms_(static_cast<uint64_t>(config.handover.timeout.count())),
+          visual_stale_ms_(config.visual_stale.count()),
+          distance_stale_ms_(config.distance_stale.count()),
+          tracking_config_(config.tracking),
+          visual_law_(control::CreateVisualControlLaw(config.visual_profile,
+                                                      config.tracking)),
+          actuator_config_(config.actuator),
+          interception_(config.interception),
+          return_home_(config.return_home),
+          fence_(config.fence),
+          takeoff_(config.takeoff),
+          approach_(config.approach),
+          approach_law_(config.approach.speed_law, config.max_speed_mps),
+          expected_interceptor_type_(config.expected_interceptor_type),
+          test_hooks_enabled_(config.test_hooks_enabled),
+          azimuth_converter_(config.tracking.camera.fx_px,
+                             config.tracking.camera.cx_px),
+          elevation_converter_(config.tracking.camera.fy_px,
+                               config.tracking.camera.cy_px) {
+        // 执行器配置构造期兜底校验：single_pwm 实现最终以
+        // `params[net_channel-1]` 索引固定 7 元素数组，程序化构造的越界
+        // channel（如 8）即 UB。配置加载期（`LoadAppConfig`）已校验，此处
+        // 对程序化构造 fail-fast，先例见 FlightController 构造期 period 防御。
+        config.actuator.Validate();
+        // 拦截入口与返航配置构造期兜底（程序化构造非法值 fail-fast）。
+        config.interception.Validate();
+        config.return_home.Validate();
+        // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
+        // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
+        config.takeoff.Validate();
+        // 接近段相位策略兜底（approach 节，2026-11-02）。
+        config.approach.Validate();
+        if (config.interception.enabled && !config.return_home.enabled) {
+            throw std::invalid_argument(
+                "interception.enabled=true 时 return_home.enabled 必须为 true"
+                "（发射后必须有返航收口）");
+        }
+        // 视场半角由内参推（主点非画面中心，见 control/tracking_config.h）：
+        // 水平取 (W−cx) 侧、垂直取 (H−cy) 侧，构造期固化。
+        const double width = static_cast<double>(config.tracking.camera.image_width);
+        const double height =
+            static_cast<double>(config.tracking.camera.image_height);
+        fow_half_azimuth_deg_ =
+            std::atan((width - config.tracking.camera.cx_px) /
+                      config.tracking.camera.fx_px) *
+            kRadToDeg;
+        fow_half_elevation_deg_ =
+            std::atan((height - config.tracking.camera.cy_px) /
+                      config.tracking.camera.fy_px) *
+            kRadToDeg;
+        SPDLOG_INFO(
+            "任务状态机创建: shadow=true control_output=false intent_valid_for_ms={} "
+            "handover(enter_s6_lock_frames={} exit_lost_frames={} timeout_ms={} "
+            "fow_margin_deg={:.1f} innovation_gate_m={:.1f}) "
+            "fov_half(az={:.2f}deg el={:.2f}deg) servo_profile={} servo={:.1f}Hz",
+            intent_valid_for_ms_, handover_.enter_s6_lock_frames,
+            handover_.exit_lost_frames,
+            handover_timeout_ms_, handover_.fow_margin_deg,
+            handover_.innovation_gate_m, fow_half_azimuth_deg_,
+            fow_half_elevation_deg_,
+            control::VisualProfileName(visual_law_->Profile()),
+            tracking_config_.control.frequency_hz);
+    }
+
+    ~Impl() {
+        Stop();
+        SPDLOG_INFO("任务状态机销毁");
+    }
+
+    /// 启动状态机工作线程。输入Topic必须已绑定，避免运行期出现空订阅。
+    bool Start() {
+        if (running_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        if (ground_target_topic_ == nullptr || flight_topic_ == nullptr ||
+            health_topic_ == nullptr) {
+            RecordError("任务状态机启动失败: 输入Topic未绑定");
+            return false;
+        }
+
+        // 估计/视觉/测距三个输入是一组：部分绑定视为装配错误，按未绑定处理
+        // （保持影子行为），避免 S5 意图只依据部分观测链。
+        const bool any_estimation_bound = estimated_topic_ != nullptr ||
+                                          visual_status_topic_ != nullptr ||
+                                          distance_topic_ != nullptr;
+        const bool all_estimation_bound = estimated_topic_ != nullptr &&
+                                          visual_status_topic_ != nullptr &&
+                                          distance_topic_ != nullptr;
+        if (any_estimation_bound && !all_estimation_bound) {
+            RecordError("估计/视觉/测距输入必须三者同时绑定；本次按未绑定处理（保持影子）");
+        }
+        // 交接判据的创新门限需要估计器诊断接口（LastVisualInnovationM）。
+        // 未注入时 S5 位置意图照常发布，但交接不放行（保持 GPS_APPROACH）：
+        // 无法核验"视觉锁定与卡尔曼航迹是否同一目标"就不允许切进视觉末段。
+        if (all_estimation_bound && estimator_diagnostics_ == nullptr) {
+            RecordError(
+                "未注入估计器诊断接口：交接判据不评估，保持GPS_APPROACH（防错锁伪目标）");
+        }
+
+        try {
+            ground_target_subscription_ = ground_target_topic_->Subscribe(4);
+            flight_subscription_ = flight_topic_->Subscribe(2);
+            health_subscription_ = health_topic_->Subscribe(2);
+            // 任务分配输入可选：未绑定时不订阅（保持既有影子行为，
+            // 不影响任何既有测试/装配）。
+            if (assignment_topic_ != nullptr) {
+                assignment_subscription_ = assignment_topic_->Subscribe(4);
+            }
+            // 围栏区域输入可选：未绑定时只用启动缓存（config/zone.json）。
+            if (fence_topic_ != nullptr) {
+                fence_subscription_ = fence_topic_->Subscribe(2);
+            }
+            // 地面站任务指令输入可选：未绑定时不处理 65020。
+            if (mission_command_topic_ != nullptr) {
+                mission_command_subscription_ = mission_command_topic_->Subscribe(2);
+            }
+            if (all_estimation_bound) {
+                estimated_subscription_ = estimated_topic_->Subscribe(2);
+                visual_status_subscription_ = visual_status_topic_->Subscribe(2);
+                distance_subscription_ = distance_topic_->Subscribe(2);
+                estimation_inputs_active_ = true;
+            }
+        } catch (const std::exception& error) {
+            RecordError(std::string("任务状态机订阅输入失败: ") + error.what());
+            return false;
+        }
+
+        // 围栏区域缓存装载（2026-10-29）：断链/重启后仍按地面站上次下发的
+        // 区域自治执行；版本号用于 65014 一致性预检（不一致拒绝起飞）。
+        if (fence_.enabled && !fence_.zone_cache_path.empty()) {
+            const auto cached = config::ZoneStore::Load(fence_.zone_cache_path);
+            if (cached.has_value()) {
+                fence_zone_ = *cached;
+                fence_dirty_ = true;
+                SPDLOG_INFO("围栏区域缓存已装载: path={} zone={}/{} 顶点={}",
+                            fence_.zone_cache_path, cached->zone_id,
+                            cached->version, cached->vertices.size());
+            } else {
+                SPDLOG_WARN(
+                    "围栏区域缓存不可用: path={}（收到 65018 之前按 no_zone 处理）",
+                    fence_.zone_cache_path);
+            }
+        }
+
+        const uint64_t now_ms = MonotonicMs();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            state_ = common::MissionState::kBoot;
+            state_entered_ms_ = now_ms;
+            transition_count_ = 0;
+            active_warning_bits_ = 0;
+        }
+        // 单次任务状态复位（per-sortie）：启动与 65020「重置任务状态」指令共用
+        // 同一份清单，避免两处漂移（只清一半锁存会导致重置后仍拒绝分配）。
+        ResetSortieState();
+        PublishStatus(now_ms);
+
+        running_.store(true, std::memory_order_release);
+        worker_ = std::thread([this] { WorkerLoop(); });
+        SPDLOG_INFO("任务状态机启动: shadow=true");
+        return true;
+    }
+
+    /// 单次任务（per-sortie）状态复位：启动时与 65020「重置任务状态」指令共用
+    /// 同一份清单，避免两处漂移（只清一半锁存会导致重置后仍拒绝分配）。
+    /// 不动状态机当前状态与启动专属计数（transition_count_ 等），也不碰任何
+    /// 遥测链路；调用方负责随后迁移状态并发布状态快照。
+    void ResetSortieState() {
+        // 交接层迟滞计数复位；去重记忆一并清空，新一轮任务不得沿用旧帧计数。
+        ResetHandoverHysteresis();
+        last_counted_locked_frame_.reset();
+        // 任务故障标志复位：不得沿用上一轮 S16 记忆（执行器本体若已处于终态
+        // 故障仍由执行器自身拒绝动作，需人工/维护处置）。
+        // 注意：65020 重置指令在 mission_faulted_=true 时直接拒绝，所以这条
+        // 复位实际只对启动路径生效（S16 仍需人工处置后重启）。
+        mission_faulted_ = false;
+        // 任务分配状态复位：一次上电一次空中任务的语义原以 Start 为界，现在也
+        // 以「重置」为界——重置后重新允许分配，分配历史与原点不得沿用上一轮。
+        assignment_tracker_ = MissionAssignmentTracker{};
+        latest_assignment_.reset();
+        accepted_assignment_.reset();
+        assignment_receive_count_ = 0;
+        assignment_reject_count_ = 0;
+        assignment_duplicate_count_ = 0;
+        // 自动起飞时序复位（Task 5）：重新允许调度。
+        takeoff_stage_ = TakeoffStage::kNone;
+        takeoff_stage_ms_ = 0;
+        takeoff_last_tick_ms_ = 0;
+        takeoff_stable_since_ms_ = 0;
+        takeoff_z_cmd_ = 0.f;
+        takeoff_disarm_sent_ = false;
+        takeoff_ack_baseline_matched_ = 0;
+        takeoff_unavailable_latched_ = false;
+        // 返航水平目标（2026-11-04）：本次任务的起飞原点随任务一起复位。
+        return_origin_valid_ = false;
+        return_origin_x_ = 0.f;
+        return_origin_y_ = 0.f;
+        return_origin_z_ = 0.f;
+        // 电池守卫复位（Task 8）：中止锁存与防抖计时清空。
+        battery_abort_latched_ = false;
+        battery_low_since_ms_.reset();
+        // 目标等待/丢失看门狗与地面站取消（Task 10）复位。
+        mission_abort_latched_ = false;
+        // 围栏越界中止锁存：重置后重新允许一次越界中止；高度带迟滞状态同清。
+        fence_abort_latched_ = false;
+        fence_altitude_ok_ = true;
+        target_wait_started_ms_ = 0;
+        assigned_target_acquired_ = false;
+        target_lost_since_ms_.reset();
+        ResetTargetHold();
+        last_cancel_action_ms_.reset();
+        // 拦截后返航段状态复位：不得沿用上一轮发射/返航记忆。
+        interception_fired_ = false;
+        return_climb_phase_ = true;
+        return_px4_takeover_ = false;
+        return_home_wait_logged_ = false;
+        return_best_distance_m_ = std::numeric_limits<double>::max();
+        return_progress_ms_ = 0;
+        return_stall_warned_ms_ = 0;
+        return_altitude_clamped_ = false;
+        arrival_stable_since_ms_ = 0;
+        landing_command_sent_ = false;
+        landing_command_ms_ = 0;
+        landing_takeover_ = false;
+        landing_command_unavailable_logged_ = false;
+        landing_command_fail_count_ = 0;
+        disarm_command_sent_ = false;
+        disarm_command_ms_ = 0;
+        disarm_command_fail_count_ = 0;
+        mission_end_logged_ = false;
+    }
+
+    /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
+    void Stop() {
+        if (!running_.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        ground_target_subscription_.Reset();
+        flight_subscription_.Reset();
+        health_subscription_.Reset();
+        assignment_subscription_.Reset();
+        fence_subscription_.Reset();
+        mission_command_subscription_.Reset();
+        estimated_subscription_.Reset();
+        visual_status_subscription_.Reset();
+        distance_subscription_.Reset();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        SPDLOG_INFO("任务状态机停止");
+    }
+
+    bool IsRunning() const { return running_.load(std::memory_order_acquire); }
+
+    /// 绑定输入Topic。必须在Start前调用；运行中重新绑定会破坏订阅一致性，因此拒绝。
+    void SetInputs(common::Topic<common::GroundStationTarget>& ground_target,
+                   common::Topic<common::FlightStateSnapshot>& flight,
+                   common::Topic<common::HealthStatus>& health) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定输入Topic");
+            return;
+        }
+        ground_target_topic_ = &ground_target;
+        flight_topic_ = &flight;
+        health_topic_ = &health;
+    }
+
+    /// 绑定估计/视觉/测距输入（三者一组）。必须在Start前调用；未绑定时
+    /// GPS_APPROACH 不出控制意图，保持影子行为。
+    void SetEstimationInputs(common::Topic<common::TargetState>& estimated,
+                             common::Topic<common::VisualTargetStatus>& visual_status,
+                             common::Topic<common::StereoTargetDistance>& distance) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定估计输入Topic");
+            return;
+        }
+        estimated_topic_ = &estimated;
+        visual_status_topic_ = &visual_status;
+        distance_topic_ = &distance;
+    }
+
+    /// 注入 PX4 命令窄接口。仅 enable_control=true 装配期调用；当前阶段只持有，
+    /// 供后续 ARM/执行机构命令使用，不参与意图发布判定。
+    void SetCommandSender(communication::IPx4CommandSender* sender) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许注入 PX4 命令接口");
+            return;
+        }
+        command_sender_ = sender;
+        intercept_device_.reset();
+        if (sender != nullptr) {
+            intercept_device_ = CreateInterceptionDevice(actuator_config_, sender);
+        }
+        SPDLOG_INFO("任务状态机 PX4 命令接口已注入: sender={} device_type={}",
+                    static_cast<const void*>(sender),
+                    intercept_device_ ? intercept_device_->Type() : "disabled");
+    }
+
+    /// 绑定任务分配输入 Topic（65014）。必须在 Start 前调用；未绑定时
+    /// 不订阅、不处理分配，既有影子行为保持不变。
+    void SetAssignmentInput(common::Topic<common::MissionAssignment>& assignment) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定任务分配输入Topic");
+            return;
+        }
+        assignment_topic_ = &assignment;
+    }
+
+    /// 绑定围栏区域输入 Topic（65018）。必须在 Start 前调用；未绑定时只用
+    /// 启动缓存（config/zone.json）。
+    void SetFenceInput(common::Topic<common::FenceZone>& zone) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定围栏区域输入Topic");
+            return;
+        }
+        fence_topic_ = &zone;
+        SPDLOG_INFO("任务状态机围栏区域输入已绑定: enabled={} cache={}",
+                    fence_.enabled, fence_.zone_cache_path);
+    }
+
+    /// 绑定地面站任务指令输入 Topic（65020）。必须在 Start 前调用；未绑定时
+    /// 不处理任何任务指令。
+    void SetMissionCommandInput(common::Topic<common::MissionCommand>& command) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许重新绑定任务指令输入Topic");
+            return;
+        }
+        mission_command_topic_ = &command;
+        SPDLOG_INFO("任务状态机任务指令输入已绑定（65020 主动返航）");
+    }
+
+    /// 围栏多边形只读快照（FlightController 位置意图钳制用；线程安全）。
+    common::FencePolygonNed LatestFencePolygon() const {
+        std::lock_guard<std::mutex> lock(fence_mutex_);
+        return fence_polygon_;
+    }
+
+    /// 注入目标估计器诊断接口（交接创新门限的数据来源）。必须在Start前调用；
+    /// 未注入时交接判据不评估（保持影子 S5 行为）。
+    void SetEstimationDiagnostics(const perception::ITargetEstimator* estimator) {
+        if (running_.load(std::memory_order_acquire)) {
+            RecordError("任务状态机运行中不允许注入估计器诊断接口");
+            return;
+        }
+        estimator_diagnostics_ = estimator;
+        SPDLOG_INFO("任务状态机估计器诊断接口已注入: estimator={}",
+                    static_cast<const void*>(estimator));
+    }
+
+    common::Topic<common::ControlIntent>& IntentOutput() { return intent_output_; }
+    common::Topic<common::MissionStatus>& StatusOutput() { return status_output_; }
+    common::Topic<common::MissionAssignmentAck>& AssignmentAckOutput() {
+        return assignment_ack_output_;
+    }
+    common::Topic<common::FenceStatus>& FenceStatusOutput() {
+        return fence_status_output_;
+    }
+
+    // 65022 区域回读输出（地面站比对本地定义与机载实况）。
+    common::Topic<common::FenceZone>& FenceZoneReportOutput() {
+        return fence_zone_report_output_;
+    }
+    common::Topic<common::MissionCommandAck>& MissionCommandAckOutput() {
+        return mission_command_ack_output_;
+    }
+
+    /// 测试入口：强制提交一次状态迁移（与生产路径共用 TransitionTo 统一挂点；
+    /// 进入/离开动作由决策线程在 Evaluate 末段评估）。
+    /// 门控：`test_hooks_enabled=false`（默认，生产装配语义）时拒绝并记 ERROR——
+    /// 强推到拦截状态会在 enable_control=true 装配下发出不可逆的捕网触发命令。
+    void ForceStateForTest(common::MissionState state) {
+        if (!test_hooks_enabled_) {
+            RecordError(
+                "未启用测试钩子（MissionStateMachineConfig::test_hooks_enabled=false）："
+                "拒绝强制状态迁移");
+            return;
+        }
+        TransitionTo(state, "测试入口强制迁移");
+    }
+
+    void SeedAcceptedAssignmentForTest(
+        const common::MissionAssignment& assignment) {
+        if (!test_hooks_enabled_) {
+            RecordError(
+                "未启用测试钩子（MissionStateMachineConfig::test_hooks_enabled=false）："
+                "拒绝预置任务分配");
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!assignment_tracker_.Accept(assignment, MonotonicMs())) {
+            RecordError("预置任务分配被 tracker 拒绝（已存在有效分配）");
+            return;
+        }
+        assignment_tracker_.RememberResult(
+            assignment.assignment_id,
+            common::MissionAssignmentResult::kAccepted,
+            common::MissionAssignmentReason::kNone);
+        accepted_assignment_ = assignment;
+        if (latest_flight_.has_value()) {
+            const auto& flight = *latest_flight_;
+            assignment_tracker_.BeginTakeoff(flight.local_x_m, flight.local_y_m,
+                                            flight.local_z_m, MonotonicMs());
+            RememberTakeoffOrigin(flight);
+        }
+        SPDLOG_INFO("测试钩子：已预置任务分配 id={} target={}（仅用于验证 65015 链路）",
+                    assignment.assignment_id, assignment.target_id);
+    }
+
+    common::MissionState CurrentState() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return state_;
+    }
+
+    uint64_t TransitionCount() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return transition_count_;
+    }
+
+    uint64_t ErrorCount() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return error_count_;
+    }
+
+private:
+    /// 状态机主循环：先进入SELF_CHECK，再按周期抽取最新输入并执行影子状态推进。
+    // 工作线程启动后先离开 BOOT 进入 SELF_CHECK；随后每个周期使用最新输入做一次决策。
+    void WorkerLoop() {
+        TransitionTo(common::MissionState::kSelfCheck, "初始化完成");
+        while (running_.load(std::memory_order_acquire)) {
+            DrainInputs();
+            Evaluate(MonotonicMs());
+            std::this_thread::sleep_for(kDecisionPeriod);
+        }
+    }
+
+    /// 抽干各输入队列，只保留最新快照。状态判断必须基于同一周期的不可变快照。
+    // 每个决策周期先抽干输入队列，只保留最新快照，避免旧目标或旧飞行状态积压。
+    void DrainInputs() {
+        while (auto message = ground_target_subscription_.TryTake()) {
+            latest_ground_target_ = **message;
+            const uint64_t count = ++target_receive_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_INFO("状态机收到地面站目标: boot={} seq={} target_id={} valid_for_ms={} age_ms={} count={}",
+                            latest_ground_target_->ground_station_boot_id,
+                            latest_ground_target_->update_seq,
+                            latest_ground_target_->target_id,
+                            latest_ground_target_->header.valid_for_ms,
+                            latest_ground_target_->transport_age_ms, count);
+            }
+        }
+        while (auto message = flight_subscription_.TryTake()) {
+            latest_flight_ = **message;
+        }
+        while (auto message = health_subscription_.TryTake()) {
+            latest_health_ = **message;
+        }
+        while (auto message = estimated_subscription_.TryTake()) {
+            latest_estimated_ = **message;
+        }
+        while (auto message = visual_status_subscription_.TryTake()) {
+            latest_visual_status_ = **message;
+            UpdateVisualHysteresis(**message);
+        }
+        while (auto message = distance_subscription_.TryTake()) {
+            latest_distance_ = **message;
+        }
+        // 任务分配（65014）：队列里只保留最新一条，由 EvaluateAssignmentEntry
+        // 在 S2 处理一次后清空（每条消息只回一条 65015，不按决策周期重发）。
+        while (auto message = assignment_subscription_.TryTake()) {
+            latest_assignment_ = **message;
+            const uint64_t count = ++assignment_receive_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_INFO("状态机收到任务分配: assignment_id={} target_id={} "
+                            "type={} flags=0x{:02x} valid_for_ms={} count={}",
+                            latest_assignment_->assignment_id,
+                            latest_assignment_->target_id,
+                            latest_assignment_->interceptor_type,
+                            latest_assignment_->flags,
+                            latest_assignment_->valid_for_ms, count);
+            }
+        }
+        // 围栏区域（65018，2026-10-29）：只保留最新一条，内容变化即时落盘
+        // 缓存并重建 NED 多边形（区域是"共享快照"，不做逐条回执）。
+        while (auto message = fence_subscription_.TryTake()) {
+            ApplyFenceZone(**message);
+        }
+        // 地面站任务指令（65020，2026-10-29）：只保留最新一条，由
+        // EvaluateMissionCommand 处理一次并回 65021（每条指令一条回执）。
+        while (auto message = mission_command_subscription_.TryTake()) {
+            latest_mission_command_ = **message;
+        }
+    }
+
+    /// 根据当前状态、飞行快照和目标新鲜度推进影子状态，并周期发布MissionStatus。
+    // 影子决策：SELF_CHECK 等待导航就绪，READY 等待新鲜目标，GPS_APPROACH 只做告警维护。
+    // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
+    void Evaluate(uint64_t now_ms) {
+        uint32_t warnings = 0;
+        // 预测越界告警按拍重算（2026-11-12 复审三轮）：S5/S6/S7 任一路径置位。
+        fence_predicted_breach_ = false;
+        // 拦截设备每拍推进（ACK/保持/复位/稳定时序全在设备内）。
+        // 故障或已处于 S16：只维护告警位与状态发布，本拍跳过一切任务控制
+        // 逻辑（位置/伺服/返航/降落意图全部停发）。
+        if (UpdateInterceptionDevice(now_ms)) {
+            SetWarnings(kWarningActuatorFault);
+            if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+                PublishStatus(now_ms);
+            }
+            return;
+        }
+
+        if (!HasNavigationForGps()) {
+            warnings |= kWarningNavigationUnavailable;
+        }
+        // 目标保持累计时长（2026-10-22）：目标失效期间保持意图维持控制流，
+        // 按决策拍累计；仅在“上一拍处于保持”时累加，恢复引导的间隙不计入。
+        if (last_evaluate_ms_ != 0 && now_ms > last_evaluate_ms_ &&
+            position_intent_source_ == PositionIntentSource::kHold) {
+            target_hold_accumulated_ms_ += now_ms - last_evaluate_ms_;
+        }
+        last_evaluate_ms_ = now_ms;
+        const bool target_fresh = HasFreshGroundTarget(now_ms);
+        const auto state = CurrentState();
+        if (state == common::MissionState::kSelfCheck && HasNavigationForGps()) {
+            TransitionTo(common::MissionState::kReady, "PX4导航快照满足GPS引导前置条件");
+        } else if (state == common::MissionState::kReady && target_fresh &&
+                   HasNavigationForGps() && command_sender_ == nullptr) {
+            // 安全影子阶段（未注入命令接口）只验证GPS目标进入状态链路；
+            // 不执行ARMING/TAKEOFF，不输出控制。注入命令接口后 65010 目标
+            // 不得单独把 S2 推到 S5：必须由 65014 分配经 S2 预检进入 S3。
+            TransitionTo(common::MissionState::kGpsApproach,
+                         "收到有效地面站目标，进入GPS_APPROACH影子验证");
+        } else if (state == common::MissionState::kGpsApproach && !target_fresh) {
+            warnings |= kWarningGroundTargetStale;
+            const uint64_t count = ++target_stale_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("GPS_APPROACH影子状态目标过期: count={}", count);
+            }
+        }
+
+        // S2 READY → S3 分配入口（2026-10-22）：只在 kReady 处理 65014。
+        // 迁移当拍即生效，后续交接/意图评估按新状态（ARMING）执行。
+        EvaluateAssignmentEntry(now_ms);
+
+        // S3 解锁/Offboard 与 S4 自动爬升（Task 5，2026-10-22）：放在分配入口
+        // 之后、交接/目标/拦截逻辑之前。S3/S4 期间上述逻辑按状态判定均不参与
+        // （交接只认 S5/S6/S7，拦截只认 S7/S9/S10）；中止当拍即停止发布起飞
+        // 意图，不留下持续控制流。
+        EvaluateTakeoffSequence(now_ms);
+
+        // 电池守卫（Task 8）：放在起飞时序之后、交接/拦截之前。飞行中低电/
+        // 遥测失效当拍中止到 S12，后续拦截入口（S7/S9/S10）不再有机会发射。
+        EvaluateBatteryGuard(now_ms);
+
+        // 地面站任务指令（65020，2026-10-29 主动返航）：放在电池守卫之后、
+        // 围栏守卫之前——人工指令优先于几何事件，且中止后围栏守卫因状态已离开
+        // 任务态自然跳过。指令只对空中任务态生效（S3~S11）。
+        EvaluateMissionCommand(now_ms);
+
+        // 围栏守卫（2026-10-29）：电池之后、目标看门狗之前——越界是几何安全
+        // 事件，优先级低于电池中止、高于目标看门狗；当拍中止后后续判定自然跳过。
+        EvaluateFenceGuard(now_ms);
+
+        // S5 目标等待/丢失看门狗（Task 10，设计 §7.5）：只在控制任务 S5 生效。
+        // 超时当拍中止到 S12 并停发位置引导；后续状态判定自然跳过交接/拦截。
+        EvaluateTargetWatchdog(now_ms);
+
+        // 到点后视觉未识别（2026-11-05）：与目标看门狗独立的提示判据——
+        // 目标以 5Hz 持续送达时看门狗永不启动，需单独观测"已到点但没锁定"。
+        // 只抬告警位（bit6），自动化处置由 visual_wait_abort_ms 决定（默认关）。
+        if (EvaluateHandoverWait(now_ms).warn) {
+            warnings |= kWarningHandoverNoVisual;
+        }
+
+        // 引导点被围栏挡住（2026-11-05）：目标跑出区域时控制器把设定值钳到
+        // 边界，飞机贴边悬停；EvaluateFenceGuard 只看飞机自身位置，看不到这件
+        // 事。这里抬 bit7 提示，动作仍由围栏守卫决定。
+        if (EvaluateGuideOutsideFence()) {
+            warnings |= kWarningGuideOutsideFence;
+        }
+
+        // 交接评估先于意图发布：S5→S6→S7 迁移当拍即改变位置/视觉意图分支
+        // （S5 位置引导 → S6 冻结续发 → S7 视觉伺服，见各函数的当拍收口）。
+        EvaluateHandover(now_ms);
+        // S9/S10 入口（2026-10-19）：S7 条件满足→S9；自动授权→S10。
+        // 放在位置/伺服意图之前，迁移当拍即可按新状态发布（S9/S10 继续伺服）。
+        EvaluateInterceptSequence(now_ms);
+        // S9→S10 迁移当拍触发捕网（有连接证据才触发；入队失败下拍重试，
+        // 超过 fire_timeout 判故障）。
+        MaybeExecuteInterception(now_ms);
+        if (mission_faulted_) {
+            SetWarnings(kWarningActuatorFault);
+            if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+                PublishStatus(now_ms);
+            }
+            return;
+        }
+
+        // 目标出区保持（2026-11-13）：保持期间**不再发**接近/冻结/视觉伺服
+        // 意图，只发保持意图——否则会"先发全速引导、再发保持"，既依赖控制器
+        // 消费顺序，也会让 PublishIntent 的首次日志每拍刷屏。
+        const bool target_outside_hold =
+            target_outside_hold_active_ && TargetOutsideHoldStateActive();
+        if (!target_outside_hold) {
+            EvaluatePositionIntent(now_ms);
+            // 告警位：S5 目标失效原地保持中（地面站可显示“悬停等待目标”）；
+            // 保持意图仍带 bit31 控制权请求，离开 S5/S12 接管后自然清除。
+            if (position_intent_source_ == PositionIntentSource::kHold) {
+                warnings |= kWarningTargetHold;
+            }
+            EvaluateVisualServoIntent(now_ms);
+            // 围栏"保持"动作（区域动作=hold）：越界未中止时，位置意图改为原地
+            // 保持（原因码 10），并压过同拍的 S5 引导与 S7 伺服输出。
+            if (fence_hold_active_) {
+                PublishFenceHoldIntent(now_ms);
+            }
+        } else {
+            // 本拍不跑视觉伺服：按"未发伺服"处理，但 bit3 由下面的条件排除
+            // （保持是主动策略，不是伺服降级/停发）。
+            servo_intent_active_ = false;
+        }
+        if (target_outside_hold) {
+            PublishTargetOutsideHoldIntent(now_ms);
+        }
+        // 告警位：S7 报告状态与实际控制输出背离标注（T9 评审裁决 I2）——本拍
+        // 未发出视觉伺服意图：伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图）
+        // 或控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停）。
+        // 状态按当拍（迁移后）判定；离开 S7 即不置位。
+        if (CurrentState() == common::MissionState::kVisualTracking &&
+            !servo_intent_active_ && !target_outside_hold) {
+            warnings |= kWarningServoSuspended;
+        }
+        // 热备份核对（Task 9）：S7 期间每秒核对卡尔曼状态年龄，断粮置告警位。
+        warnings |= EvaluateHotBackup(now_ms);
+        // 单发拦截结束（S10→S11→S12）与返航/降落（S11~S14，2026-10-19）。
+        // 顺序：先完成拦截判定，再执行返航/降落；S12 的位置意图在本拍最后发布。
+        EvaluateInterceptionCompletion();
+        EvaluateReturnHome(now_ms);
+        EvaluateLandingAndDisarm(now_ms);
+
+        // 本拍任一评估触发的故障：保留 bit4（其余告警不再覆盖故障位）。
+        if (mission_faulted_) {
+            warnings |= kWarningActuatorFault;
+        }
+        if (fence_predicted_breach_) {
+            warnings |= kWarningPredictedFenceBreach;
+        }
+        if (target_outside_hold_active_ && TargetOutsideHoldStateActive()) {
+            warnings |= kWarningTargetOutsideFence;
+        }
+        SetWarnings(warnings);
+        if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+            PublishStatus(now_ms);
+        }
+    }
+
+    /// PX4 低电参数是否可用于自动起飞门禁（设计 §9.2）：
+    /// BAT_LOW_THR 有效且落在 (0,100)，COM_LOW_BAT_ACT 有效且为 0
+    /// （Warning Only；其余动作由 PX4 自行执行，机载不再叠加处置）。
+    static bool BatteryParametersReady(
+        const common::FlightStateSnapshot& flight) {
+        return flight.battery_low_threshold_valid &&
+               flight.low_battery_action_valid &&
+               flight.battery_low_threshold_pct > 0.f &&
+               flight.battery_low_threshold_pct < 100.f &&
+               flight.low_battery_action == 0;
+    }
+
+    /// 电池遥测是否可用：电压/剩余量有效且百分比为有限值（不伪造 0）。
+    static bool BatteryTelemetryReady(
+        const common::FlightStateSnapshot& flight) {
+        return flight.battery_valid && flight.battery_remaining_valid &&
+               std::isfinite(flight.battery_remaining_pct);
+    }
+
+    /// 剩余电量是否严格高于 PX4 低电阈值。调用方须先确认参数与遥测有效。
+    static bool BatteryAboveThreshold(
+        const common::FlightStateSnapshot& flight) {
+        return BatteryTelemetryReady(flight) &&
+               flight.battery_remaining_pct > flight.battery_low_threshold_pct;
+    }
+
+    /// 自动分配/起飞的总电池门禁：参数可判定 + 遥测有效 + 高于阈值。
+    static bool BatteryGuardReady(const common::FlightStateSnapshot& flight) {
+        return BatteryParametersReady(flight) &&
+               BatteryTelemetryReady(flight) &&
+               BatteryAboveThreshold(flight);
+    }
+
+    /// 65014 分配字段预检（不改变任何状态）。返回 kNone 表示字段与当前
+    /// 预检条件全部通过；否则返回 65015 的具体 reason（设计 §5.4/§7.2）。
+    /// 注意：调用方必须先处理重复 assignment_id（WasHandled），再做本检查。
+    common::MissionAssignmentReason ValidateAssignment(
+        const common::MissionAssignment& assignment, uint64_t now_ms) const {
+        // 协议版本：当前固定 1。
+        if (assignment.protocol_version !=
+            communication::kMissionAssignmentProtocolVersion) {
+            return common::MissionAssignmentReason::kUnsupportedVersion;
+        }
+        // flags：只允许已知位，且必须带 bit0（授权自动起飞）。
+        if ((assignment.flags &
+             static_cast<uint8_t>(~communication::kMissionAssignKnownFlagsMask)) !=
+            0U) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        if ((assignment.flags & communication::kMissionAssignFlagAuthorized) == 0U) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        if (assignment.target_id == 0U) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        // 拦截功能类别必须与本机一致（25=捕网，26=火箭）。
+        if (assignment.interceptor_type != expected_interceptor_type_) {
+            return common::MissionAssignmentReason::kUnsupportedInterceptorType;
+        }
+        // 围栏区域一致性（2026-10-29）：分配携带 zone_id/version 时必须与机载缓存
+        // 的同一区域快照一致，否则拒绝起飞——不允许按旧/未知区域进入任务。
+        // 未填（zone_id=0）的旧地面站按"未声明区域"放行，仅依赖机载缓存；
+        // 未启用围栏时不做该检查（回退 Home 圆形围栏语义）。
+        if (fence_.enabled && assignment.zone_id != 0U) {
+            if (!fence_zone_.has_value() ||
+                assignment.zone_id != fence_zone_->zone_id ||
+                assignment.zone_version != fence_zone_->version) {
+                return common::MissionAssignmentReason::kZoneMismatch;
+            }
+        }
+        // 分配有效期：按本机收到时刻 + valid_for_ms 判定；0 或已过期均非法。
+        if (assignment.valid_for_ms == 0U || assignment.received_ms == 0U ||
+            now_ms > assignment.received_ms + assignment.valid_for_ms) {
+            return common::MissionAssignmentReason::kInvalidMessage;
+        }
+        // 控制路径：未注入命令接口（影子装配）或估计输入未绑定时不得起飞。
+        if (command_sender_ == nullptr) {
+            return common::MissionAssignmentReason::kControlDisabled;
+        }
+        if (!estimation_inputs_active_) {
+            return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        // 起飞中止后 PX4 状态不确定（断连/离地状态不明等）：置一次性
+        // 不可调度标志，新分配回 not_ready，不允许错误地回到 ready。
+        if (takeoff_unavailable_latched_) {
+            return common::MissionAssignmentReason::kNotReady;
+        }
+        // PX4 连接与地面/未 armed/导航前置条件（设计 §7.2）。
+        if (!latest_flight_.has_value() || !latest_flight_->connected) {
+            return common::MissionAssignmentReason::kPx4Disconnected;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.landed_state_valid || !flight.landed || flight.armed) {
+            return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        if (!flight.local_position_valid || !flight.attitude_valid ||
+            !flight.home_valid) {
+            return common::MissionAssignmentReason::kPreflightFailed;
+        }
+        // 电池门禁（设计 §9.2，Task 8）：唯一来源是 PX4 BAT_LOW_THR /
+        // COM_LOW_BAT_ACT 参数与电池遥测；机载不设本地百分比阈值。
+        // 参数缺失/非法与遥测失效分开回执，便于地面站定位。
+        if (!BatteryParametersReady(flight)) {
+            return common::MissionAssignmentReason::kBatteryConfigUnknown;
+        }
+        if (!BatteryTelemetryReady(flight)) {
+            return common::MissionAssignmentReason::kBatteryTelemetryInvalid;
+        }
+        if (!BatteryAboveThreshold(flight)) {
+            return common::MissionAssignmentReason::kBatteryLow;
+        }
+        // 设备故障：任务故障终态或拦截设备故障时不允许接受新分配。
+        if (mission_faulted_ ||
+            (intercept_device_ != nullptr && intercept_device_->Faulted())) {
+            return common::MissionAssignmentReason::kMissionFault;
+        }
+        return common::MissionAssignmentReason::kNone;
+    }
+
+    /// 任务分配入口（2026-10-22）。
+    /// 每条 65014 只消费一次（DrainInputs 保存最新一条，处理前清空，避免按
+    /// 决策周期重复回 65015）。重复 assignment_id 在任何阶段都重发原 65015；
+    /// 新分配只在 S2 预检，非 S2 一律拒绝且不重试。
+    void EvaluateAssignmentEntry(uint64_t now_ms) {
+        if (!latest_assignment_.has_value()) {
+            return;
+        }
+        const common::MissionAssignment assignment = *latest_assignment_;
+        latest_assignment_.reset();
+
+        // 取消当前分配（flags.bit1，设计 §5.1/§7.5）：必须先于重复/普通预检
+        // 处理——取消消息不要求 bit0，且活动分配在 tracker 中已记住 accepted，
+        // 若先走 WasHandled 会把取消误当作重复分配重发 accepted。
+        if ((assignment.flags & communication::kMissionAssignFlagCancel) != 0U) {
+            HandleAssignmentCancel(assignment, now_ms);
+            return;
+        }
+
+        // 重复 assignment_id：只重发原 65015，不再预检/迁移（幂等）。
+        common::MissionAssignmentResult prior_result =
+            common::MissionAssignmentResult::kRejected;
+        common::MissionAssignmentReason prior_reason =
+            common::MissionAssignmentReason::kNone;
+        bool duplicate = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            duplicate = assignment_tracker_.WasHandled(
+                assignment.assignment_id, &prior_result, &prior_reason);
+        }
+        if (duplicate) {
+            PublishAssignmentAck(assignment, prior_result, prior_reason);
+            const uint64_t count = ++assignment_duplicate_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_INFO("重复任务分配只重发65015: assignment_id={} result={} "
+                            "reason={} count={}",
+                            assignment.assignment_id,
+                            static_cast<int>(prior_result),
+                            static_cast<int>(prior_reason), count);
+            }
+            return;
+        }
+
+        // 任务已开始（S3~S16）时收到新 assignment_id：拒绝并记录结果，
+        // 不打断当前任务；重复 id 已在上面重发原回执。
+        if (CurrentState() != common::MissionState::kReady) {
+            const auto reason = common::MissionAssignmentReason::kAlreadyAssigned;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                assignment_tracker_.RememberResult(
+                    assignment.assignment_id,
+                    common::MissionAssignmentResult::kRejected, reason);
+            }
+            PublishAssignmentAck(assignment,
+                                 common::MissionAssignmentResult::kRejected,
+                                 reason);
+            const uint64_t count = ++assignment_reject_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("任务执行中拒绝新分配: assignment_id={} state={} count={}",
+                            assignment.assignment_id,
+                            MissionStateName(CurrentState()), count);
+            }
+            return;
+        }
+
+        auto reason = ValidateAssignment(assignment, now_ms);
+        bool accepted = false;
+        if (reason == common::MissionAssignmentReason::kNone) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            // 一次上电一次空中任务：非 kIdle 或已消耗机会时拒绝。
+            if (!assignment_tracker_.Accept(assignment, now_ms)) {
+                reason = common::MissionAssignmentReason::kAlreadyAssigned;
+            } else {
+                assignment_tracker_.RememberResult(
+                    assignment.assignment_id,
+                    common::MissionAssignmentResult::kAccepted,
+                    common::MissionAssignmentReason::kNone);
+                // 保存已接受的分配（id/target）：S3/S4 中止时 latest_assignment_
+                // 早已清空，65015 aborted 必须用这份副本。
+                accepted_assignment_ = assignment;
+                // 新任务重新武装电池守卫（地面低电中止后恢复再分配的路径）。
+                battery_abort_latched_ = false;
+                battery_low_since_ms_.reset();
+                // 目标看门狗与中止锁存按任务复位（一次任务只中止一次）。
+                mission_abort_latched_ = false;
+                // 围栏中止锁存同样按任务复位：上一任务的越界中止不得让新区域
+                // 在新任务中失去效力（A-09）。
+                fence_abort_latched_ = false;
+                target_wait_started_ms_ = 0;
+                assigned_target_acquired_ = false;
+                target_lost_since_ms_.reset();
+                ResetTargetHold();
+                // 记录起飞原点（局部 NED），保证 tracker 阶段与状态机一致。
+                const auto& flight = *latest_flight_;
+                assignment_tracker_.BeginTakeoff(
+                    flight.local_x_m, flight.local_y_m, flight.local_z_m, now_ms);
+                // 同时记一份给 S12 返航用（不受 PX4 Home 经纬度漂移影响）。
+                RememberTakeoffOrigin(flight);
+                accepted = true;
+            }
+        }
+
+        if (!accepted) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                assignment_tracker_.RememberResult(
+                    assignment.assignment_id,
+                    common::MissionAssignmentResult::kRejected, reason);
+            }
+            PublishAssignmentAck(assignment,
+                                 common::MissionAssignmentResult::kRejected,
+                                 reason);
+            const uint64_t count = ++assignment_reject_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("任务分配被拒绝: assignment_id={} target_id={} "
+                            "reason={} state={} count={}",
+                            assignment.assignment_id, assignment.target_id,
+                            static_cast<int>(reason),
+                            MissionStateName(CurrentState()), count);
+            }
+            return;  // 保持 S2；不自动重试、不消耗任务机会
+        }
+
+        // 成功：先回 accepted（tracker 已进入 kAssigned/kTakingOff，
+        // availability=assigned），再迁移 S3。S3 入口动作（176/400、
+        // 每拍 kTakeoff 原点意图）由 Task 5 实现。
+        PublishAssignmentAck(assignment,
+                             common::MissionAssignmentResult::kAccepted,
+                             common::MissionAssignmentReason::kNone);
+        SPDLOG_INFO("任务分配已接受: assignment_id={} target_id={} origin=({:.2f},"
+                    "{:.2f},{:.2f}) → S3 ARMING",
+                    assignment.assignment_id, assignment.target_id,
+                    static_cast<double>(assignment_tracker_.OriginX()),
+                    static_cast<double>(assignment_tracker_.OriginY()),
+                    static_cast<double>(assignment_tracker_.OriginZ()));
+        TransitionTo(common::MissionState::kArming, "接受任务分配");
+    }
+
+    // ---- 65014 取消（flags.bit1，Task 10，设计 §5.1/§7.5） ----
+
+    /// 取消动作最小间隔：同一取消在 500ms 内不重复下发命令（幂等重发回执）。
+    static constexpr uint64_t kCancelCommandMinIntervalMs = 500;
+
+    /// 任务执行阶段（已离地）：S5~S13。S14/S16 为终态，不再重启返航链。
+    static bool IsAirborneMissionState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+            case common::MissionState::kPostIntercept:
+            case common::MissionState::kReturnHome:
+            case common::MissionState::kLanding:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 本机是否已实际离地：tracker 已消耗本次空中任务机会，或当前飞行快照
+    /// armed && !landed。取消处置以此决定"地面中止"还是"空中返航"。
+    bool AssignmentAirborne() const {
+        if (assignment_tracker_.ConsumedAirborneMission()) {
+            return true;
+        }
+        return latest_flight_.has_value() && latest_flight_->armed &&
+               !latest_flight_->landed;
+    }
+
+    /// 取消消息被拒绝：记住结果（重复取消重发同一拒绝回执）并发布 65015。
+    void RejectAssignmentCancel(const common::MissionAssignment& assignment,
+                                common::MissionAssignmentReason reason) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            assignment_tracker_.RememberResult(
+                assignment.assignment_id,
+                common::MissionAssignmentResult::kRejected, reason);
+        }
+        PublishAssignmentAck(assignment,
+                             common::MissionAssignmentResult::kRejected, reason);
+        const uint64_t count = ++assignment_reject_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN("任务取消被拒绝: assignment_id={} reason={} state={} "
+                        "count={}",
+                        assignment.assignment_id, static_cast<int>(reason),
+                        MissionStateName(CurrentState()), count);
+        }
+    }
+
+    /// 处理 65014 flags.bit1。协议字段只做版本/未知位校验（取消不要求 bit0）：
+    /// - 活动分配 id 匹配：地面 → AbortTakeoff/AbortOnGround 回 READY；空中 →
+    ///   AbortAirborne + S12，65015 cancelled/aborted(cancelled_by_gcs)；
+    /// - 重复取消：重发最近结果（cancelled 结果不被 accepted 覆盖）；
+    /// - 无活动分配且 id 从未处理：rejected(not_ready)；
+    /// - 活动分配是其他 id：rejected(already_assigned)。
+    /// 取消不重启已进入 S12/S13 的返航/降落链，只记录并回执。
+    void HandleAssignmentCancel(const common::MissionAssignment& assignment,
+                                uint64_t now_ms) {
+        if (assignment.protocol_version !=
+            communication::kMissionAssignmentProtocolVersion) {
+            RejectAssignmentCancel(
+                assignment,
+                common::MissionAssignmentReason::kUnsupportedVersion);
+            return;
+        }
+        if ((assignment.flags &
+             static_cast<uint8_t>(~communication::kMissionAssignKnownFlagsMask)) !=
+            0U) {
+            RejectAssignmentCancel(
+                assignment,
+                common::MissionAssignmentReason::kInvalidMessage);
+            return;
+        }
+
+        common::MissionAssignmentResult prior_result =
+            common::MissionAssignmentResult::kRejected;
+        common::MissionAssignmentReason prior_reason =
+            common::MissionAssignmentReason::kNone;
+        bool handled = false;
+        bool has_active = false;
+        bool active_id_match = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            handled = assignment_tracker_.WasHandled(
+                assignment.assignment_id, &prior_result, &prior_reason);
+            has_active = assignment_tracker_.HasActiveAssignment();
+            active_id_match = has_active &&
+                assignment_tracker_.AssignmentId() == assignment.assignment_id;
+        }
+
+        if (active_id_match) {
+            // 该分配的取消已生效（空中取消后 tracker 仍 kReturning）：直接
+            // 重发最近结果，不再迁移/下发命令。
+            if (handled &&
+                prior_result != common::MissionAssignmentResult::kAccepted) {
+                PublishAssignmentAck(assignment, prior_result, prior_reason);
+                return;
+            }
+            // 500ms 内已执行过取消动作：不重复下发命令（含 DISARM），重发
+            // 当前取消结论。
+            if (last_cancel_action_ms_.has_value() &&
+                ElapsedMs(now_ms, *last_cancel_action_ms_) <
+                    kCancelCommandMinIntervalMs) {
+                PublishAssignmentAck(
+                    assignment,
+                    common::MissionAssignmentResult::kCancelledOrAborted,
+                    common::MissionAssignmentReason::kCancelledByGcs);
+                return;
+            }
+            last_cancel_action_ms_ = now_ms;
+            ExecuteAssignmentCancel(assignment);
+            return;
+        }
+
+        if (handled) {
+            // 已处理过：重发最终结果。已被接受但已不在活动阶段（S14/S16
+            // 终态）的分配按协议回 rejected(not_ready)（§5.5）。
+            if (prior_result != common::MissionAssignmentResult::kAccepted) {
+                PublishAssignmentAck(assignment, prior_result, prior_reason);
+                return;
+            }
+            RejectAssignmentCancel(
+                assignment, common::MissionAssignmentReason::kNotReady);
+            return;
+        }
+
+        // 未匹配当前活动分配：有活动分配说明是其他 id（already_assigned），
+        // 否则无分配/终态（not_ready）。
+        RejectAssignmentCancel(
+            assignment, has_active
+                            ? common::MissionAssignmentReason::kAlreadyAssigned
+                            : common::MissionAssignmentReason::kNotReady);
+    }
+
+    /// 执行已匹配活动分配的取消（调用方已确认 id 匹配并记录 500ms 动作时刻）。
+    void ExecuteAssignmentCancel(const common::MissionAssignment& assignment) {
+        const auto state = CurrentState();
+        const bool airborne =
+            AssignmentAirborne() || IsAirborneMissionState(state);
+
+        if (airborne) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                assignment_tracker_.AbortAirborne();
+            }
+            RememberTakeoffAbort(
+                common::MissionAssignmentReason::kCancelledByGcs);
+            SPDLOG_WARN("地面站取消任务（已离地）: assignment_id={} state={} → "
+                        "中止任务并返航",
+                        assignment.assignment_id, MissionStateName(state));
+            // 已在返航/降落链（S12~S14）：只记录并回执，不把 S13 重置回 S12。
+            if (state == common::MissionState::kReturnHome ||
+                state == common::MissionState::kLanding ||
+                state == common::MissionState::kDisarmed) {
+                PublishTakeoffAbortAck(
+                    common::MissionAssignmentReason::kCancelledByGcs);
+                return;
+            }
+            // 中止当拍停发位置引导，S12 在本拍后续接管返航意图。
+            StopPositionIntent("地面站取消任务（已离地）");
+            TransitionTo(common::MissionState::kReturnHome,
+                         "地面站取消（已离地），进入返航");
+            PublishTakeoffAbortAck(
+                common::MissionAssignmentReason::kCancelledByGcs);
+            return;
+        }
+
+        if (state == common::MissionState::kArming ||
+            state == common::MissionState::kTakeoff) {
+            // 地面 S3/S4：复用统一起飞中止（停流、必要时一次 DISARM、
+            // tracker AbortOnGround、回 READY、65015 cancelled/aborted）。
+            AbortTakeoff(common::MissionAssignmentReason::kCancelledByGcs,
+                         "地面站取消");
+            return;
+        }
+
+        // 防御路径：S2 已接受但尚未进入 S3（正常路径接受当拍即迁移 S3）。
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            assignment_tracker_.AbortOnGround();
+        }
+        RememberTakeoffAbort(
+            common::MissionAssignmentReason::kCancelledByGcs);
+        SPDLOG_WARN("地面站取消任务（地面）: assignment_id={} state={} → 保持 "
+                    "READY",
+                    assignment.assignment_id, MissionStateName(state));
+        PublishTakeoffAbortAck(
+            common::MissionAssignmentReason::kCancelledByGcs);
+    }
+
+    // ---- S3 解锁/Offboard 与 S4 自动爬升（Task 5，2026-10-22） ----
+
+    /// 单调时钟差值（无符号回绕保护：刚迁移时 now 可能早于基准）。
+    static uint64_t ElapsedMs(uint64_t now_ms, uint64_t since_ms) {
+        return now_ms >= since_ms ? now_ms - since_ms : 0;
+    }
+
+    /// 是否处于 PX4 Offboard（6/0，实际心跳模式）。
+    static bool IsPx4Offboard(const common::FlightStateSnapshot& flight) {
+        return flight.flight_mode == kPx4FlightMainModeOffboard &&
+               flight.flight_sub_mode == kPx4FlightSubModeOffboard;
+    }
+
+    /// S3/S4 起飞时序入口：每决策拍调用一次（10Hz）。
+    ///
+    /// 节拍顺序：连接/快照检查 → 实际离地记录（MarkAirborne，幂等）→
+    /// S3 模式/解锁时序或 S4 爬升推进 → 仍在起飞段则发布 kTakeoff 意图。
+    /// 中止/迁移发生在意图发布之前：故障当拍不再发布任何起飞意图。
+    void EvaluateTakeoffSequence(uint64_t now_ms) {
+        const auto state = CurrentState();
+        if (state != common::MissionState::kArming &&
+            state != common::MissionState::kTakeoff) {
+            return;
+        }
+        if (command_sender_ == nullptr) {
+            // 分配预检已要求命令接口，但强制状态/装配异常仍需兜底：不得
+            // 在无命令通道时继续起飞，也不得空指针解引用。
+            AbortTakeoff(common::MissionAssignmentReason::kControlDisabled,
+                         "S3/S4 缺少 PX4 命令接口");
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            AbortTakeoff(common::MissionAssignmentReason::kPx4Disconnected,
+                         "S3/S4 缺少飞行状态快照");
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.connected) {
+            AbortTakeoff(common::MissionAssignmentReason::kPx4Disconnected,
+                         "S3/S4 期间 PX4 断连");
+            return;
+        }
+        // 实际离地即消耗本次上电唯一的空中任务机会（PX4 判定，不依赖
+        // 已进入 S5）。S3/S4 每拍调用，tracker 内部幂等。
+        if (flight.armed && !flight.landed) {
+            assignment_tracker_.MarkAirborne(now_ms);
+        }
+
+        if (state == common::MissionState::kArming) {
+            EvaluateArmingSequence(flight, now_ms);
+        } else {
+            EvaluateClimbSequence(flight, now_ms);
+        }
+
+        // 迁移（S3→S4、S4→S5）或中止后按当拍新状态决定是否继续发意图：
+        // - 仍在 S3：原点保持（z=z0）；
+        // - 已进入 S4：位置目标按爬升率逐拍推进，同时携带垂直速度前馈
+        //   （进入末段后撤掉前馈，交给位置环收速）；
+        // - 已中止（S2/S12/S13）：停发，不留下持续控制流。
+        const auto after = CurrentState();
+        if (after == common::MissionState::kArming) {
+            PublishTakeoffIntent(assignment_tracker_.OriginZ(), now_ms);
+        } else if (after == common::MissionState::kTakeoff) {
+            const double goal_z =
+                static_cast<double>(assignment_tracker_.OriginZ()) -
+                takeoff_.height_m;
+            const double handover_m =
+                std::max(kClimbHandoverMeters, takeoff_.z_tolerance_m);
+            const bool climbing =
+                flight.local_position_valid &&
+                std::fabs(static_cast<double>(flight.local_z_m) - goal_z) >
+                    handover_m;
+            // 末段（进入到达判据范围内）直接盯目标高度，避免逐拍爬升值落后于
+            // 实际高度时，位置环还在追一个更低的旧目标。
+            const float climb_cmd_z =
+                climbing ? takeoff_z_cmd_ : static_cast<float>(goal_z);
+            PublishTakeoffIntent(
+                climb_cmd_z, now_ms,
+                climbing ? static_cast<float>(-takeoff_.climb_rate_mps) : 0.f);
+        }
+    }
+
+    // ---- 飞行中电池守卫（Task 8，2026-10-22） ----
+
+    /// 电池守卫生效阶段：S3/S4 与 S5~S10。S11 起由拦截完成/返航链处置；
+    /// S12/S13/S14/S16 不重复触发（一次任务只中止一次）。
+    static bool BatteryGuardActiveState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kArming:
+            case common::MissionState::kTakeoff:
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 飞行中电池守卫（每决策拍）：遥测失效立即中止；电池有效且
+    /// pct <= BAT_LOW_THR 连续 `takeoff.battery_low_debounce` 后中止。
+    /// 恢复高于阈值即清零防抖计时。机载不设本地百分比阈值。
+    void EvaluateBatteryGuard(uint64_t now_ms) {
+        // 影子装配（未注入命令接口）没有真实任务与控制权：S5 影子验证
+        // 路径保持既有语义，电池守卫不中止/不迁移。
+        if (command_sender_ == nullptr) {
+            battery_low_since_ms_.reset();
+            return;
+        }
+        if (!BatteryGuardActiveState(CurrentState())) {
+            battery_low_since_ms_.reset();
+            return;
+        }
+        if (battery_abort_latched_) {
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            // 无飞行快照无法确认电池状态：按遥测失效处理（S3/S4 的断连
+            // 路径已先于本拍收口，这里主要覆盖 S5~S10）。
+            TriggerBatteryAbort(
+                common::MissionAssignmentReason::kBatteryTelemetryInvalid,
+                "飞行中缺少飞行状态快照");
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (!BatteryTelemetryReady(flight)) {
+            TriggerBatteryAbort(
+                common::MissionAssignmentReason::kBatteryTelemetryInvalid,
+                "电池遥测失效（电压/剩余量无效）");
+            return;
+        }
+        // 参数在飞行中不可判定时不做低电比较（避免把未知阈值当 0），
+        // 参数有效性由 S2 预检在起飞前保证。
+        const bool low = BatteryParametersReady(flight) &&
+                         flight.battery_remaining_pct <=
+                             flight.battery_low_threshold_pct;
+        if (!low) {
+            battery_low_since_ms_.reset();
+            return;
+        }
+        if (!battery_low_since_ms_.has_value()) {
+            battery_low_since_ms_ = now_ms;
+        }
+        if (ElapsedMs(now_ms, *battery_low_since_ms_) <
+            static_cast<uint64_t>(takeoff_.battery_low_debounce.count())) {
+            return;
+        }
+        TriggerBatteryAbort(common::MissionAssignmentReason::kBatteryLow,
+                            "电池剩余电量不高于 PX4 BAT_LOW_THR");
+    }
+
+    /// 电池中止统一处置（一次任务只执行一次）：
+    /// - S3/S4：复用 AbortTakeoff（已离地 → S12；地面 → 停流/必要时
+    ///   DISARM → READY）；
+    /// - S5~S10：tracker AbortAirborne + 65015 aborted → S12 机载位置返航；
+    ///   不走 PX4 RTL，不触发新的拦截/发射。
+    void TriggerBatteryAbort(common::MissionAssignmentReason reason,
+                             const char* detail) {
+        if (battery_abort_latched_) {
+            return;
+        }
+        battery_abort_latched_ = true;
+        battery_low_since_ms_.reset();
+        const auto state = CurrentState();
+        if (state == common::MissionState::kArming ||
+            state == common::MissionState::kTakeoff) {
+            AbortTakeoff(reason, detail);
+            return;
+        }
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(reason);
+        SPDLOG_WARN("飞行中电池中止: reason={} detail={} state={} → S12 返航",
+                    static_cast<int>(reason), detail, MissionStateName(state));
+        TransitionTo(common::MissionState::kReturnHome,
+                     "电池低电/遥测失效，中止任务并返航");
+        PublishTakeoffAbortAck(reason);
+    }
+
+    // ---- S5 目标等待/丢失看门狗（Task 10，设计 §7.5） ----
+
+    /// S5 入口初始化（TransitionTo 调用）：仅在控制任务下启用（影子模式
+    /// 保持既有 S5 行为，不因目标缺失自动中止）。
+    void BeginTargetWatchdog(uint64_t now_ms) {
+        target_lost_since_ms_.reset();
+        ResetTargetHold();
+        if (command_sender_ == nullptr) {
+            target_wait_started_ms_ = 0;
+            assigned_target_acquired_ = false;
+            return;
+        }
+        target_wait_started_ms_ = now_ms;
+        assigned_target_acquired_ = false;
+        SPDLOG_INFO("S5 目标看门狗启动: target_id={} wait_timeout={}ms "
+                    "lost_timeout={}ms hold_max={}ms",
+                    assignment_tracker_.TargetId(),
+                    takeoff_.target_wait_timeout.count(),
+                    takeoff_.target_lost_timeout.count(),
+                    takeoff_.target_hold_max.count());
+    }
+
+    /// 目标保持簿记复位（per-S5 语义：S5 入口与中止时调用）。
+    /// 累计保持时长按“本次 S5”收口，不跨 S5 循环累计。
+    void ResetTargetHold() {
+        target_hold_started_ms_.reset();
+        target_hold_accumulated_ms_ = 0;
+        target_hold_count_ = 0;
+        fresh_estimate_streak_ = 0;
+        hold_logged_ = false;
+        last_evaluate_ms_ = 0;
+    }
+
+    /// 每决策拍（仅 S5、仅控制任务）：未获得匹配目标超过 target_wait_timeout，
+    /// 或已获得后匹配目标持续失效超过 target_lost_timeout → 中止分配、S12 返航、
+    /// 65015 aborted(target_wait_timeout/target_lost)。一次任务只中止一次。
+    /// S6/S7 的交接/视觉丢失逻辑不受本函数影响。
+    /// 目标保持（2026-10-22）：目标失效期间由原地保持意图续住控制流，本函数
+    /// 之外另有 `target_hold_max` 绝对兜底——目标反复闪烁会不断清零丢失计时，
+    /// 单靠 lost_timeout 无法收口，累计保持超限同样走中止返航。
+    /// 到点判定与"到点后视觉未识别"计时（2026-11-05）。
+    ///
+    /// 目标看门狗（EvaluateTargetWatchdog）只在目标**失效**时计时；现场 65010
+    /// 以 5Hz 持续送达时那三条计时器都不会启动，于是"飞机悬停在目标
+    /// 点上方、视觉整段 SEARCHING"既无告警也无处置。本函数用独立判据补这一段，
+    /// 与看门狗的计时互不影响。
+    ///
+    /// 生效条件（任一不满足即清计时返回空状态）：控制任务注入、当前 S5、
+    /// 分配目标估计新鲜、目标估计为局部 NED、本机局部位置有效。
+    ///
+    /// 数据来源：目标点取 `latest_estimated_`（与位置意图同帧），自身位置取
+    /// `latest_flight_->local_*`，地速取局部三轴速度合成，视觉锁定取"状态
+    /// LOCKED 且未超龄"（与 S6 进入判据同口径）。
+    HandoverWaitStatus EvaluateHandoverWait(uint64_t now_ms) {
+        if (mission_abort_latched_ || CurrentState() != common::MissionState::kGpsApproach ||
+            command_sender_ == nullptr || !HasFreshEstimate(now_ms) ||
+            !latest_flight_.has_value() || !latest_flight_->local_position_valid ||
+            !latest_estimated_.has_value() ||
+            latest_estimated_->header.frame_id != kFrameLocalNed) {
+            handover_wait_tracker_.Reset();
+            handover_wait_warn_logged_ = false;
+            return HandoverWaitStatus{};
+        }
+        const auto& flight = *latest_flight_;
+        const auto& target = *latest_estimated_;
+        const double dx = static_cast<double>(target.pos_x_m) -
+                          static_cast<double>(flight.local_x_m);
+        const double dy = static_cast<double>(target.pos_y_m) -
+                          static_cast<double>(flight.local_y_m);
+        const double dz = static_cast<double>(target.pos_z_m) -
+                          static_cast<double>(flight.local_z_m);
+        HandoverWaitSample sample;
+        sample.horizontal_m = std::sqrt(dx * dx + dy * dy);
+        sample.vertical_m = std::fabs(dz);
+        sample.ground_speed_mps = std::sqrt(static_cast<double>(flight.vx_mps) * flight.vx_mps +
+                                            static_cast<double>(flight.vy_mps) * flight.vy_mps);
+        sample.visual_locked = VisualLockedNow(now_ms);
+        const auto status = handover_wait_tracker_.Update(sample, now_ms,
+                                                          HandoverWaitParamsFromConfig());
+        if (status.warn && !handover_wait_warn_logged_) {
+            handover_wait_warn_logged_ = true;
+            SPDLOG_WARN("到点后视觉未识别: waited={}ms 水平={:.2f}m 垂直={:.2f}m 地速={:.2f}m/s",
+                        status.waited_ms, sample.horizontal_m, sample.vertical_m,
+                        sample.ground_speed_mps);
+        }
+        if (!status.warn) {
+            handover_wait_warn_logged_ = false;
+        }
+        // 自动处置阈值非 0 且已越过：按"目标等待超时"中止到 S12（与看门狗
+        // 同一收口路径），现场默认 0 时不走到这里。
+        if (status.abort) {
+            SPDLOG_WARN("到点后视觉未识别超过 visual_wait_abort_ms({}ms)，中止任务",
+                        status.waited_ms);
+            AbortForTargetWatchdog(
+                common::MissionAssignmentReason::kTargetWaitTimeout,
+                "到点后视觉未识别超时（handover.visual_wait_abort_ms）");
+        }
+        return status;
+    }
+
+    /// 组装到点判据参数：半径/保持/告警/处置四项来自 handover 配置节；
+    /// 地速门限固定为设计 §4.2 的 0.5m/s（不做配置键——它是"停稳"的物理
+    /// 口径，被调高会把"掠过目标点"误判成到点）。
+    HandoverWaitParams HandoverWaitParamsFromConfig() const {
+        HandoverWaitParams params;
+        params.arrival_radius_m = handover_.arrival_radius_m;
+        params.arrival_vertical_m = handover_.arrival_vertical_m;
+        params.arrival_speed_mps = kHandoverArrivalSpeedMps;
+        params.arrival_hold = handover_.arrival_hold_ms;
+        params.visual_warn = handover_.visual_wait_warn_ms;
+        params.visual_abort = handover_.visual_wait_abort_ms;
+        return params;
+    }
+
+    /// 本拍引导点是否被围栏挡住（2026-11-05，围栏钳制无提示）。
+    ///
+    /// 现场现象：目标跑出围栏后飞机贴着边界悬停、页面没有任何信息。根因是
+    /// FlightController 在发 setpoint 前用 `fence::ClampIntoPolygon()` 把越界
+    /// 设定值拉回边界（src/control/flight_controller.cpp:791），只打一条节流
+    /// WARN；而状态机的 `EvaluateFenceGuard` 只看**飞机自身**位置，于是这件事
+    /// 对 65013/65019 都不可见。
+    ///
+    /// 判据：处于"跟着目标飞"的 S5/S6/S7，且满足任一：
+    ///   - 本拍下发的引导点（PublishPositionIntent 记录）落在多边形外；
+    ///   - 已进入**贴边保持**（`guide_edge_hold_`，2026-11-12）。制导层钳制后
+    ///     引导点已落在界内，若不额外认这一条，告警会永久消失——而操作员恰恰
+    ///     需要知道"目标在区域外、飞机被围栏挡住"。S3/S4 的起飞点是规划好的、
+    ///     S12 的返航点是 HOME，都不该报"被围栏挡住"。
+    ///
+    /// 只抬告警位，不改变任何动作：越界处置仍由 EvaluateFenceGuard
+    /// （按飞机自身位置 + 深度容差）决定。
+    bool EvaluateGuideOutsideFence() {
+        const auto state = CurrentState();
+        const bool tracking = state == common::MissionState::kGpsApproach ||
+                              state == common::MissionState::kVisualHandover ||
+                              state == common::MissionState::kVisualTracking;
+        if (mission_abort_latched_ || !tracking) {
+            // 中止/离开跟踪链（S12、S13、S3/S4 等）时清掉贴边保持：它只描述
+            // "本段 S5 制导"，残留会让下一次任务的进入/解除判据沿用旧滞回
+            //（先按 release 而不是 margin 判定）——2026-11-12 复审。
+            guide_edge_hold_ = false;
+            guide_outside_fence_ = false;
+            return false;
+        }
+        if (guide_edge_hold_) {
+            guide_outside_fence_ = true;
+            return true;
+        }
+        if (!guide_point_valid_) {
+            guide_outside_fence_ = false;
+            return false;
+        }
+        const common::FencePolygonNed polygon = LatestFencePolygon();
+        if (!polygon.valid()) {
+            guide_outside_fence_ = false;
+            return false;
+        }
+        const bool outside =
+            !control::fence::PointInPolygon(polygon.vertices, guide_point_);
+        if (outside && !guide_outside_fence_) {
+            SPDLOG_WARN("引导点越出围栏: 引导=({:.2f},{:.2f}) zone={} v{} "
+                        "—— 控制器会把设定值钳到边界，飞机将贴边悬停",
+                        guide_point_.north_m, guide_point_.east_m,
+                        polygon.zone_id, polygon.version);
+        }
+        guide_outside_fence_ = outside;
+        return outside;
+    }
+
+    /// 视觉是否已锁定：状态为 LOCKED 且视觉状态消息未超龄（与 S6 进入判据
+    /// 同一视觉新鲜度阈值，避免两处对"视觉还在"给出不同答案）。
+    bool VisualLockedNow(uint64_t now_ms) const {
+        return !VisualStatusStale(now_ms) && latest_visual_status_.has_value() &&
+               latest_visual_status_->state == common::VisualTargetState::kLocked;
+    }
+
+    void EvaluateTargetWatchdog(uint64_t now_ms) {
+        if (command_sender_ == nullptr) {
+            return;  // 影子模式不启用
+        }
+        if (CurrentState() != common::MissionState::kGpsApproach) {
+            return;
+        }
+        if (mission_abort_latched_) {
+            return;
+        }
+        if (HasFreshAssignedTarget(now_ms)) {
+            assigned_target_acquired_ = true;
+            target_lost_since_ms_.reset();
+            return;
+        }
+        // 目标当前不可用：累计保持超限即收口（目标恢复后正在引导时不得因历史
+        // 累计立刻中止；下一次不可用时才按累计上限中止）。
+        if (target_hold_accumulated_ms_ >=
+            static_cast<uint64_t>(takeoff_.target_hold_max.count())) {
+            AbortForTargetWatchdog(
+                assigned_target_acquired_
+                    ? common::MissionAssignmentReason::kTargetLost
+                    : common::MissionAssignmentReason::kTargetWaitTimeout,
+                "目标保持累计超时（target_hold_max_ms）");
+            return;
+        }
+        if (!assigned_target_acquired_) {
+            if (ElapsedMs(now_ms, target_wait_started_ms_) >=
+                static_cast<uint64_t>(
+                    takeoff_.target_wait_timeout.count())) {
+                AbortForTargetWatchdog(
+                    common::MissionAssignmentReason::kTargetWaitTimeout,
+                    "起飞后等待分配目标超时");
+            }
+            return;
+        }
+        if (!target_lost_since_ms_.has_value()) {
+            target_lost_since_ms_ = now_ms;
+        }
+        if (ElapsedMs(now_ms, *target_lost_since_ms_) >=
+            static_cast<uint64_t>(takeoff_.target_lost_timeout.count())) {
+            AbortForTargetWatchdog(
+                common::MissionAssignmentReason::kTargetLost,
+                "已获得目标持续失效超时");
+        }
+    }
+
+    /// 地面站任务指令（65020，2026-10-29）：当前只支持"主动返航"。
+    ///
+    /// 与自动通道的关系：到点判据超时返航、围栏越界返航、低电返航、目标丢失
+    /// 返航都是**自动策略**；本指令是**人工即时指令**。两者共用同一个中止入口
+    /// 语义（停位置流 → tracker AbortAirborne → 65015 aborted → S12），因此不
+    /// 重复：谁先触发谁生效，后续守卫看到状态已离开任务态自然跳过。
+    ///
+    /// 只对空中任务态（S3~S11）生效；地面与终态回拒绝，已在返航/降落回"已完成"。
+    /// 每条指令只回一条 65021（含拒绝与重复），同 command_id 重发不重复执行。
+    void EvaluateMissionCommand(uint64_t now_ms) {
+        if (!latest_mission_command_.has_value()) {
+            return;
+        }
+        const common::MissionCommand command = *latest_mission_command_;
+        latest_mission_command_.reset();
+        (void)now_ms;
+
+        // 同一条指令重发（地面站重试/链路重复）：只回执，不重复执行。
+        if (command.command_id != 0U &&
+            command.command_id == last_mission_command_id_) {
+            SPDLOG_INFO("任务指令重复已忽略: command_id={} state={}",
+                        command.command_id, static_cast<int>(CurrentState()));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kDuplicateCommand);
+            return;
+        }
+        if (command.protocol_version != kMissionCommandProtocolVersion) {
+            SPDLOG_WARN("任务指令协议版本不支持: version={}（期望 {}）",
+                        command.protocol_version, kMissionCommandProtocolVersion);
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kUnsupportedVersion);
+            return;
+        }
+        // 指令分派：返航沿用既有路径；重置任务状态走独立分支（2026-11-04）。
+        if (command.type == common::MissionCommandType::kResetState) {
+            ExecuteResetStateCommand(command);
+            return;
+        }
+        if (command.type != common::MissionCommandType::kReturnHome) {
+            SPDLOG_WARN("任务指令类型不支持: type={}",
+                        static_cast<int>(command.type));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kUnsupportedCommand);
+            return;
+        }
+        // 幂等槽位不在此登记：后面还有状态守卫可能拒绝本条指令，被拒绝的 id 若
+        // 占槽会让地面站修正后在同一 id 下重发被误判 duplicate。登记只发生在真正
+        // 执行动作的分支里（RecordExecutedMissionCommandId）。
+
+        const common::MissionState state = CurrentState();
+        if (mission_faulted_) {
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kMissionFault);
+            return;
+        }
+        // 已在返航：不重复中止、不重启爬升，但把它当成“继续返航”——重置停滞
+        // 诊断计时并回执受理（2026-11-04：S12 已取消总时长超时，操作员仍需要
+        // 一个明确的“我在等你回来”入口；旧行为是回 kCompleted，Web 提示
+        // “目标状态已达成”，容易被误读为已到达）。
+        if (state == common::MissionState::kReturnHome) {
+            RecordExecutedMissionCommandId(command.command_id);
+            return_best_distance_m_ = std::numeric_limits<double>::max();
+            return_progress_ms_ = 0;
+            return_stall_warned_ms_ = 0;
+            SPDLOG_INFO("任务指令（主动返航）: 已在返航，按继续返航处理 command_id={}",
+                        command.command_id);
+            PublishMissionCommandAck(command,
+                                     common::MissionCommandResult::kAccepted,
+                                     common::MissionCommandReason::kNone);
+            return;
+        }
+        // 已在降落：不可撤销，回执“目标状态已达成”。
+        if (state == common::MissionState::kLanding) {
+            SPDLOG_INFO("任务指令（主动返航）: 已在降落流程，回执完成 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kCompleted,
+                                     common::MissionCommandReason::kAlreadyReturning);
+            return;
+        }
+        // S3/S4：复用起飞中止（已离地→S12；仍在地面→停流回 READY 并拒执）。
+        if (state == common::MissionState::kArming ||
+            state == common::MissionState::kTakeoff) {
+            RecordExecutedMissionCommandId(command.command_id);
+            AbortTakeoff(common::MissionAssignmentReason::kCancelledByGcs,
+                         "地面站主动返航指令");
+            const bool returning = CurrentState() == common::MissionState::kReturnHome;
+            SPDLOG_WARN("任务指令（主动返航）: 起飞阶段中止 returning={} command_id={}",
+                        returning, command.command_id);
+            PublishMissionCommandAck(
+                command,
+                returning ? common::MissionCommandResult::kAccepted
+                          : common::MissionCommandResult::kRejected,
+                returning ? common::MissionCommandReason::kNone
+                          : common::MissionCommandReason::kNotAirborne);
+            return;
+        }
+        // 空中任务态（S5~S11）：中止任务并进入 S12 返航。
+        if (MissionCommandAirborneState(state)) {
+            RecordExecutedMissionCommandId(command.command_id);
+            mission_abort_latched_ = true;
+            StopPositionIntent("地面站主动返航指令");
+            ResetTargetHold();
+            assignment_tracker_.AbortAirborne();
+            RememberTakeoffAbort(common::MissionAssignmentReason::kCancelledByGcs);
+            SPDLOG_WARN("任务指令（主动返航）: state={} → S12 返航 command_id={}",
+                        static_cast<int>(state), command.command_id);
+            TransitionTo(common::MissionState::kReturnHome,
+                         "地面站主动返航指令，中止任务并返航");
+            PublishTakeoffAbortAck(common::MissionAssignmentReason::kCancelledByGcs);
+            PublishMissionCommandAck(command, common::MissionCommandResult::kAccepted,
+                                     common::MissionCommandReason::kNone);
+            return;
+        }
+        // 地面态（BOOT/SELF_CHECK/READY/DISARMED）与人工/故障态：不可执行。
+        SPDLOG_INFO("任务指令（主动返航）: 当前状态不可执行 state={}",
+                    static_cast<int>(state));
+        PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                 common::MissionCommandReason::kNotAirborne);
+    }
+
+    /// 65020 kResetState：重置任务状态（2026-11-04）。
+    /// 场景：一次任务正常/中止结束后停在 S14 DISARMED，tracker 已进 kTerminal、
+    /// 中止锁存与 65015 结果仍在，地面站只能重启机载程序才能再接任务。该指令
+    /// 清空 per-sortie 状态并回 S2 READY，清理清单与 Start 的启动复位完全一致
+    /// （共用 ResetSortieState），因此不会出现"重启能恢复、重置却漏清某项"。
+    /// 守卫：**已落地且上锁**才受理（armed 时清状态会让控制意图与 tracker 断裂）；
+    /// S16 故障态与 S15 人工接管不通过本指令恢复，仍需人工处置。
+    /// 幂等：已在 S2 回 kCompleted；已在返航/降落/空中回 kRejected(kNotOnGround)。
+    void ExecuteResetStateCommand(const common::MissionCommand& command) {
+        const common::MissionState state = CurrentState();
+        if (mission_faulted_) {
+            SPDLOG_WARN("任务指令（重置状态）: 任务故障态拒绝，需人工处置 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kMissionFault);
+            return;
+        }
+        // 已就绪：幂等完成。这里不重复 ResetSortieState，避免把刚记下的 65015
+        // 结果与 tracker 终态记忆再清一次。
+        if (state == common::MissionState::kReady) {
+            SPDLOG_INFO("任务指令（重置状态）: 已在 READY，回执完成");
+            PublishMissionCommandAck(command, common::MissionCommandResult::kCompleted,
+                                     common::MissionCommandReason::kNone);
+            return;
+        }
+        if (state != common::MissionState::kDisarmed) {
+            SPDLOG_WARN("任务指令（重置状态）: 当前状态不可重置 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kNotOnGround);
+            return;
+        }
+        const bool armed = latest_flight_.has_value() && latest_flight_->armed;
+        // 兜底：状态机已在 S14 但 tracker 仍认为在空中（状态机/PX4 不同步）时
+        // 不重置，避免地面站据此误判"可再次分配"。
+        const bool airborne_task =
+            assignment_tracker_.ConsumedAirborneMission() &&
+            assignment_tracker_.Phase() != AssignmentPhase::kTerminal;
+        if (armed || airborne_task) {
+            SPDLOG_WARN("任务指令（重置状态）: 未落地/未上锁拒绝 armed={} phase={}",
+                        armed, static_cast<int>(assignment_tracker_.Phase()));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kNotOnGround);
+            return;
+        }
+        RecordExecutedMissionCommandId(command.command_id);
+        ResetSortieState();
+        SPDLOG_WARN("任务指令（重置状态）: 已清空本次任务状态 DISARMED → READY command_id={}",
+                    command.command_id);
+        TransitionTo(common::MissionState::kReady, "地面站重置任务状态");
+        PublishMissionCommandAck(command, common::MissionCommandResult::kAccepted,
+                                 common::MissionCommandReason::kNone);
+    }
+
+    /// 空中任务态（可被主动返航中止的状态集合）。
+    static bool MissionCommandAirborneState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+            case common::MissionState::kPostIntercept:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 登记"真正执行过"的 65020 command_id：只在实际执行动作的分支调用，
+    /// 被版本/类型/状态守卫或"已在返航"早退的指令不占幂等槽位。
+    void RecordExecutedMissionCommandId(uint32_t command_id) {
+        if (command_id != 0U) {
+            last_mission_command_id_ = command_id;
+        }
+    }
+
+    /// 发布 65021 任务指令回执（每条指令一条；assigned id 与状态供地面站判读）。
+    void PublishMissionCommandAck(const common::MissionCommand& command,
+                                  common::MissionCommandResult result,
+                                  common::MissionCommandReason reason) {
+        common::MissionCommandAck ack;
+        // 回执序号与节流日志共用同一累计值：只递增一次，否则 65021 序号出现
+        // 空洞（地面站按序号判读时会误以为丢包）。
+        const uint64_t count = ++mission_command_ack_count_;
+        ack.header.sequence = count;
+        ack.header.source_time_ms = command.received_ms;
+        ack.header.receive_time_ms = MonotonicMs();
+        ack.header.source_id = 1;
+        ack.header.valid_for_ms = kStatusValidForMs;
+        ack.protocol_version = kMissionCommandProtocolVersion;
+        ack.command_id = command.command_id;
+        ack.type = command.type;
+        ack.result = result;
+        ack.reason = reason;
+        ack.mission_state = CurrentState();
+        (void)mission_command_ack_output_.Publish(
+            std::make_shared<const common::MissionCommandAck>(ack));
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_INFO("任务指令回执已发布: command_id={} type={} result={} reason={} state={} count={}",
+                        ack.command_id, static_cast<int>(ack.type),
+                        static_cast<int>(ack.result), static_cast<int>(ack.reason),
+                        static_cast<int>(ack.mission_state), count);
+        }
+    }
+
+    /// 目标看门狗中止统一处置：停发位置引导（S12 当拍接管返航意图）、
+    /// tracker AbortAirborne、65015 aborted → S12；不触发拦截/187。
+    void AbortForTargetWatchdog(common::MissionAssignmentReason reason,
+                                const char* detail) {
+        if (mission_abort_latched_) {
+            return;
+        }
+        mission_abort_latched_ = true;
+        target_lost_since_ms_.reset();
+        StopPositionIntent("目标等待/丢失超时中止任务");
+        ResetTargetHold();
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(reason);
+        SPDLOG_WARN("S5 目标看门狗中止: reason={} detail={} → S12 返航",
+                    static_cast<int>(reason), detail);
+        TransitionTo(common::MissionState::kReturnHome,
+                     "目标等待/丢失超时，中止任务并返航");
+        PublishTakeoffAbortAck(reason);
+    }
+
+    /// 地面站围栏区域更新（65018）：校验 + 快照 + 落盘缓存。
+    /// 区域是"一群飞机共享的快照"，不做逐条回执；只有内容变化才写缓存与日志。
+    void ApplyFenceZone(const common::FenceZone& zone) {
+        // 退化/自交几何与非法高度带会让越界判定"恒真/恒假"，必须在接受当拍
+        // 拒绝并保留上一份可用区域（2026-10-30 审查 A-03）。
+        std::string invalid_reason;
+        if (!control::fence::ValidateZone(zone, &invalid_reason)) {
+            const uint64_t count = ++fence_invalid_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN(
+                    "围栏区域非法已忽略: zone={}/{} 顶点={} 原因={} count={}",
+                    zone.zone_id, zone.version, zone.vertices.size(),
+                    invalid_reason, count);
+            }
+            return;
+        }
+        // 内容比较不能只看 id/version：同 id/version 但几何/动作/高度带变化的
+        // 区域也必须落盘并重置越界计时，否则重启后回滚到旧区域（A-02）。
+        const bool changed =
+            !fence_zone_.has_value() || FenceZoneContentChanged(*fence_zone_, zone);
+        fence_zone_ = zone;
+        fence_dirty_ = true;
+        fence_report_pending_ = true;
+        if (!changed) {
+            return;
+        }
+        SPDLOG_INFO(
+            "围栏区域已更新: zone={}/{} 顶点={} 动作={} 高度带=[{:.1f},{:.1f}]m "
+            "基准={}",
+            zone.zone_id, zone.version, zone.vertices.size(),
+            static_cast<int>(zone.action), zone.alt_min_m, zone.alt_max_m,
+            static_cast<int>(zone.altitude_reference));
+        // 落盘缓存（断链/重启后仍按同一区域自治执行）。
+        if (!fence_.zone_cache_path.empty() &&
+            !config::ZoneStore::Save(fence_.zone_cache_path, zone)) {
+            RecordError("围栏区域缓存写入失败: " + fence_.zone_cache_path);
+        }
+        // 越界计时按新区域重新起算（区域刚切换时不得沿用旧判定）。
+        // 深度迟滞状态一并清零：否则旧区域的"已越界"状态会让新区域按缓回
+        // 阈值（−depth+hysteresis）而不是进入阈值（−depth）判定，把本应在
+        // 容差内、不构成越界的点持续判越界（2026-11-12 复审）。
+        fence_violation_since_ms_.reset();
+        fence_depth_violated_ = false;
+    }
+
+    /// 65018 区域内容是否变化：id/version 之外还要比较几何（顶点位置，容差
+    /// 0.5m 吸收地面站量化误差）、越界动作、高度基准与高度带。
+    static bool FenceZoneContentChanged(const common::FenceZone& lhs,
+                                        const common::FenceZone& rhs) {
+        constexpr double kVertexToleranceM = 0.5;
+        constexpr double kMetersPerDegreeLat = 111320.0;
+        constexpr double kDegToRad = 0.017453292519943295;
+        if (lhs.zone_id != rhs.zone_id || lhs.version != rhs.version ||
+            lhs.type != rhs.type || lhs.action != rhs.action ||
+            lhs.altitude_reference != rhs.altitude_reference ||
+            std::abs(lhs.alt_min_m - rhs.alt_min_m) > 1e-6 ||
+            std::abs(lhs.alt_max_m - rhs.alt_max_m) > 1e-6 ||
+            lhs.vertices.size() != rhs.vertices.size()) {
+            return true;
+        }
+        for (std::size_t i = 0; i < lhs.vertices.size(); ++i) {
+            const double mean_lat_deg =
+                0.5 * (lhs.vertices[i].latitude_deg + rhs.vertices[i].latitude_deg);
+            const double dn = (lhs.vertices[i].latitude_deg -
+                               rhs.vertices[i].latitude_deg) *
+                              kMetersPerDegreeLat;
+            const double de = (lhs.vertices[i].longitude_deg -
+                               rhs.vertices[i].longitude_deg) *
+                              kMetersPerDegreeLat * std::cos(mean_lat_deg * kDegToRad);
+            if (std::hypot(dn, de) > kVertexToleranceM) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 围栏守卫/动作允许的状态：起飞/任务/拦截链（含 S11 收口拍）。地面 S0~S2、
+    /// 返航降落链 S12/S13/S14 与故障态不在此列——那些阶段由各自链路收口。
+    static bool FenceActionActiveState(common::MissionState state) {
+        switch (state) {
+            case common::MissionState::kArming:
+            case common::MissionState::kTakeoff:
+            case common::MissionState::kGpsApproach:
+            case common::MissionState::kVisualHandover:
+            case common::MissionState::kVisualTracking:
+            case common::MissionState::kObstacleHold:
+            case common::MissionState::kInterceptReady:
+            case common::MissionState::kInterceptExecuting:
+            case common::MissionState::kPostIntercept:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// 多边形围栏守卫（2026-10-29）：地面站划定区域，机载自治执行。
+    /// 只在 fence.enabled 时工作；区域来源为 65018 更新或启动时的本地缓存
+    /// （config/zone.json）。越界（多边形外或高度带外）持续 violation_debounce
+    /// 后按区域动作处置：hold=原地保持（不中止任务）、return=中止到 S12 返航、
+    /// land=转 S13 降落。每拍在电池守卫之后、目标看门狗之前评估；动作只在地面/
+    /// 空中任务态生效（见 FenceActionActiveState），65019 状态始终上报。
+    /// 高度带判据使用的高度（米）；基准不可用返回 nullopt，调用方只判水平。
+    /// - altitude_reference=0：AMSL = EKF 锚点高度 + 相对锚点高度(−local_z)
+    /// - altitude_reference=1：相对起飞点 = 解锁瞬间 local_z − 当前 local_z
+    /// **不能用 `AMSL − HOME_POSITION.alt` 当“相对 Home”**：Home 高度是 GNSS
+    /// 绝对海拔，0083/0084 现场 25 分钟内从 341.775m 漂到 248.159m（窗口
+    /// 38.81m），把相对高度整体抬到 19.3m，起飞 4.83m 就撞上 20m 上限被判越界
+    /// 并中止返航（见 docs/故障排查手册.md §17.9.1）。EKF 差分在地面恒为 0，
+    /// 只受 IMU 漂移影响，与 Home 何时重设、锚点比地形高多少都无关。
+    /// **也不能用 −local_z 兜底**：EKF 锚点常比地面高数米（现场地面静止时
+    /// local_z≈+6.2m），兜底会让地面静止就判越界；宁可只判水平。
+    static std::optional<double> AltitudeForFence(
+        uint8_t altitude_reference,
+        const common::FlightStateSnapshot& flight) {
+        if (!flight.local_position_valid) {
+            return std::nullopt;
+        }
+        if (altitude_reference != 0U) {
+            // 基准优先 HOME_POSITION.z（PX4 重设 Home 时随之平移，EKF 重置自愈），
+            // 退化到解锁瞬间快照；都不可用则只判水平。
+            const auto base_z = common::RelativeAltitudeBaseZ(flight);
+            if (!base_z.has_value()) {
+                return std::nullopt;
+            }
+            return *base_z - static_cast<double>(flight.local_z_m);
+        }
+        if (!flight.ned_ref_valid) {
+            return std::nullopt;
+        }
+        return static_cast<double>(flight.ned_ref_alt_mm) * 1e-3 -
+               static_cast<double>(flight.local_z_m);
+    }
+
+    /// 高度带下限的有效值（米；<=0 表示不判下限）。
+    /// - 相对起飞点（altitude_reference=1）：从地面起算，下限恒按 0（不判）。
+    ///   否则起飞必须穿过 0→alt_min，而 S3/S4 都在围栏动作生效态、防抖只有 1.5s，
+    ///   正常起飞会被自家围栏判越界（2026-10-30 现场日志 0078 实证：地面静止
+    ///   state=2“越界 19.51m”，实际水平仍在区域内 19.5m，越界的是高度带下限）。
+    /// - AMSL（altitude_reference=0）：绝对海拔下限对跨海拔场地仍有意义，保留；
+    ///   但起飞/爬升阶段（S0~S4）不判下限，避免起飞过程被误判。
+    static double FenceEffectiveAltMin(const common::FenceZone& zone,
+                                       common::MissionState state) {
+        if (zone.altitude_reference != 0U) {
+            return 0.0;
+        }
+        switch (state) {
+            case common::MissionState::kBoot:
+            case common::MissionState::kSelfCheck:
+            case common::MissionState::kReady:
+            case common::MissionState::kArming:
+            case common::MissionState::kTakeoff:
+                return 0.0;
+            default:
+                return zone.alt_min_m;
+        }
+    }
+
+    // 无缓存、也还没收到 65018 时，用 Home 生成默认方形区域并落盘（只做一次）。
+    // 目的：避免"无区域 = 不限制"的空窗；区域随项目部署走，地面站可随时覆盖。
+    void EnsureDefaultFenceZone(uint64_t now_ms) {
+        // 只在围栏启用时生成：默认关闭时不应凭空写盘（也会干扰单元测试的
+        // 工作目录），且"未启用"本身就是地面站需要看到的信号。
+        if (!fence_.enabled || fence_zone_.has_value() || !latest_flight_.has_value()) {
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.home_valid || fence_.default_half_side_m <= 0.0 ||
+            fence_.default_zone_id == 0U || fence_.default_version == 0U) {
+            return;
+        }
+        const double lat0 = static_cast<double>(flight.home_lat_1e7) * 1e-7;
+        const double lon0 = static_cast<double>(flight.home_lon_1e7) * 1e-7;
+        if (lat0 == 0.0 && lon0 == 0.0) {
+            return;
+        }
+        const double dlat = fence_.default_half_side_m / 111320.0;
+        const double dlon =
+            fence_.default_half_side_m /
+            (111320.0 * std::max(0.1, std::cos(lat0 * 0.017453292519943295)));
+        common::FenceZone zone;
+        zone.header.sequence = 0;
+        zone.header.receive_time_ms = now_ms;
+        zone.header.valid_for_ms = 0;  // 持久快照
+        zone.header.source_id = 0;     // 0=机载默认区域（非地面站下发）
+        zone.header.health = 1;
+        zone.protocol_version = 1;
+        zone.zone_id = fence_.default_zone_id;
+        zone.version = fence_.default_version;
+        zone.type = common::FenceZoneType::kPolygon;
+        zone.action = fence_.default_action;
+        zone.altitude_reference = 1;  // 相对 Home：默认区域跟随起飞点
+        zone.alt_min_m = fence_.default_alt_min_m;
+        zone.alt_max_m = fence_.default_alt_max_m;
+        zone.ref_lat_1e7 = flight.home_lat_1e7;
+        zone.ref_lon_1e7 = flight.home_lon_1e7;
+        zone.vertices = {{lat0 - dlat, lon0 - dlon},
+                         {lat0 - dlat, lon0 + dlon},
+                         {lat0 + dlat, lon0 + dlon},
+                         {lat0 + dlat, lon0 - dlon}};
+        zone.received_ms = now_ms;
+        SPDLOG_INFO(
+            "围栏默认区域已生成: zone={}/{} 半边长={:.1f}m 高度带=[{:.1f},{:.1f}]m "
+            "动作={}（地面站可覆盖）",
+            zone.zone_id, zone.version, fence_.default_half_side_m, zone.alt_min_m,
+            zone.alt_max_m, static_cast<int>(zone.action));
+        ApplyFenceZone(zone);
+    }
+
+    // 65022 区域回读：新区域立即发一次，其后按 fence.report_period 周期重发，
+    // 使地面站刷新/重连后无需额外请求即可恢复图层与一致性比对。
+    void PublishFenceZoneReport(uint64_t now_ms) {
+        if (!fence_zone_.has_value()) {
+            return;
+        }
+        const uint64_t period_ms =
+            static_cast<uint64_t>(fence_.report_period.count());
+        const bool due =
+            fence_report_pending_ || fence_report_last_ms_ == 0 ||
+            (period_ms > 0U && now_ms - fence_report_last_ms_ >= period_ms);
+        if (!due) {
+            return;
+        }
+        (void)fence_zone_report_output_.Publish(
+            std::make_shared<const common::FenceZone>(*fence_zone_));
+        fence_report_pending_ = false;
+        fence_report_last_ms_ = now_ms;
+    }
+
+    void EvaluateFenceGuard(uint64_t now_ms) {
+        EnsureDefaultFenceZone(now_ms);
+        PublishFenceZoneReport(now_ms);
+        // 判定与动作分离：即使 fence.enabled=false（默认配置），也照常计算状态并
+        // 每拍上报 65019，让地面站能确认“区域是否已装载、形状与高度带是否合理”，
+        // 否则地面站只能看到 state=3(no_zone) 而无从判断。越界**动作**（保持/返航/
+        // 降落）仍受 enabled 门控，默认配置下不会产生任何中止或降落。
+        // 区域/锚点变化后重建 NED 多边形（锚点未就绪时降级 no_zone，不盲算）。
+        if (fence_dirty_) {
+            // 只有重建**成功**才清脏标记：锚点（ned_ref）在起飞早期可能尚未
+            // 就绪，若此时清标记，多边形会一直为空、控制器永不钳制
+            // （2026-10-29 SITL 实测：首版就是这样让"围栏钳制"偶发失效）。
+            fence_dirty_ = !RebuildFencePolygon();
+        }
+        const common::FencePolygonNed polygon = LatestFencePolygon();
+        const bool zone_present = fence_zone_.has_value();
+        const bool have_position =
+            latest_flight_.has_value() && latest_flight_->local_position_valid;
+
+        common::FenceState state = common::FenceState::kNoZone;
+        double distance_m = 0.0;
+        bool violated = false;
+        if (zone_present && !polygon.valid()) {
+            // 区域已收到但锚点/顶点尚不可换算：暂按无效区域处理（不中止）。
+            state = common::FenceState::kZoneInvalid;
+        } else if (polygon.valid() && have_position) {
+            const auto& flight = *latest_flight_;
+            const common::Vec2Ned point{static_cast<double>(flight.local_x_m),
+                                        static_cast<double>(flight.local_y_m)};
+            distance_m =
+                control::fence::SignedDistanceToBoundary(polygon.vertices, point);
+            // 水平越界判定（2026-11-12）：带**深度容差 + 回界滞回**。
+            // 零容差会把位置环被顶出边界 1~3m 又拉回的瞬时穿透判成越界中止
+            // （0119/0120 现场：目标贴边 → 飞机在边界两侧波动两下 → 第三次
+            // 出去凑满 1.5s 防抖 → 直接返航）。判定改为：
+            //   进入越界：distance_m < −violation_depth_m（越出超过深度容差）；
+            //   清除越界：distance_m > −violation_depth_m + violation_hysteresis_m
+            //             （回到"越界阈值的容差侧"即清除）。
+            // **滞回必须落在容差带内，不能放到边界内侧**：否则飞机停在边界外
+            // 但仍在容差内的位置（如 −0.9m）会一直判越界并持续累计时长，防抖
+            // 凑满后照样中止——那等于容差没生效。
+            // 深度容差/滞回都为 0 时退化为历史零容差语义（−0 与 +0 相接）。
+            const double depth = fence_.violation_depth_m;
+            const double hysteresis = fence_.violation_hysteresis_m;
+            const double clear_threshold = -depth + hysteresis;
+            const bool horizontally_violated =
+                fence_depth_violated_ ? (distance_m < clear_threshold)
+                                      : (distance_m < -depth);
+            fence_depth_violated_ = horizontally_violated;
+            // 高度带：altitude_reference=1 相对起飞点（EKF 差分）、0 相对 EKF
+            // 锚点 AMSL。上限 0 表示不限制。
+            // 下限按有效下限（相对起飞点从地面起算、AMSL 保留绝对下限，见
+            // FenceEffectiveAltMin）；未起飞/爬升阶段一律不判下限。
+            const double alt_min_m =
+                FenceEffectiveAltMin(*fence_zone_, CurrentState());
+            bool altitude_ok = true;
+            if (polygon.alt_max_m > 0.0 || alt_min_m > 0.0) {
+                const auto altitude =
+                    AltitudeForFence(fence_zone_->altitude_reference, flight);
+                if (!altitude.has_value()) {
+                    // 基准不可用（未解锁过/断连后失效/无锚点）：只判水平。
+                    // 不用 GNSS 绝对海拔兜底——那正是 §17.9.1 的误判来源。
+                    altitude_ok = true;
+                } else {
+                    // 迟滞：进入越界按带边界（超过 alt_max 即算），已越界后要回到
+                    // 带内 kFenceAltitudeHysteresisM 才算恢复，避免边界抖动反复触发。
+                    const double margin_m =
+                        fence_altitude_ok_ ? 0.0 : kFenceAltitudeHysteresisM;
+                    altitude_ok =
+                        (polygon.alt_max_m <= 0.0 ||
+                         *altitude <= polygon.alt_max_m - margin_m) &&
+                        (alt_min_m <= 0.0 || *altitude >= alt_min_m + margin_m);
+                }
+            }
+            fence_altitude_ok_ = altitude_ok;
+            // 水平只用深度容差判定（horizontally_violated，见上），高度沿用
+            // 原有带边界 + 1.5m 迟滞。65019 的"接近边界"提示改用带符号距离
+            // distance_m（界内为正），不再单独调用 PointInPolygon。
+            violated = horizontally_violated || !altitude_ok;
+            if (violated) {
+                state = common::FenceState::kViolated;
+            } else {
+                state = distance_m <= fence_.boundary_warn_m
+                            ? common::FenceState::kNearBoundary
+                            : common::FenceState::kNormal;
+            }
+        }
+        // 越界防抖：持续成立 violation_debounce 才动作（边界抖动不当场中止）。
+        if (violated) {
+            if (!fence_violation_since_ms_.has_value()) {
+                fence_violation_since_ms_ = now_ms;
+            }
+        } else {
+            fence_violation_since_ms_.reset();
+        }
+        const uint32_t violation_ms =
+            fence_violation_since_ms_.has_value()
+                ? static_cast<uint32_t>(ElapsedMs(now_ms, *fence_violation_since_ms_))
+                : 0U;
+        fence_state_ = state;
+        fence_distance_m_ = distance_m;
+        fence_violation_ms_ = violation_ms;
+        fence_hold_active_ = false;
+
+        // 目标出区保持 supervisor（2026-11-13）：每拍更新；下面的动作块据此
+        // 决定是否抑制 return/land（判定与 65019 上报不变）。
+        UpdateTargetOutsideHold(now_ms, polygon);
+
+        if (!fence_.enabled) {
+            // 判定照常上报（见函数开头），但默认配置不执行任何越界动作。
+            return;
+        }
+        if (!violated || fence_abort_latched_) {
+            return;
+        }
+        // 只在地面/空中任务态动作：S0~S2 在地面（起飞前区域越界不该触发中止→
+        // 返航链），S12 之后交返航/降落链自己收口，S16 等故障态不重复处置。
+        if (!FenceActionActiveState(CurrentState())) {
+            return;
+        }
+        if (violation_ms <
+            static_cast<uint64_t>(fence_.violation_debounce.count())) {
+            return;
+        }
+        if (target_outside_hold_active_) {
+            // 目标在区外：由"目标出区保持"接管（区内保持/区外飞回），
+            // 不执行 return/land；65019/65013 照常上报（维护者裁决：
+            // 不做超时兜底，飞不回来交 PX4 failsafe）。
+            return;
+        }
+        const common::FenceAction action =
+            fence_.follow_zone_action ? polygon.action : fence_.violation_action;
+        switch (action) {
+            case common::FenceAction::kHold:
+                // 原地保持：不中止任务，位置意图改由本拍末尾的保持意图接管。
+                fence_hold_active_ = true;
+                SPDLOG_WARN("围栏越界保持: zone={}/{} 距边界={:.2f}m 持续={}ms",
+                            polygon.zone_id, polygon.version, distance_m,
+                            violation_ms);
+                return;
+            case common::FenceAction::kLand:
+                // 降落与返航同一中止入口（2026-10-30 审查修复）：停发位置
+                // 引导、tracker AbortAirborne、65015 aborted、中止锁存。
+                // S13 若由 S9/S10 转入，会因"未见过 Offboard"立即转 S14 →
+                // S15，不会卡在 S13 反复发送 Offboard 降落。
+                AbortForFence(polygon, distance_m, violation_ms,
+                              common::FenceAction::kLand);
+                return;
+            case common::FenceAction::kReturn:
+            default:
+                AbortForFence(polygon, distance_m, violation_ms);
+                return;
+        }
+    }
+
+    /// 围栏越界中止统一处置（与目标看门狗同一个中止入口，不重复）：
+    /// 停发位置引导、tracker AbortAirborne、65015 aborted → S12 返航。
+    /// 不触发拦截/187；S9/S10 期间越界同样先中止（拦截不得在区域外执行）。
+    void AbortForFence(const common::FencePolygonNed& polygon, double distance_m,
+                       uint32_t violation_ms,
+                       common::FenceAction action = common::FenceAction::kReturn) {
+        if (mission_abort_latched_ || fence_abort_latched_) {
+            return;
+        }
+        mission_abort_latched_ = true;
+        fence_abort_latched_ = true;
+        StopPositionIntent("围栏越界中止任务");
+        ResetTargetHold();
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(common::MissionAssignmentReason::kFenceViolation);
+        const bool land = action == common::FenceAction::kLand;
+        const common::MissionState target_state =
+            land ? common::MissionState::kLanding
+                 : common::MissionState::kReturnHome;
+        SPDLOG_WARN(
+            "围栏越界中止: zone={}/{} 距边界={:.2f}m 持续={}ms 动作={} → {}",
+            polygon.zone_id, polygon.version, distance_m, violation_ms,
+            land ? "land" : "return", land ? "S13 降落" : "S12 返航");
+        TransitionTo(target_state, land ? "围栏越界，中止任务并降落"
+                                        : "围栏越界，中止任务并返航");
+        PublishTakeoffAbortAck(common::MissionAssignmentReason::kFenceViolation);
+    }
+
+    /// 目标出区保持只在 S5/S6/S7 生效（S9/S10 拦截段不打断；S12 之后由
+    /// 返航/降落链接管）。发布/告警时同样按当拍状态复核，避免当拍迁移到
+    /// S12 后仍发保持意图。
+    static bool IsTargetOutsideHoldState(common::MissionState state) {
+        return state == common::MissionState::kGpsApproach ||
+               state == common::MissionState::kVisualHandover ||
+               state == common::MissionState::kVisualTracking;
+    }
+
+    bool TargetOutsideHoldStateActive() const {
+        return IsTargetOutsideHoldState(CurrentState());
+    }
+
+    /// 目标出区保持 supervisor（2026-11-13，维护者裁决）：
+    /// 目标 NED 位置在围栏外 → 立即停止追击、位置保持。飞机在区内保持进入点；
+    /// 在区外则钳回边界内、低速飞回后悬停。只在 S5/S6/S7 生效（S9/S10 拦截段
+    /// 不打断）；不改任务状态、不执行 return/land、无超时兜底。
+    /// 解除：目标距边界 ≥ `target_outside_release_m` 且持续
+    /// `target_outside_release_hold`，**并且飞机自身已回到区内**。
+    void UpdateTargetOutsideHold(uint64_t now_ms,
+                                 const common::FencePolygonNed& polygon) {
+        const bool active_state = TargetOutsideHoldStateActive();
+        if (!active_state || !polygon.valid() || !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            ResetTargetOutsideHold();
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        const common::Vec2Ned own{static_cast<double>(flight.local_x_m),
+                                  static_cast<double>(flight.local_y_m)};
+        const double own_distance =
+            control::fence::SignedDistanceToBoundary(polygon.vertices, own);
+        // 目标位置不可用：保持现状、暂停解除计时（不凭旧数据解除）。
+        if (!HasFreshEstimate(now_ms)) {
+            target_outside_release_since_ms_ = 0;
+            return;
+        }
+        const auto& target = *latest_estimated_;
+        if (!target.valid || target.header.frame_id != kFrameLocalNed ||
+            !std::isfinite(target.pos_x_m) || !std::isfinite(target.pos_y_m)) {
+            target_outside_release_since_ms_ = 0;
+            return;
+        }
+        const common::Vec2Ned target_point{
+            static_cast<double>(target.pos_x_m),
+            static_cast<double>(target.pos_y_m)};
+        const double target_distance = control::fence::SignedDistanceToBoundary(
+            polygon.vertices, target_point);
+        if (!target_outside_hold_active_) {
+            if (target_distance >= 0.0) {
+                return;  // 目标仍在区内，不进入保持
+            }
+            target_outside_hold_active_ = true;
+            target_outside_hold_point_valid_ = true;
+            if (own_distance >= 0.0) {
+                // 飞机还在区内：减速到哪就悬停在哪（冻结进入点）。
+                target_outside_hold_point_ = own;
+            } else {
+                // 已越界（只可能是减速没减完）：钳回边界内，飞回后悬停。
+                target_outside_hold_point_ = control::fence::ClampIntoPolygon(
+                    polygon.vertices, own,
+                    std::max(0.0, fence_.boundary_margin_m));
+            }
+            target_outside_hold_z_m_ = flight.local_z_m;
+            target_outside_release_since_ms_ = 0;
+            SPDLOG_WARN(
+                "目标出区保持: 目标=({:.2f},{:.2f}) 距边界={:.2f}m "
+                "自机距边界={:.2f}m 保持点=({:.2f},{:.2f}) "
+                "—— 停止追击、位置保持，不中止任务",
+                static_cast<double>(target.pos_x_m),
+                static_cast<double>(target.pos_y_m), target_distance,
+                own_distance, target_outside_hold_point_.north_m,
+                target_outside_hold_point_.east_m);
+            return;
+        }
+        // 保持中：解除需要"目标足够深入区内 + 持续时长 + 飞机自身在区内"。
+        if (target_distance < fence_.target_outside_release_m) {
+            target_outside_release_since_ms_ = 0;
+            return;
+        }
+        if (target_outside_release_since_ms_ == 0) {
+            target_outside_release_since_ms_ = now_ms;
+        }
+        if (own_distance < 0.0) {
+            return;  // 飞机还没回到区内，继续保持
+        }
+        const uint64_t hold_ms = static_cast<uint64_t>(
+            fence_.target_outside_release_hold.count());
+        if (ElapsedMs(now_ms, target_outside_release_since_ms_) < hold_ms) {
+            return;
+        }
+        target_outside_hold_active_ = false;
+        target_outside_hold_point_valid_ = false;
+        target_outside_release_since_ms_ = 0;
+        SPDLOG_INFO("目标出区保持解除: 目标距边界={:.2f}m 自机距边界={:.2f}m"
+                    " —— 恢复跟随",
+                    target_distance, own_distance);
+    }
+
+    void ResetTargetOutsideHold() {
+        target_outside_hold_active_ = false;
+        target_outside_hold_point_valid_ = false;
+        target_outside_release_since_ms_ = 0;
+    }
+
+    /// 目标出区保持意图：固定保持点 + 进入时高度，无前馈/无限速（0=直通）。
+    void PublishTargetOutsideHoldIntent(uint64_t now_ms) {
+        if (!target_outside_hold_point_valid_) {
+            return;
+        }
+        PositionIntentTarget target;
+        target.x = static_cast<float>(target_outside_hold_point_.north_m);
+        target.y = static_cast<float>(target_outside_hold_point_.east_m);
+        target.z = target_outside_hold_z_m_;
+        target.frame_id = kFrameLocalNed;
+        PublishPositionIntent(target, now_ms, kReasonTargetOutsideFence);
+        position_intent_source_ = PositionIntentSource::kTargetOutsideHold;
+    }
+
+    /// 围栏保持意图：以 PX4 当前局部位置为设定点（原因码 10），无前馈。
+    void PublishFenceHoldIntent(uint64_t now_ms) {
+        if (!latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        PositionIntentTarget target;
+        target.x = flight.local_x_m;
+        target.y = flight.local_y_m;
+        target.z = flight.local_z_m;
+        target.frame_id = kFrameLocalNed;
+        PublishPositionIntent(target, now_ms, kReasonFenceViolation);
+        position_intent_source_ = PositionIntentSource::kHold;
+    }
+
+    /// 区域→NED 多边形重建（锚点取 EKF 参考点，与 HomeLocalNed 同源）。
+    /// 顶点经纬度到锚点的平面换算复用 perception::GeodeticToLocalNed。
+    bool RebuildFencePolygon() {
+        common::FencePolygonNed polygon;
+        bool ok = false;
+        if (fence_zone_.has_value() && fence_zone_->vertices.size() >= 3U &&
+            latest_flight_.has_value() && latest_flight_->ned_ref_valid) {
+            const auto& flight = *latest_flight_;
+            const perception::GeodeticCoordinate anchor{
+                static_cast<double>(flight.ned_ref_lat_1e7) * 1e-7,
+                static_cast<double>(flight.ned_ref_lon_1e7) * 1e-7,
+                static_cast<double>(flight.ned_ref_alt_mm) * 1e-3};
+            polygon.zone_id = fence_zone_->zone_id;
+            polygon.version = fence_zone_->version;
+            polygon.action = fence_zone_->action;
+            polygon.altitude_reference = fence_zone_->altitude_reference;
+            polygon.alt_min_m = fence_zone_->alt_min_m;
+            polygon.alt_max_m = fence_zone_->alt_max_m;
+            polygon.vertices.reserve(fence_zone_->vertices.size());
+            for (const auto& vertex : fence_zone_->vertices) {
+                const perception::GeodeticCoordinate point{vertex.latitude_deg,
+                                                           vertex.longitude_deg,
+                                                           0.0};
+                const auto ned = perception::GeodeticToLocalNed(anchor, point);
+                if (!ned.has_value()) {
+                    ok = false;
+                    break;
+                }
+                polygon.vertices.push_back(
+                    common::Vec2Ned{ned->north_m, ned->east_m});
+            }
+            ok = polygon.valid();
+        }
+        {
+            std::lock_guard<std::mutex> lock(fence_mutex_);
+            fence_polygon_ = ok ? polygon : common::FencePolygonNed{};
+        }
+        return ok;
+    }
+
+    /// 控制线程只读快照（FlightController 位置意图钳制用）。
+    // 实现见 public 段 LatestFencePolygon（供外部 —— 唯一实现）。
+
+    /// S3：每拍原点保持意图已由入口发布；等待 bootstrap_lead 后只发一次
+    /// DO_SET_MODE(176)，等待实际 6/0 后只发一次 ARM_DISARM(400)，再等待
+    /// 实际 armed。超时/ACK 非 ACCEPTED/入队失败一律中止，不重试。
+    void EvaluateArmingSequence(const common::FlightStateSnapshot& flight,
+                                uint64_t now_ms) {
+        switch (takeoff_stage_) {
+            case TakeoffStage::kOriginHold: {
+                // 先让 FlightController 的 kBootstrap 有若干拍合法原点保持流
+                // （Task 6 线程侧实现；本任务只保证意图持续发布）。
+                const uint64_t held_ms = ElapsedMs(now_ms, state_entered_ms_);
+                if (held_ms <
+                    static_cast<uint64_t>(takeoff_.bootstrap_lead.count())) {
+                    return;
+                }
+                const bool queued = command_sender_->SendCommand(
+                    kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled,
+                    kPx4MainModeOffboard, kPx4SubModeOffboard, 0.f, 0.f, 0.f,
+                    0.f);
+                if (!queued) {
+                    // 命令入队失败同样中止，不重试（不原地循环重发）。
+                    AbortTakeoff(common::MissionAssignmentReason::kBootstrapTimeout,
+                                 "176 DO_SET_MODE 入队失败");
+                    return;
+                }
+                takeoff_stage_ = TakeoffStage::kWaitOffboard;
+                takeoff_stage_ms_ = now_ms;
+                SPDLOG_INFO("S3 起飞模式命令已入队: DO_SET_MODE(176) p1={} p2={} "
+                            "p3={}（本次起飞仅一次）",
+                            static_cast<double>(kMavModeFlagCustomModeEnabled),
+                            static_cast<double>(kPx4MainModeOffboard),
+                            static_cast<double>(kPx4SubModeOffboard));
+                return;
+            }
+            case TakeoffStage::kWaitOffboard: {
+                if (TakeoffAckRejected(kMavCmdDoSetMode)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "176 ACK 非 ACCEPTED");
+                    return;
+                }
+                if (IsPx4Offboard(flight)) {
+                    // 实际 6/0 才发解锁命令（ACK 只是过程反馈）。
+                    const bool queued = command_sender_->SendCommand(
+                        kMavCmdComponentArmDisarm, 1.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+                        0.f);
+                    if (!queued) {
+                        AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
+                                     "400 ARM_DISARM 入队失败");
+                        return;
+                    }
+                    takeoff_stage_ = TakeoffStage::kWaitArmed;
+                    takeoff_stage_ms_ = now_ms;
+                    SPDLOG_INFO("S3 已进入 Offboard(6/0)，解锁命令已入队: "
+                                "ARM_DISARM(400) p1=1（本次起飞仅一次）");
+                    return;
+                }
+                if (ElapsedMs(now_ms, takeoff_stage_ms_) >=
+                    static_cast<uint64_t>(takeoff_.mode_timeout.count())) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "等待实际 Offboard(6/0) 超时");
+                }
+                return;
+            }
+            case TakeoffStage::kWaitArmed: {
+                // ACK 非 ACCEPTED（0）且非 IN_PROGRESS（5）立即中止；
+                // 实际 armed 是最终判据。
+                if (TakeoffAckRejected(kMavCmdComponentArmDisarm)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
+                                 "400 ACK 非 ACCEPTED");
+                    return;
+                }
+                if (TakeoffAckRejected(kMavCmdDoSetMode)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "176 ACK 非 ACCEPTED（等待解锁期间）");
+                    return;
+                }
+                if (flight.armed && IsPx4Offboard(flight)) {
+                    // armed + Offboard 是 S3 的最终成功判据；S4 由
+                    // TransitionTo 初始化爬升时序。
+                    TransitionTo(common::MissionState::kTakeoff,
+                                 "PX4 已解锁且处于 Offboard");
+                    return;
+                }
+                if (!IsPx4Offboard(flight)) {
+                    AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                                 "等待解锁期间 PX4 离开 Offboard");
+                    return;
+                }
+                if (ElapsedMs(now_ms, takeoff_stage_ms_) >=
+                    static_cast<uint64_t>(takeoff_.arm_timeout.count())) {
+                    AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
+                                 "等待实际 armed 超时");
+                }
+                return;
+            }
+            case TakeoffStage::kClimb:
+            case TakeoffStage::kNone:
+                return;
+        }
+    }
+
+    /// S4：水平保持原点，z 目标按 climb_rate 逐拍推进到 z0-height（NED 向上
+    /// 为负），到达判据（z/xy/vz）持续 stable_time 后进 S5。
+    void EvaluateClimbSequence(const common::FlightStateSnapshot& flight,
+                               uint64_t now_ms) {
+        // S4 只在 PX4 仍 armed + Offboard 时继续爬升。离开 Offboard（人工/
+        // failsafe/RTL）或空中失锁必须当拍停止输出：空中转 S13 仅监控；
+        // 地面走统一地面中止。
+        if (!flight.armed || !IsPx4Offboard(flight)) {
+            if (!flight.landed) {
+                assignment_tracker_.AbortAirborne();
+                RememberTakeoffAbort(
+                    common::MissionAssignmentReason::kModeTimeout);
+                if (!flight.armed) {
+                    takeoff_unavailable_latched_ = true;
+                }
+                return_px4_takeover_ = true;
+                SPDLOG_WARN("S4 中 PX4 离开 Offboard 或失锁: mode={}/{} armed={} "
+                            "landed={}，停止爬升并让权（S13 仅监控）",
+                            flight.flight_mode, flight.flight_sub_mode,
+                            flight.armed, flight.landed);
+                TransitionTo(common::MissionState::kLanding,
+                             "S4 PX4 接管/离开 Offboard");
+                PublishTakeoffAbortAck(
+                    common::MissionAssignmentReason::kModeTimeout);
+            } else {
+                AbortTakeoff(common::MissionAssignmentReason::kModeTimeout,
+                             "S4 仍在地面但未 armed/Offboard");
+            }
+            return;
+        }
+        const double goal_z =
+            static_cast<double>(assignment_tracker_.OriginZ()) - takeoff_.height_m;
+        // 逐拍推进，不阶跃；首拍 dt=0。时间回绕/重启双保险钳到 0。
+        const uint64_t dt_ms =
+            now_ms >= takeoff_last_tick_ms_ ? now_ms - takeoff_last_tick_ms_ : 0;
+        takeoff_last_tick_ms_ = now_ms;
+        if (dt_ms > 0) {
+            const double step = takeoff_.climb_rate_mps *
+                                static_cast<double>(dt_ms) / 1000.0;
+            const double candidate = static_cast<double>(takeoff_z_cmd_) - step;
+            takeoff_z_cmd_ =
+                static_cast<float>(candidate <= goal_z ? goal_z : candidate);
+        }
+
+        // 空中超时：PX4 仍在 Offboard → S13 发 AUTO.LAND（现有
+        // EvaluateLandingAndDisarm）；已离开 Offboard → 停发让权，S13 仅监控。
+        // 地面超时：停流 + 必要时一次 DISARM + 回 S2（状态不明则 unavailable）。
+        if (ElapsedMs(now_ms, state_entered_ms_) >=
+            static_cast<uint64_t>(takeoff_.height_timeout.count())) {
+            HandleTakeoffHeightTimeout(flight);
+            return;
+        }
+
+        if (!flight.local_position_valid) {
+            takeoff_stable_since_ms_ = 0;
+            return;
+        }
+        const double z_error =
+            std::fabs(static_cast<double>(flight.local_z_m) - goal_z);
+        const double xy_error = std::hypot(
+            static_cast<double>(flight.local_x_m) -
+                static_cast<double>(assignment_tracker_.OriginX()),
+            static_cast<double>(flight.local_y_m) -
+                static_cast<double>(assignment_tracker_.OriginY()));
+        const double vertical_speed =
+            std::fabs(static_cast<double>(flight.vz_mps));
+        const bool inside = z_error <= takeoff_.z_tolerance_m &&
+                            xy_error <= takeoff_.xy_tolerance_m &&
+                            vertical_speed <= takeoff_.max_vz_mps;
+        if (!inside) {
+            takeoff_stable_since_ms_ = 0;
+            return;
+        }
+        if (takeoff_stable_since_ms_ == 0) {
+            takeoff_stable_since_ms_ = now_ms;
+        }
+        if (ElapsedMs(now_ms, takeoff_stable_since_ms_) <
+            static_cast<uint64_t>(takeoff_.stable_time.count())) {
+            return;
+        }
+        assignment_tracker_.TakeoffComplete();
+        assignment_tracker_.BeginEngage();
+        SPDLOG_INFO("起飞到达任务高度: z={:.2f}（原点 z0={:.2f}，高度 {:.2f}m），"
+                    "进入 GPS_APPROACH",
+                    static_cast<double>(flight.local_z_m),
+                    static_cast<double>(assignment_tracker_.OriginZ()),
+                    takeoff_.height_m);
+        TransitionTo(common::MissionState::kGpsApproach, "起飞到达任务高度");
+    }
+
+    /// S3/S4 期间任务故障（S16）的起飞收口：按实际是否离地推进 tracker，
+    /// 记 aborted(mission_fault) 并回执；状态迁移由 HandleMissionFault 统一
+    /// 进入 S16（故障终态，不可调度）。
+    void AbortTakeoffForMissionFault(const char* detail) {
+        const auto state = CurrentState();
+        if (state != common::MissionState::kArming &&
+            state != common::MissionState::kTakeoff) {
+            return;
+        }
+        if (!accepted_assignment_.has_value()) {
+            return;
+        }
+        const bool airborne = latest_flight_.has_value() &&
+                              latest_flight_->armed && !latest_flight_->landed;
+        if (airborne) {
+            assignment_tracker_.AbortAirborne();
+        } else {
+            assignment_tracker_.AbortOnGround();
+        }
+        takeoff_unavailable_latched_ = true;
+        RememberTakeoffAbort(common::MissionAssignmentReason::kMissionFault);
+        SPDLOG_WARN("起飞段任务故障，65015 aborted(mission_fault): {}", detail);
+        PublishTakeoffAbortAck(common::MissionAssignmentReason::kMissionFault);
+    }
+
+    /// S4 高度超时处置（空中：S13 / 地面：S2）。
+    void HandleTakeoffHeightTimeout(
+        const common::FlightStateSnapshot& flight) {
+        if (!(flight.armed && !flight.landed)) {
+            // 尚未实际离地：按地面中止收口（停流/必要时 DISARM/回 S2）。
+            AbortTakeoff(common::MissionAssignmentReason::kTakeoffTimeout,
+                         "S4 等待到达任务高度超时（仍在地面）");
+            return;
+        }
+        const bool offboard = IsPx4Offboard(flight);
+        assignment_tracker_.AbortAirborne();
+        RememberTakeoffAbort(common::MissionAssignmentReason::kTakeoffTimeout);
+        // S13 入口按 return_px4_takeover_ 决定发 AUTO.LAND 还是仅监控：
+        // PX4 已离开 Offboard 时停发让权，不再争控。
+        return_px4_takeover_ = !offboard;
+        SPDLOG_WARN("起飞爬升超时（height_timeout={}ms）：{}",
+                    takeoff_.height_timeout.count(),
+                    offboard ? "PX4 仍在 Offboard，进入 S13 发 AUTO.LAND"
+                             : "PX4 已离开 Offboard，停发让权并仅监控（S13）");
+        TransitionTo(common::MissionState::kLanding,
+                     offboard ? "起飞爬升超时，AUTO.LAND"
+                              : "起飞爬升超时，PX4 已接管");
+        PublishTakeoffAbortAck(common::MissionAssignmentReason::kTakeoffTimeout);
+    }
+
+    /// 176/400 的 ACK 是否明确失败。只认 S3 入口之后新到的 ACK
+    /// （matched_count 基线），避免上一次任务/命令的陈旧 ACK 误伤本次起飞。
+    /// MAV_RESULT：0=ACCEPTED，5=IN_PROGRESS，其余（含 4=FAILED）视为失败。
+    bool TakeoffAckRejected(uint16_t command) const {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        const auto ack = command_sender_->AckStatus();
+        if (ack.matched_count <= takeoff_ack_baseline_matched_) {
+            return false;
+        }
+        return ack.last_command == command && ack.last_result != 0 &&
+               ack.last_result != 5;
+    }
+
+    /// 本轮 S3 的 400 ARM 是否已收到 ACCEPTED（实际 armed 位可能尚未刷新）。
+    bool TakeoffArmCommandAccepted() const {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        const auto ack = command_sender_->AckStatus();
+        return ack.matched_count > takeoff_ack_baseline_matched_ &&
+               ack.last_command == kMavCmdComponentArmDisarm &&
+               ack.last_result == 0;
+    }
+
+    /// S3/S4 中止统一处置：
+    /// - 已实际离地（armed && !landed）：tracker AbortAirborne → S12，
+    ///   **不空中 disarm**；
+    /// - 地面：停发意图；若 armed+landed 只发一次 DISARM；tracker
+    ///   AbortOnGround → S2 READY；
+    /// - 状态不确定（无快照/断连/离地状态不明）：置 per-boot 不可调度标志，
+    ///   65013/65015 availability=unavailable，不错误回到 ready。
+    /// 65015 aborted 使用已保存的 accepted_assignment_（latest_assignment_
+    /// 在处理 65014 时已清空）。
+    void AbortTakeoff(common::MissionAssignmentReason reason,
+                      const char* detail) {
+        const bool have_flight = latest_flight_.has_value();
+        const bool armed = have_flight && latest_flight_->armed;
+        const bool landed = have_flight && latest_flight_->landed;
+        const bool landed_known = have_flight && latest_flight_->landed_state_valid;
+        const bool connected = have_flight && latest_flight_->connected;
+        const bool airborne = have_flight && armed && !landed;
+        const bool uncertain = !have_flight || !connected || !landed_known;
+
+        SPDLOG_WARN("自动起飞中止: reason={} detail={} airborne={} uncertain={}",
+                    static_cast<int>(reason), detail, airborne, uncertain);
+        if (uncertain) {
+            takeoff_unavailable_latched_ = true;
+        }
+        if (airborne) {
+            assignment_tracker_.AbortAirborne();
+            RememberTakeoffAbort(reason);
+            // 空中中止交返航链（S12），不在此处 disarm；回执按新状态发布。
+            TransitionTo(common::MissionState::kReturnHome,
+                         "起飞中止（已离地），进入返航");
+            PublishTakeoffAbortAck(reason);
+            return;
+        }
+        // armed 位可能滞后于 400 ACK（心跳/遥测刷新周期）：ACK 已 accepted
+        // 时同样按已解锁处置，补发一次 DISARM，避免地面中止把飞机留在 armed。
+        if (landed_known && landed &&
+            (armed || TakeoffArmCommandAccepted())) {
+            SendTakeoffDisarmOnce();
+        }
+        assignment_tracker_.AbortOnGround();
+        RememberTakeoffAbort(reason);
+        TransitionTo(common::MissionState::kReady, "起飞中止（地面），回到 READY");
+        PublishTakeoffAbortAck(reason);
+    }
+
+    /// 地面中止的 DISARM：只尝试一次，不重试（本次飞行解锁流程已失败）。
+    void SendTakeoffDisarmOnce() {
+        if (takeoff_disarm_sent_ || command_sender_ == nullptr) {
+            return;
+        }
+        takeoff_disarm_sent_ = true;
+        const bool queued = command_sender_->SendCommand(
+            kMavCmdComponentArmDisarm, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            SPDLOG_INFO("地面中止 DISARM 命令已入队（仅一次）");
+        } else {
+            SPDLOG_WARN("地面中止 DISARM 入队失败（不重试，交 PX4/人工处置）");
+        }
+    }
+
+    /// 记录本次分配最终结果为 aborted（重复 65014 重发最新结果）。
+    void RememberTakeoffAbort(common::MissionAssignmentReason reason) {
+        if (!accepted_assignment_.has_value()) {
+            return;
+        }
+        assignment_tracker_.RememberResult(
+            accepted_assignment_->assignment_id,
+            common::MissionAssignmentResult::kCancelledOrAborted, reason);
+    }
+
+    /// 发布 65015 aborted（已接受分配的 id/target + 具体 reason）。
+    void PublishTakeoffAbortAck(common::MissionAssignmentReason reason) {
+        if (!accepted_assignment_.has_value()) {
+            return;
+        }
+        PublishAssignmentAck(*accepted_assignment_,
+                             common::MissionAssignmentResult::kCancelledOrAborted,
+                             reason);
+    }
+
+    /// 发布 S3/S4 起飞意图（type=kTakeoff，**不用 kPositionGuide 代替**）：
+    /// 目标 x/y=tracker 起飞原点，z 为 S3 原点值或 S4 逐拍爬升值；reason_code
+    /// 带 bit31 控制权请求位；航向尽量保持当前姿态 yaw。每决策拍发布，
+    /// 不走内容节流——控制器需要持续的原点保持/爬升流。
+    void PublishTakeoffIntent(float z_target, uint64_t now_ms,
+                              float vz_feedforward_mps = 0.f) {
+        common::ControlIntent intent;
+        intent.header.sequence = ++intent_sequence_;
+        intent.header.source_time_ms = now_ms;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = intent_valid_for_ms_;
+        intent.header.source_id = 1;
+        intent.header.health = 1;
+        intent.header.frame_id = kFrameLocalNed;
+        intent.type = common::ControlIntentType::kTakeoff;
+        intent.control_source = 0;  // 位置链（自动起飞）
+        intent.target_x = assignment_tracker_.OriginX();
+        intent.target_y = assignment_tracker_.OriginY();
+        intent.target_z = z_target;
+        if (latest_flight_.has_value() && latest_flight_->attitude_valid) {
+            intent.yaw_deg = static_cast<float>(
+                static_cast<double>(latest_flight_->yaw_rad) * kRadToDeg);
+        }
+        // bit31 显式请求控制权（FlightController kBootstrap 必要条件）+
+        // 低位 7（地面站任务下发）。
+        intent.reason_code =
+            common::kControlIntentReasonRequestControl | kReasonGroundStationTask;
+        if (std::isfinite(vz_feedforward_mps) && vz_feedforward_mps != 0.f) {
+            // 垂直速度前馈（NED 向下为正）：爬升远段直接把爬升率交给 PX4，
+            // 避免位置台阶被位置环执行成“加速→到位→减速”的抖动；末段
+            // 调用方传 0 撤掉前馈，由位置环自然收敛到目标高度。
+            intent.feedforward_vz_mps = vz_feedforward_mps;
+            intent.feedforward_valid_mask = common::kVelocityValidDown;
+        }
+        intent.valid_until_ms = now_ms + intent_valid_for_ms_;
+        (void)intent_output_.Publish(
+            std::make_shared<const common::ControlIntent>(intent));
+        last_intent_publish_ms_ = now_ms;
+    }
+
+    /// S3 入口初始化（TransitionTo 调用）：记录时序基准与 ACK 基线。
+    void BeginArmingSequence(uint64_t now_ms) {
+        takeoff_stage_ = TakeoffStage::kOriginHold;
+        takeoff_stage_ms_ = now_ms;
+        takeoff_last_tick_ms_ = now_ms;
+        takeoff_stable_since_ms_ = 0;
+        takeoff_z_cmd_ = assignment_tracker_.OriginZ();
+        takeoff_disarm_sent_ = false;
+        takeoff_ack_baseline_matched_ =
+            command_sender_ != nullptr ? command_sender_->AckStatus().matched_count
+                                       : 0;
+        SPDLOG_INFO("S3 自动起飞开始: origin=({:.2f},{:.2f},{:.2f}) "
+                    "bootstrap_lead={}ms mode_timeout={}ms arm_timeout={}ms",
+                    static_cast<double>(assignment_tracker_.OriginX()),
+                    static_cast<double>(assignment_tracker_.OriginY()),
+                    static_cast<double>(assignment_tracker_.OriginZ()),
+                    takeoff_.bootstrap_lead.count(),
+                    takeoff_.mode_timeout.count(), takeoff_.arm_timeout.count());
+    }
+
+    /// S4 入口初始化（TransitionTo 调用）：爬升目标从原点开始逐拍推进。
+    void BeginClimbSequence(uint64_t now_ms) {
+        takeoff_stage_ = TakeoffStage::kClimb;
+        takeoff_stage_ms_ = now_ms;
+        takeoff_last_tick_ms_ = now_ms;
+        takeoff_stable_since_ms_ = 0;
+        takeoff_z_cmd_ = assignment_tracker_.OriginZ();
+        SPDLOG_INFO("S4 自动爬升开始: 高度 {:.2f}m 爬升率 {:.2f}m/s "
+                    "到达判据 z±{:.2f}m xy±{:.2f}m vz≤{:.2f}m/s 稳定 {}ms",
+                    takeoff_.height_m, takeoff_.climb_rate_mps,
+                    takeoff_.z_tolerance_m, takeoff_.xy_tolerance_m,
+                    takeoff_.max_vz_mps, takeoff_.stable_time.count());
+    }
+
+    /// 计算 65013/65015 的 availability。影子模式（未注入命令接口）固定
+    /// unavailable：不可被调度；有控制路径时用 tracker 阶段映射。
+    /// 调用方必须已持有 state_mutex_。
+    common::MissionAvailability ComputeAvailabilityLocked() const {
+        if (command_sender_ == nullptr || mission_faulted_ ||
+            (intercept_device_ != nullptr && intercept_device_->Faulted()) ||
+            takeoff_unavailable_latched_) {
+            // takeoff_unavailable_latched_：起飞中止后 PX4 状态不确定
+            // （断连/armed/离地状态不明），per-boot 锁存直到重启，避免
+            // 错误回到 ready 被再次调度。
+            return common::MissionAvailability::kUnavailable;
+        }
+        if (assignment_tracker_.Phase() != AssignmentPhase::kIdle) {
+            return assignment_tracker_.Availability();
+        }
+        // 已消耗空中任务机会但阶段已清空：本次上电不可再调度。
+        if (assignment_tracker_.ConsumedAirborneMission()) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        if (!latest_flight_.has_value() || !latest_flight_->connected) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        // 电池门禁（Task 8）：地面参数缺失/遥测失效/不高于 BAT_LOW_THR 时
+        // 不可调度。未执行空中任务，电量恢复且参数有效后自然回到 ready
+        // （不锁存为 terminal）。
+        if (!BatteryGuardReady(*latest_flight_)) {
+            return common::MissionAvailability::kUnavailable;
+        }
+        return common::MissionAvailability::kReady;
+    }
+
+    common::MissionAvailability ComputeAvailability() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return ComputeAvailabilityLocked();
+    }
+
+    /// 发布 65015 任务分配回执（assignment_id/target_id/result/reason/
+    /// 当前状态/availability）。低速率控制面消息，每条 65014 一条。
+    void PublishAssignmentAck(const common::MissionAssignment& assignment,
+                              common::MissionAssignmentResult result,
+                              common::MissionAssignmentReason reason) {
+        const uint64_t now_ms = MonotonicMs();
+        common::MissionAssignmentAck ack;
+        ack.header.sequence = ++assignment_ack_sequence_;
+        ack.header.source_time_ms = now_ms;
+        ack.header.receive_time_ms = now_ms;
+        ack.header.valid_for_ms = kStatusValidForMs;
+        ack.header.source_id = 1;
+        ack.header.health = 1;
+        ack.assignment_id = assignment.assignment_id;
+        ack.target_id = assignment.target_id;
+        ack.result = result;
+        ack.reason = reason;
+        ack.mission_state = CurrentState();
+        ack.availability = ComputeAvailability();
+        (void)assignment_ack_output_.Publish(
+            std::make_shared<const common::MissionAssignmentAck>(ack));
+    }
+
+    /// S9/S10 入口判据（interception 配置节，2026-10-19）。
+    /// 条件：视觉 LOCKED 连续帧 + 测距窗口 + PX4 Offboard/armed/姿态/位置有效
+    /// + 命令接口就绪 + 机构未触发且 Ready()（无在途触发/复位时序）。
+    bool InterceptEntrySatisfied(uint64_t now_ms) const {
+        if (!interception_.enabled) {
+            return false;
+        }
+        if (!latest_flight_) {
+            return false;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.connected || !flight.armed || !flight.attitude_valid ||
+            !flight.local_position_valid) {
+            return false;
+        }
+        if (interception_.min_battery_percent > 0.0) {
+            if (!flight.battery_remaining_valid ||
+                static_cast<double>(flight.battery_remaining_pct) <
+                    interception_.min_battery_percent) {
+                return false;
+            }
+        }
+        if (flight.flight_mode != kPx4FlightMainModeOffboard ||
+            flight.flight_sub_mode != kPx4SubModeOffboard) {
+            return false;
+        }
+        if (command_sender_ == nullptr || intercept_device_ == nullptr ||
+            mission_faulted_ || intercept_device_->Faulted() ||
+            intercept_device_->Triggered() || !intercept_device_->Ready()) {
+            return false;  // 命令接口未注入 / 已触发 / 时序未回到 Ready / 故障
+        }
+        if (VisualStatusStale(now_ms) || !latest_visual_status_ ||
+            latest_visual_status_->state != common::VisualTargetState::kLocked) {
+            return false;
+        }
+        if (consecutive_lock_frames_ < interception_.enter_s9_lock_frames) {
+            return false;
+        }
+        if (!latest_distance_ || !latest_distance_->valid ||
+            !DistanceFresh(now_ms)) {
+            return false;
+        }
+        const double range_m =
+            static_cast<double>(latest_distance_->forward_distance_m);
+        return std::isfinite(range_m) && range_m >= interception_.min_range_m &&
+               range_m <= interception_.max_range_m;
+    }
+
+    /// S7→S9（入口条件满足）、S9 条件失效→S7、S9 自动授权→S10 /
+    /// 非自动授权超时→S12。S10 的动作由 MaybeExecuteInterception 处理，
+    /// 动作入队（`Triggered()`）后由 EvaluateInterceptionCompletion 进入 S11。
+    void EvaluateInterceptSequence(uint64_t now_ms) {
+        if (!interception_.enabled) {
+            return;
+        }
+        const auto state = CurrentState();
+        if (state == common::MissionState::kVisualTracking) {
+            if (!InterceptEntrySatisfied(now_ms)) {
+                return;
+            }
+            const double range_m = latest_distance_
+                ? static_cast<double>(latest_distance_->forward_distance_m)
+                : std::numeric_limits<double>::quiet_NaN();
+            SPDLOG_WARN("拦截入口条件满足: LOCKED 帧={} 测距={:.2f}m（窗口 "
+                        "{:.1f}~{:.1f}m）→ S9",
+                        consecutive_lock_frames_, range_m,
+                        interception_.min_range_m, interception_.max_range_m);
+            TransitionTo(common::MissionState::kInterceptReady,
+                         "拦截入口条件满足");
+            return;
+        }
+        if (state == common::MissionState::kInterceptReady) {
+            if (!InterceptEntrySatisfied(now_ms)) {
+                SPDLOG_WARN("拦截条件失效，退出 S9 返回视觉跟踪");
+                TransitionTo(common::MissionState::kVisualTracking,
+                             "拦截条件失效");
+                return;
+            }
+            if (interception_.auto_authorize) {
+                SPDLOG_WARN("拦截自动授权通过 → S10");
+                TransitionTo(common::MissionState::kInterceptExecuting,
+                             "自动授权通过");
+                return;
+            }
+            const uint64_t wait_ms =
+                now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
+            if (wait_ms >= static_cast<uint64_t>(
+                               interception_.authorization_timeout.count())) {
+                // 授权超时按任务中止收口（2026-10-30 审查修复）：停发视觉
+                // 伺服意图、tracker 收口、65015 记录原因。否则 S12 起不再有
+                // 任何意图发布，控制器在 intent_timeout 后刹车保持，到点不
+                // 返航（飞行安全缺陷）。
+                if (!mission_abort_latched_) {
+                    mission_abort_latched_ = true;
+                    StopPositionIntent("拦截授权超时中止任务");
+                    ResetTargetHold();
+                    assignment_tracker_.AbortAirborne();
+                    RememberTakeoffAbort(
+                        common::MissionAssignmentReason::kTargetWaitTimeout);
+                    SPDLOG_WARN("拦截授权超时，中止任务 → S12 返航");
+                    TransitionTo(common::MissionState::kReturnHome,
+                                 "拦截授权超时，中止任务并返航");
+                    PublishTakeoffAbortAck(
+                        common::MissionAssignmentReason::kTargetWaitTimeout);
+                }
+            }
+        }
+    }
+
+    /// 位置类意图发布总入口（阶段四 Task 7/9）：
+    /// - S5（GPS_APPROACH）：估计新鲜 → 发布/重发 kPositionGuide 意图；估计失效
+    ///   → 停发，超龄收口由 FlightController 意图超时门禁（intent_timeout）接管；
+    /// - S6（VISUAL_HANDOVER）：逐拍续发进入时刻冻结的最后位置目标
+    ///   （valid_until 滚动续期，设计 §2.1 冻结 + §2.5 无扰衔接：避免交接期意图
+    ///   超龄 → 控制器 COAST 刹车 → 再起步的"交接点先刹停"）；
+    /// - S7：首条视觉速度意图发出前仍续发冻结意图（伺服首拍降级时不留意图
+    ///   缺口），发出后停发（视觉链接管）。
+    void EvaluatePositionIntent(uint64_t now_ms) {
+        if (!estimation_inputs_active_) {
+            return;
+        }
+        switch (CurrentState()) {
+            case common::MissionState::kGpsApproach:
+                EvaluateEstimateGuidedIntent(now_ms);
+                return;
+            case common::MissionState::kVisualHandover:
+                PublishFrozenHandoverIntent(now_ms);
+                return;
+            case common::MissionState::kVisualTracking:
+                if (!s7_servo_started_ && frozen_position_target_.has_value()) {
+                    PublishFrozenHandoverIntent(now_ms);
+                    return;
+                }
+                StopPositionIntent("视觉伺服接续");
+                return;
+            default:
+                StopPositionIntent("离开位置引导段");
+                return;
+        }
+    }
+
+    /// S5 估计引导意图（2026-10-22 目标保持改造）：
+    /// - 估计新鲜：连续 `kHoldReleaseFreshFrames` 拍确认后回到估计引导
+    ///   （恢复迟滞，防目标在门限附近抖动导致保持/引导频繁切换）；
+    /// - 估计失效但控制任务在位且 PX4 局部位置有效：发“原地保持”意图
+    ///   （目标=PX4 当前局部位置，原因码 9，无前馈）——目标过期也绝不发旧目标，
+    ///   但控制流不断，PX4 不会在 S5 看门狗前按 Offboard 丢失兜底接管；
+    /// - 连局部位置都不可用：停发，刹停语义仍归 FlightController 意图超时门禁。
+    void EvaluateEstimateGuidedIntent(uint64_t now_ms) {
+        if (HasFreshEstimate(now_ms)) {
+            if (fresh_estimate_streak_ < kHoldReleaseFreshFrames) {
+                ++fresh_estimate_streak_;
+            }
+            if (position_intent_source_ == PositionIntentSource::kHold &&
+                fresh_estimate_streak_ < kHoldReleaseFreshFrames &&
+                HoldAllowed()) {
+                // 恢复确认中：继续保持，避免抖动切换。
+                PublishHoldIntent(now_ms);
+                return;
+            }
+            ReleaseHoldIfActive("目标恢复", now_ms);
+            PublishEstimateGuidedIntent(*latest_estimated_, now_ms);
+            return;
+        }
+        fresh_estimate_streak_ = 0;
+        if (HoldAllowed()) {
+            PublishHoldIntent(now_ms);
+            return;
+        }
+        ReleaseHoldIfActive("目标失效且无有效局部位置", now_ms);
+        if (position_intent_source_ != PositionIntentSource::kNone) {
+            position_intent_source_ = PositionIntentSource::kNone;
+            last_intent_target_.reset();
+            const uint64_t count = ++intent_stale_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("GPS_APPROACH 位置引导意图停止: 估计无效或超龄 count={}",
+                            count);
+            }
+        }
+    }
+
+    /// 是否允许“原地保持”：仅控制任务（影子保持既有停发语义）、仅 S5、
+    /// 且 PX4 连接与局部位置有效（保持目标必须来自真实位置，不能猜）。
+    bool HoldAllowed() const {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        if (CurrentState() != common::MissionState::kGpsApproach) {
+            return false;
+        }
+        if (!latest_flight_.has_value()) {
+            return false;
+        }
+        const auto& flight = *latest_flight_;
+        return flight.connected && flight.local_position_valid;
+    }
+
+    /// 发布“原地保持”位置意图：目标是 PX4 当前局部位置（绝不使用过期目标），
+    /// 原因码 9、无前馈；每决策拍发布（10Hz，满足控制器 300ms 意图超龄门禁）。
+    void PublishHoldIntent(uint64_t now_ms) {
+        const auto& flight = *latest_flight_;
+        if (!hold_logged_) {
+            hold_logged_ = true;
+            target_hold_started_ms_ = now_ms;
+            ++target_hold_count_;
+            SPDLOG_INFO(
+                "S5 目标失效，进入原地保持: target_id={} hold=({:.2f},{:.2f},{:.2f}) "
+                "reason={} accumulated_ms={}",
+                assignment_tracker_.TargetId(),
+                static_cast<double>(flight.local_x_m),
+                static_cast<double>(flight.local_y_m),
+                static_cast<double>(flight.local_z_m), kReasonTargetHold,
+                target_hold_accumulated_ms_);
+        }
+        PositionIntentTarget target;
+        target.x = flight.local_x_m;
+        target.y = flight.local_y_m;
+        target.z = flight.local_z_m;
+        target.frame_id = kFrameLocalNed;
+        PublishPositionIntent(target, now_ms, kReasonTargetHold);
+        position_intent_source_ = PositionIntentSource::kHold;
+        last_intent_target_.reset();  // 保持意图不做内容节流比较
+    }
+
+    /// 退出保持：记录保持时长并复位本次保持簿记；累计时长保留到本次 S5 结束
+    /// （`target_hold_max` 按本次 S5 累计收口）。
+    void ReleaseHoldIfActive(const char* reason, uint64_t now_ms) {
+        if (position_intent_source_ != PositionIntentSource::kHold) {
+            return;
+        }
+        const uint64_t held_ms =
+            target_hold_started_ms_.has_value() && now_ms >= *target_hold_started_ms_
+                ? now_ms - *target_hold_started_ms_
+                : 0;
+        SPDLOG_INFO(
+            "S5 原地保持结束: {} held_ms={} hold_count={} accumulated_ms={}",
+            reason, held_ms, target_hold_count_, target_hold_accumulated_ms_);
+        position_intent_source_ = PositionIntentSource::kNone;
+        last_intent_target_.reset();
+        target_hold_started_ms_.reset();
+        hold_logged_ = false;
+        fresh_estimate_streak_ = 0;
+    }
+
+    /// 冻结最后位置目标（S5→S6 进入时调用，设计 §2.1）：取进入时刻最后一条
+    /// S5 位置意图（速度律的 p_ref 锚点），而不是目标估计点——目标点会把
+    /// 位置环拉向目标本身，交接瞬间产生数米级跳变。
+    void FreezeHandoverTarget() {
+        if (last_s5_position_target_.has_value()) {
+            frozen_position_target_ = *last_s5_position_target_;
+            // P3 决策保持：S6 只冻结位置/航向，不带 S5 速度前馈，避免固定
+            // 位置目标 + 持续前馈越过交接点；速度由 S7 接管。
+            frozen_position_target_->feedforward_vx_mps = 0.f;
+            frozen_position_target_->feedforward_vy_mps = 0.f;
+            frozen_position_target_->feedforward_vz_mps = 0.f;
+            frozen_position_target_->feedforward_valid_mask = 0;
+            frozen_position_target_->max_speed_mps = 2.0f;
+            SPDLOG_INFO(
+                "交接冻结最后位置目标: pos=({:.2f},{:.2f},{:.2f}) frame_id={}",
+                static_cast<double>(frozen_position_target_->x),
+                static_cast<double>(frozen_position_target_->y),
+                static_cast<double>(frozen_position_target_->z),
+                frozen_position_target_->frame_id);
+            return;
+        }
+        // 兜底：没有 S5 意图记忆（测试直接进 S6 等）时用估计点、保守限速。
+        if (!latest_estimated_.has_value()) {
+            return;
+        }
+        PositionIntentTarget target;
+        target.x = latest_estimated_->pos_x_m;
+        target.y = latest_estimated_->pos_y_m;
+        target.z = latest_estimated_->pos_z_m;
+        target.frame_id = latest_estimated_->header.frame_id;
+        target.max_speed_mps = 2.0f;
+        ApplyHeadingToward(target, static_cast<double>(target.x),
+                           static_cast<double>(target.y));
+        frozen_position_target_ = target;
+        SPDLOG_INFO("交接冻结最后位置目标（兜底估计点）: pos=({:.2f},{:.2f},{:.2f})",
+                    static_cast<double>(target.x),
+                    static_cast<double>(target.y),
+                    static_cast<double>(target.z));
+    }
+
+    /// S6/S7 过渡期冻结位置意图续发：valid_until 逐拍滚动（不做内容节流，
+    /// 续期必须发生在每拍），内容固定为进入时刻冻结的 p_ref/航向。
+    void PublishFrozenHandoverIntent(uint64_t now_ms) {
+        if (!frozen_position_target_.has_value()) {
+            return;  // 防御：未冻结（不应发生，进入 S6 必有 S5 意图或估计快照）
+        }
+        if (position_intent_source_ != PositionIntentSource::kFrozen) {
+            position_intent_source_ = PositionIntentSource::kFrozen;
+            last_intent_target_.reset();  // 内容节流记忆失效（来源已切换）
+            SPDLOG_INFO("交接冻结位置意图续发: 滚动续期直至视觉伺服接续");
+        }
+        // 交接驻留期也要按当前速度方向重算预测限速（2026-11-12 复审三轮）：
+        // 冻结的是"目标点"，飞机仍在动，旧 cap 不能沿用整个交接窗口。
+        PositionIntentTarget target = *frozen_position_target_;
+        if (const common::FencePolygonNed polygon = LatestFencePolygon();
+            polygon.valid()) {
+            if (const auto cap = PredictiveFenceSpeedCap(polygon)) {
+                target.max_speed_mps = std::min(
+                    target.max_speed_mps, static_cast<float>(*cap));
+            }
+        }
+        PublishPositionIntent(target, now_ms);
+    }
+
+    /// 停止位置类意图发布（离开位置引导段/交接段）；幂等。
+    void StopPositionIntent(const char* reason) {
+        if (position_intent_source_ == PositionIntentSource::kNone) {
+            return;
+        }
+        if (position_intent_source_ == PositionIntentSource::kHold) {
+            // 保持被其它路径（中止/切段）打断：走统一的保持退出日志与簿记复位。
+            ReleaseHoldIfActive(reason, MonotonicMs());
+            return;
+        }
+        position_intent_source_ = PositionIntentSource::kNone;
+        last_intent_target_.reset();
+        SPDLOG_INFO("位置引导意图停止: {}", reason);
+    }
+
+    /// 交接层独立迟滞计数（与 VisualTargetMonitor 内部 acquire_lock_frames 判据是两套
+    /// 口径，不得混用：监视器判"视觉是否稳定看到"，这里判"交接是否允许切换"）。
+    ///
+    /// 计数口径（每条视觉状态消息在抽干时计数一次）：
+    /// - LOCKED：仅当 frame_sequence 推进（新的锁定帧）才 +1——监视器会周期重发
+    ///   同一帧的状态消息，重发不得重复计数（否则"连续帧"被时间稀释）；
+    /// - LOST：每条 LOST 状态消息 +1——观测断流（无新帧）时帧序冻结，
+    ///   靠状态消息本身表达"仍未见目标"，按帧序去重会让退出永不触发；
+    /// - ACQUIRING/SEARCHING：其锁定计数清零、丢失计数清零（既非锁定也非判丢）。
+    void UpdateVisualHysteresis(const common::VisualTargetStatus& status) {
+        if (status.state == common::VisualTargetState::kLocked) {
+            consecutive_lost_frames_ = 0;
+            if (!last_counted_locked_frame_.has_value() ||
+                *last_counted_locked_frame_ != status.frame_sequence) {
+                last_counted_locked_frame_ = status.frame_sequence;
+                ++consecutive_lock_frames_;
+            }
+            return;
+        }
+        consecutive_lock_frames_ = 0;
+        if (status.state == common::VisualTargetState::kLost) {
+            ++consecutive_lost_frames_;
+        } else {
+            consecutive_lost_frames_ = 0;
+        }
+    }
+
+    /// 复位交接迟滞计数（不清去重记忆：回退后重发的旧锁定帧不得立即重新起算，
+    /// 重新进入 S6 必须依赖新的锁定帧）。同时作为**交接段收口**：冻结目标、
+    /// 视觉伺服标志、控制律历史与热备份核对状态随段结束清空（S6/S7 回退与
+    /// Start 均经此函数；S6→S7 不调用，段内继续）。
+    void ResetHandoverHysteresis() {
+        consecutive_lock_frames_ = 0;
+        consecutive_lost_frames_ = 0;
+        s6_lock_baseline_ = 0;
+        s6_entered_ms_ = 0;
+        s7_entered_ms_ = 0;
+        distance_lost_since_ms_.reset();
+        if (frozen_position_target_.has_value()) {
+            SPDLOG_INFO("交接段收口: 停止冻结位置续发/视觉伺服意图");
+        }
+        frozen_position_target_.reset();
+        s7_servo_started_ = false;
+        servo_intent_active_ = false;  // 交接段收口：背离告警位随段结束清空
+        hot_backup_check_ms_ = 0;
+        hot_backup_starved_ = false;
+        visual_law_->Reset();
+        approach_law_.Reset();
+    }
+
+    /// 交接判据总入口（S5→S6→S7 推进与 S7 退出迟滞）。
+    /// 仅在估计/视觉/测距输入已绑定且估计器诊断已注入时工作，否则保持 S5 影子。
+    void EvaluateHandover(uint64_t now_ms) {
+        if (!estimation_inputs_active_ || estimator_diagnostics_ == nullptr) {
+            return;
+        }
+        switch (CurrentState()) {
+            case common::MissionState::kGpsApproach:
+                TryEnterVisualHandover(now_ms);
+                break;
+            case common::MissionState::kVisualHandover:
+                EvaluateVisualHandover(now_ms);
+                break;
+            case common::MissionState::kVisualTracking:
+                EvaluateVisualTrackingExit(now_ms);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /// S5→S6：进入条件全部满足且 LOCKED 连续帧数达 handover.enter_s6_lock_frames。
+    /// 进入当拍冻结最后位置目标（设计 §2.1，取进入时刻的 TargetState 值），
+    /// 此后 S6 驻留期由 EvaluatePositionIntent 逐拍续发该冻结位置意图
+    /// （valid_until 滚动），直到首条视觉速度意图发出（S7，Task 9）——
+    /// 避免位置意图在交接期超龄 → 控制器刹车 → 再起步（设计 §2.5）。
+    void TryEnterVisualHandover(uint64_t now_ms) {
+        if (consecutive_lock_frames_ < handover_.enter_s6_lock_frames) {
+            return;
+        }
+        if (!HandoverEntrySatisfied(now_ms)) {
+            return;
+        }
+        s6_lock_baseline_ = consecutive_lock_frames_;
+        s6_entered_ms_ = now_ms;
+        consecutive_lost_frames_ = 0;
+        FreezeHandoverTarget();
+        TransitionTo(common::MissionState::kVisualHandover, kReasonEnterHandover);
+    }
+
+    /// S6（VISUAL_HANDOVER）驻留验证：
+    /// - 进入条件任一致失效 → 撤销回 S5（不得带着失效条件推进交接）；
+    /// - 条件持续满足且再收到一条新的 LOCKED 帧（视觉链在交接期继续推进）
+    ///   → S7 VISUAL_TRACKING；
+    /// - 驻留超 handover.timeout_ms（首条视觉指令未生效）→ 回 S5 防卡死。
+    /// 注：设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量
+    /// 依赖控制侧反馈与尚未冻结的阈值配置，归 Task 9/T12 补齐；本任务用
+    /// "条件持续满足 + 视觉链继续推进 + 驻留超时"作为等价的最小验证。
+    void EvaluateVisualHandover(uint64_t now_ms) {
+        if (!HandoverEntrySatisfied(now_ms)) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach, kReasonHandoverRevoked);
+            return;
+        }
+        if (consecutive_lock_frames_ > s6_lock_baseline_) {
+            consecutive_lost_frames_ = 0;
+            s7_entered_ms_ = now_ms;  // S7 伺服未启动超时计时基准（见退出路径④）
+            TransitionTo(common::MissionState::kVisualTracking,
+                         kReasonHandoverVerified);
+            return;
+        }
+        if (now_ms - s6_entered_ms_ >= handover_timeout_ms_) {
+            // 超时回退同样复位计数：重新进入 S6 需要新的连续锁定证据，
+            // 不得因陈旧计数在下一拍立即回跳。
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach, kReasonHandoverTimeout);
+        }
+    }
+
+    /// S7 退出（四条独立路径，任一成立即回退 S5）：
+    /// ① 视觉状态断流：最近一条 VisualTargetStatus 的接收年龄超过 S6 进入判据
+    ///    所用的同一视觉新鲜度阈值（监视器线程死亡/链路中断时无 LOST 消息可计数、
+    ///    帧序冻结，按超龄直接收口）；
+    /// ② 测距失效连续计时达 handover.distance_lost_ms（valid=false 或超龄；
+    ///    恢复有效即清零）——覆盖"测距丢失但视觉仍锁定"的收口；
+    /// ③ 视觉 LOST 连续帧数达 handover.exit_lost_frames（进入 enter_s6_lock_frames 与
+    ///    退出 exit_lost_frames 门限不同防抖动）；
+    /// ④ 伺服未启动超时：S7 驻留超 handover.timeout_ms 仍未见首条有效视觉意图
+    ///    （控制律持续降级，如姿态超龄）——冻结位置续发不得无限续期（S6 有
+    ///    超时封顶，S7 需等价封顶），收口回 S5 重新走交接判据。
+    /// 未达门限保持 S7，短时丢失的图像空间 coast 由 Task 9 的视觉伺服承担
+    /// （监视器按 publish_interval≈100ms 发布，健康流不会触及 200ms 超龄阈值）。
+    void EvaluateVisualTrackingExit(uint64_t now_ms) {
+        if (VisualStatusStale(now_ms)) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach, kReasonVisionStreamLost);
+            return;
+        }
+        UpdateDistanceLostTimer(now_ms);
+        if (distance_lost_since_ms_.has_value() &&
+            now_ms - *distance_lost_since_ms_ >=
+                static_cast<uint64_t>(handover_.distance_lost_ms.count())) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach,
+                         kReasonDistanceLostExit);
+            return;
+        }
+        if (consecutive_lost_frames_ >= handover_.exit_lost_frames) {
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach,
+                         kReasonVisualTrackingExit);
+            return;
+        }
+        // 防御：s7_entered_ms_ 由 S6→S7 迁移当拍赋值，正常路径进入 S7 必有值
+        //（未赋值时不评估，避免误判 0 为"已驻留超时"当拍即退）。
+        if (!s7_servo_started_ && s7_entered_ms_ != 0 &&
+            now_ms - s7_entered_ms_ >= handover_timeout_ms_) {
+            // 超时回退同样复位计数：重新进入 S6 需要新的连续锁定证据，
+            // 不得因陈旧计数在下一拍立即回跳。
+            ResetHandoverHysteresis();
+            TransitionTo(common::MissionState::kGpsApproach,
+                         kReasonServoNotStartedTimeout);
+        }
+    }
+
+    /// 测距失效计时（S7 专用）：invalid 或超龄即累计起始时刻，恢复有效清零。
+    void UpdateDistanceLostTimer(uint64_t now_ms) {
+        if (DistanceLost(now_ms)) {
+            if (!distance_lost_since_ms_.has_value()) {
+                distance_lost_since_ms_ = now_ms;
+            }
+            return;
+        }
+        distance_lost_since_ms_.reset();
+    }
+
+    /// 测距是否失效：无测距快照、valid=false 或接收超龄（阈值与进入判据同源）。
+    bool DistanceLost(uint64_t now_ms) const {
+        if (!latest_distance_) {
+            return true;
+        }
+        if (!latest_distance_->valid) {
+            return true;
+        }
+        return !DistanceFresh(now_ms);
+    }
+
+    /// 测距接收是否新鲜（存在且未超龄；valid 单独判定，供进入判据两字段使用）。
+    bool DistanceFresh(uint64_t now_ms) const {
+        if (!latest_distance_) {
+            return false;
+        }
+        return !control::StalenessChecker::IsStale(
+            static_cast<int64_t>(latest_distance_->header.receive_time_ms),
+            static_cast<int64_t>(now_ms), distance_stale_ms_);
+    }
+
+    /// 视觉状态是否断流：无状态消息或接收超龄（阈值与进入判据同源）。
+    bool VisualStatusStale(uint64_t now_ms) const {
+        if (!latest_visual_status_) {
+            return true;
+        }
+        return control::StalenessChecker::IsStale(
+            static_cast<int64_t>(latest_visual_status_->header.receive_time_ms),
+            static_cast<int64_t>(now_ms), visual_stale_ms_);
+    }
+
+    /// 进入判据整体核验：视觉状态新鲜 + 卡尔曼估计存活 + 四项判据（纯函数）。
+    /// 视觉/测距状态消息不携带 valid_for_ms（生产者未设置），新鲜度按
+    /// receive_time + 注入的超龄阈值判定；估计新鲜是创新门限的前提
+    /// （卡尔曼必须存活，预测才有意义）。
+    bool HandoverEntrySatisfied(uint64_t now_ms) const {
+        if (VisualStatusStale(now_ms)) {
+            return false;
+        }
+        if (!HasFreshEstimate(now_ms)) {
+            return false;
+        }
+        return HandoverEntryConditionsMet(BuildHandoverInputs(now_ms), handover_);
+    }
+
+    /// 组装交接判据输入：视线角由平滑像素中心经标定内参换算（PixelToAngle），
+    /// 视场半角为构造期固化的内参推断值，创新值取自估计器诊断接口。
+    HandoverInputs BuildHandoverInputs(uint64_t now_ms) const {
+        HandoverInputs in;
+        in.fow_half_azimuth_deg = fow_half_azimuth_deg_;
+        in.fow_half_elevation_deg = fow_half_elevation_deg_;
+        if (latest_visual_status_) {
+            in.visual = *latest_visual_status_;
+            in.los_azimuth_deg =
+                azimuth_converter_.Convert(
+                    static_cast<double>(in.visual.center_pixel_x)) *
+                kRadToDeg;
+            in.los_elevation_deg =
+                elevation_converter_.Convert(
+                    static_cast<double>(in.visual.center_pixel_y)) *
+                kRadToDeg;
+        }
+        if (latest_distance_) {
+            in.distance_valid = latest_distance_->valid;
+            in.distance_fresh = DistanceFresh(now_ms);
+        }
+        if (estimator_diagnostics_ != nullptr) {
+            in.innovation_distance_m =
+                estimator_diagnostics_->LastVisualInnovationM();
+        }
+        return in;
+    }
+
+    /// 控制任务下是否按当前分配的 target_id 过滤目标（设计 §7.5）。
+    /// 影子装配（未注入命令接口）保持既有行为，不过滤。
+    bool AssignmentTargetFilterActive() const {
+        return command_sender_ != nullptr &&
+               assignment_tracker_.HasActiveAssignment();
+    }
+
+    /// 目标编号是否允许进入本机任务链。无过滤条件时全部放行；控制任务下
+    /// 只允许 `target_id == assignment.target_id`（0 永远不匹配）。
+    bool TargetMatchesAssignment(uint32_t target_id) const {
+        if (!AssignmentTargetFilterActive()) {
+            return true;
+        }
+        return assignment_tracker_.AllowsTarget(target_id);
+    }
+
+    /// 估计目标是否新鲜有效（valid 标志 + 剩余有效期，与 TargetEstimator 输出语义一致）。
+    /// 控制任务下非本分配 target_id 的估计一律视为不可用（不进入 S5 引导、
+    /// 不参与交接、不满足目标看门狗）。
+    bool HasFreshEstimate(uint64_t now_ms) const {
+        if (!latest_estimated_) {
+            return false;
+        }
+        const auto& target = *latest_estimated_;
+        if (!target.valid) {
+            return false;
+        }
+        if (!TargetMatchesAssignment(target.target_id)) {
+            return false;
+        }
+        if (target.header.receive_time_ms == 0 || target.header.valid_for_ms == 0) {
+            return false;
+        }
+        return now_ms <= target.header.receive_time_ms + target.header.valid_for_ms;
+    }
+
+    /// S5 目标看门狗判据：只看匹配当前分配的估计目标。65010 只是上游位置
+    /// 输入，S5 的位置引导实际消耗 TargetEstimator 输出；若地面站持续发
+    /// 65010 但估计器不出目标，不能把“已收到 65010”误当成可执行目标，
+    /// 否则 S5 会无引导地悬停且 target_wait_timeout 永不触发。
+    /// 控制路径的 target_id 过滤在 HasFreshEstimate 内生效。
+    bool HasFreshAssignedTarget(uint64_t now_ms) const {
+        return HasFreshEstimate(now_ms);
+    }
+
+    /// 位置型意图的组装输入（S5 估计引导 / S6 冻结续发共用）。
+    /// 前馈字段只对 S5 生效；S6 构造时保持 mask=0、前馈值=0（P3 冻结决策）。
+    struct PositionIntentTarget {
+        float x = 0.f;
+        float y = 0.f;
+        float z = 0.f;
+        uint8_t frame_id = 0;
+        float feedforward_vx_mps = 0.f;
+        float feedforward_vy_mps = 0.f;
+        float feedforward_vz_mps = 0.f;
+        uint8_t feedforward_valid_mask = 0;
+        /// 航向（2026-10-29，返航机头朝飞行方向）：yaw_valid=false 表示不指定
+        /// 航向（PX4 保持原机头平移）；true 时 yaw_deg 为 NED 航向角（0=正北，
+        /// 顺时针为正）。历史 `yaw_deg != 0` 约定无法表达正北，必须走显式位。
+        bool yaw_valid = false;
+        float yaw_deg = 0.f;
+        /// 相位速率上限（2026-11-02 P0-2）：0 = 不限制（沿用控制器硬上限）。
+        /// FlightController 对位置型意图按此上限从当前位置向目标推进（位置
+        /// 引导限速），对速度型意图作为额外限幅。S5/S6 填接近段上限，S12
+        /// 不填（返航有自己的速度参数）。
+        float max_speed_mps = 0.f;
+    };
+
+    /// 机头指向给定局部 NED 点（0=正北，顺时针为正）。目标过近时保持原机头，
+    /// 避免末端原地打转；无有效局部位置时不指定航向。
+    void ApplyHeadingToward(PositionIntentTarget& target, double px, double py) {
+        if (!latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            return;
+        }
+        const double dn = px - static_cast<double>(latest_flight_->local_x_m);
+        const double de = py - static_cast<double>(latest_flight_->local_y_m);
+        if (std::hypot(dn, de) < 0.5) {
+            return;
+        }
+        target.yaw_valid = true;
+        target.yaw_deg = static_cast<float>(
+            std::atan2(de, dn) * 180.0 / 3.14159265358979323846);
+    }
+
+    /// 发布 S5 估计引导位置意图。节流纪律：内容无变化按 10Hz 上限重发
+    /// （意图是周期语义，FlightController 50ms 周期消费）；内容变化立即发。
+    void PublishEstimateGuidedIntent(const common::TargetState& target,
+                                     uint64_t now_ms) {
+        // 前馈逐轴归一化：只保留“有效位 + 值有限”的轴；其余轴清零，
+        // 避免无效 KF 值污染内容比较或下发。S6 不走本函数（冻结段无前馈）。
+        PositionIntentTarget position_target;
+        position_target.x = target.pos_x_m;
+        position_target.y = target.pos_y_m;
+        position_target.z = target.pos_z_m;
+        position_target.frame_id = target.header.frame_id;
+        const uint8_t target_ff_mask =
+            target.velocity_valid_mask & common::kVelocityValidAll;
+        if ((target_ff_mask & common::kVelocityValidNorth) != 0 &&
+            std::isfinite(target.vel_x_mps)) {
+            position_target.feedforward_vx_mps = target.vel_x_mps;
+            position_target.feedforward_valid_mask |= common::kVelocityValidNorth;
+        }
+        if ((target_ff_mask & common::kVelocityValidEast) != 0 &&
+            std::isfinite(target.vel_y_mps)) {
+            position_target.feedforward_vy_mps = target.vel_y_mps;
+            position_target.feedforward_valid_mask |= common::kVelocityValidEast;
+        }
+        if ((target_ff_mask & common::kVelocityValidDown) != 0 &&
+            std::isfinite(target.vel_z_mps)) {
+            position_target.feedforward_vz_mps = target.vel_z_mps;
+            position_target.feedforward_valid_mask |= common::kVelocityValidDown;
+        }
+        // 接近段速度律（2026-11-11 起 S5 唯一引导方式）：直接产出
+        // (p_ref, v_ref)，位置环只做速度指令的兜底锚点。
+        if (!target.valid || target.header.frame_id != kFrameLocalNed ||
+            !std::isfinite(target.pos_x_m) || !std::isfinite(target.pos_y_m) ||
+            !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            const uint64_t count = ++approach_law_skip_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("S5 速度律跳过：目标/局部位置无效 count={}", count);
+            }
+            return;
+        }
+        {
+            control::ApproachInput law_input;
+            law_input.own_valid = true;
+            law_input.target_valid = true;
+            law_input.own_n_m = static_cast<double>(latest_flight_->local_x_m);
+            law_input.own_e_m = static_cast<double>(latest_flight_->local_y_m);
+            law_input.own_d_m = static_cast<double>(latest_flight_->local_z_m);
+            law_input.own_vn_mps = std::isfinite(latest_flight_->vx_mps)
+                                       ? static_cast<double>(latest_flight_->vx_mps)
+                                       : 0.0;
+            law_input.own_ve_mps = std::isfinite(latest_flight_->vy_mps)
+                                       ? static_cast<double>(latest_flight_->vy_mps)
+                                       : 0.0;
+            law_input.own_vd_mps = std::isfinite(latest_flight_->vz_mps)
+                                       ? static_cast<double>(latest_flight_->vz_mps)
+                                       : 0.0;
+            law_input.target_n_m = static_cast<double>(target.pos_x_m);
+            law_input.target_e_m = static_cast<double>(target.pos_y_m);
+            law_input.target_d_m =
+                std::isfinite(target.pos_z_m)
+                    ? static_cast<double>(target.pos_z_m)
+                    : law_input.own_d_m;
+            law_input.target_vn_mps = std::isfinite(target.vel_x_mps)
+                                          ? static_cast<double>(target.vel_x_mps)
+                                          : 0.0;
+            law_input.target_ve_mps = std::isfinite(target.vel_y_mps)
+                                          ? static_cast<double>(target.vel_y_mps)
+                                          : 0.0;
+            law_input.target_vd_mps =
+                std::isfinite(target.vel_z_mps)
+                    ? static_cast<double>(target.vel_z_mps)
+                    : 0.0;
+            // 时延补偿用“观测时刻”而不是发布时刻：TargetState.last_observed_ms
+            // 是最近一次有效观测的单调时钟，header.receive_time_ms 只是估计器
+            // 本拍发布时刻（10Hz 刷屏时几乎等于 now，会把时延补偿吃掉）。
+            law_input.target_sample_ms = static_cast<std::int64_t>(
+                target.last_observed_ms > 0 ? target.last_observed_ms
+                                            : target.header.receive_time_ms);
+            const control::ApproachOutput law_out = approach_law_.Update(
+                law_input, static_cast<std::int64_t>(now_ms));
+            if (law_out.valid) {
+                position_target.x = static_cast<float>(law_out.ref_n_m);
+                position_target.y = static_cast<float>(law_out.ref_e_m);
+                position_target.z = static_cast<float>(law_out.ref_d_m);
+                position_target.feedforward_vx_mps =
+                    static_cast<float>(law_out.v_n_mps);
+                position_target.feedforward_vy_mps =
+                    static_cast<float>(law_out.v_e_mps);
+                position_target.feedforward_vz_mps =
+                    static_cast<float>(law_out.v_d_mps);
+                position_target.feedforward_valid_mask =
+                    common::kVelocityValidAll;
+                // 位置引导限速至少覆盖本拍期望速度，并留 0.5 m/s 余量让
+                // 引导点能追上目标；控制器仍有 position_guide_speed_mps 硬上限。
+                const double law_speed =
+                    std::hypot(law_out.v_n_mps, law_out.v_e_mps);
+                position_target.max_speed_mps = static_cast<float>(
+                    std::max(law_speed, 0.5));
+                ApplyHeadingToward(position_target, target.pos_x_m,
+                                   target.pos_y_m);
+                // 贴边保持（2026-11-12）：目标跑出区域时，把引导点钳到边界内
+                // 并清空速度前馈，飞机停在边界内侧——而不是让控制器逐拍钳制、
+                // 前馈继续朝外顶出"边界来回冲"（§17.10.4 的极限环）。
+                ApplyGuideEdgeHold(position_target, target);
+                if (now_ms - approach_diag_last_ms_ >= 1000) {
+                    approach_diag_last_ms_ = now_ms;
+                    SPDLOG_INFO(
+                        "S5 速度律: d={:.2f}m |v_ref|={:.2f} max_speed={:.2f} "
+                        "phase={} ref=({:.2f},{:.2f},{:.2f}) own=({:.2f},{:.2f},"
+                        "{:.2f}) v_own=({:.2f},{:.2f},{:.2f})",
+                        law_out.distance_m, law_speed,
+                        static_cast<double>(position_target.max_speed_mps),
+                        control::ApproachPhaseName(law_out.phase),
+                        static_cast<double>(position_target.x),
+                        static_cast<double>(position_target.y),
+                        static_cast<double>(position_target.z),
+                        static_cast<double>(latest_flight_->local_x_m),
+                        static_cast<double>(latest_flight_->local_y_m),
+                        static_cast<double>(latest_flight_->local_z_m),
+                        static_cast<double>(latest_flight_->vx_mps),
+                        static_cast<double>(latest_flight_->vy_mps),
+                        static_cast<double>(latest_flight_->vz_mps));
+                }
+                if (!approach_speed_law_logged_) {
+                    approach_speed_law_logged_ = true;
+                    SPDLOG_INFO(
+                        "S5 接近速度律启动: target_id={} d={:.2f}m closing={:.2f}m/s "
+                        "phase={} ref=({:.2f},{:.2f},{:.2f}) v=({:.2f},{:.2f},"
+                        "{:.2f})",
+                        target.target_id, law_out.distance_m,
+                        law_out.closing_mps,
+                        control::ApproachPhaseName(law_out.phase),
+                        static_cast<double>(position_target.x),
+                        static_cast<double>(position_target.y),
+                        static_cast<double>(position_target.z),
+                        static_cast<double>(position_target.feedforward_vx_mps),
+                        static_cast<double>(position_target.feedforward_vy_mps),
+                        static_cast<double>(position_target.feedforward_vz_mps));
+                }
+            } else {
+                const uint64_t count = ++approach_law_skip_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN("S5 速度律输出无效（输入不完整）count={}", count);
+                }
+                return;
+            }
+        }
+        if (position_intent_source_ != PositionIntentSource::kEstimate) {
+            SPDLOG_INFO(
+                "GPS_APPROACH 位置引导意图启动: target_id={} pos=({:.2f},{:.2f},{:.2f}) "
+                "ff_mask=0x{:02x} ff=({:.2f},{:.2f},{:.2f})",
+                target.target_id, static_cast<double>(target.pos_x_m),
+                static_cast<double>(target.pos_y_m),
+                static_cast<double>(target.pos_z_m),
+                position_target.feedforward_valid_mask,
+                static_cast<double>(position_target.feedforward_vx_mps),
+                static_cast<double>(position_target.feedforward_vy_mps),
+                static_cast<double>(position_target.feedforward_vz_mps));
+            position_intent_source_ = PositionIntentSource::kEstimate;
+        }
+        last_s5_position_target_ = position_target;
+        PublishPositionIntent(position_target, now_ms);
+        last_intent_target_ = target;
+    }
+
+    /// 围栏停止点预测（2026-11-12 复审三轮，维护者裁决）：
+    ///   p_stop = own + v̂ · (v·guard_reaction_s + v²/(2·guard_decel_mps2))
+    /// 沿**实测速度方向**取到边界的首个交点，若刹停点越过边界（含
+    /// `boundary_margin_m` 余量）则返回本拍允许速度；否则 `nullopt`（不限速）。
+    /// - 速度 < `kFencePredictMinSpeedMps` 不启用（方向噪声大、刹停距离≈0）；
+    /// - `guard_decel_mps2=0` 关闭预测（回退仅几何保持）；
+    /// - 返回值已抬到 `kGuideHoldMinCapMps`：0 在控制器里是"未填上限"。
+    /// 一旦返回限速即置 `fence_predicted_breach_`（bit8）。
+    std::optional<double> PredictiveFenceSpeedCap(
+        const common::FencePolygonNed& polygon) {
+        if (fence_.guard_decel_mps2 <= 0.0 || !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            return std::nullopt;
+        }
+        const auto& flight = *latest_flight_;
+        const double vx = std::isfinite(flight.vx_mps) ? flight.vx_mps : 0.0;
+        const double vy = std::isfinite(flight.vy_mps) ? flight.vy_mps : 0.0;
+        const double speed = std::hypot(vx, vy);
+        if (speed < kFencePredictMinSpeedMps) {
+            return std::nullopt;
+        }
+        const common::Vec2Ned own{static_cast<double>(flight.local_x_m),
+                                  static_cast<double>(flight.local_y_m)};
+        const common::Vec2Ned direction{vx / speed, vy / speed};
+        const double boundary_m = control::fence::RayDistanceToBoundary(
+            polygon.vertices, own, direction);
+        if (!std::isfinite(boundary_m)) {
+            return std::nullopt;
+        }
+        const double margin = std::max(0.0, fence_.boundary_margin_m);
+        const double usable = boundary_m - margin;
+        const double stop_m = control::fence::StopDistance(
+            speed, fence_.guard_decel_mps2, fence_.guard_reaction_s);
+        if (usable > 0.0 && stop_m <= usable) {
+            return std::nullopt;
+        }
+        const double allowed = control::fence::AllowedSpeedForStop(
+            usable, fence_.guard_decel_mps2, fence_.guard_reaction_s);
+        fence_predicted_breach_ = true;
+        // 现场可观测（节流：首次 + 每 100 次）：0121 里只能从 max_speed 变化
+        // 反推预测是否介入，加上这条日志后可直接核对速度/距边界/余量。
+        const uint64_t count = ++fence_predict_count_;
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_WARN(
+                "围栏停止点预测: 速度={:.2f}m/s 允许={:.2f}m/s 距边界={:.2f}m "
+                "余量={:.1f}m 累计={}",
+                speed, allowed, boundary_m, margin, count);
+        }
+        return std::max(allowed, kGuideHoldMinCapMps);
+    }
+
+    /// 贴边保持（2026-11-12，维护者裁决："贴边保持 + 告警、不中止"）。
+    ///
+    /// 现场问题：目标飞出区域后，S5 速度律仍按目标生成参考点与朝外的速度前馈，
+    /// 控制器只把**位置**拉回边界、前馈被逐拍清零又逐拍恢复 —— 飞机在边界两侧
+    /// 波动几米（0119/0120 日志 `own` 在边界 ±7m 摆动），第三次越界凑满 1.5s
+    /// 防抖就中止返航。
+    ///
+    /// 本函数在**制导层**收口（2026-11-12 复审三轮，维护者裁决"两级越界判断"）：
+    ///   ① **停止点预测限速**：沿实测速度方向预测刹停点
+    ///      `p + v̂·(v·τ + v²/(2a))`，越过边界（含 margin）就把位置引导速度压到
+    ///      允许值 `−aτ + √((aτ)² + 2a·(d − margin))`——10 m/s 的物理刹停距离
+    ///      约 17 m，等贴到边界才把限速从 10 砸到 0.5 守不住；
+    ///   ② 参考点距边界不足 `boundary_margin_m` 时把位置目标钳到多边形内；
+    ///   ③ 清空速度前馈与前馈掩码（不再朝外顶）；
+    ///   ④ 位置引导限速取 `min(当前, 0.5)`（贴边微调；预测可能已压得更低）；
+    ///   ⑤ 抬 `kWarningGuideOutsideFence` 告警，**不改变任务状态、不中止**。
+    /// 目标重新回到区域内、且距边界超过 `guide_hold_release_m` 后自动解除
+    /// （滞回，避免目标贴边时保持/跟随反复切换）。
+    ///
+    /// 预测与几何保持解耦：只要预测刹停点会越界就限速，不等参考点出界；
+    /// `fence.guard_decel_mps2=0` 关闭预测（回退纯几何保持）。
+    ///
+    /// 本函数只在 S5 生成；S6 冻结续发在 `PublishFrozenHandoverIntent()` 里
+    /// **每拍按当前速度重算**预测 cap（不沿用旧值）；S7/S9/S10 的速度意图在
+    /// `EvaluateVisualServoIntent()` 里单独做预测限速/贴边悬停；S12 返航目标
+    /// 就是 HOME，不经过本函数。`guide_hold_enabled=false` 时完全不做处理。
+    void ApplyGuideEdgeHold(PositionIntentTarget& position_target,
+                            const common::TargetState& target) {
+        if (!fence_.guide_hold_enabled) {
+            return;
+        }
+        const common::FencePolygonNed polygon = LatestFencePolygon();
+        if (!polygon.valid()) {
+            guide_edge_hold_ = false;
+            return;
+        }
+        const double margin = std::max(0.0, fence_.boundary_margin_m);
+        // ① 停止点预测限速（2026-11-12 复审三轮）：沿**实测速度方向**预测
+        //    刹停位置，越过边界（含 margin）时把位置引导速度压到允许值。
+        //    与"参考点是否被挡住"解耦——等参考点出界才刹车已经太晚。
+        if (const auto cap = PredictiveFenceSpeedCap(polygon)) {
+            position_target.max_speed_mps = std::min(
+                position_target.max_speed_mps, static_cast<float>(*cap));
+        }
+        const common::Vec2Ned ref{static_cast<double>(position_target.x),
+                                  static_cast<double>(position_target.y)};
+        const double signed_distance =
+            control::fence::SignedDistanceToBoundary(polygon.vertices, ref);
+        // ② 进入：参考点距边界不足 boundary_margin_m（界内侧预警带与界外都算
+        // "被围栏挡住"）；解除：参考点回到界内且距边界超过释放滞回。两者之间
+        // 保持当前状态（滞回）。
+        // 解除阈值取 max(margin, release)：配置的释放滞回低于进入余量时，
+        // 保持/跟随会在 [release, margin) 区间每拍反复切换（没有滞回），
+        // 实现按不产生振荡的下限收口（2026-11-12 复审）。
+        const double release_m = std::max(margin, fence_.guide_hold_release_m);
+        const bool engaged_now = guide_edge_hold_
+                                     ? signed_distance < release_m
+                                     : signed_distance < margin;
+        if (!engaged_now) {
+            if (guide_edge_hold_) {
+                guide_edge_hold_ = false;
+                SPDLOG_INFO("S5 贴边保持解除: 目标回界内 zone={}/{} 距边界={:.2f}m",
+                            polygon.zone_id, polygon.version, signed_distance);
+            }
+            return;
+        }
+        // ②③④ 制导层钳制：位置拉回边界内、前馈清零、限速降为贴边微调。
+        // 限速取 min：停止点预测可能已经把 cap 压得比 0.5 更低，不能覆盖回去。
+        const common::Vec2Ned clamped = control::fence::ClampIntoPolygon(
+            polygon.vertices, ref, margin);
+        position_target.x = static_cast<float>(clamped.north_m);
+        position_target.y = static_cast<float>(clamped.east_m);
+        position_target.feedforward_vx_mps = 0.f;
+        position_target.feedforward_vy_mps = 0.f;
+        position_target.feedforward_vz_mps = 0.f;
+        position_target.feedforward_valid_mask = 0;
+        position_target.max_speed_mps =
+            std::min(position_target.max_speed_mps, 0.5f);
+        if (!guide_edge_hold_) {
+            guide_edge_hold_ = true;
+            const uint64_t count = ++guide_edge_hold_count_;
+            SPDLOG_WARN(
+                "S5 贴边保持: 目标越出区域 target_id={} 目标=({:.2f},{:.2f}) "
+                "引导钳到=({:.2f},{:.2f}) zone={}/{} 距边界={:.2f}m "
+                "—— 保持贴边不中止任务，目标回界内后自动恢复",
+                target.target_id, static_cast<double>(target.pos_x_m),
+                static_cast<double>(target.pos_y_m), clamped.north_m,
+                clamped.east_m, polygon.zone_id, polygon.version,
+                signed_distance);
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("S5 贴边保持累计进入次数={}", count);
+            }
+        }
+    }
+
+    /// 组装并发布位置引导意图（S5/S6 引导与 S12 返航共用）。
+    /// 高度无效时 pos_z 为 NaN（合法语义）：原样透传，由 FlightController
+    /// 有限性门禁拒绝，状态机侧不得改成 0。
+    /// reason_low：低位原因码（S5/S6=7 地面站任务，S12=8 返航）。
+    void PublishPositionIntent(const PositionIntentTarget& target,
+                               uint64_t now_ms,
+                               uint32_t reason_low = kReasonGroundStationTask) {
+        common::ControlIntent intent;
+        intent.header.sequence = ++intent_sequence_;
+        intent.header.source_time_ms = now_ms;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = intent_valid_for_ms_;
+        intent.header.source_id = 1;
+        intent.header.health = 1;
+        intent.header.frame_id = target.frame_id;
+        intent.type = common::ControlIntentType::kPositionGuide;
+        intent.control_source = 0;  // 位置链
+        intent.target_x = target.x;
+        intent.target_y = target.y;
+        intent.target_z = target.z;
+        intent.feedforward_vx_mps = target.feedforward_vx_mps;
+        intent.feedforward_vy_mps = target.feedforward_vy_mps;
+        intent.feedforward_vz_mps = target.feedforward_vz_mps;
+        intent.feedforward_valid_mask = target.feedforward_valid_mask;
+        // 航向：仅显式 yaw_valid 才下发（S12 机头朝飞行方向）；其余位置意图
+        // 保持 use_yaw=false，PX4 按原机头平移。
+        intent.yaw_valid = target.yaw_valid;
+        intent.yaw_deg = target.yaw_deg;
+        // 相位速率上限（2026-11-02 P0-2）：0 = 不限制（S12 返航沿用历史行为）。
+        intent.max_speed_mps = target.max_speed_mps;
+        // bit31 显式请求控制权（FlightController 授权链必要条件）+
+        // 低位原因码（S5/S6=7 地面站任务；S12=8 返航）。
+        intent.reason_code =
+            common::kControlIntentReasonRequestControl | reason_low;
+        intent.valid_until_ms = now_ms + intent_valid_for_ms_;
+        (void)intent_output_.Publish(
+            std::make_shared<const common::ControlIntent>(intent));
+        last_intent_publish_ms_ = now_ms;
+
+        // 围栏钳制提示（2026-11-05）：记下本拍真正下发的局部 NED 引导点，
+        // 供 EvaluateGuideOutsideFence 判断它是否被控制器钳到边界。
+        // 非局部 NED 或坐标非有限时不参与判断。
+        guide_point_valid_ = target.frame_id == kFrameLocalNed &&
+                             std::isfinite(target.x) && std::isfinite(target.y);
+        if (guide_point_valid_) {
+            guide_point_ = common::Vec2Ned{target.x, target.y};
+        }
+    }
+
+    // ---- S7 视觉伺服（Task 9：TrackingControlLaw 迁入状态机） ----
+
+    /// S7 视觉伺服意图发布入口。仅在估计输入已绑定且处于 S7 时工作；
+    /// 意图逐拍发布（决策周期 10Hz；控制律按实际时钟差推算 dt，配置频率
+    /// 仅作首拍兜底）。S7 去留由 EvaluateVisualTrackingExit 四条路径决定，
+    /// 本函数不迁移状态。
+    void EvaluateVisualServoIntent(uint64_t now_ms) {
+        if (!estimation_inputs_active_) {
+            return;
+        }
+        const auto state = CurrentState();
+        // S7 正常跟踪；S9/S10 期间继续输出伺服意图（保持瞄准/稳定，避免
+        // 拦截准备段因意图停发触发控制器 COAST 刹车）。S11/S12 起返航接管。
+        if (state != common::MissionState::kVisualTracking &&
+            state != common::MissionState::kInterceptReady &&
+            state != common::MissionState::kInterceptExecuting) {
+            return;
+        }
+        servo_intent_active_ = false;  // 本拍默认停发（S7 背离告警位按拍评估）
+        auto intent = BuildVisualIntent(now_ms);
+        if (!intent.has_value()) {
+            // 控制律降级保持（output.valid=false，姿态/视觉超龄）：不发布意图。
+            // 安全语义——控制律已明确"禁止正常控制"，补发零速会与其矛盾；
+            // 收口交 FlightController 意图超时门禁（intent_timeout）刹停。
+            const uint64_t count = ++servo_degraded_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("S7 视觉伺服停发意图: 控制律降级（{}）count={}",
+                            DegradedReasonName(last_degraded_reason_), count);
+            }
+            return;
+        }
+        // 围栏停止点预测（2026-11-12 复审三轮）：S7 发的是速度意图，
+        // FlightController 的位置钳制不覆盖速度通道，必须在这里按实测速度
+        // 方向预测刹停点。预测越界 → 限速；已无可用制动距离 → 贴边悬停
+        // （清零平移速度，只保留偏航跟踪），并置 bit8。
+        if (const common::FencePolygonNed polygon = LatestFencePolygon();
+            polygon.valid()) {
+            if (const auto cap = PredictiveFenceSpeedCap(polygon)) {
+                const double existing =
+                    intent->max_speed_mps > 0.f
+                        ? static_cast<double>(intent->max_speed_mps)
+                        : std::numeric_limits<double>::infinity();
+                const double applied = std::min(existing, *cap);
+                intent->max_speed_mps = static_cast<float>(applied);
+                if (applied <= kFenceHoldSpeedMps) {
+                    intent->target_x = 0.f;
+                    intent->target_y = 0.f;
+                    intent->target_z = 0.f;
+                }
+            }
+        }
+        if (!s7_servo_started_) {
+            s7_servo_started_ = true;
+            SPDLOG_INFO(
+                "S7 视觉伺服意图启动: type={} vx={:.2f} vy={:.2f} vz={:.2f} "
+                "yaw_rate={:.1f}dps",
+                IntentTypeName(intent->type),
+                static_cast<double>(intent->target_x),
+                static_cast<double>(intent->target_y),
+                static_cast<double>(intent->target_z),
+                static_cast<double>(intent->yaw_rate_dps));
+        }
+        servo_intent_active_ = true;
+        (void)intent_output_.Publish(
+            std::make_shared<const common::ControlIntent>(*intent));
+    }
+
+    /// 组装控制快照并计算 S7 视觉伺服意图（本任务核心）：
+    /// ① 快照：视觉（`LOCKED`→tracked；主链路无预测坐标 → is_predicted 恒
+    ///    false）、双目距离（valid 且接收时间有效才透传，超龄判定在控制律内）、
+    ///    真实姿态（正式路径不做虚拟姿态兜底——姿态缺失按控制律原语义降级）；
+    /// ② TrackingControlLaw::Update（机体系增益/限幅 + 机体系→NED 旋转）；
+    /// ③ 输出映射：kVelocityHeading 填 NED 速度与航向通道；kBrakeHover 为零速
+    ///    安全意图（判丢刹车，§6.4）；二者均 control_source=1、带 bit31 控制权
+    ///    请求位（刹车保持控制权比停发更安全）；降级保持返回 nullopt。
+    std::optional<common::ControlIntent> BuildVisualIntent(uint64_t now_ms) {
+        control::ControlSnapshot snapshot;
+        if (latest_visual_status_.has_value() &&
+            latest_visual_status_->header.receive_time_ms > 0) {
+            snapshot.track.tracked =
+                latest_visual_status_->state == common::VisualTargetState::kLocked;
+            snapshot.track.is_predicted = false;  // 主链路无预测坐标
+            snapshot.track.center_x =
+                static_cast<double>(latest_visual_status_->center_pixel_x);
+            snapshot.track.center_y =
+                static_cast<double>(latest_visual_status_->center_pixel_y);
+            snapshot.track_time_ms = static_cast<int64_t>(
+                latest_visual_status_->header.receive_time_ms);
+        }
+        if (latest_distance_.has_value() && latest_distance_->valid &&
+            latest_distance_->header.receive_time_ms > 0) {
+            snapshot.target_distance_m =
+                static_cast<double>(latest_distance_->forward_distance_m);
+            snapshot.distance_valid = true;
+            snapshot.distance_time_ms = static_cast<int64_t>(
+                latest_distance_->header.receive_time_ms);
+        }
+        if (latest_flight_.has_value()) {
+            snapshot.attitude_present = latest_flight_->attitude_valid &&
+                latest_flight_->header.receive_time_ms > 0;
+            snapshot.attitude_time_ms = static_cast<int64_t>(
+                latest_flight_->header.receive_time_ms);
+            snapshot.roll_rad = static_cast<double>(latest_flight_->roll_rad);
+            snapshot.pitch_rad = static_cast<double>(latest_flight_->pitch_rad);
+            snapshot.yaw_rad = static_cast<double>(latest_flight_->yaw_rad);
+        }
+
+        const auto output =
+            visual_law_->Update(snapshot, static_cast<int64_t>(now_ms));
+        last_degraded_reason_ = output.degraded_reason;
+        if (!output.valid) {
+            return std::nullopt;
+        }
+
+        common::ControlIntent intent;
+        intent.header.sequence = ++intent_sequence_;
+        intent.header.source_time_ms = now_ms;
+        intent.header.receive_time_ms = now_ms;
+        intent.header.valid_for_ms = intent_valid_for_ms_;
+        intent.header.source_id = 1;
+        intent.header.health = 1;
+        // 速度输出已是局部 NED（机体系→NED 旋转在控制律内完成），
+        // FlightController 不再做二次旋转。
+        intent.header.frame_id = kFrameLocalNed;
+        intent.control_source = 1;  // 1=视觉
+        intent.valid_until_ms = now_ms + intent_valid_for_ms_;
+        switch (output.mode) {
+            case control::ControlMode::kVelocityHeading:
+                intent.type = common::ControlIntentType::kVelocityHeading;
+                intent.target_x = static_cast<float>(output.vx_mps);
+                intent.target_y = static_cast<float>(output.vy_mps);
+                intent.target_z = static_cast<float>(output.vz_mps);
+                intent.yaw_deg = static_cast<float>(output.yaw_deg);
+                intent.yaw_rate_dps = static_cast<float>(output.yaw_rate_dps);
+                intent.reason_code = common::kControlIntentReasonRequestControl |
+                                     kReasonVisualTracking;
+                return intent;
+            case control::ControlMode::kBrakeHover:
+                // 判丢零速刹车（§6.4）：速度分量保持零（ControlIntent 默认值）
+                intent.type = common::ControlIntentType::kBrakeHover;
+                intent.reason_code = common::kControlIntentReasonRequestControl |
+                                     kReasonVisualBrake;
+                return intent;
+            case control::ControlMode::kDegradedHold:
+                break;  // valid=true 时不应出现；防御：不发布
+        }
+        return std::nullopt;
+    }
+
+    /// 热备份核对（设计 §2.4）：S7 期间每秒核对卡尔曼状态年龄
+    /// （`TargetState.header.receive_time_ms` 年龄是否超出其自报有效期窗
+    /// `valid_for_ms`——生产者声明的"数据允许使用的最长时间"，与 S5 意图门禁
+    /// `HasFreshEstimate` 同一口径；无快照、valid=false 亦视为断粮）。
+    /// 进入 S7 后立即核对一次，此后每秒一次；断粮 → 节流 WARN + 返回告警位
+    /// （不退出 S7：S7 去留由四条收口路径决定，热备份告警只提示"假备份"风险）。
+    uint32_t EvaluateHotBackup(uint64_t now_ms) {
+        if (CurrentState() != common::MissionState::kVisualTracking) {
+            hot_backup_starved_ = false;
+            return 0;
+        }
+        if (hot_backup_check_ms_ != 0 &&
+            now_ms - hot_backup_check_ms_ < kHotBackupCheckIntervalMs) {
+            return hot_backup_starved_ ? kWarningHotBackupStarved : 0;
+        }
+        hot_backup_check_ms_ = now_ms;
+        hot_backup_starved_ = !HasFreshEstimate(now_ms);
+        if (hot_backup_starved_) {
+            const uint64_t count = ++hot_backup_starved_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN(
+                    "S7 热备份断粮: 卡尔曼状态年龄超窗（估计无效/超龄/未收到），"
+                    "不退出 S7 count={}",
+                    count);
+            }
+        }
+        return hot_backup_starved_ ? kWarningHotBackupStarved : 0;
+    }
+
+    // ---- 通用拦截设备（Task 10：MAV_CMD_DO_SET_ACTUATOR 命令窄接口） ----
+
+    /// 组装设备每拍反馈：PX4 连接证据（最新飞行快照）与命令 ACK 快照。
+    /// 设备内部时序只认本次 Update 的反馈，状态机不复制计时逻辑。
+    InterceptFeedback BuildInterceptFeedback(uint64_t now_ms) const {
+        InterceptFeedback feedback;
+        feedback.now_ms = now_ms;
+        feedback.px4_connected =
+            latest_flight_.has_value() && latest_flight_->connected;
+        if (command_sender_ != nullptr) {
+            feedback.ack = command_sender_->AckStatus();
+        }
+        return feedback;
+    }
+
+    /// 每拍推进拦截设备并处理其故障。返回 true 表示已进入/处于故障态，
+    /// 本拍应跳过任务控制逻辑（S16 只维护告警与状态发布）。
+    bool UpdateInterceptionDevice(uint64_t now_ms) {
+        if (mission_faulted_) {
+            return true;
+        }
+        if (intercept_device_ == nullptr) {
+            return false;  // 物理缺席（影子/未开控制）：不产生任何命令
+        }
+        intercept_device_->Update(BuildInterceptFeedback(now_ms));
+        if (intercept_device_->Faulted()) {
+            HandleMissionFault(intercept_device_->FaultReason());
+            return true;
+        }
+        return false;
+    }
+
+    /// S10 内发起一次拦截动作。语义：
+    /// - 无飞行快照 = 没有连接证据（启动早期/测试未注入）→ 不发起；
+    /// - 快照在线才发起；快照存在但 connected=false → 故障；
+    /// - 入队失败由设备保持 Ready、下拍重试；超过 return_home.fire_timeout
+    ///   仍未入队 → 故障（不再“按失败结果返航”）；
+    /// - 发起成功后由设备维护 ACK 保持/复位时序，状态机不重复发起。
+    void MaybeExecuteInterception(uint64_t now_ms) {
+        if (intercept_device_ == nullptr || mission_faulted_ ||
+            CurrentState() != common::MissionState::kInterceptExecuting) {
+            return;
+        }
+        if (intercept_device_->Triggered()) {
+            return;
+        }
+        const uint64_t held_ms =
+            now_ms >= state_entered_ms_ ? now_ms - state_entered_ms_ : 0;
+        if (held_ms >= static_cast<uint64_t>(return_home_.fire_timeout.count())) {
+            HandleMissionFault("触发命令未入队（发射超时）");
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            return;  // 启动早期/测试未注入：没有连接证据，不触发
+        }
+        if (!latest_flight_->connected) {
+            HandleMissionFault("S10 期间 PX4 连接断开");
+            return;
+        }
+        if (intercept_device_->Ready() && intercept_device_->RemainingUses() > 0) {
+            if (intercept_device_->Execute()) {
+                interception_fired_ = true;
+            }
+        }
+    }
+
+    /// 拦截设备故障 → S16 FAILSAFE：置 bit4、取消待发命令（恰好一次）、
+    /// 停发一切控制意图，交 PX4/遥控处置；不重试、不补发复位。
+    void HandleMissionFault(const char* reason) {
+        if (mission_faulted_) {
+            return;
+        }
+        mission_faulted_ = true;
+        // 起飞段（S3/S4）发生任务故障：先按实际是否离地收口 tracker 并回
+        // 65015 aborted(mission_fault)，再迁移 S16（故障为终态，控制意图停发）。
+        AbortTakeoffForMissionFault(reason);
+        SetWarnings(kWarningActuatorFault);
+        if (command_sender_ != nullptr) {
+            command_sender_->CancelPendingCommands();
+        }
+        SPDLOG_ERROR("拦截设备故障，停止任务控制并交 PX4/遥控: {}", reason);
+        TransitionTo(common::MissionState::kFailsafe, reason);
+    }
+
+    // ---- 拦截后返航/降落（S11~S14，2026-10-19 V1 单发口径） ----
+
+    /// Home 在 EKF 锚点坐标系下的局部 NED（返航目标）。
+    /// 使用 Home 经纬度 + 锚点换算，避免依赖 HOME_POSITION.x/y/z（MAVLink
+    /// 报文未携带 PX4 的 valid_lpos 标志）；home/锚点/当前位置任一无效返回 nullopt。
+    /// 记录本次任务的起飞原点（S3 接受分配时）。返航水平目标优先用它，
+    /// 避免 PX4 Home 经纬度漂移把返航点带偏。
+    void RememberTakeoffOrigin(const common::FlightStateSnapshot& flight) {
+        return_origin_valid_ = true;
+        return_origin_x_ = flight.local_x_m;
+        return_origin_y_ = flight.local_y_m;
+        return_origin_z_ = flight.local_z_m;
+    }
+
+    /// 返航水平目标（局部 NED，2026-11-04 现场回归）：
+    /// 优先用 S3 记录的**起飞原点**——它与 `local_position` 同一坐标系，不受
+    /// PX4 Home 经纬度漂移影响（现场 25 分钟内 Home 水平漂 5~16 m，用它换算会
+    /// 让返航点偏离真实起飞点，表现为“飞到起飞点附近又拐弯、落到坡上”）。
+    /// 无起飞原点（如 65020 人工返航且未走任务分配）时退回 Home 经纬度换算。
+    /// 高度不在这里取：返航高度统一走 `RelativeAltitudeBaseZ()` 的 EKF 差分口径。
+    std::optional<common::Vec2Ned> ReturnHorizontalTarget() const {
+        if (return_origin_valid_) {
+            return common::Vec2Ned{return_origin_x_, return_origin_y_};
+        }
+        if (!latest_flight_.has_value()) {
+            return std::nullopt;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.home_valid || !flight.ned_ref_valid) {
+            return std::nullopt;
+        }
+        const perception::GeodeticCoordinate anchor{
+            static_cast<double>(flight.ned_ref_lat_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_lon_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_alt_mm) * 1e-3};
+        const perception::GeodeticCoordinate home{
+            static_cast<double>(flight.home_lat_1e7) * 1e-7,
+            static_cast<double>(flight.home_lon_1e7) * 1e-7,
+            static_cast<double>(flight.home_altitude_mm) * 1e-3};
+        const auto ned = perception::GeodeticToLocalNed(anchor, home);
+        if (!ned.has_value()) {
+            return std::nullopt;
+        }
+        return common::Vec2Ned{static_cast<float>(ned->north_m),
+                               static_cast<float>(ned->east_m)};
+    }
+
+    /// 返航目标相对高度（m，相对起飞点/AMSL 由区域口径决定，2026-11-04）。
+    /// 默认 `return_home_.altitude_m`（5 m），但如果区域高度带上限更低，必须
+    /// 收敛到 `上限 − 0.5m`：否则飞控把设定值压在上限，垂直差永远大于
+    /// `arrival_vertical_m`，S12 会永远判不到"到达"，表现就是一直返航不降落。
+    double ReturnAltitudeM() const {
+        double altitude_m = return_home_.altitude_m;
+        if (fence_zone_.has_value() && fence_zone_->altitude_reference != 0U &&
+            fence_zone_->alt_max_m > 0.0) {
+            const double capped =
+                fence_zone_->alt_max_m - kReturnAltitudeMarginM;
+            if (capped > 0.0 && altitude_m > capped) {
+                altitude_m = capped;
+            }
+        }
+        return altitude_m;
+    }
+
+    std::optional<perception::LocalNedCoordinate> HomeLocalNed() const {
+        if (!latest_flight_.has_value()) {
+            return std::nullopt;
+        }
+        const auto& flight = *latest_flight_;
+        if (!flight.home_valid || !flight.ned_ref_valid ||
+            !flight.local_position_valid) {
+            return std::nullopt;
+        }
+        const perception::GeodeticCoordinate anchor{
+            static_cast<double>(flight.ned_ref_lat_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_lon_1e7) * 1e-7,
+            static_cast<double>(flight.ned_ref_alt_mm) * 1e-3};
+        const perception::GeodeticCoordinate home{
+            static_cast<double>(flight.home_lat_1e7) * 1e-7,
+            static_cast<double>(flight.home_lon_1e7) * 1e-7,
+            static_cast<double>(flight.home_altitude_mm) * 1e-3};
+        return perception::GeodeticToLocalNed(anchor, home);
+    }
+
+    /// 发布返航位置意图（低位原因码 8；不带目标速度前馈）。
+    /// heading_valid 时附带航向（S12 机头朝飞行方向，2026-10-29）。
+    /// S12 返航位置意图（2026-11-03）：`max_speed_mps` 交给控制器位置引导限速，
+    /// 爬升段传 `climb_rate_mps`、水平段传本拍速度剖面输出；悬停收口传 0（不推进）。
+    void PublishReturnHomeIntent(float x, float y, float z, uint64_t now_ms,
+                                 bool heading_valid = false,
+                                 float heading_deg = 0.f,
+                                 float max_speed_mps = 0.f) {
+        PositionIntentTarget target;
+        target.x = x;
+        target.y = y;
+        target.z = z;
+        target.frame_id = kFrameLocalNed;
+        target.yaw_valid = heading_valid;
+        target.yaw_deg = heading_deg;
+        target.max_speed_mps = max_speed_mps;
+        PublishPositionIntent(target, now_ms, kReasonReturnHome);
+    }
+
+    /// 返航速度剖面参数（return_home 节 → 纯函数配置，构造期固化）。
+    control::ReturnSpeedLawConfig ReturnSpeedConfig() const {
+        control::ReturnSpeedLawConfig law;
+        law.cruise_mps = return_home_.cruise_speed_mps;
+        law.accel_mps2 = return_home_.accel_plan_mps2;
+        law.decel_mps2 = return_home_.decel_plan_mps2;
+        law.brake_safety = return_home_.brake_safety;
+        law.final_speed_mps = return_home_.final_speed_mps;
+        law.final_zone_m = return_home_.final_zone_m;
+        law.arrival_radius_m = return_home_.arrival_radius_m;
+        return law;
+    }
+
+    /// 推进一拍返航速度剖面（2026-11-12）。
+    ///
+    /// 调用前提：S12 水平段且局部位置/返航目标已可用（调用方保证，进入本函数
+    /// 前已做过分支判定）。输入全部取实时测量：`remaining_m` 为到返航水平目标
+    /// 的剩余距离，`ground_speed_mps` 为 PX4 实测水平地速。用实测值而非上一拍
+    /// 指令的原因：
+    ///   - 起步段（目标未运动/已掉落，飞机已被追停到 0）必须靠实测 0 才能
+    ///     生成加速斜坡；按指令积分会让剖面"以为自己在巡航"，永远不加速；
+    ///   - 超速进入（始终追不上目标转返航，飞机可能 6~10 m/s）必须靠实测
+    ///     才能生成减速斜坡，否则指令一直高于实际、退不回来。
+    float UpdateReturnSpeed(float remaining_m, float ground_speed_mps,
+                            uint64_t now_ms) {
+        control::ReturnSpeedInput input;
+        input.valid = true;
+        input.remaining_m = static_cast<double>(remaining_m);
+        input.ground_speed_mps = static_cast<double>(ground_speed_mps);
+        double dt_s = static_cast<double>(kDecisionPeriod.count()) / 1000.0;
+        if (return_speed_last_ms_ != 0 && now_ms > return_speed_last_ms_) {
+            dt_s = static_cast<double>(now_ms - return_speed_last_ms_) / 1000.0;
+            // 节拍异常（调度抖动/系统卡顿）时钳住 dt：过大的 dt 会让斜坡
+            // 一步跨到顶速，过小会让斜坡停滞。
+            dt_s = std::clamp(dt_s, 0.02, 0.5);
+        }
+        return_speed_last_ms_ = now_ms;
+        input.dt_s = dt_s;
+        const control::ReturnSpeedOutput out =
+            control::ComputeReturnSpeed(ReturnSpeedConfig(), input,
+                                        return_speed_state_);
+        // brake_limited 只用于诊断（phase=brake 已能表达），不额外存一份状态。
+        return_speed_phase_ = out.valid ? out.phase : control::ReturnSpeedPhase::kIdle;
+        return out.valid ? static_cast<float>(out.speed_mps) : 0.f;
+    }
+
+    /// 返航航向（机头朝飞行方向）：方位角 = atan2(东, 北)，按
+    /// return_home.heading_rate_limit_dps / heading_accel_limit_dps2 做二阶限幅，
+    /// 角度走最短路径（±180°）。距离 <1m 不改航向（避免终点抖动）。
+    /// heading_mode=0 返回 0 且由调用方保持 heading_valid=false（PX4 保持原机头）。
+    float ReturnHeadingToward(float from_x, float from_y, float to_x, float to_y,
+                              uint64_t now_ms) {
+        const double north = static_cast<double>(to_x) - static_cast<double>(from_x);
+        const double east = static_cast<double>(to_y) - static_cast<double>(from_y);
+        if (std::hypot(north, east) < 1.0) {
+            return static_cast<float>(return_heading_cmd_deg_);
+        }
+        const double bearing_deg = std::atan2(east, north) * kRadToDeg;
+        double dt_s = 0.0;
+        if (return_heading_last_ms_ != 0 && now_ms > return_heading_last_ms_) {
+            dt_s = static_cast<double>(now_ms - return_heading_last_ms_) / 1000.0;
+        }
+        return_heading_last_ms_ = now_ms;
+        if (dt_s <= 0.0) {
+            // 首拍直接对齐方位角：返航起点即可见机头朝向，不从 0° 慢慢转。
+            return_heading_cmd_deg_ = bearing_deg;
+            return_heading_rate_dps_ = 0.0;
+        } else {
+            // 最短角差（-180~180）+ 角速度限幅 + 角加速度限幅。
+            const double delta =
+                std::fmod(bearing_deg - return_heading_cmd_deg_ + 540.0, 360.0) -
+                180.0;
+            const double desired_rate = control::Clamp(
+                delta / dt_s, -return_home_.heading_rate_limit_dps,
+                return_home_.heading_rate_limit_dps);
+            const double max_dv = return_home_.heading_accel_limit_dps2 * dt_s;
+            return_heading_rate_dps_ =
+                control::Clamp(desired_rate, return_heading_rate_dps_ - max_dv,
+                               return_heading_rate_dps_ + max_dv);
+            return_heading_cmd_deg_ =
+                std::fmod(return_heading_cmd_deg_ +
+                              return_heading_rate_dps_ * dt_s + 540.0,
+                          360.0) -
+                180.0;
+        }
+        return static_cast<float>(return_heading_cmd_deg_);
+    }
+
+    /// 单发拦截完成：S10 动作已入队（`Triggered()`，不等 ACK）→ S11 → S12。
+    /// V1 不判断命中；摄像头状态不参与返航判断。发射超时/断连已由
+    /// MaybeExecuteInterception/执行器判故障进入 S16，不再走“失败返航”。
+    void EvaluateInterceptionCompletion() {
+        if (!return_home_.enabled || mission_faulted_) {
+            return;
+        }
+        const auto state = CurrentState();
+        if (state == common::MissionState::kInterceptExecuting) {
+            if (intercept_device_ != nullptr && intercept_device_->Triggered()) {
+                interception_fired_ = true;
+                SPDLOG_WARN("单发拦截命令已入队，进入 POST_INTERCEPT（V1 不判命中）");
+                TransitionTo(common::MissionState::kPostIntercept,
+                             "单发拦截命令已入队（不判命中）");
+            }
+            return;
+        }
+        if (state == common::MissionState::kPostIntercept) {
+            TransitionTo(common::MissionState::kReturnHome,
+                         interception_fired_ ? "单发拦截已发射，进入返航"
+                                             : "单发拦截未发射，进入返航");
+        }
+    }
+
+    /// S12 返航：低于 5m 先原地爬升，再位置设定值飞 Home；到达后进 S13。
+    /// PX4 离开 Offboard（failsafe/人工）→ 停止争控，转 S13 仅监控降落。
+    void EvaluateReturnHome(uint64_t now_ms) {
+        if (!return_home_.enabled ||
+            CurrentState() != common::MissionState::kReturnHome) {
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        // 进入返航前 PX4 已自行落地并上锁（例如 S5 无目标停发后 PX4 RTL
+        // 完成，模式又恢复为 Offboard）：不再发返航设定值，直接交 S13 收口。
+        // 否则 S12 会对着已落地/已上锁的飞机持续发位置目标并卡到返航超时。
+        if (flight.landed_state_valid && flight.landed && !flight.armed) {
+            SPDLOG_INFO("返航前 PX4 已落地并上锁，直接进入降落收口");
+            TransitionTo(common::MissionState::kLanding,
+                         "返航前已落地/上锁");
+            return;
+        }
+        if (flight.flight_mode != kPx4FlightMainModeOffboard ||
+            flight.flight_sub_mode != kPx4FlightSubModeOffboard) {
+            return_px4_takeover_ = true;
+            SPDLOG_WARN("返航中 PX4 已离开 Offboard（mode={}/{}），停止返航设定值",
+                        flight.flight_mode, flight.flight_sub_mode);
+            TransitionTo(common::MissionState::kLanding, "PX4 接管返航/降落");
+            return;
+        }
+        if (!flight.local_position_valid) {
+            if (!return_home_wait_logged_) {
+                SPDLOG_WARN("返航等待 PX4 局部位置有效");
+                return_home_wait_logged_ = true;
+            }
+            return;
+        }
+        // 返航不设总时长上限（2026-11-04 用户裁决）：用"从进 S12 起的绝对时长"
+        // 猜"飞不飞得到"必然误判——现场 128m、限速 1.5m/s 需要 85s，旧 60s
+        // 超时一到就原地悬停。返航一直飞到"到达判据"成立为止；卡住与否改用
+        // 长度无关的停滞诊断（见下方 horizontal_m 段），只 WARN 不中止。
+        const auto home_xy = ReturnHorizontalTarget();
+        if (!home_xy.has_value()) {
+            if (!return_home_wait_logged_) {
+                SPDLOG_WARN("返航等待起飞原点/Home/EKF 锚点有效（无局部返航基准）");
+                return_home_wait_logged_ = true;
+            }
+            // 无基准时原地悬停，不盲目返航。**仍要限速**：目标=当前位置本身
+            // 不推进，但 max_speed_mps=0 在控制器语义里是"回退硬上限 10m/s"，
+            // 一旦分支行为变动就会按 10m/s 跑（2026-11-12 收口为 cruise）。
+            PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
+                                    flight.local_z_m, now_ms, false, 0.f,
+                                    static_cast<float>(return_home_.cruise_speed_mps));
+            return;
+        }
+        // 返航高度基准（2026-11-04）：优先与围栏/65011 同口径的 EKF 差分，
+        // 不再用 Home 的 GNSS 绝对海拔（现场会漂 18~38 m）；仅有 Home 基准的
+        // 老装配（无 HOME_POSITION.z / 起飞快照）退回 Home 换算，保持旧行为。
+        double base_z = 0.0;
+        bool altitude_known = false;
+        if (const auto ekf_base = common::RelativeAltitudeBaseZ(flight);
+            ekf_base.has_value()) {
+            base_z = *ekf_base;
+            altitude_known = true;
+        } else if (const auto home = HomeLocalNed(); home.has_value()) {
+            base_z = home->down_m;
+            altitude_known = true;
+        }
+        if (!altitude_known) {
+            if (!return_home_wait_logged_) {
+                SPDLOG_WARN("返航等待相对高度基准（HOME_POSITION/起飞快照/Home）");
+                return_home_wait_logged_ = true;
+            }
+            // 同上：无高度基准也只做水平悬停等待，但仍按 cruise 限速，
+            // 避免 max_speed_mps=0 落回控制器硬上限（2026-11-12）。
+            PublishReturnHomeIntent(flight.local_x_m, flight.local_y_m,
+                                    flight.local_z_m, now_ms, false, 0.f,
+                                    static_cast<float>(return_home_.cruise_speed_mps));
+            return;
+        }
+
+        // 返航高度：低于目标高度（默认 5m，受区域上限约束）先原地爬升；
+        // 已达到则保持当前高度。
+        const double return_altitude_m = ReturnAltitudeM();
+        if (return_altitude_m < return_home_.altitude_m &&
+            !return_altitude_clamped_) {
+            return_altitude_clamped_ = true;
+            SPDLOG_WARN("返航高度受区域高度带上限约束: {:.1f}m -> {:.1f}m"
+                        "（否则飞控钳制后垂直差永远超限、无法判到达）",
+                        return_home_.altitude_m, return_altitude_m);
+        }
+        const double relative_alt_m =
+            base_z - static_cast<double>(flight.local_z_m);
+        double target_z = static_cast<double>(flight.local_z_m);
+        if (relative_alt_m < return_altitude_m) {
+            target_z = base_z - return_altitude_m;
+        } else {
+            return_climb_phase_ = false;
+        }
+        if (return_climb_phase_) {
+            const bool climbed =
+                std::fabs(static_cast<double>(flight.local_z_m) - target_z) <=
+                    return_home_.arrival_vertical_m &&
+                std::fabs(static_cast<double>(flight.vz_mps)) <=
+                    return_home_.arrival_speed_mps;
+            if (climbed) {
+                return_climb_phase_ = false;
+                SPDLOG_INFO("返航爬升完成（相对起飞点 {:.1f}m），开始水平返航",
+                            return_altitude_m);
+            }
+        }
+        const double target_x = return_climb_phase_
+                                    ? static_cast<double>(flight.local_x_m)
+                                    : static_cast<double>(home_xy->north_m);
+        const double target_y = return_climb_phase_
+                                    ? static_cast<double>(flight.local_y_m)
+                                    : static_cast<double>(home_xy->east_m);
+        // 返航航向（机头朝飞行方向，2026-10-29）：只在水平返航段生效；
+        // 爬升段（水平目标=当前位置）与 heading_mode=0 不指定航向。
+        const bool heading_valid = !return_climb_phase_ &&
+                                   return_home_.heading_mode != 0U;
+        const float heading_deg =
+            heading_valid
+                ? ReturnHeadingToward(flight.local_x_m, flight.local_y_m,
+                                      static_cast<float>(target_x),
+                                      static_cast<float>(target_y), now_ms)
+                : 0.f;
+        // 返航速度指令（2026-11-12）：爬升段用 climb_rate_mps（垂直通道，
+        // 水平目标=当前位置不推进）；水平段走速度剖面——起步加速、超速减速、
+        // 末端制动包络与低速档，全部由 return_speed_law 纯函数给出。
+        float return_speed_mps = static_cast<float>(return_home_.climb_rate_mps);
+        if (!return_climb_phase_) {
+            const double remaining_m = std::hypot(
+                static_cast<double>(home_xy->north_m) -
+                    static_cast<double>(flight.local_x_m),
+                static_cast<double>(home_xy->east_m) -
+                    static_cast<double>(flight.local_y_m));
+            // 逐轴有限性降级：坏轴按 0 处理。若直接 hypot 出 NaN，剖面会被
+            // 当成"实测 0"从静止重新加速（std::max(0, NaN) 取 0），与实况背离。
+            const double ground_speed_mps =
+                std::hypot(std::isfinite(flight.vx_mps)
+                               ? static_cast<double>(flight.vx_mps)
+                               : 0.0,
+                           std::isfinite(flight.vy_mps)
+                               ? static_cast<double>(flight.vy_mps)
+                               : 0.0);
+            return_speed_mps = UpdateReturnSpeed(
+                static_cast<float>(remaining_m),
+                static_cast<float>(ground_speed_mps), now_ms);
+        }
+        PublishReturnHomeIntent(static_cast<float>(target_x),
+                                static_cast<float>(target_y),
+                                static_cast<float>(target_z), now_ms,
+                                heading_valid, heading_deg, return_speed_mps);
+
+        if (return_climb_phase_) {
+            return;
+        }
+        const double horizontal_m = std::hypot(
+            static_cast<double>(home_xy->north_m) -
+                static_cast<double>(flight.local_x_m),
+            static_cast<double>(home_xy->east_m) -
+                static_cast<double>(flight.local_y_m));
+
+        // 停滞诊断（只告警，不中止）：距离连续 `return_home_.timeout` 没有缩短
+        // kReturnStallProgressM 以上，说明"没在靠近"，排查风/围栏钳制/遥控接管，
+        // 但返航照常继续——程序和 PX4 都可能在正常工作。
+        if (horizontal_m + kReturnStallProgressM < return_best_distance_m_) {
+            return_best_distance_m_ = horizontal_m;
+            return_progress_ms_ = now_ms;
+        } else if (return_progress_ms_ != 0 && now_ms >= return_progress_ms_) {
+            const uint64_t stalled_ms = now_ms - return_progress_ms_;
+            // `return_home.timeout_ms` 语义已改为“停滞告警间隔”（2026-11-04，
+            // 不再用于中止返航），默认 60s。
+            const uint64_t warn_interval =
+                static_cast<uint64_t>(return_home_.timeout.count());
+            if (stalled_ms >= warn_interval &&
+                (return_stall_warned_ms_ == 0 ||
+                 now_ms - return_stall_warned_ms_ >= warn_interval)) {
+                return_stall_warned_ms_ = now_ms;
+                SPDLOG_WARN("返航停滞: {:.1f}s 未靠近返航目标（距目标 {:.1f}m，"
+                            "检查逆风/区域钳制/遥控接管），继续返航",
+                            static_cast<double>(stalled_ms) / 1000.0,
+                            horizontal_m);
+            }
+        }
+
+        const double vertical_m =
+            std::fabs(target_z - static_cast<double>(flight.local_z_m));
+        const double horizontal_speed_mps =
+            std::hypot(static_cast<double>(flight.vx_mps),
+                       static_cast<double>(flight.vy_mps));
+        // 返航速度摘要（2026-11-11，1Hz）：给出"距目标/地速/指令上限"三件套，
+        // 现场核对"返航是不是太慢"时不必再从两个状态跳变时刻反推平均值。
+        // 2026-11-12：补速度剖面分级（accel/cruise/decel/brake/final），
+        // 用于核对"起步加速/超速回落/末端制动"是否按预期推进。
+        if (now_ms - return_diag_last_ms_ >= 1000) {
+            return_diag_last_ms_ = now_ms;
+            const double command_mps =
+                return_climb_phase_ ? return_home_.climb_rate_mps
+                                    : static_cast<double>(return_speed_mps);
+            SPDLOG_INFO(
+                "S12 返航摘要: 距目标={:.1f}m 垂直差={:.2f}m 地速={:.2f}m/s "
+                "指令上限={:.2f}m/s 剖面={} 爬升段={} 相对高度={:.1f}m",
+                horizontal_m, vertical_m, horizontal_speed_mps, command_mps,
+                control::ReturnSpeedPhaseName(return_speed_phase_),
+                return_climb_phase_ ? "是" : "否", relative_alt_m);
+        }
+        const bool inside = horizontal_m <= return_home_.arrival_radius_m &&
+                            vertical_m <= return_home_.arrival_vertical_m &&
+                            horizontal_speed_mps <= return_home_.arrival_speed_mps;
+        if (!inside) {
+            arrival_stable_since_ms_ = 0;
+            return;
+        }
+        if (arrival_stable_since_ms_ == 0) {
+            arrival_stable_since_ms_ = now_ms;
+        }
+        const uint64_t arrival_held_ms =
+            now_ms >= arrival_stable_since_ms_
+                ? now_ms - arrival_stable_since_ms_
+                : 0;
+        if (arrival_held_ms >=
+            static_cast<uint64_t>(return_home_.arrival_hold.count())) {
+            TransitionTo(common::MissionState::kLanding,
+                         "到达 Home 附近，进入降落");
+        }
+    }
+
+    /// S13 发 AUTO.LAND（4/6），S14 前发 DISARM；PX4 接管时只监控不争控。
+    void EvaluateLandingAndDisarm(uint64_t now_ms) {
+        if (!return_home_.enabled) {
+            return;
+        }
+        const auto state = CurrentState();
+        if (state == common::MissionState::kLanding) {
+            if (!latest_flight_.has_value()) {
+                return;
+            }
+            const auto& flight = *latest_flight_;
+            if (flight.landed_state_valid && flight.landed) {
+                if (!flight.armed) {
+                    TransitionTo(common::MissionState::kDisarmed,
+                                 "PX4 已确认 landed + disarmed，任务结束");
+                    return;
+                }
+                if (command_sender_ == nullptr) {
+                    if (!landing_command_unavailable_logged_) {
+                        SPDLOG_ERROR("S13 无法 DISARM：命令接口未注入");
+                        landing_command_unavailable_logged_ = true;
+                    }
+                    return;
+                }
+                if (now_ms - disarm_command_ms_ >=
+                    static_cast<uint64_t>(return_home_.command_retry.count())) {
+                    const bool queued = command_sender_->SendCommand(
+                        kMavCmdComponentArmDisarm, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+                        0.f);
+                    disarm_command_ms_ = now_ms;
+                    if (queued) {
+                        if (!disarm_command_sent_) {
+                            disarm_command_sent_ = true;
+                            SPDLOG_INFO("S14 前 DISARM 命令已入队");
+                        }
+                    } else {
+                        const uint64_t count = ++disarm_command_fail_count_;
+                        if (ShouldLogThrottled(count)) {
+                            SPDLOG_WARN("DISARM 入队失败（下拍重试）累计={}", count);
+                        }
+                    }
+                }
+                return;
+            }
+
+            if (landing_takeover_) {
+                return;  // PX4 主导返航/降落，仅等待 landed/disarmed
+            }
+            if (command_sender_ == nullptr) {
+                if (!landing_command_unavailable_logged_) {
+                    SPDLOG_ERROR("S13 无法发 AUTO.LAND：命令接口未注入");
+                    landing_command_unavailable_logged_ = true;
+                }
+                return;
+            }
+            const bool offboard =
+                flight.flight_mode == kPx4FlightMainModeOffboard &&
+                flight.flight_sub_mode == kPx4FlightSubModeOffboard;
+            if (!offboard) {
+                const bool auto_land =
+                    flight.flight_mode == kPx4FlightMainModeAuto &&
+                    flight.flight_sub_mode == kPx4FlightSubModeAutoLand;
+                if (!auto_land) {
+                    landing_takeover_ = true;
+                    SPDLOG_WARN(
+                        "S13 PX4 已离开 Offboard 且非 AUTO.LAND（mode={}/{}），"
+                        "停止命令重试，等待降落",
+                        flight.flight_mode, flight.flight_sub_mode);
+                }
+                return;
+            }
+            if (now_ms - landing_command_ms_ >=
+                static_cast<uint64_t>(return_home_.command_retry.count())) {
+                const bool queued = command_sender_->SendCommand(
+                    kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled,
+                    kPx4MainModeAuto, kPx4SubModeAutoLand, 0.f, 0.f, 0.f, 0.f);
+                landing_command_ms_ = now_ms;
+                if (queued) {
+                    if (!landing_command_sent_) {
+                        landing_command_sent_ = true;
+                        SPDLOG_INFO("S13 AUTO.LAND 命令已入队");
+                    }
+                } else {
+                    const uint64_t count = ++landing_command_fail_count_;
+                    if (ShouldLogThrottled(count)) {
+                        SPDLOG_WARN("AUTO.LAND 入队失败（下拍重试）累计={}", count);
+                    }
+                }
+            }
+            return;
+        }
+        if (state == common::MissionState::kDisarmed && !mission_end_logged_) {
+            mission_end_logged_ = true;
+            SPDLOG_INFO("任务结束: S14 DISARMED，拦截结果={}",
+                        interception_fired_ ? "已发射" : "未发射");
+        }
+    }
+
+    /// GPS位置引导的最低导航前置条件。后续接入控制前还需增加模式/高度/电池等门禁。
+    // GPS 引导最低门禁：连接、3D fix、全局位置和 Home 必须同时有效。
+    bool HasNavigationForGps() const {
+        if (!latest_flight_) {
+            return false;
+        }
+        const auto& flight = *latest_flight_;
+        return flight.connected && flight.gps_state_valid && flight.gps_fix &&
+               flight.global_position_valid && flight.home_valid;
+    }
+
+    /// 判断地面站目标是否仍在飞机端计算出的剩余有效期内。
+    // 目标有效期使用 GroundStationLink 校正后的 receive_time + remaining valid_for 判断。
+    bool HasFreshGroundTarget(uint64_t now_ms) const {
+        if (!latest_ground_target_) {
+            return false;
+        }
+        const auto& target = *latest_ground_target_;
+        // 控制任务下非本分配 target_id 的 65010 直接忽略（GroundStationLink
+        // 仍可照常做链路 ACK，状态机不进入任务链/不更新引导）。
+        if (!TargetMatchesAssignment(target.target_id)) {
+            return false;
+        }
+        if (target.header.receive_time_ms == 0 || target.header.valid_for_ms == 0) {
+            return false;
+        }
+        return now_ms <= target.header.receive_time_ms + target.header.valid_for_ms;
+    }
+
+    /// 执行状态转移并立即发布状态。所有转移统一经过此函数，便于计数和日志审计。
+    void TransitionTo(common::MissionState next_state, const char* reason) {
+        const uint64_t now_ms = MonotonicMs();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (state_ == next_state) {
+                return;
+            }
+            SPDLOG_INFO("任务状态转移: {} -> {} reason={}", MissionStateName(state_),
+                        MissionStateName(next_state), reason);
+            state_ = next_state;
+            state_entered_ms_ = now_ms;
+            ++transition_count_;
+            // 拦截后返航/降落段入口状态初始化（S11~S14，2026-10-19）。
+            if (next_state == common::MissionState::kReturnHome) {
+                return_climb_phase_ = true;
+                return_px4_takeover_ = false;
+                return_home_wait_logged_ = false;
+                return_best_distance_m_ = std::numeric_limits<double>::max();
+                return_progress_ms_ = 0;
+                return_stall_warned_ms_ = 0;
+                return_diag_last_ms_ = 0;
+                return_altitude_clamped_ = false;
+                arrival_stable_since_ms_ = 0;
+                // 返航速度剖面复位（2026-11-12）：本轮返航从当前实测地速
+                // 重新起步（可能是 0=目标未动，也可能高于巡航=追不上转返航）。
+                control::ResetReturnSpeedState(return_speed_state_);
+                return_speed_last_ms_ = 0;
+                return_speed_phase_ = control::ReturnSpeedPhase::kIdle;
+                SPDLOG_INFO("返航开始: 水平目标={}（起飞原点优先，Home 经纬度仅兜底），"
+                            "高度基准=EKF 差分，返航高度 {:.1f}m，到达半径 {:.1f}m，"
+                            "不设总时长上限",
+                            return_origin_valid_ ? "起飞原点" : "Home 经纬度",
+                            ReturnAltitudeM(), return_home_.arrival_radius_m);
+            } else if (next_state == common::MissionState::kLanding) {
+                landing_command_sent_ = false;
+                landing_command_ms_ = 0;
+                landing_takeover_ = return_px4_takeover_;
+                landing_command_unavailable_logged_ = false;
+                landing_command_fail_count_ = 0;
+                disarm_command_sent_ = false;
+                disarm_command_ms_ = 0;
+                disarm_command_fail_count_ = 0;
+                SPDLOG_INFO("降落阶段: {}",
+                            landing_takeover_
+                                ? "PX4 已接管，停止发设定值并等待 landed/disarmed"
+                                : "发 AUTO.LAND（4/6）");
+            } else if (next_state == common::MissionState::kDisarmed) {
+                mission_end_logged_ = false;
+                // 任务结束（Task 8）：分配进入 terminal，本次上电不再分配。
+                assignment_tracker_.Terminal();
+            } else if (next_state == common::MissionState::kFailsafe) {
+                // 故障终态同样不再分配（S16）。
+                assignment_tracker_.Terminal();
+            }
+            // 自动起飞时序入口（Task 5）：S3 记录 bootstrap/mode/arm 基准与
+            // ACK 基线；S4 初始化逐拍爬升目标。中止迁移由统一挂点保证
+            // 下一拍不再发布起飞意图。
+            if (next_state == common::MissionState::kArming) {
+                BeginArmingSequence(now_ms);
+            } else if (next_state == common::MissionState::kTakeoff) {
+                BeginClimbSequence(now_ms);
+            } else if (next_state == common::MissionState::kGpsApproach) {
+                // S5 目标等待计时从进入任务高度起算（仅控制任务）。
+                BeginTargetWatchdog(now_ms);
+                // 到点/未识别计时同拍复位：换一段接近必须重新累计。
+                handover_wait_tracker_.Reset();
+            } else if (next_state == common::MissionState::kVisualHandover) {
+                // S6 冻结段保持交接时刻最后一条 S5 意图（见 FreezeHandoverTarget）。
+            }
+        }
+        PublishStatus(now_ms);
+    }
+
+    /// 更新当前告警位。状态发布线程读取同一份告警快照。
+    void SetWarnings(uint32_t warnings) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        active_warning_bits_ = warnings;
+    }
+
+    /// 发布任务状态回传。影子阶段control_source固定为0，表示未取得真实控制权。
+    // 发布不可变任务状态快照；影子阶段固定 control_source=0 且禁止拦截授权。
+    void PublishStatus(uint64_t now_ms) {
+        common::MissionStatus status;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            status.header.sequence = ++status_sequence_;
+            status.state = state_;
+            status.state_entered_ms = state_entered_ms_;
+            status.task_phase = TaskPhase(state_);
+            status.active_warning_bits = active_warning_bits_;
+            // 65013 v2（2026-10-22）：分配编号/目标/功能类别与可用状态。
+            // 无分配时 id 为 0；影子模式 availability 固定 unavailable。
+            status.assignment_id = assignment_tracker_.AssignmentId();
+            status.target_id = assignment_tracker_.TargetId();
+            status.interceptor_type = assignment_tracker_.InterceptorType();
+            status.availability = ComputeAvailabilityLocked();
+        }
+        // 65013 v3（2026-10-29）：围栏区域与状态。影子/未启用时为 0/no_zone。
+        status.zone_id = fence_zone_.has_value() ? fence_zone_->zone_id : 0U;
+        status.zone_version = fence_zone_.has_value() ? fence_zone_->version : 0U;
+        status.fence_state =
+            static_cast<uint8_t>(fence_.enabled ? fence_state_
+                                                : common::FenceState::kNoZone);
+        status.header.source_time_ms = now_ms;
+        status.header.receive_time_ms = now_ms;
+        status.header.valid_for_ms = kStatusValidForMs;
+        status.header.source_id = 1;
+        status.header.health = 1;
+        status.control_source = 0;
+        status.interception_authorized = false;
+        (void)status_output_.Publish(std::make_shared<const common::MissionStatus>(status));
+        last_status_publish_ms_ = now_ms;
+        PublishFenceStatus(now_ms);
+    }
+
+    /// 发布围栏状态（65019）：按 fence.status_period 周期，地面站据此绘制区域
+    /// 与越界告警（区域本身由地面站下发，机载只回报判定结果）。
+    void PublishFenceStatus(uint64_t now_ms) {
+        const uint64_t period_ms =
+            static_cast<uint64_t>(fence_.status_period.count());
+        if (period_ms == 0U ||
+            (last_fence_status_publish_ms_ != 0U &&
+             now_ms - last_fence_status_publish_ms_ < period_ms)) {
+            return;
+        }
+        common::FenceStatus status;
+        status.header.sequence = ++fence_status_sequence_;
+        status.header.source_time_ms = now_ms;
+        status.header.receive_time_ms = now_ms;
+        status.header.valid_for_ms = kStatusValidForMs;
+        status.header.source_id = 1;
+        status.header.health = 1;
+        status.zone_id = fence_zone_.has_value() ? fence_zone_->zone_id : 0U;
+        status.version = fence_zone_.has_value() ? fence_zone_->version : 0U;
+        // 状态始终上报真实判定结果（enabled=false 时动作被门控，但几何状态仍要可见：
+        // 否则地面站只能看到 no_zone，无法判断区域是否装载、形状是否合理）。
+        status.state = fence_state_;
+        status.distance_to_boundary_m = fence_distance_m_;
+        status.violation_duration_ms = fence_violation_ms_;
+        status.action_pending = fence_hold_active_ || fence_abort_latched_ ||
+                                target_outside_hold_active_;
+        if (latest_flight_.has_value() && latest_flight_->local_position_valid) {
+            status.local_north_m = latest_flight_->local_x_m;
+            status.local_east_m = latest_flight_->local_y_m;
+            status.local_down_m = latest_flight_->local_z_m;
+        }
+        (void)fence_status_output_.Publish(
+            std::make_shared<const common::FenceStatus>(status));
+        last_fence_status_publish_ms_ = now_ms;
+    }
+
+    /// 记录状态机错误并按节流规则打印，避免启动失败或运行期错误刷屏。
+    void RecordError(const std::string& message) {
+        uint64_t count = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            count = ++error_count_;
+        }
+        if (ShouldLogThrottled(count)) {
+            SPDLOG_ERROR("{} count={}", message, count);
+        }
+    }
+
+    common::Topic<common::GroundStationTarget>* ground_target_topic_ = nullptr;
+    common::Topic<common::FlightStateSnapshot>* flight_topic_ = nullptr;
+    common::Topic<common::HealthStatus>* health_topic_ = nullptr;
+    common::Topic<common::TargetState>* estimated_topic_ = nullptr;
+    common::Topic<common::VisualTargetStatus>* visual_status_topic_ = nullptr;
+    common::Topic<common::StereoTargetDistance>* distance_topic_ = nullptr;
+    /// 任务分配输入（65014，可选绑定；未绑定时不订阅、不处理）。
+    common::Topic<common::MissionAssignment>* assignment_topic_ = nullptr;
+    /// PX4 命令窄接口（仅 enable_control=true 装配期注入）。当前消费点：
+    /// S13 AUTO.LAND / S14 DISARM；未注入时零调用。
+    communication::IPx4CommandSender* command_sender_ = nullptr;
+    /// 通用拦截设备（随命令接口注入创建；actuator.type 工厂选择 kPulse/kHold/kNone）。
+    /// 为空=影子/未开控制，触发/复位物理缺席。
+    std::unique_ptr<IInterceptionDevice> intercept_device_;
+    /// 估计器诊断接口（只读；交接创新门限的数据来源，Start 前注入）。
+    const perception::ITargetEstimator* estimator_diagnostics_ = nullptr;
+
+    common::Topic<common::GroundStationTarget>::Subscription ground_target_subscription_;
+    common::Topic<common::FlightStateSnapshot>::Subscription flight_subscription_;
+    common::Topic<common::HealthStatus>::Subscription health_subscription_;
+    common::Topic<common::TargetState>::Subscription estimated_subscription_;
+    common::Topic<common::VisualTargetStatus>::Subscription visual_status_subscription_;
+    common::Topic<common::StereoTargetDistance>::Subscription distance_subscription_;
+    common::Topic<common::MissionAssignment>::Subscription assignment_subscription_;
+    /// 围栏区域输入（65018，可选绑定；未绑定时只用本地缓存）。
+    common::Topic<common::FenceZone>* fence_topic_ = nullptr;
+    common::Topic<common::FenceZone>::Subscription fence_subscription_;
+    /// 任务指令输入（65020，可选绑定；未绑定时不处理任务指令）。
+    common::Topic<common::MissionCommand>* mission_command_topic_ = nullptr;
+    common::Topic<common::MissionCommand>::Subscription mission_command_subscription_;
+    /// 最新一条 65020（DrainInputs 写入，EvaluateMissionCommand 处理后清空）。
+    std::optional<common::MissionCommand> latest_mission_command_;
+    /// 最近处理过的指令编号（去重：同 id 重发只回执不重复执行）。
+    uint32_t last_mission_command_id_ = 0;
+    /// 65021 回执输出。
+    common::Topic<common::MissionCommandAck> mission_command_ack_output_;
+
+    std::optional<common::GroundStationTarget> latest_ground_target_;
+    std::optional<common::FlightStateSnapshot> latest_flight_;
+    std::optional<common::HealthStatus> latest_health_;
+    std::optional<common::TargetState> latest_estimated_;
+    std::optional<common::VisualTargetStatus> latest_visual_status_;
+    std::optional<common::StereoTargetDistance> latest_distance_;
+    /// 最新一条 65014（DrainInputs 写入，EvaluateAssignmentEntry 处理后清空）。
+    std::optional<common::MissionAssignment> latest_assignment_;
+    /// 已接受的分配副本（Task 5）：S3/S4 中止时 latest_assignment_ 已清空，
+    /// 65015 aborted 必须用这份 id/target。下一次接受时覆盖。
+    std::optional<common::MissionAssignment> accepted_assignment_;
+    // ---- 多边形围栏（2026-10-29）----
+    /// 配置（fence 节同源注入）。
+    const config::FenceConfig fence_;
+    /// 最新区域（决策线程独占；几何快照另见 fence_polygon_）。
+    std::optional<common::FenceZone> fence_zone_;
+    /// 区域→NED 多边形快照（控制线程只读，fence_mutex_ 保护）。
+    mutable std::mutex fence_mutex_;
+    common::FencePolygonNed fence_polygon_;
+    bool fence_dirty_ = true;              ///< 区域/锚点变化后需重建多边形
+    std::optional<uint64_t> fence_violation_since_ms_;  ///< 越界持续起点
+    bool fence_abort_latched_ = false;     ///< 越界中止已执行（一次任务一次）
+    bool fence_hold_active_ = false;       ///< 本拍按"保持"动作接管位置意图
+    /// 围栏高度带迟滞（米）：进入越界按带边界判定，已越界后要回到带内该距离
+    /// 才算恢复，避免高度贴边抖动导致越界/恢复反复切换。
+    static constexpr double kFenceAltitudeHysteresisM = 1.5;
+    /// 上一拍高度带是否正常（迟滞状态；基准不可用时置 true = 只判水平）。
+    bool fence_altitude_ok_ = true;
+    common::FenceState fence_state_ = common::FenceState::kNoZone;
+    double fence_distance_m_ = 0.0;        ///< 距边界带符号距离（内正外负）
+    uint32_t fence_violation_ms_ = 0;      ///< 越界已持续时长（65019）
+    uint64_t fence_invalid_count_ = 0;     ///< 非法区域帧累计（节流日志用）
+    uint64_t mission_command_ack_count_ = 0;  ///< 65021 回执累计（节流日志用）
+    // 返航航向（S12 机头朝飞行方向）：二阶限幅状态。
+    double return_heading_cmd_deg_ = 0.0;
+    double return_heading_rate_dps_ = 0.0;
+    uint64_t return_heading_last_ms_ = 0;
+    // 返航速度剖面（2026-11-12）：分段恒定加速度，覆盖起步加速/超速减速/末端制动。
+    control::ReturnSpeedState return_speed_state_;
+    uint64_t return_speed_last_ms_ = 0;
+    control::ReturnSpeedPhase return_speed_phase_ = control::ReturnSpeedPhase::kIdle;
+    /// 围栏越界判定的"深层越界"状态（2026-11-12，violation_depth_m 容差）：
+    /// true 表示当前已判定越界（超过深度容差），回界需越过滞回才清除。
+    bool fence_depth_violated_ = false;
+    /// 贴边保持（2026-11-12）：目标跑出区域后，S5/S6 引导点被围栏挡住时，
+    /// 改为"贴边保持 + 告警"，不中止任务；目标回到区域内足够远才解除。
+    bool guide_edge_hold_ = false;
+    uint64_t guide_edge_hold_count_ = 0;  ///< 进入贴边保持的累计次数（节流日志）
+    /// 目标出区保持（2026-11-13）：目标 NED 在围栏外时立即位置保持。
+    bool target_outside_hold_active_ = false;
+    bool target_outside_hold_point_valid_ = false;
+    common::Vec2Ned target_outside_hold_point_{};
+    float target_outside_hold_z_m_ = 0.f;
+    uint64_t target_outside_release_since_ms_ = 0;
+    /// 本拍围栏停止点预测是否已介入（S5/S6/S7 任一路径置位；bit8）。
+    bool fence_predicted_breach_ = false;
+    uint64_t fence_predict_count_ = 0;  ///< 预测限速日志节流计数
+
+    std::atomic<bool> running_{false};
+    std::thread worker_;
+    mutable std::mutex state_mutex_;
+    common::MissionState state_ = common::MissionState::kBoot;
+    uint64_t state_entered_ms_ = 0;
+    uint64_t transition_count_ = 0;
+    uint64_t error_count_ = 0;
+    uint64_t status_sequence_ = 0;
+    uint64_t last_status_publish_ms_ = 0;
+    uint32_t active_warning_bits_ = 0;
+    /// 到点判定与"到点后视觉未识别"计时（2026-11-05）。纯逻辑，每拍推进；
+    /// 离开 S5 / 目标失效 / 任务中止时 Reset()。
+    HandoverWaitTracker handover_wait_tracker_;
+    /// 告警日志节流：只在首次越过 visual_wait_warn_ms 时打一次。
+    bool handover_wait_warn_logged_ = false;
+    /// 本拍下发的局部 NED 引导点（2026-11-05，围栏钳制提示）。由
+    /// PublishPositionIntent 每拍刷新；非局部 NED 或坐标非有限时置无效。
+    common::Vec2Ned guide_point_{};
+    bool guide_point_valid_ = false;
+    /// 上一拍是否已判定"引导点越界"——用于只在跃变时打一次日志。
+    bool guide_outside_fence_ = false;
+    uint64_t target_receive_count_ = 0;
+    uint64_t target_stale_count_ = 0;
+    uint64_t assignment_receive_count_ = 0;
+    uint64_t assignment_reject_count_ = 0;
+    uint64_t assignment_duplicate_count_ = 0;
+    uint64_t assignment_ack_sequence_ = 0;
+
+    /// 控制意图有效期（构造注入，与 controller.intent_timeout 对齐）。
+    const uint64_t intent_valid_for_ms_;
+    /// 交接判据配置与阈值（构造注入，全部来自 config.json handover/visual_tracking 节）。
+    const config::HandoverConfig handover_;
+    const uint64_t handover_timeout_ms_;
+    const int64_t visual_stale_ms_;
+    const int64_t distance_stale_ms_;
+    /// 视觉跟踪控制律配置拷贝与主控律（Task 9；仅决策线程访问，遵循控制律
+    /// 单线程约定。控制律内部超龄阈值取 tracking.control.*，生产与状态机侧
+    /// visual_stale/distance_stale 同源注入）。
+    const control::TrackingConfig tracking_config_;
+    std::unique_ptr<control::IVisualControlLaw> visual_law_;
+    /// 标定内参换算器与视场半角（构造期固化；热路径零分配）。
+    control::PixelToAngle azimuth_converter_;
+    control::PixelToAngle elevation_converter_;
+    double fow_half_azimuth_deg_ = 0.0;
+    double fow_half_elevation_deg_ = 0.0;
+    /// 交接层独立迟滞计数（仅决策线程访问；与 VisualTargetMonitor 内部
+    /// acquire_lock_frames 判据是两套口径，不得混用）。
+    uint64_t consecutive_lock_frames_ = 0;
+    uint64_t consecutive_lost_frames_ = 0;
+    std::optional<uint64_t> last_counted_locked_frame_;  ///< 去重：最近计数的锁定帧序号
+    uint64_t s6_lock_baseline_ = 0;  ///< S6 进入时的锁定计数（S6→S7 需再推进）
+    uint64_t s6_entered_ms_ = 0;     ///< S6 进入时刻（驻留超时基准）
+    uint64_t s7_entered_ms_ = 0;     ///< S7 进入时刻（伺服未启动超时基准）
+    /// S7 测距失效计时起始时刻（nullopt=测距未失效；恢复有效即清零）
+    std::optional<uint64_t> distance_lost_since_ms_;
+    bool estimation_inputs_active_ = false;  ///< 估计/视觉/测距输入组已成功订阅
+    /// 位置类意图来源（Task 9 起含 S6 冻结续发与 S7 首拍过渡续发；
+    /// 2026-10-22 增 kHold：S5 目标失效时的原地保持）：
+    /// kNone=未发布，kEstimate=S5 估计引导，kFrozen=S6/S7 冻结续发，
+    /// kHold=S5 目标失效保持（目标=PX4 当前局部位置，原因码 9）。
+    enum class PositionIntentSource {
+        kNone,
+        kEstimate,
+        kFrozen,
+        kHold,
+        kTargetOutsideHold,  ///< 目标出区保持（bit5 不置位，与目标失效保持区分）
+    };
+    PositionIntentSource position_intent_source_ = PositionIntentSource::kNone;
+    /// S5 接近速度律启动日志一次性标记（每进程只打一次，避免热路径刷屏）。
+    bool approach_speed_law_logged_ = false;
+    /// S5 速度律输入无效/输出无效的节流计数。
+    uint64_t approach_law_skip_count_ = 0;
+    /// S5 速度律 1Hz 诊断日志计时（d/v_ref/max_speed/phase/自机状态）。
+    uint64_t approach_diag_last_ms_ = 0;
+    /// S5→S6 冻结的最后位置目标（进入时刻的估计快照；交接段结束清空）。
+    std::optional<PositionIntentTarget> frozen_position_target_;  ///< S6/S7 冻结的 p_ref/航向
+    std::optional<PositionIntentTarget> last_s5_position_target_;  ///< 最后一条 S5 位置意图（交接冻结用）
+    /// S7 段内是否已发出首条视觉意图（冻结续发的收口条件）。
+    bool s7_servo_started_ = false;
+    /// S7 本拍是否实际发出视觉伺服意图（背离告警位 kWarningServoSuspended
+    /// 的判定依据；EvaluateVisualServoIntent 每拍置位，离开 S7 不再更新）。
+    bool servo_intent_active_ = false;
+    /// 视觉伺服降级停发计数（节流日志）与最近降级原因。
+    uint64_t servo_degraded_count_ = 0;
+    control::DegradedReason last_degraded_reason_ = control::DegradedReason::kNone;
+    /// 热备份核对（Task 9）：上次核对时刻、断粮状态与断粮计数（节流日志）。
+    uint64_t hot_backup_check_ms_ = 0;
+    bool hot_backup_starved_ = false;
+    uint64_t hot_backup_starved_count_ = 0;
+    /// 拦截设备配置（构造注入，actuator 配置节同源；装机确认前为默认值）。
+    const config::ActuatorConfig actuator_config_;
+    /// 拦截入口/授权与返航配置（构造注入；JSON interception/return_home 节）。
+    const config::InterceptionConfig interception_;
+    const config::ReturnHomeConfig return_home_;
+    /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
+    /// S3 时序/S4 爬升在 Task 5 使用）。
+    const config::TakeoffConfig takeoff_;
+    /// 接近段相位策略（approach 节，2026-11-02）：S5/S6 速率上限、预测提前量。
+    const config::ApproachConfig approach_;
+    /// S5 接近段速度律（approach.speed_law 节，2026-11-11）：打开后由本律
+    /// 产出 (p_ref, v_ref)，关闭时保留旧的位置引导点 + 固定提前行为。
+    control::ApproachSpeedLaw approach_law_;
+    /// 本机拦截功能类别（ground_station.aircraft_component_id 同源）。
+    const uint8_t expected_interceptor_type_;
+    /// 任务分配生命周期助手（一次上电一次任务、重复 id 回执、原点记录）。
+    /// 只由决策线程访问；状态发布读取时受 state_mutex_ 保护。
+    MissionAssignmentTracker assignment_tracker_;
+    /// 自动起飞（S3/S4）时序阶段。只由决策线程推进；仅在 S3/S4 状态内有效。
+    enum class TakeoffStage : uint8_t {
+        kNone,          ///< 未在起飞时序中
+        kOriginHold,    ///< S3：发布原点保持意图，等待 bootstrap_lead 后发 176
+        kWaitOffboard,  ///< S3：已发 176，等待实际 6/0
+        kWaitArmed,     ///< S3：已发 400，等待实际 armed
+        kClimb,         ///< S4：逐拍爬升到任务高度
+    };
+    TakeoffStage takeoff_stage_ = TakeoffStage::kNone;
+    uint64_t takeoff_stage_ms_ = 0;        ///< 当前阶段起点（mode/arm 超时基准）
+    uint64_t takeoff_last_tick_ms_ = 0;    ///< S4 爬升 dt 基准
+    uint64_t takeoff_stable_since_ms_ = 0; ///< S4 到达判据连续成立起点
+    float takeoff_z_cmd_ = 0.f;            ///< S4 逐拍推进的 z 目标（局部 NED）
+    bool takeoff_disarm_sent_ = false;     ///< 地面中止 DISARM 已尝试（仅一次）
+    /// 本次任务的起飞原点（局部 NED，S3 接受分配时记录，2026-11-04）。
+    /// 返航水平目标优先用它：PX4 Home 的经纬度会随 GPS 漂移（现场 5~16 m），
+    /// 用 Home 经纬度换算会让返航点偏离真实起飞点（表现为“飞过起飞点再拐弯、
+    /// 落到坡上”）。`ReturnHorizontalTarget()` 在无原点（人工返航未走分配）时
+    /// 退回 Home 换算。
+    bool return_origin_valid_ = false;
+    float return_origin_x_ = 0.f;
+    float return_origin_y_ = 0.f;
+    float return_origin_z_ = 0.f;
+    uint64_t takeoff_ack_baseline_matched_ = 0;  ///< S3 入口 ACK 匹配计数基线
+    /// 起飞中止后 PX4 状态不确定（断连/离地状态不明）：per-boot 锁存，
+    /// availability=unavailable 且新分配回 not_ready，直到 Start() 复位。
+    bool takeoff_unavailable_latched_ = false;
+    /// 飞行中电池中止锁存（Task 8）：一次任务只中止/回 65015 一次；
+    /// 接受新分配或 Start() 时复位。
+    bool battery_abort_latched_ = false;
+    /// 低电防抖起点（nullopt=当前不低电/不在守卫生效阶段）。
+    std::optional<uint64_t> battery_low_since_ms_;
+    /// 目标看门狗（Task 10）：一次任务只中止一次；Accept/Start 复位。
+    bool mission_abort_latched_ = false;
+    uint64_t target_wait_started_ms_ = 0;  ///< S5 入口时刻（等待目标基准）
+    bool assigned_target_acquired_ = false;  ///< 本次 S5 是否已获得匹配目标
+    std::optional<uint64_t> target_lost_since_ms_;  ///< 目标持续失效起点
+    /// 目标保持（2026-10-22）：S5 目标失效时以 PX4 当前局部位置续流，
+    /// 避免 PX4 在 10s 看门狗前按 Offboard 丢失兜底（→ Position → RTL）接管。
+    std::optional<uint64_t> target_hold_started_ms_;  ///< 本次保持起点（诊断）
+    uint64_t target_hold_accumulated_ms_ = 0;  ///< 本次 S5 累计保持时长
+    uint64_t target_hold_count_ = 0;           ///< 本次 S5 保持进入次数
+    uint32_t fresh_estimate_streak_ = 0;       ///< 连续新鲜估计拍数（恢复迟滞）
+    uint64_t last_evaluate_ms_ = 0;            ///< 上一决策拍（累计计时）
+    bool hold_logged_ = false;                 ///< 本次保持已打印（进入日志一次）
+    /// 最近一次执行的取消动作时刻（500ms 内不重复下发命令）。
+    std::optional<uint64_t> last_cancel_action_ms_;
+    /// 测试钩子开关（构造注入，默认 false）：门控 ForceStateForTest。
+    const bool test_hooks_enabled_;
+    /// 任务故障（S16 FAILSAFE）：拦截设备 ACK 超时/非 ACCEPTED/PX4 断连/
+    /// 入队超时。置位后本拍只维护告警与状态发布，停发一切控制意图；
+    /// 故障为终态（需人工/维护处置），Start() 复位。
+    bool mission_faulted_ = false;
+    // ---- 拦截后返航（S11~S14，2026-10-19）----
+    bool interception_fired_ = false;       ///< 单发触发命令已入队（S10→S11 依据）
+    bool return_climb_phase_ = true;        ///< S12：先爬升到 5m（若不足）
+    bool return_px4_takeover_ = false;      ///< S12 中 PX4 离开 Offboard（停止争控）
+    bool return_home_wait_logged_ = false;  ///< Home/锚点无效告警已打印
+    /// 返航停滞诊断（2026-11-04）：只告警不中止。
+    /// 总时长超时已删除——用"从进 S12 起的绝对时长"猜"飞不飞得到"必然误判
+    /// （现场 128m/1.5m/s 需 85s，给了 60s 就原地悬停）。改为看"有没有靠近"：
+    /// 到返航目标的距离连续 `return_home_.timeout` 没有缩短 kReturnStallProgressM
+    /// 以上就 WARN 一次（提示风/围栏钳制/遥控接管），返航继续。
+    static constexpr double kReturnStallProgressM = 0.3;
+    /// 返航高度相对区域上限的安全余量（m）。
+    static constexpr double kReturnAltitudeMarginM = 0.5;
+    double return_best_distance_m_ = std::numeric_limits<double>::max();
+    uint64_t return_progress_ms_ = 0;       ///< 最近一次"靠近"的时刻
+    uint64_t return_stall_warned_ms_ = 0;   ///< 最近一次停滞告警时刻（节流）
+    /// S12 返航速度摘要 1Hz 节流（2026-11-11）：返航段此前没有周期日志，
+    /// 只能靠"进入 S12 / 到达"两个时刻反推平均速度，无法核对配置上限与实际地速。
+    uint64_t return_diag_last_ms_ = 0;
+    bool return_altitude_clamped_ = false;  ///< 返航高度被区域上限压低的告警已打印
+    uint64_t arrival_stable_since_ms_ = 0;  ///< 到达判据连续成立起点
+    bool landing_command_sent_ = false;     ///< AUTO.LAND 曾成功入队
+    uint64_t landing_command_ms_ = 0;       ///< 最近一次 AUTO.LAND 入队尝试时刻
+    bool landing_takeover_ = false;         ///< S13 由 PX4 接管（不再发 AUTO.LAND）
+    bool landing_command_unavailable_logged_ = false;  ///< 命令接口未注入只报一次
+    uint64_t landing_command_fail_count_ = 0;          ///< AUTO.LAND 入队失败计数
+    bool disarm_command_sent_ = false;      ///< DISARM 曾成功入队
+    uint64_t disarm_command_ms_ = 0;        ///< 最近一次 DISARM 入队尝试时刻
+    uint64_t disarm_command_fail_count_ = 0;///< DISARM 入队失败计数
+    bool mission_end_logged_ = false;       ///< S14 结束日志只打一次
+    uint64_t intent_sequence_ = 0;
+    uint64_t last_intent_publish_ms_ = 0;
+    uint64_t intent_stale_count_ = 0;
+    // ---- 引导点一阶低通（approach.guide_lowpass_ms，2026-11-02）----
+    // 旧位置引导点低通状态已随 ApplyApproachPolicy 删除（2026-11-11）。
+    std::optional<common::TargetState> last_intent_target_;  ///< 上次发布意图对应的目标内容
+
+    common::Topic<common::ControlIntent> intent_output_;
+    common::Topic<common::MissionStatus> status_output_;
+    common::Topic<common::MissionAssignmentAck> assignment_ack_output_;
+    common::Topic<common::FenceStatus> fence_status_output_;
+    common::Topic<common::FenceZone> fence_zone_report_output_;
+    uint64_t fence_report_last_ms_ = 0;
+    bool fence_report_pending_ = false;
+    uint64_t fence_status_sequence_ = 0;
+    uint64_t last_fence_status_publish_ms_ = 0;
+};
+
+MissionStateMachine::MissionStateMachine(MissionStateMachineConfig config)
+    : impl_(std::make_unique<Impl>(config)) {}
+MissionStateMachine::~MissionStateMachine() = default;
+bool MissionStateMachine::Start() { return impl_->Start(); }
+void MissionStateMachine::Stop() { impl_->Stop(); }
+bool MissionStateMachine::IsRunning() const { return impl_->IsRunning(); }
+void MissionStateMachine::SetInputs(common::Topic<common::GroundStationTarget>& ground_target,
+                                    common::Topic<common::FlightStateSnapshot>& flight,
+                                    common::Topic<common::HealthStatus>& health) {
+    impl_->SetInputs(ground_target, flight, health);
+}
+void MissionStateMachine::SetEstimationInputs(
+    common::Topic<common::TargetState>& estimated,
+    common::Topic<common::VisualTargetStatus>& visual_status,
+    common::Topic<common::StereoTargetDistance>& distance) {
+    impl_->SetEstimationInputs(estimated, visual_status, distance);
+}
+void MissionStateMachine::SetCommandSender(communication::IPx4CommandSender* sender) {
+    impl_->SetCommandSender(sender);
+}
+void MissionStateMachine::SetAssignmentInput(
+    common::Topic<common::MissionAssignment>& assignment) {
+    impl_->SetAssignmentInput(assignment);
+}
+void MissionStateMachine::SetEstimationDiagnostics(
+    const perception::ITargetEstimator* estimator) {
+    impl_->SetEstimationDiagnostics(estimator);
+}
+void MissionStateMachine::SetFenceInput(common::Topic<common::FenceZone>& zone) {
+    impl_->SetFenceInput(zone);
+}
+void MissionStateMachine::SetMissionCommandInput(
+    common::Topic<common::MissionCommand>& command) {
+    impl_->SetMissionCommandInput(command);
+}
+common::FencePolygonNed MissionStateMachine::LatestFencePolygon() const {
+    return impl_->LatestFencePolygon();
+}
+common::Topic<common::ControlIntent>& MissionStateMachine::IntentOutput() {
+    return impl_->IntentOutput();
+}
+common::Topic<common::MissionStatus>& MissionStateMachine::StatusOutput() {
+    return impl_->StatusOutput();
+}
+common::Topic<common::MissionAssignmentAck>&
+MissionStateMachine::AssignmentAckOutput() {
+    return impl_->AssignmentAckOutput();
+}
+common::Topic<common::FenceZone>& MissionStateMachine::FenceZoneReportOutput() {
+    return impl_->FenceZoneReportOutput();
+}
+
+common::Topic<common::FenceStatus>& MissionStateMachine::FenceStatusOutput() {
+    return impl_->FenceStatusOutput();
+}
+common::Topic<common::MissionCommandAck>&
+MissionStateMachine::MissionCommandAckOutput() {
+    return impl_->MissionCommandAckOutput();
+}
+common::MissionState MissionStateMachine::CurrentState() const {
+    return impl_->CurrentState();
+}
+uint64_t MissionStateMachine::TransitionCount() const {
+    return impl_->TransitionCount();
+}
+uint64_t MissionStateMachine::ErrorCount() const { return impl_->ErrorCount(); }
+void MissionStateMachine::ForceStateForTest(common::MissionState state) {
+    impl_->ForceStateForTest(state);
+}
+void MissionStateMachine::SeedAcceptedAssignmentForTest(
+    const common::MissionAssignment& assignment) {
+    impl_->SeedAcceptedAssignmentForTest(assignment);
+}
 
 MissionStateMachineStub::MissionStateMachineStub() {
     SPDLOG_INFO("任务状态机部件骨架创建");
@@ -37,10 +5592,43 @@ bool MissionStateMachineStub::IsRunning() const {
     return running_;
 }
 
-void MissionStateMachineStub::SetInputs(common::Topic<common::TargetState>& /*target*/,
-                                        common::Topic<common::FlightStateSnapshot>& /*flight*/,
-                                        common::Topic<common::HealthStatus>& /*health*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动决策周期
+void MissionStateMachineStub::SetInputs(
+    common::Topic<common::GroundStationTarget>& /*ground_target*/,
+    common::Topic<common::FlightStateSnapshot>& /*flight*/,
+    common::Topic<common::HealthStatus>& /*health*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetEstimationInputs(
+    common::Topic<common::TargetState>& /*estimated*/,
+    common::Topic<common::VisualTargetStatus>& /*visual_status*/,
+    common::Topic<common::StereoTargetDistance>& /*distance*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetCommandSender(
+    communication::IPx4CommandSender* /*sender*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetAssignmentInput(
+    common::Topic<common::MissionAssignment>& /*assignment*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetEstimationDiagnostics(
+    const perception::ITargetEstimator* /*estimator*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetFenceInput(
+    common::Topic<common::FenceZone>& /*zone*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
+}
+
+void MissionStateMachineStub::SetMissionCommandInput(
+    common::Topic<common::MissionCommand>& /*command*/) {
+    // 骨架实现仅保留接口兼容性；正式逻辑见 MissionStateMachine。
 }
 
 common::Topic<common::ControlIntent>& MissionStateMachineStub::IntentOutput() {
@@ -49,6 +5637,26 @@ common::Topic<common::ControlIntent>& MissionStateMachineStub::IntentOutput() {
 
 common::Topic<common::MissionStatus>& MissionStateMachineStub::StatusOutput() {
     return status_output_;
+}
+
+common::Topic<common::MissionAssignmentAck>&
+MissionStateMachineStub::AssignmentAckOutput() {
+    return assignment_ack_output_;
+}
+
+common::Topic<common::FenceStatus>&
+MissionStateMachineStub::FenceStatusOutput() {
+    return fence_status_output_;
+}
+
+common::Topic<common::FenceZone>&
+MissionStateMachineStub::FenceZoneReportOutput() {
+    return fence_zone_report_output_;
+}
+
+common::Topic<common::MissionCommandAck>&
+MissionStateMachineStub::MissionCommandAckOutput() {
+    return mission_command_ack_output_;
 }
 
 common::MissionState MissionStateMachineStub::CurrentState() const {

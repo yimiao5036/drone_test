@@ -41,9 +41,21 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 - 消费线程与编码后端同一线程串行推进（单消费者订阅句柄，无需锁），与解码器/合成线程解耦。
 
 ### 编码链路（FFmpeg，PIMPL 隔离）
-1. `Start`：`PickEncoderName` 按 `codec=h264/h265` 与 `prefer_hardware` 选择
-   `h264_rkmpp/hevc_rkmpp`（香橙派）或 `libx264/libx265`（软解回退）；打开编码器，
-   `AV_CODEC_FLAG_GLOBAL_HEADER` 使 SPS/PPS 进 `extradata`。
+1. `Start`：`OpenEncoderWithFallback` 按 `codec=h264/h265` 与 `prefer_hardware` 组候选列表：
+   `h264_rkmpp/hevc_rkmpp` 存在则先试硬编（香橙派），失败或不存在回退
+   `libx264/libx265`（软编，开发机正常路径）。单个候选由 `TryOpenEncoder(name, is_rkmpp)`
+   打开，幂等自清场（重试前释放半成品上下文）；日志对齐解码器模式——无 rkmpp 打 INFO
+   属正常，rkmpp 存在但打开失败打 WARN。`AV_CODEC_FLAG_GLOBAL_HEADER` 使 SPS/PPS 进
+   `extradata`。
+   - **rkmpp 码率控制**（仅硬编分支；内部常量不进 config.json）：
+
+     | 项 | 值 | 说明 |
+     |------|-----|------|
+     | `rc_mode`（AVDictionary 私有选项） | `VBR` | 动态码率模式 |
+     | `AVCodecContext::rc_max_rate`（字段直设） | `config.bitrate` | VBR 峰值码率上限（bps）。**勿走 dict**：同名键在 ffmpeg-rockchip 8.1 的 h264_rkmpp 上不被识别（2026-09-23 板上 WARN 实证） |
+
+     open 后检查 dict 残留：未被编码器识别的选项打 WARN（启动期护栏，FFmpeg 版本/拼写
+     漂移立即可见——上述 rc_max_rate 问题就是它抓到的）。libx264/265 路径不开选项（行为与旧版一致）。
 2. 输出格式：
    - **RTSP**：`avformat_alloc_output_context2(nullptr, "rtsp", url)`，
      `avformat_write_header` 内部建立网络会话；`rtsp_transport=tcp/udp`。
@@ -53,7 +65,13 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 3. 帧输入：NV12 帧按行拷入 `nv12_in_`（Y 平面 `hor_stride`，UV 平面偏移
    `hor_stride*height`，每行 `w` 字节）。
    - **硬编（rkmpp）**：rkmpp 编码器直接收 NV12 软件帧（内部自行导入 MPP 缓冲），直接送。
-   - **软编（libx264/265）**：需 YUV420P，`sws_scale` NV12→YUV420P 到 `pic_out_` 再送编码器。
+     **hwupload 预案（未实现，触发条件）**：若 ffmpeg-rockchip 某版本拒收 CPU NV12 帧
+     （送帧报格式不支持/段错误），需在解码侧保留 DMA-BUF 并 hwupload 到 rkmpp 帧队列
+     再送编码；骨架设计见 `docs/superpowers/plans/2026-09-22-ffmpeg-rockchip硬解硬编.md`，
+     触发前不预先实现。
+   - **软编（libx264/265）**：需 YUV420P，`sws_scale` NV12→YUV420P 到 `pic_out_` 再送编码器
+     （sws 上下文用现代创建路径 `sws_alloc_context`+`av_opt`+`sws_init_context`，
+     兼容 FFmpeg 6.1/8.1，规避 libswscale 9 对旧式 `sws_getContext` 的弃用风险）。
 4. `EncodeFrame`：`avcodec_send_frame` → `DrainPackets`（`avcodec_receive_packet` →
    `WritePacket`，`av_interleaved_write_frame`）。
 5. `WritePacket`：时间戳换算；**RTSP** 关键帧前手动拼 `extradata`（提高中途接入兼容性）。
@@ -75,6 +93,21 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 依赖 `Stop` 在独立线程被调用；开发机文件路径无该问题。若实机出现"推流写包卡死"，需补
 中断回调——**留待香橙派实机验证时处理**（标记 TODO）。
 
+### 延迟统计
+
+- `InputQueueLatency()`：标注帧发布到VideoSender开始处理；
+- `FramePrepareLatency()`：NV12复制到FFmpeg输入帧，软编时含色彩转换；
+- `EncodeAndPushLatency()`：完整`EncodeFrame()`调用，含H264编码、取包和本地RTSP写入；
+- `PacketWriteLatency()`：单个`av_interleaved_write_frame()`调用；
+- `IngressToRtspLatency()`：编码访问单元进入机载进程到本地RTSP写调用完成。
+
+`collect_detailed_latency=false` 时中间统计不采集：10 输入排队/12 编码推送由
+`VideoSenderConfig::collect_detailed_latency` 控制，11 帧准备/13 写包由
+`EncoderBackendConfig::collect_detailed_latency` 控制（经 `encode` 字段自动透传给默认后端）；
+仅保留 ingress→RTSP 链 `IngressToRtspLatency()`。正式配置恒为 true，仅探针首尾模式两者同关。
+
+这些指标不包含MediaMTX之后的HM30传输、Web转码和浏览器显示。
+
 ## 日志行为
 
 - **INFO**：创建（编码格式/地址/分辨率/帧率）、启动、停止、销毁、后端就绪。
@@ -89,15 +122,20 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
   （`backend_factory`）验证线程/生命周期/发送计数/后端失败丢帧不反压/停机/重启/后端启动失败。
 - **集成测试** `tests/video_transmission/video_encoder_integration_test.cpp`：走真实
   FFmpeg 后端，开发机软编码（libx264）合成 NV12 → 编码到**本地 mpegts 文件**，验证
-  编码器可开、帧可送、文件非空、计数正确。自动清理文件。
+  编码器可开、帧可送、文件非空、计数正确。含 `prefer_hardware=true` 回退用例（开发机
+  无 rkmpp 自动回退 libx264；香橙派上同用例天然走真实硬编）。自动清理文件。
   ```bash
   cmake --build build -j$(nproc) && cd build && ctest -R "Encoder|Sender|Compositor"
   ```
 - **RTSP 推流 + rkmpp 硬编码**：需真实图传目标/香橙派（`ffmpeg-rockchip`），在
   香橙派实机用 `ffprobe -rtsp_transport tcp ...` 或地面站播放器验收。
-  **当前采用 mediamtx 中转架构**：`config.output_rtsp` 指向本机 mediamtx
-  （`rtsp://127.0.0.1:8554/drone_out`），香橙派程序推给本机 mediamtx，mediamtx 再对外
+  **当前采用 mediamtx 中转架构**：`config.video.output_rtsp` 指向本机 mediamtx。
+  为避免多机图传路径冲突，正式配置使用身份占位符
+  `rtsp://127.0.0.1:8554/drone_{aircraft_component_id}_{aircraft_system_id}`，配置解析后
+  捕网-01会变为`rtsp://127.0.0.1:8554/drone_25_1`，火箭-01会变为
+  `rtsp://127.0.0.1:8554/drone_26_1`。香橙派程序推给本机 mediamtx，mediamtx 再对外
   发布供任意图传设备拉取（见 `deploy/mediamtx.yml`、`deploy/install_mediamtx.sh`）。
+  当前捕网-01已完成HM30/Web实机复验，Web端可通过`/drone_25_1`看到视频。
   换图传设备时不动香橙派代码/配置。
 
 ## 排查 / 修改要点
@@ -105,7 +143,8 @@ kAnnotatedFrame (Topic<video::FrameHandle>, NV12)
 - **推流地址不可达**：`Start` 返回 false，`avformat_write_header` 报
   "图传 RTSP 写头失败"。
   - 若指向本机 mediamtx：确认 mediamtx 服务已启动（`systemctl status mediamtx`）、
-    8554 端口在监听、配置含 `drone_out` 且 `source: publisher`。
+    8554 端口在监听、配置含对应身份路径或`all_others: source: publisher`。当前捕网-01
+    默认路径为`drone_25_1`。
   - 若目标是远端图传设备：确认地址端口与传输协议（`transport=tcp` 不支持时回 udp）。
 - **软编不产包 / stride 报错**：确认未在软编路径误送 NV12；`pic_out_` YUV420P 转换是否生效。
 - **文件测试段错误（avio_write）**：多半是文件输出未 `avio_open`，`pb` 空。

@@ -1,123 +1,102 @@
 # drone_test
 
-运行在香橙派 RK3588 算力板上的反无人机控制系统，使用 C++17 和 CMake 实现。当前已完成视频与 YOLO 实机链路，正在进入 PX4、地面站通信和状态控制阶段。
+运行在香橙派 RK3588（ARM64 / Ubuntu）上的反无人机机载 C++17 控制系统：
+地面站目标位置 → YOLO/RKNN 识别 → 轨迹估计 → 控制 PX4 接近/视觉跟踪/拦截 → 返航降落。
 
-## 系统目标
+> **当前状态与门禁**：见 [`docs/开发进度.md`](docs/开发进度.md)
+> **文档入口与更新规范**：见 [`docs/README.md`](docs/README.md)
 
-系统接收自研地面站持续下发的目标无人机位置，通过 PX4 控制拦截无人机接近目标；摄像头稳定捕获目标后切换为视觉速度跟踪。拦截执行机构采用抽象接口，V1 不限定捕网或其他具体手段。
+## 安全基线
 
-主流程如下：
+- `config/config.json` 保持 `runtime.enable_control=false`，正式程序不向 PX4 发送飞行控制；
+- `interception.enabled=false`，生产不自动触发捕网；
+- 状态机、目标估计、视觉稳定性、双目测距均为影子运行；
+- 打开控制只允许在现场部署目录本地副本，且必须先完成 G4/G5 与 `enable_control` 前置清单。
+
+## 快速构建与测试
+
+唯一构建环境：WSL2 Ubuntu 24.04。
+
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure     # 750/750
+python3 tools/check_docs.py                    # 文档基线/链接检查
+./build/drone_control                          # 生成 logs/0001_xxx.log
+```
+
+CMake 会把 `config/` 和 `models/` 同步到构建目录。配置查找顺序：
+`--config` 参数 → 可执行文件旁 `config/config.json` → `./config/config.json`。
+
+## 文档入口
+
+先看 [`docs/README.md`](docs/README.md)。日常维护最常用的几份：
+
+- [`docs/项目总览与数据流.md`](docs/项目总览与数据流.md)：正式/影子/Stub 边界、数据流、线程
+- [`docs/模块索引.md`](docs/模块索引.md)：按类名/Topic/配置/测试定位代码
+- [`docs/故障排查手册.md`](docs/故障排查手册.md)：按现象定位
+- [`docs/新增设备接入指南.md`](docs/新增设备接入指南.md)：替换/新增硬件
+- [`docs/数据接口文档.md`](docs/数据接口文档.md)：消息字段、Topic、接口契约
+- [`docs/部署与打包.md`](docs/部署与打包.md)：香橙派部署与自检
+- [`docs/开发进度.md`](docs/开发进度.md)：当前状态、门禁、最近变更
+- [`docs/开发历史.md`](docs/开发历史.md)：历史时间线（只读）
+
+历史设计与性能记录在 [`docs/archive/`](docs/archive/README.md) 与
+[`docs/superpowers/`](docs/superpowers/)；各模块实现文档放在 `include/` 对应目录下。
+
+## 系统目标与主流程
+
+系统接收地面站持续下发的目标无人机位置，先按 GPS 位置引导接近；视觉稳定锁定后
+切换为速度/方向跟踪；满足拦截条件后触发执行机构（V1 单发、不判命中），随后返回 Home、
+降落并上锁。
 
 ```text
-地面站目标位置
-  -> GPS 位置引导
-  -> 视觉稳定锁定
-  -> 速度与方向跟踪
-  -> 拦截
-  -> 算力板控制返回 Home
+地面站目标位置 → GPS 位置引导 → 视觉稳定锁定
+  → 速度/方向跟踪 → 拦截 → 算力板控制返回 Home → AUTO.LAND → DISARM
 ```
 
 ## 已确认硬件与软件
 
 | 项目 | 当前方案 |
-|------|----------|
+|---|---|
 | 算力板 | Orange Pi，RK3588，Ubuntu |
-| 飞控 | Pixhawk 2.4.8，PX4 1.11.3 |
-| 算力板与飞控 | 串口 MAVLink |
-| 地面站 | 自研，通过电台与算力板使用 MAVLink 通信 |
-| 摄像头 | 机头正前方固定安装，RJ45/TCP，H.265，实机流 1280×720、25 FPS |
-| 视觉算法 | YOLOv26 RKNN；正式模型输出 `[1,5,8400]` 归一化框与置信度，类别名称由 JSON 配置 |
-| 测距雷达 | 机头正前方单点激光雷达，更新频率可配置 |
-| 导航信息 | PX4 融合 GPS、IMU、磁力计和气压计；算力板自身没有 GPS |
-| Home 点 | 使用 PX4 上报的 Home 点 |
-| 遥控器 | 用于测试、故障处理和人工接管 |
-| 供电 | 动力电池与算力板独立电池分开供电 |
+| 飞控 | Pixhawk 2.4.8，PX4 1.17.0 |
+| 算力板与飞控 | `/dev/ttyS1` 串口 MAVLink |
+| 地面站 | 自研，HM30 电台，`/dev/ttyS6` |
+| 摄像头 | USB 双目 SBS MJPG（UVC）；左目用于 YOLO/图传，右目用于稀疏 Census 测距（影子） |
+| 视觉算法 | YOLOv26 RKNN，生产输入 384×640 |
+| 测距 | 双目稀疏 Census v2（影子）；室外目标 <8m 可用，卷尺级精度待验收 |
+| 导航 | PX4 融合 GPS/IMU/磁力计/气压计；算力板无独立 GPS |
+| Home/锚点 | 目标估计以 EKF 锚点（`GPS_GLOBAL_ORIGIN` #49）为原点；返航使用 PX4 Home |
+| 捕网枪 | PX4 MAIN5，Output Function=`Peripheral via Actuator Set 1`；机载 `net_channel=1` |
+| 供电 | 香橙派 5V/4A 与 PX4 共用动力电池；电量统一读 PX4 电池状态 |
 
 ## V1 能力边界
 
-- 地面站持续发送目标编号、经纬度、高度、速度、航向、定位精度、时间戳和有效期。
-- 未稳定识别目标时，算力板根据目标位置向 PX4 发送位置引导指令。
-- 视觉连续稳定后，在到达上一位置控制目标且飞行状态稳定时，切换为速度和方向控制。
-- 视觉目标短暂丢失可由状态估计器预测，并结合最新地面站位置执行搜索；完整丢失策略保留为可替换策略。
-- 摄像头负责识别障碍物及其画面方位，单点激光雷达提供机头前向绝对距离，光流提供图像运动信息。
-- V1 遇到障碍物只保证减速、刹停和悬停，不承诺自主绕行；避障策略通过抽象接口提供，方便后续替换。
-- V1 拦截结束后默认返回，不自动执行第二次任务。
-- 正常返航由算力板使用 PX4 上报的 Home 点控制；算力板、程序或串口完全失效时，由 PX4 自身的失联保护执行后备 RTL。
-- 遥控器人工接管优先于算力板任务控制。
+- 地面站目标：编号、经纬度、高度、速度、航向、精度、时间戳、有效期；
+- 未稳定识别时按目标位置做 GPS 位置引导；视觉稳定后切换速度/方向控制；
+- 视觉短暂丢失可由估计器有限预测，完整丢失策略保留为可替换接口；
+- 双目深度无效时必须显式降级，不能伪造距离；
+- V1 遇障只减速/刹停/悬停，不承诺绕行（S8 暂缓）；
+- V1 单发拦截、不判命中，结束后默认返航；不自动执行第二次任务；
+- 正常返航不用 PX4 自动 RTL；算力板/程序/串口完全失效时由 PX4 自身失联保护兜底；
+- 遥控器人工接管优先。
 
-## 架构原则
+## 目录边界
 
-- 采用线程、消息队列和内存池解耦物理链路、感知和控制。
-- 图像队列有界，优先处理最新帧，不假设推理永远快于采集。
-- 所有跨线程数据携带时间戳、序号、有效期和来源健康状态。
-- PX4 通信线程是向飞控发送 MAVLink 指令的唯一出口。
-- 状态机与控制线程集中管理任务状态和控制权。
-- 避障、目标丢失、返航、拦截授权、拦截后决策和执行机构均通过接口隔离。
-- V1 实现保持简单，但不得把具体硬件、阈值或算法固化到状态机中。
-
-初始逻辑执行单元包括摄像头采集与解码、YOLO/光流感知、图传发送、PX4 通信、地面站电台通信、激光雷达读取以及状态机与控制。最终操作系统线程数量允许根据解码器和推理后端调整。
-
-## 文档
-
-- [需求分析](docs/需求分析.md)
-- [系统架构设计](docs/系统架构设计.md)
-- [状态机设计](docs/状态机设计.md)
-- [开发思路](docs/开发思路.md)
-- [通信与数据定义](docs/通信与数据定义.md)
-- [数据接口文档](docs/数据接口文档.md)
-- [感知与避障设计](docs/感知与避障设计.md)
-- [电源与失效保护设计](docs/电源与失效保护设计.md)
-- [RK3588 RTSP + YOLO 视频链路修复与优化方案](videoPart/rtsp_yolo_stream/OPTIMIZATION_PLAN.md)
-- [项目文件结构与命名规划](docs/项目文件结构.md)
-- [部署与打包](docs/部署与打包.md)
-- [开发进度](docs/开发进度.md)
-- [Topic 发布订阅使用文档](include/common/topic.md)
-
-### 模块实现文档（与代码同目录，随实现更新）
-
-- [异步文件日志](include/common/logger.md)
-- [视频帧句柄](include/video/video_frame.md)
-- [视频帧内存池](include/video/video_frame_pool.md)
-- [RTSP 接收](include/video/camera_receiver.md)
-- [视频解码](include/video/video_decoder.md)
-- [视频叠加](include/video/frame_compositor.md)
-- [图传发送与编码后端](include/video_transmission/video_sender.md)
-- [串口封装](include/communication/serial_port.md)
-
-## 当前正式工程目录
-
-```text
-drone_test/
-├── CMakeLists.txt
-├── main.cpp
-├── README.md
-├── docs/                     # 全部设计文档
-├── include/
-│   ├── common/               # logger.h, topic.h, types.h（公共消息类型与 Topic 名称常量）
-│   ├── video/                # video_frame.h, video_frame_pool.h, camera_receiver.h, video_decoder.h,
-│   │                         #   frame_compositor.h（叠加）
-│   ├── video_transmission/   # video_sender.h, video_encoder.h（编码+图传协议可替换边界）
-│   ├── perception/           # yolo_detector.h, detection_backend.h, yolo_postprocess.h,
-│   │                         #   optical_flow_estimator.h, laser_range_finder.h,
-│   │                         #   perception_fusion.h, target_estimator.h
-│   ├── communication/        # serial_port.h, px4_link.h, ground_station_link.h
-│   ├── control/              # flight_controller.h
-│   ├── state_machine/        # mission_state_machine.h
-│   ├── health/               # health_manager.h
-│   └── config/
-├── src/                      # 各模块实现（含真实实现与 Stub）
-├── tests/                    # 单元测试 + tests/skeleton/ 骨架冒烟测试
-├── config/
-├── models/                   # yolo26n-int8.rknn
-├── third_party/
-└── videoPart/                # 现有视频/RKNN验证原型，后续按模块迁移
-```
+| 目录 | 性质 |
+|---|---|
+| `src/`、`include/`、`main.cpp` | 正式工程（镜像结构，模块一一对应） |
+| `tests/` | Google Test，结构与 `src/` 对应 |
+| `config/`、`models/` | 生产配置/标定与 RKNN 模型 |
+| `tools/` | 探针、PX4 冒烟/SITL 分级测试、**SITL 验收装置 `sitl_harness.sh`**、标定、Web 地面站 |
+| `docs/` | 当前文档入口 + `archive/` + `superpowers/` 历史材料 |
+| `target_tracker/`、`visual_track_control/`、`stereo_depth/` | 独立子工程，不接入主应用 |
+| `videoPart/`、`yolo_pt/` | 历史验证原型 / 模型训练导出 |
 
 ## 构建环境
 
-- 运行目标：Ubuntu / ARM64 / RK3588（香橙派）
-- 开发/构建环境：Windows + WSL2 中的 **Ubuntu 24.04**（工具链已配置好，本项目唯一构建环境；WSL2 内的 Ubuntu 20.04 不用于本项目）
-- C++17、CMake、spdlog、Google Test、FFmpeg（dev 包：libavformat/libavcodec/libavutil/libswscale；香橙派需 ffmpeg-rockchip 版）
-- 提交前在 WSL2 Ubuntu 24.04 中执行 `cmake -S . -B build && cmake --build build` 编译通过
-
-正式工程骨架、根入口和发布订阅基础类已经创建；13 个部件接口抽象与 Stub 占位实现已完成（接口签名见 `docs/数据接口文档.md`）。当前视频正式链路已经在香橙派实机闭环：H.265 RTSP 拉流 → rkmpp 硬解 → RGA letterbox → YOLO RKNN `[1,5,8400]` 推理 → 红色动态检测框与 JSON 类别名称叠加 → h264_rkmpp 硬编 → MediaMTX RTSP TCP → HM30/QGC。实机已确认框随目标移动、历史位置不残留，开发机全工程 **79/79 测试通过**。`videoPart` 保留为硬件验证原型；下一阶段开发 PX4 串口、地面站电台、状态主题和全量控制装配，之后在 PX4 SITL、台架及受控飞行环境中分级验证。
+- 运行目标：Ubuntu / ARM64 / RK3588；
+- 开发/构建：Windows + WSL2 **Ubuntu 24.04**（唯一构建环境）；
+- C++17、CMake、spdlog、Google Test、FFmpeg（香橙派需 ffmpeg-rockchip、librknnrt、librga）；
+- 提交前在 WSL2 中编译通过，并运行 `ctest` 与 `python3 tools/check_docs.py`。

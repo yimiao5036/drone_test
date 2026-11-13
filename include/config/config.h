@@ -1,0 +1,376 @@
+#pragma once
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "communication/ground_station_link.h"
+#include "communication/px4_link.h"
+#include "control/approach_speed_law.h"
+#include "control/tracking_config.h"
+#include "control/visual_tracking_shadow.h"
+#include "perception/stereo_ranger_core.h"
+#include "perception/target_estimator.h"
+#include "perception/visual_target_monitor.h"
+#include "perception/yolo_detector.h"
+#include "video/camera_receiver.h"
+#include "video/frame_compositor.h"
+#include "video/stereo_frame_splitter.h"
+#include "video/uvc_camera_receiver.h"
+#include "video/video_decoder.h"
+#include "video_transmission/video_sender.h"
+
+namespace drone::config {
+
+struct LogConfig {
+    std::string directory = "logs/";
+    std::string level = "info";
+};
+
+struct RuntimeConfig {
+    bool enable_video = true;
+    bool enable_px4 = true;
+    bool enable_ground_station = false;
+    bool enable_target_estimator = false;
+    bool enable_visual_monitor = false;
+    bool enable_visual_tracking = false;  ///< 视觉跟踪控制律影子（kControlIntent 无消费者）
+    bool enable_stereo_ranging = false;  ///< 双目测距影子（依赖 uvc+stereo_split+视觉跟踪）
+    /// 双目视觉观测 → 局部 NED 融合进目标估计器（影子；依赖 target_estimator +
+    /// stereo_ranging + px4；不延展地面站有效期，docs/物理追踪思路.md §6.3）
+    bool enable_visual_position_fusion = false;
+    bool enable_control = false;
+};
+
+/// HealthManager 数据源最大允许无数据时间。各值必须为正数。
+struct HealthManagerConfig {
+    std::chrono::milliseconds cpu_sample_period{1000};
+    std::chrono::milliseconds startup_grace_period{5000};
+    std::chrono::milliseconds camera_max_age{1000};
+    std::chrono::milliseconds decoder_max_age{1000};
+    std::chrono::milliseconds yolo_max_age{1000};
+    std::chrono::milliseconds video_max_age{1000};
+    std::chrono::milliseconds px4_max_age{3000};
+    std::chrono::milliseconds ground_station_max_age{3000};
+};
+
+/// 视频输入源选择（video 配置节）：RTSP 单目链路与 USB UVC 双目链路二选一。
+struct VideoSourceConfig {
+    std::string camera_source = "rtsp";  ///< rtsp | uvc
+    bool stereo_split = false;           ///< uvc 时是否装配 StereoFrameSplitter 左右拆分
+};
+
+/// FlightController 配置（controller 配置节，阶段四控制接入）。
+/// 全部字段可选，缺席回退默认值；Validate 做范围与跨字段校验，
+/// 非法值在配置加载期 fail-fast（抛 std::invalid_argument，消息带字段名）。
+struct FlightControllerConfig {
+    std::chrono::milliseconds period{50};        // 控制周期
+    double max_speed_mps = 2.0;                  // 速度幅值上限
+    double max_accel_mps2 = 2.0;                 // 加速度上限（slew）
+    double max_jerk_mps3 = 0.0;                  // jerk 上限；0=不启用（v1 预留）
+    // 位置型意图速度前馈（P3，2026-10-19）：开关默认关闭（保守：未知速度
+    // 时不叠加前馈）；生产配置显式打开并给出上限。上限独立于 max_speed_mps
+    // （后者只约束速度式意图），水平模长/垂直分量分别钳制。
+    bool enable_position_velocity_feedforward = false;
+    double max_feedforward_mps = 2.0;
+    /// 位置引导速率上限（2026-11-02，P0-2）：位置型意图不再把目标点原样
+    /// 直通给 PX4，而是按本速率把引导点从当前位置向目标推进（避免目标跳变
+    /// 时 PX4 用自身 MPC_XY_VEL_MAX 冲过去）。仅当意图带 max_speed_mps>0
+    /// 时启用；实际速率取 min(本值, 意图 max_speed_mps)。垂直分量另限。
+    double position_guide_speed_mps = 6.0;
+    double position_guide_vz_mps = 1.5;
+    std::chrono::milliseconds intent_timeout{300};   // 意图超龄阈值
+    std::chrono::milliseconds coast_timeout{1000};   // COAST 最长保持
+    std::chrono::milliseconds slew_transition{500};  // 无扰衔接斜坡时长
+    /// kBootstrap 预授权原点保持流最长时长（防卡死兜底）。状态机 S3 的
+    /// 模式/解锁超时是权威，本值须覆盖 bootstrap_lead + mode + arm；
+    /// 装配时由 DroneApplication 从 takeoff.bootstrap_timeout 注入。
+    std::chrono::milliseconds bootstrap_timeout{6000};
+    /// 多边形围栏钳制内缩余量（由 fence.boundary_margin_m 拷贝到此处，
+    /// 控制器不自读 fence 节；2026-10-29 多边形围栏）。
+    double fence_margin_m = 1.0;
+    void Validate() const;
+};
+
+/// 捕网执行器配置（actuator 配置节，阶段四控制接入 Task 10）。
+/// 机载只负责发送 MAV_CMD_DO_SET_ACTUATOR 的归一化控制量（-1..1）；
+/// 输出功能、对应 PWM 映射区间（MAIN 输出为 PWM_MAIN_MINn/MAXn，AUX 输出为
+/// PWM_AUX_MINn/MAXn）、舵机行程与方向在 PX4/QGC 侧配置，机载不再保存 PWM
+/// 微秒或输出映射区间，避免两套系统重复维护。
+/// `net_channel` 是 Actuator Set N（1..6），不是物理输出通道号。
+/// 当前装机（2026-10-21 确认）：捕网接 MAIN5，Output Function 为
+/// `Peripheral via Actuator Set 1`，故 net_channel=1。
+struct ActuatorConfig {
+    /// 执行器实现类型：当前 `single_pwm`=单发舵机式；后续多发实现通过该键
+    /// 在工厂切换，状态机只依赖 IInterceptionDevice 抽象接口。
+    std::string type = "single_pwm";
+    int32_t net_channel = 1;        ///< PX4 Actuator Set N（1..6）
+    /// 归一化控制量：PX4 按该输出通道的 PWM_MAIN_MINn/MAXn（或 AUX）线性
+    /// 映射为 PWM。
+    /// 标准 1000..2000µs 映射下，-0.7→1150µs（发射）、0.0→1500µs（待机）。
+    double net_fire_norm = -0.7;    ///< 发射控制量（-1..1）
+    double net_idle_norm = 0.0;     ///< 待机/复位控制量（-1..1）
+    /// 触发 ACK ACCEPTED 后到发复位的保持时间；当前捕网枪说明书要求 1~2s。
+    std::chrono::milliseconds reset_delay{1500};
+    /// 复位 ACK ACCEPTED 后到 Ready 的稳定时间（多发用；单发默认 0）。
+    std::chrono::milliseconds reset_settle{0};
+    /// 地面站直控发射（65016）开关，默认 false。与 `interception.enabled` 互斥：
+    /// 直控发射是拆桨台架/测试用途，不经过拦截授权链，装配期二者同时为 true
+    /// 直接 fail-fast（避免两条发射路径抢同一个执行器）。
+    bool gcs_fire_enabled = false;
+    /// 两次成功直控发射之间的最小间隔，防止地面站误连点。默认 3000ms。
+    std::chrono::milliseconds gcs_fire_cooldown{3000};
+    void Validate() const;
+};
+
+/// 交接缝配置（handover 配置节，阶段四控制接入）。
+/// 视觉锁定↔卡尔曼跟踪的状态切换迟滞：exit_lost_frames 必须大于 enter_s6_lock_frames。
+struct HandoverConfig {
+    uint32_t enter_s6_lock_frames = 10;  // S5→S6：LOCKED 连续帧数
+    double fow_margin_deg = 5.0;        // 视线角视场余量
+    double innovation_gate_m = 3.0;     // 视觉观测与卡尔曼预测创新门限（米）
+    std::chrono::milliseconds timeout{3000};  // S6 驻留超时
+    uint32_t exit_lost_frames = 30;     // S7 退出：LOST 连续帧数（必须 > enter_s6_lock_frames）
+    /// S7 退出：双目测距失效（invalid 或超龄）连续达该时长即回退——覆盖
+    /// "测距丢失但视觉仍锁定"的收口（no_distance_action 不触发 kExit 的档位）
+    std::chrono::milliseconds distance_lost_ms{3000};
+    // ---- 到点判定与"到点后视觉未识别"等待（2026-11-05，S5 到点不告警）----
+    // 目标看门狗只在目标失效时计时；目标以 5Hz 持续送达时它永不启动，
+    // 于是"飞到目标点上方悬停、视觉一直没锁定"没有任何提示。以下四组参数
+    // 用独立的判据补这一段，语义与 target_wait/lost/hold 完全无关。
+    /// 到点水平半径（m）：飞机与分配目标点的水平距离进入该值视为到点候选。
+    double arrival_radius_m = 3.0;
+    /// 到点垂直半径（m）：相对目标点高度差的绝对值上限。
+    double arrival_vertical_m = 2.0;
+    /// 到点需连续保持的时长：进入半径且地速 ≤ 0.5m/s 持续该时长才判到点，
+    /// 避免掠过目标点就当"到点"。
+    std::chrono::milliseconds arrival_hold_ms{2000};
+    /// 到点后视觉未锁定的告警阈值：超过即置 warning bit6「到点未识别」。
+    std::chrono::milliseconds visual_wait_warn_ms{20000};
+    /// 到点后视觉未锁定的自动处置阈值：0 = 只提示、不自动返航（现场默认）。
+    std::chrono::milliseconds visual_wait_abort_ms{0};
+    void Validate() const;
+};
+
+/// 拦截入口/授权（interception 节，2026-10-19）。
+/// V1 默认关闭：生产只有在 G4/实机射程与授权策略验证后，才允许在本地副本开启。
+struct InterceptionConfig {
+    bool enabled = false;
+    /// V1 自动授权。false 时 S9 等待授权并最终按超时返航；地面站确认协议尚未实现。
+    bool auto_authorize = true;
+    /// 连续 LOCKED 帧门限（拦截质量，与 handover.enter_s6_lock_frames 独立）。
+    uint32_t enter_s9_lock_frames = 10;
+    /// 允许发射的测距窗口（米）。上限已按双目测距极限冻结为 8m（2026-10-23，
+    /// 维护者确认：测距极限 8m 即有效射程，进入 ≤8m 才算有效）；下限 2.0 仍为
+    /// 占位，待实机最小可用距离确认。
+    double min_range_m = 2.0;
+    double max_range_m = 8.0;
+    /// 动力电池最低剩余百分比；0=不启用（当前尚无冻结门限，按需配置）。
+    double min_battery_percent = 0.0;
+    /// S9 等待授权的超时；超时按设计返航。
+    std::chrono::milliseconds authorization_timeout{1000};
+    void Validate() const;
+};
+
+/// 拦截后返航（return_home 节，2026-10-19）。
+struct ReturnHomeConfig {
+    /// 单发发射后是否自动进入 S11/S12（默认 true）。测试可关闭以隔离捕网
+    /// 执行器语义（S10 停留/复位重试用例）。
+    bool enabled = true;
+    /// 相对 Home 的返航高度：低于该值先原地爬升，再水平返航。
+    double altitude_m = 5.0;
+    /// 返航爬升率（m/s）：爬升段经控制器“位置引导限速”推进，避免位置目标
+    /// 阶跃时 PX4 用自身 MPC_Z_VEL_MAX_UP（默认 3m/s）冲上去——2026-11-03
+    /// 实机反馈“低于 5m 时上升很快”即此原因。
+    double climb_rate_mps = 0.5;
+    /// 水平返航速度上限（m/s）：爬升完成后朝 Home 推进的最大速度。
+    /// **独立于追踪速度**（`controller.max_speed_mps=10`）：返航是安全收口，
+    /// 顶速不需要跟追踪同量级（2026-11-12 维护者裁决：4.0）。
+    double cruise_speed_mps = 4.0;
+    /// 返航水平速度剖面的加/减速度（m/s²，2026-11-12）。
+    /// 状态机在 S12 内按“分段恒定加速度”生成速度指令（无 jerk），两种情况
+    /// 都必须有斜坡：①进入返航时飞机可能静止（目标未运动/已掉落），需要
+    /// 加速到 cruise；②追不上目标转返航时飞机速度可能高于 cruise，需要先
+    /// 减速。**不复用 `controller.max_accel_mps2`**（那是追踪/位置引导共用的
+    /// 限幅参数），返航有自己的安全收口节奏。
+    /// `accel_plan_mps2=0` 或 `decel_plan_mps2=0` 表示该段不做斜坡（直通）。
+    double accel_plan_mps2 = 1.5;
+    double decel_plan_mps2 = 2.0;
+    /// 末端制动包络的规划减速度余量：巡航段按 v ≤ √(2·decel·d) 收敛即可，
+    /// 该值只用于末端包络的安全系数（1.0=不加余量）。
+    double brake_safety = 1.3;
+    /// 末端低速档（m/s）：距目标进入 `final_zone_m` 后巡航顶速降为该值，
+    /// 使末端平顺、到达判据（`arrival_speed_mps`）自然满足。
+    double final_speed_mps = 1.0;
+    double final_zone_m = 10.0;
+    /// 到达判据：水平半径、垂直误差、水平速度与稳定保持时长。
+    double arrival_radius_m = 2.0;
+    double arrival_vertical_m = 0.5;
+    double arrival_speed_mps = 0.5;
+    std::chrono::milliseconds arrival_hold{1000};
+    /// 返航超时：超时后原地悬停告警（不自动转 RTL，交地面站/人工）。
+    std::chrono::milliseconds timeout{60000};
+    /// S10 发射命令入队超时：超时按"发射失败"结束并返航。
+    std::chrono::milliseconds fire_timeout{3000};
+    /// AUTO.LAND / DISARM 命令重试间隔。
+    std::chrono::milliseconds command_retry{1000};
+    /// 返航机头模式（2026-10-29）：0=不指定航向（保持原机头平移）；
+    /// 1=机头朝飞行方向（前视避障传感器需要，维护者 2026-10-29 确认）。
+    uint8_t heading_mode = 1;
+    /// 机头朝飞行方向时的偏航角速度/角加速度上限（与视觉跟踪同量级）。
+    double heading_rate_limit_dps = 30.0;
+    double heading_accel_limit_dps2 = 60.0;
+    void Validate() const;
+};
+
+/// 多边形围栏（fence 节，2026-10-29）。
+/// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
+/// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
+/// 默认**开启**（2026-10-29 维护者裁决）：开启后无区域时按 `default_*` 以 Home
+/// 为中心生成默认区域，因此没有"圆形兜底围栏"这一层——围栏只有多边形一种。
+struct FenceConfig {
+    bool enabled = true;
+    /// 区域缓存路径（相对可执行文件目录）；缺失/非法按 kNoZone 处理（不中止）。
+    std::string zone_cache_path = "config/zone.json";
+    /// 越界判定防抖：连续处于区域外达该时长才判定越界并执行动作。
+    std::chrono::milliseconds violation_debounce{1500};
+    /// 越界**深度**容差（m，2026-11-12）：飞机自身位置必须越出多边形边界
+    /// 超过该深度才算越界。0=零容差（历史行为）。现场 0119/0120 日志显示
+    /// 目标贴边时飞机会被位置环推出去 1~3m 又被拉回，零容差会把一次瞬时
+    /// 穿透判成越界中止（`波动两下就返航`）。建议 1.0~2.0。
+    double violation_depth_m = 1.5;
+    /// 越界恢复滞回（m，2026-11-12）：已判越界后，带符号距离必须回到
+    /// `−violation_depth_m + violation_hysteresis_m`（默认 −1.0m）以上才清除，
+    /// 即越界深度收敛到 1.0m 以内（仍在边界外也可以，配合 depth 避免抖动）。
+    /// **必须 ≤ 本值对应的 violation_depth_m**：滞回要落在容差带内，不能放到
+    /// 边界内侧——否则飞机停在界外但仍在容差内时会一直累计越界时长，容差失效。
+    double violation_hysteresis_m = 0.5;
+    /// 位置意图钳制内缩余量：钳制落点距边界至少这么多米（>0）。
+    double boundary_margin_m = 1.0;
+    /// 接近边界告警距离（m）：区域内但距边界小于该值报 kNearBoundary。
+    double boundary_warn_m = 10.0;
+    /// 目标跑出区域时的制导策略（2026-11-12 维护者裁决）：
+    /// true=S5 引导点被围栏挡住时改为“贴边保持 + 告警、不中止任务”
+    /// （S6 冻结续发沿用最后一条 S5 意图），
+    /// 目标回到区域内（带 `guide_hold_release_m` 滞回）后自动恢复跟随；
+    /// false=只依赖控制器逐拍钳制（2026-11-11 之前行为，会在边界来回冲）。
+    bool guide_hold_enabled = true;
+    /// 贴边保持的解除滞回（m）：目标重新回到区域内、且距边界超过该距离，
+    /// 才恢复正常的接近制导（避免目标贴边时保持/跟随反复切换）。
+    /// 实现取 `max(boundary_margin_m, 本值)`：低于进入余量时不产生滞回，
+    /// 保持/跟随会每拍切换，故按进入余量兜底（2026-11-12 复审）。
+    double guide_hold_release_m = 2.0;
+    /// **围栏停止点预测**（2026-11-12 复审三轮，维护者裁决）：沿飞机当前
+    /// 速度方向做停止点预测 `p + v̂·(v·reaction + v²/(2·decel))`，预测点越界
+    /// 就提前压速度/贴边保持。`decel=0` 关闭预测（回退仅几何保持）。
+    /// 用可达最大减速度，**不要用接近律当前相位的计划加速度**。
+    double guard_decel_mps2 = 2.0;
+    /// 停止点预测的反应/姿态延迟（秒）：`v·reaction` 计入刹停距离。
+    double guard_reaction_s = 0.2;
+    /// **目标出区保持**（2026-11-13，维护者裁决）：目标 NED 位置落在围栏外时，
+    /// 立即停止追击、位置保持（不中止任务、不执行 return/land、无超时兜底）。
+    /// 解除条件：目标回到区内且距边界 ≥ `target_outside_release_m`，持续
+    /// `target_outside_release_hold`，**并且飞机自身已回到区内**。
+    /// 0 = 目标一回到区内即可解除（仅调试用）。
+    double target_outside_release_m = 50.0;
+    /// 目标出区保持的解除保持时长。
+    std::chrono::milliseconds target_outside_release_hold{10000};
+    /// 越界动作：follow_zone_action=true 时以 65018 下发的动作为准，
+    /// 否则固定使用本字段。
+    bool follow_zone_action = true;
+    common::FenceAction violation_action = common::FenceAction::kReturn;
+    /// 围栏状态回传（65019）周期。
+    std::chrono::milliseconds status_period{1000};
+    /// 65022 区域回读周期（机载 → 地面站）：地面站据此比对本地定义与机载实况，
+    /// 并在刷新/重连后恢复图层。5s 一次、约 56B，对串口负担可忽略。
+    std::chrono::milliseconds report_period{5000};
+
+    // 机载初始区域（2026-10-29）：既没有 zone.json 缓存、也还没收到 65018 时，
+    // 以 Home 为中心生成该方形区域并立即落盘，保证"开机即有围栏"，避免出现
+    // "无区域则不限制"的空窗。地面站连上后可比对并整体覆盖。
+    double default_half_side_m = 100.0;
+    double default_alt_min_m = 0.0;
+    double default_alt_max_m = 30.0;
+    uint16_t default_zone_id = 1;
+    uint16_t default_version = 1;
+    common::FenceAction default_action = common::FenceAction::kReturn;
+    void Validate() const;
+};
+
+/// 自动起飞（takeoff 节，2026-10-22 多机任务分配与自动起飞）。
+/// 约束 S3 解锁/Offboard 与 S4 爬升的时序、到达判据和目标丢失收口；
+/// 电池门限不使用本地百分比，唯一来源为 PX4 `BAT_LOW_THR`（后续任务接入）。
+/// 全部字段可选，缺席回退默认值；Validate 做范围与跨字段校验。
+struct TakeoffConfig {
+    double height_m = 2.0;                         ///< 相对起飞点爬升高度
+    double climb_rate_mps = 0.5;                   ///< S4 爬升速度
+    std::chrono::milliseconds bootstrap_lead{300}; ///< 起飞意图到 176 的前置保持
+    std::chrono::milliseconds mode_timeout{2000};  ///< 等待 Offboard(6/0) 的超时
+    std::chrono::milliseconds arm_timeout{3000};   ///< 等待解锁的超时
+    std::chrono::milliseconds bootstrap_timeout{6000};  ///< Bootstrap 原点保持流最长时长
+    std::chrono::milliseconds height_timeout{15000};    ///< S4 到达任务高度的超时
+    std::chrono::milliseconds stable_time{1000};   ///< 到达判据持续时长
+    double z_tolerance_m = 0.2;                    ///< 到达判据：垂直误差
+    double xy_tolerance_m = 0.5;                   ///< 到达判据：水平误差
+    double max_vz_mps = 0.3;                       ///< 到达判据：垂直速度
+    std::chrono::milliseconds target_wait_timeout{10000};  ///< 等待目标位置超时
+    std::chrono::milliseconds target_lost_timeout{10000};  ///< 目标丢失收口超时
+    /// S5 目标失效期间“原地保持”的累计时长上限（绝对兜底）。目标反复闪烁时
+    /// target_lost_timeout 每次恢复都会清零，单靠它无法防止无限悬停；本上限按
+    /// 本次 S5 内累计保持时长收口，超限 → 65015 aborted + S12 返航。
+    std::chrono::milliseconds target_hold_max{60000};
+    std::chrono::milliseconds battery_low_debounce{1000};  ///< 低电防抖时长
+    void Validate() const;
+};
+
+/// 接近段策略（approach 节，2026-11-02 引入；2026-11-11 起只保留速度律）：
+/// S5 由 `control::ApproachSpeedLaw` 产出 `(p_ref, v_ref)`，旧“固定提前 +
+/// 位置引导点”实现已删除，不再保留回退字段。
+struct ApproachConfig {
+    /// S5 接近段速度律（2026-11-11 落机载，唯一 S5 引导方式）。
+    control::ApproachSpeedLawConfig speed_law;
+    void Validate() const;
+};
+
+struct AppConfig {
+    LogConfig log;
+    RuntimeConfig runtime;
+    HealthManagerConfig health;
+    VideoSourceConfig video_source;
+    video::CameraReceiverConfig camera;
+    video::UvcCameraReceiverConfig uvc_camera;
+    video::VideoDecoderConfig decoder;
+    video::StereoFrameSplitterConfig stereo_splitter;
+    perception::YoloDetectorConfig yolo;
+    video::CompositorConfig compositor;
+    video_transmission::VideoSenderConfig video_sender;
+    communication::Px4LinkConfig px4;
+    communication::GroundStationLinkConfig ground_station;
+    perception::TargetEstimatorConfig target_estimator;
+    perception::VisualTargetMonitorConfig visual_monitor;
+    control::TrackingConfig visual_tracking;              ///< 视觉跟踪控制律（含标定内参）
+    control::VisualTrackingShadowConfig visual_tracking_shadow;
+    perception::StereoRangerConfig stereo_ranger;  ///< 双目测距 v2（稀疏 Census，影子）
+    /// 预置校正矩阵：由 stereo_ranger.rectify_matrices_path 指向的 JSON 加载
+    /// （基准=SBS右半=物理左目；重标定后必须重跑 export_rectify.py）。
+    perception::StereoRectifyMatrices stereo_rectify;
+    FlightControllerConfig controller;  ///< FlightController 参数（阶段四控制接入）
+    HandoverConfig handover;            ///< 交接缝迟滞参数（阶段四控制接入）
+    ActuatorConfig actuator;            ///< 捕网执行器（阶段四控制接入 Task 10）
+    InterceptionConfig interception;    ///< S9/S10 入口判据与授权（2026-10-19）
+    ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
+    TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
+    FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
+    ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）
+};
+
+/// 按“可执行文件旁 config/config.json → 当前目录 config/config.json”查找配置。
+std::string ResolveConfigPath(const std::string& executable_directory,
+                              const std::string& requested_path = {});
+
+/// 加载并校验正式主程序配置。资源相对路径按可执行文件目录解析。
+AppConfig LoadAppConfig(const std::string& path,
+                        const std::string& executable_directory);
+
+}  // namespace drone::config

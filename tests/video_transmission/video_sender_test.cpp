@@ -51,6 +51,8 @@ public:
     }
     std::uint64_t SentFrameCount() const override { return encode_count; }
     std::uint64_t ErrorCount() const override { return start_result ? error_override : 1; }
+    common::LatencySummary FramePrepareLatency() const override { return {}; }
+    common::LatencySummary PacketWriteLatency() const override { return {}; }
 };
 
 /// 轮询等待条件满足（带超时）。
@@ -140,8 +142,14 @@ TEST_F(VideoSenderTest, SendsFramesToBackend) {
     ASSERT_TRUE(sender->Start());
 
     PublishFrame();
-    EXPECT_TRUE(WaitFor([mock] { return mock->encode_count == 1; }));
+    // 后端 EncodeFrame 返回后发送器还要累计时延、再 ++sent_count。只等
+    // encode_count 会与下面的计数断言竞态（2026-11-12 全量跑偶发失败一次），
+    // 这里把 sent_count 一并作为条件（它是最后一步，能覆盖时延统计）。
+    EXPECT_TRUE(WaitFor([&] {
+        return mock->encode_count == 1 && sender->SentFrameCount() == 1u;
+    }));
     EXPECT_EQ(sender->SentFrameCount(), 1u);
+    EXPECT_EQ(sender->EncodeAndPushLatency().total_count, 1u);
     EXPECT_EQ(sender->DroppedFrameCount(), 0u);
 
     sender->Stop();
@@ -198,6 +206,36 @@ TEST_F(VideoSenderTest, StartFailsWhenBackendFails) {
     EXPECT_FALSE(sender->Start());
     EXPECT_GT(sender->ErrorCount(), 0u);
     EXPECT_FALSE(sender->IsRunning());
+}
+
+// collect_detailed_latency=false：中间阶段（输入队列/编码推送）不统计，
+// 只留 ingress→RTSP 端到端链（探针首尾模式）。
+TEST_F(VideoSenderTest, DetailedLatencyDisabledCollectsOnlyIngress) {
+    VideoSenderConfig config;
+    config.encode.url = "rtsp://127.0.0.1:8554/drone_out";
+    config.encode.width = 64;
+    config.encode.height = 64;
+    config.encode.fps = 25;
+    config.collect_detailed_latency = false;
+    config.backend_factory = [] { return std::make_unique<MockBackend>(); };
+    auto sender = std::make_unique<VideoSender>(std::move(config));
+    sender->SetInput(frame_topic_);
+
+    ASSERT_TRUE(sender->Start());
+    auto handle = pool_->Acquire();
+    ASSERT_TRUE(handle.Valid());
+    std::memset(handle.Data(), 0, pool_->SlotSize());
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    handle.SetTiming(now_ms, now_ms);
+    (void)frame_topic_.Emplace(std::move(handle));
+
+    ASSERT_TRUE(WaitFor([&] { return sender->SentFrameCount() == 1; }));
+    sender->Stop();
+
+    EXPECT_EQ(sender->InputQueueLatency().total_count, 0u);
+    EXPECT_EQ(sender->EncodeAndPushLatency().total_count, 0u);
+    EXPECT_EQ(sender->IngressToRtspLatency().total_count, 1u);
 }
 
 }  // namespace

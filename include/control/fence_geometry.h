@@ -1,0 +1,88 @@
+/**
+ * @file fence_geometry.h
+ * @brief 多边形围栏几何（纯函数，无状态、无日志、无线程）
+ *
+ * 属于 drone/control 模块。职责：局部 NED 平面上的点在多边形内判定、
+ * 有符号边界距离、越界点钳制。被 `MissionStateMachine`（越界判定）与
+ * `FlightController`（位置意图钳制）共用，故独立成零依赖的头文件 + 实现。
+ *
+ * 坐标系：局部 NED，单位为米；多边形顶点按任意环绕方向给出（不要求凸、
+ * 不要求顺时针，允许凹多边形；不支持自交与多环）。
+ *
+ * 实现文档见同目录 fence_geometry.md。
+ */
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "common/types.h"
+
+namespace drone::control::fence {
+
+/// 区域几何/高度带合法性校验（65018 接受前的唯一闸口）：
+/// - zone_id/version 非 0，altitude_reference ∈ {0=AMSL, 1=Home}；
+/// - 高度带有限，允许 alt_min_m <= 0（相对 Home 表示低于起飞点，地面站 UI
+///   允许 -1000m；下限只受协议 i16 0.1m 范围约束，最低 -3276.8m），
+///   允许 alt_max_m == 0（不限高），否则要求 alt_min_m <= alt_max_m；
+/// - 顶点坐标有限且在经纬度范围内，顶点数 >= 3；
+/// - 任意一边长 >= 0.5m（拒绝重复点/共线堆积造成的退化边）；
+/// - 任意两条不相邻边不相交（射线法对自交多边形无意义）；
+/// - 投影面积 >= 1m²（拒绝面积 0 的退化多边形）。
+///
+/// 校验在"顶点均值"为参考的局部等距平面上完成（只用于几何判定，不参与
+/// 实际换算）。失败时返回 false 并写入中文原因（reason 可为 nullptr）。
+bool ValidateZone(const common::FenceZone& zone, std::string* reason);
+
+/// 点是否位于多边形内部（射线法；恰落在边上按"内部"处理）。
+/// 顶点少于 3 个时返回 false。
+bool PointInPolygon(const std::vector<common::Vec2Ned>& polygon,
+                    const common::Vec2Ned& point);
+
+/// 点到多边形边界的最短距离（米，恒非负）；顶点不足 3 个返回 0。
+double DistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
+                          const common::Vec2Ned& point);
+
+/// 有符号边界距离（米）：区域内为正、区域外为负、恰在边界为 0。
+/// 越界判定的主判据更偏好"约定边界守距"（如越界 5m 才处置），
+/// 因此提供符号而不只是距离。
+double SignedDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
+                                const common::Vec2Ned& point);
+
+/// 把点钳制为"位于多边形内、尽量距边界 margin_m"的点：
+/// - **已在界内（不论余量是否够）原样返回**：margin 是期望值，不是安全硬约束。
+///   旧实现会为凑余量把点向质心退让，凹多边形/尖角处曾把目标拉出 413m
+///   （0121 SITL），造成位置目标瞬移；
+/// - 界外：投影到最近边界点，沿内法线内缩 margin；尖角/凹角不足 margin 时
+///   沿"候选点→质心"做**有界**局部搜索（≤max(4·margin,4m)），找不到就停在
+///   边界点，绝不向质心跳。
+/// margin_m <= 0 按 0 处理；多边形退化（顶点 < 3）时原样返回 point。
+common::Vec2Ned ClampIntoPolygon(const std::vector<common::Vec2Ned>& polygon,
+                                 const common::Vec2Ned& point,
+                                 double margin_m);
+
+/// 沿给定方向到多边形边界的**首个交点距离**（米，纯函数）。
+/// 用于"沿飞行方向预测停止点"：飞机在界内、方向单位化后，返回射线第一次
+/// 穿出边界的距离（凹多边形也取第一交点，不会"穿出又穿回"被漏判）。
+/// - 起点在界外：返回 0（调用方按已越界处理）；
+/// - 方向退化/非有限、多边形顶点 < 3：返回 +inf（不限制）。
+double RayDistanceToBoundary(const std::vector<common::Vec2Ned>& polygon,
+                             const common::Vec2Ned& origin,
+                             const common::Vec2Ned& direction);
+
+/// 停止距离（米）：`v·reaction_s + v²/(2·decel_mps2)`。
+/// `v<=0` 返回 0；`decel<=0` 且 `v>0` 返回 +inf（表示不启用预测）。
+double StopDistance(double speed_mps, double decel_mps2, double reaction_s);
+
+/// 由可用距离反解允许速度（m/s）：解 `v·τ + v²/(2a) = distance`，
+/// 取正根 `v = −aτ + √((aτ)² + 2a·distance)`。
+/// `distance<=0` 返回 0（必须刹车/保持）；`a<=0` 返回 +inf（不限制）。
+/// **返回值可能为 0**：控制器把 `max_speed_mps=0` 解释为"未填相位上限"，
+/// 调用方必须抬到小正数（见 `MissionStateMachine` 的预测限速）。
+double AllowedSpeedForStop(double distance_m, double decel_mps2,
+                           double reaction_s);
+
+/// 多边形质心（顶点算术平均；仅用于内法线方向的兜底判定）。
+common::Vec2Ned Centroid(const std::vector<common::Vec2Ned>& polygon);
+
+}  // namespace drone::control::fence

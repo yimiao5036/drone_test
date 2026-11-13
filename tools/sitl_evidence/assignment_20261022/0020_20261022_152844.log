@@ -1,0 +1,77 @@
+[2026-10-22 15:28:44.354] [info] [t:14235] 异步文件日志已初始化: /root/drone_test/build/logs/0020_20261022_152844.log (等级=info)
+[2026-10-22 15:28:44.354] [info] [t:14235] 正式主程序加载配置: path=../config/px4_sitl_assignment.json log_level=info
+[2026-10-22 15:28:44.354] [info] [t:14235] UVC摄像头接收器创建: /dev/video0 2560x720@30 缓冲=4
+[2026-10-22 15:28:44.354] [info] [t:14235] 视频解码器创建: 池容量=16 预置分辨率=2560x720 硬解优先=true RGA_DMA优先=true RGA_DMA可用=false
+[2026-10-22 15:28:44.354] [info] [t:14235] 视频帧内存池创建: 容量=8 槽位大小=1382400B 对齐=64B 总内存=10.5MB 格式=1
+[2026-10-22 15:28:44.354] [info] [t:14235] 视频帧内存池创建: 容量=8 槽位大小=1382400B 对齐=64B 总内存=10.5MB 格式=1
+[2026-10-22 15:28:44.354] [info] [t:14235] 双目拆分输出池创建: 容量=8x2 单目=1280x720 水平stride=1280 槽位=1382400B
+[2026-10-22 15:28:44.354] [info] [t:14235] 双目拆分器创建: 全幅=2560x720 池容量=8x2 RGA=无（memcpy）
+[2026-10-22 15:28:44.354] [info] [t:14235] YOLO 检测器创建: 模型=/root/drone_test/build/models/yolov26_ReLU6_09_13-rk3588_384_640.rknn 置信度阈值=0.3 NMS阈值=0.45 订阅队列=1 NPU核心=all 内部性能统计=false 逐层性能报告=false 细分延迟统计=true 后端=缺失(启动将失败)
+[2026-10-22 15:28:44.391] [info] [t:14235] 双目测距v2创建: shadow=true 基准图=SBS右半(物理左目) fx_rect=1057.33px 基线=60.120mm fxB=63.57m·px 视差=[8,160]px
+[2026-10-22 15:28:44.391] [info] [t:14235] 叠加器创建: 池容量=8 线宽=2 文字=开
+[2026-10-22 15:28:44.391] [info] [t:14235] 图传发送器创建: 编码=h264 地址=rtsp://127.0.0.1:8554/drone_25_1 分辨率=1280x720@25fps
+[2026-10-22 15:28:44.391] [info] [t:14235] 视觉稳定性判定创建: shadow=true control_output=false lock_frames=5 lost_frames=10
+[2026-10-22 15:28:44.391] [info] [t:14235] PX4 通信部件创建: firmware=1.17.0 transport=udp:127.0.0.1:14540 onboard=1/191 target=1/1 mavlink=2
+[2026-10-22 15:28:44.391] [info] [t:14235] 串口对象创建: device=/tmp/gcs_app baud=115200 数据位=8 停止位=1 校验=N
+[2026-10-22 15:28:44.391] [info] [t:14235] 地面站通信部件创建: serial=/tmp/gcs_app@115200 aircraft=1/25 type=net_capture callsign=捕网-01 gcs=255/190 mavlink=2 timesync=true
+[2026-10-22 15:28:44.391] [info] [t:14235] 目标估计器创建: model=linear_cv shadow=true control_output=false
+[2026-10-22 15:28:44.391] [info] [t:14235] 健康管理部件创建: cpu_sample_period_ms=1000 startup_grace_ms=5000
+[2026-10-22 15:28:44.391] [info] [t:14235] 任务状态机创建: shadow=true control_output=false intent_valid_for_ms=300 handover(lock_frames=10 exit_lost_frames=30 timeout_ms=3000 fow_margin_deg=5.0 innovation_gate_m=3.0) fov_half(az=33.19deg el=10.56deg) servo=TrackingControlLaw(20.0Hz)
+[2026-10-22 15:28:44.391] [info] [t:14235] 飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线+控制权三态+Home 围栏已接入）
+[2026-10-22 15:28:44.391] [info] [t:14235] 任务状态机估计器诊断接口已注入: estimator=0x58c27739bc70
+[2026-10-22 15:28:44.391] [info] [t:14235] 任务状态机 PX4 命令接口已注入: sender=0x58c27739b810 net_type=single_pwm
+[2026-10-22 15:28:44.391] [warning] [t:14235] 正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint
+[2026-10-22 15:28:44.391] [info] [t:14235] 主程序集成创建: video=true px4=true ground_station=true target_estimator=true control=true camera_source=uvc stereo_split=true stereo_ranging=true
+[2026-10-22 15:28:44.391] [info] [t:14235] 视觉稳定性判定启动: shadow=true
+[2026-10-22 15:28:44.392] [info] [t:14235] 视觉跟踪影子启动: 频率=20Hz 虚拟姿态=true 姿态输入=true 距离输入=true
+[2026-10-22 15:28:44.392] [info] [t:14245] 视觉跟踪影子：姿态缺失/超龄，启用虚拟零姿态（仅供观察控制律行为，不产生真实控制输出）
+[2026-10-22 15:28:44.392] [info] [t:14245] 视觉跟踪影子摘要: 模式=降级保持 有效=false vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=true 距离=--(有效=0)
+[2026-10-22 15:28:44.392] [info] [t:14235] 双目测距启动: shadow=true 配对窗=20ms 批次闭合=50ms 帧缓冲=4 队列容量=2
+[2026-10-22 15:28:44.392] [info] [t:14235] 图传无 rkmpp 硬编码器（h264_rkmpp），使用软编码
+[2026-10-22 15:28:44.412] [info] [t:14244] 视觉稳定性摘要: state=SEARCHING valid=false 连续检测=0 连续丢失=0 置信度=0.00 中心=(0,0) 框=0x0px 画面速度=均0.0/峰0.0(n=0) 从未检测 近期检测率=0.0%(0/0) 累计检测率=0.0% 累计观测=0 累计转换=0
+[2026-10-22 15:28:44.413] [error] [t:14235] 图传 RTSP 写头失败(推流地址不可达?): Connection refused
+[2026-10-22 15:28:44.413] [error] [t:14235] 图传发送器后端启动失败（推流地址不可达或无可用编码器）
+[2026-10-22 15:28:44.413] [error] [t:14235] 主程序图传发送启动失败，视频链路降级
+[2026-10-22 15:28:44.413] [info] [t:14235] 叠加器启动
+[2026-10-22 15:28:44.413] [error] [t:14235] YOLO 检测器启动失败: 无推理后端（未启用 RKNN 编译或未注入后端）
+[2026-10-22 15:28:44.413] [error] [t:14235] 主程序YOLO启动失败，检测链路降级
+[2026-10-22 15:28:44.413] [info] [t:14235] 双目拆分器启动
+[2026-10-22 15:28:44.413] [info] [t:14235] 视频帧内存池创建: 容量=16 槽位大小=2764800B 对齐=64B 总内存=42.2MB 格式=1
+[2026-10-22 15:28:44.413] [info] [t:14235] 解码帧内存池创建: 容量=16 分辨率=2560x720 水平stride=2560 槽位=2764800B
+[2026-10-22 15:28:44.413] [info] [t:14235] 视频解码器启动
+[2026-10-22 15:28:44.413] [error] [t:14235] UVC摄像头打开失败: /dev/video0 open: No such file or directory，累计 1
+[2026-10-22 15:28:44.413] [error] [t:14235] 主程序摄像头接收启动失败，视频链路降级
+[2026-10-22 15:28:44.413] [info] [t:14235] 目标估计器启动: shadow=true visual_fusion=false
+[2026-10-22 15:28:44.414] [info] [t:14235] 飞行控制器启动: period=50ms intent_timeout=300ms coast_timeout=1000ms bootstrap_timeout=6000ms feedforward=off cap=2.00m/s
+[2026-10-22 15:28:44.414] [info] [t:14274] 任务状态转移: BOOT -> SELF_CHECK reason=初始化完成
+[2026-10-22 15:28:44.414] [info] [t:14235] 任务状态机启动: shadow=true
+[2026-10-22 15:28:44.414] [info] [t:14235] 串口打开成功: device=/tmp/gcs_app baud=115200
+[2026-10-22 15:28:44.414] [info] [t:14235] 地面站通信启动: serial=/tmp/gcs_app@115200
+[2026-10-22 15:28:44.414] [info] [t:14235] 健康管理部件启动: source_count=6
+[2026-10-22 15:28:44.415] [warning] [t:14277] 健康数据源活动错误: camera
+[2026-10-22 15:28:44.415] [warning] [t:14277] 健康数据源活动错误: yolo
+[2026-10-22 15:28:44.415] [warning] [t:14277] 健康数据源活动错误: video
+[2026-10-22 15:28:44.417] [info] [t:14235] UDP 传输打开: udp:127.0.0.1:14540
+[2026-10-22 15:28:44.418] [info] [t:14235] PX4 通信启动: transport=udp:127.0.0.1:14540
+[2026-10-22 15:28:44.418] [info] [t:14235] 主程序启动完成: degraded=true
+[2026-10-22 15:28:44.418] [info] [t:14235] 正式主程序运行中，按Ctrl+C停止
+[2026-10-22 15:28:44.442] [info] [t:14245] [ControlLaw] 状态切换: 降级保持 -> 零速刹车 (判丢，零速刹车)
+[2026-10-22 15:28:44.442] [info] [t:14245] 视觉跟踪影子摘要: 模式=零速刹车 有效=true vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=true 距离=--(有效=0)
+[2026-10-22 15:28:44.542] [info] [t:14245] 视觉跟踪影子摘要: 模式=零速刹车 有效=true vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=false 距离=--(有效=0)
+[2026-10-22 15:28:45.123] [info] [t:14278] PX4 心跳已连接: source=1/1 mode=4/3 armed=false
+[2026-10-22 15:28:45.123] [info] [t:14278] PX4 遥测请求已入队: one_shot=3 intervals=9
+[2026-10-22 15:28:45.124] [info] [t:14278] PX4 电池参数读取完成: BAT_LOW_THR=15.0% COM_LOW_BAT_ACT=0
+[2026-10-22 15:28:45.130] [info] [t:14278] PX4 固件版本上报: reported=1.17.0 configured=1.17.0 capabilities=59647
+[2026-10-22 15:28:45.134] [info] [t:14278] PX4 命令 ACK: sequence=1 command=512 result=0 internal=true progress=0
+[2026-10-22 15:28:45.138] [info] [t:14278] PX4 命令 ACK: sequence=2 command=512 result=0 internal=true progress=0
+[2026-10-22 15:28:45.142] [info] [t:14278] PX4 命令 ACK: sequence=3 command=512 result=0 internal=true progress=0
+[2026-10-22 15:28:45.154] [info] [t:14278] PX4 命令 ACK: sequence=4 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.166] [info] [t:14278] PX4 命令 ACK: sequence=5 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.178] [info] [t:14278] PX4 命令 ACK: sequence=6 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.186] [info] [t:14278] PX4 命令 ACK: sequence=7 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.198] [info] [t:14278] PX4 命令 ACK: sequence=8 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.206] [info] [t:14278] PX4 命令 ACK: sequence=9 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.215] [info] [t:14274] 任务状态转移: SELF_CHECK -> READY reason=PX4导航快照满足GPS引导前置条件
+[2026-10-22 15:28:45.218] [info] [t:14278] PX4 命令 ACK: sequence=10 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.226] [info] [t:14278] PX4 命令 ACK: sequence=11 command=511 result=0 internal=true progress=0
+[2026-10-22 15:28:45.235] [info] [t:14278] PX4 命令 ACK: sequence=12 command=511 result=0 internal=true progress=0

@@ -31,6 +31,9 @@ namespace drone::video {
 
 namespace {
 
+// CameraReceiver 数据流：avformat 拉取 RTSP 访问单元 → EncodedFrame Topic；
+// 本模块只负责接收与重连，不解码，参数集作为独立流级消息发送给解码器。
+
 /// 单调时钟毫秒（与消息头时间戳约定一致）。
 std::uint64_t SteadyNowMs() {
     return static_cast<std::uint64_t>(
@@ -54,6 +57,7 @@ std::string AvErrorToString(int errnum) {
 }  // namespace
 
 /// CameraReceiver 实现细节（PIMPL）：FFmpeg 上下文与接收线程。
+// PIMPL 隔离 FFmpeg 资源；接收线程独占 format_ctx，外部只读取原子统计量和输出 Topic。
 struct CameraReceiver::Impl {
     explicit Impl(CameraReceiverConfig config) : config(std::move(config)) {
         if (this->config.rtsp_url.empty()) {
@@ -84,12 +88,14 @@ struct CameraReceiver::Impl {
     common::Topic<common::EncodedFrame> stream_output;
 
     /// avformat 中断回调：停止请求时返回 1，打断阻塞中的网络读写。
+    // Stop 只需设置 stop_requested，FFmpeg 的阻塞调用会通过此回调尽快返回。
     static int InterruptCallback(void* opaque) {
         const auto* self = static_cast<Impl*>(opaque);
         return self->stop_requested.load() ? 1 : 0;
     }
 
     /// 打开 RTSP 流并完成探测；失败返回 false（已记录错误日志）。
+    // 建连成功后确定视频流索引和编码类型，并先发布一次流级 extradata 参数集。
     bool OpenStream() {
         if (stop_requested.load()) {
             return false;
@@ -99,8 +105,8 @@ struct CameraReceiver::Impl {
         av_dict_set(&options, "rtsp_transport", config.rtsp_transport.c_str(), 0);
         // 以下选项与已验证成功拉流的原型 videoPart/rtsp_yolo_stream/rtsp_decoder.cpp
         // 保持一致：nobuffer+discardcorrupt（低延迟+丢坏包）、禁用 RTP 重排（防 SPS/PPS
-        // 与 IDR 顺序打乱导致 rkmpp 收不到参数集）、无额外延迟、小 TCP 缓冲、临时
-        // stimeout。这些是实测可稳定解析本摄像头 H265 流的组合。
+        // 与 IDR 顺序打乱导致 rkmpp 收不到参数集）、无额外延迟、小 TCP 缓冲、建连
+        // timeout。这些是实测可稳定解析本摄像头 H265 流的组合。
         av_dict_set(&options, "fflags", "nobuffer+discardcorrupt", 0);
         av_dict_set(&options, "reorder_queue_size", "0", 0);
         av_dict_set(&options, "max_delay", "0", 0);
@@ -109,7 +115,9 @@ struct CameraReceiver::Impl {
         av_dict_set(&options, "buffer_size", "102400", 0);
         const std::string timeout_us =
             std::to_string(config.open_timeout.count() * 1000);
-        av_dict_set(&options, "stimeout", timeout_us.c_str(), 0);
+        // RTSP 建连超时（微秒）：旧名 stimeout 已在 FFmpeg 8 删除，
+        // timeout 为 5.1+ 正式替代，6.1/8.1 双版本通用
+        av_dict_set(&options, "timeout", timeout_us.c_str(), 0);
 
         format_ctx = avformat_alloc_context();
         if (format_ctx == nullptr) {
@@ -200,6 +208,7 @@ struct CameraReceiver::Impl {
     }
 
     /// 接收线程主循环：建连 → 读包发布 → 断流重连。
+    // av_read_frame 返回的 packet 视为一个可交给解码器的访问单元，不在此处拆码流。
     void ReceiveLoop() {
         while (!stop_requested.load()) {
             if (!OpenStream()) {
@@ -250,6 +259,7 @@ struct CameraReceiver::Impl {
         }
     }
 
+    // 停止接收：先触发 FFmpeg 中断回调，再等待线程退出，最后关闭当前 RTSP 上下文。
     void Stop() {
         if (!thread.joinable()) {
             return;

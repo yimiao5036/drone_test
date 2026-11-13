@@ -1,0 +1,73 @@
+[2026-10-22 15:27:40.737] [info] [t:13710] 异步文件日志已初始化: logs/0019_20261022_152740.log (等级=info)
+[2026-10-22 15:27:40.737] [info] [t:13710] PX4 通信部件创建: firmware=1.17.0 transport=udp:127.0.0.1:14540 onboard=1/191 target=1/1 mavlink=2
+[2026-10-22 15:27:40.738] [info] [t:13710] 目标估计器创建: model=linear_cv shadow=true control_output=false
+[2026-10-22 15:27:40.738] [info] [t:13710] 任务状态机创建: shadow=true control_output=false intent_valid_for_ms=300 handover(lock_frames=10 exit_lost_frames=30 timeout_ms=3000 fow_margin_deg=5.0 innovation_gate_m=3.0) fov_half(az=33.19deg el=10.56deg) servo=TrackingControlLaw(20.0Hz)
+[2026-10-22 15:27:40.738] [info] [t:13710] 飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线+控制权三态+Home 围栏已接入）
+[2026-10-22 15:27:40.738] [info] [t:13710] 任务状态机估计器诊断接口已注入: estimator=0x7ffc3c7e40b0
+[2026-10-22 15:27:40.740] [info] [t:13710] UDP 传输打开: udp:127.0.0.1:14540
+[2026-10-22 15:27:40.740] [info] [t:13710] PX4 通信启动: transport=udp:127.0.0.1:14540
+[2026-10-22 15:27:40.740] [info] [t:13710] 目标估计器启动: shadow=true visual_fusion=true
+[2026-10-22 15:27:40.740] [info] [t:13710] 任务状态机启动: shadow=true
+[2026-10-22 15:27:40.740] [info] [t:13715] 任务状态转移: BOOT -> SELF_CHECK reason=初始化完成
+[2026-10-22 15:27:40.740] [info] [t:13710] 飞行控制器启动: period=50ms intent_timeout=300ms coast_timeout=1000ms bootstrap_timeout=6000ms feedforward=off cap=2.00m/s
+[2026-10-22 15:27:41.433] [info] [t:13713] PX4 心跳已连接: source=1/1 mode=4/3 armed=false
+[2026-10-22 15:27:41.434] [info] [t:13713] PX4 遥测请求已入队: one_shot=3 intervals=9
+[2026-10-22 15:27:41.434] [info] [t:13713] PX4 电池参数读取完成: BAT_LOW_THR=15.0% COM_LOW_BAT_ACT=0
+[2026-10-22 15:27:41.434] [info] [t:13713] PX4 固件版本上报: reported=1.17.0 configured=1.17.0 capabilities=59647
+[2026-10-22 15:27:41.436] [info] [t:13713] PX4 命令 ACK: sequence=1 command=512 result=0 internal=true progress=0
+[2026-10-22 15:27:41.441] [info] [t:13713] PX4 命令 ACK: sequence=2 command=512 result=0 internal=true progress=0
+[2026-10-22 15:27:41.442] [info] [t:13715] 任务状态转移: SELF_CHECK -> READY reason=PX4导航快照满足GPS引导前置条件
+[2026-10-22 15:27:41.445] [info] [t:13713] PX4 命令 ACK: sequence=3 command=512 result=0 internal=true progress=0
+[2026-10-22 15:27:41.453] [info] [t:13713] PX4 命令 ACK: sequence=4 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.465] [info] [t:13713] PX4 命令 ACK: sequence=5 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.473] [info] [t:13713] PX4 命令 ACK: sequence=6 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.481] [info] [t:13713] PX4 命令 ACK: sequence=7 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.489] [info] [t:13713] PX4 命令 ACK: sequence=8 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.497] [info] [t:13713] PX4 命令 ACK: sequence=9 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.505] [info] [t:13713] PX4 命令 ACK: sequence=10 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.513] [info] [t:13713] PX4 命令 ACK: sequence=11 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:41.521] [info] [t:13713] PX4 命令 ACK: sequence=12 command=511 result=0 internal=true progress=0
+[2026-10-22 15:27:43.437] [info] [t:13713] PX4 命令 ACK: sequence=13 command=176 result=0 internal=false progress=0
+[2026-10-22 15:27:44.444] [info] [t:13713] PX4 命令 ACK: sequence=14 command=400 result=0 internal=false progress=0
+[2026-10-22 15:27:45.440] [warning] [t:13716] 飞行控制器控制权迁移: IDLE -> ACTIVE (授权链全通)
+[2026-10-22 15:27:45.993] [info] [t:13713] PX4 命令 ACK: sequence=15 command=176 result=0 internal=false progress=0
+[2026-10-22 15:27:46.440] [warning] [t:13716] 飞行控制器控制权迁移: ACTIVE -> IDLE (授权链断开)
+[2026-10-22 15:27:46.509] [warning] [t:13714] PX4 Home变化（诊断记录，估计器不重置）: 旧=(47.3979713,8.5461635,0.230m) 新=(47.3979711,8.5461636,0.214m) gps_fix=3 卫星=10 eph=0.70m epv=1.10m 锚点ref=(47.3979711,8.5461638,0.27m,收1) 局部位置=(0.01,-0.01,0.03)
+[2026-10-22 15:27:48.793] [info] [t:13713] PX4 命令 ACK: sequence=16 command=176 result=0 internal=false progress=0
+[2026-10-22 15:27:49.440] [warning] [t:13716] 飞行控制器控制权迁移: IDLE -> ACTIVE (授权链全通)
+[2026-10-22 15:27:59.606] [info] [t:13714] 目标估计已接受地面站观测: target_id=1 seq=1 N=149.99 E=-0.01 D=-0.94 VN=0.00 VE=0.00 altitude_valid=true count=1
+[2026-10-22 15:27:59.664] [info] [t:13715] 状态机收到地面站目标: boot=893583361 seq=1 target_id=1 valid_for_ms=2000 age_ms=0 count=1
+[2026-10-22 15:27:59.664] [info] [t:13715] 任务状态转移: READY -> GPS_APPROACH reason=收到有效地面站目标，进入GPS_APPROACH影子验证
+[2026-10-22 15:27:59.764] [info] [t:13715] GPS_APPROACH 位置引导意图启动: target_id=1 pos=(149.99,-0.01,-0.94) ff_mask=0x00 ff=(0.00,0.00,0.00)
+[2026-10-22 15:27:59.890] [warning] [t:13716] 飞行控制器围栏水平半径钳制: r=149.99 > max=100.00 累计=1
+[2026-10-22 15:28:01.658] [info] [t:13714] 目标估计器重新初始化: reason=target_id_changed target_id=2
+[2026-10-22 15:28:06.548] [info] [t:13714] 目标估计已接受视觉观测: frame=1 N=40.21 E=-0.01 D=-1.00 sigma=9.073m z=33.96m 创新=0.22m count=1
+[2026-10-22 15:28:07.680] [info] [t:13715] 交接冻结最后位置目标: pos=(39.99,-0.01,-0.95) frame_id=3
+[2026-10-22 15:28:07.680] [info] [t:13715] 任务状态转移: GPS_APPROACH -> VISUAL_HANDOVER reason=交接进入判据满足（连续锁定/测距有效/视场余量/创新门限）
+[2026-10-22 15:28:07.680] [info] [t:13715] 交接冻结位置意图续发: 滚动续期直至视觉伺服接续
+[2026-10-22 15:28:07.780] [info] [t:13715] 任务状态转移: VISUAL_HANDOVER -> VISUAL_TRACKING reason=交接验证通过（视觉链持续推进），进入VISUAL_TRACKING
+[2026-10-22 15:28:07.780] [info] [t:13715] [ControlLaw] 状态切换: 降级保持 -> 速度航向 (正常跟踪)
+[2026-10-22 15:28:07.780] [info] [t:13715] S7 视觉伺服意图启动: type=速度航向 vx=0.10 vy=0.00 vz=-0.08 yaw_rate=0.1dps
+[2026-10-22 15:28:07.880] [info] [t:13715] 位置引导意图停止: 视觉伺服接续
+[2026-10-22 15:28:07.880] [info] [t:13715] [ControlLaw] 状态切换: 速度航向 -> 零速刹车 (判丢，零速刹车)
+[2026-10-22 15:28:09.583] [info] [t:13715] 交接段收口: 停止冻结位置续发/视觉伺服意图
+[2026-10-22 15:28:09.583] [info] [t:13715] 任务状态转移: VISUAL_TRACKING -> GPS_APPROACH reason=视觉连续丢失达退出迟滞门限，回退GPS_APPROACH
+[2026-10-22 15:28:09.583] [info] [t:13715] GPS_APPROACH 位置引导意图启动: target_id=2 pos=(39.99,-0.01,-0.96) ff_mask=0x07 ff=(-0.00,-0.00,-0.00)
+[2026-10-22 15:28:11.715] [warning] [t:13714] 目标估计状态已过期: target_id=2 last_observed_ms=2032017
+[2026-10-22 15:28:11.786] [warning] [t:13715] GPS_APPROACH影子状态目标过期: count=1
+[2026-10-22 15:28:11.786] [warning] [t:13715] GPS_APPROACH 位置引导意图停止: 估计无效或超龄 count=1
+[2026-10-22 15:28:11.999] [warning] [t:13716] 飞行控制器拒绝意图(意图持有期超龄): 累计=1
+[2026-10-22 15:28:11.999] [warning] [t:13716] 飞行控制器控制权迁移: ACTIVE -> COAST (意图持有期超龄)
+[2026-10-22 15:28:13.049] [warning] [t:13716] 飞行控制器控制权迁移: COAST -> IDLE (COAST 超时)
+[2026-10-22 15:28:14.350] [info] [t:13713] PX4 命令 ACK: sequence=17 command=176 result=0 internal=false progress=0
+[2026-10-22 15:28:17.958] [info] [t:13713] PX4 命令 ACK: sequence=18 command=400 result=0 internal=false progress=0
+[2026-10-22 15:28:18.349] [info] [t:13710] 飞行控制器停止: setpoint_count=436 rejected_intent_count=1
+[2026-10-22 15:28:18.394] [info] [t:13710] 任务状态机停止
+[2026-10-22 15:28:18.394] [warning] [t:13710] PX4 Home变化窗口汇总（停止）: 窗口=0.0s 变化=1次 首=(47.3979710,8.5461637,0.212m) 末=(47.3979710,8.5461637,0.212m) 水平范围=0.0x0.0m 净漂移=0.0m 高度净漂移=+0.00m 高度范围=0.00m 最大单步=0.01m gps_fix=3 卫星=10 eph=0.70m epv=1.10m 锚点ref=(47.3979711,8.5461638,0.27m,收1) 局部位置=(14.86,0.07,0.03)
+[2026-10-22 15:28:18.394] [info] [t:13710] 目标估计器停止
+[2026-10-22 15:28:18.402] [info] [t:13713] PX4 通信线程停止，连接状态置为断开
+[2026-10-22 15:28:18.402] [info] [t:13710] UDP 传输关闭: udp:127.0.0.1:14540
+[2026-10-22 15:28:18.402] [info] [t:13710] PX4 通信停止: transport=udp:127.0.0.1:14540
+[2026-10-22 15:28:18.402] [info] [t:13710] 任务状态机销毁
+[2026-10-22 15:28:18.402] [info] [t:13710] 目标估计器销毁
+[2026-10-22 15:28:18.402] [info] [t:13710] PX4 通信部件销毁: transport=udp:127.0.0.1:14540

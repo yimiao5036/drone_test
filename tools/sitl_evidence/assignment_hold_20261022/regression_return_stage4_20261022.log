@@ -1,0 +1,104 @@
+PX4 链路冒烟测试
+  config: /mnt/e/dswj/无人机/香橙派的代码/drone_test/config/px4_sitl_return.json
+  transport: udp
+  device: /dev/ttyS1
+  baud: 115200
+  onboard: 1/191
+  target: 1/1
+  firmware: 1.17.0
+  duration: 120 秒
+  安全边界: SITL UDP S9~S14 返航专项（非门禁）：S7 锁定/测距 → S9/S10 自动授权发射 → S12 返航 → S13 AUTO.LAND → S14
+
+  整定参数: heading.gain=0.9 vertical.vz_gain=0.1 distance kp=0.5 ki=0.05 kd=0.1 d_exp=10m；剧本 dwell=25/15s，接近窗口 ≤20m
+  注入几何自检: 相机系互逆偏差 0 m，地理反解互逆偏差 1.69606e-10 m
+  整定 CSV: /mnt/e/dswj/无人机/香橙派的代码/drone_test/build/logs/stage4_tune_20261022_194913.csv
+  整定: phase=bootstrap 状态机=1 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] 引导阶段开始：注入零速度引导流
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] Offboard 模式请求已入队
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] ARM 请求已入队
+  整定: phase=bootstrap 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=IDLE
+[SITL] 起飞目标已锁定: N=-0.0351435 E=-0.0257802 D=-1.03608
+[SITL] 控制器已接管设定值流（授权链全通）
+[SITL] 接管完成，进入工具位置引导起飞段
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=takeoff 状态机=2 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+[SITL] 悬停稳定完成，注入主目标（北向 40m），S5 位置引导接近至 20m 内
+[SITL] 状态机已接管意图流（S5 位置引导），工具停止注入引导意图
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+  整定: phase=approach 状态机=5 目标N=40 E=0 up=1 射程=nan 控制权=ACTIVE
+[SITL] 已进入射程（水平间隙 19.9777m），开始注入模拟视觉观测（SEARCHING → LOCKED）
+  整定: phase=visual_inject 状态机=5 目标N=40 E=0 up=1 射程=19.5613 控制权=ACTIVE
+[SITL] S7 已启动，等待 S9/S10 自动拦截（interception.enabled）→ 返航/降落
+  整定: phase=intercept_return 状态机=7 目标N=40 E=0 up=1 射程=17.5441 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=7 目标N=40 E=0 up=1 射程=16.1579 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=7 目标N=40 E=0 up=1 射程=14.5793 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=7 目标N=40 E=0 up=1 射程=12.6825 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=12 目标N=40 E=0 up=1 射程=11.6424 控制权=ACTIVE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=COAST
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+  整定: phase=intercept_return 状态机=13 目标N=40 E=0 up=1 射程=11.6424 控制权=IDLE
+[SITL] S11~S14 返航/降落/上锁完成（状态机接管）
+
+========== stage4-return S9~S14 返航专项报告（非门禁）==========
+[PASS] 剧本走通（含过期停发链）
+[PASS] CSV 记录可写
+[PASS] 飞行未触发安全回收
+[PASS] 控制器无异常计数
+[PASS] AUTO.LAND landed + 主动 DISARM 确认
+[PASS] S9 INTERCEPT_READY 进入
+[PASS] S10 INTERCEPT_EXECUTING 进入（发射）
+[PASS] S12 RETURN_HOME 进入
+[PASS] S13 AUTO.LAND 进入
+[PASS] S14 DISARMED 完成
+[PASS] 187 触发 ACK accepted
+[PASS] 187 复位 ACK accepted
+[PASS] 187 复位保持时序(reset_delay~+500ms)
+[PASS] 187 ACK 无超时/多余命令
+187 实测: 触发 ACK 830091ms，复位 ACK 831699ms，间隔 1608ms（reset_delay 1500ms，容差 500ms；无超时/多余=是）
+S9~S14 实测: 状态机接管返航=是，迁移 11 次，错误 0 次
+包线: 最大相对高度 4.9902 m，最大北向 28.9668 m，最大东西 0.313375 m；状态机迁移 11 次，错误 0 次
+结果: S9~S14 返航专项通过

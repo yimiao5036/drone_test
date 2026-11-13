@@ -1,0 +1,149 @@
+PX4 链路冒烟测试
+  config: /mnt/e/dswj/无人机/香橙派的代码/drone_test/config/px4_sitl.json
+  transport: udp
+  device: /dev/ttyS1
+  baud: 115200
+  onboard: 1/191
+  target: 1/1
+  firmware: 1.17.0
+  duration: 150 秒
+  安全边界: SITL UDP 装配状态机全链（G3）：注入地面站目标 + 模拟视觉观测，走通 S5/S6/S7/回退/停发；含围栏钳制与模式停发补验
+
+  状态机: lock_frames=10 exit_lost_frames=30 handover_timeout=3000ms innovation_gate=3m fow_margin=5deg intent_valid=300ms
+  注入几何: 探针目标北向 150m（> 围栏半边长 100m），主目标北向 40m，目标高度 +1m；相机 1280x720 fx=1007.82
+  注入几何自检: 相机系互逆偏差 0 m，地理反解互逆偏差 1.69606e-10 m
+[0s] connected=否 armed=否 mode=0/0 landed=未知 gps=无/不足 global=否 local=否 attitude=否 battery=否 home=否 rc=否
+  状态机: state=1 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[状态变化] connected=是 armed=否 mode=4/3
+[SITL] 引导阶段开始：注入零速度引导流
+[1s] connected=是 armed=否 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[2s] connected=是 armed=否 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[SITL] Offboard 模式请求已入队
+[3s] connected=是 armed=否 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[状态变化] connected=是 armed=否 mode=6/0
+[SITL] ARM 请求已入队
+[4s] connected=是 armed=否 mode=6/0 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[状态变化] connected=是 armed=是 mode=6/0
+[SITL] 起飞目标已锁定: N=0.0121999 E=-0.0244807 D=-1.00315
+[SITL] 控制器已接管设定值流（授权链全通：armed+Offboard+请求位）
+[SITL] 第一轮接管完成，进入切非 Offboard 停发补验段
+[SITL] 切非 Offboard(AUTO.LOITER) 请求已入队
+[5s] connected=是 armed=是 mode=6/0 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[状态变化] connected=是 armed=是 mode=4/3
+[SITL] 控制器已停发：首见非 Offboard→停发 20 ms（上限 200ms），停发后额外发送 0 条
+[SITL] 引导阶段开始（重入 Offboard）：注入零速度引导流
+[6s] connected=是 armed=是 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[7s] connected=是 armed=是 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[SITL] Offboard 模式请求已入队
+[8s] connected=是 armed=是 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=IDLE
+[状态变化] connected=是 armed=是 mode=6/0
+[SITL] 控制器已接管设定值流（授权链全通：armed+Offboard+请求位）（第二轮）
+[SITL] 第二轮接管完成，进入工具位置引导起飞段
+[9s] connected=是 armed=是 mode=6/0 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[10s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[11s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[12s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[13s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[14s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[15s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[16s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[17s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[18s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=2 warnings=0x0 注入目标北向=0 视觉=停 卡尔曼=未初始化 控制权=ACTIVE
+[SITL] 悬停稳定完成，注入围栏外目标（北向 150m > 围栏半边长 100m）
+[SITL] 围栏多边形诊断: valid=1 顶点=4 zone=1/1 高度带上限=30 锚点有效=1 Home有效=1
+[SITL] 状态机已接管意图流（S5 位置引导），工具停止注入引导意图
+[19s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=150 视觉=停 卡尔曼=有效 估计(N/E/D)=(150.013,-0.0452937,-1.031) 控制权=ACTIVE
+[20s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=150 视觉=停 卡尔曼=有效 估计(N/E/D)=(150.013,-0.0452937,-1.031) 控制权=ACTIVE
+[SITL] 围栏钳制证据成立：ClampedCount +38，最大位置设定值水平模长 98.873 m（围栏 100 m）；换注入近距目标（北向 40m）
+[21s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=40 视觉=停 卡尔曼=有效 估计(N/E/D)=(40.0132,-0.0452937,-1.031) 控制权=ACTIVE
+[22s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=40 视觉=停 卡尔曼=有效 估计(N/E/D)=(40.0132,-0.0452937,-1.031) 控制权=ACTIVE
+[SITL] S5 位置引导稳定，开始注入模拟视觉观测（SEARCHING → LOCKED）
+[SITL] 注入 LOCKED 帧序列（lock_frames=10，exit_lost_frames=30，创新门限 3m）
+[23s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=40 视觉=注入中 卡尔曼=有效 估计(N/E/D)=(40.0136,-0.0414126,-1.02637) 控制权=ACTIVE
+[SITL] S6→S7 完成：交接缝间隔 200 ms（上限 300 ms，窗口内 COAST=否；伺服接管前意图最大间隔 101 ms；S6 冻结续发意图观察=是），视觉伺服意图已启动，进入短期 LOST 注入段
+[24s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=7 warnings=0x0 注入目标北向=40 视觉=注入中 卡尔曼=有效 估计(N/E/D)=(40.0112,-0.0388108,-1.02251) 控制权=ACTIVE
+[SITL] 短期 LOST 10 帧注入完成：状态=7（期望 S7 保持），刹车意图=是
+[25s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=7 warnings=0x0 注入目标北向=40 视觉=注入中 卡尔曼=有效 估计(N/E/D)=(40.0111,-0.0385338,-1.0219) 控制权=ACTIVE
+[SITL] 持续 LOST 回退 S5（控制权不中断），等待卡尔曼备份接管
+[SITL] 卡尔曼备份位置意图恢复：是；停止注入目标（过期）
+[26s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=40 视觉=停 卡尔曼=有效 估计(N/E/D)=(40.0116,-0.0400876,-1.02333) 控制权=ACTIVE
+[27s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x0 注入目标北向=40 视觉=停 卡尔曼=有效 估计(N/E/D)=(40.0117,-0.0406594,-1.02343) 控制权=ACTIVE
+[SITL] 目标过期后意图停发，控制器进入 COAST 零速刹车
+[28s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x2 注入目标北向=40 视觉=停 卡尔曼=失效 估计(N/E/D)=(40.0118,-0.0410023,-1.02349) 控制权=COAST
+[SITL] 控制器转 IDLE 停发（COAST 超时），等待 PX4 退出 Offboard
+[29s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x2 注入目标北向=40 视觉=停 卡尔曼=失效 估计(N/E/D)=(40.0118,-0.0410023,-1.02349) 控制权=IDLE
+[30s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x2 注入目标北向=40 视觉=停 卡尔曼=失效 估计(N/E/D)=(40.0118,-0.0410023,-1.02349) 控制权=IDLE
+[状态变化] connected=是 armed=是 mode=4/5
+[SITL] PX4 已退出 Offboard: mode=4/5（IDLE 后 1272 ms）
+[SITL] AUTO.LAND 模式请求已入队
+[31s] connected=是 armed=是 mode=4/5 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x2 注入目标北向=40 视觉=停 卡尔曼=失效 估计(N/E/D)=(40.0118,-0.0410023,-1.02349) 控制权=IDLE
+[状态变化] connected=是 armed=是 mode=4/6
+[32s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x2 注入目标北向=40 视觉=停 卡尔曼=失效 估计(N/E/D)=(40.0118,-0.0410023,-1.02349) 控制权=IDLE
+[33s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+  状态机: state=5 warnings=0x2 注入目标北向=40 视觉=停 卡尔曼=失效 估计(N/E/D)=(40.0118,-0.0410023,-1.02349) 控制权=IDLE
+[SITL] PX4 已确认降落，准备主动 DISARM
+[SITL] DISARM 请求已入队
+
+========== stage4-mission 全链门禁报告（G3：状态机 → FlightController → Px4Link → PX4）==========
+[PASS] PX4 HEARTBEAT
+[PASS] 测试结束时心跳仍连接
+[PASS] 引导零速度流已注入(≥20 条)
+[PASS] 控制器已接管设定值流(第一轮授权链全通)
+[PASS] 切非 Offboard 停发时延 ≤200ms
+[PASS] 切回 Offboard 重新接管(第二轮授权链全通)
+[PASS] 相对起飞 1m 稳定悬停完成
+[PASS] 围栏钳制: 位置设定值未超围栏半边长
+[PASS] 状态机接管意图流(S5 位置引导 reason=7)
+[PASS] 迁移序列 S5→S6→S7→(LOST 回退)S5
+[PASS] 交接缝意图无超龄(末条S5位置意图→首条S7速度意图 < intent_timeout 且未跌入 COAST)
+[PASS] S7 视觉伺服意图启动(control_source=1)
+[PASS] 短期 LOST 保持 S7 且输出零速刹车意图
+[PASS] 持续 LOST 回退 S5 且卡尔曼备份接管(位置意图恢复)
+[PASS] 交接/回退全程速度设定值连续(≤max_accel×1.5)
+[PASS] 目标过期: 告警位/停发/COAST/IDLE/退出 Offboard 链完整
+[PASS] AUTO.LAND 请求/ACK accepted/PX4 已确认 landed
+[PASS] 主动 DISARM 前未被自动上锁
+[PASS] DISARM ACK accepted 且已确认 disarmed
+[PASS] 飞行未触发高度/漂移安全回收
+[PASS] 控制器无异常计数(未支持意图/未知来源)
+[PASS] LOCAL_POSITION_NED 收到 353 条
+[PASS] ATTITUDE 收到 382 条
+状态迁移序列: 0 → 1 → 2 → 5 → 6 → 7 → 5
+实测值: 切非Offboard→控制器停发 20 ms（上限 200，停发后额外发送 0 条），围栏探针最大设定值水平模长 98.873 m（围栏 100 m），速度设定值最大隐含加速度 2.5 m/s²（上限 3），交接缝（末条S5位置→首条S7速度） 200 ms（意图有效期 300 ms，窗口内 COAST=否，伺服接管前意图最大间隔 101 ms，S6 冻结续发观察=是）
+实测时延: 过期→COAST 2227 ms，COAST→IDLE 1060 ms，IDLE→退出 Offboard 1272 ms（上限 2200），退出模式 4/5，停发后额外发送 0 条
+包线: 最大相对高度 1.05572 m，最大北向 14.9777 m，最大东西 0.130357 m，控制权最终态 IDLE
+状态机诊断: 迁移 6 次，错误 0 次（估计器错误计数见日志）
+控制器诊断: setpoint=436 rejected=1 clamped=42 error=0
+结果: stage4-mission 全链门禁通过

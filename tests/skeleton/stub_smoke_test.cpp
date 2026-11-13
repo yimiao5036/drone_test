@@ -175,7 +175,8 @@ TEST(StubSmokeTest, CommonTypesDefaultValues) {
     EXPECT_EQ(intent.type, common::ControlIntentType::kNone);
 
     common::FlightStateSnapshot snapshot;
-    EXPECT_TRUE(snapshot.landed);
+    EXPECT_FALSE(snapshot.landed);
+    EXPECT_FALSE(snapshot.landed_state_valid);
     EXPECT_FALSE(snapshot.connected);
 
     common::MissionStatus status;

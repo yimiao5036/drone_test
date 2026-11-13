@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 
+#include "common/latency_statistics.h"
 #include "video/video_frame.h"
 
 namespace drone::video_transmission {
@@ -43,6 +44,7 @@ struct EncoderBackendConfig {
     std::string output_format = "rtsp";  ///< 输出封装：rtsp(默认) / mpegts(本地文件调试)
     std::string output_url = "";         ///< 实际输出地址（非空时优先于 url，本地文件调试用）
     bool prefer_hardware = true;    ///< 优先 rkmpp 硬编码（香橙派）；否则软编码
+    bool collect_detailed_latency = true;  ///< 帧准备/写包细分统计；false=只留ingress→RTSP链（探针首尾模式）
 };
 
 /// 视频编码 + 图传推送后端抽象接口。
@@ -72,6 +74,10 @@ public:
     virtual std::uint64_t SentFrameCount() const = 0;
     /// 累计错误次数。
     virtual std::uint64_t ErrorCount() const = 0;
+    /// NV12复制/软编色彩转换耗时。
+    virtual common::LatencySummary FramePrepareLatency() const = 0;
+    /// 单个编码输出包写入本地文件/RTSP会话的调用耗时。
+    virtual common::LatencySummary PacketWriteLatency() const = 0;
 };
 
 /// 按配置创建默认编码后端（FFmpeg 封装：rkmpp 硬编优先 / 软编回退）。

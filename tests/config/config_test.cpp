@@ -1,0 +1,1444 @@
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+
+#include "config/config.h"
+#include "config/zone_store.h"
+
+namespace {
+
+using nlohmann::json;
+
+std::string SourceConfigPath() {
+    return std::string(TEST_SOURCE_DIR) + "/config/config.json";
+}
+
+json ReadSourceConfig() {
+    std::ifstream input(SourceConfigPath());
+    EXPECT_TRUE(input.is_open());
+    return json::parse(input);
+}
+
+void CopyRectifyMatricesBeside(const std::filesystem::path& config_path) {
+    // 预置校正矩阵与 config.json 同目录解析；临时配置也要有伴生矩阵文件
+    // （仅 enable_stereo_ranging=true 的用例会读取）。
+    const auto source = std::filesystem::path(TEST_SOURCE_DIR) / "config" /
+                        "stereo_rectify_uvc_1280x720.json";
+    if (!std::filesystem::exists(source)) {
+        return;
+    }
+    std::filesystem::copy_file(
+        source, config_path.parent_path() / "stereo_rectify_uvc_1280x720.json",
+        std::filesystem::copy_options::overwrite_existing);
+}
+
+std::filesystem::path WriteTemporaryConfig(json value, const char* name) {
+    const auto path = std::filesystem::temp_directory_path() / name;
+    std::ofstream output(path);
+    output << value.dump(2);
+    output.close();
+    CopyRectifyMatricesBeside(path);
+    return path;
+}
+
+TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+
+    EXPECT_TRUE(config.runtime.enable_video);
+    EXPECT_TRUE(config.runtime.enable_px4);
+    EXPECT_TRUE(config.runtime.enable_ground_station);
+    EXPECT_TRUE(config.runtime.enable_target_estimator);
+    EXPECT_TRUE(config.runtime.enable_visual_monitor);
+    // 2026-10-30 维护者决定：现场实测期仓库默认配置打开控制输出（G5 首飞前），
+    // 不再把 enable_control 锁死为 false；回影子只需改配置重启。
+    EXPECT_TRUE(config.runtime.enable_control);
+    EXPECT_EQ(config.health.cpu_sample_period.count(), 1000);
+    EXPECT_EQ(config.health.startup_grace_period.count(), 5000);
+    EXPECT_EQ(config.health.camera_max_age.count(), 1000);
+    EXPECT_EQ(config.health.decoder_max_age.count(), 1000);
+    EXPECT_EQ(config.health.yolo_max_age.count(), 1000);
+    EXPECT_EQ(config.health.video_max_age.count(), 1000);
+    EXPECT_EQ(config.health.px4_max_age.count(), 3000);
+    EXPECT_EQ(config.health.ground_station_max_age.count(), 3000);
+    EXPECT_EQ(config.px4.transport, "serial");
+    EXPECT_EQ(config.px4.onboard_system_id, 1);
+    EXPECT_EQ(config.px4.onboard_component_id, 191);
+    EXPECT_EQ(config.px4.target_system_id, 1);
+    EXPECT_EQ(config.px4.target_component_id, 1);
+    EXPECT_EQ(config.px4.serial.device, "/dev/ttyS1");
+    EXPECT_EQ(config.ground_station.aircraft_system_id, 1);
+    EXPECT_EQ(config.ground_station.aircraft_component_id, 25);
+    EXPECT_EQ(config.ground_station.aircraft_type, "net_capture");
+    EXPECT_EQ(config.ground_station.aircraft_number, 1);
+    EXPECT_EQ(config.ground_station.callsign, "捕网-01");
+    EXPECT_EQ(config.ground_station.ground_system_id, 255);
+    EXPECT_EQ(config.ground_station.ground_component_id, 190);
+    EXPECT_EQ(config.ground_station.serial.device, "/dev/ttyS6");
+    EXPECT_EQ(config.ground_station.serial.baud_rate, 115200);
+    EXPECT_EQ(config.ground_station.serial.data_bits, 8);
+    EXPECT_EQ(config.ground_station.mavlink_version, 2);
+    EXPECT_TRUE(config.ground_station.enable_time_sync);
+    EXPECT_EQ(config.ground_station.time_sync_acquire_interval.count(), 200);
+    EXPECT_EQ(config.ground_station.time_sync_steady_interval.count(), 1000);
+    EXPECT_EQ(config.ground_station.time_sync_minimum_samples, 5u);
+    EXPECT_EQ(config.ground_station.time_sync_window_capacity, 10u);
+    EXPECT_EQ(config.ground_station.time_sync_timeout.count(), 5000);
+    EXPECT_EQ(config.ground_station.time_sync_max_rtt.count(), 300);
+    EXPECT_EQ(config.ground_station.time_sync_max_offset_jump.count(), 100);
+    EXPECT_EQ(config.ground_station.target_minimum_valid_for.count(), 100);
+    EXPECT_EQ(config.ground_station.target_maximum_valid_for.count(), 5000);
+    EXPECT_EQ(config.ground_station.target_minimum_remaining_valid.count(), 100);
+    EXPECT_EQ(config.ground_station.target_maximum_transport_delay.count(), 1000);
+    EXPECT_EQ(config.ground_station.target_future_tolerance.count(), 200);
+    EXPECT_EQ(config.ground_station.attitude_send_interval.count(), 100);
+    EXPECT_EQ(config.ground_station.health_status_send_interval.count(), 1000);
+    EXPECT_EQ(config.ground_station.mission_status_send_interval.count(), 500);
+    EXPECT_EQ(config.target_estimator.ground_target_queue_capacity, 4U);
+    EXPECT_EQ(config.target_estimator.flight_state_queue_capacity, 2U);
+    EXPECT_EQ(config.target_estimator.publish_interval.count(), 100);
+    EXPECT_DOUBLE_EQ(config.target_estimator.process_acceleration_std_mps2, 8.0);
+    EXPECT_DOUBLE_EQ(config.target_estimator.default_horizontal_accuracy_m, 10.0);
+    EXPECT_EQ(config.visual_monitor.input_queue_capacity, 2U);
+    EXPECT_EQ(config.visual_monitor.publish_interval.count(), 100);
+    EXPECT_EQ(config.visual_monitor.observation_timeout.count(), 500);
+    EXPECT_EQ(config.visual_monitor.acquire_lock_frames, 5);
+    EXPECT_EQ(config.visual_monitor.lost_frames, 10);
+    EXPECT_DOUBLE_EQ(config.visual_monitor.smoothing_alpha, 0.3);
+    EXPECT_EQ(config.visual_monitor.transition_log_interval.count(), 1000);
+    EXPECT_EQ(config.visual_monitor.status_log_interval.count(), 5000);
+    EXPECT_TRUE(config.decoder.prefer_rga_dma_transfer);
+    // 生产配置已切换 USB 双目 UVC 链路（提交 cd1b4eb），RTSP 为保留备份
+    EXPECT_EQ(config.video_source.camera_source, "uvc");
+    EXPECT_TRUE(config.video_source.stereo_split);
+    EXPECT_EQ(config.uvc_camera.device, "/dev/video0");
+    EXPECT_EQ(config.uvc_camera.width, 2560u);
+    EXPECT_EQ(config.uvc_camera.height, 720u);
+    EXPECT_EQ(config.uvc_camera.fps, 30u);
+    EXPECT_EQ(config.stereo_splitter.width, 2560u);
+    EXPECT_EQ(config.stereo_splitter.height, 720u);
+    // 生产配置已切换 384x640 矩形输入模型（提交 cdde006）
+    EXPECT_EQ(config.yolo.model_path,
+              "/opt/drone/models/yolov26_ReLU6_09_13-rk3588_384_640.rknn");
+    EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
+    EXPECT_EQ(config.yolo.npu_core_mode, "all");
+    EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
+    EXPECT_FALSE(config.yolo.collect_npu_perf_detail);
+    EXPECT_EQ(config.video_sender.encode.url,
+              "rtsp://127.0.0.1:8554/drone_25_1");
+    // 视觉跟踪控制律（影子）：camera 组为 2026-09-23 左目标定实测内参
+    EXPECT_TRUE(config.runtime.enable_visual_tracking);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.fx_px, 1007.82);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.fy_px, 1008.02);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cx_px, 620.73);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cy_px, 532.07);
+    EXPECT_EQ(config.visual_tracking.camera.image_width, 1280);
+    EXPECT_EQ(config.visual_tracking.camera.image_height, 720);
+    // 2026-11-11：S7 跟随状态机 10Hz；影子独立 20Hz。
+    EXPECT_DOUBLE_EQ(config.visual_tracking.control.frequency_hz, 10.0);
+    EXPECT_DOUBLE_EQ(config.visual_tracking_shadow.frequency_hz, 20.0);
+    EXPECT_TRUE(config.visual_tracking_shadow.virtual_attitude_when_absent);
+}
+
+TEST(ConfigTest, DefaultsVisualTrackingWhenSectionMissing) {
+    json value = ReadSourceConfig();
+    value.erase("visual_tracking");
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 段缺席回退默认值（即 2026-09-23 标定实测内参）
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.fx_px, 1007.82);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.camera.cy_px, 532.07);
+    EXPECT_EQ(config.visual_tracking.heading.mode,
+              drone::control::HeadingMode::kRate);
+    EXPECT_DOUBLE_EQ(config.visual_tracking.control.frequency_hz, 10.0);
+    EXPECT_DOUBLE_EQ(config.visual_tracking_shadow.frequency_hz, 20.0);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualTrackingHeadingMode) {
+    json value = ReadSourceConfig();
+    value["visual_tracking"]["heading"]["mode"] = "invalid";
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_mode_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsVisualTrackingPrincipalPointOutOfFrame) {
+    json value = ReadSourceConfig();
+    value["visual_tracking"]["camera"]["cy_px"] = 5000.0;  // 超出画面高 720
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_cy_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsVisualTrackingWithoutVisualMonitor) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_visual_monitor"] = false;
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_no_monitor.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, DefaultsRgaDmaTransferToDisabledWhenFieldMissing) {
+    json value = ReadSourceConfig();
+    value["video"].erase("prefer_rga_dma_transfer");
+    const auto path = WriteTemporaryConfig(value, "drone_config_rga_dma_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_FALSE(config.decoder.prefer_rga_dma_transfer);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidYoloNpuCoreMode) {
+    json value = ReadSourceConfig();
+    value["yolo"]["npu_core_mode"] = "invalid";
+    const auto path = WriteTemporaryConfig(value, "drone_config_yolo_core_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, DefaultsVideoSourceWhenFieldsMissing) {
+    json value = ReadSourceConfig();
+    value["video"].erase("camera_source");
+    value["video"].erase("stereo_split");
+    value["video"].erase("uvc_device");
+    value["video"].erase("uvc_width");
+    value["video"].erase("uvc_height");
+    value["video"].erase("uvc_fps");
+    // 本用例刻意移除 uvc/stereo_split，会破坏双目测距依赖链（另有专门用例
+    // 覆盖该拒绝），故先关掉测距，聚焦视频源默认值。
+    value["runtime"]["enable_stereo_ranging"] = false;
+    // 视觉融合依赖测距，一并关闭（依赖链另有专门用例覆盖）
+    value["runtime"]["enable_visual_position_fusion"] = false;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_video_source_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.video_source.camera_source, "rtsp");
+    EXPECT_FALSE(config.video_source.stereo_split);
+    EXPECT_EQ(config.uvc_camera.device, "/dev/video0");
+    EXPECT_EQ(config.uvc_camera.width, 2560u);
+    EXPECT_EQ(config.uvc_camera.height, 720u);
+    EXPECT_EQ(config.uvc_camera.fps, 30u);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidCameraSource) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "usb";
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_camera_source_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsStereoSplitWithoutUvcSource) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "rtsp";
+    value["video"]["stereo_split"] = true;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_split_without_uvc.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsOddUvcWidthForUvcSource) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "uvc";
+    value["video"]["uvc_width"] = 2561;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_uvc_odd_width.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ParsesUvcStereoConfiguration) {
+    json value = ReadSourceConfig();
+    value["video"]["camera_source"] = "uvc";
+    value["video"]["stereo_split"] = true;
+    value["video"]["uvc_width"] = 3840;
+    value["video"]["uvc_height"] = 1080;
+    const auto path = WriteTemporaryConfig(value, "drone_config_uvc_stereo.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.video_source.camera_source, "uvc");
+    EXPECT_TRUE(config.video_source.stereo_split);
+    EXPECT_EQ(config.uvc_camera.width, 3840u);
+    EXPECT_EQ(config.uvc_camera.height, 1080u);
+    EXPECT_EQ(config.stereo_splitter.width, 3840u);
+    EXPECT_EQ(config.stereo_splitter.height, 1080u);
+    std::filesystem::remove(path);
+}
+
+// 阶段四装配门禁：enable_control=true 在依赖链（PX4+地面站）齐备且
+// controller 配置 Validate 通过时允许加载（正式绑定仍是装配期行为，
+// 仓库生产 config.json 永远保持 false）。
+TEST(ConfigTest, AllowsControlWhenAssemblyPreconditionsMet) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_control"] = true;
+    const auto path = WriteTemporaryConfig(value, "drone_config_control_allowed.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.runtime.enable_control);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsControlWithoutGroundStation) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_control"] = true;
+    value["runtime"]["enable_ground_station"] = false;
+    // 摘掉依赖地面站的链路，确保拒绝原因只剩 enable_control 门禁本身。
+    value["runtime"]["enable_target_estimator"] = false;
+    value["runtime"]["enable_visual_position_fusion"] = false;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_control_without_ground.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsControlWithInvalidControllerConfig) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_control"] = true;
+    // coast_timeout 必须大于 intent_timeout（默认 300ms），违反则 Validate 拒绝。
+    value["controller"]["coast_timeout_ms"] = 100;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_control_invalid_controller.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsTargetEstimatorWithoutGroundStation) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_ground_station"] = false;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_estimator_without_ground.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsVisualMonitorWithoutVideo) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_video"] = false;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_without_video.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualMonitorThreshold) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["acquire_lock_frames"] = 0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_threshold_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidVisualMonitorLogInterval) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["status_log_interval_ms"] = 0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_visual_monitor_log_interval_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidTargetEstimatorNoise) {
+    json value = ReadSourceConfig();
+    value["target_estimator"]["process_acceleration_std_mps2"] = 0.0;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_estimator_noise_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsGroundStationWithoutPx4StateSource) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_px4"] = false;
+    const auto path = WriteTemporaryConfig(value, "drone_config_ground_without_px4.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, AllowsMissingGroundStationSectionWhenDisabled) {
+    json value = ReadSourceConfig();
+    // 用例意图：地面站链路关闭时 ground_station 段可缺省。控制输出依赖地面站链路
+    // （装配门禁），因此这里同步关闭 enable_control，只验“配置段可缺省”。
+    value["runtime"]["enable_control"] = false;
+    value["runtime"]["enable_ground_station"] = false;
+    value["runtime"]["enable_target_estimator"] = false;
+    // 视觉融合依赖目标估计器，一并关闭
+    value["runtime"]["enable_visual_position_fusion"] = false;
+    value.erase("ground_station");
+    value["video"]["output_rtsp"] = "rtsp://127.0.0.1:8554/drone_out";
+    const auto path = WriteTemporaryConfig(value, "drone_config_ground_disabled.json");
+
+    EXPECT_NO_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"));
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidGroundStationSendInterval) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["send_interval_ms"]["gps"] = 0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_ground_rate_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidTimeSyncWindow) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["time_sync"]["minimum_samples"] = 11;
+    value["ground_station"]["time_sync"]["window_capacity"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_timesync_window.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsTimeSyncRttNotBelowTimeout) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["time_sync"]["max_rtt_ms"] = 5000;
+    value["ground_station"]["time_sync"]["sync_timeout_ms"] = 5000;
+    const auto path = WriteTemporaryConfig(value, "drone_config_timesync_timeout.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, AcceptsRocketGroundStationIdentity) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["aircraft_component_id"] = 26;
+    value["ground_station"]["aircraft_type"] = "rocket";
+    value["ground_station"]["callsign"] = "火箭-01";
+    const auto path = WriteTemporaryConfig(value, "drone_config_rocket_identity.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.ground_station.aircraft_system_id, 1);
+    EXPECT_EQ(config.ground_station.aircraft_component_id, 26);
+    EXPECT_EQ(config.ground_station.aircraft_type, "rocket");
+    EXPECT_EQ(config.ground_station.callsign, "火箭-01");
+    EXPECT_EQ(config.video_sender.encode.url,
+              "rtsp://127.0.0.1:8554/drone_26_1");
+    EXPECT_EQ(config.px4.onboard_component_id, 191);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, AllowsExplicitVideoOutputWithoutIdentityPlaceholder) {
+    json value = ReadSourceConfig();
+    value["video"]["output_rtsp"] = "rtsp://127.0.0.1:8554/debug";
+    const auto path = WriteTemporaryConfig(value, "drone_config_explicit_video.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.video_sender.encode.url, "rtsp://127.0.0.1:8554/debug");
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, AcceptsJammerGroundStationIdentity) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["aircraft_component_id"] = 27;
+    value["ground_station"]["aircraft_type"] = "jammer";
+    value["ground_station"]["callsign"] = "干扰-01";
+    const auto path = WriteTemporaryConfig(value, "drone_config_jammer_identity.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.ground_station.aircraft_component_id, 27);
+    EXPECT_EQ(config.ground_station.aircraft_type, "jammer");
+    EXPECT_EQ(config.ground_station.callsign, "干扰-01");
+    EXPECT_EQ(config.video_sender.encode.url,
+              "rtsp://127.0.0.1:8554/drone_27_1");
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsLegacyHandoverLockFramesKey) {
+    json value = ReadSourceConfig();
+    value["handover"]["lock_frames"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_legacy_handover_lock.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsLegacyInterceptionLockFramesKey) {
+    json value = ReadSourceConfig();
+    value["interception"]["lock_frames"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_legacy_interception_lock.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsLegacyVisualMonitorLockFramesKey) {
+    json value = ReadSourceConfig();
+    value["visual_monitor"]["lock_frames"] = 5;
+    const auto path = WriteTemporaryConfig(value, "drone_config_legacy_visual_lock.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsGroundStationTypeComponentMismatch) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["aircraft_component_id"] = 26;
+    value["ground_station"]["aircraft_type"] = "net_capture";
+    const auto path = WriteTemporaryConfig(value, "drone_config_identity_mismatch.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsReservedGroundStationComponent) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["aircraft_component_id"] = 28;
+    value["ground_station"]["aircraft_type"] = "rocket";
+    const auto path = WriteTemporaryConfig(value, "drone_config_reserved_identity.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsGroundStationNumberMismatch) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["aircraft_system_id"] = 2;
+    value["ground_station"]["aircraft_number"] = 1;
+    const auto path = WriteTemporaryConfig(value, "drone_config_number_mismatch.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsUnexpectedGroundStationSourceIdentity) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["ground_system_id"] = 254;
+    const auto path = WriteTemporaryConfig(value, "drone_config_gcs_identity_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveStatusSendInterval) {
+    json value = ReadSourceConfig();
+    value["ground_station"]["status_send_interval_ms"]["health"] = 0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_status_interval_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNegativeHealthTimeout) {
+    json value = ReadSourceConfig();
+    value["health"]["cpu_sample_period_ms"] = 0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_health_timeout_invalid.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, StereoRangerDefaultsWhenSectionAbsent) {
+    json value = ReadSourceConfig();
+    value.erase("stereo_ranger");
+    value["runtime"].erase("enable_stereo_ranging");
+    // 视觉融合依赖测距，一并关闭
+    value["runtime"]["enable_visual_position_fusion"] = false;
+    const auto path = WriteTemporaryConfig(value, "drone_config_stereo_default.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 段缺席回退默认值（即参考实现实测配置）
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.disp_min_px, 8.0);
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.disp_max_px, 160.0);
+    EXPECT_EQ(config.stereo_ranger.coarse_stride, 2);
+    EXPECT_EQ(config.stereo_ranger.census_win, 7);
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.near_pct, 90.0);
+    EXPECT_DOUBLE_EQ(config.stereo_ranger.smooth_alpha, 0.4);
+    EXPECT_FALSE(config.runtime.enable_stereo_ranging);
+    // 未启用测距时不加载校正矩阵（禁用路径不依赖伴生文件）
+    EXPECT_DOUBLE_EQ(config.stereo_rectify.fx_rect_px, 0.0);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, StereoRangerLoadsRectifyMatricesWhenEnabled) {
+    // 生产配置启用测距：应从 config.json 同目录加载预置矩阵（复算值对拍）
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(),
+                                     std::string(TEST_SOURCE_DIR));
+    ASSERT_TRUE(config.runtime.enable_stereo_ranging);
+    EXPECT_EQ(config.stereo_rectify.view_width, 1280);
+    EXPECT_EQ(config.stereo_rectify.view_height, 720);
+    EXPECT_NEAR(config.stereo_rectify.fx_rect_px, 1057.3349, 1e-3);
+    EXPECT_NEAR(config.stereo_rectify.baseline_m, 0.060120, 1e-6);
+    EXPECT_NEAR(config.stereo_rectify.fxb_m_px, 63.5665, 1e-3);
+    // 基准内参（SBS 右半 = 物理左目）主点应大于辅助（两目 cx 差约 54px）
+    EXPECT_GT(config.stereo_rectify.k_ref[2], config.stereo_rectify.k_aux[2]);
+}
+
+TEST(ConfigTest, StereoRangerRejectsMissingRectifyMatricesWhenEnabled) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_stereo_ranging"] = true;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_stereo_no_matrices.json");
+    // 删除伴生矩阵文件：启用测距时必须启动失败而非静默降级
+    std::filesystem::remove(path.parent_path() /
+                            "stereo_rectify_uvc_1280x720.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    CopyRectifyMatricesBeside(path);  // 恢复，避免影响其他用例
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, VisualFusionParsesAndCopiesFxb) {
+    // 生产配置已启用融合：fxb 由校正矩阵装配拷贝（单一真源，不进 JSON）
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(),
+                                                     std::string(TEST_SOURCE_DIR));
+    ASSERT_TRUE(config.runtime.enable_visual_position_fusion);
+    EXPECT_TRUE(config.target_estimator.visual.enabled);
+    EXPECT_NEAR(config.target_estimator.visual.fxb_m_px, 63.5665, 1e-3);
+    // 子组默认值（生产配置显式给出 mount 全 0 = 准直安装假设）
+    EXPECT_DOUBLE_EQ(config.target_estimator.visual.disparity_std_px, 0.5);
+    EXPECT_DOUBLE_EQ(config.target_estimator.visual.mount.yaw_deg, 0.0);
+}
+
+TEST(ConfigTest, VisualFusionRequiresEstimatorRangingAndPx4) {
+    // 依赖链：目标估计器 + 双目测距 + PX4，任一缺失都必须拒绝
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_target_estimator"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_no_estimator.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_no_stereo.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_px4"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_no_px4.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, VisualFusionRejectsInvalidValues) {
+    {
+        json value = ReadSourceConfig();
+        value["target_estimator"]["visual"]["disparity_std_px"] = 0.0;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_disp_std.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["target_estimator"]["visual"]["min_confidence"] = 1.5;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_fusion_conf_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, StereoRangingRequiresUvcSplitAndVisualTracking) {
+    // 依赖链：enable_video + camera_source=uvc + stereo_split + 视觉跟踪影子，
+    // 任一环节缺失都必须拒绝。
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = true;
+        value["video"]["stereo_split"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_no_split.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = true;
+        value["video"]["camera_source"] = "rtsp";
+        value["video"]["stereo_split"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_rtsp.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["runtime"]["enable_stereo_ranging"] = true;
+        value["runtime"]["enable_visual_tracking"] = false;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_no_tracking.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, StereoRangerRejectsInvalidValues) {
+    {
+        json value = ReadSourceConfig();
+        value["stereo_ranger"]["disp_min_px"] = 0.0;
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_dispmin_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["stereo_ranger"]["disp_max_px"] = 8.0;  // 必须大于 disp_min
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_dispmax_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+    {
+        json value = ReadSourceConfig();
+        value["stereo_ranger"]["census_win"] = 4;  // 仅支持 3/5/7
+        const auto path =
+            WriteTemporaryConfig(value, "drone_config_stereo_census_invalid.json");
+        EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                     std::invalid_argument);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(ConfigTest, VisualTrackingStaleFieldsAreParsed) {
+    // 回归：visual_stale_ms/distance_stale_ms/attitude_stale_ms 此前在
+    // config.json 声明但 config.cpp 未解析，静默失效。
+    json value = ReadSourceConfig();
+    value["visual_tracking"]["control"]["distance_stale_ms"] = 250;
+    const auto path = WriteTemporaryConfig(value, "drone_config_vt_stale.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.visual_tracking.control.distance_stale_ms, 250);
+    EXPECT_EQ(config.visual_tracking.control.visual_stale_ms, 200);
+    EXPECT_EQ(config.visual_tracking.control.attitude_stale_ms, 300);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ControllerAndApproachParseFromProductionConfig) {
+    // 生产配置（2026-11-02 起）已声明 controller/approach 节：逐项核对解析结果。
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
+    EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 10.0);
+    // P0-2：位置型意图按 position_guide_* 从当前位置推进（限制跳变速度）；
+    // 前馈与上限用于追运动目标。2026-11-11 起三者缺省同源于 max_speed_mps。
+    EXPECT_TRUE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 10.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 10.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
+    // 2026-11-11：S5 改为接近速度律；旧 speed_mps/lead_time/guide_lowpass 已删除。
+    // 速度上限由 controller.max_speed_mps 注入，speed_law 不重复定义。
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.standoff_m, 2.9);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.brake_safety, 1.3);
+    EXPECT_TRUE(config.approach.speed_law.speed_match);
+    EXPECT_TRUE(config.approach.speed_law.auto_boost);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_s, 0.3);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_max_m, 6.0);
+    EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 5u);
+    // S9/S10 入口默认关闭；返航默认启用以保证发射后有收口。
+    EXPECT_FALSE(config.interception.enabled);
+    EXPECT_TRUE(config.interception.auto_authorize);
+    EXPECT_EQ(config.interception.enter_s9_lock_frames, 10u);
+    EXPECT_DOUBLE_EQ(config.interception.min_range_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.interception.max_range_m, 8.0);
+    EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 0.0);
+    EXPECT_TRUE(config.return_home.enabled);
+    EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 5.0);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 2.0);
+    EXPECT_EQ(config.return_home.arrival_hold, std::chrono::milliseconds(1000));
+    EXPECT_EQ(config.handover.enter_s6_lock_frames, 10u);
+    EXPECT_EQ(config.handover.exit_lost_frames, 30u);
+    EXPECT_EQ(config.handover.distance_lost_ms, std::chrono::milliseconds(3000));
+}
+
+TEST(ConfigTest, ControllerAndApproachFallBackToDefaultsWhenAbsent) {
+    // controller/approach 两节缺席时必须回退保守默认值：前馈关闭、上限 2.0；
+    // 位置引导限速 6.0/1.5 与接近段 3.5/1.0/500ms（2026-11-02 P0/P1 默认）。
+    json value = ReadSourceConfig();
+    value.erase("controller");
+    value.erase("approach");
+    const auto path = WriteTemporaryConfig(value, "drone_config_no_controller.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.controller.period, std::chrono::milliseconds(50));
+    EXPECT_DOUBLE_EQ(config.controller.max_speed_mps, 2.0);
+    EXPECT_FALSE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 2.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_speed_mps, 2.0);
+    EXPECT_DOUBLE_EQ(config.controller.position_guide_vz_mps, 1.5);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.standoff_m, 2.9);
+    EXPECT_DOUBLE_EQ(config.approach.speed_law.ref_lead_s, 0.3);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveHandoverDistanceLost) {
+    // S7 测距失效退出计时门限必须为正：0 → 拒绝（否则进 S7 立即超时退出）
+    json value = ReadSourceConfig();
+    value["handover"]["distance_lost_ms"] = 0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_handover_distance_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsHandoverExitNotGreaterThanEnter) {
+    // 迟滞关系强制：enter_s6_lock_frames=20、exit_lost_frames=10 → 拒绝
+    json value = ReadSourceConfig();
+    value["handover"]["enter_s6_lock_frames"] = 20;
+    value["handover"]["exit_lost_frames"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_handover_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, GcsNetFireDefaultsDisabled) {
+    // 直控发射（65016）默认关闭：生产配置不声明 gcs_fire 字段时必须回退默认值，
+    // 避免"装配即生效"把捕网通道挂到地面站任意帧上。
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_FALSE(config.actuator.gcs_fire_enabled);
+    EXPECT_EQ(config.actuator.gcs_fire_cooldown, std::chrono::milliseconds(3000));
+}
+
+TEST(ConfigTest, RejectsGcsFireWithInterceptionBothEnabled) {
+    // 直控发射与自动拦截共用同一执行器：同时开启必须在加载期 fail-fast。
+    json value = ReadSourceConfig();
+    value["actuator"]["gcs_fire_enabled"] = true;
+    value["interception"]["enabled"] = true;
+    const auto path = WriteTemporaryConfig(value, "drone_config_gcs_fire_mutex.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsGcsFireCooldownOutOfRange) {
+    // 冷却下限 100ms：低于下限等同关闭防连点保护 → 拒绝。
+    json value = ReadSourceConfig();
+    value["actuator"]["gcs_fire_enabled"] = true;
+    value["actuator"]["gcs_fire_cooldown_ms"] = 50;
+    const auto path = WriteTemporaryConfig(value, "drone_config_gcs_fire_cooldown.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveControllerLimits) {
+    // max_speed_mps=0 → 拒绝
+    json value = ReadSourceConfig();
+    value["controller"]["max_speed_mps"] = 0.0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_controller_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ParsesFeedforwardConfig) {
+    // P3：显式开关、独立前馈上限、KF 速度更新门限。
+    json value = ReadSourceConfig();
+    value["controller"]["enable_position_velocity_feedforward"] = true;
+    value["controller"]["max_feedforward_mps"] = 3.5;
+    value["target_estimator"]["min_velocity_position_updates"] = 7;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_feedforward.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.controller.enable_position_velocity_feedforward);
+    EXPECT_DOUBLE_EQ(config.controller.max_feedforward_mps, 3.5);
+    EXPECT_EQ(config.target_estimator.min_velocity_position_updates, 7u);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveFeedforwardLimit) {
+    json value = ReadSourceConfig();
+    value["controller"]["max_feedforward_mps"] = 0.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_feedforward_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsFeedforwardAboveMaxSpeed) {
+    // 前馈是水平速度上限的一部分：超过 max_speed 只会被下游钳掉，配置期拒绝。
+    json value = ReadSourceConfig();
+    value["controller"]["max_speed_mps"] = 2.0;
+    value["controller"]["max_feedforward_mps"] = 3.5;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_feedforward_above_speed.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsZeroVelocityUpdateThreshold) {
+    json value = ReadSourceConfig();
+    value["target_estimator"]["min_velocity_position_updates"] = 0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_velocity_updates_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ParsesInterceptionAndReturnHomeConfig) {
+    json value = ReadSourceConfig();
+    value["interception"]["enabled"] = true;
+    value["interception"]["auto_authorize"] = false;
+    value["interception"]["enter_s9_lock_frames"] = 7;
+    value["interception"]["min_range_m"] = 3.5;
+    value["interception"]["max_range_m"] = 14.0;
+    value["interception"]["min_battery_percent"] = 35.0;
+    value["interception"]["authorization_timeout_ms"] = 1500;
+    value["return_home"]["enabled"] = true;
+    value["return_home"]["altitude_m"] = 6.5;
+    value["return_home"]["climb_rate_mps"] = 0.8;
+    value["return_home"]["cruise_speed_mps"] = 4.5;
+    value["return_home"]["accel_plan_mps2"] = 2.0;
+    value["return_home"]["decel_plan_mps2"] = 2.5;
+    value["return_home"]["brake_safety"] = 1.4;
+    value["return_home"]["final_speed_mps"] = 1.2;
+    value["return_home"]["final_zone_m"] = 8.0;
+    value["return_home"]["arrival_radius_m"] = 1.5;
+    value["return_home"]["arrival_vertical_m"] = 0.4;
+    value["return_home"]["arrival_speed_mps"] = 0.3;
+    value["return_home"]["arrival_hold_ms"] = 800;
+    value["return_home"]["timeout_ms"] = 45000;
+    value["return_home"]["fire_timeout_ms"] = 2500;
+    value["return_home"]["command_retry_ms"] = 700;
+    const auto path = WriteTemporaryConfig(
+        value, "drone_config_interception_return.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.interception.enabled);
+    EXPECT_FALSE(config.interception.auto_authorize);
+    EXPECT_EQ(config.interception.enter_s9_lock_frames, 7u);
+    EXPECT_DOUBLE_EQ(config.interception.min_range_m, 3.5);
+    EXPECT_DOUBLE_EQ(config.interception.max_range_m, 14.0);
+    EXPECT_DOUBLE_EQ(config.interception.min_battery_percent, 35.0);
+    EXPECT_EQ(config.interception.authorization_timeout,
+              std::chrono::milliseconds(1500));
+    EXPECT_TRUE(config.return_home.enabled);
+    EXPECT_DOUBLE_EQ(config.return_home.altitude_m, 6.5);
+    EXPECT_DOUBLE_EQ(config.return_home.climb_rate_mps, 0.8);
+    EXPECT_DOUBLE_EQ(config.return_home.cruise_speed_mps, 4.5);
+    EXPECT_DOUBLE_EQ(config.return_home.accel_plan_mps2, 2.0);
+    EXPECT_DOUBLE_EQ(config.return_home.decel_plan_mps2, 2.5);
+    EXPECT_DOUBLE_EQ(config.return_home.brake_safety, 1.4);
+    EXPECT_DOUBLE_EQ(config.return_home.final_speed_mps, 1.2);
+    EXPECT_DOUBLE_EQ(config.return_home.final_zone_m, 8.0);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_radius_m, 1.5);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_vertical_m, 0.4);
+    EXPECT_DOUBLE_EQ(config.return_home.arrival_speed_mps, 0.3);
+    EXPECT_EQ(config.return_home.arrival_hold, std::chrono::milliseconds(800));
+    EXPECT_EQ(config.return_home.timeout, std::chrono::milliseconds(45000));
+    EXPECT_EQ(config.return_home.fire_timeout, std::chrono::milliseconds(2500));
+    EXPECT_EQ(config.return_home.command_retry, std::chrono::milliseconds(700));
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNonPositiveReturnClimbRate) {
+    // 返航爬升率/巡航速度必须为正：0 或负数会让位置引导限速失效或反向推进。
+    json value = ReadSourceConfig();
+    value["return_home"]["climb_rate_mps"] = 0.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_return_climb_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidInterceptionRange) {
+    json value = ReadSourceConfig();
+    value["interception"]["min_range_m"] = 12.0;
+    value["interception"]["max_range_m"] = 5.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_interception_range_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsDExpOutsideInterceptionWindow) {
+    // S7 保持距离必须落在 S9 入口窗口内，否则 interception.enabled=true 时
+    // S7 永远停在窗口外、S9 不可达（2026-11-11 审计结论）。
+    json value = ReadSourceConfig();
+    value["interception"]["enabled"] = true;
+    value["interception"]["min_range_m"] = 2.0;
+    value["interception"]["max_range_m"] = 8.0;
+    value["visual_tracking"]["distance"]["d_exp_m"] = 10.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_dexp_outside_window.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInvalidReturnHomeAltitude) {
+    json value = ReadSourceConfig();
+    value["return_home"]["altitude_m"] = 0.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_return_home_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsInterceptionEnabledWithoutReturnHome) {
+    json value = ReadSourceConfig();
+    value["interception"]["enabled"] = true;
+    value["return_home"]["enabled"] = false;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_interception_no_return.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 捕网执行器（actuator 节）：机载只保存 Actuator Set N 与归一化控制量；
+// PWM 输出功能/映射区间在 PX4 侧配置。单发默认 -0.7 发射、0.0 待机。
+TEST(ConfigTest, ActuatorSectionDefaultsParse) {
+    const auto config = drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_EQ(config.actuator.type, "single_pwm");
+    EXPECT_EQ(config.actuator.net_channel, 1);
+    EXPECT_DOUBLE_EQ(config.actuator.net_fire_norm, -0.7);
+    EXPECT_DOUBLE_EQ(config.actuator.net_idle_norm, 0.0);
+}
+
+TEST(ConfigTest, ParsesActuatorSection) {
+    json value = ReadSourceConfig();
+    value["actuator"]["type"] = "single_pwm";
+    value["actuator"]["net_channel"] = 5;
+    value["actuator"]["net_fire_norm"] = -0.5;
+    value["actuator"]["net_idle_norm"] = 0.1;
+    const auto path = WriteTemporaryConfig(value, "drone_config_actuator.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.actuator.type, "single_pwm");
+    EXPECT_EQ(config.actuator.net_channel, 5);
+    EXPECT_DOUBLE_EQ(config.actuator.net_fire_norm, -0.5);
+    EXPECT_DOUBLE_EQ(config.actuator.net_idle_norm, 0.1);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, AcceptsActuatorNormBoundaries) {
+    drone::config::ActuatorConfig actuator;
+    actuator.net_fire_norm = -1.0;
+    actuator.net_idle_norm = 1.0;
+    EXPECT_NO_THROW(actuator.Validate());
+}
+
+TEST(ConfigTest, RejectsUnsupportedActuatorType) {
+    // 类型键为后续多发实现预留；未接入的类型必须 fail-fast，不能静默回退。
+    json value = ReadSourceConfig();
+    value["actuator"]["type"] = "multi_pwm";
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_type_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsActuatorChannelOutOfRange) {
+    // MAV_CMD_DO_SET_ACTUATOR 仅 6 个执行器组：net_channel=7 → 拒绝
+    json value = ReadSourceConfig();
+    value["actuator"]["net_channel"] = 7;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_channel_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsActuatorNormOutOfRange) {
+    // MAV_CMD_DO_SET_ACTUATOR 控制量为 -1..1；超出即拒绝。
+    json value = ReadSourceConfig();
+    value["actuator"]["net_fire_norm"] = 1.5;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_norm_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsEqualActuatorNorm) {
+    json value = ReadSourceConfig();
+    value["actuator"]["net_idle_norm"] = -0.7;  // 与发射值相同
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_equal_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 捕网执行器 ACK 复位时序：发射 ACK 后保持 reset_delay 再发复位，
+// 复位 ACK 后再稳定 reset_settle 才回 Ready（多发用，单发默认 0）。
+TEST(ConfigTest, ActuatorResetTimingDefaults) {
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_EQ(config.actuator.reset_delay, std::chrono::milliseconds(1500));
+    EXPECT_EQ(config.actuator.reset_settle, std::chrono::milliseconds(0));
+}
+
+TEST(ConfigTest, ParsesActuatorResetTiming) {
+    json value = ReadSourceConfig();
+    value["actuator"]["reset_delay_ms"] = 1000;
+    value["actuator"]["reset_settle_ms"] = 200;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_timing.json");
+
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.actuator.reset_delay, std::chrono::milliseconds(1000));
+    EXPECT_EQ(config.actuator.reset_settle, std::chrono::milliseconds(200));
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsNegativeActuatorResetTiming) {
+    json value = ReadSourceConfig();
+    value["actuator"]["reset_delay_ms"] = -1;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_actuator_timing_bad.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, RejectsConfigurationWithNoEnabledDataLink) {
+    json value = ReadSourceConfig();
+    value["runtime"]["enable_video"] = false;
+    value["runtime"]["enable_px4"] = false;
+    value["runtime"]["enable_ground_station"] = false;
+    value["runtime"]["enable_target_estimator"] = false;
+    value["runtime"]["enable_visual_monitor"] = false;
+    const auto path = WriteTemporaryConfig(value, "drone_config_empty_runtime.json");
+
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 自动起飞（takeoff 节，2026-10-22）：默认值与生产配置解析；
+// 低电门限不使用本地电量百分比。
+TEST(ConfigTest, TakeoffDefaultsAndParse) {
+    const auto config =
+        drone::config::LoadAppConfig(SourceConfigPath(), "/opt/drone");
+    EXPECT_DOUBLE_EQ(config.takeoff.height_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.takeoff.climb_rate_mps, 0.5);
+    EXPECT_EQ(config.takeoff.bootstrap_lead.count(), 300);
+    EXPECT_EQ(config.takeoff.mode_timeout.count(), 2000);
+    EXPECT_EQ(config.takeoff.arm_timeout.count(), 3000);
+    EXPECT_EQ(config.takeoff.bootstrap_timeout.count(), 6000);
+    EXPECT_EQ(config.takeoff.target_hold_max.count(), 60000);
+}
+
+TEST(ConfigTest, RejectsBadTakeoffTimeouts) {
+    json value = ReadSourceConfig();
+    value["takeoff"]["bootstrap_timeout_ms"] = 4000;
+    const auto path = WriteTemporaryConfig(value, "drone_config_takeoff_bad.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 目标保持累计上限：非正数拒绝；缺席回退默认 60s（2026-10-22）。
+TEST(ConfigTest, RejectsBadTakeoffHoldMax) {
+    json value = ReadSourceConfig();
+    value["takeoff"]["target_hold_max_ms"] = 0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_takeoff_hold_bad.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, TakeoffHoldMaxDefaultsWhenAbsent) {
+    json value = ReadSourceConfig();
+    value["takeoff"].erase("target_hold_max_ms");
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_takeoff_hold_default.json");
+    const auto config =
+        drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.takeoff.target_hold_max.count(), 60000);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, NoLocalTakeoffBatteryPercent) {
+    json value = ReadSourceConfig();
+    EXPECT_FALSE(value["takeoff"].contains("min_battery_percent"));
+}
+
+// ---- 围栏与区域缓存（2026-10-29）----
+
+TEST(ConfigTest, FenceDefaultsApplyWhenSectionMissing) {
+    json value = ReadSourceConfig();
+    value.erase("fence");
+    const auto path = WriteTemporaryConfig(value, "drone_config_fence_default.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    // 段缺席时围栏默认**开启**（2026-10-29 维护者裁决：围栏只有多边形一种，
+    // 开机按 fence.default_* 以 Home 为中心生成默认区域）。
+    EXPECT_TRUE(config.fence.enabled);
+    EXPECT_EQ(config.fence.violation_debounce.count(), 1500);
+    EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 1.0);
+    EXPECT_DOUBLE_EQ(config.fence.boundary_warn_m, 10.0);
+    // 越界深度容差/回界滞回/S5 贴边保持（2026-11-12）。
+    EXPECT_DOUBLE_EQ(config.fence.violation_depth_m, 1.5);
+    EXPECT_DOUBLE_EQ(config.fence.violation_hysteresis_m, 0.5);
+    EXPECT_TRUE(config.fence.guide_hold_enabled);
+    EXPECT_DOUBLE_EQ(config.fence.guide_hold_release_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.fence.guard_decel_mps2, 2.0);
+    EXPECT_DOUBLE_EQ(config.fence.guard_reaction_s, 0.2);
+    EXPECT_DOUBLE_EQ(config.fence.target_outside_release_m, 50.0);
+    EXPECT_EQ(config.fence.target_outside_release_hold.count(), 10000);
+    EXPECT_TRUE(config.fence.follow_zone_action);
+    EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kReturn);
+    EXPECT_EQ(config.fence.status_period.count(), 1000);
+    // 控制器围栏边距由 fence 节拷贝（控制器不自读 fence 节）。
+    EXPECT_DOUBLE_EQ(config.controller.fence_margin_m, 1.0);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, FenceSectionOverridesDefaults) {
+    json value = ReadSourceConfig();
+    value["fence"]["enabled"] = true;
+    value["fence"]["violation_debounce_ms"] = 800;
+    value["fence"]["boundary_margin_m"] = 2.5;
+    value["fence"]["boundary_warn_m"] = 15.0;
+    value["fence"]["violation_depth_m"] = 2.0;
+    value["fence"]["violation_hysteresis_m"] = 0.8;
+    value["fence"]["guide_hold_enabled"] = false;
+    value["fence"]["guide_hold_release_m"] = 3.0;
+    value["fence"]["guard_decel_mps2"] = 2.5;
+    value["fence"]["guard_reaction_s"] = 0.3;
+    value["fence"]["target_outside_release_m"] = 40.0;
+    value["fence"]["target_outside_release_hold_ms"] = 5000;
+    value["fence"]["violation_action"] = 2;  // land
+    const auto path = WriteTemporaryConfig(value, "drone_config_fence_override.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.fence.enabled);
+    EXPECT_EQ(config.fence.violation_debounce.count(), 800);
+    EXPECT_DOUBLE_EQ(config.fence.boundary_margin_m, 2.5);
+    EXPECT_DOUBLE_EQ(config.controller.fence_margin_m, 2.5);
+    EXPECT_DOUBLE_EQ(config.fence.violation_depth_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.fence.violation_hysteresis_m, 0.8);
+    EXPECT_FALSE(config.fence.guide_hold_enabled);
+    EXPECT_DOUBLE_EQ(config.fence.guide_hold_release_m, 3.0);
+    EXPECT_DOUBLE_EQ(config.fence.guard_decel_mps2, 2.5);
+    EXPECT_DOUBLE_EQ(config.fence.guard_reaction_s, 0.3);
+    EXPECT_DOUBLE_EQ(config.fence.target_outside_release_m, 40.0);
+    EXPECT_EQ(config.fence.target_outside_release_hold.count(), 5000);
+    EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kLand);
+    std::filesystem::remove(path);
+}
+
+// 2026-10-30 审查修复：fence.default_* 的 0/越界/倒挂值归一化。旧实现里
+// default_zone_id/default_version=0 会让 EnsureDefaultFenceZone 永不生成区域
+// （开机无围栏、也不落盘），半边长<=0 会让默认区域退化成空多边形，
+// 高度带倒挂则把默认区域整段判为越界。
+TEST(ConfigTest, FenceInvalidDefaultsNormalized) {
+    json value = ReadSourceConfig();
+    value["fence"]["default_zone_id"] = 0;
+    value["fence"]["default_version"] = 0;
+    value["fence"]["default_half_side_m"] = 0.0;
+    value["fence"]["default_alt_min_m"] = 40.0;
+    value["fence"]["default_alt_max_m"] = 10.0;
+    value["fence"]["default_action"] = 9;  // 越界枚举（> kLand）
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_fence_invalid_defaults.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.fence.default_zone_id, 1);
+    EXPECT_EQ(config.fence.default_version, 1);
+    EXPECT_DOUBLE_EQ(config.fence.default_half_side_m, 100.0);
+    // 高度带倒挂（min=40 > max=10）时下限回退 0、保留操作者给的上限 10。
+    EXPECT_DOUBLE_EQ(config.fence.default_alt_min_m, 0.0);
+    EXPECT_DOUBLE_EQ(config.fence.default_alt_max_m, 10.0);
+    EXPECT_EQ(config.fence.default_action, drone::common::FenceAction::kReturn);
+    std::filesystem::remove(path);
+}
+
+// 2026-11-12：回界滞回必须落在越界深度容差带内。滞回 > 深度会让清除阈值
+// 跑到边界内侧，飞机停在界外但仍在容差内时一直累计越界时长，容差形同虚设。
+TEST(ConfigTest, FenceHysteresisExceedsDepthRejected) {
+    json value = ReadSourceConfig();
+    value["fence"]["violation_depth_m"] = 1.0;
+    value["fence"]["violation_hysteresis_m"] = 1.5;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_fence_hysteresis.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, FenceWarnDistanceBelowMarginRejected) {
+    json value = ReadSourceConfig();
+    value["fence"]["boundary_margin_m"] = 5.0;
+    value["fence"]["boundary_warn_m"] = 2.0;
+    const auto path = WriteTemporaryConfig(value, "drone_config_fence_warn.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 2026-11-12：末端低速档顶速不得高于巡航顶速（否则剖面自相矛盾）。
+TEST(ConfigTest, ReturnHomeFinalSpeedAboveCruiseRejected) {
+    json value = ReadSourceConfig();
+    value["return_home"]["cruise_speed_mps"] = 2.0;
+    value["return_home"]["final_speed_mps"] = 3.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_return_final_speed.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ReturnHomeHeadingModeValidated) {
+    json value = ReadSourceConfig();
+    value["return_home"]["heading_mode"] = 2;
+    const auto path = WriteTemporaryConfig(value, "drone_config_heading_mode.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(ConfigTest, ReturnHomeHeadingDefaultsToVelocityDirection) {
+    json value = ReadSourceConfig();
+    value["return_home"].erase("heading_mode");
+    const auto path = WriteTemporaryConfig(value, "drone_config_heading_default.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_EQ(config.return_home.heading_mode, 1U);
+    EXPECT_DOUBLE_EQ(config.return_home.heading_rate_limit_dps, 30.0);
+    EXPECT_DOUBLE_EQ(config.return_home.heading_accel_limit_dps2, 60.0);
+    std::filesystem::remove(path);
+}
+
+TEST(ZoneStoreTest, SaveThenLoadRoundTrips) {
+    const auto path =
+        std::filesystem::temp_directory_path() / "drone_zone_roundtrip.json";
+    std::filesystem::remove(path);
+
+    drone::common::FenceZone zone;
+    zone.protocol_version = 1;
+    zone.zone_id = 7;
+    zone.version = 3;
+    zone.type = drone::common::FenceZoneType::kPolygon;
+    zone.action = drone::common::FenceAction::kReturn;
+    zone.altitude_reference = 1;
+    zone.alt_min_m = 0.0;
+    zone.alt_max_m = 100.0;
+    zone.vertices = {{28.8605, 105.4958},
+                     {28.8605, 105.4962},
+                     {28.8601, 105.4962},
+                     {28.8601, 105.4958}};
+    ASSERT_TRUE(drone::config::ZoneStore::Save(path.string(), zone));
+
+    const auto loaded = drone::config::ZoneStore::Load(path.string());
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->zone_id, 7U);
+    EXPECT_EQ(loaded->version, 3U);
+    EXPECT_EQ(loaded->action, drone::common::FenceAction::kReturn);
+    EXPECT_EQ(loaded->altitude_reference, 1U);
+    EXPECT_DOUBLE_EQ(loaded->alt_max_m, 100.0);
+    ASSERT_EQ(loaded->vertices.size(), 4U);
+    EXPECT_NEAR(loaded->vertices[0].latitude_deg, 28.8605, 1e-9);
+    EXPECT_NEAR(loaded->vertices[2].longitude_deg, 105.4962, 1e-9);
+    std::filesystem::remove(path);
+}
+
+TEST(ZoneStoreTest, MissingFileIsSilentNullopt) {
+    const auto path =
+        std::filesystem::temp_directory_path() / "drone_zone_absent.json";
+    std::filesystem::remove(path);
+    EXPECT_FALSE(drone::config::ZoneStore::Load(path.string()).has_value());
+}
+
+TEST(ZoneStoreTest, InvalidContentRejected) {
+    const auto path =
+        std::filesystem::temp_directory_path() / "drone_zone_invalid.json";
+    {
+        std::ofstream output(path);
+        output << R"({"schema":1,"zone_id":0,"version":1,"vertices":[]})";
+    }
+    EXPECT_FALSE(drone::config::ZoneStore::Load(path.string()).has_value());
+    {
+        std::ofstream output(path);
+        output << "not json";
+    }
+    EXPECT_FALSE(drone::config::ZoneStore::Load(path.string()).has_value());
+    std::filesystem::remove(path);
+}
+
+}  // namespace

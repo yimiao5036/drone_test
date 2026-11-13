@@ -105,7 +105,7 @@ TEST(YoloPostProcessTest, DecodeBranchNoDfl) {
     std::vector<float> boxes;
     std::vector<float> probs;
     std::vector<int> class_ids;
-    const int count = DecodeBranch(branch, 64, 1, 0.25f, boxes, probs, class_ids);
+    const int count = DecodeBranch(branch, 64, 64, 1, 0.25f, boxes, probs, class_ids);
 
     EXPECT_EQ(count, 1);
     ExpectBoxes(boxes, probs, class_ids, {{96.f, 96.f, 64.f, 64.f, 0.5f, 0}});
@@ -131,7 +131,7 @@ TEST(YoloPostProcessTest, DecodeBranchFiltersLowScore) {
     std::vector<float> boxes;
     std::vector<float> probs;
     std::vector<int> class_ids;
-    const int count = DecodeBranch(branch, 64, 1, 0.25f, boxes, probs, class_ids);
+    const int count = DecodeBranch(branch, 64, 64, 1, 0.25f, boxes, probs, class_ids);
 
     // 仅 cell1 保留：x1=(-(-1)+0.5+1)*64=160
     EXPECT_EQ(count, 1);
@@ -161,7 +161,7 @@ TEST(YoloPostProcessTest, DecodeBranchScoreSumFastFilter) {
     std::vector<float> boxes;
     std::vector<float> probs;
     std::vector<int> class_ids;
-    const int count = DecodeBranch(branch, 64, 1, 0.25f, boxes, probs, class_ids);
+    const int count = DecodeBranch(branch, 64, 64, 1, 0.25f, boxes, probs, class_ids);
 
     EXPECT_EQ(count, 1);
     ExpectBoxes(boxes, probs, class_ids, {{160.f, 96.f, 64.f, 64.f, 0.9f, 0}});
@@ -242,7 +242,7 @@ TEST(YoloPostProcessTest, PostProcessFullChain) {
     letterbox.scale = 0.5f;
 
     std::vector<YoloDetection> detections;
-    const int count = PostProcess({branch}, 64, 0.25f, 0.45f, 1, letterbox,
+    const int count = PostProcess({branch}, 64, 64, 0.25f, 0.45f, 1, letterbox,
                                   &detections);
 
     ASSERT_EQ(count, 1);
@@ -253,6 +253,47 @@ TEST(YoloPostProcessTest, PostProcessFullChain) {
     EXPECT_NEAR(detections[0].y2, 104.f, 1e-3f);
     EXPECT_NEAR(detections[0].confidence, 0.5f, 1e-3f);
     EXPECT_EQ(detections[0].class_id, 0);
+}
+
+TEST(YoloPostProcessTest, PostProcessRectangularModelInput) {
+    // 矩形模型 128x64，grid 2x2：stride_x=128/2=64，stride_y=64/2=32（按轴分离），
+    // cell (i=1, j=1)，box 量化 scale=0.1875：
+    //   b0: 0.5625 → x1=(-0.5625+1.5)*64=60
+    //   b1: 0.375  → y1=(-0.375+1.5)*32=36
+    //   b2: 0.1875 → x2=(0.1875+1.5)*64=108
+    //   b3: 0.1875 → y2=(0.1875+1.5)*32=54
+    // letterbox: x_pad=10, y_pad=20, scale=0.5
+    // 期望：x1=(60-10)/0.5=100, y1=(36-20)/0.5=32,
+    //       x2=(108-10)/0.5=196, y2=(54-20)/0.5=68
+    constexpr float kBoxScale = 0.1875f;
+    TensorBuilder box(4, 2, 2, 0, kBoxScale);
+    box.Set(0, 1, 1, 0.5625f);
+    box.Set(1, 1, 1, 0.375f);
+    box.Set(2, 1, 1, 0.1875f);
+    box.Set(3, 1, 1, 0.1875f);
+    TensorBuilder score(1, 2, 2, 0, 0.1f);
+    score.Set(0, 1, 1, 0.5f);
+
+    BranchOutput branch;
+    branch.box = box.Make();
+    branch.score = score.Make();
+
+    LetterBox letterbox;
+    letterbox.x_pad = 10;
+    letterbox.y_pad = 20;
+    letterbox.scale = 0.5f;
+
+    std::vector<YoloDetection> detections;
+    const int count = PostProcess({branch}, 128, 64, 0.25f, 0.45f, 1, letterbox,
+                                  &detections);
+
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(detections.size(), 1u);
+    EXPECT_NEAR(detections[0].x1, 100.f, 1e-3f);
+    EXPECT_NEAR(detections[0].y1, 32.f, 1e-3f);
+    EXPECT_NEAR(detections[0].x2, 196.f, 1e-3f);
+    EXPECT_NEAR(detections[0].y2, 68.f, 1e-3f);
+    EXPECT_NEAR(detections[0].confidence, 0.5f, 1e-3f);
 }
 
 TEST(YoloPostProcessTest, NormalizedXywhSingleOutputRestoresLetterbox) {
@@ -320,14 +361,14 @@ TEST(YoloPostProcessTest, NormalizedXywhRejectsInvalidTensor) {
 
 TEST(YoloPostProcessTest, PostProcessEmptyBranch) {
     std::vector<YoloDetection> detections;
-    EXPECT_EQ(PostProcess({}, 64, 0.25f, 0.45f, 1, LetterBox{}, &detections), 0);
+    EXPECT_EQ(PostProcess({}, 64, 64, 0.25f, 0.45f, 1, LetterBox{}, &detections), 0);
     EXPECT_TRUE(detections.empty());
 }
 
 TEST(YoloPostProcessTest, PostProcessNullDataBranchSkipped) {
     BranchOutput branch;  // 全空
     std::vector<YoloDetection> detections;
-    EXPECT_EQ(PostProcess({branch}, 64, 0.25f, 0.45f, 1, LetterBox{},
+    EXPECT_EQ(PostProcess({branch}, 64, 64, 0.25f, 0.45f, 1, LetterBox{},
                           &detections),
               0);
 }

@@ -12,6 +12,9 @@
 
 namespace drone::video {
 
+// 数据流：RTSP → EncodedFrame Topic。Stub 只暴露生命周期与输出主题，
+// 真实建连/拉流/重连逻辑由 CameraReceiver 实现。
+
 CameraReceiverStub::CameraReceiverStub() {
     SPDLOG_INFO("摄像头接收部件骨架创建");
 }
@@ -38,8 +41,8 @@ bool CameraReceiverStub::IsRunning() const {
     return running_;
 }
 
+// 骨架期未实现建连，恒为 false。
 bool CameraReceiverStub::IsConnected() const {
-    // 骨架期未实现建连，恒为 false
     return false;
 }
 

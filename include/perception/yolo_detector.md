@@ -2,7 +2,7 @@
 
 > 对应实现：`src/perception/yolo_detector.cpp`、`src/perception/yolo_postprocess.cpp`、
 > `src/perception/rknn_detection_backend.cpp`（香橙派条件编译）
-> 更新：2026-08-26
+> 更新：2026-09-22
 
 ## 功能职责
 
@@ -10,17 +10,21 @@
   NV12），逐帧调用推理后端做目标检测，将检测结果转换为 `common::DetectionResult` 发布到
   检测结果主题。独立消费线程运行，与 VideoDecoder 相同的线程模型。
 - **yolo_postprocess**（纯函数子模块）：支持旧版多分支 INT8 张量和当前模型单输出
-  `[1,5,8400]` INT8 张量；完成反量化、置信度过滤、NMS 与 letterbox 逆变换。
+  `[1,5,N]` INT8 张量（N 随模型输入尺寸变化）；完成反量化、置信度过滤、NMS 与
+  letterbox 逆变换。
   不依赖任何硬件库，开发机可单测。
 - **RknnDetectionBackend**（`IDetectionBackend` 实现，仅 `DRONE_HAVE_RKNN=ON` 编译）：
   RGA 预处理（完整 NV12 帧等比例缩放 → RGB letterbox）+ RKNN NPU 推理（3 核上下文）+
-  `[1,5,8400]` 后处理 + 坐标还原原图。
+  `[1,5,N]` 后处理 + 坐标还原原图。模型输入宽高（支持矩形，如 640×384）与输出 N
+  均在 `Load()` 时从 `.rknn` 读取，换模型无需改动前/后处理代码；letterbox 画布/
+  缩放/pad 按宽高分别计算，多分支后处理步长按轴分离（stride_x=model_w/grid_w、
+  stride_y=model_h/grid_h）。
 
 边界：
 - 不做：目标跟踪（track_id 保持 0）、类别语义映射（class_id 透传模型类别，反无人机
-  专用模型定稿后由配置映射 0=无人机 1=障碍物）、帧级聚合（一帧多目标发布多条消息，
-  融合侧按 frame_sequence 聚合并做超时判丢）。
-- 不做：图像叠加标注（第 5 步图传链路）、光流（optical_flow_estimator 独立部件）。
+  专用模型定稿后由配置映射 0=无人机 1=障碍物）、多目标ID关联与主目标选举。
+- 不做：图像叠加标注（由 FrameCompositor 承担）、光流（optical_flow_estimator 独立部件）。
+- 视觉稳定性判定（连续检测/丢失、锁定状态）由 `visual_target_monitor` 承担，不在本部件内实现。
 
 ## 接口与数据流
 
@@ -31,22 +35,35 @@ IVideoDecoder::FrameOutput()
 YoloDetector::DetectLoop（独立线程）
         │  IDetectionBackend::Detect(frame)   ← 后端依赖注入
         ▼
-YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一条）
+        ├─► YoloDetector::DetectionOutput()  Topic<common::DetectionResult>
+        │     每目标一条，供 FrameCompositor 画框；一帧无目标时不发布
         │
-        ▼  IPerceptionFusion（第 4.7 步）
+        └─► YoloDetector::ObservationOutput() Topic<common::VisualTargetObservation>
+              每个成功推理帧恰好一条，允许 detected=false；
+              作为视觉链路的帧级节拍，供 VisualTargetMonitor 判定锁定/丢失
 ```
 
 - 接口签名：见 `include/perception/yolo_detector.h`（IYoloDetector 冻结于
   `docs/数据接口文档.md` §4.4，本实现不改变签名）。
 - `YoloDetectorConfig`：`model_path`（RKNN 模型路径，空 = 必须注入后端）、
   `conf_threshold`（默认 0.25）、`nms_threshold`（默认 0.45）、
-  `input_queue_capacity`（解码帧订阅队列容量，默认 2）。
+  `input_queue_capacity`（解码帧订阅队列容量，默认2，生产为1）、
+  `npu_core_mode`（`auto/core0/core01/core012/all`，生产当前`all`）、
+  `collect_npu_internal_perf`（仅诊断`RKNN_QUERY_PERF_RUN`，生产为`false`）、
+  `collect_npu_perf_detail`（仅诊断一次逐层报告，生产为`false`）、
+  `collect_detailed_latency`（中间阶段延迟细分统计，生产恒为`true`）。
 - `IDetectionBackend`：`Load() / Unload() / IsLoaded() / Detect(FrameHandle) →
   vector<BackendDetection>`（原图坐标系像素框）。工厂 `CreateDefaultDetectionBackend`
   在 `DRONE_HAVE_RKNN` 编译时返回 RKNN 后端，否则返回 nullptr。
 - 发布约定：每条 `DetectionResult` 一个目标；`frame_sequence` = 帧 `Info().sequence`；
   `header.source_time_ms` = 帧单调时间戳；`header.sequence` 检测器内递增；
   `inference_time_ms` 同帧多目标相同；一帧无检测不发布。
+- 帧级观测约定：`VisualTargetObservation` **每个成功推理帧发布且仅发布一条**，
+  一帧无目标时 `detected=false` 仍然发布。当前按单目标约定取置信度最高者为唯一目标，
+  `candidate_count` 记录本帧候选总数。推理失败或被跳过的帧不发布观测。
+  该消息解决了一个关键歧义：解码帧会被输入队列丢弃（容量为1），因此不能拿解码帧
+  序号判断“本帧推理完成”，下游只能靠本消息区分“本帧确实无目标”与“本帧未推理完”。
+  配套计数：`ObservationCount()`（成功推理帧数）、`DetectedObservationCount()`。
 
 ## 关键实现点
 
@@ -57,19 +74,40 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
 - **后端抽象与双环境**：推理后端经构造参数注入（`std::unique_ptr<IDetectionBackend>`），
   开发机测试注入 Mock；香橙派默认 `RknnDetectionBackend`。两者都不可用时
   `Start()` 返回 false 并打 ERROR，不静默空转。
-- **耗时统计**：检测线程对 `Detect()` 调用计时，指数滑动平均（EMA, α=0.1），
-  长时间运行不迟钝。热路径不打日志。
-- **后处理**（`yolo_postprocess`）：当前模型输出为通道优先 `[1,5,8400]`，每个候选为
+- **耗时统计**：检测线程对`Detect()`完整调用计时并保留EMA；固定窗口统计进一步拆分为RGA缩放/颜色转换、CPU letterbox填充复制、`rknn_run`、输出布局转换及阈值过滤/NMS。热路径不打印逐帧日志。
+- **后处理**（`yolo_postprocess`）：当前模型输出为通道优先 `[1,5,N]`，每个候选为
   归一化 `[x_center,y_center,width,height,confidence]`。实现按 confidence 过滤，乘模型
   宽高转换为模型像素坐标，执行单类别 NMS，再按 `(coord-pad)/scale` 撤销 letterbox。
   模型不输出类别，当前统一写入 `class_id=0`。旧版多分支量化解码继续保留兼容。
-- **RKNN 后端**（香橙派）：使用 `rknn_init` + `rknn_dup_context`×2、
-  `RKNN_NPU_CORE_ALL`、`rknn_create_mem` / `rknn_set_io_mem`。`QueryModelInfo` 自动识别
+- **RKNN 后端**（香橙派）：使用单个`rknn_context`，通过配置选择`RKNN_NPU_CORE_AUTO/0/0_1/0_1_2/ALL`，并使用`rknn_create_mem` / `rknn_set_io_mem`。旧实现额外复制两个上下文却始终只运行`ctxs_[0]`，现已删除无效上下文和对应两套I/O内存；组合多核由单上下文core mask控制。`QueryModelInfo`自动识别
   单输出 `[1,5,N]` 与旧版多分支格式；单输出当前要求 INT8。输出为 NC1HWC2 时转换成
   通道优先连续缓冲。预处理严格对齐已通过验证的 Python 参考代码：完整原图等比缩放，
   缩放宽高使用 round，RGB 画布以 114 居中填充，不再先裁掉 16:9 画面的左右区域。
 - **分辨率变化**：裁剪缓冲懒分配按需扩容；letterbox 每帧按实际宽高计算，
   解码分辨率变化（断流重连）无需重建后端。
+
+### 延迟统计
+
+`InputQueueLatency()`统计解码帧发布到YOLO开始处理；`InferenceLatency()`统计后端`Detect()`完整时间；`IngressToInferenceLatency()`统计码流进入机载进程到YOLO完成。无检测帧同样计入统计。
+
+`collect_detailed_latency=false` 时 04/05（`InputQueueLatency()`/`InferenceLatency()`）与后端 Y1-Y4 细分不采集，仅保留 ingress→推理完成链 `IngressToInferenceLatency()`；正式配置恒为 true，仅探针首尾模式使用。`InferenceTimeMsAvg()` 是功能字段不受影响，RKNN 内部性能统计（Y2N/Y2O/Y2Q）仍由 `collect_npu_internal_perf` 独立控制。
+
+`BackendLatencySnapshot()`提供最近256帧的后端细分：
+
+| 探针编号 | 指标 | 代码范围 |
+|---|---|---|
+| Y1 | 预处理总耗时 | RGA、临时缓冲准备和CPU letterbox总和 |
+| Y1R | RGA缩放+颜色转换 | `imresize`或`imcvtcolor` |
+| Y1C | CPU letterbox复制 | 114填充、缩放RGB逐行复制到RKNN输入内存 |
+| Y2 | NPU推理 | `rknn_run(ctxs_[0])` |
+| Y3 | 输出布局转换 | NC1HWC2→NCHW或原生输出`memcpy` |
+| Y4 | 后处理 | INT8反量化、阈值过滤、排序、单类别NMS、坐标还原 |
+
+Y1通常约等于Y1R+Y1C，但还包含缓冲`resize`检查与RGA描述准备。Y1～Y4之和与外层`InferenceLatency()`可能存在少量调用、统计和线程调度开销。
+
+2026-09-09香橙派120秒实测表明：Y1平均约2.8～3.6ms，其中Y1R约2.5～3.2ms、Y1C约0.3ms；Y2平均约24～29ms，占后端总耗时约80%～90%；Y3约0.01ms、Y4约0.13～0.20ms。当前主要计算瓶颈已确认是`rknn_run`，不是CPU letterbox、输出布局或NMS。
+
+YOLO队列容量2→1的120秒A/B中，容量1仅少处理约38/2945帧（约1.3%），队列平均14.21→12.12ms、P99 54→37ms、最大77→42ms；入口到YOLO完成平均46.22→43.99ms、P99 91.53→81ms、最大127→89ms。实时性收益明显且吞吐损失较小，因此当前生产配置已设`yolo.input_queue_capacity=1`，保留探针参数继续复测。
 
 ## 日志行为
 
@@ -87,13 +125,15 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   ```bash
   cmake -S . -B build && cmake --build build -j$(nproc)
   ./build/yolo_postprocess_test   # 后处理纯函数：多分支 + `[1,5,N]`/NMS/letterbox
-  ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理，9 用例
-  ctest --test-dir build          # 当前全工程 79/79 用例应通过
+  ./build/yolo_detector_test      # Mock 后端注入：线程/发布/统计/错误处理
+  ctest --test-dir build --output-on-failure
   ```
   期望结果：`yolo_postprocess_test` 验证多分支量化解码，以及 `[1,5,N]` 的阈值过滤、
-  单类别 NMS、1280×720→640×640 letterbox 坐标还原；`yolo_detector_test` 验证
+  单类别 NMS、letterbox 坐标还原（用例覆盖 1280×720→640×640 正方形与 128×64 矩形
+  输入的按轴步长/钳制，生产输入尺寸以模型为准）；`yolo_detector_test` 验证
   Start/Stop 幂等、无后端失败、检测字段完整、帧序号关联、后端故障恢复、无效帧跳过、
-  停机后停止消费、停止后重启。
+  停机后停止消费、停止后重启，以及帧级观测契约：无目标帧仍发布一条观测、
+  多候选取置信度最高者、逐帧观测序号推进且不重复。
 - **香橙派实机**：CMake 在目标架构为 `aarch64/arm64` 时默认开启 `DRONE_HAVE_RKNN`；
   x86_64 开发机默认关闭。已有 `build/CMakeCache.txt` 会保留旧值，香橙派首次切换可执行
   `cmake -S . -B build -U DRONE_HAVE_RKNN` 让架构默认值重新生效，或显式执行
@@ -111,19 +151,23 @@ YoloDetector::DetectionOutput()  Topic<common::DetectionResult>（每目标一�
   香橙派检查 CMake 是否 `DRONE_HAVE_RKNN=ON`、模型路径是否存在。
 - **启动失败"后端加载失败"**：模型文件不可读、RKNN 驱动未加载（`dmesg` 查 rknpu）、
   SRAM 初始化失败（尝试去掉 `RKNN_FLAG_ENABLE_SRAM`）。
-- **单输出模型**：正式模型已经替换，输出为 `[1,5,8400]`（通道优先），语义是归一化
+- **单输出模型**：正式模型已经替换，输出为 `[1,5,N]`（通道优先，N 由模型输入
+  尺寸决定），语义是归一化
   `[x_center,y_center,width,height,confidence]`。后端已自动识别并走
   `PostProcessNormalizedXywh`，模型不输出类别，因此当前固定 `class_id=0`。若日志显示
   张量不是 INT8 或形状不是 `[1,5,N]`，先核对部署模型是否与 `config.json` 指向文件一致。
 - **检测结果坐标错位**：先核对 letterbox 参数（`x_pad/y_pad/scale`）与后处理逆变换
   一致性；再核对裁剪偏移叠加；用单目标单色场景在香橙派打点验证。
-- **推理耗时异常**：确认 3 核上下文与 `RKNN_NPU_CORE_ALL`；检查是否误用
-  `RKNN_FLAG_COLLECT_PERF_MASK`（原型已去除）。
+- **推理耗时异常**：先读取Y1～Y4确定瓶颈，不再仅凭`Detect()`总耗时推测。探针可用`--npu-core all/core012/core01/core0/auto`做同模型A/B；组合core mask仍是单次同步推理，不等于多上下文并发或把单核耗时除以核心数。使用`--rknn-perf-run`后同时输出Y2W墙钟、Y2N RKNN内部、Y2O差值和Y2Q查询开销；该总耗时查询不需要`RKNN_FLAG_COLLECT_PERF_MASK`。`--rknn-perf-detail`会用该标志初始化，在第100次成功推理后打印一次逐层报告；官方明确说明会降低帧率，因此只用于独占短时诊断。
 - **RGA 接口差异**：香橙派当前 `im2d.hpp` 的 `wrapbuffer_virtualaddr` 六参数顺序为
   `地址, width, height, format, wstride, hstride`。若误写成把 format 放在最后，会出现
   `wstride=720, width=1280` 的 Invalid parameters。预处理内部 RGA 错误由外层按第 1 次和
   每 100 次节流，避免逐帧刷屏。`/usr/include/rga` 缺失时安装对应 librga 开发包。
-- **修改关联**：`DetectionResult` 字段与 `docs/数据接口文档.md` §2 冻结，改动需同步
+- **下游一直不锁定目标**：先确认 `ObservationCount()` 是否随帧增长。若不增长，说明
+  推理未成功（后端异常/无输入），而不是视觉稳定性门限问题；`VisualTargetMonitor`
+  会在观测超时后报“视觉观测超时”。
+- **修改关联**：`DetectionResult` 与 `VisualTargetObservation` 字段与
+  `docs/数据接口文档.md` §2 冻结，改动需同步
   文档并重跑 `yolo_detector_test`；后处理数值逻辑改动需同步原型
   `videoPart/yolo26-rknn`（避免两套实现漂移）；`IDetectionBackend` 新增后端时
   同步 `CreateDefaultDetectionBackend` 工厂与 CMake 条件编译。

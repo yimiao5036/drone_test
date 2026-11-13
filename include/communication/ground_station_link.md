@@ -1,0 +1,221 @@
+# 地面站数传链路实现文档
+
+## 功能职责
+
+`GroundStationLink`通过独立串口与自研地面站进行MAVLink 2通信。它订阅`Px4Link::StateOutput()`发布的`FlightStateSnapshot`，按配置频率重新编码为标准MAVLink遥测消息发送给地面站；同时接收并识别`MAV_TYPE_GCS`心跳，维护地面站在线状态，并通过标准`TIMESYNC`估算地面站单调时钟相对飞机时钟的offset、RTT和jitter。
+
+本模块不是PX4原始字节透传器，不允许地面站绕过状态机直接控制PX4。目标位置与时间同步总体协议见`docs/地面站目标位置与时间同步协议.md`；当前已实现TIMESYNC第一阶段，并通过MAVLink `V2_EXTENSION.message_type=65010/65011`实现`TRACK_TARGET_UPDATE/ACK`最小闭环：合法目标发布`GroundStationTarget`，非法本机目标返回拒绝ACK，错误地址静默忽略。状态回传通过`V2_EXTENSION.message_type=65012/65013`实现（`HEALTH_STATUS` v1、`MISSION_STATUS` v2）。任务分配通过`65014/65015`实现：`MISSION_ASSIGN`地址双字段匹配本机后发布`MissionAssignment`，`MISSION_ASSIGN_ACK`由状态机 Topic 驱动发送。四类自定义消息均使用MAVLink2短帧`payload_len=60`；65012/65013/65015不要求ACK。
+
+## 接口与数据流
+
+```cpp
+struct GroundStationLinkConfig;
+class GroundStationLink final : public IGroundStationLink;
+
+void SetFlightStateInput(Topic<FlightStateSnapshot>&);
+void SetMissionStatusInput(Topic<MissionStatus>&); // V2_EXTENSION 65013 v2
+void SetHealthInput(Topic<HealthStatus>&);          // V2_EXTENSION 65012 v1
+void SetMissionAssignmentAckInput(Topic<MissionAssignmentAck>&); // 65015 回执输入
+Topic<GroundStationTarget>& TargetOutput();         // 合法TRACK_TARGET_UPDATE发布到此Topic
+Topic<MissionAssignment>& MissionAssignmentOutput(); // 地址匹配的65014发布到此Topic
+GroundStationTimeSyncStatus GetTimeSyncStatus() const;
+
+struct GroundStationLinkConfig {
+    uint8_t aircraft_system_id;     // 同类别飞机编号，1~254
+    uint8_t aircraft_component_id;  // 功能类别：25捕网类，26火箭类
+    std::string aircraft_type;      // net_capture 或 rocket
+    uint8_t aircraft_number;        // 必须等于 aircraft_system_id
+    std::string callsign;           // 日志/界面显示名
+    uint8_t ground_system_id;       // 当前固定255
+    uint8_t ground_component_id;    // 当前固定190
+    bool enable_time_sync;
+    milliseconds time_sync_acquire_interval;
+    milliseconds time_sync_steady_interval;
+    milliseconds time_sync_timeout;
+    milliseconds time_sync_max_rtt;
+    milliseconds time_sync_max_offset_jump;
+    size_t time_sync_minimum_samples;
+    size_t time_sync_window_capacity;
+};
+```
+
+正式接线：
+
+```text
+Px4Link::StateOutput()
+  → Topic<FlightStateSnapshot>的独立订阅队列
+  → GroundStationLink独占串口线程
+  → 标准MAVLink 2遥测
+  → /dev/ttyS6（可在JSON修改）
+  → 自研Vue3地面站
+```
+
+当前实现已按`docs/多机身份与功能寻址设计.md`拆分地面站链路身份：`aircraft_system_id`表示同类型编号，`aircraft_component_id`表示功能类别，捕网类使用25、火箭类使用26；PX4链路继续保持独立的1/191→1/1。生产配置当前为捕网-01，下行MAVLink帧头应显示`system=1/component=25`。地面站来源固定为`255/190`，只有该来源且类型为`MAV_TYPE_GCS`的心跳会刷新在线状态。
+
+当前下行消息（周期列为当前生产配置值，均可经 `ground_station.send_interval_ms` 调整）：
+
+| 内容 | MAVLink消息 | 生产周期 |
+|---|---|---:|
+| 在线、armed、PX4模式和系统状态 | `HEARTBEAT` | 1000ms |
+| 姿态 | `ATTITUDE` | 100ms |
+| 局部NED位置和速度 | `LOCAL_POSITION_NED` | 200ms |
+| 经纬度、高度和速度 | `GLOBAL_POSITION_INT` | 200ms |
+| GPS fix、卫星数、水平/垂直精度（eph/epv） | `GPS_RAW_INT` | 200ms |
+| landed状态 | `EXTENDED_SYS_STATE` | 500ms |
+| 总电压、电流和剩余电量 | `SYS_STATUS` | 1000ms |
+| 电池电流和剩余电量 | `BATTERY_STATUS` | 1000ms |
+| Home点 | `HOME_POSITION` | 1000ms |
+| 健康状态 v1 | `V2_EXTENSION(65012)` | 1000ms，状态变化立即发送 |
+| 任务状态 v2 | `V2_EXTENSION(65013)` | 500ms，状态/分配字段变化立即发送 |
+| 任务分配回执 | `V2_EXTENSION(65015)` | 事件驱动：每收到一条 ACK Topic 即发送 |
+| 单调时钟同步 | `TIMESYNC` | 获取期200ms，稳定后1000ms |
+
+上行接收：
+
+| 内容 | MAVLink消息 | 处理 |
+|---|---|---|
+| 目标位置 | `V2_EXTENSION(65010)` | 帧长≥59、地址/时效校验后发布 `GroundStationTarget`，回 65011 |
+| 任务分配 | `V2_EXTENSION(65014)` | 帧长与地址双字段匹配后发布 `MissionAssignment`，链路层不回 65015 |
+| 围栏区域 | `V2_EXTENSION(65018)` | 帧长60、地址双字段、marker=1、动作码0/1/2、高度带合理性校验后发布 `FenceZone` |
+| 人工任务指令 | `V2_EXTENSION(65020)` | 帧长、地址双字段（帧头 + payload[50]/[51]）、marker=1 校验后发布 `MissionCommand` |
+
+遥测周期均在`ground_station.send_interval_ms`配置，TIMESYNC参数在`ground_station.time_sync`配置。状态首次到达及连接、armed、模式、landed、GPS、电池或Home有效性变化时，会立即发送关键状态，减少事件显示延迟。
+
+## 关键实现点
+
+- 一条串口只由`GroundStationLink`工作线程独占，统一复用`SerialPort`和独立`MavlinkHandler`，不与PX4链路共享解析/发送序号。
+- `FlightStateSnapshot`订阅队列默认容量2，满时丢最旧状态，避免电台拥塞积压旧遥测。
+- 只在对应有效标志为真时发送姿态、位置、GPS、电池和Home消息；无效数据不伪造成有效零值。
+- `FlightStateSnapshot`只有动力电池总压，没有单体电压，因此总压放在`SYS_STATUS.voltage_battery`；`BATTERY_STATUS.voltages[]`保持未知，禁止把总压误当成首节电芯电压。
+- `GLOBAL_POSITION_INT.relative_alt` **自 2026-11-04 起改用 EKF 差分**：`(相对高度基准 − local_z_m) × 1000`，
+  基准由 `common::RelativeAltitudeBaseZ()` 决定——优先 `HOME_POSITION.z`（PX4 重设 Home 时
+  随之平移，EKF 高度重置自愈），退化到解锁上升沿抓取的 `takeoff_ref_local_z_m`；
+  都不可用时发 0，不再用 `MSL − HOME_POSITION.alt`（那个会被 GNSS 海拔漂移带偏，
+  见 `docs/故障排查手册.md` §17.9.1）。`alt` 仍是 `MSL`（EKF 绝对海拔），两者口径不同，
+  地面站不要互相换算。
+- 接收方向处理来源`255/190`的GCS心跳、TIMESYNC和`V2_EXTENSION`承载的目标位置；其他合法MAVLink消息计入接收统计但不执行，不存在地面站到PX4的控制转发。实链验证中状态和`TRACK_TARGET_UPDATE`均采用MAVLink2短帧承载：`V2_EXTENSION`头部5字节加协议有效55字节，`mavlink_payload_len=60`，不要求发送满长扩展payload。
+- `HEALTH_STATUS`使用私有`message_type=65012`（版本1），`MISSION_STATUS`使用私有`message_type=65013`（版本2）；两者均为飞机→地面站单向状态消息，不返回ACK。状态变化由输入Topic事件触发立即发送，未变化时按JSON周期发送。65013 v2 在 offset 40/44/48/49 写入`assignment_id/target_id/availability/interceptor_type`，offset 0~39 与 v1 不变；`kHealthStatusProtocolVersion`与`kMissionStatusProtocolVersion`独立，不再共用版本常量。
+- 健康状态字段布局见`docs/地面站目标位置与时间同步协议.md` §13；任务状态中的距离使用毫米整数，未知值为`INT32_MIN`，CPU负载使用百分之一整数。
+- 65014 `MISSION_ASSIGN`只接受地面站来源`255/190`。先校验`message.len >= 60`，再要求`V2_EXTENSION.target_system/target_component`与payload offset 50/51同时等于本机二元身份、offset 54=1；任一不满足即计数并按第1次及每满100次WARN丢弃，不发布、不回65015。地址匹配后链路层原样发布`MissionAssignment`（含protocol_version/flags/target_id），语义拒绝由状态机负责。
+- 65015 `MISSION_ASSIGN_ACK`订阅状态机的`Topic<MissionAssignmentAck>`，逐条编码：offset 0 版本、1 assignment_id、5 target_id、9 result、10 reason、11 mission_state、12 availability、26/27 本机身份、54=1；以本机身份发往`255/190`。链路层不生成回执、不重发，发送失败只记账并节流日志。
+- 飞机在收到合法GCS心跳后主动发送定向TIMESYNC请求；请求`tc1=0`、`ts1=飞机单调纳秒`、target=`255/190`。
+- 响应必须来自`255/190`，target必须匹配本机二元身份，`ts1`必须匹配尚未完成的请求。offset按`地面站tc1-(请求ts1+接收时刻)/2`计算。
+- 样本窗口优先选择低RTT样本，对offset和RTT取中位数；达到最小样本数后进入`SYNCHRONIZED`。高RTT、错误target和无匹配请求计入拒绝样本。捕网-01 HM30实链第一版门限为`max_rtt_ms=300`、`max_offset_jump_ms=100`。
+- GCS心跳超时会清空同步状态；同步样本独立超时也会从`SYNCHRONIZED`退回未同步。
+- 同时支持响应地面站发起的广播或定向TIMESYNC请求，响应target回填`255/190`。
+- `Start()`前必须绑定飞行状态Topic；`Start/Stop`幂等，停止后可以重新启动。
+
+### 串口链路自愈（2026-10-30 增）
+
+- 工作线程读串口返回错误时先累计`serial_read_error_streak_`；连续达`kSerialReadErrorReconnectThreshold=3`次即调用`EnterSerialReconnect()`：关闭端口、`connected_=false`、清空`latest_state_/health_/mission_status_`与`last_ground_station_boot_id_/last_target_update_seq_`、`ResetTimeSync(false)`、重置 MAVLink 解析器，并节流 WARN。**不再是"计数+sleep"后带着坏 fd 空转**。
+- 进入重连后工作线程每拍先`TrySerialReconnect()`（固定间隔`kSerialReconnectInterval=500ms`重开设备，成功则`Open()/Flush()/mavlink_.Reset()`并 INFO、失败节流 WARN 并顺延），期间不发送任何帧；重连成功也不直接置连接，必须重新收到合法 GCS 心跳才恢复`connected_`。
+- 读成功或读超时（返回0）都会把连续错误计数清零，只有真正的 I/O 错误才累积，避免偶发中断误触发重连。
+- 重试间隔为编译期常量而非配置项：`GroundStationLinkConfig`没有重连字段，且本模块不在配置解析链路内改动，固定 500ms 与 PX4 链路的`reconnect_interval`默认值量级一致。
+
+### 周期发送失败重试（2026-10-30 增）
+
+- `SendIfDue()`原来的`(void)sender(); deadline=now+interval;`改为看返回值：失败时`deadline = now + min(interval, 100ms)`，即不推进正常周期、按短退避重试；通信恢复后立即回到配置周期，不必等一整个周期。
+- 发送失败本身由最底层`EncodeAndWrite()`统一`RecordError()`（ERROR，第1次/每100次），上层不重复记录。
+- `SendStatusExtension()`在`mavlink_version != 2`时显式`RecordError("地面站扩展帧需要 MAVLink 2…")`并返回 false，不再静默丢帧；这也让"配成 v1 导致 65012/65013 全部发不出"能被错误计数和退避重试共同暴露。
+
+### 时间同步状态判定（2026-10-30 修正）
+
+- 每次重算都先刷新`offset/RTT/jitter`估计再判状态；已`SYNCHRONIZED`时若`jitter > time_sync_max_offset_jump`，现在会显式降级到`DEGRADED`并节流 WARN（此前只有 `if` 没有 `else`，抖动恶化不会降级，只能等样本超时或单样本 offset 跳变）。协议§5 的四种状态因此与实现一致。
+- 状态快照不再每收一条 TIMESYNC 响应就加锁刷新：只有**状态跃迁**（建立/降级/超时/重置）强制发布，无状态变化的估计值变化按`kTimeSyncStatusPublishInterval=1s`低频发布（`PublishTimeSyncStatusIfDue`）。读超时20ms时不会出现~50Hz 的加锁分配。
+
+### 65010 帧长校验（2026-10-30 增）
+
+- 65010 的协议区最短 54 字节（offset 0~53 必需；offset 54 的`alt_reference`允许被 MAVLink2 截尾为0），因此最小总帧长 = `V2_EXTENSION`头5 + 54 = **59**。`HandleV2Extension()`按`message.len - 5`算出真实 payload 长度传给`HandleTrackTargetUpdate()`，短于 54 即整帧拒收、计入`target_update_invalid_count_`、节流 WARN，并回`kRejectedInvalidField/kInternalError` ACK。
+- 长度校验通过后`DecodeTrackTargetUpdate()`不再返回`optional`（长度已由调用方保证），删除了原先永不可达的`if (!payload)`分支。
+
+### 65018 动作码与高度带（2026-10-30 修正）
+
+- `action`只接受 0/1/2（悬停/返航/降落），`> 2` 与顶点数越界、`type != 0`、marker 非法、地址不匹配同属整帧拒收，计入`fence_invalid_count_`并节流 WARN。此前`action=3~255`会被三元表达式静默映射为返航，等于地面站一个坏字节就能触发返航。
+- `alt_max_dm != 0` 时要求`alt_min_dm <= alt_max_dm`（`alt_max_dm=0` 表示不限制高度带，保持原语义），倒置的高度带整帧拒收，避免把无效高度范围交给状态机做越界判定。
+
+### 65022 回读的量程与顶点数（2026-11-11 改 v2）
+
+- 65022 回读改用 **v2 分帧**（`protocol_version=2`）：顶点为 **int32 厘米**偏移（每帧最多 4 个，`frame_count=ceil(顶点数/4)`），不再受 v1 单帧 ±327.67m 量程限制；`SendFenceZoneReport()` 把该区域的所有帧连续发完，地面站按帧序号拼装。
+- 高度带（`dm`，int16 量程 ±3276.7m）仍用 `ClampRoundedDouble()`：NaN→0、超量程钳到 `int16` 边界，避免未定义回绕。
+- 顶点数不在 3~`kFenceMaxVertices=8` 时不再静默 `return false`：计入 `fence_report_invalid_count_` 并节流 WARN 后再返回失败，便于定位"地面站看不到区域回读"的原因。
+- v1 单帧回读（老固件）仍可被地面站解码；机载本身不再发 v1。
+
+### 65018/65022 分帧协议 v2（2026-11-11 增）
+
+- **动机**：v1 顶点是 int16 厘米，单帧只能表示参考点 ±327m 内的点；把区域画大（例如 800m 见方）时 Web 端直接报"顶点超出编码量程（±300m）"。历史上下发只能一条 55 字节短帧，才用短字段；现改为**分帧上传**，用 int32 厘米换掉量程限制。
+- **布局**：见 `docs/数据接口文档.md` §3.2.3；常量在 `include/communication/ground_station_link.h`（`kFenceZoneFramedProtocolVersion=2`、`kFenceVerticesPerFrame=4`、`kFenceMaxVertices=8`）。
+- **拼装**：`HandleFramedFenceZone()` 只在通信线程访问；`frame_index=0` 开始/重启，要求各帧的 `zone_id/version/frame_count/vertex_count/ref/action/高度带` 一致，`frame_index` 连续；最后一帧到达且累计顶点数==声明值才发布。缺首帧、元数据不一致、序号断档分别计数并节流 WARN；半成品超过 `kFenceAssemblyTimeoutMs=2000ms` 丢弃（地面站中途停发时不会一直等）。
+- **兼容**：`protocol_version=1` 走原单帧路径（老地面站/老日志），`2` 走分帧；其它版本整帧拒收并计数。65019 状态帧仍用 `kFenceZoneProtocolVersion=1`，两者版本号不要混用。
+
+## 多边形围栏编解码（2026-10-29 增）
+
+| 方向 | 类型 | 处理 |
+|---|---|---|
+| 下行 | 65018 `ZONE_DEFINE` | `HandleFenceZone()`：60B payload、尾部 marker=1、地址双字段（本机）三重校验通过后按 `protocol_version` 分派；**v2 分帧**按帧序号拼装，最后一帧收齐才发布 `FenceZone`；v1 单帧即时发布。顶点以参考点 + cm 偏移表示，链路层反算成 `latitude_deg/longitude_deg`（`kDegToRad`），`valid_for_ms=0` 表示持久快照 |
+| 上行 | 65019 `ZONE_STATE` | `SetFenceStatusInput()` + 工作线程每拍 `DrainFenceStatuses()`（只留最新一条）→ `SendFenceStatus()` 编码后定向发 255/190；局部位置用 mm（`DistanceMillimeters`，负值与 NaN→INT32_MIN 不崩）；协议版本固定 v1 |
+
+版本策略：65014 保持 **v1**、65013 保持 **v2**；65018/65022 区域帧使用
+**v2 分帧**（int32 厘米、每帧 4 顶点、按 `frame_index` 拼装），v1 单帧只用于
+兼容老地面站/老日志。`kFenceMaxVertices=8`（一个区域的总顶点数上限）。帧长/
+字段非法一律丢弃并计数，不发布半成品。
+
+## 人工任务指令编解码（2026-10-29 增）
+
+| 方向 | 类型 | 处理 |
+|---|---|---|
+| 下行 | 65020 `MISSION_COMMAND` | `HandleMissionCommand()`：帧长、地址双字段（帧头 `target_system/component` 与 payload[50]/[51] 都必须指向本机，2026-10-30 补齐 payload 校验；不符即丢帧、不回 65021）、尾部 marker=1、版本、类型逐项校验后填 `MissionCommand`（`valid_for_ms = kMissionCommandValidForMs = 1000`）并发布；校验失败分别计数（`mission_command_invalid_count_` / `mission_command_address_mismatch_count_`）并节流 WARN。`type` 只做 `static_cast` 透传（2026-11-04 增 `kResetState(2)`），类型是否受理由状态机判定并回 65021 `reason=3` |
+| 上行 | 65021 `MISSION_COMMAND_ACK` | `SetMissionCommandAckInput()` + 工作线程每拍 `DrainMissionCommandAcks()`（逐条发送，不合并）→ `SendMissionCommandAck()` 编码后定向发 255/190 |
+
+设计取舍：
+
+- **与 65014 分工**：65014 是"分配任务"（可重复、带 target/zone 版本）；65020 是"现在就做某件事"，
+  一次性、`command_id` 幂等、带 1s 有效期。串口积压导致迟到超过 1s 的指令会被丢弃，避免
+  "补执行"一个已经过期的返航动作。
+- **拒绝原因不复用 65015 的 reason 空间**：65021 有独立的 `MissionCommandReason`（0~8、20），
+  因为 65015 的原因码是任务分配语义，混用会让地面站无法区分"分配被拒"与"指令被拒"。
+  `reason=8 kNotOnGround` 专供 `type=2 重置任务状态`（2026-11-04）：只在落地并上锁后受理。
+- **状态由机载决定**：地面站只能"请求返航/请求重置"，是否接受取决于当前状态（未起飞拒绝、
+  已在返航回 `kCompleted`、故障拒绝、重置时未落地回 `reason=8`）。回执里的 `mission_state`
+  让地面站不必猜机载在哪一态。
+
+## 日志行为
+
+- INFO：部件创建/销毁、串口启动/停止、首次收到地面站心跳、首次建立时间同步（带offset/RTT/jitter/样本数）、串口重连成功（带设备与尝试次数）。目标协议调试/排障会在第1条及每100条打印`V2_EXTENSION`接收、`TRACK_TARGET_UPDATE`接收、合法目标发布和`TRACK_TARGET_ACK`发送结果；任务分配在第1条及每100条打印65014接收/发布和65015发送结果。
+- WARN：地面站心跳超时、时间同步超时、时间同步抖动超门限降级、串口连续读取错误与进入重连、串口重连失败、`SendIfDue`失败退避重试（由发送失败上层汇总）、目标/任务分配/围栏/指令的地址不匹配与帧长/字段非法、65018 分帧缺首帧/元数据不一致/序号断档/半成品超时、65022 顶点数越界，均按第1条及每100条节流警告。
+- ERROR：配置/启动/绑定时序错误和发送失败（`RecordError`，含"扩展帧需要 MAVLink 2"）；错误按第1次及每100次节流。
+- 不逐条记录遥测消息，不在高频发送路径打印成功日志；时间同步状态快照按1Hz低频发布，不会因读超时20ms而刷屏。
+
+## 测试方式
+
+围栏往返编解码在 `ground_station_link_test` 覆盖（构造 65018/65019 payload → 分派 → 字段一致）；
+65020/65021 由状态机侧用例与链路编解码共同覆盖：`mission_state_machine_test` 的
+`*MissionCommand*` 四例验证回执语义（接受/重复/版本/地面拒绝），
+web 侧 `server/mission_command.test.ts` 用同一套偏移做编码往返校验。
+
+Ubuntu 24.04开发机：
+
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
+./build/ground_station_link_test
+ctest --test-dir build --output-on-failure
+```
+
+`tests/communication/ground_station_link_test.cpp`使用Linux PTY覆盖：配置校验、未绑定拒绝启动、MAVLink 2飞机二元身份心跳、捕网-02与火箭-01身份、飞行快照字段编码、健康/任务状态`V2_EXTENSION`字段与短帧长度（65012 v1、65013 v2 扩展字段）、GCS来源过滤与心跳超时、TIMESYNC请求字段、offset/RTT估算、错误target拒绝、同步超时、响应地面站TIMESYNC请求、幂等停止和重启；65014 地址双字段匹配发布、帧头/payload 地址不匹配静默丢弃、语义字段原样发布、截断短帧安全丢弃，以及65015字段/版本/身份编码。2026-10-30 新增用例：`RecoversSerialLinkAfterReadErrors`（关闭 PTY 主端→链路置未连接→换新 PTY 后自动重连并重新等心跳）、`FenceZoneRejectsInvalidActionAndAltitudeBand`（action=3、高度带倒置整帧拒收，action=2 正常发布）、`TrackTargetAcceptsTruncatedAltReference` 与 `TrackTargetUpdateRejectsTruncatedFrame`（65010 的 59/55 字节边界）、`TelemetrySendFailureRetriesWithBackoff`（周期发送失败按 100ms 退避重试）、`TimeSyncDegradesWhenJitterExceedsThreshold`、`TimeSyncStatusPublishIsLowFrequency`、`FenceZoneReportEncodesWideOffsetsAsV2Frames`、`FenceZoneFramedAssemblesTwoFrames`、`FenceZoneFramedDropsFrameWithoutFirst`、`FenceZoneFramedRejectsInconsistentFrameCount`、`FenceZoneReportRejectsTooManyVertices`。硬件阶段已在香橙派/HM30/Web闭环确认基础链路；TIMESYNC已使用`tools/ground_station_time_sync_responder.py`完成捕网-01实机采样，RTT中位数约78ms，历史最大约203ms，offset jitter常见约20～50ms，主动测量偶发超时率低于1%，忽略包为0。
+
+## 排查与修改要点
+
+- 串口打不开：检查`ground_station.serial.device`是否为实际Linux节点、用户组权限和设备树串口使能；不需要修改代码。
+- 地面站失联后飞机遥测"永久消失"：看日志是否有`地面站串口连续读取错误`与`地面站串口链路中断，进入重连`。出现后链路会按 500ms 重开设备，`地面站串口重连成功` 只表示端口打开，仍需地面站心跳才会`connected_`；若一直刷`地面站串口重连失败`，说明设备节点已不存在（USB 转串口被拔出），属硬件/内核层问题。
+- 地面站看不到区域回读（65022）：先确认 mavlink 版本为 2（v1 会在 ERROR 日志里报"扩展帧需要 MAVLink 2"），再看是否有`围栏区域回读顶点数非法`——顶点数必须 3~8，超出时链路层显式失败而不是发半截帧。
+- 地面站显示的区域高度/顶点数值"翻转"：确认运行的是含`ClampRoundedDouble`的版本；旧实现超量程回绕会把 +1000m 回读成负值。
+- 时间同步长期停在`DEGRADED`：查日志`地面站时间同步降级`的 jitter 与门限，链路抖动超过`max_offset_jump_ms`时会主动降级；持续超时会退回`UNSYNCHRONIZED`并重新 TIMESYNC。
+- RK3588同一UART可有多组引脚复用。香橙派实测曾误启用`uart6-m2`而接线位于`uart6-m1`，表现为`/dev/ttyS6`可打开且`tx`计数增加，但排针无正确收发。必须保证设备树Overlay选择与实际TX/RX排针一致；当前实机使用`uart6-m1`。
+- 地面站无数据：先抓取`HEARTBEAT`，核对MAVLink 2、115200 8N1和地面站解析器是否接受完整system/component二元身份。HM30 UDP实机参数为地面端`192.168.144.12:19856`；Windows/Vue3必须发送`255/190` GCS心跳，飞机下行应看到捕网N号=`N/25`、火箭N号=`N/26`。当前生产配置捕网-01已实测来源为`1/25`；如果仍看到`1/191`，说明运行的不是本版本或配置未更新。
+- 有心跳但无GPS/电池：检查PX4快照对应`*_valid`标志；本模块不会发送失效字段。
+- 模式显示：读取机载心跳中的`base_mode/custom_mode`，其中`custom_mode`保持PX4原始编码。
+- 修改发送频率只改JSON；不得在工作循环写死新周期。
+- 修改目标协议时，必须同步更新V2_EXTENSION payload布局、ACK语义、测试、地面站工具和协议文档；禁止在通信层直接生成PX4命令。若实链出现`TIMESYNC`正常但`TRACK_TARGET_UPDATE`无ACK，优先检查地面站工具是否发送短帧（debug中`mavlink_payload_len=60`），以及日志中是否出现`收到地面站V2_EXTENSION`。
+- 65014 已解析但不产生65015：先看日志`任务分配地址不匹配`（核对帧头与payload offset 50/51）和`任务分配帧长不足`（必须是短帧60字节）。地址匹配后无65015属于状态机未投递`MissionAssignmentAck`，不是链路丢弃。
+- 65013 地面站仍按v1解析时，检查offset 0 是否为2；旧解析器读到版本2应只读取offset 0~39。
+- 增加任务/健康自定义消息时同步更新dialect、Vue3解析器、测试和本文档。

@@ -82,7 +82,8 @@ public:
 
     /// 获取一帧可写句柄；池耗尽时返回空句柄（Valid() == false）并计入
     /// DroppedCount()。不阻塞、不抛异常。
-    [[nodiscard]] FrameHandle Acquire() noexcept;
+    /// @param pipeline_ingress_time_ms 原始码流进入机载进程的单调时间；0表示未知。
+    [[nodiscard]] FrameHandle Acquire(std::int64_t pipeline_ingress_time_ms = 0) noexcept;
 
     /// 池容量（槽位数）。
     [[nodiscard]] std::size_t Capacity() const noexcept { return capacity_; }

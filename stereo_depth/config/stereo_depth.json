@@ -1,0 +1,21 @@
+{
+  "source_width": 1280,
+  "source_height": 720,
+  "max_disparity": 96,
+  "distance_min_m": 0.8,
+  "distance_max_m": 12.0,
+  "disparity_min_px": 1.5,
+  "roi_margin_px": 48,
+  "census_window": 7,
+  "sgm_paths": 8,
+  "penalty_p1": 8.0,
+  "penalty_p2": 32.0,
+  "uniqueness_ratio": 0.9,
+  "speckle_max_size": 32,
+  "query_use_median": true,
+  "min_valid_ratio": 0.35,
+  "subpixel": "linear",
+  "smooth_alpha": 0.3,
+  "jump_reset_m": 5.0,
+  "calibration_path": "../config/camera_calibration_uvc_1280x720.json"
+}

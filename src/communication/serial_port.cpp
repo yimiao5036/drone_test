@@ -2,16 +2,19 @@
  * @file serial_port.cpp
  * @brief 串口封装实现（Linux termios）
  *
- * 打开/关闭/读写均基于 POSIX termios；读取使用 VMIN=0 + VTIME 实现
- * 超时读（阻塞模式）。所有 PX4、地面站电台、激光雷达串口链路复用本类。
+ * 打开/关闭基于 POSIX termios；fd 使用非阻塞模式，读写通过 poll()
+ * 和单调时钟实现毫秒级超时。所有 PX4、地面站电台、激光雷达串口链路复用本类。
  */
 #include "communication/serial_port.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
+#include <climits>
 #include <cstring>
 #include <stdexcept>
 #include <system_error>
@@ -52,8 +55,47 @@ bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
 }
 
+/// 使用单调时钟等待 fd 就绪，避免 termios VTIME 只能按 100ms 取整。
+/// 返回 1=就绪，0=超时，-1=错误；EINTR 会在剩余超时内继续等待。
+int WaitForFd(int fd, short events, std::chrono::milliseconds timeout,
+              short* returned_events) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = now >= deadline
+                                   ? std::chrono::milliseconds{0}
+                                   : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         deadline - now);
+        const auto remaining_count = remaining.count();
+        const int timeout_ms = remaining_count > INT_MAX
+                                   ? INT_MAX
+                                   : static_cast<int>(remaining_count);
+
+        pollfd descriptor{};
+        descriptor.fd = fd;
+        descriptor.events = events;
+        const int result = ::poll(&descriptor, 1, timeout_ms);
+        if (result > 0) {
+            if (returned_events != nullptr) {
+                *returned_events = descriptor.revents;
+            }
+            return 1;
+        }
+        if (result == 0) {
+            return 0;
+        }
+        if (errno != EINTR) {
+            return -1;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return 0;
+        }
+    }
+}
+
 }  // namespace
 
+// 校验 termios 所需的设备路径、串口格式和超时参数；非法配置在构造阶段拒绝。
 void SerialPortConfig::Validate() const {
     if (device.empty()) {
         throw std::invalid_argument("串口设备路径不能为空");
@@ -70,8 +112,13 @@ void SerialPortConfig::Validate() const {
     if (parity != 'N' && parity != 'E' && parity != 'O') {
         throw std::invalid_argument("串口校验位必须是 N/E/O");
     }
-    if (read_timeout.count() < 0) {
-        throw std::invalid_argument("串口读取超时不能为负");
+    // 超时必须严格为正：wait_event 在 timeout<=0 时会立即返回 0，
+    // 读循环会把"超时"当成"无数据"空转，整条链路线程满核轮询。
+    if (read_timeout.count() <= 0) {
+        throw std::invalid_argument("串口读取超时必须为正数（毫秒）");
+    }
+    if (write_timeout.count() <= 0) {
+        throw std::invalid_argument("串口写入超时必须为正数（毫秒）");
     }
 }
 
@@ -89,6 +136,7 @@ SerialPort::~SerialPort() {
     SPDLOG_INFO("串口对象销毁: device={}", config_.device);
 }
 
+// 移动构造转移 fd 所有权；移动后源对象置为关闭状态，避免析构重复 close。
 SerialPort::SerialPort(SerialPort&& other) noexcept
     : config_(std::move(other.config_)),
       fd_(other.fd_),
@@ -98,6 +146,7 @@ SerialPort::SerialPort(SerialPort&& other) noexcept
     other.fd_ = -1;
 }
 
+// 移动赋值前先关闭当前 fd，再接管源对象资源。
 SerialPort& SerialPort::operator=(SerialPort&& other) noexcept {
     if (this != &other) {
         if (fd_ >= 0) {
@@ -113,12 +162,13 @@ SerialPort& SerialPort::operator=(SerialPort&& other) noexcept {
     return *this;
 }
 
+// 打开并配置串口：先建立非阻塞 fd，再应用 raw 模式、波特率、数据位、校验位和停止位。
 void SerialPort::Open() {
     if (fd_ >= 0) {
         return;  // 已打开，幂等
     }
 
-    fd_ = ::open(config_.device.c_str(), O_RDWR | O_NOCTTY);
+    fd_ = ::open(config_.device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0) {
         const int err = errno;
         throw std::system_error(err, std::generic_category(),
@@ -134,6 +184,11 @@ void SerialPort::Open() {
     }
 
     ::cfmakeraw(&options);
+    options.c_cflag |= static_cast<tcflag_t>(CLOCAL | CREAD);
+#ifdef CRTSCTS
+    options.c_cflag &= static_cast<tcflag_t>(~CRTSCTS);
+#endif
+    options.c_iflag &= static_cast<tcflag_t>(~(IXON | IXOFF | IXANY));
 
     const speed_t baud = ToBaudConstant(config_.baud_rate);
     if (baud == B0) {
@@ -179,11 +234,9 @@ void SerialPort::Open() {
         options.c_cflag &= static_cast<tcflag_t>(~CSTOPB);
     }
 
-    // 读取超时：VMIN=0 + VTIME（单位 0.1 秒），阻塞读最多等待该时长。
-    // 骨架期简化实现；精度不足时后续替换为 poll/epoll 精确超时。
+    // fd 使用非阻塞模式，读取/写入超时统一由 poll() 精确控制。
     options.c_cc[VMIN] = 0;
-    options.c_cc[VTIME] =
-        static_cast<cc_t>(config_.read_timeout.count() / 100);
+    options.c_cc[VTIME] = 0;
 
     if (::tcsetattr(fd_, TCSANOW, &options) != 0) {
         const int err = errno;
@@ -207,12 +260,42 @@ bool SerialPort::IsOpen() const {
     return fd_ >= 0;
 }
 
+// 读取单次字节流：0 表示超时/暂时无数据，-1 表示运行时错误，正数为实际字节数。
 std::ptrdiff_t SerialPort::Read(uint8_t* buffer, std::size_t size) {
-    if (fd_ < 0 || size == 0) {
+    if (fd_ < 0 || buffer == nullptr || size == 0) {
         return -1;
     }
-    const ssize_t n = ::read(fd_, buffer, size);
-    if (n < 0) {
+
+    short events = 0;
+    const int wait_result = WaitForFd(fd_, POLLIN, config_.read_timeout, &events);
+    if (wait_result == 0) {
+        return 0;
+    }
+    if (wait_result < 0 || (events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        ++error_count_;
+        if (ShouldLogThrottled(error_count_)) {
+            SPDLOG_ERROR("串口等待读取失败: device={} events={} errno={} ({})，累计 {}",
+                         config_.device, events, errno, std::strerror(errno), error_count_);
+        }
+        return -1;
+    }
+
+    while (true) {
+        const ssize_t n = ::read(fd_, buffer, size);
+        if (n > 0) {
+            read_bytes_ += static_cast<uint64_t>(n);
+            return n;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+
         ++error_count_;
         if (ShouldLogThrottled(error_count_)) {
             SPDLOG_ERROR("串口读取错误: device={} errno={} ({})，累计 {}",
@@ -220,40 +303,67 @@ std::ptrdiff_t SerialPort::Read(uint8_t* buffer, std::size_t size) {
         }
         return -1;
     }
-    if (n > 0) {
-        read_bytes_ += static_cast<uint64_t>(n);
-    }
-    return n;  // 0 = 超时无数据
 }
 
+// 全量写入：循环处理 partial write，整个数据块共享一个绝对截止时间。
+// 超时或设备错误返回 false，禁止上层误以为完整协议帧已经发送。
 bool SerialPort::Write(const uint8_t* data, std::size_t size) {
     if (fd_ < 0 || (data == nullptr && size > 0)) {
         return false;
     }
+    if (size == 0) {
+        return true;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + config_.write_timeout;
     std::size_t written = 0;
     while (written < size) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = now >= deadline
+                                   ? std::chrono::milliseconds{0}
+                                   : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         deadline - now);
+        short events = 0;
+        const int wait_result = WaitForFd(fd_, POLLOUT, remaining, &events);
+        if (wait_result <= 0 || (events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            ++error_count_;
+            if (ShouldLogThrottled(error_count_)) {
+                if (wait_result == 0) {
+                    SPDLOG_ERROR("串口写入超时: device={} 已写入={}/{}，累计 {}",
+                                 config_.device, written, size, error_count_);
+                } else {
+                    SPDLOG_ERROR("串口等待写入失败: device={} events={} errno={} ({})，累计 {}",
+                                 config_.device, events, errno, std::strerror(errno), error_count_);
+                }
+            }
+            return false;
+        }
+
         const ssize_t n = ::write(fd_, data + written, size - written);
-        if (n < 0) {
-            ++error_count_;
-            if (ShouldLogThrottled(error_count_)) {
-                SPDLOG_ERROR("串口写入错误: device={} errno={} ({})，累计 {}",
-                             config_.device, errno, std::strerror(errno), error_count_);
-            }
-            return false;
+        if (n > 0) {
+            written += static_cast<std::size_t>(n);
+            continue;
         }
-        if (n == 0) {
-            ++error_count_;
-            if (ShouldLogThrottled(error_count_)) {
-                SPDLOG_ERROR("串口写入零字节: device={}，累计 {}", config_.device, error_count_);
-            }
-            return false;
+        if (n < 0 && errno == EINTR) {
+            continue;
         }
-        written += static_cast<std::size_t>(n);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+
+        ++error_count_;
+        if (ShouldLogThrottled(error_count_)) {
+            SPDLOG_ERROR("串口写入错误: device={} errno={} ({})，累计 {}",
+                         config_.device, errno, std::strerror(errno), error_count_);
+        }
+        return false;
     }
+
     write_bytes_ += written;
     return true;
 }
 
+// 清空内核收发缓冲，用于链路重连或协议重新同步前丢弃残留字节。
 void SerialPort::Flush() {
     if (fd_ < 0) {
         return;

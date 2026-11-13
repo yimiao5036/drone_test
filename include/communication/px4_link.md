@@ -1,0 +1,517 @@
+# PX4 通信链路（px4_link）
+
+> 对应实现：`include/communication/px4_link.h`、`src/communication/px4_link.cpp`
+> 协议基础：`include/communication/mavlink_handler.md`
+> 串口基础：`include/communication/serial_port.md`
+
+## 1. 功能职责
+
+`Px4Link` 是 Pixhawk/PX4 MAVLink 链路的唯一拥有者，可通过 `ICommunicationTransport`
+选择真实串口或 PX4 SITL UDP。当前已实现：
+
+- 根据 `Px4LinkConfig.transport` 打开 PX4 串口或 UDP；
+- 启动一条独占通信线程，只有该线程执行串口读写；
+- 通过 `MavlinkHandler` 增量解析 MAVLink 1/2；
+- 周期发送机载电脑 `HEARTBEAT`；
+- 接收并筛选目标 PX4 `HEARTBEAT`；
+- 维护 connected、armed、PX4 main/sub mode 和 system status；
+- 解析固件版本/能力、落地、全局/局部位置、姿态、GPS、电池、Home 和 RC；
+- 连接后读取 PX4 电池参数 `BAT_LOW_THR` / `COM_LOW_BAT_ACT`（静态配置，非遥测流）；
+- 心跳超时后将连接状态置为断开，各类遥测按 `telemetry_timeout` 独立失效；
+- **串口连续读错误时关闭端口，按 `reconnect_interval` 自动重开**；UDP 不重连；
+- 周期及状态变化时发布 `Topic<FlightStateSnapshot>`；
+- Start/Stop 幂等，停止后可以重新启动。
+
+当前不做：姿态设定值、全局坐标设定值。`Px4Setpoint` 的本地 NED
+位置/速度发送、可靠 `COMMAND_LONG` 队列、ACK 和安全遥测请求已经实现。
+
+`Px4LinkStub` 继续保留，仅供骨架冒烟测试，不参与真实硬件通信。
+
+## 2. 接口与数据流
+
+```cpp
+struct Px4LinkConfig {
+    std::string transport;  // serial / udp
+    SerialPortConfig serial;
+    UdpTransportConfig udp;
+    std::string firmware_version;  // 当前为 1.17.0
+    uint8_t onboard_system_id;
+    uint8_t onboard_component_id;
+    uint8_t target_system_id;
+    uint8_t target_component_id;
+    uint8_t mavlink_version;
+    std::chrono::milliseconds heartbeat_send_interval;
+    std::chrono::milliseconds heartbeat_timeout;
+    std::chrono::milliseconds telemetry_timeout;
+    std::chrono::milliseconds state_publish_interval;
+    std::chrono::milliseconds reconnect_interval;
+    std::chrono::milliseconds command_ack_timeout;
+    std::chrono::milliseconds setpoint_send_interval;
+    std::chrono::milliseconds setpoint_timeout;
+    std::chrono::milliseconds parameter_request_interval;  // 参数请求重试周期
+    std::chrono::milliseconds parameter_timeout;           // 连接后无有效参数的告警阈值
+    std::size_t setpoint_queue_capacity;
+    std::size_t command_queue_capacity;
+    std::vector<uint32_t> one_shot_message_requests;
+    std::vector<MavlinkMessageIntervalRequest> message_interval_requests;
+};
+
+class Px4Link : public IPx4Link {
+public:
+    explicit Px4Link(Px4LinkConfig config);
+    bool Start();
+    void Stop();
+    bool IsRunning() const;
+    bool IsConnected() const;
+    void SetInput(Topic<Px4Setpoint>& setpoint);
+    Topic<FlightStateSnapshot>& StateOutput();
+    FlightStateSnapshot LatestState() const;  // 最近发布快照的只读拷贝
+};
+```
+
+窄命令接口与只读快照（阶段四控制接入）：
+
+```cpp
+class IPx4CommandSender {          // IPx4Link 的父接口
+    virtual bool SendCommand(uint16_t mavlink_command, float p1, ..., float p7) = 0;
+    virtual uint64_t AckMatchCount() const = 0;
+    virtual uint64_t AckTimeoutCount() const = 0;
+    virtual CommandAckStatus AckStatus() const = 0;   // 最近 ACK/超时快照
+    virtual void CancelPendingCommands() = 0;         // 清空排队与在途命令
+};
+
+struct CommandAckStatus {          // common/types.h
+    uint64_t matched_count;        // 累计匹配 ACK（单调递增）
+    uint64_t timeout_count;        // 累计 ACK 超时（单调递增）
+    uint16_t last_command;         // 最近一次匹配 ACK 的 MAV_CMD
+    uint8_t last_result;           // 最近一次匹配 ACK 的 MAV_RESULT
+    uint64_t last_time_ms;         // 最近一次匹配 ACK 的单调时钟毫秒
+    uint16_t last_timeout_command; // 最近一次超时的 MAV_CMD
+    // MAV_CMD_DO_SET_ACTUATOR(187) 专用关联，避免 176/400 等 ACK 覆盖
+    uint64_t do_set_actuator_ack_count;        // 187 匹配 ACK 累计数
+    uint8_t do_set_actuator_last_result;       // 最近 187 ACK 的 MAV_RESULT
+    uint64_t do_set_actuator_last_time_ms;     // 最近 187 ACK 到达时刻
+    uint64_t do_set_actuator_timeout_count;    // 187 ACK 超时累计数
+};
+```
+
+- `IPx4CommandSender` 暴露命令发送、ACK 计数、ACK 快照与取消，供状态机在
+  `enable_control=true` 时注入（装配期物理隔离；`false` 时不注入，命令通道在装配层缺席）。
+- `AckStatus()` 返回最近 ACK/超时快照，互斥量保护一次结构拷贝，可由状态机线程随时调用。
+  `do_set_actuator_*` 在 `HandleCommandAck` / `CheckCommandTimeout` 的同一把锁内维护，
+  只统计 `MAV_CMD_DO_SET_ACTUATOR(187)`：捕网复位等待跨越 S12~S14，期间
+  AUTO.LAND(176)/DISARM(400) 的 ACK 不得覆盖 187 的终态；全局 `last_*` 仍用于通用诊断。
+- `CancelPendingCommands()` 只置原子取消标志，由链路通信线程在下一次循环自己执行
+  `ClearCommands()`（线程安全，不跨线程修改在途命令）。语义边界：**已写入串口的命令
+  无法撤回**；排队命令与未超时的在途命令最迟在下一次读超时后失效，因此取消在
+  ≤ 一次读超时内生效，返回后不再发送旧命令。
+- `IPx4Link::LatestState()` 返回最近一次发布快照的拷贝，供 FlightController 控制权
+  门禁做只读判断——门禁不订阅 `kFlightState` Topic，避免控制环路经 Topic 回环。
+  未发布过快照时返回默认值（`connected=false`）。线程安全（互斥锁保护一次结构拷贝），
+  且保证观察到 `IsConnected()==true` 的线程经 `LatestState()` 必读到
+  `connected=true` 的快照（心跳处理先发布快照再置连接原子标志）。
+
+当前接收数据流：
+
+```text
+PX4 串口
+  → SerialPort::Read
+  → MavlinkHandler::Feed
+  → 目标 system/component ID 过滤
+  → 心跳/版本/飞行遥测解码与新鲜度校验
+  → BatteryStatus/SYS_STATUS → 电池遥测
+  → PARAM_VALUE → 电池参数快照（BAT_LOW_THR/COM_LOW_BAT_ACT）
+  → FlightStateSnapshot
+  → kFlightState Topic
+  → 后续状态机/控制/感知融合
+```
+
+当前发送数据流：
+
+```text
+机载电脑 HEARTBEAT / SendCommand / 自动遥测请求
+  → 有界命令队列（命令）
+  → 单条在途 COMMAND_LONG
+  → MavlinkHandler::Encode
+  → SerialPort::Write
+  → PX4
+  → COMMAND_ACK 匹配/超时
+
+PARAM_REQUEST_READ（BAT_LOW_THR / COM_LOW_BAT_ACT）
+  → 直接 MavlinkHandler::Encode + SerialPort::Write（不进命令队列、不占 ACK 通道）
+```
+
+`SetInput()` 必须在 `Start()` 前调用。订阅采用容量可配置、丢旧留新策略；通信线程缓存最新
+有效设定值，并按 `setpoint_send_interval` 重复发送 `SET_POSITION_TARGET_LOCAL_NED`。
+
+## 3. 关键实现点
+
+### 3.1 独占线程
+
+通信线程按以下顺序循环：
+
+1. 带超时读取串口；
+2. 增量解析收到的 MAVLink 帧；
+3. 检查 PX4 心跳和命令 ACK 超时，处理外部取消请求（清空排队/在途命令）；
+4. 按 `parameter_request_interval` 重发缺失的电池参数请求（直接写 transport）；
+5. 发送下一条排队命令；
+6. 到期发送机载电脑心跳；
+7. 到期发布飞行状态快照。
+
+其他线程不得访问 `SerialPort::Write()`。设定值和命令只能进入 Topic/有界队列，由本线程发送。
+
+### 3.2 身份过滤
+
+只有同时匹配以下配置的消息进入 PX4 业务处理：
+
+```text
+message.sysid  == target_system_id
+message.compid == target_component_id
+```
+
+HEARTBEAT 还必须满足：
+
+```text
+heartbeat.autopilot == MAV_AUTOPILOT_PX4
+```
+
+这样可避免同一 MAVLink 总线上其他组件或地面站心跳被误判为飞控连接。
+
+### 3.3 PX4 1.17.0 模式解析
+
+`HEARTBEAT.custom_mode` 按 PX4 1.17.0 格式保存并拆分：
+
+```text
+bits 16..23 → flight_mode（main mode）
+bits 24..31 → flight_sub_mode（sub mode）
+```
+
+同时保留原始 `base_mode` 和 `custom_mode`，避免上层丢失版本适配信息。armed 来自
+`MAV_MODE_FLAG_SAFETY_ARMED`。PX4 1.17.0 在旧模式基础上增加了 `TERMINATION`、
+`ALTITUDE_CRUISE`、`AUTO_VTOL_TAKEOFF`、`POSCTL_SLOW` 等值，因此业务层不得只按旧版
+枚举范围判断合法性。ACK 不能代替这些真实状态。
+
+### 3.4 快照有效性
+
+已解析字段包括：
+
+- 心跳：`connected/armed/base_mode/custom_mode/flight_mode/flight_sub_mode/system_status`；
+- 落地：`landed`，仅 `landed_state_valid=true` 时可用；
+- 导航：GPS fix、卫星数（`gps_satellites_visible`）、水平/垂直定位精度
+  （`gps_eph_m/gps_epv_m`，eph/epv 由 cm 换算为米；MAVLink 约定的未知值
+  `satellites_visible=255`、`eph/epv=UINT16_MAX` 不伪装成数值，对应
+  `gps_satellites_valid/gps_accuracy_valid` 标志为假）、全局位置、局部 NED 位置和
+  NED 速度；
+- 姿态：roll/pitch/yaw；
+- 动力电池：电压、电流、剩余量及各自有效标志；
+- 电池参数：`battery_low_threshold_valid/pct`（`BAT_LOW_THR`）、
+  `low_battery_action_valid/action`（`COM_LOW_BAT_ACT`，float 四舍五入到 uint8）
+  与 `battery_parameter_time_ms`；属于静态配置，**不参与 `telemetry_timeout`**，
+  断连/Stop 直接失效（见 §3.9）；
+- Home：经纬度与 MSL 高度；
+- **EKF 投影参考锚点**（2026-10-15 新增）：`GPS_GLOBAL_ORIGIN`（**#49**，内容为
+  `vehicle_local_position.ref_*` 的 MAVLink 出口）→
+  `ned_ref_valid/ned_ref_lat_1e7/ned_ref_lon_1e7/ned_ref_alt_mm` 与
+  `ned_ref_received_count`。**该消息为变化触发式**：流按 1Hz 调度、仅在锚点
+  变化 >1.1cm 或 `REQUEST_MESSAGE` 请求时发送一条——**锚点稳定则一条都不发
+  （计数≈0 是正常态，非链路故障）**；无周期新鲜度语义：valid 在连接期间保持、
+  断连清除。**`ned_ref_received_count`（收到计数）即锚点变化次数的直接度量**——
+  与持续刷新的 Home 不同源，用于 Home 漂移处置方案（迟滞阈值 / 换锚点基准）
+  的现场裁决观测。启用方式：`message_interval_requests` 请求 49 1Hz（流对
+  客户端默认不启用，须显式请求；SITL 已实测验证：`commander set_ekf_origin`
+  改锚点 → 机载端收到 1 条）。
+  **实机订正（2026-10-16，根因已定位：消息号写错）**：历史配置把锚点流请求写成
+  **411**，而本方言 GPS_GLOBAL_ORIGIN = **#49**（411 = CURRENT_EVENT_SEQUENCE）。
+  PX4 v1.17.0 对两条显式请求分别回 `REQUEST_MESSAGE(411)` → result=2（DENIED）、
+  `SET_MESSAGE_INTERVAL(411)` → result=4（FAILED）——与源码路径完全吻合：
+  `set_message_interval` 在 `get_stream_name(411)` 未命中时返回 ERROR；
+  `handle_request_message_command` 首轮找不到流对象、回退路径又因 `get_stream_name`
+  未命中而跳过 → DENIED。**该错误在 10-15 的 SITL 验证中被"改锚点 → 变化触发发送"
+  掩盖**（锚点流由链路 mode 默认实例化，改锚点即发一条，与请求无关）。
+  2026-10-16 会话 `锚点ref=--`（6 分钟收 0）= 锚点未变化（正常静默）或流未实例化，
+  两者此前无法区分；**配置已订正为 49**，定案工具：
+  `px4_link_smoke --probe-message-interval 49`（见 `tools/px4_link_smoke.md` §2.4）。
+- RC：链路有效性、在线状态和 RSSI，不自动等同人工接管；
+- 固件：`flight_sw_version`、语义版本、capabilities；
+- **起飞高度基准**（2026-11-04 新增）：`takeoff_ref_valid/takeoff_ref_local_z_m`——
+  在 HEARTBEAT 的**解锁上升沿**（`armed` false→true）抓一次 `state_.local_z_m` 作为
+  "相对高度 0"；若当时还没有 `LOCAL_POSITION_NED`，置 `takeoff_ref_pending_`，
+  等 `HandleLocalPosition()` 到达时补抓（`CaptureTakeoffReference()`）。链路失效
+  （`InvalidateVolatileState()`）清空基准，下次解锁重新抓。**该基准只是兜底**：
+  首选见下一条 `home_local_z`。用途：围栏高度判定、飞控高度钳制与 65011
+  `relative_alt` 下传统一走 `common::RelativeAltitudeBaseZ()`（EKF 差分），
+  不再用两个 GNSS 绝对海拔相减（`ned_ref_alt − local_z − home_alt`），后者会被
+  Home 海拔漂移带偏，见 `docs/故障排查手册.md` §17.9.1。
+- **Home 局部高度**（2026-11-04 新增）：`home_local_z_valid/home_local_z_m`——
+  从 `HOME_POSITION.z` 解析（EKF 局部 NED 高度，不是 `altitude`）。它是"相对起飞点
+  高度"的**首选基准**：PX4 在 EKF 位置相对 Home 漂移超过 `2×EPH/2×EPV` 时会重设
+  Home（`commander/HomePosition` 的 `hasMovedFromCurrentHomeLocation()`），该字段
+  与 `local_z` 同属一个局部坐标系、一起平移，因此差分对 EKF 高度重置免疫（自愈），
+  与 PX4 任务相对高度同源。取值统一走 `common::RelativeAltitudeBaseZ()`：先 Home
+  `z`、再 `takeoff_ref`、都无则 `nullopt`（调用方按"只判水平/不下发相对高度"处理）。
+  链路失效一并清空。
+
+各类周期遥测使用 `telemetry_timeout` 判断新鲜度。超时后保留最后数值供排查，但将对应 valid
+标志清零，控制模块只能使用 valid=true 的字段。Home 在心跳连接期间保持有效，但连接断开时
+立即失效；固件版本属于诊断信息，可保留到链路重新 Start 时统一重置。
+
+快照头：
+
+- `receive_time_ms`：算力板单调时钟发布时间；
+- `valid_for_ms`：心跳超时配置；
+- `source_id`：PX4 target system ID；
+- `health`：连接时 1，断开时 3；
+- `source_time_ms=0`：HEARTBEAT 不提供可靠源时间，不伪造。
+
+### 3.5 本地 NED 设定值
+
+当前支持：
+
+- `SetpointType::kPosition`：x/y/z 为 NED 位置（米）；
+- `SetpointType::kVelocity`：x/y/z 为 NED 速度（m/s）；
+- **位置+速度前馈（P3，2026-10-19）**：位置型可携带 `feedforward_vx/vy/vz_mps`
+  与逐轴 `feedforward_valid_mask`（bit0=N/bit1=E/bit2=D）。掩码置位的轴在
+  `type_mask` 中清除对应 `VX/VY/VZ_IGNORE` 并填速度字段；未置位轴仍置 IGNORE、
+  打包写 0。掩码为 0 时与旧实现逐位一致（位置型速度三轴全忽略、字段全 0）。
+  速度型设定值必须保持掩码为 0。
+- 可选 yaw 或 yaw rate，度/度每秒在发送前转换为弧度/弧度每秒；
+- 坐标系必须为 `header.frame_id=3`（本地 NED）；
+- 根据类型构造严格的 `POSITION_TARGET_TYPEMASK`，忽略未使用的位置/速度/加速度/yaw 字段。
+
+**下行报文与执行帧（2026-10-16 补注）**：实际发送 `SET_POSITION_TARGET_LOCAL_NED`
+（#84），`frame = MAV_FRAME_LOCAL_NED`——**给 PX4 的是局部 NED 米制量，不是经纬度**；
+该局部帧的原点是 **EKF 投影参考锚点**（`GPS_GLOBAL_ORIGIN` #49 的 `ref_*`），
+PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地 NED"的实际基准是
+**锚点**（不是 Home）——目标换算若用 Home 会带来固定偏置 H，详见
+`docs/方案C锚点基准实施清单.md`。
+
+安全规则：
+
+- `valid=false` 清除缓存并停止发送，不会用空 mask 维持 Offboard；
+- 刹停/悬停必须由控制器生成有效零速度或位置保持设定值；
+- `kNone/kAttitude`、非 NED、NaN/Inf、同时启用 yaw 和 yaw rate 均拒绝；
+  位置前馈掩码越界、置位轴非有限、速度型携带前馈掩码同样按结构非法拒绝；
+- 有效期取 `min(header.valid_for_ms, setpoint_timeout)`；头部未给有效期时使用配置上限；
+- 设定值收到时已过期、时间戳在未来或缓存过期时停止发送；
+- 只在 PX4 心跳连接期间发送，断开/Stop/Start 都清除旧设定值。
+
+### 3.6 可靠命令与安全遥测请求
+
+`SendCommand()` 只负责把命令放入有界队列，返回 true 表示成功入队，不表示 PX4 已接受。
+链路线程同一时刻只发送一条 `COMMAND_LONG` 并等待同 command ID 的 `COMMAND_ACK`：
+
+- 最终 ACK 增加 `AckMatchCount()`，更新 `AckStatus()` 快照（`matched_count`/
+  `last_command`/`last_result`/`last_time_ms`）后发送下一条；
+- `MAV_RESULT_IN_PROGRESS` 保持在途并刷新超时时间；
+- 超过 `command_ack_timeout` 增加 `AckTimeoutCount()`，更新 `AckStatus()`
+  （`timeout_count`/`last_timeout_command`），丢弃该在途命令并继续队列；
+- `CancelPendingCommands()` 由状态机线程调用时只置原子标志，通信线程在检查 ACK 超时后、
+  发送下一条命令前清空排队与在途命令——保证本轮不会再发出旧命令；已写入串口的
+  命令无法撤回（≤ 一次读超时内生效）；
+- 队列满、未运行或未连接时拒绝外部命令；
+- 心跳断开和 Stop 清空排队/在途命令，禁止重连后恢复旧命令。
+
+发送失败按指令语义分别处理（2026-10-30 修正，A-02，含参数读取）：
+
+命令/请求按语义分流——三条命令通道 + 一类直写请求，失败策略不同，避免"可重放的
+遥测请求堵住关键命令"或"重放过期设定值"：
+
+1. **关键单次命令**（`internal=false`：ARM/DISARM/LAND/`DO_SET_ACTUATOR` 等）
+   - 出队后编码为空或 `transport_->Write()` 失败时，命令**放回队首**（`command_queue_.push_front`），
+     保持先入先出顺序；
+   - 放回后按 `kCommandSendRetryBackoffMs=50` 退避再试；
+   - 同一条命令连续失败达到 `kMaxCommandSendAttempts=10` 次才丢弃，丢弃打 **ERROR**
+     （不再是静默 WARN），防止坏链路永久堵住队头；
+2. **内部遥测请求**（`internal=true`：`REQUEST_MESSAGE`/`SET_MESSAGE_INTERVAL`）
+   - 独立 `telemetry_command_queue_`，只在关键命令队列为空时发送，**不占用关键命令名额**；
+   - 写失败**直接丢弃**：不重试、不设置退避窗口，下一轮循环立即继续；为避免首次建链时
+     `SET_MESSAGE_INTERVAL` 偶发丢失导致遥测流永不开启，丢弃后按 `kTelemetryRequestRetryMs=1000`
+     低频重新排队（只重排遥测批次，仍不占关键命令队列、不进关键命令退避窗口）；
+3. **流式设定值**（`SET_POSITION_TARGET_LOCAL_NED`）
+   - 不进命令队列，走 `cached_setpoint_` 最新值缓存；写失败只跳过本周期，下一周期发送
+     **最新值**，绝不重放旧设定值（过期由 `setpoint_timeout` 丢弃）。
+4. **参数读取请求**（`PARAM_REQUEST_READ`：`BAT_LOW_THR`/`COM_LOW_BAT_ACT`）
+   - 消息类型不是 `COMMAND_LONG`，**不入命令队列、不占 ACK 通道**，直接写 `transport_`；
+   - 属可重放内部请求：写失败**不重试**，由 `parameter_request_interval`（默认 1s）自然重排；
+   - 失败打节流 WARN（首次 + 每 100 次，含参数名与累计次数）；连接后超过 `parameter_timeout`
+     仍读不到时另有"电池参数读取超时"WARN，参数保持无效（不以 0 冒充阈值）。
+
+只有**写成功**才把命令置为 `in_flight_command_` 并开始 ACK 超时计时——写失败的命令
+既不算在途也不产生 ACK 超时，`AckTimeoutCount()` 语义保持"已发出但没等到 ACK"。
+失败均节流日志（首次 + 每 100 次），含 command ID/参数名、尝试次数与累计失败数；
+`ClearCommands()`（断链/Stop/取消）同时清空两个队列并复位尝试计数与退避时间。
+
+`AckStatus()` 与原有 `AckMatchCount()/AckTimeoutCount()` 口径一致（计数单调递增、
+重启不归零）；`last_*` 字段用于状态机判断最近一条命令是否被接受。
+
+首次建立心跳后按 JSON 自动排队：
+
+- `MAV_CMD_REQUEST_MESSAGE`：请求 `AUTOPILOT_VERSION` 和 `HOME_POSITION`；
+- `MAV_CMD_SET_MESSAGE_INTERVAL`：周期遥测频率（含 `GPS_GLOBAL_ORIGIN` 49 1Hz，
+  显式启用 EKF 锚点流——变化触发式，启用后锚点变化即上报；**消息号 49，勿写 411**）；
+- `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
+  `EXTENDED_SYS_STATE` 的配置频率（当前生产配置：姿态/局部位置 25Hz、GPS 10Hz、
+  全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；
+  115200 波特率下链路占用约 45%）。
+
+这些内部命令只改变本 MAVLink 链路的消息输出，不执行解锁、模式切换或飞行控制。
+
+### 3.7 停机与重启
+
+`Stop()` 先清除运行标志，等待串口 `poll()` 在 `read_timeout` 内返回并退出线程，然后关闭串口。
+若停止前已连接，会发布最终 `connected=false` 快照。再次 `Start()` 时重置 MAVLink 半包、发送序号、
+状态快照和心跳时间，不恢复旧控制状态。
+
+### 3.8 串口断链与自动重连
+
+仅 `transport=serial`：
+
+1. `Read()` 连续返回错误达到 3 次（单次 EINTR/瞬时错误不触发）→ 判定串口/设备丢失；
+2. 立即 `connected=false`、清命令队列与在途 ACK、清设定值缓存、失效遥测，发布断开快照；
+3. `transport_->Close()`，按 `reconnect_interval` 周期 `Open()` 重试；
+4. 重连成功：重置 MAVLink 半包/解析状态、遥测时间与固件上报标记，保持
+   `connected=false`，等待新的 PX4 HEARTBEAT；心跳到达后再置 connected；
+5. 断链期间 Worker 不发送心跳/setpoint，不读取旧 fd；重连失败只写节流 WARN
+   （首次 + 每 10 次），进程不退出；
+6. `Stop()` 可随时打断重连等待并正常关闭。
+
+`FlightController` 通过快照 `connected` 观察断链，授权链立即撤权并停发；
+正式程序不会因串口断开退出，视频/地面站继续运行。重连成功后控制是否恢复仍由
+现有授权链（PX4 connected+armed+Offboard+请求位）决定，不恢复旧命令队列。
+UDP/SITL 不自动重连（socket 保持打开，PX4 上线后心跳自然恢复）。
+
+日志：断链一条 WARN（含原因/设备/重试周期）；重连成功一条 INFO（含尝试次数）；
+重连失败首次与每 10 次 WARN；底层串口错误仍由 `SerialPort` 节流记录。
+
+### 3.9 PX4 电池参数读取（BAT_LOW_THR / COM_LOW_BAT_ACT）
+
+自动分配/起飞和机载低电守卫需要 PX4 自身的电池保护参数（设计文档 §9）。
+这两个参数是**静态配置**，不是周期遥测：
+
+1. **请求**：首次收到 PX4 心跳（连接建立）后，通信线程发送
+   `PARAM_REQUEST_READ`，`param_id` 分别为 `BAT_LOW_THR`、`COM_LOW_BAT_ACT`，
+   `param_index=-1`（按名称读取），target system/component 取配置值。
+   请求帧直接 `MavlinkHandler::Encode` + `transport_->Write`，
+   **不进入 `COMMAND_LONG` 命令队列，不占用 ACK 通道**。
+2. **重试**：连接的每个参数独立判断；未收到有效值且距上次请求达到
+   `parameter_request_interval`（默认 1000ms）时重发缺失项。两个参数都有效后
+   停止请求，避免周期性刷屏。
+3. **回包**：`PARAM_VALUE` 按 `param_id` 精确匹配（`char[16]` 长度恰为 16 时
+   没有 NUL 结尾，使用定长比较，不能直接 `strcmp`）。`BAT_LOW_THR` 在 PX4
+   1.17 中是**归一化比例**（`module.yaml`：`unit: norm`，范围 0.12~0.5，
+   默认 0.15 即 15%），写入快照前乘 100 换算为 `battery_low_threshold_pct`
+   （0~100 百分比），与 `battery_remaining_pct` 同量纲；`COM_LOW_BAT_ACT`
+   的 float 四舍五入并夹紧到
+   `uint8_t` 后写 `low_battery_action`。每次命中更新
+   `battery_parameter_time_ms` 并立即 `PublishState()`，状态机无需等待下一个
+   周期快照。非有限数值丢弃；其它参数名完全忽略，不影响电池参数或 ACK 状态。
+4. **超时**：连接建立超过 `parameter_timeout`（默认 5000ms）仍无有效值时，
+   **保持 `valid=false`，不得用 0 冒充真实阈值**；按首次 + 每 100 次节流 WARN。
+   读取失败由上层映射为 `battery_config_unknown`（Task 8）。
+5. **失效**：心跳超时、串口断链重连、Worker 退出与 `Stop()` 都会清空两个
+   valid 标志、`battery_parameter_time_ms` 和请求簿记；重连后重新请求。
+   数值字段保留最后一次读数仅供排查，`valid=false` 时上层不得使用。
+6. 参数读取与 RC 无关：不读取、不修改遥控器通道；参数读取本身也不下发任何
+   飞行控制命令。
+
+`Px4LinkStub` 不实现参数请求，`LatestState()` 返回默认快照（两个 valid 均为
+false）。
+
+## 4. 日志行为
+
+| 等级 | 场景 |
+|---|---|
+| INFO | 创建/销毁、启动/停止、首次心跳、串口重连成功、遥测请求入队、电池参数读取完成（每连接一次）、命令 ACK、固件版本、正常停止、解锁上升沿锁定起飞高度基准（`起飞高度基准已锁定: local_z=..m`，每次解锁一条） |
+| WARN | 心跳超时、串口断链/重连失败、电池参数读取超时（首次 + 每 100 次）、固件不一致、命令队列满、命令发送失败（首次 + 每 100 次）、ACK 超时、非法/过期设定值（均节流） |
+| ERROR | 启动打开串口失败、运行期读写错误统计、Start 后错误绑定 Topic（节流） |
+
+不逐帧打印 HEARTBEAT 或状态快照，避免高频刷屏。底层串口错误由 `SerialPort` 记录一次，
+`Px4Link` 只累计链路级错误，不重复打印同一调用链错误。
+
+**设定值下发统计（2026-11-02 增，INFO，10s 一次）**：
+`PX4 设定值下发统计: 窗口=…ms 本次=… 速率=…Hz 累计=… 拒绝=… 写错误=…`。用于回答
+“设定值到底按多少赫兹下发”——0082 实飞 PX4 ULG 里相邻 `trajectory_setpoint` 间隔
+0.21s（≈4.8Hz）曾让人误判为下发太慢，机载计数证明真实下发是 **15.9~17.5Hz**，ULG 那
+是记录抽稀。测量同时暴露：通信线程按串口读超时（`px4.read.timeout_ms`，默认 20ms）
+阻塞唤醒，`setpoint_send_interval_ms=50` 会被量化成 60ms；配置改为 **40ms** 后 SITL 实测
+20.9~22.3Hz。若要改下发周期，注意它必须是读超时的整数倍。
+
+## 5. 测试方式
+
+测试：`tests/communication/px4_link_test.cpp`，使用 Linux PTY 模拟 Pixhawk 串口，不依赖硬件。
+
+覆盖：
+
+- 配置身份和 MAVLink 版本校验；
+- 启动后发送标准机载电脑 HEARTBEAT；
+- 接收 PX4 HEARTBEAT 后连接；
+- armed、main/sub mode、system status 解码；
+- 落地、GPS、全局/局部位置、姿态、电池、Home、RC、固件版本与 capabilities；
+- `FlightStateSnapshot` 发布、消息头和 NED frame ID；
+- 心跳超时断开并发布快照；
+- 串口读错误后关闭旧端口、重开同一路径，并在新 PTY 心跳到达后恢复 connected；
+- 遥测超时后有效标志清零但心跳连接保持；
+- 忽略非目标 system ID；
+- Stop 后重新 Start；
+- 未连接拒绝命令；
+- `COMMAND_LONG` 参数编码、最终 ACK 匹配和快照更新；
+- `AckStatus()` 报告最近匹配 ACK（command/result/time）与超时命令；
+- 187 专用 ACK 计数/终态在后续其它命令 ACK 到达后保持不变；
+- `CancelPendingCommands()` 清掉排队命令，在途命令超时后不得发出；
+- ACK 超时计数后继续队列；
+- 命令发送失败时放回队首并退避重试（`CommandSendRetriesAndKeepsCommandWhenWriteFails`，
+  用不可用的 UDP 目的地址构造确定性写失败，断言错误计数在重试窗口内持续增长且
+  `AckTimeoutCount()` 不增加）；
+- 内部遥测请求写失败只丢弃不重试、不占用关键命令退避窗口
+  （`TelemetryRequestDroppedWithoutRetryWhileCriticalCommandRetries`：错误计数在
+  遥测请求丢弃后的稳态窗口内不随重试增长，随后的 ARM 命令仍按 50ms 退避重试）；
+- 首次心跳后按顺序发送单次消息请求和消息频率请求；
+- 首次心跳后发送 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 两条 `PARAM_REQUEST_READ`
+  （index=-1，target 身份正确）；
+- `PARAM_VALUE` 回包后 `LatestState()` 与 `StateOutput()` 的
+  `battery_low_threshold_valid/pct`、`low_battery_action_valid/action`、
+  `battery_parameter_time_ms` 正确，且不改变 ACK 计数/快照；
+- 参数超时保持 `valid=false`（不伪造 0）；未知/16 字节无 NUL 参数名不影响已有值；
+- 断连清除两个 valid，重连后重新发起参数请求；
+- `Px4LinkStub` 默认两个 valid 均为 false；
+- `LatestState()` 未发布时返回默认快照，连接后反映已发布快照（connected/armed）；
+- 本地 NED 位置设定值、type mask 和 yaw 角转换；
+- 位置+逐轴速度前馈的 type mask/字段打包（仅 N 时 VY/VZ 保持忽略）；
+- 非有限置位轴、未知前馈掩码位、速度型携带前馈掩码均拒绝；
+- 本地 NED 速度设定值、type mask 和 yaw rate 转换；
+- 过期设定值停止重发；
+- 非 NED、姿态、NaN/Inf 和 yaw 选择冲突拒绝。
+
+运行：
+
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
+./build/px4_link_test
+ctest --test-dir build --output-on-failure
+```
+
+真实硬件和 SITL 均使用独立 `px4_link_smoke` 验证，详见 `tools/px4_link_smoke.md` 和
+`tools/PX4_SITL分级测试.md`。硬件模式只发送机载电脑
+HEARTBEAT、`REQUEST_MESSAGE` 和 `SET_MESSAGE_INTERVAL`，不发送解锁、模式或飞行控制命令，
+可在正式 main 全量装配前验证 `/dev/ttyS1`、ACK 和 PX4 实际消息流。
+
+## 6. 排查/修改要点
+
+| 现象 | 排查方向 |
+|---|---|
+| `Start()` 返回 false | JSON 设备名、权限、波特率、UART 是否被占用 |
+| 能收到字节但不连接 | target system/component ID 或 `MAV_AUTOPILOT_PX4` 不匹配 |
+| 心跳连接反复变化 | 波特率/接线不稳定，或 `heartbeat_timeout` 过短 |
+| 模式数值异常 | 检查 PX4 固件是否为 1.17.0，以及 custom mode 位布局 |
+| Stop 延迟 | `serial.read_timeout_ms` 决定最坏退出等待时间 |
+| 重启后旧控制恢复 | 属于缺陷；Start 必须清空状态和后续的设定值/命令缓存 |
+| 收到其他 MAVLink 设备消息 | 当前按目标 ID 过滤；未来多组件遥测需明确白名单后扩展 |
+| 电池参数一直无效 | 确认 PX4 有 `BAT_LOW_THR`/`COM_LOW_BAT_ACT` 参数、链路已连接；检查 `parameter_timeout` 内的超时 WARN 与 `PARAM_VALUE` 是否到达 |
+
+PX4 1.17.0 SITL 第 3A~3D 已完成：Offboard 前置流、ARM/DISARM、零速度、相对起飞、
+位置悬停、水平速度/制动/返回、AUTO.LAND，以及停止 setpoint 后退出 Offboard 的保护闭环。
+实测 `COM_OF_LOSS_T=1s`，应用侧 1270ms 观测到 6/0→4/5 AUTO/RTL；源码确认
+`COM_OBL_RC_ACT=0`先请求 Position，无人工控制信号时经模式可运行性回退到 RTL。下一阶段为
+真实 Pixhawk 拆桨台架，仍从只读、disarmed setpoint、disarmed Offboard、拆桨 ARM/主动
+DISARM逐级执行。姿态/机体系/全局设定值需要独立接口评审后才能扩展。

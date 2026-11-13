@@ -1,0 +1,61 @@
+[0/1] cd /root/PX4-Autopilot/build/px4_sitl_default/src/modules/simulation/gz_bridge && /usr/bin/cmake -E env PX4_SIM_MODEL=gz_x500 GZ_IP=127.0.0.1 /root/PX4-Autopilot/build/px4_sitl_default/bin/px4
+
+______  __   __    ___ 
+| ___ \ \ \ / /   /   |
+| |_/ /  \ V /   / /| |
+|  __/   /   \  / /_| |
+| |     / /^\ \ \___  |
+\_|     \/   \/     |_/
+
+px4 starting.
+
+INFO  [px4] startup script: /bin/sh etc/init.d-posix/rcS 0
+INFO  [init] found model autostart file as SYS_AUTOSTART=4001
+INFO  [param] selected parameter default file parameters.bson
+INFO  [param] importing from 'parameters.bson'
+INFO  [parameters] BSON document size 517 bytes, decoded 517 bytes (INT32:16, FLOAT:9)
+INFO  [param] selected parameter backup file parameters_backup.bson
+INFO  [dataman] data manager file './dataman' size is 1208528 bytes
+INFO  [init] Gazebo simulator 8.15.0
+INFO  [init] Starting gazebo with world: /root/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf
+[1;31m[Err] [SystemLoader.cc:92] [0m[1;31mFailed to load system plugin [[0m[1;31mlibGstCameraSystem.so[0m[1;31m] : Could not find shared library.[0m[1;31m[0m
+INFO  [init] Waiting for Gazebo world...
+INFO  [init] Gazebo world is ready
+INFO  [init] Gazebo model pose: 0 0 0 0 0 1.5708
+INFO  [init] Spawning Gazebo model
+[1;33mWarning [Utils.cc:132][0m [/sdf/model[@name="x500_base"]/link[@name="base_link"]/sensor[@name="air_pressure_sensor"]/gz_frame_id:/root/PX4-Autopilot/Tools/simulation/gz/models/x500_base/model.sdf:L219]: XML Element[gz_frame_id], child of element[sensor], not defined in SDF. Copying[gz_frame_id] as children of [sensor].
+[1;33mWarning [Utils.cc:132][0m [/sdf/model[@name="x500_base"]/link[@name="base_link"]/sensor[@name="magnetometer_sensor"]/gz_frame_id:/root/PX4-Autopilot/Tools/simulation/gz/models/x500_base/model.sdf:L233]: XML Element[gz_frame_id], child of element[sensor], not defined in SDF. Copying[gz_frame_id] as children of [sensor].
+[1;33mWarning [Utils.cc:132][0m [/sdf/model[@name="x500_base"]/link[@name="base_link"]/sensor[@name="imu_sensor"]/gz_frame_id:/root/PX4-Autopilot/Tools/simulation/gz/models/x500_base/model.sdf:L259]: XML Element[gz_frame_id], child of element[sensor], not defined in SDF. Copying[gz_frame_id] as children of [sensor].
+[1;33mWarning [Utils.cc:132][0m [/sdf/model[@name="x500_base"]/link[@name="base_link"]/sensor[@name="navsat_sensor"]/gz_frame_id:/root/PX4-Autopilot/Tools/simulation/gz/models/x500_base/model.sdf:L311]: XML Element[gz_frame_id], child of element[sensor], not defined in SDF. Copying[gz_frame_id] as children of [sensor].
+INFO  [lockstep_scheduler] setting initial absolute time to 4284000 us
+INFO  [gz_bridge] world: default, model: x500_0
+INFO  [commander] LED: open /dev/led0 failed (22)
+WARN  [health_and_arming_checks] Preflight Fail: ekf2 missing data
+WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS
+INFO  [uxrce_dds_client] init UDP agent IP:127.0.0.1, port:8888
+INFO  [mavlink] mode: Normal, data rate: 4000000 B/s on udp port 18570 remote port 14550
+INFO  [mavlink] mode: Onboard, data rate: 4000000 B/s on udp port 14580 remote port 14540
+INFO  [mavlink] mode: Onboard, data rate: 4000 B/s on udp port 14280 remote port 14030
+INFO  [mavlink] mode: Gimbal, data rate: 400000 B/s on udp port 13030 remote port 13280
+INFO  [logger] logger started (mode=all)
+INFO  [logger] Start file log (type: full)
+INFO  [logger] [logger] ./log/2026-10-22/11_49_08.ulg	
+INFO  [logger] Opened full log file: ./log/2026-10-22/11_49_08.ulg
+INFO  [mavlink] MAVLink only on localhost (set param MAV_{i}_BROADCAST = 1 to enable network)
+INFO  [mavlink] MAVLink only on localhost (set param MAV_{i}_BROADCAST = 1 to enable network)
+INFO  [px4] Startup script returned successfully
+pxh> INFO  [tone_alarm] home set
+[2Kpxh> p[2Kpxh> pa[2Kpxh> par[2Kpxh> para[2Kpxh> param[2Kpxh> param [2Kpxh> param s[2Kpxh> param se[2Kpxh> param set[2Kpxh> param set [2Kpxh> param set M[2Kpxh> param set MP[2Kpxh> param set MPC[2Kpxh> param set MPC_[2Kpxh> param set MPC_X[2Kpxh> param set MPC_XY[2Kpxh> param set MPC_XY_[2Kpxh> param set MPC_XY_V[2Kpxh> param set MPC_XY_VE[2Kpxh> param set MPC_XY_VEL[2Kpxh> param set MPC_XY_VEL_[2Kpxh> param set MPC_XY_VEL_M[2Kpxh> param set MPC_XY_VEL_MA[2Kpxh> param set MPC_XY_VEL_MAX[2Kpxh> param set MPC_XY_VEL_MAX [2Kpxh> param set MPC_XY_VEL_MAX 2[2Kpxh> param set MPC_XY_VEL_MAX 2.[2Kpxh> param set MPC_XY_VEL_MAX 2.0
+pxh> [2Kpxh> p[2Kpxh> pa[2Kpxh> par[2Kpxh> para[2Kpxh> param[2Kpxh> param [2Kpxh> param s[2Kpxh> param se[2Kpxh> param set[2Kpxh> param set [2Kpxh> param set C[2Kpxh> param set CO[2Kpxh> param set COM[2Kpxh> param set COM_[2Kpxh> param set COM_L[2Kpxh> param set COM_LO[2Kpxh> param set COM_LOW[2Kpxh> param set COM_LOW_[2Kpxh> param set COM_LOW_B[2Kpxh> param set COM_LOW_BA[2Kpxh> param set COM_LOW_BAT[2Kpxh> param set COM_LOW_BAT_[2Kpxh> param set COM_LOW_BAT_A[2Kpxh> param set COM_LOW_BAT_AC[2Kpxh> param set COM_LOW_BAT_ACT[2Kpxh> param set COM_LOW_BAT_ACT [2Kpxh> param set COM_LOW_BAT_ACT 0
+pxh> [2Kpxh> p[2Kpxh> pa[2Kpxh> par[2Kpxh> para[2Kpxh> param[2Kpxh> param [2Kpxh> param s[2Kpxh> param se[2Kpxh> param set[2Kpxh> param set [2Kpxh> param set B[2Kpxh> param set BA[2Kpxh> param set BAT[2Kpxh> param set BAT_[2Kpxh> param set BAT_L[2Kpxh> param set BAT_LO[2Kpxh> param set BAT_LOW[2Kpxh> param set BAT_LOW_[2Kpxh> param set BAT_LOW_T[2Kpxh> param set BAT_LOW_TH[2Kpxh> param set BAT_LOW_THR[2Kpxh> param set BAT_LOW_THR [2Kpxh> param set BAT_LOW_THR 0[2Kpxh> param set BAT_LOW_THR 0.[2Kpxh> param set BAT_LOW_THR 0.1[2Kpxh> param set BAT_LOW_THR 0.15
+pxh> WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS
+WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS
+INFO  [mavlink] partner IP: 127.0.0.1
+INFO  [commander] [32mReady for takeoff![0m
+INFO  [mavlink] partner IP: 127.0.0.1
+INFO  [commander] Armed by external command	
+INFO  [tone_alarm] arming warning
+INFO  [commander] Takeoff detected	
+INFO  [commander] Landing detected	
+INFO  [commander] Disarmed by external command	
+INFO  [tone_alarm] notify neutral

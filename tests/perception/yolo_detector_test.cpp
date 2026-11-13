@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -69,6 +70,14 @@ bool WaitFor(const std::function<bool()>& condition, int timeout_ms = 3000) {
     return condition();
 }
 
+TEST(YoloDetectorConfigTest, RejectsInvalidNpuCoreMode) {
+    YoloDetectorConfig config;
+    config.npu_core_mode = "invalid";
+    EXPECT_THROW(
+        YoloDetector detector(config, std::make_unique<MockBackend>()),
+        std::invalid_argument);
+}
+
 class YoloDetectorTest : public Test {
 protected:
     void SetUp() override {
@@ -89,6 +98,7 @@ protected:
         detector_ = std::make_unique<YoloDetector>(config, std::move(backend));
         detector_->SetInput(frame_topic_);
         result_sub_ = detector_->DetectionOutput().Subscribe(8);
+        observation_sub_ = detector_->ObservationOutput().Subscribe(8);
     }
 
     void TearDown() override {
@@ -119,11 +129,23 @@ protected:
         return false;
     }
 
+    /// 阻塞等待一条帧级观测。
+    bool WaitObservation(common::VisualTargetObservation* out, int timeout_ms = 3000) {
+        auto message =
+            observation_sub_.WaitTakeFor(std::chrono::milliseconds(timeout_ms));
+        if (message) {
+            *out = **message;
+            return true;
+        }
+        return false;
+    }
+
     std::shared_ptr<video::VideoFramePool> pool_;
     MockBackend* mock_ = nullptr;  // 所有权归 YoloDetector，裸指针仅测试读取
     std::unique_ptr<YoloDetector> detector_;
     common::Topic<video::FrameHandle> frame_topic_;
     common::Topic<common::DetectionResult>::Subscription result_sub_;
+    common::Topic<common::VisualTargetObservation>::Subscription observation_sub_;
 };
 
 TEST_F(YoloDetectorTest, StartWithoutBackendFails) {
@@ -201,6 +223,8 @@ TEST_F(YoloDetectorTest, DetectPublishesResults) {
     // 统计
     EXPECT_TRUE(WaitFor([this] { return detector_->ProcessedFrameCount() == 1; }));
     EXPECT_GT(detector_->InferenceTimeMsAvg(), 0.f);
+    EXPECT_EQ(detector_->InferenceLatency().total_count, 1u);
+    EXPECT_EQ(detector_->BackendLatencySnapshot().npu_run.total_count, 0u);
     EXPECT_EQ(mock_->detect_count, 1u);
 }
 
@@ -213,6 +237,71 @@ TEST_F(YoloDetectorTest, NoDetectionsNoPublish) {
     EXPECT_TRUE(WaitFor([this] { return detector_->ProcessedFrameCount() == 1; }));
     EXPECT_EQ(result_sub_.PendingCount(), 0u);
     EXPECT_TRUE(result_sub_.TryTake() == std::nullopt);
+}
+
+TEST_F(YoloDetectorTest, EmptyFrameStillPublishesObservationAsFrameTick) {
+    // 帧级契约的核心：本帧推理完成但没有目标时必须仍然发布一条观测，
+    // 下游据此区分“本帧无目标”和“本帧还没推理完”。
+    mock_->detections = {};
+    ASSERT_TRUE(detector_->Start());
+
+    PublishFrame();
+
+    common::VisualTargetObservation observation;
+    ASSERT_TRUE(WaitObservation(&observation));
+    EXPECT_FALSE(observation.detected);
+    EXPECT_EQ(observation.candidate_count, 0u);
+    EXPECT_EQ(observation.frame_sequence, 0u);
+    EXPECT_EQ(observation.frame_width, 64u);
+    EXPECT_EQ(observation.frame_height, 64u);
+    EXPECT_GT(observation.inference_time_ms, 0.f);
+
+    // 检测结果侧仍保持“一帧无目标不发布”。
+    EXPECT_EQ(result_sub_.PendingCount(), 0u);
+    EXPECT_TRUE(WaitFor([this] { return detector_->ObservationCount() == 1; }));
+    EXPECT_EQ(detector_->DetectedObservationCount(), 0u);
+}
+
+TEST_F(YoloDetectorTest, ObservationPicksHighestConfidenceSingleTarget) {
+    mock_->detections = {
+        {0, 0.62f, 10.f, 10.f, 30.f, 30.f},
+        {0, 0.91f, 100.f, 40.f, 160.f, 100.f},
+        {0, 0.75f, 200.f, 200.f, 240.f, 240.f},
+    };
+    ASSERT_TRUE(detector_->Start());
+
+    PublishFrame();
+
+    common::VisualTargetObservation observation;
+    ASSERT_TRUE(WaitObservation(&observation));
+    EXPECT_TRUE(observation.detected);
+    EXPECT_EQ(observation.candidate_count, 3u);
+    EXPECT_NEAR(observation.confidence, 0.91f, 1e-6f);
+    EXPECT_NEAR(observation.bbox_x, 100.f, 1e-6f);
+    EXPECT_NEAR(observation.bbox_w, 60.f, 1e-6f);
+    EXPECT_NEAR(observation.center_pixel_x, 130.f, 1e-6f);
+    EXPECT_NEAR(observation.center_pixel_y, 70.f, 1e-6f);
+    EXPECT_TRUE(WaitFor([this] { return detector_->ObservationCount() == 1; }));
+    EXPECT_EQ(detector_->DetectedObservationCount(), 1u);
+}
+
+TEST_F(YoloDetectorTest, ObservationPerFrameSharesFrameSequence) {
+    mock_->detections = {{0, 0.8f, 1.f, 1.f, 5.f, 5.f}};
+    ASSERT_TRUE(detector_->Start());
+
+    PublishFrame();
+    PublishFrame();
+
+    common::VisualTargetObservation first;
+    common::VisualTargetObservation second;
+    ASSERT_TRUE(WaitObservation(&first));
+    ASSERT_TRUE(WaitObservation(&second));
+    EXPECT_TRUE(first.detected);
+    EXPECT_TRUE(second.detected);
+    // 每个推理帧恰好一条观测，帧序号随之推进且不重复。
+    EXPECT_NE(first.frame_sequence, second.frame_sequence);
+    EXPECT_GT(second.header.sequence, first.header.sequence);
+    EXPECT_TRUE(WaitFor([this] { return detector_->ObservationCount() == 2; }));
 }
 
 TEST_F(YoloDetectorTest, BackendThrowCountsErrorAndContinues) {
@@ -292,6 +381,33 @@ TEST_F(YoloDetectorTest, RestartAfterStop) {
     ASSERT_TRUE(WaitResult(&r));
     EXPECT_EQ(detector_->ProcessedFrameCount(), 1u);
     detector_->Stop();
+}
+
+TEST_F(YoloDetectorTest, DetailedLatencyDisabledCollectsOnlyIngress) {
+    // 夹具 detector_ 用默认配置；本用例自建 detail=false 实例
+    YoloDetectorConfig config;
+    config.input_queue_capacity = 2;
+    config.collect_detailed_latency = false;
+    std::unique_ptr<IDetectionBackend> backend(new MockBackend());
+    auto detector = std::make_unique<YoloDetector>(config, std::move(backend));
+    detector->SetInput(frame_topic_);
+
+    ASSERT_TRUE(detector->Start());
+    auto handle = pool_->Acquire();
+    ASSERT_TRUE(handle.Valid());
+    std::memset(handle.Data(), 0, pool_->SlotSize());
+    // 同时打帧时间戳与 ingress 时间戳，使队列/ingress 两条统计路径都走到
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    handle.SetTiming(now_ms, now_ms);
+    (void)frame_topic_.Emplace(std::move(handle));
+
+    ASSERT_TRUE(WaitFor([&] { return detector->ProcessedFrameCount() == 1; }));
+    detector->Stop();
+
+    EXPECT_EQ(detector->InputQueueLatency().total_count, 0u);
+    EXPECT_EQ(detector->InferenceLatency().total_count, 0u);
+    EXPECT_EQ(detector->IngressToInferenceLatency().total_count, 1u);
 }
 
 }  // namespace
