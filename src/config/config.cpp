@@ -726,6 +726,16 @@ void FenceConfig::Validate() const {
     if (!std::isfinite(guard_reaction_s) || guard_reaction_s < 0.0) {
         throw std::invalid_argument("fence.guard_reaction_s 必须为有限非负数");
     }
+    // 目标出区保持解除（2026-11-13）：距离非负、保持时长非负。
+    if (!std::isfinite(target_outside_release_m) ||
+        target_outside_release_m < 0.0) {
+        throw std::invalid_argument(
+            "fence.target_outside_release_m 必须为有限非负数");
+    }
+    if (target_outside_release_hold.count() < 0) {
+        throw std::invalid_argument(
+            "fence.target_outside_release_hold_ms 必须为非负数");
+    }
     if (status_period.count() <= 0) {
         throw std::invalid_argument("fence.status_period_ms 必须为正");
     }
@@ -1213,6 +1223,14 @@ AppConfig LoadAppConfig(const std::string& path,
         fence, "guard_decel_mps2", config.fence.guard_decel_mps2);
     config.fence.guard_reaction_s = ReadOptionalNonNegativeDouble(
         fence, "guard_reaction_s", config.fence.guard_reaction_s);
+    // 目标出区保持解除（2026-11-13）。
+    config.fence.target_outside_release_m = ReadOptionalNonNegativeDouble(
+        fence, "target_outside_release_m",
+        config.fence.target_outside_release_m);
+    config.fence.target_outside_release_hold =
+        ReadOptionalNonNegativeMilliseconds(
+            fence, "target_outside_release_hold_ms",
+            config.fence.target_outside_release_hold);
     config.fence.follow_zone_action =
         fence.value("follow_zone_action", config.fence.follow_zone_action);
     config.fence.violation_action = static_cast<common::FenceAction>(

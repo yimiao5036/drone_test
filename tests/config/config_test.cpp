@@ -1262,6 +1262,8 @@ TEST(ConfigTest, FenceDefaultsApplyWhenSectionMissing) {
     EXPECT_DOUBLE_EQ(config.fence.guide_hold_release_m, 2.0);
     EXPECT_DOUBLE_EQ(config.fence.guard_decel_mps2, 2.0);
     EXPECT_DOUBLE_EQ(config.fence.guard_reaction_s, 0.2);
+    EXPECT_DOUBLE_EQ(config.fence.target_outside_release_m, 50.0);
+    EXPECT_EQ(config.fence.target_outside_release_hold.count(), 10000);
     EXPECT_TRUE(config.fence.follow_zone_action);
     EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kReturn);
     EXPECT_EQ(config.fence.status_period.count(), 1000);
@@ -1282,6 +1284,8 @@ TEST(ConfigTest, FenceSectionOverridesDefaults) {
     value["fence"]["guide_hold_release_m"] = 3.0;
     value["fence"]["guard_decel_mps2"] = 2.5;
     value["fence"]["guard_reaction_s"] = 0.3;
+    value["fence"]["target_outside_release_m"] = 40.0;
+    value["fence"]["target_outside_release_hold_ms"] = 5000;
     value["fence"]["violation_action"] = 2;  // land
     const auto path = WriteTemporaryConfig(value, "drone_config_fence_override.json");
     const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
@@ -1295,6 +1299,8 @@ TEST(ConfigTest, FenceSectionOverridesDefaults) {
     EXPECT_DOUBLE_EQ(config.fence.guide_hold_release_m, 3.0);
     EXPECT_DOUBLE_EQ(config.fence.guard_decel_mps2, 2.5);
     EXPECT_DOUBLE_EQ(config.fence.guard_reaction_s, 0.3);
+    EXPECT_DOUBLE_EQ(config.fence.target_outside_release_m, 40.0);
+    EXPECT_EQ(config.fence.target_outside_release_hold.count(), 5000);
     EXPECT_EQ(config.fence.violation_action, drone::common::FenceAction::kLand);
     std::filesystem::remove(path);
 }

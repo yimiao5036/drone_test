@@ -4995,7 +4995,9 @@ TEST(MissionStateMachineTest, S5GuideEdgeHoldDoesNotAbort) {
     std::this_thread::sleep_for(60ms);
     ASSERT_TRUE(DriveToGpsApproach(harness, 1));
 
-    // 飞机在界内 29m；目标在 200m 外（区域外）。
+    // 飞机在界内 29m；目标在界内但贴边（29.6m，距边界约 0.25m）。
+    // 目标本身没出区 → 不触发“目标出区保持”；但速度律前导点会越过
+    // boundary_margin_m → 触发贴边保持（bit7）。
     ASSERT_TRUE(harness.flight_topic
                     .Publish(std::make_shared<const common::FlightStateSnapshot>(
                         MakeFenceOffboardFlight(29.0f, 0.0f, -0.4f)))
@@ -5007,7 +5009,7 @@ TEST(MissionStateMachineTest, S5GuideEdgeHoldDoesNotAbort) {
     while (std::chrono::steady_clock::now() < deadline) {
         auto estimate = MakeValidEstimatedTarget();
         estimate.header.receive_time_ms = TestMonotonicMs();
-        estimate.pos_x_m = 200.0;
+        estimate.pos_x_m = 29.6;
         estimate.pos_y_m = 0.0;
         estimate.pos_z_m = -0.4;
         (void)harness.estimated_topic.Publish(
@@ -5076,7 +5078,8 @@ TEST(MissionStateMachineTest, S5FenceStopPredictionSlowsBeforeBoundary) {
     ASSERT_TRUE(DriveToGpsApproach(harness, 1));
 
     // 飞机北侧 20m（距边界约 10m）、以 10 m/s 朝北（朝边界）飞；
-    // 目标在 200m 外（区域外）。预测必须基于这个实测速度方向。
+    // 目标在区内 28m（靠边界但仍在区内，不触发“目标出区保持”）。
+    // 预测必须基于这个实测速度方向。
     auto brake_flight = MakeFenceOffboardFlight(20.0f, 0.0f, -0.4f);
     brake_flight.vx_mps = 10.0f;
     brake_flight.vy_mps = 0.0f;
@@ -5087,7 +5090,7 @@ TEST(MissionStateMachineTest, S5FenceStopPredictionSlowsBeforeBoundary) {
     auto feed_estimate = [&] {
         auto estimate = MakeValidEstimatedTarget();
         estimate.header.receive_time_ms = TestMonotonicMs();
-        estimate.pos_x_m = 200.0;
+        estimate.pos_x_m = 28.0;  // 区内靠边界，不触发目标出区保持
         estimate.pos_y_m = 0.0;
         estimate.pos_z_m = -0.4;
         (void)harness.estimated_topic.Publish(
@@ -5200,6 +5203,279 @@ TEST(MissionStateMachineTest, VisualServoPredictedFenceBreachHoldsAtEdge) {
     EXPECT_TRUE(warning_bit_seen) << "预测越界应置 65013 bit8";
     EXPECT_EQ(f.machine->CurrentState(), common::MissionState::kVisualTracking)
         << "贴边悬停不得中止任务";
+}
+
+/// 目标出区保持（2026-11-13，维护者裁决）：目标 NED 在围栏外 → 立即停止
+/// 追击、位置保持。飞机在区内深处（离边界 30m）也立即悬停，不改任务状态、
+/// 不执行 return/land，并置 bit9。
+TEST(MissionStateMachineTest, S5TargetOutsideHoldsInPlace) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(60, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    // 飞机在区域中心（距边界 ~30m，深处）；目标在 200m 外。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(0.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    bool hold_intent_seen = false;
+    bool warning_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                (guide.reason_code & 0xFFU) == 11U) {
+                hold_intent_seen = true;
+                // 保持点 = 进入保持瞬间的位置（区域中心附近），不是追向目标。
+                EXPECT_LE(std::hypot(static_cast<double>(guide.target_x),
+                                     static_cast<double>(guide.target_y)),
+                          1.0)
+                    << "区内目标出区应原地悬停，不得继续追击";
+            }
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(20ms)) {
+            if (((*status)->active_warning_bits & (1U << 9U)) != 0U) {
+                warning_seen = true;
+            }
+        }
+        if (hold_intent_seen && warning_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen) << "目标出区应发位置保持意图（原因码 11）";
+    EXPECT_TRUE(warning_seen) << "目标出区保持应置 bit9";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标出区保持不得中止任务";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     200ms)
+                     .has_value())
+        << "目标出区保持不得产生 65015 aborted";
+}
+
+/// 目标出区 + 飞机已越界（减速没减完）：保持点钳回区域内，飞机飞回后悬停；
+/// 越界持续 >1.5s 也不执行区域动作（return），不产生 65015。
+TEST(MissionStateMachineTest, S5TargetOutsideWhenOwnOutsideHoldsAndDoesNotReturn) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.violation_debounce = 0ms;  // 逼出"若未抑制就会立即返航"
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(61, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    // 飞机在北边界外约 10m（40m），目标在 200m 外。
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(40.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    bool hold_intent_seen = false;
+    double hold_north_m = 0.0;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                (guide.reason_code & 0xFFU) == 11U) {
+                hold_intent_seen = true;
+                hold_north_m = static_cast<double>(guide.target_x);
+            }
+        }
+        if (hold_intent_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen) << "目标出区 + 自机越界应发位置保持意图";
+    EXPECT_LT(hold_north_m, 30.0)
+        << "保持点必须在区域内（飞回后悬停），不能保持越界位置";
+    // 再等 1.5s：第一重防抖=0，若未被抑制会立即返航。
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach)
+        << "目标在区外时不得执行 return/land（无超时兜底）";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     200ms)
+                     .has_value())
+        << "目标在区外时不得产生 65015 aborted";
+}
+
+/// 目标出区保持解除：目标回到区内 ≥target_outside_release_m 且持续
+/// target_outside_release_hold，并且飞机自身在区内，才恢复跟随。
+TEST(MissionStateMachineTest, S5TargetOutsideHoldReleasesAfterHysteresis) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.fence.target_outside_release_m = 5.0;
+    config.fence.target_outside_release_hold = 300ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(62, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(DriveToGpsApproach(harness, 1));
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(0.0f, 0.0f, -0.4f)))
+                    .accepted);
+
+    auto feed_estimate = [&](double north) {
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = static_cast<float>(north);
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+    };
+    // 读最新 65013 告警位（先排空积压，再等下一条新状态）。
+    auto read_bits = [&]() -> std::optional<uint32_t> {
+        while (auto stale = harness.status_subscription.TryTake()) {
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(700ms)) {
+            return (*status)->active_warning_bits;
+        }
+        return std::nullopt;
+    };
+    // 目标出区 → 进入保持（bit9 置位）。
+    bool entered = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline && !entered) {
+            feed_estimate(200.0);
+            if (auto bits = read_bits()) {
+                entered = ((*bits) & (1U << 9U)) != 0U;
+            }
+        }
+    }
+    ASSERT_TRUE(entered) << "目标出区应进入保持并置 bit9";
+    // 目标回区但深度不足 5m（26m，距边界约 3.85m）：bit9 必须保持。
+    bool still_held = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 1200ms;
+        while (std::chrono::steady_clock::now() < deadline) {
+            feed_estimate(26.0);
+            if (auto bits = read_bits()) {
+                still_held = ((*bits) & (1U << 9U)) != 0U;
+            }
+        }
+    }
+    EXPECT_TRUE(still_held) << "目标回区深度不足 release_m 时不得解除保持";
+    // 目标深入区内（24m，距边界约 5.85m）并保持 300ms → bit9 清除。
+    bool released = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+        while (std::chrono::steady_clock::now() < deadline && !released) {
+            feed_estimate(24.0);
+            if (auto bits = read_bits()) {
+                released = ((*bits) & (1U << 9U)) == 0U;
+            }
+        }
+    }
+    EXPECT_TRUE(released) << "目标回区内 ≥release_m 持续 hold_ms 且自机在区内后应解除";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kGpsApproach);
+}
+
+/// 视觉锁定（S7）同样执行目标出区保持（2026-11-13，维护者裁决）：
+/// 目标 NED 出区 → 位置保持意图（原因码 11）覆盖视觉速度意图，置 bit9；
+/// 不改任务状态、不中止。本用例用测试钩子直接摆到 S7，并喂视觉/测距保持。
+TEST(MissionStateMachineTest, S7TargetOutsideSwitchesToPositionHold) {
+    auto config = MakeFenceTestConfig(common::FenceAction::kReturn);
+    config.test_hooks_enabled = true;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()));
+    ASSERT_TRUE(harness.fence_topic
+                    .Publish(std::make_shared<const common::FenceZone>(
+                        MakeSquareZone(63, 1, common::FenceAction::kReturn, 30.0)))
+                    .accepted);
+    std::this_thread::sleep_for(60ms);
+    ASSERT_TRUE(harness.flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeFenceOffboardFlight(0.0f, 0.0f, -0.4f)))
+                    .accepted);
+    harness.machine.SeedAcceptedAssignmentForTest(MakeAssignment(1));
+    harness.machine.ForceStateForTest(common::MissionState::kVisualTracking);
+
+    bool hold_intent_seen = false;
+    bool warning_seen = false;
+    common::MissionState state_at_hold = common::MissionState::kBoot;
+    uint64_t frame = 1;
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)harness.visual_topic.Publish(
+            std::make_shared<const common::VisualTargetStatus>(
+                MakeVisualStatus(common::VisualTargetState::kLocked, frame)));
+        (void)harness.distance_topic.Publish(
+            std::make_shared<const common::StereoTargetDistance>(
+                MakeFreshDistance(frame, true, 8.0F)));
+        ++frame;
+        auto estimate = MakeValidEstimatedTarget();
+        estimate.header.receive_time_ms = TestMonotonicMs();
+        estimate.pos_x_m = 200.0;
+        estimate.pos_y_m = 0.0;
+        estimate.pos_z_m = -0.4;
+        (void)harness.estimated_topic.Publish(
+            std::make_shared<const common::TargetState>(estimate));
+        if (auto intent = harness.intent_subscription.WaitTakeFor(20ms)) {
+            const auto& guide = **intent;
+            if (guide.type == common::ControlIntentType::kPositionGuide &&
+                (guide.reason_code & 0xFFU) == 11U) {
+                hold_intent_seen = true;
+                state_at_hold = harness.machine.CurrentState();
+            }
+        }
+        if (auto status = harness.status_subscription.WaitTakeFor(20ms)) {
+            if (((*status)->active_warning_bits & (1U << 9U)) != 0U) {
+                warning_seen = true;
+            }
+        }
+        if (hold_intent_seen && warning_seen) {
+            break;
+        }
+    }
+    EXPECT_TRUE(hold_intent_seen)
+        << "S7 目标出区应发位置保持意图（覆盖视觉速度意图）";
+    EXPECT_TRUE(warning_seen) << "S7 目标出区保持应置 bit9";
+    EXPECT_EQ(state_at_hold, common::MissionState::kVisualTracking)
+        << "保持意图必须在 S7 视觉锁定态发出（不是回退后的 S5）";
+    EXPECT_FALSE(WaitForAckWithResult(
+                     harness.ack_subscription,
+                     common::MissionAssignmentResult::kCancelledOrAborted,
+                     200ms)
+                     .has_value())
+        << "目标出区保持不得产生 65015 aborted";
 }
 
 /// 起飞前区域一致性：65014 携带的 zone_id/version 与机载缓存不一致 → 21。
@@ -6388,7 +6664,10 @@ TEST(MissionStateMachineTest, S5ArrivedWithoutVisualAbortsWhenConfigured) {
 // 仍在界内时，FlightController 会把越界设定值钳到边界，飞机贴边悬停；状态机
 // 的围栏守卫只看飞机自身位置，所以这件事原本对 65013 不可见。本用例验证
 // bit7 随"引导点是否在区域内"置位与清除。
-TEST(MissionStateMachineTest, S5GuideOutsideFenceRaisesWarning) {
+/// 目标出区的新告警语义（2026-11-13）：目标出区走"目标出区保持"，置 bit9；
+/// bit7 只表示"引导点/贴边保持"（目标贴边但仍在区内时）。本用例锁死两条位的
+/// 分工：目标在区外时 bit9=1、bit7=0。
+TEST(MissionStateMachineTest, S5TargetOutsideUsesBit9NotBit7) {
     auto config = MakeFenceTestConfig(common::FenceAction::kHold);
     config.takeoff.target_wait_timeout = 20000ms;
     config.takeoff.target_lost_timeout = 20000ms;
@@ -6396,57 +6675,45 @@ TEST(MissionStateMachineTest, S5GuideOutsideFenceRaisesWarning) {
     AssignmentHarness harness(config);
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
                               /*with_estimation=*/true));
-    // 半径 30m 的区域：飞机在原点（界内），目标推到 200m 外（界外）。
     auto zone = MakeSquareZone(7, 1, common::FenceAction::kHold, 30.0);
     ASSERT_TRUE(harness.fence_topic
                     .Publish(std::make_shared<const common::FenceZone>(zone))
                     .accepted);
     ASSERT_TRUE(DriveToGpsApproach(harness, 311));
-
-    // 飞机在区域边界内侧（29m/30m），速度律锚点会越过边界；目标在 200m 外。
     auto flight = MakeFenceOffboardFlight(29.f, 0.f, -0.4f);
     ASSERT_TRUE(PublishFlight(harness.flight_topic, flight));
 
-    bool warning_seen = false;
+    bool bit9_seen = false;
+    bool bit7_seen = false;
     const auto deadline = std::chrono::steady_clock::now() + 2500ms;
     while (std::chrono::steady_clock::now() < deadline) {
         auto estimate = MakeValidEstimatedTarget();
         estimate.header.receive_time_ms = TestMonotonicMs();
-        estimate.pos_x_m = 200.0;  // 正北 200m，区域外
+        estimate.pos_x_m = 200.0;  // 目标出区
         estimate.pos_y_m = 0.0;
         estimate.pos_z_m = -0.4;
         (void)harness.estimated_topic.Publish(
             std::make_shared<const common::TargetState>(estimate));
         auto status = harness.status_subscription.WaitTakeFor(50ms);
-        if (status && (((*status)->active_warning_bits & (1U << 7U)) != 0U)) {
-            warning_seen = true;
-            break;
+        if (status) {
+            const uint32_t bits = (*status)->active_warning_bits;
+            if ((bits & (1U << 9U)) != 0U) {
+                bit9_seen = true;
+            }
+            if ((bits & (1U << 7U)) != 0U) {
+                bit7_seen = true;
+            }
+            if (bit9_seen) {
+                break;
+            }
         }
     }
-    EXPECT_TRUE(warning_seen)
-        << "引导点落在围栏外时应置 bit7（飞机自身仍在界内、不应中止）";
+    EXPECT_TRUE(bit9_seen) << "目标出区应置 bit9（目标出区保持）";
+    EXPECT_FALSE(bit7_seen)
+        << "目标出区保持时引导点是保持点（区内），不应再报 bit7";
     EXPECT_EQ(harness.machine.CurrentState(),
               common::MissionState::kGpsApproach)
-        << "提示不得改变动作：围栏越界动作仍按飞机自身位置判定";
-
-    // 目标回到区域内：bit7 应清除（每拍重算，不做迟滞）。
-    bool cleared = false;
-    const auto clear_deadline = std::chrono::steady_clock::now() + 2000ms;
-    while (std::chrono::steady_clock::now() < clear_deadline) {
-        auto estimate = MakeValidEstimatedTarget();
-        estimate.header.receive_time_ms = TestMonotonicMs();
-        estimate.pos_x_m = 5.0;
-        estimate.pos_y_m = 0.0;
-        estimate.pos_z_m = -0.4;
-        (void)harness.estimated_topic.Publish(
-            std::make_shared<const common::TargetState>(estimate));
-        auto status = harness.status_subscription.WaitTakeFor(50ms);
-        if (status && (((*status)->active_warning_bits & (1U << 7U)) == 0U)) {
-            cleared = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(cleared) << "引导点回到区域内后 bit7 应清除";
+        << "目标出区保持不得中止任务";
 }
 
 }  // namespace

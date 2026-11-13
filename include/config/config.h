@@ -268,6 +268,14 @@ struct FenceConfig {
     double guard_decel_mps2 = 2.0;
     /// 停止点预测的反应/姿态延迟（秒）：`v·reaction` 计入刹停距离。
     double guard_reaction_s = 0.2;
+    /// **目标出区保持**（2026-11-13，维护者裁决）：目标 NED 位置落在围栏外时，
+    /// 立即停止追击、位置保持（不中止任务、不执行 return/land、无超时兜底）。
+    /// 解除条件：目标回到区内且距边界 ≥ `target_outside_release_m`，持续
+    /// `target_outside_release_hold`，**并且飞机自身已回到区内**。
+    /// 0 = 目标一回到区内即可解除（仅调试用）。
+    double target_outside_release_m = 50.0;
+    /// 目标出区保持的解除保持时长。
+    std::chrono::milliseconds target_outside_release_hold{10000};
     /// 越界动作：follow_zone_action=true 时以 65018 下发的动作为准，
     /// 否则固定使用本字段。
     bool follow_zone_action = true;

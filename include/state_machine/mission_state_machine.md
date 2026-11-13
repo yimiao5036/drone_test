@@ -132,6 +132,10 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
 路径的预测限速生效即置位；与 bit7（引导点已经在界外）区分，条件解除即清除。
 消费口径见 `docs/数据接口文档.md` §3.1。
 
+**目标出区保持告警位 bit9（2026-11-13）**：bit9 =「目标出区保持中」
+（`kWarningTargetOutsideFence`）。目标 NED 位置在围栏外、状态机已停止追击并
+发位置保持时置位；条件解除即清除。
+
 **围栏停止点预测（2026-11-12 复审三轮，维护者裁决"两级越界判断"）**：
 第一重仍是 `EvaluateFenceGuard()` 的**当前自身位置**判定（深度容差 + 回界滞回 +
 防抖 + 区域动作）。第二重是**沿实测速度方向的停止点预测**
@@ -162,6 +166,22 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
 **不改变任务状态、不发 65015**：任务继续在 S5 等待目标回界内。
 `fence.guide_hold_enabled=false` 可回退到 2026-11-11 行为（只靠控制器逐拍钳制）。
 进入/解除各打一条日志（`S5 贴边保持: 目标越出区域…` / `S5 贴边保持解除: 目标回界内…`）。
+
+**目标出区保持（2026-11-13，维护者裁决）**：`UpdateTargetOutsideHold()` 在
+`EvaluateFenceGuard()` 内每拍更新，`Evaluate` 末尾由
+`PublishTargetOutsideHoldIntent()` 覆盖当拍位置/速度意图（原因码 11
+`kReasonTargetOutsideFence`）。判据：目标 NED 位置（估计器，局部 NED）落在
+多边形外（`target_distance < 0`）；**S5/S6/S7 生效**（S9/S10 拦截段不打断）。
+- 飞机在区内：保持点 = 进入保持瞬间的自机位置（"减速到哪就悬停在哪"）；
+- 飞机在区外（只可能是减速没减完）：保持点 = `fence::ClampIntoPolygon(自机,
+  boundary_margin_m)`，钳回区域内、低速飞回后悬停；不要求停在边界线上；
+- 保持期间**不执行区域动作 return/land**（只上报 65019/65013），无超时兜底；
+- 解除：目标回到区内、距边界 ≥ `fence.target_outside_release_m`（默认 50 m）
+  持续 `fence.target_outside_release_hold_ms`（默认 10000 ms），**且自机已回到区内**；
+- 视觉段：S7（以及若后续纳入的 S9/S10）速度意图被位置保持覆盖，即"切换到
+  位置引导"；本版保持只在 S5/S6/S7，S9/S10 拦截流程不被打断。
+- 日志：`目标出区保持: 目标=(..) 距边界=..m 自机距边界=..m 保持点=(..)`（WARN）、
+  `目标出区保持解除: …`（INFO）。
 
 **G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`enter_s6_lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
 

@@ -118,6 +118,11 @@ constexpr uint32_t kWarningGuideOutsideFence = 1U << 7U;
 /// 复审三轮）。只提示"围栏制动/贴边保持已介入"，与 bit7（引导点已经在界外）
 /// 区分；实际越界处置仍由 EvaluateFenceGuard 的深度容差 + 防抖决定。
 constexpr uint32_t kWarningPredictedFenceBreach = 1U << 8U;
+/// 告警位 bit9：**目标出区保持**（2026-11-13，维护者裁决）。目标 NED 位置
+/// 落在围栏多边形外时立即停止追击、位置保持（区内保持进入点；区外钳回边界内
+/// 飞回），**不中止任务、不执行 return/land**。与 bit7（引导点/贴边）、bit8
+/// （停止点预测）区分。
+constexpr uint32_t kWarningTargetOutsideFence = 1U << 9U;
 /// 到点判据的"停稳"地速门限（m/s）：设计 §4.2 冻结值，不做配置键。
 constexpr double kHandoverArrivalSpeedMps = 0.5;
 /// 意图重发上限（10Hz）：意图是周期语义，FlightController 50ms 周期消费；
@@ -139,6 +144,9 @@ constexpr uint32_t kReasonReturnHome = 8;
 constexpr uint32_t kReasonTargetHold = 9;
 /// 围栏越界中止位置意图低位原因码（10，紧接保持码；S12 返航时仍用 8）。
 constexpr uint32_t kReasonFenceViolation = 10;
+/// 目标出区保持位置意图低位原因码（11）：目标 NED 在围栏外，保持点=进入点
+/// 或钳回边界内；不中止任务。
+constexpr uint32_t kReasonTargetOutsideFence = 11;
 /// 地面站任务指令（65020）协议版本（与 GroundStationLink 同源约定）。
 constexpr uint8_t kMissionCommandProtocolVersion = 1;
 /// 目标恢复迟滞：连续 N 个决策拍看到新鲜估计才退出保持（防抖动来回切换；
@@ -941,24 +949,38 @@ private:
             return;
         }
 
-        EvaluatePositionIntent(now_ms);
-        // 告警位：S5 目标失效原地保持中（地面站可显示“悬停等待目标”）；
-        // 保持意图仍带 bit31 控制权请求，离开 S5/S12 接管后自然清除。
-        if (position_intent_source_ == PositionIntentSource::kHold) {
-            warnings |= kWarningTargetHold;
+        // 目标出区保持（2026-11-13）：保持期间**不再发**接近/冻结/视觉伺服
+        // 意图，只发保持意图——否则会"先发全速引导、再发保持"，既依赖控制器
+        // 消费顺序，也会让 PublishIntent 的首次日志每拍刷屏。
+        const bool target_outside_hold =
+            target_outside_hold_active_ && TargetOutsideHoldStateActive();
+        if (!target_outside_hold) {
+            EvaluatePositionIntent(now_ms);
+            // 告警位：S5 目标失效原地保持中（地面站可显示“悬停等待目标”）；
+            // 保持意图仍带 bit31 控制权请求，离开 S5/S12 接管后自然清除。
+            if (position_intent_source_ == PositionIntentSource::kHold) {
+                warnings |= kWarningTargetHold;
+            }
+            EvaluateVisualServoIntent(now_ms);
+            // 围栏"保持"动作（区域动作=hold）：越界未中止时，位置意图改为原地
+            // 保持（原因码 10），并压过同拍的 S5 引导与 S7 伺服输出。
+            if (fence_hold_active_) {
+                PublishFenceHoldIntent(now_ms);
+            }
+        } else {
+            // 本拍不跑视觉伺服：按"未发伺服"处理，但 bit3 由下面的条件排除
+            // （保持是主动策略，不是伺服降级/停发）。
+            servo_intent_active_ = false;
         }
-        EvaluateVisualServoIntent(now_ms);
-        // 围栏"保持"动作（区域动作=hold）：越界未中止时，位置意图改为原地
-        // 保持（原因码 10），并压过同拍的 S5 引导与 S7 伺服输出。
-        if (fence_hold_active_) {
-            PublishFenceHoldIntent(now_ms);
+        if (target_outside_hold) {
+            PublishTargetOutsideHoldIntent(now_ms);
         }
         // 告警位：S7 报告状态与实际控制输出背离标注（T9 评审裁决 I2）——本拍
         // 未发出视觉伺服意图：伺服尚未启动（S6/S7 过渡期仍在续发冻结位置意图）
         // 或控制律降级停发（姿态/视觉超龄 → 控制器意图超时门禁接手刹停）。
         // 状态按当拍（迁移后）判定；离开 S7 即不置位。
         if (CurrentState() == common::MissionState::kVisualTracking &&
-            !servo_intent_active_) {
+            !servo_intent_active_ && !target_outside_hold) {
             warnings |= kWarningServoSuspended;
         }
         // 热备份核对（Task 9）：S7 期间每秒核对卡尔曼状态年龄，断粮置告警位。
@@ -975,6 +997,9 @@ private:
         }
         if (fence_predicted_breach_) {
             warnings |= kWarningPredictedFenceBreach;
+        }
+        if (target_outside_hold_active_ && TargetOutsideHoldStateActive()) {
+            warnings |= kWarningTargetOutsideFence;
         }
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
@@ -2416,6 +2441,10 @@ private:
         fence_violation_ms_ = violation_ms;
         fence_hold_active_ = false;
 
+        // 目标出区保持 supervisor（2026-11-13）：每拍更新；下面的动作块据此
+        // 决定是否抑制 return/land（判定与 65019 上报不变）。
+        UpdateTargetOutsideHold(now_ms, polygon);
+
         if (!fence_.enabled) {
             // 判定照常上报（见函数开头），但默认配置不执行任何越界动作。
             return;
@@ -2430,6 +2459,12 @@ private:
         }
         if (violation_ms <
             static_cast<uint64_t>(fence_.violation_debounce.count())) {
+            return;
+        }
+        if (target_outside_hold_active_) {
+            // 目标在区外：由"目标出区保持"接管（区内保持/区外飞回），
+            // 不执行 return/land；65019/65013 照常上报（维护者裁决：
+            // 不做超时兜底，飞不回来交 PX4 failsafe）。
             return;
         }
         const common::FenceAction action =
@@ -2483,6 +2518,125 @@ private:
         TransitionTo(target_state, land ? "围栏越界，中止任务并降落"
                                         : "围栏越界，中止任务并返航");
         PublishTakeoffAbortAck(common::MissionAssignmentReason::kFenceViolation);
+    }
+
+    /// 目标出区保持只在 S5/S6/S7 生效（S9/S10 拦截段不打断；S12 之后由
+    /// 返航/降落链接管）。发布/告警时同样按当拍状态复核，避免当拍迁移到
+    /// S12 后仍发保持意图。
+    static bool IsTargetOutsideHoldState(common::MissionState state) {
+        return state == common::MissionState::kGpsApproach ||
+               state == common::MissionState::kVisualHandover ||
+               state == common::MissionState::kVisualTracking;
+    }
+
+    bool TargetOutsideHoldStateActive() const {
+        return IsTargetOutsideHoldState(CurrentState());
+    }
+
+    /// 目标出区保持 supervisor（2026-11-13，维护者裁决）：
+    /// 目标 NED 位置在围栏外 → 立即停止追击、位置保持。飞机在区内保持进入点；
+    /// 在区外则钳回边界内、低速飞回后悬停。只在 S5/S6/S7 生效（S9/S10 拦截段
+    /// 不打断）；不改任务状态、不执行 return/land、无超时兜底。
+    /// 解除：目标距边界 ≥ `target_outside_release_m` 且持续
+    /// `target_outside_release_hold`，**并且飞机自身已回到区内**。
+    void UpdateTargetOutsideHold(uint64_t now_ms,
+                                 const common::FencePolygonNed& polygon) {
+        const bool active_state = TargetOutsideHoldStateActive();
+        if (!active_state || !polygon.valid() || !latest_flight_.has_value() ||
+            !latest_flight_->local_position_valid) {
+            ResetTargetOutsideHold();
+            return;
+        }
+        const auto& flight = *latest_flight_;
+        const common::Vec2Ned own{static_cast<double>(flight.local_x_m),
+                                  static_cast<double>(flight.local_y_m)};
+        const double own_distance =
+            control::fence::SignedDistanceToBoundary(polygon.vertices, own);
+        // 目标位置不可用：保持现状、暂停解除计时（不凭旧数据解除）。
+        if (!HasFreshEstimate(now_ms)) {
+            target_outside_release_since_ms_ = 0;
+            return;
+        }
+        const auto& target = *latest_estimated_;
+        if (!target.valid || target.header.frame_id != kFrameLocalNed ||
+            !std::isfinite(target.pos_x_m) || !std::isfinite(target.pos_y_m)) {
+            target_outside_release_since_ms_ = 0;
+            return;
+        }
+        const common::Vec2Ned target_point{
+            static_cast<double>(target.pos_x_m),
+            static_cast<double>(target.pos_y_m)};
+        const double target_distance = control::fence::SignedDistanceToBoundary(
+            polygon.vertices, target_point);
+        if (!target_outside_hold_active_) {
+            if (target_distance >= 0.0) {
+                return;  // 目标仍在区内，不进入保持
+            }
+            target_outside_hold_active_ = true;
+            target_outside_hold_point_valid_ = true;
+            if (own_distance >= 0.0) {
+                // 飞机还在区内：减速到哪就悬停在哪（冻结进入点）。
+                target_outside_hold_point_ = own;
+            } else {
+                // 已越界（只可能是减速没减完）：钳回边界内，飞回后悬停。
+                target_outside_hold_point_ = control::fence::ClampIntoPolygon(
+                    polygon.vertices, own,
+                    std::max(0.0, fence_.boundary_margin_m));
+            }
+            target_outside_hold_z_m_ = flight.local_z_m;
+            target_outside_release_since_ms_ = 0;
+            SPDLOG_WARN(
+                "目标出区保持: 目标=({:.2f},{:.2f}) 距边界={:.2f}m "
+                "自机距边界={:.2f}m 保持点=({:.2f},{:.2f}) "
+                "—— 停止追击、位置保持，不中止任务",
+                static_cast<double>(target.pos_x_m),
+                static_cast<double>(target.pos_y_m), target_distance,
+                own_distance, target_outside_hold_point_.north_m,
+                target_outside_hold_point_.east_m);
+            return;
+        }
+        // 保持中：解除需要"目标足够深入区内 + 持续时长 + 飞机自身在区内"。
+        if (target_distance < fence_.target_outside_release_m) {
+            target_outside_release_since_ms_ = 0;
+            return;
+        }
+        if (target_outside_release_since_ms_ == 0) {
+            target_outside_release_since_ms_ = now_ms;
+        }
+        if (own_distance < 0.0) {
+            return;  // 飞机还没回到区内，继续保持
+        }
+        const uint64_t hold_ms = static_cast<uint64_t>(
+            fence_.target_outside_release_hold.count());
+        if (ElapsedMs(now_ms, target_outside_release_since_ms_) < hold_ms) {
+            return;
+        }
+        target_outside_hold_active_ = false;
+        target_outside_hold_point_valid_ = false;
+        target_outside_release_since_ms_ = 0;
+        SPDLOG_INFO("目标出区保持解除: 目标距边界={:.2f}m 自机距边界={:.2f}m"
+                    " —— 恢复跟随",
+                    target_distance, own_distance);
+    }
+
+    void ResetTargetOutsideHold() {
+        target_outside_hold_active_ = false;
+        target_outside_hold_point_valid_ = false;
+        target_outside_release_since_ms_ = 0;
+    }
+
+    /// 目标出区保持意图：固定保持点 + 进入时高度，无前馈/无限速（0=直通）。
+    void PublishTargetOutsideHoldIntent(uint64_t now_ms) {
+        if (!target_outside_hold_point_valid_) {
+            return;
+        }
+        PositionIntentTarget target;
+        target.x = static_cast<float>(target_outside_hold_point_.north_m);
+        target.y = static_cast<float>(target_outside_hold_point_.east_m);
+        target.z = target_outside_hold_z_m_;
+        target.frame_id = kFrameLocalNed;
+        PublishPositionIntent(target, now_ms, kReasonTargetOutsideFence);
+        position_intent_source_ = PositionIntentSource::kTargetOutsideHold;
     }
 
     /// 围栏保持意图：以 PX4 当前局部位置为设定点（原因码 10），无前馈。
@@ -5011,7 +5165,8 @@ private:
         status.state = fence_state_;
         status.distance_to_boundary_m = fence_distance_m_;
         status.violation_duration_ms = fence_violation_ms_;
-        status.action_pending = fence_hold_active_ || fence_abort_latched_;
+        status.action_pending = fence_hold_active_ || fence_abort_latched_ ||
+                                target_outside_hold_active_;
         if (latest_flight_.has_value() && latest_flight_->local_position_valid) {
             status.local_north_m = latest_flight_->local_x_m;
             status.local_east_m = latest_flight_->local_y_m;
@@ -5119,6 +5274,12 @@ private:
     /// 改为"贴边保持 + 告警"，不中止任务；目标回到区域内足够远才解除。
     bool guide_edge_hold_ = false;
     uint64_t guide_edge_hold_count_ = 0;  ///< 进入贴边保持的累计次数（节流日志）
+    /// 目标出区保持（2026-11-13）：目标 NED 在围栏外时立即位置保持。
+    bool target_outside_hold_active_ = false;
+    bool target_outside_hold_point_valid_ = false;
+    common::Vec2Ned target_outside_hold_point_{};
+    float target_outside_hold_z_m_ = 0.f;
+    uint64_t target_outside_release_since_ms_ = 0;
     /// 本拍围栏停止点预测是否已介入（S5/S6/S7 任一路径置位；bit8）。
     bool fence_predicted_breach_ = false;
     uint64_t fence_predict_count_ = 0;  ///< 预测限速日志节流计数
@@ -5183,7 +5344,13 @@ private:
     /// 2026-10-22 增 kHold：S5 目标失效时的原地保持）：
     /// kNone=未发布，kEstimate=S5 估计引导，kFrozen=S6/S7 冻结续发，
     /// kHold=S5 目标失效保持（目标=PX4 当前局部位置，原因码 9）。
-    enum class PositionIntentSource { kNone, kEstimate, kFrozen, kHold };
+    enum class PositionIntentSource {
+        kNone,
+        kEstimate,
+        kFrozen,
+        kHold,
+        kTargetOutsideHold,  ///< 目标出区保持（bit5 不置位，与目标失效保持区分）
+    };
     PositionIntentSource position_intent_source_ = PositionIntentSource::kNone;
     /// S5 接近速度律启动日志一次性标记（每进程只打一次，避免热路径刷屏）。
     bool approach_speed_law_logged_ = false;

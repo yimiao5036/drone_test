@@ -242,6 +242,8 @@
         "guide_hold_release_m": 2.0,
         "guard_decel_mps2": 2.0,
         "guard_reaction_s": 0.2,
+        "target_outside_release_m": 50.0,
+        "target_outside_release_hold_ms": 10000,
         "violation_action": 1,
         "status_period_ms": 1000
     },
