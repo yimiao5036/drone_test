@@ -849,6 +849,31 @@ void EstimatorGuardConfig::Validate() const {
     // MAV_SYS_STATUS_SENSOR_* / ESTIMATOR_STATUS_FLAGS 定义填写。
 }
 
+void MissionConfig::Validate() const {
+    // 重置 = 清状态 + 重启 PX4（P4b，设计 §6.5）。上下限只挡"明显填错数量级"的
+    // 值：默认 90 s 已覆盖 PX4 冷启动 15~30 s 的 3 倍。**超时只影响诊断**
+    // （什么时候打 ERROR、什么时候置 65013 bit10），不改变"一直等飞控回来"的
+    // 行为——所以下限放到 100 ms，让单测能用几百毫秒窗口覆盖超时分支；真按 100 ms
+    // 配到现场只会立刻报超时，不会造成安全问题。
+    if (reboot_timeout.count() < 100 || reboot_timeout.count() > 300000) {
+        throw std::invalid_argument(
+            "mission.reboot_timeout_ms 必须在 [100, 300000]");
+    }
+    // 重试次数含首次：0 等于一条 246 都不发（重置语义名存实亡），上限 10 挡住
+    // "把正在重启的飞控又打一遍"；失败后按固定 1 s 间隔重发，用完即停。
+    if (reboot_retry < 1 || reboot_retry > 10) {
+        throw std::invalid_argument("mission.reboot_retry 必须在 [1, 10]");
+    }
+    // 两次重启最小间隔：下限 5 s 挡住"连续点两下按钮"把刚起来的飞控又重启；
+    // 上限 300 s 只是兜底，超过该量级属于地面站自己该管的事。
+    if (reboot_min_interval.count() < 5000 ||
+        reboot_min_interval.count() > 300000) {
+        throw std::invalid_argument(
+            "mission.reboot_min_interval_ms 必须在 [5000, 300000]");
+    }
+    // reset_reboot_px4 不校验：bool 本身只有两个值，false 是合法回滚语义。
+}
+
 void FenceConfig::Validate() const {
     if (zone_cache_path.empty()) {
         throw std::invalid_argument("fence.zone_cache_path 不能为空");
@@ -1399,6 +1424,23 @@ AppConfig LoadAppConfig(const std::string& path,
         estimator_guard, "bad_estimator_flag_mask",
         config.estimator_guard.bad_estimator_flag_mask);
     config.estimator_guard.Validate();
+
+    // 任务级重置动作（mission 节，2026-11-17 P4b）：全部可选，缺席回退默认值。
+    // 65020 type=2 受理后发 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246) param1=1 重启
+    // PX4，迁移 S1 SELF_CHECK 等飞控回来再走常规 S1→S2。reset_reboot_px4=false
+    // 是唯一回滚开关（旧语义：只清状态直接回 S2）。**重启治标不治本**：罗盘失效、
+    // Z 轴振动、EKF 参数问题重启后仍会复发，只恢复到已知初始状态，不修复硬件
+    // （设计 §6/§6.5）。
+    const json mission = root.value("mission", json::object());
+    config.mission.reset_reboot_px4 =
+        mission.value("reset_reboot_px4", config.mission.reset_reboot_px4);
+    config.mission.reboot_timeout = ReadOptionalPositiveMilliseconds(
+        mission, "reboot_timeout_ms", config.mission.reboot_timeout);
+    config.mission.reboot_retry = ReadOptionalPositiveInt(
+        mission, "reboot_retry", config.mission.reboot_retry);
+    config.mission.reboot_min_interval = ReadOptionalPositiveMilliseconds(
+        mission, "reboot_min_interval_ms", config.mission.reboot_min_interval);
+    config.mission.Validate();
 
     // 自动起飞（takeoff 节，2026-10-22）：S3/S4 时序、到达判据与目标收口；
     // 全部可选，缺席回退默认值。低电门限不使用本地电量百分比，唯一来源是

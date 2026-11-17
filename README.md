@@ -15,6 +15,9 @@
   停发一切控制意图、冻结任务推进（不自动返航/降落/上锁），恢复只能「重置任务状态」或重启；
   `estimator_guard.enabled=false` 是唯一回滚开关。见
   [`docs/降落与估计器保护设计-2026-11-17.md`](docs/降落与估计器保护设计-2026-11-17.md) §5.6。
+- **重置任务状态会重启飞控**（2026-11-17 P4b）：65020 `type=2` 重置 = 清任务状态 + 重启 PX4
+  （发 `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246)`，飞控约 20~30 s 不可用；S1 SELF_CHECK 等飞控
+  回来，超时 65013 bit10）；`mission.reset_reboot_px4=false` 回滚成"只清状态回 S2"。见同一设计文档 §6.7。
 - 两个发射闸门仍关：`interception.enabled=false`（生产不自动触发捕网）、
   `actuator.gcs_fire_enabled=false`（65016 直控不装配）。
 - `TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 是**观测**模块（跑真实算法、
@@ -28,7 +31,7 @@
 ```bash
 cmake -S . -B build
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure     # 778/778
+ctest --test-dir build --output-on-failure     # 790/790
 python3 tools/check_docs.py                    # 文档基线/链接检查
 ./build/drone_control                          # 生成 logs/0001_xxx.log
 ```

@@ -356,6 +356,23 @@ availability、飞行中 S12）由 Task 8 接入；65014 `flags.bit1` 取消、S
 不自动返航、不空中上锁、不自动重试切模式、不纠偏估计。解除只允许「重置任务状态」
 （65020 `type=2`）或进程重启。**只读运行**（未注入命令接口）时只打一条 WARN、
 **不锁存、不冻结**——功能内部按能力判断，不读 `enable_control`。
+**冻结期间 65020 仍可达（2026-11-17 P4b 修复）**：冻结分支里照样调用
+`EvaluateMissionCommand()`，所以锁存期间 65020 **逐条回 65021**——空中（`armed=true`）
+被 `kRejected/kNotOnGround` 拒（悬停中不许重启飞控），**落地 + 已上锁后的重置是解除
+降级锁存的唯一入口**（`ResetSortieState()` 清 `estimator_degraded_`，再按
+`mission.reset_reboot_px4` 走 S1 重启或 S2 回滚），不必重启机载程序。
+
+**重置任务状态 = 清状态 + 重启 PX4（2026-11-17 降落与估计器保护 P4b）**：65020
+`type=2` 的职责从"把 S14 拉回 S2"扩为"清空本次任务状态 + 重启 PX4"。准入**只看飞控
+事实**（遥测在线、未上锁、已落地证据、非任务故障），**不再要求 `state == S14`**——
+旧门槛在状态机与 PX4 不同步时无路可走，只能重启机载程序。受理后发
+`MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246) param1=1`，迁移 **S1 SELF_CHECK** 等飞控
+重新上线；等待期间本模块**不发任何控制意图与命令**（246 重发除外），仍逐条回 65021、
+周期发布 65013。`mission.reset_reboot_px4=false`（或命令接口未注入）回滚为"只清状态、
+直接回 S2 READY"。**明确不做**：不修复硬件（罗盘失效/Z 轴振动重启后会复发）、不自动
+重启机载程序、不在被拒/无 ACK 后无限重发、不自动解除估计器降级锁存（只清状态）；
+重启不是"修好飞机"，只是把飞控与状态机拉回同一起点（设计与实施口径见
+[`降落与估计器保护设计-2026-11-17.md`](../../docs/降落与估计器保护设计-2026-11-17.md) §6/§6.7）。
 
 ## 接口与数据流
 
@@ -378,6 +395,9 @@ struct MissionStateMachineConfig {
     config::ReturnHomeConfig return_home;             // S11~S14 返航（return_home 配置节同源）
     config::LandingConfig landing;                    // S13 拆两段（landing 配置节同源，2026-11-17 P2）
     config::EstimatorGuardConfig estimator_guard;     // 估计器降级处置（estimator_guard 节同源，2026-11-17 P3）
+    config::MissionConfig mission;                    // 重置动作（mission 节同源，2026-11-17 P4b）：
+                                                      // reset_reboot_px4/reboot_timeout_ms/
+                                                      // reboot_retry/reboot_min_interval_ms
     uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
@@ -401,9 +421,12 @@ public:
     Topic<MissionStatus>& StatusOutput() override;                            // 65013 v2
     Topic<MissionAssignmentAck>& AssignmentAckOutput() override;              // 65015
 
-    // ---- 估计器降级可观测出口（2026-11-17 P3）----
+    // ---- 降级/PX4 重启可观测出口（2026-11-17 P3/P4b）----
     /// 降级是否已锁存（测试/SITL 断言用；非虚，不扩张 IMissionStateMachine）。
     bool EstimatorDegraded() const;
+    /// PX4 重启等待是否进行中（测试/SITL 断言用；非虚，不扩张 IMissionStateMachine）。
+    /// 65020 `type=2` 受理后在 S1 SELF_CHECK 等飞控回来期间为 true。
+    bool Px4RebootPending() const;
 
     // ---- 测试入口（生产装配不得调用） ----
     void ForceStateForTest(common::MissionState state);  // 强制迁移（需 test_hooks_enabled=true）
@@ -532,8 +555,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     同一次越界不重复触发中止链/重复回执。
   - 只在**飞行相关状态**动作（`kArming`~`kPostIntercept`）：地面 S0~S2、S12/S13/S14
     与故障态只上报 65019，不触发中止链，避免地面就锁死任务。
-- **人工任务指令（2026-10-29，65020/65021；2026-11-04 增 type=2 重置状态）**：地面站可下发
-  "主动返航"打断当前任务，或"重置任务状态"把落地后的飞机从 S14 拉回 S2。
+- **人工任务指令（2026-10-29，65020/65021；2026-11-04 增 type=2 重置状态；2026-11-17 P4b
+  改为"清状态 + 重启 PX4"）**：地面站可下发"主动返航"打断当前任务，或"重置任务状态"
+  清空本次任务并重启 PX4（落地且未上锁即可，不再要求 S14）。
   - 输入：`SetMissionCommandInput()` 绑定 `kMissionCommand`（Start 前）；`DrainInputs()`
     每拍只保留最新一条（`latest_mission_command_`），`valid_for_ms=1000` 由链路层写入，
     过期指令由状态机侧按时钟判定丢弃。
@@ -552,15 +576,61 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `assignment_tracker_.AbortAirborne()`、`RememberTakeoffAbort(kCancelledByGcs)`、
     `TransitionTo(kReturnHome,"地面站主动返航指令，中止任务并返航")`，并发 65015
     `aborted reason=kCancelledByGcs(12)`。**不是 PX4 RTL**：返航轨迹仍由 S12 位置意图控制。
-  - **`type=2` 重置任务状态（2026-11-04）**：`ExecuteResetStateCommand()` 的守卫顺序为
-    `mission_faulted_` → `kRejected/kMissionFault`；当前已在 S2 `READY` → `kCompleted/kNone`
-    （幂等，不重复清状态）；状态不是 S14 `DISARMED` → `kRejected/kNotOnGround`；
-    `armed=true` 或任务分配已进 `kAirborne/kEngaged/kReturning` → 同样 `kRejected/kNotOnGround`。
-    受理时 `RecordExecutedMissionCommandId()` → `ResetSortieState()`（与进程启动共用同一份
-    复位清单：任务分配记忆、起飞/返航/降落/围栏/目标保持/各类锁存与计次）→
-    `TransitionTo(kReady,"地面站重置任务状态")`，回 `kAccepted/kNone`。
-    动机：S14 是纯终态（只记 `任务结束: S14 DISARMED`），没有回 S2 的迁移，改前现场只能
-    重启机载程序才能继续接 65014 分配。
+  - **`type=2` 重置任务状态 = 清状态 + 重启 PX4（2026-11-04 引入；2026-11-17 P4b 改语义）**：
+    `ExecuteResetStateCommand()` 的准入**只看飞控事实**（`state` 编号只用于幂等与日志，
+    不再当门槛）。判据按下列顺序逐条短路：
+
+    | 顺序 | 判据 | 不过时的回执 | 说明 |
+    |---|---|---|---|
+    | ① | `mission_faulted_` | `kRejected/kMissionFault` | 故障态先人工处置 |
+    | ② | 当前状态 ∈ {S1 SELF_CHECK, S2 READY, S0 BOOT} | `kCompleted/kNone` | 幂等：不重复清状态，**也不重启飞控** |
+    | ③ | 无飞行快照或 `connected == false` | `kRejected/kTelemetryStale(9)` | 没有遥测就判不了"能不能安全重启飞控" |
+    | ④ | `armed == true` | `kRejected/kNotOnGround(8)` | 解锁态重启飞控 = 空中断控制 |
+    | ⑤ | 未确认落地：`landed_state_valid` 时看 `landed`；否则退化为"相对高度 ≤ 0.5 m"（`RelativeAltitudeAgl()`）；两者都不可用同样拒绝 | `kRejected/kNotOnGround(8)` | "不知道高度" ≠ "在地面"，不得用 0 代高度 |
+    | ⑥ | tracker 仍认为在空中（`ConsumedAirborneMission() && Phase() != kTerminal`） | —— | **只 WARN 不拒绝**：`ResetSortieState()` 会一并清空 tracker，拒绝反而把人卡死 |
+    | ⑦ | 距上次重启 < `mission.reboot_min_interval`（默认 30 s） | `kRejected/kDuplicateCommand` | 刚重启的飞控不许被再打一遍 |
+
+    准入通过 → `RecordExecutedMissionCommandId()` → `ResetSortieState()`（与进程启动共用
+    同一份复位清单：任务分配记忆、起飞/返航/降落/围栏/目标保持、估计器降级锁存、
+    各类锁存与计次）→ 默认置 `px4_reboot_pending_=true` +
+    `TransitionTo(kSelfCheck,"地面站重置任务状态，重启 PX4")` + 受理当拍发一次 246 →
+    **最后**才回 `kAccepted/kNone`（此时 `ack.mission_state == S1 SELF_CHECK`，地面站据此
+    显示"自检/重启中"；仍在 Web 的 3 s 超时内。回执放在迁移之后是 P4b 的落地口径，
+    设计稿 §6.2 原写"先回执再动作"）。
+    246 参数：`param1=1`（重启飞控）、`param2~7=0`。编号与语义已核对：
+    `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN = 246`（`third_party/c_library_v2-master/common/common.xml`）；
+    PX4 `Commander.cpp` 的该分支只读 `param1`（`param1==1 && !isArmed()` 才 ACCEPTED，
+    否则 DENIED），**`param6` 的"安全互锁/强制"在当前固件没有生效**——落地互锁完全由
+    本模块的准入（④⑤）负责。
+    回滚路径：`mission.reset_reboot_px4=false` **或命令接口未注入**（`command_sender_ == nullptr`）
+    → 只清状态、`TransitionTo(kReady,...)`、不发 246、回 `kAccepted/kNone`
+    （`ack.mission_state == S2 READY`）；此时仍记 `last_px4_reboot_ms_` 占住最小间隔窗口。
+  - **等待 PX4 回来（`Px4RebootPending() == true`）**：`Evaluate()` 最前面**早返回**——
+    不发任何控制意图/命令（246 重发除外）、不推进任何任务逻辑，只做三件事：
+    ① 246 重发：首次已由受理当拍发出，之后每 1 s 一次，**总尝试次数 ≤
+    `mission.reboot_retry`（默认 3，含首次；入队失败同样计数）**；收到 ACK `result=0`
+    立即停止重发；ACK `result ∈ {2,3,4}`（DENIED/UNSUPPORTED/FAILED）→ 停止重发、
+    下一决策拍**立刻回退 S2 READY** 并 WARN（原因多为固件未编板级 reset 能力，
+    **SITL 恒为 DENIED**），同时清掉最小间隔计时（飞控没真重启，不该占窗口）；
+    `result=1`（TEMPORARILY_REJECTED）按"未确认"继续重试；
+    ② 恢复判据：**必须先观察到一次断连**（`connected == false`）之后**再**出现
+    `connected && HasNavigationForGps()`（心跳 + 3D fix + 全局位置 + Home）→
+    `px4_reboot_pending_=false`、INFO「PX4 重启完成…」，下一拍走常规 S1→S2 判据。
+    先要求断连是为了挡住"PX4 只 ACK 但实际没重启"时把旧心跳当成已恢复；
+    ③ 超时 `mission.reboot_timeout`（默认 90 s，`Validate` 允许 100 ms~300 s）到点 →
+    ERROR **一次** + 65013 **bit10**（`kWarningPx4RebootTimeout = 1U << 10U = 1024`，
+    `PX4 重启超时`），**保持 S1**，不自动重启机载程序。
+    等待期间**仍逐条回 65021**（`EvaluateMissionCommand()` 在早退分支里照样调用：
+    重置类走 ② 的 `kCompleted`，返航类走"未起飞"`kNotAirborne`，都不发命令），
+    并周期发布 65013（bit10 置位后一直带到回到 S2 为止）。
+  - **S16 故障态也处理 65020（2026-11-17 P4b 行为修复）**：故障态的两个早退分支里
+    补上了 `EvaluateMissionCommand()`。此前故障态早退导致 65021 根本不发，
+    `kMissionFault` 这条 reason 不可达；而 P4b 之后重置是唯一的恢复入口，不能失联。
+    现在故障态收到重置/返航都如实回 `kRejected/kMissionFault`。
+  - 动机与边界：旧实现要求 `state == S14`，落地后状态机/PX4 不同步（现场常卡在
+    S13/S12）时无路可走、只能重启机载程序；P4b 改看飞控事实后，"落地 + 未上锁 +
+    遥测在线 + 非故障"即可重置。**重启治标不治本**——罗盘失效、Z 轴振动等硬件问题
+    重启后会复发，这是能力边界，文档与界面文案都写明。
   - 回执：`PublishMissionCommandAck()` 走 `kMissionCommandAck`，字段含 result/reason/
     `mission_state`（回执时刻状态），地面站无需猜测机载处于哪一态；`header.sequence`
     每条回执只自增一次（2026-10-30 审查修复：旧实现同一条回执自增两次、序号跳 2，
@@ -1058,11 +1128,42 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航，按继续返航处理 command_id=..`
   （S12）、`任务指令（主动返航）: 已在返航/降落流程，回执完成`（S13）、
   `任务指令（主动返航）: 当前状态不可执行`。
-- WARN：`任务指令（重置状态）: 已清空本次任务状态 DISARMED → READY command_id=..`
-  （2026-11-04，受理后打一条；随后 `DISARMED -> READY` 由统一迁移日志记录）。
+- WARN：`任务指令（重置状态）: …`（受理、各类拒绝、回滚各一条，逐条见下节
+  「重置任务状态 = 清状态 + 重启 PX4」）。
 - WARN：`任务指令协议版本不支持`、`任务指令类型不支持`、
   `任务指令（主动返航）: state=.. → S12 返航 command_id=..`（接受路径，关键动作不节流）、
   `任务指令（主动返航）: 起飞阶段中止 returning=.. command_id=..`。
+
+重置任务状态 = 清状态 + 重启 PX4（2026-11-17 P4b；与人工指令同一通道，日志里
+`PX4 重启` / `重置动作配置` 前缀可单独筛）：
+
+- INFO（构造期，一行含生效值）：`重置动作配置: 清状态 + 重启 PX4（发 246 param1=1，S1 等
+  飞控回来）（超时=90000ms 246重发=3次 最小间隔=30000ms）`；回滚时该行前缀为
+  `重置动作配置: 回滚：只清状态不重启（reset_reboot_px4=false，直接回 S2）（…）`。
+- INFO：`PX4 重启命令已入队（246 param1=1，第 N 次）`（每次受理/重发一条；入队失败另打
+  节流 WARN `PX4 重启命令入队失败（第 N 次，按 1s 重试）累计=..`）、
+  `PX4 重启命令已确认（246 ACK accepted），等待飞控重新上线`（仅一次）、
+  `PX4 重启完成: 断连已确认、心跳/3D fix/全局位置/Home 全部恢复，耗时 X.Xs（246 发送 N 次
+  ACK=已确认/未确认），本拍起回到常规 S1→S2 判据`（仅一次）、
+  `任务指令（重置状态）: 已在 S1/S2，回执完成 state=..`（幂等）。
+- WARN（受理与拒绝，均为关键动作、不节流）：`任务指令（重置状态）: 已清空任务状态并请求
+  重启 PX4（S1 等飞控回来，期间不发任何 setpoint/命令）command_id=.. 超时=..ms`、
+  回滚受理 `任务指令（重置状态）: 已清空本次任务状态 LANDING → S2 READY command_id=..
+  （原因：mission.reset_reboot_px4=false 回滚）`（原因也可能是"命令接口未注入"）、
+  `任务指令（重置状态）: 飞控遥测不可用，拒绝 state=..`、
+  `任务指令（重置状态）: 飞控仍上锁(armed)，拒绝 state=..`、
+  `任务指令（重置状态）: 未确认落地，拒绝 state=.. landed_valid=.. landed=..`、
+  `任务指令（重置状态）: 距上次重启仅 ..ms（最小间隔 ..ms），拒绝`、
+  `任务指令（重置状态）: 任务故障态拒绝，需人工处置 state=..`、
+  `任务指令（重置状态）: tracker 仍在空中任务相（phase=..），照常执行重置
+  （ResetSortieState 会一并清空）`（只告警不拒绝）、
+  `PX4 拒绝重启（246 ACK result=X，2=DENIED 3=UNSUPPORTED 4=FAILED）：已清空任务状态，
+  但飞控未重启，回 S2 READY。原因多为固件未编入板级 reset 能力（SITL 即如此）或解锁
+  竞态；需要真重启请人工断电/重启飞控`（仅一次）、
+  `PX4 重启命令未收到 ACK（已发 N 次，reboot_retry=M）：不再重发，继续等心跳`（仅一次）。
+- ERROR（仅一次）：`PX4 重启超时: ..ms 内未恢复遥测（connected=0/1 断连已见=0/1 246 发送
+  N 次 ACK=已确认/未确认），保持 S1 并置 65013 bit10。重启不修复硬件（罗盘/振动会复发），
+  请人工检查飞控与链路`。
 
 
 - INFO：状态机创建、启动、停止、销毁；状态转移（含交接进入/验证通过/撤销/超时/
@@ -1270,11 +1371,30 @@ ctest --test-dir build --output-on-failure
   旧快照仍被使用的话会算成 13 m 误判）、
   `FenceAltitudeUnavailableJudgesHorizontalOnly`（无起飞基准时只判水平、不判高度）、
   `FenceAltitudeHysteresisAwaitsClearance`（−10.5 m 越界 → −9.5 m 仍越界 → −8.0 m 才恢复）。
-- 65020 重置任务状态（2026-11-04）：`MissionCommandResetStateReturnsDisarmedToReady`
-  （S14 + 未 arm → `kAccepted`、状态回 S2）、`MissionCommandResetStateRejectedWhenArmed`
-  （`armed=true` → `kRejected/kNotOnGround`、状态不变）、
-  `MissionCommandResetStateRejectedOutsideDisarmed`（S5 飞行态 → `kRejected/kNotOnGround`）、
-  `MissionCommandResetStateIdempotentInReady`（S2 再重置 → `kCompleted`）。
+- 65020 重置任务状态（2026-11-04 引入；2026-11-17 P4b 改为"清状态 + 重启 PX4"）：
+  `MissionCommandResetStateReturnsDisarmedToReady`（改写：S14 + 未 arm → `kAccepted`、
+  切 S1、246 入队、`Px4RebootPending()` 为真）、
+  `MissionCommandResetStateRejectedWhenArmed`（`armed=true` → `kRejected/kNotOnGround`、
+  状态不变）、`MissionCommandResetStateIdempotentInReady`（S2 再重置 → `kCompleted`）、
+  `ResetGuard_LandedFromS13Accepted`（原 `...RejectedOutsideDisarmed` 改写：S13 已落地 +
+  未上锁也受理——旧代码会拒）、`ResetGuard_NoTelemetryRejected`（断连 →
+  `kRejected/kTelemetryStale(9)`）、`ResetGuard_FaultRejected`（S16 故障态 →
+  `kRejected/kMissionFault`，且 65021 必须真的发出来）、`ResetGuard_NotLandedRejected`
+  （未落地 → `kRejected/kNotOnGround`）、`ResetGuard_RollbackSwitchKeepsOldPath`
+  （`reset_reboot_px4=false` → 回 S2、零 246）、`Reboot_WaitsForHeartbeatThenReady`
+  （等断连→恢复 → `Px4RebootPending()` 归零、S1→S2）、`Reboot_TimeoutStaysInSelfCheck`
+  （超时 → 保持 S1 + 65013 bit10）、`Reboot_RetryStopsAfterLimit`（246 发满
+  `reboot_retry` 次即停）、`Reboot_DeniedFallsBackToReady`（ACK DENIED → 停重发、
+  回 S2 READY）、`ResetGuard_ClearsEstimatorDegradationAfterLanding`（估计器降级冻结中
+  空中重置被 `kNotOnGround` 拒、落地 disarm 后重置受理并清掉降级锁存——冻结分支里
+  仍处理 65020，否则"重置解除降级"不可达）。`mission` 配置 3 条在 `config_test`：`ConfigTest.
+  MissionDefaultsWhenSectionMissing` / `MissionPartialOverrideKeepsDefaults` /
+  `MissionOutOfRangeRejected`。只跑这一组（两条等价）：
+
+  ```bash
+  ctest --test-dir build -R 'ResetGuard_|Reboot_' --output-on-failure
+  ./build/mission_state_machine_test --gtest_filter='*ResetGuard_*:*Reboot_*'
+  ```
 - 配置（`interception`/`return_home` 节）：默认值、显式解析、非法窗口/
   返航高度拒绝、`interception.enabled=true` 且 `return_home.enabled=false`
   拒绝（发射后必须有返航收口）。
@@ -1430,10 +1550,21 @@ ctest --test-dir build --output-on-failure
   调度行为回到 P2（S13a 的三条保护仍在，但**不再兜 EKF 跳变/传感器失效**）。
 - **降级后任务卡住不动、不返航也不降落**：这是设计，不是卡死——冻结期间跳过
   电池守卫/围栏/看门狗/返航/降落全部逻辑（低电也不会自动返航），处置完全交给飞手。
-  恢复只有两条：65020 `type=2`「重置任务状态」或重启机载程序。注意 65020 只在 S14
-  （且未上锁、tracker 不在空中）时真正执行重置（S2 只回幂等完成）：若降级发生在 S13，
-  落地后状态机会自行收口 S14，可直接重置；冻结在 S5/S7 等其它任务态时落地后状态仍
-  停在那里，65020 会被拒（`kNotOnGround`），只能重启机载程序。
+  **恢复入口是「重置任务状态」（65020 `type=2`），不是重启机载程序**：冻结分支里仍处理
+  65020 并逐条回 65021，空中（`armed=true`）被 `kRejected/kNotOnGround` 拒，落地 disarm
+  后按 P4b 准入（遥测在线 + 未上锁 + 已落地 + 非故障）受理——清状态会一并清
+  `estimator_degraded_`，随后按 `mission.reset_reboot_px4` 重启 PX4 并停在 S1 等飞控
+  回来，或（回滚开关）只清状态直接回 S2。
+- **重置后一直停在 S1、日志有 `PX4 重启超时`**：说明 246 之后飞控既没断连、也没恢复
+  遥测。先确认飞控是否真的重启（听继电器/看 PX4 自身日志/串口是否重开），再查供电、
+  串口 `/dev/ttyS1` 与链路；超时只置 65013 bit10 并保持 S1，**不会**自动重启机载程序。
+- **日志 `PX4 拒绝重启（246 ACK result=2/3/4）`**：SITL 恒为 DENIED（未编
+  `CONFIG_BOARDCTL_RESET`）；真机多为固件未编板级 reset 能力。此时任务状态已清干净、
+  机载回 S2 READY 可继续接任务；需要真重启请人工断电/重启飞控。不要把 result=1
+  （TEMPORARILY_REJECTED，会继续重试）误判成拒绝。
+- **"重置了但没重启"**：先看构造期 `重置动作配置:` 一行——`回滚：只清状态不重启` 说明
+  `mission.reset_reboot_px4=false`；配置为启用却没发 246，则确认命令接口已注入
+  （只读运行 `command_sender_ == nullptr` 时按设计只清状态、直接回 S2）。
 - **改判据阈值时别只改字典**：`EstimatorGuardThresholds` 的默认值与 `config.h` 的
   `EstimatorGuardConfig` 同源，生产值来自 `estimator_guard` 节 13 键；启动日志
   `估计器降级处置: …` 打印的是**生效值**（含 `critical_sensor_mask=0` 被归一成

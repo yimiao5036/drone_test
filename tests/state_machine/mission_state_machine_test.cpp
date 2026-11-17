@@ -6343,7 +6343,12 @@ TEST(MissionStateMachineTest, MissionCommandAckSequenceIncrementsOnce) {
 }
 
 // ---------------------------------------------------------------------------
-// 65020 重置任务状态（2026-11-04）：S14 DISARMED → S2 READY，免重启机载程序
+// 65020 重置任务状态（2026-11-17 P4b 改写）：清状态 + 重启 PX4
+//
+// 准入从"状态 == S14 DISARMED"改成**飞控事实**：遥测在线 + 未上锁 + 已落地；
+// 受理后默认发 246 重启 PX4 并迁移 S1 SELF_CHECK 等飞控回来（`reset_reboot_px4=false`
+// 回滚成"只清状态直接回 S2"）。判定顺序见设计 §6.1/§6.2 与任务卡：
+// 故障态 → S1/S2 幂等 → 遥测 → 上锁 → 落地 → tracker(只 WARN) → 最小间隔。
 // ---------------------------------------------------------------------------
 
 /// 构造一条 65020 重置任务状态指令。
@@ -6353,104 +6358,207 @@ common::MissionCommand MakeResetStateCommand(uint32_t command_id) {
     return command;
 }
 
-/// S14（落地上锁、任务已结束）收到重置 → 回执 accepted，状态回 S2 READY。
-/// 旧实现 S14 没有回 S2 的路径，现场只能重启机载程序才能再接任务。
+/// S14（落地上锁、任务已结束）收到重置 → 默认配置是"清状态 + 重启 PX4"：
+/// 回执 accepted、迁移 S1 SELF_CHECK、恰好一条 246(param1=1)，**不回 S2**；
+/// 飞控先断连、再带着心跳/3D fix/全局位置/Home 回来，才走常规 S1→S2。
+/// 旧的"只清状态直接回 S2"现在只能由 `mission.reset_reboot_px4=false` 打开。
 TEST(MissionStateMachineTest, MissionCommandResetStateReturnsDisarmedToReady) {
     auto config = MakeTakeoffTestConfig();
     config.test_hooks_enabled = true;  // 用例需把状态机摆到 S14
     AssignmentHarness harness(config);
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
-                              /*with_estimation=*/true, MakeGroundedFlight()));
-    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "用例前提：应处于 S2 READY";
 
     harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
     ASSERT_TRUE(PublishFlight(harness.flight_topic,
-                              MakeOffboardFlight(/*armed=*/false, /*landed=*/true)));
+                              MakeOffboardFlight(/*armed=*/false, /*landed=*/true)))
+        << "飞行快照应被 Topic 接收";
     std::this_thread::sleep_for(80ms);
-    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
+        << "用例前提：应处于 S14 DISARMED";
 
     ASSERT_TRUE(harness.mission_command_topic
                     .Publish(std::make_shared<const common::MissionCommand>(
                         MakeResetStateCommand(9300)))
-                    .accepted);
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
     const auto ack =
         WaitForMissionCommandAck(harness.mission_command_ack_subscription);
     ASSERT_TRUE(ack.has_value()) << "重置指令应回 65021";
-    EXPECT_EQ(ack->type, common::MissionCommandType::kResetState);
-    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted);
-    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
-    EXPECT_EQ(ack->mission_state, common::MissionState::kReady);
+    EXPECT_EQ(ack->type, common::MissionCommandType::kResetState)
+        << "65021 的 type 必须是 kResetState";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "落地上锁的 S14 必须受理重置";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone)
+        << "受理回执 reason 必须是 kNone";
+    EXPECT_EQ(ack->mission_state, common::MissionState::kSelfCheck)
+        << "默认配置下受理后先到 S1 SELF_CHECK 等飞控回来，不得直接回 S2";
+
+    // 恰好一条 246：param1=1（REBOOT），param2~param6 必须为 0。先补一条 ACK
+    // 抑制 1s 重发，避免后续等待跨过重发周期时计数被多打一次。
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 1U)
+        << "重置受理应恰好发一条 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246)";
+    for (const auto& call : harness.sender.History()) {
+        if (call.command != 246U) {
+            continue;
+        }
+        EXPECT_FLOAT_EQ(call.params[0], 1.0f) << "246 param1 必须是 REBOOT(1)";
+        for (int index = 1; index <= 5; ++index) {
+            EXPECT_FLOAT_EQ(call.params[index], 0.0f)
+                << "246 param" << (index + 1) << " 必须为 0";
+        }
+    }
+    harness.sender.SimulateAck(246U, 0U, TestMonotonicMs());
+
     EXPECT_TRUE(WaitForState(harness.status_subscription,
-                             common::MissionState::kReady, 2000ms)
+                             common::MissionState::kSelfCheck, 2000ms)
                     .has_value())
-        << "重置后应回到 S2 READY";
+        << "重置受理后应迁移 S1 SELF_CHECK";
+    EXPECT_TRUE(harness.machine.Px4RebootPending())
+        << "S1 等飞控回来期间 Px4RebootPending() 必须为 true";
+
+    // 真重启一定会掉链路：先喂断连快照（完成判据要求"先观察到 connected=false"）。
+    auto disconnected = MakeOffboardFlight(/*armed=*/false, /*landed=*/true);
+    disconnected.connected = false;
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, disconnected))
+        << "飞行快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+
+    // 恢复：心跳 + 3D fix + 全局位置 + Home 全部有效（MakeGroundedFlight 基线）。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, MakeGroundedFlight()))
+        << "飞行快照应被 Topic 接收";
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               harness.machine.Px4RebootPending()) {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    EXPECT_FALSE(harness.machine.Px4RebootPending())
+        << "断连后恢复导航应结束 PX4 重启等待";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReady, 3000ms)
+                    .has_value())
+        << "重启完成后下一个决策拍应走常规 S1→S2 READY";
 }
 
-/// 未上锁（armed=true）时拒绝重置：回执 kNotOnGround，状态保持 S14。
-/// 清状态会让控制意图与 tracker 断裂，必须等落地 disarm。
+/// 未上锁（armed=true）时拒绝重置：回执 kNotOnGround，状态保持 S14，**不发 246**。
+/// 解锁态重启飞控等于空中断控制，必须等落地 disarm。
 TEST(MissionStateMachineTest, MissionCommandResetStateRejectedWhenArmed) {
     auto config = MakeTakeoffTestConfig();
     config.test_hooks_enabled = true;
     AssignmentHarness harness(config);
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
-                              /*with_estimation=*/true, MakeGroundedFlight()));
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
     harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
     ASSERT_TRUE(PublishFlight(harness.flight_topic,
-                              MakeOffboardFlight(/*armed=*/true, /*landed=*/false)));
+                              MakeOffboardFlight(/*armed=*/true, /*landed=*/false)))
+        << "飞行快照应被 Topic 接收";
     std::this_thread::sleep_for(80ms);
-    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
+        << "用例前提：应处于 S14 DISARMED";
 
     ASSERT_TRUE(harness.mission_command_topic
                     .Publish(std::make_shared<const common::MissionCommand>(
                         MakeResetStateCommand(9301)))
-                    .accepted);
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
     const auto ack =
         WaitForMissionCommandAck(harness.mission_command_ack_subscription);
-    ASSERT_TRUE(ack.has_value());
-    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
-    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround);
+    ASSERT_TRUE(ack.has_value()) << "重置指令应回 65021";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected)
+        << "armed=true 必须拒绝重置";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround)
+        << "上锁检查排在落地之前：armed=true 回 kNotOnGround";
     EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
         << "拒绝时不得改变任务状态";
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 0U)
+        << "未上锁时不得发 246 重启飞控";
+    EXPECT_FALSE(harness.machine.Px4RebootPending())
+        << "被拒的重置不得进入重启等待";
 }
 
-/// 只在 S14 受理：空中任务态（S5）重置被拒绝（kNotOnGround），任务状态不变。
-TEST(MissionStateMachineTest, MissionCommandResetStateRejectedOutsideDisarmed) {
-    AssignmentHarness harness(MakeTakeoffTestConfig());
+/// S13 降落段（landed && !armed && 遥测在线）重置必须受理：这就是"删掉
+/// `state == S14` 硬门槛"的证据（2026-11-17 P4b）。旧实现只认 S14，落地后停在
+/// S13 时地面站无法重置，只能重启机载程序。
+///
+/// 本用例**故意关掉 `return_home.enabled`**：S13 → S14 的自动收口由
+/// `EvaluateLandingAndDisarm` 负责，开着它时"落地快照"会让状态机在同一拍内
+/// 先迁到 S14，用例就退化成"从 S14 重置"，无法证明 S13 也受理。关掉后 S13
+/// 稳定驻留（降落动作由 Landing_* 一组用例覆盖，不在这里重复）。
+TEST(MissionStateMachineTest, ResetGuard_LandedFromS13Accepted) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;    // 需要把状态机摆到 S13
+    config.return_home.enabled = false;  // 见上文：保持 S13 稳定驻留
+    AssignmentHarness harness(config);
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
-                              /*with_estimation=*/true, MakeFenceFlight()));
-    ASSERT_TRUE(DriveToGpsApproach(harness, 44));
-    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach);
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+
+    harness.machine.ForceStateForTest(common::MissionState::kLanding);
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false, /*landed=*/true)))
+        << "飞行快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kLanding)
+        << "用例前提：状态机应稳定停在 S13 降落段";
 
     ASSERT_TRUE(harness.mission_command_topic
                     .Publish(std::make_shared<const common::MissionCommand>(
                         MakeResetStateCommand(9302)))
-                    .accepted);
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
     const auto ack =
         WaitForMissionCommandAck(harness.mission_command_ack_subscription);
-    ASSERT_TRUE(ack.has_value());
-    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected);
-    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround);
-    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
-        << "飞行中不得重置任务状态";
+    ASSERT_TRUE(ack.has_value()) << "S13 落地上锁态应回 65021";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "S13 已落地且未上锁必须受理（不再要求 state == S14）";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone)
+        << "受理回执 reason 必须是 kNone";
+    EXPECT_EQ(ack->mission_state, common::MissionState::kSelfCheck)
+        << "受理后应迁移 S1 SELF_CHECK 等飞控回来";
+    EXPECT_EQ(harness.machine.CurrentState(),
+              common::MissionState::kSelfCheck)
+        << "S13 受理后应离开降落段进入 S1 重启等待";
+    EXPECT_TRUE(harness.machine.Px4RebootPending())
+        << "默认配置下受理即进入 PX4 重启等待";
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 1U)
+        << "S13 受理后应发出一条 246 重启 PX4";
 }
 
-/// 已在 S2 READY 时重置是幂等完成（kCompleted/kNone），不重复执行清理。
+/// 已在 S2 READY 时重置是幂等完成（kCompleted/kNone），不重复执行清理，
+/// 更不重启飞控（幂等分支在准入判据之前，不读遥测也不发 246）。
 TEST(MissionStateMachineTest, MissionCommandResetStateIdempotentInReady) {
     AssignmentHarness harness(MakeTakeoffTestConfig());
     ASSERT_TRUE(harness.Start(/*with_control=*/true,
-                              /*with_estimation=*/true, MakeGroundedFlight()));
-    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "用例前提：应处于 S2 READY";
 
     ASSERT_TRUE(harness.mission_command_topic
                     .Publish(std::make_shared<const common::MissionCommand>(
                         MakeResetStateCommand(9303)))
-                    .accepted);
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
     const auto ack =
         WaitForMissionCommandAck(harness.mission_command_ack_subscription);
-    ASSERT_TRUE(ack.has_value());
-    EXPECT_EQ(ack->result, common::MissionCommandResult::kCompleted);
-    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone);
-    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady);
+    ASSERT_TRUE(ack.has_value())
+        << "应收到 65021 回执";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kCompleted)
+        << "已在 S2 的重置必须回幂等完成 kCompleted";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone)
+        << "幂等完成 reason 必须是 kNone";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "幂等完成不得改变任务状态";
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 0U)
+        << "S2 幂等分支不得重启飞控（不发 246）";
+    EXPECT_FALSE(harness.machine.Px4RebootPending())
+        << "幂等完成不得进入重启等待";
 }
 
 }  // namespace
@@ -7288,6 +7396,615 @@ TEST(MissionStateMachineTest, EstimatorGuard_FreezesMissionAndStopsIntents) {
     EXPECT_EQ(intents_after_second, 0U)
         << "降级后意图计数不得增长，实际 " << intents_after_second;
 
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// P4b 重置准入与 PX4 重启等待（2026-11-17，设计 §6 / §9.1）
+//
+// 本组用例都从"落地上锁"出发（S14），验证四件事：
+// 1. 准入改判"飞控事实"：遥测在线 + 未上锁 + 已落地；故障态 / 无遥测拒绝；
+// 2. 默认受理 = 清状态 + 发 246(REBOOT) + S1 SELF_CHECK 等飞控回来；
+// 3. 等待期间不发任何控制意图、不推进任务，超时置 65013 bit10（1024）；
+// 4. 回滚开关 `reset_reboot_px4=false` 保持旧语义（只清状态直接回 S2）。
+// ---------------------------------------------------------------------------
+
+/// 断连快照（P4b 用例）：模拟 246 重启后 PX4 掉链路。
+/// 用 `connected=false` 表达与 `px4_link` 心跳超时后清空快照等价的"无遥测"语义
+/// （状态机的遥测判据只看 `connected`，见 `ExecuteResetStateCommand` ①）。
+common::FlightStateSnapshot MakeRebootDisconnectedFlight() {
+    auto flight = MakeOffboardFlight(/*armed=*/false, /*landed=*/true);
+    flight.connected = false;
+    return flight;
+}
+
+/// 等待 PX4 重启等待结束（轮询 + 上限，不写死大 sleep）。
+bool WaitForPx4RebootDone(const state_machine::MissionStateMachine& machine,
+                          std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!machine.Px4RebootPending()) {
+            return true;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    return !machine.Px4RebootPending();
+}
+
+/// 把夹具摆到 S14 DISARMED（落地上锁）并等飞行快照被决策线程消费：
+/// P4b 重置用例的统一起点（S14 是旧语义唯一受理态，新语义只是其中之一）。
+bool ForceDisarmedGrounded(AssignmentHarness& harness) {
+    harness.machine.ForceStateForTest(common::MissionState::kDisarmed);
+    if (!PublishFlight(harness.flight_topic,
+                       MakeOffboardFlight(/*armed=*/false, /*landed=*/true))) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (harness.machine.CurrentState() == common::MissionState::kDisarmed) {
+            break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    // 快照要被下一拍的 DrainInputs 收下（决策周期 100ms）。
+    std::this_thread::sleep_for(100ms);
+    return harness.machine.CurrentState() == common::MissionState::kDisarmed;
+}
+
+/// 准入第 3 条（契约判定顺序）：没有遥测（快照缺失 / connected=false）→
+/// kTelemetryStale(reason=9)，一条 246 都不发。刻意与 kNotOnGround 分开：
+/// 地面站据此提示"等链路"而不是"等落地"。
+///
+/// 起点必须是 S14：判定顺序里"已在 S1/S2 → 幂等 kCompleted"排在遥测判据**之前**，
+/// 稳定在 S1/S2 时重置根本走不到遥测这一条（见任务卡补充说明），所以这里从
+/// S14 出发、只把飞行快照换成断连帧。
+TEST(MissionStateMachineTest, ResetGuard_NoTelemetryRejected) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;  // 需要把状态机摆到 S14
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+
+    // 喂一帧断连快照：S14 不会因断连迁移，但最新飞行快照已变成"无遥测"。
+    ASSERT_TRUE(
+        PublishFlight(harness.flight_topic, MakeRebootDisconnectedFlight()))
+        << "飞行快照应被 Topic 接收";
+    std::this_thread::sleep_for(200ms);  // ≥2 个决策周期，确保快照被收下
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
+        << "断连本身不得改变任务状态";
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9400)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "拒绝也要回 65021";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected)
+        << "无遥测必须拒绝重置";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kTelemetryStale)
+        << "无遥测必须回 kTelemetryStale(9)，不得混用 kNotOnGround";
+    EXPECT_EQ(ack->mission_state, common::MissionState::kDisarmed)
+        << "拒绝时回执状态应保持 S14";
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 0U)
+        << "遥测不可用时不得重启飞控（不发 246）";
+    EXPECT_FALSE(harness.machine.Px4RebootPending())
+        << "被拒的重置不得进入重启等待";
+}
+
+/// 准入第 1 条：任务故障态（`mission_faulted_`，S16 FAILSAFE）→
+/// kRejected / kMissionFault，且不重启飞控。故障由 S10 捕网 ACK 超时造出
+/// （与 `FireAckTimeoutEntersFailsafeAndCancelsCommands` 同一条既有路径）。
+TEST(MissionStateMachineTest, ResetGuard_FaultRejected) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::MissionCommand> mission_command_topic;
+    FakeCommandSender sender;
+    auto config = MakeNetActuatorTestConfig();
+    config.actuator.reset_delay = 0ms;  // 故障终态不得补发复位（同既有用例）
+    config.actuator.reset_settle = 0ms;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetMissionCommandInput(mission_command_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto ack_subscription = machine.MissionCommandAckOutput().Subscribe(8);
+    ASSERT_TRUE(machine.Start())
+        << "状态机应启动成功";
+    ASSERT_TRUE(WaitForSelfCheck(machine))
+        << "启动首个迁移应到 S1 SELF_CHECK";
+
+    // 造故障：S10 触发捕网（187）→ 执行器 ACK 超时 → HandleMissionFault → S16。
+    ASSERT_TRUE(flight_topic
+                    .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                        MakeReturnHomeFlight(10.f, 5.f, -10.f)))
+                    .accepted)
+        << "飞行快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCallCount(sender, 1)) << "捕网触发命令（187）应已入队";
+    sender.SimulateTimeout(187U);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value())
+        << "执行器 ACK 超时必须进入 S16 故障态";
+
+    // 换"落地上锁 + 遥测在线"的快照：除故障态外其余准入项全部满足，
+    // 此时若仍被拒，只能是 mission_faulted_ 这一条。
+    auto landed = MakeReturnHomeFlight(10.f, 5.f, -10.f, 0.f, 0.f, 0.f,
+                                       /*armed=*/false);
+    landed.landed = true;
+    landed.landed_state_valid = true;
+    ASSERT_TRUE(PublishFlight(flight_topic, landed))
+        << "飞行快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+
+    ASSERT_TRUE(mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9401)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack = WaitForMissionCommandAck(ack_subscription);
+    ASSERT_TRUE(ack.has_value())
+        << "故障态也必须回 65021（kMissionFault），不能静默";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected)
+        << "任务故障态必须拒绝重置";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kMissionFault)
+        << "故障态 reason 必须是 kMissionFault";
+    EXPECT_EQ(CountCommands(sender, 246U), 0U) << "故障态不得重启飞控";
+    EXPECT_FALSE(machine.Px4RebootPending())
+        << "故障态被拒后不得进入重启等待";
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kFailsafe)
+        << "故障为终态，拒绝重置不得改变状态";
+    machine.Stop();
+}
+
+/// 回滚开关：`reset_reboot_px4=false` 回到 2026-11-04 旧语义（只清状态、
+/// 直接回 S2、不发 246）。老地面站连新机载时靠它降级。
+TEST(MissionStateMachineTest, ResetGuard_RollbackSwitchKeepsOldPath) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    config.mission.reset_reboot_px4 = false;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9402)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "回滚路径也应回 65021";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "回滚开关下重置仍应受理";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNone)
+        << "回滚受理 reason 必须是 kNone";
+    EXPECT_EQ(ack->mission_state, common::MissionState::kReady)
+        << "回滚语义受理后直接回 S2 READY（不进 S1、不等飞控）";
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 0U)
+        << "回滚开关下不得重启飞控（不发 246）";
+    EXPECT_FALSE(harness.machine.Px4RebootPending())
+        << "回滚路径不得进入重启等待";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReady, 2000ms)
+                    .has_value())
+        << "回滚路径应直接回 S2 READY";
+}
+
+/// 准入第 5 条（补充覆盖，任务卡清单外）：未上锁但**未确认落地** → kNotOnGround，
+/// 不重启飞控。"落地证据"这一行需要独立用例：上锁用例的阻挡在 armed 上，删掉
+/// landed 判据不会让它失败。`landed_state_valid && !landed` 走 PX4 事实分支。
+TEST(MissionStateMachineTest, ResetGuard_NotLandedRejected) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+
+    // 同一状态、同一条链路上换成"未上锁但 PX4 明确报未落地"的快照。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false, /*landed=*/false)))
+        << "飞行快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9406)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "拒绝也要回 65021";
+    EXPECT_EQ(ack->result, common::MissionCommandResult::kRejected)
+        << "未确认落地必须拒绝重置";
+    EXPECT_EQ(ack->reason, common::MissionCommandReason::kNotOnGround)
+        << "未落地（landed_state_valid && !landed）必须回 kNotOnGround";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kDisarmed)
+        << "拒绝时不得改变任务状态";
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 0U)
+        << "未落地时不得重启飞控（不发 246）";
+    EXPECT_FALSE(harness.machine.Px4RebootPending())
+        << "未落地被拒后不得进入重启等待";
+}
+
+/// 默认重启语义的完整时序：受理 → S1 + pending + 246 → 只有断连帧时仍停在 S1
+/// 且不发任何控制意图 → 先"见到断连"、再喂心跳/3D fix/全局位置/Home → 结束等待
+/// → 下一个决策拍走常规 S1→S2 READY。
+TEST(MissionStateMachineTest, Reboot_WaitsForHeartbeatThenReady) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    config.mission.reboot_timeout = 5000ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+    DrainIntents(harness.intent_subscription);  // 从干净队列开始断言"不发意图"
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9403)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "重置指令应回 65021";
+    ASSERT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "落地上锁的 S14 必须受理重启";
+    EXPECT_EQ(ack->mission_state, common::MissionState::kSelfCheck)
+        << "受理后回执状态应是 S1 SELF_CHECK";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kSelfCheck, 2000ms)
+                    .has_value())
+        << "受理后应迁移 S1 SELF_CHECK 等飞控回来";
+    ASSERT_TRUE(harness.machine.Px4RebootPending())
+        << "受理后应进入重启等待";
+
+    // 只喂断连快照：真重启一定会掉链路；此时状态机必须停在 S1、不推进任务。
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(
+            PublishFlight(harness.flight_topic, MakeRebootDisconnectedFlight()))
+            << "飞行快照应被 Topic 接收";
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kSelfCheck)
+        << "断连期间必须停在 S1 SELF_CHECK，不得推进任务";
+    EXPECT_TRUE(harness.machine.Px4RebootPending())
+        << "断连期间 Px4RebootPending() 必须为 true";
+    bool saw_intent = false;
+    while (harness.intent_subscription.TryTake().has_value()) {
+        saw_intent = true;
+    }
+    EXPECT_FALSE(saw_intent) << "重启等待期间不得发布任何控制意图";
+
+    // 恢复：心跳 + 3D fix + 全局位置 + Home 全部有效 → 结束等待 → S2 READY。
+    ASSERT_TRUE(PublishFlight(harness.flight_topic, MakeGroundedFlight()))
+        << "飞行快照应被 Topic 接收";
+    EXPECT_TRUE(WaitForPx4RebootDone(harness.machine, 2000ms))
+        << "断连已见 + 导航恢复后应结束 PX4 重启等待";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReady, 3000ms)
+                    .has_value())
+        << "重启完成后下一个决策拍应走常规 S1→S2 READY";
+}
+
+/// 超时：`reboot_timeout=300ms`，只喂断连快照（飞控一直不回来）→ 保持 S1、
+/// pending 仍为 true、65013 `active_warning_bits` 含 bit10(1024)、ERROR 只打一次。
+TEST(MissionStateMachineTest, Reboot_TimeoutStaysInSelfCheck) {
+    drone::test::LogCapture logs;  // 断言 ERROR 只打一次（须在组件启动前挂载）
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    config.mission.reboot_timeout = 300ms;  // 契约值：~800ms 内应能观察到超时
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9404)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "超时用例也要先拿到受理回执";
+    ASSERT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "落地上锁的 S14 必须受理重启";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kSelfCheck, 2000ms)
+                    .has_value())
+        << "受理后应迁移 S1 SELF_CHECK 等飞控回来";
+    ASSERT_TRUE(harness.machine.Px4RebootPending())
+        << "受理后应进入 PX4 重启等待";
+
+    constexpr uint32_t kWarningPx4RebootTimeout = 1U << 10U;
+    // 只喂断连快照：飞控一直不回来，跨过 300ms 超时门限。
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(
+            PublishFlight(harness.flight_topic, MakeRebootDisconnectedFlight()))
+            << "飞行快照应被 Topic 接收";
+        std::this_thread::sleep_for(100ms);
+    }
+    // 65013 周期 500ms，轮询上限 1.5s（契约要求 ~800ms 量级可观察，留余量）。
+    const auto timed_out = WaitForWarningBit(
+        harness.status_subscription, kWarningPx4RebootTimeout, 1500ms);
+    ASSERT_TRUE(timed_out.has_value())
+        << "重启超时后 MissionStatus.active_warning_bits 必须含 bit10(1024)";
+    EXPECT_EQ(timed_out->active_warning_bits & kWarningPx4RebootTimeout,
+              kWarningPx4RebootTimeout)
+        << "bit10 的值必须是 1U<<10 = 1024";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kSelfCheck)
+        << "超时后保持 S1 SELF_CHECK（不自动重启机载程序）";
+    EXPECT_TRUE(harness.machine.Px4RebootPending())
+        << "超时后仍处于重启等待，等人工处置";
+    EXPECT_EQ(logs.Count("PX4 重启超时"), 1)
+        << "重启超时 ERROR 只打一次（不刷屏）";
+}
+
+/// 246 重发上限：`reboot_retry=2`（含首次），不给 ACK、只喂断连快照 →
+/// 首发 + 1s 后重发 1 次 = 恰好 2 次，用满即停（不无限重发）。
+TEST(MissionStateMachineTest, Reboot_RetryStopsAfterLimit) {
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    config.mission.reboot_retry = 2;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9405)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "重发用例也要先拿到受理回执";
+    ASSERT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "落地上锁的 S14 必须受理重启";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kSelfCheck, 2000ms)
+                    .has_value())
+        << "受理后应迁移 S1 SELF_CHECK 等飞控回来";
+    ASSERT_TRUE(harness.machine.Px4RebootPending())
+        << "受理后应进入 PX4 重启等待";
+
+    // 2.5s 必须跨过两个 1s 重发周期（这是本用例唯一需要固定等待的地方）。
+    const auto deadline = std::chrono::steady_clock::now() + 2500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)PublishFlight(harness.flight_topic,
+                            MakeRebootDisconnectedFlight());
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 2U)
+        << "reboot_retry=2 应恰好发 2 次 246（含首次），用满即停不得无限重发";
+    EXPECT_TRUE(harness.machine.Px4RebootPending())
+        << "飞控未回来时应仍在重启等待";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kSelfCheck)
+        << "重发期间不得离开 S1";
+}
+
+/// PX4 **明确拒绝** 246（2=DENIED / 3=UNSUPPORTED / 4=FAILED）→ 停止重发并回退
+/// S2 READY，不再停在 S1 干等 `reboot_timeout`。
+///
+/// 现实依据：SITL 的 PX4 固件未编入板级 reset 能力（`CONFIG_BOARDCTL_RESET`），
+/// 对 246 恒回 `result=2 DENIED`——"拒绝"在 SITL 是常态，卡在 S1 等 90 s 没有意义。
+/// 拒绝不算"真正重启过"，所以 `reboot_min_interval` 计时也要清掉：紧接着再来
+/// 一次重置必须能受理（否则现场要白等 30 s 才能重试）。
+TEST(MissionStateMachineTest, Reboot_DeniedFallsBackToReady) {
+    drone::test::LogCapture logs;  // 断言拒绝 WARN 只打一次
+    auto config = MakeTakeoffTestConfig();
+    config.test_hooks_enabled = true;
+    config.mission.reboot_timeout = 5000ms;  // 给大值：拒绝必须走回退而不是超时
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeGroundedFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：应停在 S14 DISARMED";
+
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9407)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto ack =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "拒绝用例也要先拿到受理回执";
+    ASSERT_EQ(ack->result, common::MissionCommandResult::kAccepted)
+        << "落地上锁的 S14 必须受理重启";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kSelfCheck, 2000ms)
+                    .has_value())
+        << "受理后应迁移 S1 SELF_CHECK 等飞控回来";
+    ASSERT_TRUE(harness.machine.Px4RebootPending())
+        << "受理后应进入 PX4 重启等待";
+
+    // 等 246 首次入队之后再模拟 PX4 明确拒绝：ACK 时刻不得早于重启起点
+    // （`EvaluatePx4RebootWait` 只认本次重启之后的 ACK）。
+    std::this_thread::sleep_for(120ms);
+    ASSERT_EQ(CountCommands(harness.sender, 246U), 1U)
+        << "拒绝前应恰好发过一条 246";
+    harness.sender.SimulateAck(246U, /*result=*/2U, TestMonotonicMs());
+
+    // 回退：pending=false + 直接回 S2 READY（不要求"先断连再恢复"，那是 ACCEPTED
+    // 后等遥测的路径才需要的）。
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               harness.machine.Px4RebootPending()) {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    ASSERT_FALSE(harness.machine.Px4RebootPending())
+        << "PX4 明确拒绝重启后必须立刻结束等待";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReady, 2000ms)
+                    .has_value())
+        << "PX4 拒绝重启后应回退到 S2 READY";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "拒绝重启后应回退到 S2 READY";
+
+    // 跨过 1s 重发周期：明确拒绝后不得再发 246（计数仍为 1）。
+    std::this_thread::sleep_for(1200ms);
+    EXPECT_EQ(CountCommands(harness.sender, 246U), 1U)
+        << "PX4 明确拒绝后不得继续重发 246";
+    EXPECT_EQ(logs.Count("PX4 拒绝重启"), 1)
+        << "拒绝重启应打一条 WARN（不刷屏）";
+
+    // 拒绝没真正重启 → `reboot_min_interval` 计时已清：紧接着（<30s）从 S14
+    // 再重置必须受理，不能回 kDuplicateCommand。
+    ASSERT_TRUE(ForceDisarmedGrounded(harness))
+        << "用例前提：第二次重置前应回到 S14";
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9408)))
+                    .accepted)
+        << "65020 指令应被 Topic 接收";
+    const auto second =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(second.has_value()) << "第二次重置也应回 65021";
+    EXPECT_EQ(second->result, common::MissionCommandResult::kAccepted)
+        << "拒绝未真正重启，reboot_min_interval 不应拦住紧接着的重置";
+    EXPECT_TRUE(harness.machine.Px4RebootPending())
+        << "第二次重置应再次进入重启等待";
+}
+
+/// P3 遗留缺口（2026-11-17 补）：估计器降级**冻结期间**收到的 65020 必须仍然处理
+/// 并回 65021——`ResetSortieState()` 是清除降级锁存的**唯一入口**，冻结分支若不
+/// 处理 65020，"落地后重置解除降级"在代码上不可达，现场只能重启机载程序。
+/// 准入判据同时保证空中调不动：悬停中 `armed=true` 被 `kNotOnGround` 拒绝，
+/// 落地 disarm 后才受理并清锁存、按默认重启语义迁移 S1 等飞控回来。
+TEST(MissionStateMachineTest, ResetGuard_ClearsEstimatorDegradationAfterLanding) {
+    auto config = MakeLandingDescentTestConfig();
+    // 判据必须开启（生产语义）：本用例验证降级后的 65020 可达性与解除。
+    config.estimator_guard.enabled = true;
+    // 需要把状态机摆到空中任务态：留在 S2 会先命中"已在 S1/S2 → kCompleted"幂等分支，
+    // 测不到 armed 判据。
+    config.test_hooks_enabled = true;
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    common::Topic<common::MissionCommand> mission_command_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetMissionCommandInput(mission_command_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto ack_subscription = machine.MissionCommandAckOutput().Subscribe(8);
+    ASSERT_TRUE(machine.Start()) << "状态机应启动成功";
+    ASSERT_TRUE(WaitForSelfCheck(machine))
+        << "启动首个迁移应到 S1 SELF_CHECK";
+
+    // 基线帧：上锁、局部位置新鲜、z=0；随后把状态摆到 S5（空中任务态）。
+    // 降级一旦锁存，Evaluate 冻结推进，状态不会再变化。
+    const uint64_t t0 = TestMonotonicMs();
+    ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, 0.f, t0))
+        << "基线快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kGpsApproach);
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               machine.CurrentState() != common::MissionState::kGpsApproach) {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    ASSERT_EQ(machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "用例前提：状态机应停在空中任务态 S5";
+
+    // 单拍 9m 高度跳变 → 锁存降级（P3 的既有临界路径）。
+    ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, 9.f, t0 + 100))
+        << "跳变快照应被 Topic 接收";
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !machine.EstimatorDegraded()) {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    ASSERT_TRUE(machine.EstimatorDegraded())
+        << "单拍 9m 跳变应锁存估计器降级";
+
+    // ① 空中（armed=true）重置：冻结分支仍要处理 65020 并回 65021（这就是"可达性"
+    //    的证据），但被上锁判据拒绝，降级锁存不得被清掉。
+    ASSERT_TRUE(mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9410)))
+                    .accepted)
+        << "空中重置指令应被 Topic 接收";
+    const auto airborne_ack = WaitForMissionCommandAck(ack_subscription);
+    ASSERT_TRUE(airborne_ack.has_value())
+        << "降级冻结期间也必须回 65021（否则重置入口不可达）";
+    EXPECT_EQ(airborne_ack->result, common::MissionCommandResult::kRejected)
+        << "空中（armed=true）不得重置";
+    EXPECT_EQ(airborne_ack->reason, common::MissionCommandReason::kNotOnGround)
+        << "上锁检查挡在落地之前：应回 kNotOnGround";
+    EXPECT_TRUE(machine.EstimatorDegraded())
+        << "被拒的重置不得清除降级锁存";
+    EXPECT_EQ(CountCommands(sender, 246U), 0U)
+        << "空中被拒不得发 246";
+
+    // ② 落地 + 已上锁：持续喂快照（判据开着时未上锁只刷新基线，不会重新锁存），
+    //    再发第二条 65020（新 command_id）→ 受理、清降级、进入重启等待。
+    for (int round = 0; round < 3; ++round) {
+        // 落地后 z 回 0（判据开着时 armed=false 只刷新基线，不重新判定）。
+        auto landed =
+            MakeEstimatorGuardFlight(0.f, TestMonotonicMs(), /*armed=*/false);
+        landed.landed = true;
+        landed.landed_state_valid = true;
+        ASSERT_TRUE(PublishFlight(flight_topic, landed))
+            << "落地快照应被 Topic 接收";
+        std::this_thread::sleep_for(100ms);
+    }
+    // 清掉冻结期间积压的 65013，下面的 WaitForState 才能证明"受理后新发布了 S1"。
+    while (status_subscription.TryTake().has_value()) {
+    }
+    ASSERT_TRUE(mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeResetStateCommand(9411)))
+                    .accepted)
+        << "落地重置指令应被 Topic 接收";
+    const auto landed_ack = WaitForMissionCommandAck(ack_subscription);
+    ASSERT_TRUE(landed_ack.has_value()) << "落地后重置应回 65021";
+    EXPECT_EQ(landed_ack->result, common::MissionCommandResult::kAccepted)
+        << "落地 disarm 后重置必须受理";
+    EXPECT_EQ(landed_ack->reason, common::MissionCommandReason::kNone)
+        << "受理回执 reason 必须是 kNone";
+    EXPECT_EQ(landed_ack->mission_state, common::MissionState::kSelfCheck)
+        << "默认重启语义受理后应迁 S1 SELF_CHECK";
+    EXPECT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kSelfCheck, 2000ms)
+                    .has_value())
+        << "受理后状态应迁移 S1 SELF_CHECK";
+    EXPECT_FALSE(machine.EstimatorDegraded())
+        << "受理重置后 ResetSortieState 必须清除估计器降级锁存";
+    EXPECT_TRUE(machine.Px4RebootPending())
+        << "默认 reset_reboot_px4=true 应进入 PX4 重启等待";
+    EXPECT_EQ(CountCommands(sender, 246U), 1U)
+        << "受理后应恰好发一条 246 重启 PX4";
+
+    // 抑制 1s 重发后结束（本用例只验证"降级 → 重置解除"这条链路）。
+    sender.SimulateAck(246U, 0U, TestMonotonicMs());
     machine.Stop();
 }
 

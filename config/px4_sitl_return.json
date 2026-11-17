@@ -194,5 +194,12 @@
         "local_position_stale_ms": 500,
         "critical_sensor_mask": 0,
         "bad_estimator_flag_mask": 0
+    },
+    "mission": {
+        "_comment": "任务级重置动作（2026-11-17 P4b）：与 config/config.json 键集一致的默认值。本文件不含 runtime 节（只读运行、不注入命令接口），65020 重置即便受理也无处发 246，保留本节点只为原地切到控制装配后行为一致。reset_reboot_px4=false 是唯一回滚开关（旧语义：只清状态直接回 S2）。**重启治标不治本**：罗盘/振动/EKF 参数问题重启后会再次出现，不修复硬件。",
+        "reset_reboot_px4": true,
+        "reboot_timeout_ms": 90000,
+        "reboot_retry": 3,
+        "reboot_min_interval_ms": 30000
     }
 }

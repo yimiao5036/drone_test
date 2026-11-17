@@ -788,6 +788,10 @@ enum class MissionCommandReason : uint8_t {
     /// 需落地并上锁后才能重置（2026-11-04，仅 kResetState 使用）：空中/解锁
     /// 状态下拒绝重置，避免把进行中的任务状态清掉造成控制意图断裂。
     kNotOnGround = 8,
+    /// 飞控遥测不可用（2026-11-17 P4b，仅 kResetState 使用）：重置的准入改为
+    /// "飞控事实"（connected/armed/landed）后，没有遥测就无法判定能否重启飞控，
+    /// 只能拒绝。**不要**与 kNotOnGround 混用——地面站据此提示"等链路"。
+    kTelemetryStale = 9,
     kInternalError = 20,
 };
 

@@ -11,7 +11,7 @@
 - **主要功能**：接收地面站目标位置 → YOLOv26 目标识别 → 轨迹预测 → 控制 PX4 无人机跟踪/反制
 - **通信协议**：MAVLink（与 PX4 飞控和地面站通信）
 
-**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定）= **控制运行**；改成 `false` 重启即 **只读运行**（只采日志、不下发控制，用于地面排查）。**`enable_control` 的语义、只读运行、模块状态标记的唯一事实来源是 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)**（2026-11-17 重写，"影子"不再作为状态词）。两个发射闸门仍关：`interception.enabled=false`（S9/S10 自动拦截不可达）、`actuator.gcs_fire_enabled=false`（65016 直控不装配）。控制链由 `MissionStateMachine` 的 `kControlIntent` 经 `FlightController` → `Px4Setpoint` 下发 PX4；`EstimatorGuard` 判据命中会切 `POSCTL(3/0)` + 停发一切控制意图 + 冻结任务推进（`estimator_guard.enabled=false` 回滚，见 [`docs/降落与估计器保护设计-2026-11-17.md`](docs/降落与估计器保护设计-2026-11-17.md) §5.6）；`TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 是**观测**模块（跑真实算法、无控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home）；阶段四控制接入路径代码已全部落地，控制运行时绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口。门禁 G1~G4 已完成（G4-1 电机怠速 2026-10-21 人工确认、G4-2 机体方向 2026-10-28 遥控器飞行确认、G4-3 机构/参数/时序 2026-10-23 冻结、G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过），下一步是 G5 首飞（科目见 [`docs/PX4实链验证清单.md`](docs/PX4实链验证清单.md) §7.5）。
+**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定）= **控制运行**；改成 `false` 重启即 **只读运行**（只采日志、不下发控制，用于地面排查）。**`enable_control` 的语义、只读运行、模块状态标记的唯一事实来源是 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)**（2026-11-17 重写，"影子"不再作为状态词）。两个发射闸门仍关：`interception.enabled=false`（S9/S10 自动拦截不可达）、`actuator.gcs_fire_enabled=false`（65016 直控不装配）。控制链由 `MissionStateMachine` 的 `kControlIntent` 经 `FlightController` → `Px4Setpoint` 下发 PX4；`EstimatorGuard` 判据命中会切 `POSCTL(3/0)` + 停发一切控制意图 + 冻结任务推进（`estimator_guard.enabled=false` 回滚，见 [`docs/降落与估计器保护设计-2026-11-17.md`](docs/降落与估计器保护设计-2026-11-17.md) §5.6）；65020 `type=2` 重置 = 清状态 + 重启 PX4（发 `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246)`，飞控约 20~30 s 不可用，`mission.reset_reboot_px4=false` 回滚成旧语义，见同一设计文档 §6.7）；`TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 是**观测**模块（跑真实算法、无控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home）；阶段四控制接入路径代码已全部落地，控制运行时绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口。门禁 G1~G4 已完成（G4-1 电机怠速 2026-10-21 人工确认、G4-2 机体方向 2026-10-28 遥控器飞行确认、G4-3 机构/参数/时序 2026-10-23 冻结、G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过），下一步是 G5 首飞（科目见 [`docs/PX4实链验证清单.md`](docs/PX4实链验证清单.md) §7.5）。
 
 ## 开发与构建环境（强制规则）
 
@@ -25,7 +25,7 @@
   # 主工程
   cmake -S . -B build
   cmake --build build -j$(nproc)
-  ctest --test-dir build --output-on-failure     # 基线 778/778
+  ctest --test-dir build --output-on-failure     # 基线 790/790
   python3 tools/check_docs.py                    # 文档基线/链接/模块文档检查
   ./build/drone_control                          # 生成 logs/0001_xxx.log
   ./build/drone_control --config /路径/config.json

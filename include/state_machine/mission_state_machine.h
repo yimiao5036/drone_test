@@ -111,6 +111,10 @@ struct MissionStateMachineConfig {
     /// （不自动返航/降落/上锁），只等飞手接 `STABILIZED` 处置（设计 §5）。
     /// `enabled=false` 是回滚开关：判据完全不跑，行为回到 P2。
     config::EstimatorGuardConfig estimator_guard;
+    /// 重置动作（mission 配置节，2026-11-17 降落与估计器保护 P4b）：
+    /// 65020 `type=2` 受理后"清任务状态 + 重启 PX4"（发 246 param1=1 → S1 SELF_CHECK
+    /// 等飞控回来）。`reset_reboot_px4=false` 回滚成 `2026-11-04` 的旧语义（只清状态）。
+    config::MissionConfig mission;
     /// 多边形围栏（fence 配置节，2026-10-29）：机载自治围栏——区域缓存装载、
     /// 越界判定与中止、位置意图钳制。默认关闭（回退 Home 圆形围栏）。
     config::FenceConfig fence;
@@ -261,6 +265,11 @@ public:
     ///
     /// 非虚接口：只给具体实现与测试用，不扩张 `IMissionStateMachine` 契约。
     bool EstimatorDegraded() const;
+
+    /// PX4 重启等待是否进行中（P4b，2026-11-17；测试/SITL 断言用，不参与控制决策）。
+    /// 65020 `type=2` 受理后在 S1 SELF_CHECK 等飞控回来期间为 true：这段时间本机
+    /// **不发任何控制意图与命令**（246 重发除外），只维护 65013。
+    bool Px4RebootPending() const;
 
     // ---- 测试入口（生产装配不可达） ----
     /// 强制提交一次状态迁移（单测/SITL 验收入口；Start 后调用，由决策线程消费

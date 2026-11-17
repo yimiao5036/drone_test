@@ -1559,6 +1559,64 @@ TEST(ConfigTest, EstimatorGuardMasksPreservedWhenExplicit) {
     std::filesystem::remove(zero_path);
 }
 
+// 任务级重置动作（mission 节，2026-11-17 P4b）：整节缺席时全部回退默认值。
+// 默认就是"清状态 + 重启 PX4"（reset_reboot_px4=true）；2026-11-04 的旧语义
+// （只清状态、不重启）不是默认。
+TEST(ConfigTest, MissionDefaultsWhenSectionMissing) {
+    json value = ReadSourceConfig();
+    value.erase("mission");
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_mission_default.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.mission.reset_reboot_px4);
+    EXPECT_EQ(config.mission.reboot_timeout.count(), 90000);
+    EXPECT_EQ(config.mission.reboot_retry, 3);
+    EXPECT_EQ(config.mission.reboot_min_interval.count(), 30000);
+    std::filesystem::remove(path);
+}
+
+// 只写部分键时其余键回退默认（回滚开关可以单独关，不必整节照抄）。
+TEST(ConfigTest, MissionPartialOverrideKeepsDefaults) {
+    json value = ReadSourceConfig();
+    json partial = json::object();
+    partial["reset_reboot_px4"] = false;
+    partial["reboot_retry"] = 5;
+    value["mission"] = partial;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_mission_partial.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_FALSE(config.mission.reset_reboot_px4);
+    EXPECT_EQ(config.mission.reboot_retry, 5);
+    // 未写的键仍是默认值。
+    EXPECT_EQ(config.mission.reboot_timeout.count(), 90000);
+    EXPECT_EQ(config.mission.reboot_min_interval.count(), 30000);
+    std::filesystem::remove(path);
+}
+
+// 越界在加载期拒绝：超时太短会在飞控还没起来时判超时，重试 0 次等于不发 246。
+TEST(ConfigTest, MissionOutOfRangeRejected) {
+    // 重启超时 50 ms：低于下限（100 ms）——超时只影响诊断时机，下限放到 100 ms
+    // 是为了让单测能用几百毫秒窗口覆盖超时分支，但不能填到"比一帧决策周期还短"。
+    json timeout = ReadSourceConfig();
+    timeout["mission"] = json::object();
+    timeout["mission"]["reboot_timeout_ms"] = 50;
+    const auto timeout_path =
+        WriteTemporaryConfig(timeout, "drone_config_mission_timeout.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(timeout_path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(timeout_path);
+
+    // 重试 0 次：一条 246 都不发，"清状态 + 重启 PX4"的语义名存实亡。
+    json retry = ReadSourceConfig();
+    retry["mission"] = json::object();
+    retry["mission"]["reboot_retry"] = 0;
+    const auto retry_path =
+        WriteTemporaryConfig(retry, "drone_config_mission_retry.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(retry_path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(retry_path);
+}
+
 TEST(ZoneStoreTest, SaveThenLoadRoundTrips) {
     const auto path =
         std::filesystem::temp_directory_path() / "drone_zone_roundtrip.json";

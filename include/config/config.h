@@ -332,6 +332,32 @@ struct EstimatorGuardConfig {
     void Validate() const;
 };
 
+/// 任务级重置动作（mission 节，2026-11-17 降落与估计器保护 P4b）。
+///
+/// 背景：2026-11-17 10:24 现场 EKF 全状态重置 + AUTO.LAND 翻滚之后，飞控自身状态
+/// 已经不可信（估计器、Home、起飞基准都可能错），只清我们状态机的锁存解决不了问题。
+/// 因此 65020 `type=2` 的语义从"只清状态"改为**清任务状态 + 重启 PX4**（设计 §6）：
+/// 受理后发 `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246) param1=1`，迁移 S1 SELF_CHECK
+/// 等飞控回来（心跳 + GPS fix + 全局位置 + Home），再走常规 S1→S2。
+///
+/// **重启治标不治本**：罗盘失效、Z 轴振动、EKF 参数问题重启后仍会出现，
+/// 这只是把飞控恢复到"已知初始状态"，不修复硬件。
+struct MissionConfig {
+    /// 回滚开关：false = 恢复 2026-11-04 的旧语义（只清状态、不重启 PX4，
+    /// 直接回 S2 READY）。老地面站（不知道重启语义）连新机载时用这个降级。
+    bool reset_reboot_px4 = true;
+    /// 等 PX4 回来的上限。PX4 冷启动 15~30 s，留足余量；到点仍无遥测则保持
+    /// S1 SELF_CHECK 并打 ERROR（不自动重启机载程序）。
+    std::chrono::milliseconds reboot_timeout{90000};
+    /// 246 命令的最大发送次数（含首次）。每次失败/无 ACK 后按固定 1 s 间隔重发，
+    /// 用完即停（**不无限重发**，避免把正在重启的飞控再打一遍）。
+    int reboot_retry = 3;
+    /// 两次重启的最小间隔：期间收到的新重置指令直接拒绝（回 kDuplicateCommand），
+    /// 避免刚起来的飞控又被重启。
+    std::chrono::milliseconds reboot_min_interval{30000};
+    void Validate() const;
+};
+
 /// 多边形围栏（fence 节，2026-10-29）。
 /// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
 /// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
@@ -470,6 +496,7 @@ struct AppConfig {
     ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
     LandingConfig landing;              ///< S13 拆两段（2026-11-17 P2）
     EstimatorGuardConfig estimator_guard;              ///< 估计器降级判据与处置（2026-11-17 P3）
+    MissionConfig mission;                  ///< 65020 重置 = 清状态 + 重启 PX4（2026-11-17 P4b）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
     FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
     ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）

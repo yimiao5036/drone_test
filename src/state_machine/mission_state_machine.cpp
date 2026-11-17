@@ -192,6 +192,35 @@ constexpr uint64_t kEstimatorModeMaxAttempts = 3;
 /// 降级冻结期间的存活摘要周期：冻结后日志会安静下来，现场需要能确认
 /// "机载还活着、仍在等飞手接管"，又不至于刷屏。
 constexpr uint64_t kEstimatorFreezeDiagIntervalMs = 10000;
+/// MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN（246，2026-11-17 P4b）：重置任务状态时
+/// 重启 PX4。编号取自 `third_party/c_library_v2-master/common/common.xml`
+/// （`<entry value="246" name="MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN">`），
+/// param1 用 `REBOOT_SHUTDOWN_ACTION_REBOOT = 1`（重启组件）。
+/// param2~7 全 0：**本版 PX4 只读 param1**（`Commander.cpp` 的
+/// `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` 分支只判 param1 与 armed），param6 的
+/// "安全互锁/强制"枚举在当前固件里没有生效，所以真正的落地互锁由我们这边的准入判据
+/// 保证（`ExecuteResetStateCommand`）。
+constexpr uint16_t kMavCmdPreflightRebootShutdown = 246;
+constexpr float kRebootShutdownActionReboot = 1.0F;
+/// 246 的重发间隔（设计 §6.3：1 s 重试，最多 `mission.reboot_retry` 次）。
+constexpr uint64_t kRebootRetryIntervalMs = 1000;
+/// 65013 告警位 bit10：PX4 重启超时（`mission.reboot_timeout` 内飞控没回来）。
+/// 位 0~9 已被围栏/目标/执行器/伺服等占用，本项是 2026-11-17 P4b 新增。
+/// 仅机载侧在重启等待期间置位，回到 S2 后自然清除。
+constexpr uint32_t kWarningPx4RebootTimeout = 1U << 10U;
+/// 重置准入的"已落地"近似判据（设计 §6.1）：PX4 `landed` 证据缺失时，相对高度
+/// ≤ 该值视为在地面。**只在 landed_state_valid=false 时使用**——它是兜底，
+/// 不能替代 PX4 的 land detector。
+constexpr double kResetGroundAltM = 0.5;
+/// MAV_RESULT_*（COMMAND_ACK.result，只列判断用到的）。**SITL 的 PX4 未编入
+/// `CONFIG_BOARDCTL_RESET`（`boards/px4/sitl/default.px4board` 无该项，
+/// `Commander.cpp` 里 param1=1 的重启分支整段被编译掉），因此 SITL 对 246 恒回
+/// `DENIED(2)`；只有 NuttX 真机固件才会真的重启。这条差异必须体现在处置里：
+/// 拒绝是"明确答复"，不该重发，也不该在 S1 干等到超时。
+constexpr uint8_t kMavResultAccepted = 0;     // MAV_RESULT_ACCEPTED
+constexpr uint8_t kMavResultDenied = 2;       // MAV_RESULT_DENIED
+constexpr uint8_t kMavResultUnsupported = 3;  // MAV_RESULT_UNSUPPORTED
+constexpr uint8_t kMavResultFailed = 4;       // MAV_RESULT_FAILED
 constexpr uint8_t kPx4FlightMainModeOffboard = 6;
 constexpr uint8_t kPx4FlightSubModeOffboard = 0;
 constexpr uint8_t kPx4FlightMainModeAuto = 4;
@@ -420,6 +449,7 @@ public:
           landing_(config.landing),
           estimator_guard_(ToEstimatorThresholds(config.estimator_guard)),
           estimator_guard_enabled_(config.estimator_guard.enabled),
+          mission_(config.mission),
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
@@ -444,6 +474,9 @@ public:
         // 估计器降级判据阈值构造期兜底（estimator_guard 节，2026-11-17 P3）：
         // 阈值错了就是漏报或误报，程序化构造的非法值一律 fail-fast。
         config.estimator_guard.Validate();
+        // 重置动作配置兜底（mission 节，2026-11-17 P4b）：超时/重试次数/最小间隔
+        // 非法时直接抛异常，不允许带病重启飞控。
+        config.mission.Validate();
         // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
         // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
         config.takeoff.Validate();
@@ -513,6 +546,15 @@ public:
             estimator_guard_.Thresholds().local_position_stale_ms,
             estimator_guard_.Thresholds().critical_sensor_mask,
             estimator_guard_.Thresholds().bad_estimator_flag_mask);
+        // 重置动作（2026-11-17 P4b）：把"重置会不会重启飞控"在启动日志里说清楚——
+        // 现场按重置按钮前必须先知道飞控要断 20~30 s。
+        SPDLOG_INFO(
+            "重置动作配置: {}（超时={}ms 246重发={}次 最小间隔={}ms）",
+            mission_.reset_reboot_px4
+                ? "清状态 + 重启 PX4（发 246 param1=1，S1 等飞控回来）"
+                : "回滚：只清状态不重启（reset_reboot_px4=false，直接回 S2）",
+            mission_.reboot_timeout.count(), mission_.reboot_retry,
+            mission_.reboot_min_interval.count());
     }
 
     ~Impl() {
@@ -693,6 +735,17 @@ public:
         estimator_mode_unavailable_logged_ = false;
         estimator_degraded_since_ms_ = 0;
         estimator_freeze_diag_ms_ = 0;
+        // PX4 重启等待（2026-11-17 P4b）：清零。调用方（ExecuteResetStateCommand）
+        // 在清理完成后才置 pending 并发 246，避免自己把自己清掉。
+        px4_reboot_pending_ = false;
+        px4_reboot_started_ms_ = 0;
+        px4_reboot_command_ms_ = 0;
+        px4_reboot_send_count_ = 0;
+        px4_reboot_ack_seen_ = false;
+        px4_reboot_offline_seen_ = false;
+        px4_reboot_timeout_logged_ = false;
+        px4_reboot_retry_exhausted_logged_ = false;
+        last_px4_reboot_ms_ = 0;
     }
 
     /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
@@ -716,6 +769,11 @@ public:
     }
 
     bool IsRunning() const { return running_.load(std::memory_order_acquire); }
+
+    /// PX4 重启等待是否进行中（线程安全读取；供外层转发与测试/SITL 断言）。
+    bool Px4RebootPending() const {
+        return px4_reboot_pending_.load(std::memory_order_acquire);
+    }
 
     /// 估计器降级是否已锁存（线程安全读取；供外层转发与测试/SITL 断言）。
     /// 只有"判据命中 + 已注入命令接口"才为 true：只读运行只告警不冻结，恒为 false。
@@ -966,6 +1024,29 @@ private:
     // 影子决策：SELF_CHECK 等待导航就绪，READY 等待新鲜目标，GPS_APPROACH 只做告警维护。
     // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
     void Evaluate(uint64_t now_ms) {
+        // PX4 重启等待（2026-11-17 P4b，设计 §6.3）：处置期间本机**不发任何控制
+        // 意图与命令**（246 重发除外），也不推进任何任务逻辑；只维护 65013 与
+        // 等待判据。放在最前面：飞控正在重启时，任何 setpoint 都可能被正在初始化的
+        // PX4 当成有效输入（COM_OF_LOSS/Offboard 兜底语义此时不可预测）。
+        if (px4_reboot_pending_) {
+            EvaluatePx4RebootWait(now_ms);
+            // 重启期间仍然逐条回 65021（否则地面站会以为丢包而狂重发）：此时
+            // 重置类指令走"已在 S1 → kCompleted"，返航类走"未起飞 → kNotAirborne"，
+            // 都不会发出任何命令。
+            EvaluateMissionCommand(now_ms);
+            uint32_t reboot_warnings = 0;
+            if (px4_reboot_timeout_logged_) {
+                reboot_warnings |= kWarningPx4RebootTimeout;
+            }
+            if (!HasNavigationForGps()) {
+                reboot_warnings |= kWarningNavigationUnavailable;
+            }
+            SetWarnings(reboot_warnings);
+            if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+                PublishStatus(now_ms);
+            }
+            return;
+        }
         // 估计器降级判据（2026-11-17 P3，设计 §5）：每拍先喂快照。命中即锁存、
         // 切 POSCTL、停发意图并冻结推进。放在最前面是有意的——拦截设备故障
         // （S16）时也要能观测到 EKF 故障，否则事后无法解释"为什么先切了模式"。
@@ -977,6 +1058,9 @@ private:
         // 故障或已处于 S16：只维护告警位与状态发布，本拍跳过一切任务控制
         // 逻辑（位置/伺服/返航/降落意图全部停发）。
         if (UpdateInterceptionDevice(now_ms)) {
+            // 故障态也要逐条回 65021：否则地面站的「重置」永远等不到回执，
+            // 只能猜"是不是链路断了"（P4b 起重置是唯一的恢复入口，不能失联）。
+            EvaluateMissionCommand(now_ms);
             SetWarnings(kWarningActuatorFault);
             if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
                 PublishStatus(now_ms);
@@ -989,6 +1073,12 @@ private:
         // 为什么不复用 S16：S16 是"执行器故障"终态，语义与处置都不同（S16 仍允许
         // 后续重置流程）；这里只冻结，状态保持原样，等飞手接管后人工处置。
         if (EstimatorFreezeActive()) {
+            // 冻结期间仍然逐条处理 65020：重置是**解除降级锁存的唯一入口**
+            // （`ResetSortieState()` 会清 `estimator_degraded_`），不处理等于让
+            // 现场只剩"重启机载程序"一条路——这正是 2026-11-17 P3 遗留的缺口。
+            // 准入判据（connected/未上锁/已落地）保证空中调不动它：悬停中 armed=true
+            // 会被 kNotOnGround 拒；落地 disarm 后才受理。
+            EvaluateMissionCommand(now_ms);
             // 冻结期间告警位也要维护（地面站据此显示导航不可用），但不新增
             // 协议位：估计器降级按设计 Q1 只落机载日志，暂不扩 65013。
             if (!HasNavigationForGps()) {
@@ -1081,6 +1171,8 @@ private:
         // 超过 fire_timeout 判故障）。
         MaybeExecuteInterception(now_ms);
         if (mission_faulted_) {
+            // 同上：故障态保留 65020 处理入口（重置/返航都回 kRejected/kMissionFault）。
+            EvaluateMissionCommand(now_ms);
             SetWarnings(kWarningActuatorFault);
             if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
                 PublishStatus(now_ms);
@@ -1271,6 +1363,134 @@ private:
                 "请飞手立即接管（STABILIZED）",
                 estimator_mode_attempts_);
         }
+    }
+
+    /// PX4 重启等待（2026-11-17 P4b，设计 §6.2/§6.3）。
+    ///
+    /// 受理 65020 `type=2` 后状态机停在 S1 SELF_CHECK，只做三件事：
+    ///   ① 246 重发：未收到 ACK 且未用满 `mission.reboot_retry` 次时，每 1 s 一次；
+    ///   ② 等飞控回来：**必须先看到一次断连**（真重启一定会掉链路，这一条同时挡住
+    ///      "PX4 只 ACK 但没重启"时把旧心跳当成已恢复），再出现
+    ///      `connected && HasNavigationForGps()`（心跳 + 3D fix + 全局位置 + Home）；
+    ///   ③ 超时 `mission.reboot_timeout` → ERROR 一次 + 65013 bit10，保持 S1。
+    ///
+    /// 不自动重启机载程序、不无限重发：重启治标不治本，飞控没回来就是链路/飞控
+    /// 问题，交人工。
+    void EvaluatePx4RebootWait(uint64_t now_ms) {
+        const bool connected =
+            latest_flight_.has_value() && latest_flight_->connected;
+        if (!connected) {
+            px4_reboot_offline_seen_ = true;
+        }
+        // ① ACK 观察：只认本次重启之后的 ACK（避免用上一轮落地的旧 ACK）。
+        if (!px4_reboot_ack_seen_ && command_sender_ != nullptr) {
+            const common::CommandAckStatus ack = command_sender_->AckStatus();
+            if (ack.last_command == kMavCmdPreflightRebootShutdown &&
+                ack.last_time_ms >= px4_reboot_started_ms_) {
+                if (ack.last_result == kMavResultAccepted) {
+                    px4_reboot_ack_seen_ = true;
+                    SPDLOG_INFO(
+                        "PX4 重启命令已确认（246 ACK accepted），等待飞控重新上线");
+                } else if (ack.last_result == kMavResultDenied ||
+                           ack.last_result == kMavResultUnsupported ||
+                           ack.last_result == kMavResultFailed) {
+                    // 明确拒绝/不支持/失败：**不重发**（再发也是同样的答复），也不在
+                    // S1 干等到超时——我们的状态已经清干净，回 S2 与 2026-11-04 的
+                    // 旧语义等价。SITL 的 PX4 恒走这条（未编入板级 reset 能力）。
+                    px4_reboot_pending_.store(false, std::memory_order_release);
+                    last_px4_reboot_ms_ = 0;  // 没真的重启，不占用最小间隔
+                    SPDLOG_WARN(
+                        "PX4 拒绝重启（246 ACK result={}，2=DENIED 3=UNSUPPORTED "
+                        "4=FAILED）：已清空任务状态，但飞控未重启，回 S2 READY。"
+                        "原因多为固件未编入板级 reset 能力（**SITL 即如此**）或"
+                        "解锁竞态；需要真重启请人工断电/重启飞控",
+                        ack.last_result);
+                    TransitionTo(common::MissionState::kReady,
+                                 "PX4 未执行重启（降级为只清状态）");
+                    return;
+                }
+                // 其余结果（如 1=TEMPORARILY_REJECTED）按"未确认"继续重试。
+            }
+        }
+        // ② 246 重发（未 ACK 且未用满次数）。
+        const uint64_t retry_limit =
+            static_cast<uint64_t>(mission_.reboot_retry);
+        if (!px4_reboot_ack_seen_ && px4_reboot_send_count_ < retry_limit &&
+            now_ms - px4_reboot_command_ms_ >= kRebootRetryIntervalMs) {
+            SendPx4RebootCommand(now_ms);
+        }
+        if (!px4_reboot_ack_seen_ && !px4_reboot_retry_exhausted_logged_ &&
+            px4_reboot_send_count_ >= retry_limit &&
+            now_ms - px4_reboot_command_ms_ >= kRebootRetryIntervalMs) {
+            px4_reboot_retry_exhausted_logged_ = true;
+            SPDLOG_WARN(
+                "PX4 重启命令未收到 ACK（已发 {} 次，reboot_retry={}）：不再重发，"
+                "继续等心跳",
+                px4_reboot_send_count_, mission_.reboot_retry);
+        }
+        // ③ 完成判据：断连 + 恢复。
+        if (connected && px4_reboot_offline_seen_ && HasNavigationForGps()) {
+            px4_reboot_pending_ = false;
+            SPDLOG_INFO(
+                "PX4 重启完成: 断连已确认、心跳/3D fix/全局位置/Home 全部恢复，"
+                "耗时 {:.1f}s（246 发送 {} 次 ACK={}），本拍起回到常规 S1→S2 判据",
+                (now_ms - px4_reboot_started_ms_) / 1000.0,
+                px4_reboot_send_count_,
+                px4_reboot_ack_seen_ ? "已确认" : "未确认");
+            return;
+        }
+        // ④ 超时：保持 S1，只报一次。
+        if (!px4_reboot_timeout_logged_ &&
+            now_ms - px4_reboot_started_ms_ >=
+                static_cast<uint64_t>(mission_.reboot_timeout.count())) {
+            px4_reboot_timeout_logged_ = true;
+            SPDLOG_ERROR(
+                "PX4 重启超时: {}ms 内未恢复遥测（connected={} 断连已见={} "
+                "246 发送 {} 次 ACK={}），保持 S1 并置 65013 bit10。"
+                "重启不修复硬件（罗盘/振动会复发），请人工检查飞控与链路",
+                mission_.reboot_timeout.count(), connected ? 1 : 0,
+                px4_reboot_offline_seen_ ? 1 : 0, px4_reboot_send_count_,
+                px4_reboot_ack_seen_ ? "已确认" : "未确认");
+        }
+    }
+
+    /// 发一次 246（`param1=1` 重启飞控，其余参数 0）。
+    /// 每次调用都计入 `px4_reboot_send_count_`，入队失败也计数——上限是"尝试次数"，
+    /// 不是"成功次数"，避免链路一直失败时无限重发。
+    bool SendPx4RebootCommand(uint64_t now_ms) {
+        if (command_sender_ == nullptr) {
+            return false;
+        }
+        ++px4_reboot_send_count_;
+        px4_reboot_command_ms_ = now_ms;
+        const bool queued = command_sender_->SendCommand(
+            kMavCmdPreflightRebootShutdown, kRebootShutdownActionReboot, 0.f, 0.f,
+            0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            SPDLOG_INFO("PX4 重启命令已入队（246 param1=1，第 {} 次）",
+                        px4_reboot_send_count_);
+        } else {
+            const uint64_t count = ++px4_reboot_fail_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN("PX4 重启命令入队失败（第 {} 次，按 1s 重试）累计={}",
+                            px4_reboot_send_count_, count);
+            }
+        }
+        return queued;
+    }
+
+    /// 相对高度（相对起飞点/Home 基准，向上为正）。不可用时返回 nullopt——
+    /// 调用方**不得**用 0 代替（"不知道高度"≠"在地面"）。
+    std::optional<double> RelativeAltitudeAgl(
+        const common::FlightStateSnapshot& flight) const {
+        if (!flight.local_position_valid) {
+            return std::nullopt;
+        }
+        const auto base_z = common::RelativeAltitudeBaseZ(flight);
+        if (!base_z.has_value() || !std::isfinite(static_cast<double>(flight.local_z_m))) {
+            return std::nullopt;
+        }
+        return *base_z - static_cast<double>(flight.local_z_m);
     }
 
     /// PX4 低电参数是否可用于自动起飞门禁（设计 §9.2）：
@@ -2253,11 +2473,11 @@ private:
     /// 中止锁存与 65015 结果仍在，地面站只能重启机载程序才能再接任务。该指令
     /// 清空 per-sortie 状态并回 S2 READY，清理清单与 Start 的启动复位完全一致
     /// （共用 ResetSortieState），因此不会出现"重启能恢复、重置却漏清某项"。
-    /// 守卫：**已落地且上锁**才受理（armed 时清状态会让控制意图与 tracker 断裂）；
-    /// S16 故障态与 S15 人工接管不通过本指令恢复，仍需人工处置。
-    /// 幂等：已在 S2 回 kCompleted；已在返航/降落/空中回 kRejected(kNotOnGround)。
+    /// **2026-11-17 P4b 起准入改成"飞控事实"**（遥测在线 + 未上锁 + 已落地 + 非故障），
+    /// 不再要求 `state == S14`；受理后默认还会重启 PX4（见下方实现与设计 §6）。
     void ExecuteResetStateCommand(const common::MissionCommand& command) {
         const common::MissionState state = CurrentState();
+        const uint64_t now_ms = MonotonicMs();
         if (mission_faulted_) {
             SPDLOG_WARN("任务指令（重置状态）: 任务故障态拒绝，需人工处置 state={}",
                         static_cast<int>(state));
@@ -2265,39 +2485,102 @@ private:
                                      common::MissionCommandReason::kMissionFault);
             return;
         }
-        // 已就绪：幂等完成。这里不重复 ResetSortieState，避免把刚记下的 65015
-        // 结果与 tracker 终态记忆再清一次。
-        if (state == common::MissionState::kReady) {
-            SPDLOG_INFO("任务指令（重置状态）: 已在 READY，回执完成");
+        // 已在就绪/自检：幂等完成。不重复 ResetSortieState（避免把刚记下的 65015
+        // 结果与 tracker 终态记忆再清一次），更不重启飞控。
+        if (state == common::MissionState::kReady ||
+            state == common::MissionState::kSelfCheck ||
+            state == common::MissionState::kBoot) {
+            SPDLOG_INFO("任务指令（重置状态）: 已在 S1/S2，回执完成 state={}",
+                        static_cast<int>(state));
             PublishMissionCommandAck(command, common::MissionCommandResult::kCompleted,
                                      common::MissionCommandReason::kNone);
             return;
         }
-        if (state != common::MissionState::kDisarmed) {
-            SPDLOG_WARN("任务指令（重置状态）: 当前状态不可重置 state={}",
+        // ① 遥测在线：没有快照就无法判"能不能安全重启飞控"（重启期间也不该发命令）。
+        if (!latest_flight_.has_value() || !latest_flight_->connected) {
+            SPDLOG_WARN("任务指令（重置状态）: 飞控遥测不可用，拒绝 state={}",
+                        static_cast<int>(state));
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kTelemetryStale);
+            return;
+        }
+        const common::FlightStateSnapshot& flight = *latest_flight_;
+        // ② 未上锁：解锁态重启飞控等于空中断控制。
+        if (flight.armed) {
+            SPDLOG_WARN("任务指令（重置状态）: 飞控仍上锁(armed)，拒绝 state={}",
                         static_cast<int>(state));
             PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
                                      common::MissionCommandReason::kNotOnGround);
             return;
         }
-        const bool armed = latest_flight_.has_value() && latest_flight_->armed;
-        // 兜底：状态机已在 S14 但 tracker 仍认为在空中（状态机/PX4 不同步）时
-        // 不重置，避免地面站据此误判"可再次分配"。
-        const bool airborne_task =
-            assignment_tracker_.ConsumedAirborneMission() &&
-            assignment_tracker_.Phase() != AssignmentPhase::kTerminal;
-        if (armed || airborne_task) {
-            SPDLOG_WARN("任务指令（重置状态）: 未落地/未上锁拒绝 armed={} phase={}",
-                        armed, static_cast<int>(assignment_tracker_.Phase()));
+        // ③ 已落地：优先用 PX4 的 landed 判据；证据缺失时退化为"相对高度 ≤0.5m"，
+        //    两者都不可用即拒绝（"不知道高度"不等于"在地面"）。
+        bool on_ground = false;
+        if (flight.landed_state_valid) {
+            on_ground = flight.landed;
+        } else if (const auto agl = RelativeAltitudeAgl(flight);
+                   agl.has_value()) {
+            on_ground = *agl <= kResetGroundAltM;
+        }
+        if (!on_ground) {
+            SPDLOG_WARN(
+                "任务指令（重置状态）: 未确认落地，拒绝 state={} landed_valid={} "
+                "landed={}",
+                static_cast<int>(state), flight.landed_state_valid ? 1 : 0,
+                flight.landed ? 1 : 0);
             PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
                                      common::MissionCommandReason::kNotOnGround);
             return;
         }
+        // ④ tracker 仍认为在空中（状态机/PX4 不同步）：**只告警不拒绝**（设计 §6.1）。
+        //    ResetSortieState() 本来就会清 tracker，拒绝反而把人卡死。
+        if (assignment_tracker_.ConsumedAirborneMission() &&
+            assignment_tracker_.Phase() != AssignmentPhase::kTerminal) {
+            SPDLOG_WARN(
+                "任务指令（重置状态）: tracker 仍在空中任务相（phase={}），"
+                "照常执行重置（ResetSortieState 会一并清空）",
+                static_cast<int>(assignment_tracker_.Phase()));
+        }
+        // ⑤ 重启最小间隔：刚重启过的飞控不许被再打一遍（设计 §6.3）。
+        if (mission_.reset_reboot_px4 && last_px4_reboot_ms_ != 0 &&
+            now_ms - last_px4_reboot_ms_ <
+                static_cast<uint64_t>(mission_.reboot_min_interval.count())) {
+            SPDLOG_WARN(
+                "任务指令（重置状态）: 距上次重启仅 {}ms（最小间隔 {}ms），拒绝",
+                now_ms - last_px4_reboot_ms_,
+                mission_.reboot_min_interval.count());
+            PublishMissionCommandAck(command, common::MissionCommandResult::kRejected,
+                                     common::MissionCommandReason::kDuplicateCommand);
+            return;
+        }
+        // ⑥ 执行：清状态 +（默认）重启飞控。
         RecordExecutedMissionCommandId(command.command_id);
         ResetSortieState();
-        SPDLOG_WARN("任务指令（重置状态）: 已清空本次任务状态 DISARMED → READY command_id={}",
-                    command.command_id);
-        TransitionTo(common::MissionState::kReady, "地面站重置任务状态");
+        const bool reboot = mission_.reset_reboot_px4 && command_sender_ != nullptr;
+        if (reboot) {
+            px4_reboot_pending_.store(true, std::memory_order_release);
+            px4_reboot_started_ms_ = now_ms;
+            last_px4_reboot_ms_ = now_ms;
+            TransitionTo(common::MissionState::kSelfCheck,
+                         "地面站重置任务状态，重启 PX4");
+            SendPx4RebootCommand(now_ms);
+            SPDLOG_WARN(
+                "任务指令（重置状态）: 已清空任务状态并请求重启 PX4（S1 等飞控回来，"
+                "期间不发任何 setpoint/命令）command_id={} 超时={}ms",
+                command.command_id, mission_.reboot_timeout.count());
+        } else {
+            last_px4_reboot_ms_ = now_ms;
+            TransitionTo(common::MissionState::kReady,
+                         !mission_.reset_reboot_px4
+                             ? "地面站重置任务状态（回滚：不重启 PX4）"
+                             : "地面站重置任务状态（命令接口未注入：只清状态）");
+            SPDLOG_WARN(
+                "任务指令（重置状态）: 已清空本次任务状态 {} → S2 READY "
+                "command_id={}（原因：{}）",
+                MissionStateName(state), command.command_id,
+                !mission_.reset_reboot_px4 ? "mission.reset_reboot_px4=false 回滚"
+                                           : "命令接口未注入");
+        }
         PublishMissionCommandAck(command, common::MissionCommandResult::kAccepted,
                                  common::MissionCommandReason::kNone);
     }
@@ -6022,6 +6305,23 @@ private:
     bool estimator_mode_unavailable_logged_ = false;
     /// 冻结存活摘要节流（10s 一条）。
     uint64_t estimator_freeze_diag_ms_ = 0;
+    /// 重置动作配置（mission 节，2026-11-17 P4b；构造注入）。
+    const config::MissionConfig mission_;
+    /// PX4 重启等待锁存（原子：决策线程写，测试/SITL 线程读）。置位期间 `Evaluate()`
+    /// 早返回——不发任何控制意图与命令（246 重发除外），只维护 65013。
+    std::atomic<bool> px4_reboot_pending_{false};
+    uint64_t px4_reboot_started_ms_ = 0;   ///< 受理时刻（超时与耗时基准）
+    uint64_t px4_reboot_command_ms_ = 0;   ///< 最近一次 246 入队时刻（重发基准）
+    uint64_t px4_reboot_send_count_ = 0;   ///< 246 已尝试次数（含首次）
+    bool px4_reboot_ack_seen_ = false;     ///< 收到过 246 的 ACK(result=0)
+    /// 是否观察到过断连。**完成判据的必要条件**：真重启一定会掉链路，
+    /// 这一条同时挡住"PX4 只 ACK 但没重启时把旧心跳当成已恢复"。
+    bool px4_reboot_offline_seen_ = false;
+    bool px4_reboot_timeout_logged_ = false;         ///< 超时 ERROR 只打一次
+    bool px4_reboot_retry_exhausted_logged_ = false;  ///< 重试用尽 WARN 只打一次
+    uint64_t px4_reboot_fail_count_ = 0;   ///< 246 入队失败累计（节流告警）
+    /// 上次重启时刻（`mission.reboot_min_interval` 的最小间隔判据）。
+    uint64_t last_px4_reboot_ms_ = 0;
     /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
     /// S3 时序/S4 爬升在 Task 5 使用）。
     const config::TakeoffConfig takeoff_;
@@ -6229,6 +6529,9 @@ uint64_t MissionStateMachine::TransitionCount() const {
 uint64_t MissionStateMachine::ErrorCount() const { return impl_->ErrorCount(); }
 bool MissionStateMachine::EstimatorDegraded() const {
     return impl_->EstimatorDegraded();
+}
+bool MissionStateMachine::Px4RebootPending() const {
+    return impl_->Px4RebootPending();
 }
 void MissionStateMachine::ForceStateForTest(common::MissionState state) {
     impl_->ForceStateForTest(state);

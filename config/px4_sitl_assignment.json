@@ -236,6 +236,13 @@
         "critical_sensor_mask": 0,
         "bad_estimator_flag_mask": 0
     },
+    "mission": {
+        "_comment": "任务级重置动作（2026-11-17 P4b）SITL 侧显式列出与 config/config.json 同源的默认值。65020 type=2 = 清任务状态 + 重启 PX4（MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246) param1=1），状态机切 S1 SELF_CHECK 等飞控回来；重启期间不发任何 setpoint/命令（246 重试除外）。reset_reboot_px4=false 是唯一回滚开关（旧语义：只清状态直接回 S2）。**重启治标不治本**：罗盘/振动/EKF 参数问题重启后会再次出现，不修复硬件。",
+        "reset_reboot_px4": true,
+        "reboot_timeout_ms": 90000,
+        "reboot_retry": 3,
+        "reboot_min_interval_ms": 30000
+    },
     "takeoff": {
         "height_m": 2.0,
         "climb_rate_mps": 0.5,

@@ -155,6 +155,10 @@ void DroneApplication::BuildComponents() {
         // 生效，而这个注入点本身就在下面的控制运行装配分支里——所以只读运行
         // 天然只告警不动作，功能内部不需要再判断 enable_control。
         state_machine_config.estimator_guard = config_.estimator_guard;
+        // 重置动作（mission 节，2026-11-17 P4b）整节同源注入：65020 type=2 受理后
+        // "清状态 + 重启 PX4" 的超时/重试/最小间隔都来自 JSON。`reset_reboot_px4=false`
+        // 是回滚开关（旧语义：只清状态直接回 S2）。
+        state_machine_config.mission = config_.mission;
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;
