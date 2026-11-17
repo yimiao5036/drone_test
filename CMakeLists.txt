@@ -147,6 +147,7 @@ target_link_libraries(drone_communication PRIVATE spdlog::spdlog)
 
 # ---- state_machine 模块（任务状态机接口） ----
 add_library(drone_state_machine STATIC
+    src/state_machine/estimator_guard.cpp
     src/state_machine/gcs_net_fire.cpp
     src/state_machine/interception_device.cpp
     src/state_machine/mission_assignment.cpp
@@ -496,6 +497,23 @@ if(BUILD_TESTING)
 
         include(GoogleTest)
         gtest_discover_tests(mission_state_machine_test)
+
+        # 估计器健康判据（P1）：跳变/交叉校验/传感器健康位/锁存与未上锁不判
+        add_executable(estimator_guard_test
+            tests/state_machine/estimator_guard_test.cpp)
+        target_link_libraries(estimator_guard_test PRIVATE
+            drone_common
+            drone_state_machine
+            spdlog::spdlog
+            GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(estimator_guard_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(estimator_guard_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(estimator_guard_test)
 
         # 通用拦截设备内部时序测试：触发 ACK 保持、复位 ACK/稳定、故障与重试
         add_executable(interception_device_test

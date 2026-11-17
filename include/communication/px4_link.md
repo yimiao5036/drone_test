@@ -251,6 +251,35 @@ bits 24..31 → flight_sub_mode（sub mode）
   `z`、再 `takeoff_ref`、都无则 `nullopt`（调用方按"只判水平/不下发相对高度"处理）。
   链路失效一并清空。
 
+- **估计器与传感器健康遥测**（2026-11-17 新增，对应
+  `docs/降落与估计器保护设计-2026-11-17.md` §3）：2026-11-17 10:24 现场 EKF 全状态
+  重置（`delta_z≈9m`）+ `fs_bad_acc_vertical` 导致 AUTO.LAND 中翻滚，而机载当时
+  对这些量零可见性。新增订阅四类消息（`config/config.json` 的
+  `message_interval_requests` 同时登记）：
+
+  | 消息 | ID | 频率 | 快照字段 | 用途 |
+  |---|---|---|---|---|
+  | `ALTITUDE` | 141 | 5 Hz | `baro_altitude_valid`/`baro_amsl_m`/`baro_local_up_m`/`baro_relative_m`/`baro_bottom_clearance_m` | 气压高度独立源，与 EKF `local_z` 不同源，做交叉校验 |
+  | `ESTIMATOR_STATUS` | 230 | 1 Hz | `estimator_status_valid`/`estimator_flags`/`estimator_*_ratio`/`estimator_*_accuracy` | 估计器健康（原始值透出，极性判断在 `EstimatorGuard`） |
+  | `VIBRATION` | 241 | 1 Hz | `vibration_*`、`vibration_clipping_*` | 本次根因（Z 轴振动与削波）在线观测 |
+  | `STATUSTEXT` | 253 | 事件式 | `statustext_valid`/`statustext_severity`/`statustext_text`/`statustext_time_ms` | PX4 拒绝原因（`Arming denied: ...`）与 EKF 告警文本 |
+
+  另扩展 `SYS_STATUS`：新增 `sensors_status_valid`/`sensors_present`/`sensors_health`/
+  `sensors_enabled` 三个位图（`MAV_SYS_STATUS_SENSOR_*`），此前只取了电压/电流/电量。
+  `DISTANCE_SENSOR`（132）的**解析已就位**（`distance_*`，`current_distance` 为
+  `UINT16_MAX`/0 时置 `distance_valid=false`），但本期不订阅、不参与判据，留待
+  P5 装雷达后启用。
+
+  **气压基准**：`baro_takeoff_ref_valid`/`baro_takeoff_ref_amsl_m` 与起飞高度基准
+  同一时刻抓取（`CaptureTakeoffReference()`），二者相减即"气压 AGL"
+  （`common::BaroAboveTakeoffM()`）。若解锁瞬间 `ALTITUDE` 还没到（5 Hz，最多晚
+  200 ms），置 `baro_ref_pending_`，由 `HandleAltitude()` 在**PX4 相对高度仍 ≤5 m**
+  时补抓——上限 5 m 是硬约束：空中补抓会把当时高度当成 0，气压 AGL 与 EKF 恒一致，
+  等于悄无声息地关掉这条交叉校验。`baro_amsl_m` 只受气压计/QNH 影响，不会被
+  EKF 坐标重置整体平移——这正是识别"EKF 被重置而气压平滑"的依据。
+  `statustext_text` 落盘前按严重级节流：同文本 10 s 内只打一条，`INFO/NOTICE`
+  只计数不落盘，被抑制条数在下一条里带出。链路失效时上述 valid 全部清零。
+
 各类周期遥测使用 `telemetry_timeout` 判断新鲜度。超时后保留最后数值供排查，但将对应 valid
 标志清零，控制模块只能使用 valid=true 的字段。Home 在心跳连接期间保持有效，但连接断开时
 立即失效；固件版本属于诊断信息，可保留到链路重新 Start 时统一重置。
@@ -351,8 +380,11 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
   显式启用 EKF 锚点流——变化触发式，启用后锚点变化即上报；**消息号 49，勿写 411**）；
 - `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
   `EXTENDED_SYS_STATE` 的配置频率（当前生产配置：姿态/局部位置 25Hz、GPS 10Hz、
-  全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；
-  115200 波特率下链路占用约 45%）。
+  全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；另含估计器健康三路订阅
+  `ALTITUDE(141)` 5Hz、`ESTIMATOR_STATUS(230)` 1Hz、`VIBRATION(241)` 1Hz）。
+  **2026-11-17 起串口波特率为 921600**（原 115200）：115200 下这套订阅 + 65010 目标流
+  已占约 45%，现场出现设定值迟到导致 `ARM` 被 `TEMPORARILY_REJECTED` 拒绝；
+  921600 下余量约 8×。
 
 这些内部命令只改变本 MAVLink 链路的消息输出，不执行解锁、模式切换或飞行控制。
 

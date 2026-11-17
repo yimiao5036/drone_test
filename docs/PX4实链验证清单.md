@@ -23,7 +23,7 @@
 | 1 | 接线：香橙派 UART6 ↔ PX4 TELEM，**`uart6-m1`**（与排针一致） | 见 `docs/部署与打包.md` §9.2 | |
 | 2 | 权限：当前用户在 `dialout` 组 | `groups \| grep dialout` | |
 | 3 | 串口未被系统控制台占用 | `sudo lsof /dev/ttyS1`；`systemctl status serial-getty@ttyS1` | |
-| 4 | 配置：`px4.serial.device=/dev/ttyS1`、115200、`firmware_version` 与实际一致 | `config/config.json` | |
+| 4 | 配置：`px4.serial.device=/dev/ttyS1`、**921600**（2026-11-17 起，原 115200；PX4 侧对应串口须同步）、`firmware_version` 与实际一致 | `config/config.json` | |
 | 5 | 硬件安全：**拆螺旋桨**、TTL 电平兼容、共地 | 见 `tools/px4_link_smoke.md` §4.3 | |
 | 6 | PX4 上电（USB 或电池），GPS 天线接好 | PX4 指示灯正常 | |
 
@@ -54,8 +54,8 @@ echo "退出码=$?"
 
 | # | 项 | 期望日志/现象 | 室内可达 |
 |---|---|---|---|
-| 1 | 串口打开 | `串口打开成功: device=/dev/ttyS1 baud=115200` | ✅ |
-| 2 | 链路启动 | `PX4 通信启动: transport=serial:/dev/ttyS1@115200` | ✅ |
+| 1 | 串口打开 | `串口打开成功: device=/dev/ttyS1 baud=921600` | ✅ |
+| 2 | 链路启动 | `PX4 通信启动: transport=serial:/dev/ttyS1@921600` | ✅ |
 | 3 | 心跳 | `PX4 心跳已连接: source=1/1 mode=… armed=…` | ✅ |
 | 4 | 固件版本 | `PX4 固件版本上报: reported=1.17.0`（与配置一致） | ✅ |
 | 5 | 遥测快照 | 地面站下行有真实姿态/电池；`FlightStateSnapshot` 计数增长 | ✅（GPS 项除外） |

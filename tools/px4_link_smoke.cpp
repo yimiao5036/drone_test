@@ -8228,6 +8228,24 @@ int main(int argc, char** argv) {
         std::cout << "[INFO] GPS_GLOBAL_ORIGIN（EKF锚点） 收到 "
                   << link.MessageReceiveCount(MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN) << " 条"
                   << std::endl;
+        // 估计器/传感器观测（P1，2026-11-17）：EstimatorGuard 的数据源，
+        // 收不到就等于"看不见 EKF"，2026-11-17 事故正是这样漏掉的。
+        const uint64_t altitude_count =
+            link.MessageReceiveCount(MAVLINK_MSG_ID_ALTITUDE);
+        PrintMessageCheck("ALTITUDE(141 气压高度)", altitude_count,
+                          altitude_count > 0);
+        const uint64_t estimator_status_count =
+            link.MessageReceiveCount(MAVLINK_MSG_ID_ESTIMATOR_STATUS);
+        PrintMessageCheck("ESTIMATOR_STATUS(230 估计器状态)", estimator_status_count,
+                          estimator_status_count > 0);
+        const uint64_t vibration_count =
+            link.MessageReceiveCount(MAVLINK_MSG_ID_VIBRATION);
+        PrintMessageCheck("VIBRATION(241 振动)", vibration_count,
+                          vibration_count > 0);
+        // STATUSTEXT 是事件式（PX4 只在有话说时发），0 条不算失败。
+        std::cout << "[INFO] STATUSTEXT(253 文本告警) 收到 "
+                  << link.MessageReceiveCount(MAVLINK_MSG_ID_STATUSTEXT) << " 条"
+                  << std::endl;
         PrintMessageCheck("RC_CHANNELS",
                           link.MessageReceiveCount(MAVLINK_MSG_ID_RC_CHANNELS),
                           observed.rc);

@@ -819,6 +819,22 @@ private:
             case MAVLINK_MSG_ID_PARAM_VALUE:
                 HandleParamValue(message, now_ms);
                 break;
+            // ---- 估计器与传感器健康（2026-11-17，降落与估计器保护 P1）----
+            case MAVLINK_MSG_ID_ALTITUDE:
+                HandleAltitude(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_ESTIMATOR_STATUS:
+                HandleEstimatorStatus(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_VIBRATION:
+                HandleVibration(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_STATUSTEXT:
+                HandleStatustext(message, now_ms);
+                break;
+            case MAVLINK_MSG_ID_DISTANCE_SENSOR:
+                HandleDistanceSensor(message, now_ms);
+                break;
             default:
                 break;
         }
@@ -844,6 +860,11 @@ private:
         if (state_.armed && !was_armed) {
             state_.takeoff_ref_valid = false;
             takeoff_ref_pending_ = true;
+            // 气压基准可能比解锁晚到（ALTITUDE 5Hz）：允许在解锁后一小段时间内补抓，
+            // 由 HandleAltitude 用"仍在地面附近"约束——绝不空中补抓，否则基准本身
+            // 就是当时高度，气压 AGL 恒为 0，交叉校验会变成假阴性。
+            state_.baro_takeoff_ref_valid = false;
+            baro_ref_pending_ = true;
             CaptureTakeoffReference();
         }
         state_.base_mode = heartbeat.base_mode;
@@ -906,6 +927,10 @@ private:
         state_.vz_mps = position.vz;
         state_.local_position_valid = true;
         last_local_position_time_ms_ = now_ms;
+        // 单独记录到达时刻：EstimatorGuard 的跳变判据要按"帧间隔"折算允许位移，
+        // 只靠 PublishState 的发布时刻会把 25Hz 的同一帧比较两次。
+        state_.local_position_time_valid = true;
+        state_.local_position_time_ms = now_ms;
         // 解锁时若尚无局部位置，这里补抓（基准只能取解锁后第一帧，不能延后）。
         CaptureTakeoffReference();
     }
@@ -921,6 +946,14 @@ private:
         takeoff_ref_pending_ = false;
         SPDLOG_INFO("起飞高度基准已锁定: local_z={:.2f}m（相对高度=EKF 差分）",
                     static_cast<double>(state_.takeoff_ref_local_z_m));
+        // 同一时刻锁气压基准：ALTITUDE.altitude_amsl 只受气压计影响，与 EKF local_z
+        // 不同源，两者相减即"气压 AGL"，用于交叉校验 EKF 是否被重置（2026-11-17 事故）。
+        if (state_.baro_altitude_valid) {
+            state_.baro_takeoff_ref_amsl_m = state_.baro_amsl_m;
+            state_.baro_takeoff_ref_valid = true;
+            SPDLOG_INFO("起飞气压基准已锁定: amsl={:.2f}m（用于 EKF 高度交叉校验）",
+                        static_cast<double>(state_.baro_takeoff_ref_amsl_m));
+        }
     }
 
     // EKF 投影参考锚点（GPS_GLOBAL_ORIGIN，内容为 LOCAL_POSITION_NED.ref_*）。
@@ -995,6 +1028,131 @@ private:
             state_.battery_remaining_pct =
                 static_cast<float>(status.battery_remaining);
         }
+        // 板载传感器健康位：GYRO/ACCEL/MAG/AHRS 任一不健康都是估计器不可信的
+        // 直接证据（2026-11-17 罗盘 #1 失效就属这条，当时我们只看电池）。
+        state_.sensors_status_valid = true;
+        state_.sensors_present = status.onboard_control_sensors_present;
+        state_.sensors_health = status.onboard_control_sensors_health;
+        state_.sensors_enabled = status.onboard_control_sensors_enabled;
+    }
+
+    // 气压高度（ALTITUDE，141）：与 EKF local_z 不同源，用于交叉校验。
+    // altitude_amsl 只受气压计/QNH 影响，不会被 EKF 坐标重置平移。
+    void HandleAltitude(const mavlink_message_t& message, uint64_t now_ms) {
+        (void)now_ms;
+        mavlink_altitude_t altitude{};
+        mavlink_msg_altitude_decode(&message, &altitude);
+        if (!std::isfinite(altitude.altitude_amsl)) {
+            return;
+        }
+        state_.baro_altitude_valid = true;
+        state_.baro_amsl_m = altitude.altitude_amsl;
+        state_.baro_local_up_m = altitude.altitude_local;
+        state_.baro_relative_m = altitude.altitude_relative;
+        // bottom_clearance 由 EKF 的地形估计给出：P5 装雷达后才可靠，负值表示无测量。
+        state_.baro_bottom_clearance_m = altitude.bottom_clearance;
+        // 补抓气压起飞基准：只在解锁后、且 PX4 报的相对高度仍在 5m 以内时进行。
+        // 上限 5m 是硬约束——空中补抓会把"当时高度"当成 0，让气压 AGL 与 EKF
+        // 永远一致，等于悄悄关掉这条交叉校验。
+        if (baro_ref_pending_ && std::fabs(altitude.altitude_relative) <= 5.f) {
+            state_.baro_takeoff_ref_amsl_m = altitude.altitude_amsl;
+            state_.baro_takeoff_ref_valid = true;
+            baro_ref_pending_ = false;
+            SPDLOG_INFO("起飞气压基准已补抓: amsl={:.2f}m relative={:.2f}m",
+                        static_cast<double>(state_.baro_takeoff_ref_amsl_m),
+                        static_cast<double>(altitude.altitude_relative));
+        }
+    }
+
+    // 估计器状态（ESTIMATOR_STATUS，230）：原始值全部透出，极性判断留给
+    // EstimatorGuard（不同 MAVLink 方言的 flags 位语义不同，见 estimator_guard.h）。
+    void HandleEstimatorStatus(const mavlink_message_t& message,
+                               uint64_t now_ms) {
+        mavlink_estimator_status_t status{};
+        mavlink_msg_estimator_status_decode(&message, &status);
+        state_.estimator_status_valid = true;
+        state_.estimator_flags = status.flags;
+        state_.estimator_vel_ratio = status.vel_ratio;
+        state_.estimator_pos_horiz_ratio = status.pos_horiz_ratio;
+        state_.estimator_pos_vert_ratio = status.pos_vert_ratio;
+        state_.estimator_mag_ratio = status.mag_ratio;
+        state_.estimator_hagl_ratio = status.hagl_ratio;
+        state_.estimator_pos_horiz_accuracy_m = status.pos_horiz_accuracy;
+        state_.estimator_pos_vert_accuracy_m = status.pos_vert_accuracy;
+        state_.estimator_status_time_ms = now_ms;
+    }
+
+    // 振动（VIBRATION，241）：本次事故的根因之一是 Z 轴振动与削波，仅透出不告警。
+    void HandleVibration(const mavlink_message_t& message, uint64_t now_ms) {
+        (void)now_ms;
+        mavlink_vibration_t vibration{};
+        mavlink_msg_vibration_decode(&message, &vibration);
+        state_.vibration_valid = true;
+        state_.vibration_x = vibration.vibration_x;
+        state_.vibration_y = vibration.vibration_y;
+        state_.vibration_z = vibration.vibration_z;
+        state_.vibration_clipping_0 = vibration.clipping_0;
+        state_.vibration_clipping_1 = vibration.clipping_1;
+        state_.vibration_clipping_2 = vibration.clipping_2;
+    }
+
+    // PX4 文本告警（STATUSTEXT，253）：`Arming denied: ...`、EKF 故障等只走这条。
+    // 落盘节流：同一文本 10s 内只打一条；INFO 及以下只计数丢弃。
+    void HandleStatustext(const mavlink_message_t& message, uint64_t now_ms) {
+        mavlink_statustext_t status{};
+        mavlink_msg_statustext_decode(&message, &status);
+        char text[MAVLINK_MSG_STATUSTEXT_FIELD_TEXT_LEN + 1] = {};
+        mavlink_msg_statustext_get_text(&message, text);
+        if (text[0] == '\0') {
+            return;
+        }
+        state_.statustext_valid = true;
+        state_.statustext_severity = status.severity;
+        state_.statustext_text.assign(text, strnlen(text, sizeof(text)));
+        state_.statustext_time_ms = now_ms;
+
+        // INFO/NOTICE 不落盘（PX4 会周期刷 "EKF2 IMU0 is using GPS" 之类）。
+        if (status.severity > MAV_SEVERITY_WARNING) {
+            return;
+        }
+        constexpr uint64_t kSameTextIntervalMs = 10000;
+        if (state_.statustext_text == last_statustext_log_text_ &&
+            now_ms - last_statustext_log_ms_ < kSameTextIntervalMs) {
+            ++statustext_suppressed_;
+            return;
+        }
+        last_statustext_log_text_ = state_.statustext_text;
+        last_statustext_log_ms_ = now_ms;
+        const uint32_t suppressed = statustext_suppressed_;
+        statustext_suppressed_ = 0;
+        const std::string suffix = suppressed != 0
+                                       ? " (抑制 " + std::to_string(suppressed) +
+                                             " 条同文本)"
+                                       : std::string();
+        if (status.severity <= MAV_SEVERITY_CRITICAL) {
+            SPDLOG_ERROR("PX4 文本告警: severity={} text={}{}", status.severity,
+                         state_.statustext_text, suffix);
+        } else {
+            SPDLOG_WARN("PX4 文本告警: severity={} text={}{}", status.severity,
+                        state_.statustext_text, suffix);
+        }
+    }
+
+    // 测距传感器（DISTANCE_SENSOR，132）：P5 装雷达后才参与判据，本期只解析。
+    void HandleDistanceSensor(const mavlink_message_t& message,
+                              uint64_t now_ms) {
+        (void)now_ms;
+        mavlink_distance_sensor_t sensor{};
+        mavlink_msg_distance_sensor_decode(&message, &sensor);
+        state_.distance_min_m = static_cast<float>(sensor.min_distance) / 100.f;
+        state_.distance_max_m = static_cast<float>(sensor.max_distance) / 100.f;
+        state_.distance_type = sensor.type;
+        state_.distance_orientation = sensor.orientation;
+        // UINT16_MAX / 0 都表示"本帧无有效测量"，不是 0 米。
+        state_.distance_valid =
+            sensor.current_distance != std::numeric_limits<uint16_t>::max() &&
+            sensor.current_distance != 0;
+        state_.distance_m = static_cast<float>(sensor.current_distance) / 100.f;
     }
 
     // 电池状态：累加各电芯电压求总压，仅处理动力电池 id=0。
@@ -1365,6 +1523,21 @@ private:
         state_.takeoff_ref_valid = false;
         state_.takeoff_ref_local_z_m = 0.f;
         takeoff_ref_pending_ = false;
+        // 估计器/传感器健康相关的易变状态：断连后一律失效，重连必须重新观测。
+        // 注意 baro_* 与最后值保留只为排查，valid=false 时上层不得使用。
+        state_.local_position_time_valid = false;
+        state_.local_position_time_ms = 0;
+        state_.estimator_status_valid = false;
+        state_.sensors_status_valid = false;
+        state_.baro_altitude_valid = false;
+        state_.baro_takeoff_ref_valid = false;
+        state_.vibration_valid = false;
+        state_.statustext_valid = false;
+        state_.distance_valid = false;
+        last_statustext_log_text_.clear();
+        last_statustext_log_ms_ = 0;
+        statustext_suppressed_ = 0;
+        baro_ref_pending_ = false;
         rc_link_present_ = false;
         InvalidateBatteryParameters();
     }
@@ -1555,6 +1728,14 @@ private:
     bool takeoff_ref_pending_ = false;
     bool firmware_version_logged_ = false;
     bool telemetry_requests_queued_ = false;
+
+    // STATUSTEXT 落盘节流（仅通信线程访问）：同文本 10s 内只打一条，
+    // 期间被抑制的条数在下一条里带出（PX4 会周期刷同一条 EKF 告警）。
+    std::string last_statustext_log_text_;
+    uint64_t last_statustext_log_ms_ = 0;
+    uint32_t statustext_suppressed_ = 0;
+    /// 气压起飞基准待补抓（解锁上升沿置位，HandleAltitude 在地面附近补抓）。
+    bool baro_ref_pending_ = false;
 
     // 电池参数请求簿记（仅通信线程访问）：上次请求时刻、连接起点、是否已打印
     // 成功日志、超时告警节流计数。

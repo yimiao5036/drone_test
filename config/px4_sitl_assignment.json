@@ -82,6 +82,18 @@
             {
                 "message_id": 49,
                 "interval_us": 1000000
+            },
+            {
+                "message_id": 141,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 230,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 241,
+                "interval_us": 1000000
             }
         ],
         "serial": {

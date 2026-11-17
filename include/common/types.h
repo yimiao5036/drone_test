@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace drone::common {
@@ -314,6 +315,61 @@ struct FlightStateSnapshot {
     uint16_t last_ack_command = 0;      ///< 最近 MAVLink 命令 ACK 对应的命令
     uint8_t last_ack_result = 0;        ///< 最近 ACK 结果
     uint64_t last_ack_time_ms = 0;
+
+    // ---- 估计器与传感器健康（2026-11-17，降落与估计器保护 P1）------------------
+    // 背景：2026-11-17 10:24 现场 EKF 全状态重置（delta_z≈9m）+ fs_bad_acc_vertical
+    // 导致 AUTO.LAND 中翻滚。当时机载对这些量**零可见性**：既看不到 EKF 重置，也
+    // 看不到 PX4 的 "Arming denied: ..." 原因。以下字段把 PX4 的估计器/传感器/
+    // 气压/振动/文本告警透出来，供 EstimatorGuard 判据与事后排查使用。
+    // 全部是新增字段，不改变既有语义，现有消费方（围栏/健康/地面站）无需改动。
+    bool local_position_time_valid = false;  ///< LOCAL_POSITION_NED 已有到达时间
+    uint64_t local_position_time_ms = 0;     ///< 最近一帧 LOCAL_POSITION_NED 单调时钟
+    bool estimator_status_valid = false;     ///< ESTIMATOR_STATUS(230) 已收到
+    uint16_t estimator_flags = 0;            ///< ESTIMATOR_STATUS.flags，退化位见 MAV_ESTIMATOR_STATUS_FLAGS
+    float estimator_vel_ratio = 0.f;         ///< 归一化新息检验比：>1 表示该路不可信
+    float estimator_pos_horiz_ratio = 0.f;
+    float estimator_pos_vert_ratio = 0.f;
+    float estimator_mag_ratio = 0.f;
+    float estimator_hagl_ratio = 0.f;
+    float estimator_pos_horiz_accuracy_m = 0.f;
+    float estimator_pos_vert_accuracy_m = 0.f;
+    uint64_t estimator_status_time_ms = 0;
+    /// SYS_STATUS 的板载传感器健康位（MAV_SYS_STATUS_SENSOR_*）：
+    /// present/health/enabled 三个位图，health 位清零即为该传感器不健康。
+    bool sensors_status_valid = false;
+    uint32_t sensors_present = 0;
+    uint32_t sensors_health = 0;
+    uint32_t sensors_enabled = 0;
+    /// 气压高度（ALTITUDE，141）：与 EKF local_z 不同源，用于交叉校验。
+    /// altitude_amsl 来自气压计（只受 QNH 影响），是唯一不被 EKF 重置平移的高度量；
+    /// 起飞时抓取的 `baro_takeoff_ref_amsl_m` 与它相减即"气压 AGL"（见 BaroAboveTakeoffM）。
+    bool baro_altitude_valid = false;
+    float baro_amsl_m = 0.f;                 ///< ALTITUDE.altitude_amsl
+    float baro_local_up_m = 0.f;             ///< ALTITUDE.altitude_local（本地坐标，向上为正）
+    float baro_relative_m = 0.f;             ///< ALTITUDE.altitude_relative（相对 Home，向上为正）
+    float baro_bottom_clearance_m = -1.f;    ///< 融合离地高度，<0 表示无测量（P5 装雷达后才可靠）
+    bool baro_takeoff_ref_valid = false;     ///< 起飞时抓取的气压 MSL 基准
+    float baro_takeoff_ref_amsl_m = 0.f;
+    /// 振动（VIBRATION，241）：本次事故的根因之一是 Z 轴振动 5.24 m/s² 与削波。
+    bool vibration_valid = false;
+    float vibration_x = 0.f;
+    float vibration_y = 0.f;
+    float vibration_z = 0.f;
+    uint32_t vibration_clipping_0 = 0;
+    uint32_t vibration_clipping_1 = 0;
+    uint32_t vibration_clipping_2 = 0;
+    /// PX4 文本告警（STATUSTEXT，253）：`Arming denied: ...` 与 EKF 告警只走这条。
+    bool statustext_valid = false;
+    uint8_t statustext_severity = 0;         ///< MAV_SEVERITY（0 最严重）
+    std::string statustext_text;             ///< 最近一条（截断到 63 字节）
+    uint64_t statustext_time_ms = 0;
+    /// 测距传感器（DISTANCE_SENSOR，132）：P5 装雷达后才参与判据，本期只解析。
+    bool distance_valid = false;
+    float distance_m = 0.f;
+    float distance_min_m = 0.f;
+    float distance_max_m = 0.f;
+    uint8_t distance_type = 0;
+    uint8_t distance_orientation = 0;        ///< MAV_SENSOR_ORIENTATION，向下为 ROTATION_PITCH_270(25)
 };
 
 /// 相对起飞点高度基准（NED z，向下为正），供围栏判据、飞控钳制、65011 下传共用：
@@ -330,6 +386,19 @@ inline std::optional<double> RelativeAltitudeBaseZ(
         return static_cast<double>(state.takeoff_ref_local_z_m);
     }
     return std::nullopt;
+}
+
+/// 气压 AGL（相对起飞点，向上为正）：`ALTITUDE.altitude_amsl` 减去起飞时抓取的气压基准。
+/// 用途：与 EKF 相对高度交叉校验，**不被 EKF 坐标重置平移**——2026-11-17 事故里
+/// EKF z 被重置约 9m，而气压曲线是平滑的（baro_alt_meter 277.84→276.41 只降 1.4m），
+/// 这类判据正是靠"两个不同物理路径的高度不一致"发现估计器出了问题。
+/// 数据缺失返回 nullopt，调用方按"不做交叉校验"处理，不得退化成"用 EKF 高度当气压"。
+inline std::optional<double> BaroAboveTakeoffM(const FlightStateSnapshot& state) {
+    if (!state.baro_altitude_valid || !state.baro_takeoff_ref_valid) {
+        return std::nullopt;
+    }
+    return static_cast<double>(state.baro_amsl_m) -
+           static_cast<double>(state.baro_takeoff_ref_amsl_m);
 }
 
 /// 控制意图类型（状态机/策略 → 飞行控制）。
