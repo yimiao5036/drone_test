@@ -91,6 +91,11 @@ struct Options {
     bool sitl_stage4_fence_land = false;
     /// 65018 高度带专项：仅高度越界（水平在区域内），验证高度带判定链路。
     bool sitl_stage4_fence_altitude = false;
+    /// 65020 type=2 重置并重启飞控专项（2026-11-17 P4b，非门禁）：
+    /// 复用 stage4-command 全链（S12→S13→S14）后注入一条重置，断言
+    /// 65021 accepted(state=S1) → 65013 回 S2 READY（SITL 的 PX4 恒拒绝 246，
+    /// 机载收到明确拒绝后停止重发并降级回 S2）→ 再注入一条验证幂等 completed。
+    bool sitl_stage4_reset = false;
     /// G4 串口台架（真实 PX4 + 机体，卸桨）：只做零速/Offboard/ARM/小量
     /// 方向激励/停发失控保护，不执行起飞、降落航线或返航。
     bool bench_stage4_controller = false;
@@ -120,7 +125,7 @@ void PrintUsage(const char* program) {
               << "        | --sitl-stage4-return]\n"
               << "        | --sitl-stage4-command | --sitl-stage4-fence]\n"
               << "        | --sitl-stage4-fence-hold | --sitl-stage4-fence-land\n"
-              << "        | --sitl-stage4-fence-altitude]\n"
+              << "        | --sitl-stage4-fence-altitude | --sitl-stage4-reset]\n"
               << "       | --bench-stage4-controller --bench-ack-props-off\n"
               << "SITL 参数仅允许 UDP；offboard-loss 起飞 1m 后主动停止 setpoint，\n"
               << "验证 PX4 退出 Offboard，再统一 AUTO.LAND 回收。\n"
@@ -146,6 +151,10 @@ void PrintUsage(const char* program) {
               << "  直接进 S13 发 AUTO.LAND（不经 S12 返航）→ S14 DISARM。\n"
               << "stage4-fence-altitude 高度带专项（非门禁）：区域水平范围足够大，仅高度带\n"
               << "  （相对 Home 上限 0.5m）越界，验收 65019 VIOLATED + S12 中止返航。\n"
+              << "stage4-reset 重置并重启飞控专项（非门禁）：复用 stage4-command 全链\n"
+              << "  （S12→S13→S14），S14 后注入 65020 type=2，验收 65021 result=0\n"
+              << "  state=S1 SELF_CHECK → 65013 回 S2 READY（SITL 的 PX4 恒拒绝 246，\n"
+              << "  机载降级回 READY）→ 再注入一条验证幂等 result=1 completed。\n"
               << "bench-stage4-controller G4 串口台架（仅 serial）：零速引导 → Offboard\n"
               << "  → ARM → 零速保持 → 北/东/南/西小量速度脉冲 → 停发验证 PX4 退出\n"
               << "  Offboard → DISARM；不发送起飞/降落/返航指令。必须同时给\n"
@@ -254,6 +263,11 @@ Options ParseOptions(int argc, char** argv) {
             options.tune_script = "fence_altitude";
             continue;
         }
+        if (argument == "--sitl-stage4-reset") {
+            options.sitl_stage4_reset = true;
+            options.tune_script = "reset_reboot";
+            continue;
+        }
         if (argument == "--bench-stage4-controller") {
             options.bench_stage4_controller = true;
             continue;
@@ -349,6 +363,7 @@ Options ParseOptions(int argc, char** argv) {
                                  static_cast<int>(options.sitl_stage4_command_assigned) +
                                  static_cast<int>(options.sitl_stage4_fence_land) +
                                  static_cast<int>(options.sitl_stage4_fence_altitude) +
+                                 static_cast<int>(options.sitl_stage4_reset) +
                                  static_cast<int>(options.bench_stage4_controller);
     if (sitl_stage_count > 1) {
         throw std::invalid_argument("多个 SITL/台架阶段参数不能同时使用");
@@ -394,7 +409,7 @@ Options ParseOptions(int argc, char** argv) {
         options.sitl_stage4_return || options.sitl_stage4_command ||
         options.sitl_stage4_fence || options.sitl_stage4_fence_hold ||
         options.sitl_stage4_command_assigned || options.sitl_stage4_fence_land ||
-        options.sitl_stage4_fence_altitude) {
+        options.sitl_stage4_fence_altitude || options.sitl_stage4_reset) {
         if (options.tune_script != "static" && options.tune_script != "heading" &&
             options.tune_script != "distance" && options.tune_script != "vertical" &&
             options.tune_script != "full" && options.tune_script != "feedforward" &&
@@ -404,17 +419,20 @@ Options ParseOptions(int argc, char** argv) {
             options.tune_script != "fence_hold" &&
             options.tune_script != "return_command_assigned" &&
             options.tune_script != "fence_land" &&
-            options.tune_script != "fence_altitude") {
+            options.tune_script != "fence_altitude" &&
+            options.tune_script != "reset_reboot") {
             throw std::invalid_argument(
                 "--tune-script 只支持 static|heading|distance|vertical|full|"
                 "feedforward|intercept_return|return_command|fence_violation|"
-                "fence_hold|return_command_assigned|fence_land|fence_altitude");
+                "fence_hold|return_command_assigned|fence_land|fence_altitude|"
+                "reset_reboot");
         }
         if (options.sitl_stage4_feedforward || options.sitl_stage4_return ||
             options.sitl_stage4_command || options.sitl_stage4_fence ||
             options.sitl_stage4_fence_hold ||
             options.sitl_stage4_command_assigned ||
-            options.sitl_stage4_fence_land || options.sitl_stage4_fence_altitude) {
+            options.sitl_stage4_fence_land || options.sitl_stage4_fence_altitude ||
+            options.sitl_stage4_reset) {
             if (options.duration < std::chrono::seconds(90)) {
                 throw std::invalid_argument("专项场景时长不能少于 90 秒");
             }
@@ -4661,6 +4679,7 @@ enum class TuneScript : uint8_t {
     kReturnCommandAssigned, ///< 65014 已接受 + 65020：验证中止补发 65015
     kFenceLand,      ///< 65018(land)：越界后直接降落（不经 S12）
     kFenceAltitude,  ///< 65018 高度带：仅高度越界即中止返航
+    kResetReboot,    ///< 65020 type=2：S14 后重置任务状态并重启 PX4（SITL 验回退）
 };
 
 /// 解析 --tune-script 取值（无效值返回 false）。
@@ -4691,6 +4710,8 @@ bool ParseTuneScript(const std::string& text, TuneScript* out) {
         *out = TuneScript::kFenceLand;
     } else if (text == "fence_altitude") {
         *out = TuneScript::kFenceAltitude;
+    } else if (text == "reset_reboot") {
+        *out = TuneScript::kResetReboot;
     } else {
         return false;
     }
@@ -4737,6 +4758,9 @@ constexpr uint16_t kFenceZoneId = 21;
 constexpr uint16_t kFenceZoneVersion = 1;
 // 65020 注入：1s 有效期（与机载 kMissionCommandValidForMs 一致），来源 id 冒充地面站。
 constexpr uint32_t kMissionCommandValidMs = 1000;
+// 65020 type=2 重置：65021 回执等待上限。机载在 Evaluate 当拍受理并回执，
+// 协议侧地面站超时是 3 s，这里放到 5 s 容忍 SITL 调度抖动。
+constexpr uint64_t kResetAckTimeoutMs = 5000;
 constexpr uint8_t kGcsSourceId = 255;
 constexpr uint64_t kTunePollMs = 20;
 constexpr uint64_t kTuneCsvPeriodMs = 50;            // CSV 记录 20Hz
@@ -4882,6 +4906,7 @@ enum class TunePhase : uint8_t {
     kFenceHoldRun,     ///< 65018(hold)：越界后保持观察，再发 65020 收尾
     kFenceLandRun,     ///< 65018(land)：越界后直接 S13 降落→S14
     kFenceAltitudeRun, ///< 65018 高度带：仅高度越界→S12→S13→S14
+    kResetRun,         ///< 65020 type=2：S14 后重置→S1→回退 S2→再注入验幂等
     kDone,
 };
 
@@ -4905,6 +4930,7 @@ const char* TunePhaseName(TunePhase phase) {
         case TunePhase::kFenceHoldRun: return "fence_hold_run";
         case TunePhase::kFenceLandRun: return "fence_land_run";
         case TunePhase::kFenceAltitudeRun: return "fence_altitude_run";
+        case TunePhase::kResetRun: return "reset_run";
         case TunePhase::kDone: return "done";
     }
     return "unknown";
@@ -4934,6 +4960,8 @@ public:
           static_dwell_ms_(static_dwell_s * 1000),
           dwell_ms_(dwell_s * 1000),
           approach_until_m_(approach_until_m),
+          reset_reboot_timeout_ms_(
+              static_cast<uint64_t>(app_config.mission.reboot_timeout.count())),
           duration_ms_(static_cast<uint64_t>(duration.count()) * 1000),
           subscription_(std::move(subscription)),
           rig_(std::move(rig)),
@@ -5060,6 +5088,7 @@ public:
             script_ == TuneScript::kReturnCommandAssigned;
         const bool fence_land_scenario = script_ == TuneScript::kFenceLand;
         const bool fence_altitude_scenario = script_ == TuneScript::kFenceAltitude;
+        const bool reset_scenario = script_ == TuneScript::kResetReboot;
         const ActuatorAckTiming actuator_ack_timing = actuator_timing();
         // 65020 主动返航：机载必须回 65021 result=0、65015 reason=cancelled_by_gcs，
         // 且未经 S9/S10（人工中止不是拦截完成），返航段位置设定值带 USE_YAW 指向 Home。
@@ -5111,6 +5140,34 @@ public:
              saw_landing_ && saw_disarmed_ && state_machine_managed_return_ &&
              landed_after_flight_ && disarmed_confirmed_ &&
              !saw_intercept_executing_);
+        // 65020 type=2 重置并重启飞控（2026-11-17 P4b）：
+        //   ① 第 1 条：65021 result=0 accepted、reason=0、state=S1 SELF_CHECK；
+        //   ② 65013 从 S1 回到 S2 READY，且早于 mission.reboot_timeout（SITL 的
+        //      PX4 恒拒绝 246 → 机载停止重发并降级回 S2，这是 SITL 能覆盖的那段）；
+        //   ③ 每个 command_id 只回一条 65021；
+        //   ④ 回到 S2 后再注入一条：result=1 completed、reason=0、state=S2 READY
+        //      （幂等，不会再发 246）。
+        // 真重启后的恢复段（心跳/3D fix/全局位置/Home）SITL 不可覆盖。
+        const bool reset_first_ack_ok =
+            reset_first_sent_ && reset_first_ack_.seen &&
+            reset_first_ack_.result == common::MissionCommandResult::kAccepted &&
+            reset_first_ack_.reason == common::MissionCommandReason::kNone &&
+            reset_first_ack_.mission_state == common::MissionState::kSelfCheck &&
+            reset_first_ack_.count == 1;
+        const bool reset_back_to_ready =
+            reset_saw_self_check_ && reset_saw_ready_back_ &&
+            reset_ready_ms_ >= reset_first_sent_ms_ &&
+            reset_ready_ms_ - reset_first_sent_ms_ < reset_reboot_timeout_ms_;
+        const bool reset_second_ack_ok =
+            reset_second_sent_ && reset_second_ack_.seen &&
+            reset_second_ack_.result == common::MissionCommandResult::kCompleted &&
+            reset_second_ack_.reason == common::MissionCommandReason::kNone &&
+            reset_second_ack_.mission_state == common::MissionState::kReady &&
+            reset_second_ack_.count == 1;
+        const bool reset_ok =
+            !reset_scenario ||
+            (reset_first_ack_ok && reset_back_to_ready && reset_second_ack_ok &&
+             reset_ready_at_end_);
         const bool return_ok =
             !return_scenario ||
             (saw_intercept_ready_ && saw_intercept_executing_ &&
@@ -5122,7 +5179,7 @@ public:
                             landed_after_flight_ && disarmed_confirmed_ &&
                             ff_ok && return_ok && command_ok && fence_ok &&
                             fence_hold_ok && assigned_ok && fence_land_ok &&
-                            fence_altitude_ok;
+                            fence_altitude_ok && reset_ok;
         const char* report_title = "\n========== stage4-tune 整定场景报告 ==========";
         if (feedforward_scenario) {
             report_title =
@@ -5134,6 +5191,10 @@ public:
         } else if (command_scenario) {
             report_title =
                 "\n========== stage4-command 65020 主动返航专项报告（非门禁）==========";
+        } else if (reset_scenario) {
+            report_title =
+                "\n========== stage4-reset 65020 重置并重启飞控专项报告"
+                "（非门禁）==========";
         } else if (fence_land_scenario) {
             report_title =
                 "\n========== stage4-fence-land 65018 围栏降落专项报告（非门禁）==========";
@@ -5178,6 +5239,48 @@ public:
                       << yaw_setpoint_samples_ << " 个（指向 Home="
                       << YesNo(return_yaw_toward_home_) << "）；迁移 "
                       << machine_.TransitionCount() << " 次" << std::endl;
+        }
+        if (reset_scenario) {
+            PrintCheck("65020 type=2 第 1 条已下发", reset_first_sent_, true);
+            PrintCheck("65021 回执 result=0 accepted / reason=0 / state=S1 SELF_CHECK",
+                       reset_first_ack_ok, true);
+            PrintCheck("65013 回到 S2 READY（SITL 拒绝 246 的降级回退）",
+                       reset_back_to_ready, true);
+            PrintCheck("回退在 mission.reboot_timeout 之前到达",
+                       reset_saw_ready_back_ && reset_ready_ms_ >= reset_first_sent_ms_ &&
+                           reset_ready_ms_ - reset_first_sent_ms_ <
+                               reset_reboot_timeout_ms_,
+                       true);
+            PrintCheck("每个 command_id 只回一条 65021",
+                       reset_first_sent_ && reset_second_sent_ &&
+                           reset_first_ack_.count == 1 && reset_second_ack_.count == 1,
+                       true);
+            PrintCheck("第 2 条重置 65021 result=1 completed / reason=0 / state=S2 READY",
+                       reset_second_ack_ok, true);
+            PrintCheck("收尾时状态仍是 S2 READY", reset_ready_at_end_, true);
+            const uint64_t reset_back_ms =
+                (reset_saw_ready_back_ && reset_ready_ms_ >= reset_first_sent_ms_)
+                    ? reset_ready_ms_ - reset_first_sent_ms_
+                    : 0;
+            std::cout << "65020 重置实测: 第 1 条 command_id="
+                      << reset_first_command_id_ << "（65021 回执 "
+                      << reset_first_ack_.count << " 条，result="
+                      << static_cast<int>(reset_first_ack_.result) << " reason="
+                      << static_cast<int>(reset_first_ack_.reason) << " state="
+                      << static_cast<int>(reset_first_ack_.mission_state)
+                      << "；65013 S1 帧已观测=" << YesNo(reset_saw_self_check_)
+                      << "，65013 S2 帧已观测=" << YesNo(reset_saw_ready_back_)
+                      << "），S1→S2 回退耗时 " << reset_back_ms << "ms（上限 "
+                      << reset_reboot_timeout_ms_ << "ms）；第 2 条 command_id="
+                      << reset_second_command_id_ << "（65021 回执 "
+                      << reset_second_ack_.count << " 条，result="
+                      << static_cast<int>(reset_second_ack_.result) << " reason="
+                      << static_cast<int>(reset_second_ack_.reason) << " state="
+                      << static_cast<int>(reset_second_ack_.mission_state)
+                      << "）；SITL 的 PX4 拒绝 246（未编 CONFIG_BOARDCTL_RESET），"
+                         "只验受理→S1→回退 S2→幂等，恢复段不可覆盖；迁移 "
+                      << machine_.TransitionCount() << " 次、错误 "
+                      << machine_.ErrorCount() << " 次" << std::endl;
         }
         if (assigned_scenario) {
             PrintCheck("65020 已下发（单发）", command_sent_, true);
@@ -5350,6 +5453,10 @@ public:
         } else if (command_scenario) {
             result_text = passed ? "结果: 65020 主动返航专项通过"
                                  : "结果: 65020 主动返航专项未通过";
+        } else if (reset_scenario) {
+            // 本场景是 P4b 的 SITL 覆盖段（受理→S1→回退 S2→幂等），非门禁。
+            result_text = passed ? "结果: 重置并重启飞控专项通过"
+                                 : "结果: 重置并重启飞控专项失败";
         } else if (fence_land_scenario) {
             result_text = passed ? "结果: 65018 围栏降落专项通过"
                                  : "结果: 65018 围栏降落专项未通过";
@@ -5409,6 +5516,23 @@ private:
                         break;
                     default:
                         break;
+                }
+            }
+            if (script_ == TuneScript::kResetReboot && reset_first_sent_) {
+                // 重置专项：等 65013 回到 S2 READY。S1 SELF_CHECK 的 65013 帧
+                // 不一定能观测到——状态机每 500ms 才发一次 65013，而 SITL 的
+                // PX4 对 246 几乎立刻回 DENIED，S1 可能只活一个决策拍；
+                // S1 证据因此同时接受 65021 回执里的 mission_state=S1。
+                if (mission_state_ == common::MissionState::kSelfCheck) {
+                    reset_saw_self_check_ = true;
+                }
+                if (mission_state_ == common::MissionState::kReady &&
+                    !reset_saw_ready_back_) {
+                    reset_saw_ready_back_ = true;
+                    reset_ready_ms_ = MonotonicMs();
+                    std::cout << "[SITL] 65013 已回退到 S2 READY（S1 SELF_CHECK "
+                                 "已观测="
+                              << YesNo(reset_saw_self_check_) << "）" << std::endl;
                 }
             }
         }
@@ -5520,6 +5644,38 @@ private:
                       << " reason=" << static_cast<int>(ack.reason)
                       << " state=" << static_cast<int>(ack.mission_state)
                       << std::endl;
+            // 重置专项：按 command_id 归集两条 type=2 的回执，验证内容与
+            // "同一 command_id 只回一条 65021"。
+            if (script_ == TuneScript::kResetReboot &&
+                ack.type == common::MissionCommandType::kResetState) {
+                ResetAckRecord* record = nullptr;
+                if (reset_first_sent_ &&
+                    ack.command_id == reset_first_command_id_) {
+                    record = &reset_first_ack_;
+                } else if (reset_second_sent_ &&
+                           ack.command_id == reset_second_command_id_) {
+                    record = &reset_second_ack_;
+                }
+                if (record != nullptr) {
+                    ++record->count;
+                    if (!record->seen) {
+                        record->seen = true;
+                        record->result = ack.result;
+                        record->reason = ack.reason;
+                        record->mission_state = ack.mission_state;
+                        // S1 证据：65013 可能因 500ms 发布间隔错过整个 S1 窗口，
+                        // 65021 回执里的 mission_state 是同一时刻的状态机事实。
+                        if (ack.mission_state == common::MissionState::kSelfCheck) {
+                            reset_saw_self_check_ = true;
+                        }
+                        std::cout << "[SITL] 重置回执归集: command_id="
+                                  << ack.command_id << " count=" << record->count
+                                  << " state="
+                                  << static_cast<int>(record->mission_state)
+                                  << std::endl;
+                    }
+                }
+            }
         }
         while (auto message = assignment_ack_subscription_.TryTake()) {
             const auto& ack = **message;
@@ -5558,7 +5714,8 @@ private:
                script_ == TuneScript::kFenceHold ||
                script_ == TuneScript::kReturnCommandAssigned ||
                script_ == TuneScript::kFenceLand ||
-               script_ == TuneScript::kFenceAltitude;
+               script_ == TuneScript::kFenceAltitude ||
+               script_ == TuneScript::kResetReboot;
     }
 
     /// 角度归一化到 (-180, 180]。
@@ -5941,6 +6098,16 @@ private:
                 phase_start_ms_ = now_ms;
                 return;
             }
+            if (script_ == TuneScript::kResetReboot) {
+                // 重置专项（2026-11-17 P4b）：先用 65020 `type=1` 走完
+                // "返航 → 两段降落 → S14"，再由 `AdvanceInterceptReturn` 在 S14
+                // 转入 `kResetRun` 注入 `type=2`。前置链与 stage4-command 完全一致，
+                // 避免为重置专项另写一套飞控流程。
+                SendReturnHomeCommand(now_ms);
+                phase_ = TunePhase::kMissionCommandRun;
+                phase_start_ms_ = now_ms;
+                return;
+            }
             if (script_ == TuneScript::kReturnCommandAssigned) {
                 // 先让机载存在「已接受的任务分配」，再下发 65020：只有
                 // accepted_assignment_ 有值时中止链才会补发 65015
@@ -6038,6 +6205,31 @@ private:
             std::make_shared<const common::MissionCommand>(command));
         std::cout << "[SITL] 下发 65020 主动返航指令: command_id=" << command_id_
                   << "（期望 65021 result=0、65015 reason=cancelled_by_gcs）" << std::endl;
+    }
+
+    /// 发布一条 65020 type=2（重置任务状态）：机载受理后清任务状态、切 S1
+    /// SELF_CHECK 并发 246 重启 PX4；SITL 的 PX4 恒回 DENIED → 机载停止重发、
+    /// 降级回 S2 READY。command_id 由 command_sequence_ 单调递增（与返航指令、
+    /// 两次重置之间都不重复，机载按 command_id 去重）。
+    uint32_t SendResetStateCommand(uint64_t now_ms) {
+        ++command_sequence_;
+        const uint32_t command_id = command_sequence_;
+        common::MissionCommand command;
+        command.header.sequence = command_id;
+        command.header.source_time_ms = now_ms;
+        command.header.receive_time_ms = now_ms;
+        command.header.valid_for_ms = kMissionCommandValidMs;
+        command.header.source_id = kGcsSourceId;
+        command.header.health = 1;
+        command.protocol_version = 1;
+        command.command_id = command_id;
+        command.type = common::MissionCommandType::kResetState;
+        command.received_ms = now_ms;
+        (void)mission_command_topic_.Publish(
+            std::make_shared<const common::MissionCommand>(command));
+        std::cout << "[SITL] 下发 65020 重置任务状态：command_id=" << command_id
+                  << "（期望 65021 result=0 state=1 SELF_CHECK）" << std::endl;
+        return command_id;
     }
 
     /// 以 EKF 锚点为心注入方形 65018 区域（Home 相对高度，不限制高度带）。
@@ -6168,6 +6360,15 @@ private:
         if (state == common::MissionState::kDisarmed) {
             landed_after_flight_ = true;
             disarmed_confirmed_ = true;
+            if (script_ == TuneScript::kResetReboot) {
+                // 重置专项：S14 收口不结束剧本，转由 AdvanceResetRun 在落地后
+                // 注入 65020 type=2（复用同一条返航/降落全链，不重写飞控流程）。
+                phase_ = TunePhase::kResetRun;
+                phase_start_ms_ = now_ms;
+                std::cout << "[SITL] S14 DISARMED 完成，进入重置并重启飞控专项"
+                          << std::endl;
+                return;
+            }
             phase_ = TunePhase::kDone;
             std::cout << "[SITL] 状态机接管返航/降落/上锁完成（S12→S13→S14）"
                       << std::endl;
@@ -6182,6 +6383,77 @@ private:
                                     ? "65018 围栏保持专项超时（未观测到 S14）"
                                     : "S9~S14 返航专项超时（未观测到 S14）")));
         }
+    }
+
+    /// 65020 type=2 重置并重启飞控专项（2026-11-17 P4b，非门禁）。
+    ///
+    /// SITL 的 PX4 未编入板级 reset 能力（`CONFIG_BOARDCTL_RESET`），对
+    /// 246 恒回 `DENIED`：机载收到明确拒绝后**停止重发并降级回 S2 READY**。
+    /// 因此本场景只验「受理 → S1 → 回退 S2 → 幂等」四段；"等飞控重新上线"
+    /// 的恢复段（心跳/3D fix/全局位置/Home）不可能在 SITL 覆盖，由单测与
+    /// 真机台架负责（见 docs/降落与估计器保护设计-2026-11-17.md §6.7）。
+    void AdvanceResetRun(uint64_t now_ms) {
+        // 第 1 段：S14 落地后注入第一条重置（受理 → S1 + 发 246）。
+        if (!reset_first_sent_) {
+            reset_first_sent_ = true;
+            reset_first_command_id_ = SendResetStateCommand(now_ms);
+            reset_first_sent_ms_ = now_ms;
+            std::cout << "[SITL] 重置专项第 1 段：等待 65021 result=0 state=S1 → "
+                         "65013 回 S2 READY（SITL 的 PX4 拒绝 246，机载降级回 READY）"
+                      << std::endl;
+            return;
+        }
+        if (!reset_first_ack_.seen) {
+            if (now_ms - reset_first_sent_ms_ >= kResetAckTimeoutMs) {
+                Abort("重置专项超时：注入 65020 type=2 后未收到 65021 回执");
+            }
+            return;
+        }
+        // 回执内容不对就不必再等：直接中断并让报告打出实测值。
+        if (reset_first_ack_.result != common::MissionCommandResult::kAccepted ||
+            reset_first_ack_.reason != common::MissionCommandReason::kNone ||
+            reset_first_ack_.mission_state != common::MissionState::kSelfCheck) {
+            Abort("重置专项失败：第 1 条重置的 65021 非预期（期望 "
+                  "result=0/reason=0/state=1 SELF_CHECK）");
+            return;
+        }
+        // 第 2 段：等 65013 从 S1 回到 S2 READY；必须早于 mission.reboot_timeout，
+        // 否则机载会停在 S1 并置 65013 bit10（真机上意味着飞控没回来）。
+        if (!reset_saw_ready_back_) {
+            if (now_ms - reset_first_sent_ms_ >= reset_reboot_timeout_ms_) {
+                Abort("重置专项超时：超过 mission.reboot_timeout 仍未从 S1 回到 "
+                      "S2 READY（机载可能停在 S1 等飞控）");
+            }
+            return;
+        }
+        // 第 3 段：已在 S2 READY 再注入一条 → 幂等 completed，且不会再发 246。
+        if (!reset_second_sent_) {
+            reset_second_sent_ = true;
+            reset_second_command_id_ = SendResetStateCommand(now_ms);
+            reset_second_sent_ms_ = now_ms;
+            std::cout << "[SITL] 重置专项第 2 段：已在 S2 READY，再注入一条验证幂等"
+                         "（期望 65021 result=1 completed、state=2）"
+                      << std::endl;
+            return;
+        }
+        if (!reset_second_ack_.seen) {
+            if (now_ms - reset_second_sent_ms_ >= kResetAckTimeoutMs) {
+                Abort("重置专项超时：幂等重置未收到 65021 回执");
+            }
+            return;
+        }
+        if (reset_second_ack_.result != common::MissionCommandResult::kCompleted ||
+            reset_second_ack_.reason != common::MissionCommandReason::kNone ||
+            reset_second_ack_.mission_state != common::MissionState::kReady) {
+            Abort("重置专项失败：第 2 条重置的 65021 非预期（期望 "
+                  "result=1/reason=0/state=2 READY）");
+            return;
+        }
+        reset_ready_at_end_ = mission_state_ == common::MissionState::kReady;
+        phase_ = TunePhase::kDone;
+        std::cout << "[SITL] 重置并重启飞控专项完成（受理 → S1 → 回退 S2 → 幂等 "
+                     "completed；SITL 不覆盖真重启恢复段）"
+                  << std::endl;
     }
 
     /// 静态驻留 + 阶跃段的公共节拍：持续注入 LOCKED 并按时刻推进目标换位。
@@ -6403,6 +6675,9 @@ private:
             case TunePhase::kFenceHoldRun:
                 AdvanceFenceHoldRun(now_ms);
                 return;
+            case TunePhase::kResetRun:
+                AdvanceResetRun(now_ms);
+                return;
             case TunePhase::kMissionCommandRun:
             case TunePhase::kFenceZoneRun:
             case TunePhase::kFenceLandRun:
@@ -6580,6 +6855,8 @@ private:
     const uint64_t static_dwell_ms_;
     const uint64_t dwell_ms_;
     const double approach_until_m_;
+    /// mission.reboot_timeout：重置后 S1→S2 回退必须在此之前到达。
+    const uint64_t reset_reboot_timeout_ms_;
     uint64_t duration_ms_ = 0;
     drone::common::Topic<drone::common::FlightStateSnapshot>::Subscription subscription_;
     drone::common::Topic<drone::common::MissionStatus>::Subscription status_subscription_;
@@ -6658,6 +6935,29 @@ private:
     double fence_violation_altitude_m_ = 0.0;
     uint64_t yaw_setpoint_samples_ = 0;
     bool return_yaw_toward_home_ = false;
+    // ---- 65020 type=2 重置并重启飞控专项观测（2026-11-17 P4b）----
+    /// 一条重置指令对应的 65021 回执记录（按 command_id 归集，用于验证
+    /// "同一 command_id 只回一条"与回执内容）。
+    struct ResetAckRecord {
+        bool seen = false;                      ///< 是否已收到该 command_id 的回执
+        uint32_t count = 0;                     ///< 该 command_id 的 65021 条数
+        common::MissionCommandResult result =
+            common::MissionCommandResult::kRejected;
+        common::MissionCommandReason reason = common::MissionCommandReason::kNone;
+        common::MissionState mission_state = common::MissionState::kBoot;
+    };
+    bool reset_first_sent_ = false;             ///< 第 1 条重置已下发
+    bool reset_second_sent_ = false;            ///< 第 2 条重置（幂等）已下发
+    uint32_t reset_first_command_id_ = 0;
+    uint32_t reset_second_command_id_ = 0;
+    uint64_t reset_first_sent_ms_ = 0;
+    uint64_t reset_second_sent_ms_ = 0;
+    ResetAckRecord reset_first_ack_;
+    ResetAckRecord reset_second_ack_;
+    bool reset_saw_self_check_ = false;  ///< 65013 曾进入 S1 SELF_CHECK
+    bool reset_saw_ready_back_ = false;  ///< 65013 从 S1 回到 S2 READY
+    uint64_t reset_ready_ms_ = 0;        ///< 回到 S2 READY 的时刻
+    bool reset_ready_at_end_ = false;    ///< 专项收尾时状态仍是 S2 READY
     // ---- P3 前馈专项观测（2026-10-19）----
     uint64_t motion_start_ms_ = 0;
     bool feedforward_window_entered_ = false;
@@ -6797,6 +7097,9 @@ int RunStage4Tune(drone::communication::Px4Link& link, const std::string& config
     // 注入命令窄接口），因此 S13 自动走 S13a→S13b；想回到旧路径（S13 直接
     // AUTO.LAND）把配置里 landing.enabled 置 false。
     mission_config.landing = app.landing;
+    // 重置 = 清状态 + 重启 PX4（2026-11-17 P4b）：mission 节同源加载，工具侧的
+    // 重置专项断言（S1→S2 回退必须早于 reboot_timeout）与状态机实际行为同源。
+    mission_config.mission = app.mission;
     // 围栏：65018 专项必须显式启用，且不落盘（只验证在线下发与钳制）；其余剧本关闭。
     mission_config.fence = app.fence;
     if (tune_script == TuneScript::kFenceViolation ||
@@ -7480,7 +7783,8 @@ int main(int argc, char** argv) {
              options.sitl_stage4_command || options.sitl_stage4_fence ||
              options.sitl_stage4_fence_hold ||
              options.sitl_stage4_command_assigned ||
-             options.sitl_stage4_fence_land || options.sitl_stage4_fence_altitude) &&
+             options.sitl_stage4_fence_land || options.sitl_stage4_fence_altitude ||
+             options.sitl_stage4_reset) &&
             config.transport != "udp") {
             throw std::invalid_argument("SITL 设定值参数只允许 transport=udp，禁止在真实串口运行");
         }
@@ -7524,6 +7828,10 @@ int main(int argc, char** argv) {
                           : (options.sitl_stage4_command
                           ? "SITL UDP 65020 主动返航专项（非门禁）：S7 锁定后注入 "
                             "65020 → 65021/65015 回执 → S12（带航向）→ S13 → S14"
+                          : (options.sitl_stage4_reset
+                          ? "SITL UDP 65020 重置并重启飞控专项（非门禁）：S14 后注入 "
+                            "type=2 → 65021 accepted(state=S1) → 65013 回 S2（SITL "
+                            "的 PX4 恒拒绝 246 的降级回退）→ 再注入验证幂等 completed"
                           : (options.sitl_stage4_fence_hold
                           ? "SITL UDP 65018 围栏保持专项（非门禁）：注入动作=hold 的"
                             "区域 → 65019 越界 → 原地保持不返航 → 65020 收尾 → S12/S13/S14"
@@ -7553,7 +7861,7 @@ int main(int argc, char** argv) {
                                  ? "SITL UDP 零速度流后切 Offboard，强制保持不解锁"
                                  : (options.sitl_zero_velocity
                                         ? "SITL UDP 零速度流，不切模式、不解锁"
-                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令"))))))))))))))))
+                                        : "仅发送 HEARTBEAT 和遥测请求命令，不发送飞行控制指令")))))))))))))))))
                   << '\n'
                   << std::endl;
 
@@ -7581,10 +7889,12 @@ int main(int argc, char** argv) {
             options.sitl_stage4_fence || options.sitl_stage4_fence_hold ||
             options.sitl_stage4_command_assigned ||
             options.sitl_stage4_fence_land ||
-            options.sitl_stage4_fence_altitude) {
+            options.sitl_stage4_fence_altitude ||
+            options.sitl_stage4_reset) {
             // stage4-tune 控制律整定 / P3 前馈 / S9~S14 返航 / 65020 主动返航 /
-            // 65018 围栏：装配与 G3 同构，剧本分别按长驻留+阶跃、匀速目标、
-            // 拦截后返航、人工返航指令、区域越界中止；逐拍落 CSV。
+            // 65018 围栏 / 65020 type=2 重置并重启飞控：装配与 G3 同构，剧本分别按
+            // 长驻留+阶跃、匀速目标、拦截后返航、人工返航指令、区域越界中止、
+            // 落地后重置重启；逐拍落 CSV。
             return RunStage4Tune(link, config_path, options);
         }
         drone::common::Topic<drone::common::Px4Setpoint> setpoint_topic;

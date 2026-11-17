@@ -82,11 +82,19 @@ bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --
 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-hold
 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-land
 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 150 --sitl-stage4-fence-altitude
+# 65020 type=2 重置并重启飞控（2026-11-17 P4b，非门禁）：S14 后注入重置，验
+# 65021 accepted(state=S1) → 65013 回 S2 READY（SITL 的 PX4 恒拒绝 246 的降级回退）
+# → 再注入一条验幂等 completed
+bash tools/sitl_harness.sh smoke --config config/px4_sitl_assignment.json --duration 150 --sitl-stage4-reset
 
 # 查看状态 / 停止
 bash tools/sitl_harness.sh status
 bash tools/sitl_harness.sh stop
 ```
+
+> `--sitl-stage4-reset` 要求机载 `mission.reset_reboot_px4=true`（默认），会看到
+> S1→S2 的降级回退；SITL 的 PX4 未编 `CONFIG_BOARDCTL_RESET`，对 246 恒回 DENIED，
+> 因此本场景只验「受理 → S1 → 回退 S2 → 幂等」，真重启后的恢复段需真机台架实测。
 
 ### 4.1 接 Web 地面站（`webgcs`，2026-11-04）
 

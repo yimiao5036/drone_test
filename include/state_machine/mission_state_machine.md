@@ -374,6 +374,13 @@ availability、飞行中 S12）由 Task 8 接入；65014 `flags.bit1` 取消、S
 重启不是"修好飞机"，只是把飞控与状态机拉回同一起点（设计与实施口径见
 [`降落与估计器保护设计-2026-11-17.md`](../../docs/降落与估计器保护设计-2026-11-17.md) §6/§6.7）。
 
+**人工返航指令 = 受理 + 收口两条 65021（2026-11-17 §11.6 E 项）**：地面站 65020 `type=1`
+"主动返航"受理（空中任务态，或已离地的起飞阶段/已在返航）时只回 `accepted`（"已开始执行"），
+真正的终点在任务收口时才报——
+S14 落地上锁补 `completed`、S16 任务故障补 `rejected/mission_fault`，两条回执**同
+`command_id`、同 `type`**，地面站按 `command_id` 更新同一条记录；`type=2`（重置）受理当拍
+即离开进行中，没有第二条。机制与判读见「关键实现点」的「延迟终态回执」段。
+
 ## 接口与数据流
 
 ```cpp
@@ -576,6 +583,25 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     `assignment_tracker_.AbortAirborne()`、`RememberTakeoffAbort(kCancelledByGcs)`、
     `TransitionTo(kReturnHome,"地面站主动返航指令，中止任务并返航")`，并发 65015
     `aborted reason=kCancelledByGcs(12)`。**不是 PX4 RTL**：返航轨迹仍由 S12 位置意图控制。
+  - **延迟终态回执（2026-11-17 §11.6 E 项）**：`type=1` 受理当拍只能回"已开始执行"，
+    终态必须等任务真正收口，因此把这条 65020 原样登记在 `Impl::deferred_return_ack_`，
+    收口时补发**第二条 65021**（同 `command_id`、同 `type`）：
+    - **登记点三处**（都先 `RecordExecutedMissionCommandId()`）：`kReturnHome` 已在返航
+      （"继续返航"）、`kArming/kTakeoff` 起飞中止且已离地（`AbortTakeoff` 后状态确为
+      S12）、`kGpsApproach`~`kPostIntercept` 空中态中止进 S12。`kLanding` 分支当拍回
+      `kCompleted/kAlreadyReturning` 直接终态，不登记。
+    - **收口点两处**（都在 `TransitionTo()` 内、`state_` 已改成 `next_state` 之后）：
+      落到 **S14 `kDisarmed`** → `kCompleted/kNone`（`mission_state=14`）；落到
+      **S16 `kFailsafe`** → `kRejected/kMissionFault(7)`（`mission_state=16`）。字段由
+      `PublishMissionCommandAck()` 组装，`type`/`command_id` 逐字复制受理那条，只有
+      `result/reason/mission_state` 变化——地面站按 `command_id` 更新既有记录，不是新增
+      一条指令。
+    - **清空**：`ResetSortieState()`（进程启动与 65020 `type=2` 重置共用）清空登记，避免
+      上一轮的 `command_id` 在下一轮 S14 被"补"出来；补发后立即清空，同一轮只发一次。
+    - **为什么不算重复指令**：去重只针对**新收到的 65020**（`last_mission_command_id_`），
+      补发走 `PublishMissionCommandAck()` 直接出版，不重入 `EvaluateMissionCommand()`；
+      受理那条已占幂等槽位，同一 `command_id` 再下发仍回 `kDuplicateCommand`。
+      `type=2` 重置没有第二条（受理当拍已离开进行中，`ResetSortieState()` 也把登记清空）。
   - **`type=2` 重置任务状态 = 清状态 + 重启 PX4（2026-11-04 引入；2026-11-17 P4b 改语义）**：
     `ExecuteResetStateCommand()` 的准入**只看飞控事实**（`state` 编号只用于幂等与日志，
     不再当门槛）。判据按下列顺序逐条短路：
@@ -1125,6 +1151,9 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 人工指令相关（2026-10-29）：
 - INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
   `任务指令回执已发布: command_id=.. type=.. result=.. reason=.. state=.. count=..`（节流，首条与每 100 条）；
+  `任务指令收口: 补发 65021 type=.. command_id=.. result=.. reason=..`（2026-11-17 起，
+  `type=1` 收口时一条：S14 → `result=1`/`reason=0`，S16 → `result=2`/`reason=7`；
+  与受理那条同 `command_id`，不节流）；
   `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航，按继续返航处理 command_id=..`
   （S12）、`任务指令（主动返航）: 已在返航/降落流程，回执完成`（S13）、
   `任务指令（主动返航）: 当前状态不可执行`。
@@ -1395,6 +1424,18 @@ ctest --test-dir build --output-on-failure
   ctest --test-dir build -R 'ResetGuard_|Reboot_' --output-on-failure
   ./build/mission_state_machine_test --gtest_filter='*ResetGuard_*:*Reboot_*'
   ```
+- 65020 主动返航两条回执（2026-11-17 §11.6 E 项）：
+  `MissionCommandReturnHomeCompletedAckAtLanding`（受理回 `kAccepted/kNone`、`mission_state`
+  已是 S12(12)；落地 disarm 进 S14 后补第二条 65021 `kCompleted/kNone`、`mission_state=14`，
+  `command_id`/`type` 与受理那条一致）、`MissionCommandReturnHomeFailsafeAckOnFault`
+  （受理后任务故障进 S16 → 补 `kRejected/kMissionFault(7)`、`mission_state=16`）。
+  只跑这一组：
+
+  ```bash
+  ctest --test-dir build -R 'MissionCommandReturnHome' --output-on-failure
+  ./build/mission_state_machine_test --gtest_filter='*MissionCommandReturnHome*'
+  ```
+
 - 配置（`interception`/`return_home` 节）：默认值、显式解析、非法窗口/
   返航高度拒绝、`interception.enabled=true` 且 `return_home.enabled=false`
   拒绝（发射后必须有返航收口）。
@@ -1571,6 +1612,14 @@ ctest --test-dir build --output-on-failure
   `0x200007`），排查"为什么没告警/为什么误告警"以日志为准，改配置后必须重启再对一遍。
 - **S13 已落地但不到 S14**：通常为仍 armed 且 DISARM 未 accepted；查 400 命令
   入队/ACK 与 PX4 disarmed 状态。
+- **地面站显示"已受理"后一直不再变化（飞机其实在返航/已落地）**：`type=1` 受理只回
+  `accepted`，终态靠 S14/S16 补第二条同 `command_id` 的 65021。先在机载日志里找
+  `任务指令收口: 补发 65021 type=1 command_id=.. result=.. reason=..`：
+  - **没有这条** → 状态机没走到 S14/S16：按上面「S12 不进入 S13」「S13 已落地但不到
+    S14」两条查（没到收口点自然没有终态回执，不是回执丢了）；
+  - **有这条但界面仍不动** → 地面站侧没按 `command_id` 更新记录（老 Web 把第二条当成
+    "重复指令"丢弃）；Web 与机载需成对升级，机载侧无法替 Web 显示。
+  - `type=2` 重置本来就没有第二条 65021，别拿它套这个现象。
 - **65014 发送后没有 65015**：确认 `SetAssignmentInput` 已绑定且
   `GroundStationLink::MissionAssignmentOutput()` 已接到该 Topic；地址/来源
   不匹配的 65014 由 GroundStationLink 丢弃（设计上不回 65015），不是状态机问题。

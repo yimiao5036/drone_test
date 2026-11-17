@@ -6343,6 +6343,215 @@ TEST(MissionStateMachineTest, MissionCommandAckSequenceIncrementsOnce) {
 }
 
 // ---------------------------------------------------------------------------
+// 65020 返航的延迟终态回执（设计 §11.6 E 项，2026-11-17）
+//
+// 返航受理时只能回一条 accepted（"已开始执行"），任务收口时再补一条**同
+// command_id / 同 type** 的 65021：正常落地 disarm（S14）补 kCompleted，任务
+// 故障终态（S16）补 kRejected / kMissionFault。地面站按 command_id 更新同一条
+// 指令记录；没有第二条回执，界面会永远停在"已受理"（现场"点了返航没反应"的
+// 直接原因）。重置指令（type=2）受理当拍即离开进行中，不享受延迟回执。
+// ---------------------------------------------------------------------------
+
+/// 等待指定 command_id 的 65021（跳过队列里其它回执）。
+std::optional<common::MissionCommandAck> WaitForMissionCommandAckOf(
+    common::Topic<common::MissionCommandAck>::Subscription& subscription,
+    uint32_t command_id, std::chrono::milliseconds timeout = 3000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if ((*message)->command_id == command_id) {
+            return **message;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 在给定窗口内清点（并丢弃）属于指定 command_id 的 65021 条数，
+/// 用于断言"同一条指令全程只有 2 条回执"。
+uint64_t DrainMissionCommandAcksOf(
+    common::Topic<common::MissionCommandAck>::Subscription& subscription,
+    uint32_t command_id, std::chrono::milliseconds window = 400ms) {
+    uint64_t count = 0;
+    const auto deadline = std::chrono::steady_clock::now() + window;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        if ((*message)->command_id == command_id) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+/// 返航受理 → 落地 disarm（S14）→ 补发第二条 65021：result=kCompleted、
+/// reason=kNone、mission_state=14，且同 command_id 全程只有 2 条回执。
+TEST(MissionStateMachineTest, MissionCommandReturnHomeCompletedAckAtLanding) {
+    auto config = MakeTakeoffTestConfig();
+    config.estimator_guard.enabled = false;  // 与既有用例口径一致，避免判据冻结
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(DriveToGpsApproach(harness, 950))
+        << "用例前提：应经 S3/S4 驱动到 S5 空中态";
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "用例前提：应停在空中任务态 S5";
+
+    // S5 注入 65020 type=1（主动返航）→ 第一条回执 accepted。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9500)))
+                    .accepted)
+        << "65020 返航指令应被 Topic 接收";
+    const auto accepted =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(accepted.has_value()) << "受理时应先回一条 65021";
+    EXPECT_EQ(accepted->command_id, 9500U) << "第一条回执必须属于本条指令";
+    EXPECT_EQ(accepted->type, common::MissionCommandType::kReturnHome)
+        << "第一条回执 type 必须回填 kReturnHome";
+    EXPECT_EQ(accepted->result, common::MissionCommandResult::kAccepted)
+        << "受理回执 result 必须是 kAccepted";
+    EXPECT_EQ(accepted->reason, common::MissionCommandReason::kNone)
+        << "受理回执 reason 必须是 kNone";
+    EXPECT_EQ(accepted->mission_state, common::MissionState::kReturnHome)
+        << "受理当拍应已迁移 S12 返航";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "受理后应进入 S12 返航";
+
+    // 持续喂"落地 + 已上锁 + 遥测在线"的快照：S12 → S13 → S14（同拍收口）。
+    const auto landed = MakeOffboardFlight(/*armed=*/false, /*landed=*/true);
+    ASSERT_TRUE(landed.connected) << "用例前提：落地快照必须带遥测在线";
+    ASSERT_TRUE(landed.landed) << "用例前提：快照应确认已落地";
+    ASSERT_FALSE(landed.armed) << "用例前提：快照应确认已上锁（disarm）";
+    ASSERT_TRUE(landed.landed_state_valid) << "用例前提：落地判据必须有效";
+    bool reached_disarmed = false;
+    const auto landing_deadline = std::chrono::steady_clock::now() + 3000ms;
+    while (std::chrono::steady_clock::now() < landing_deadline) {
+        ASSERT_TRUE(PublishFlight(harness.flight_topic, landed))
+            << "落地快照应被 Topic 接收";
+        if (harness.machine.CurrentState() == common::MissionState::kDisarmed) {
+            reached_disarmed = true;
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(reached_disarmed) << "落地 disarm 后应迁移 S14 DISARMED";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kDisarmed, 1000ms)
+                    .has_value())
+        << "65013 也应报告 S14 DISARMED";
+
+    // 第二条同 command_id / 同 type 的 65021：收口补发 kCompleted。
+    const auto completed = WaitForMissionCommandAckOf(
+        harness.mission_command_ack_subscription, 9500U, 3000ms);
+    ASSERT_TRUE(completed.has_value())
+        << "落地 disarm 后必须补发第二条 65021（地面站界面据此结束任务）";
+    EXPECT_EQ(completed->command_id, 9500U) << "补发回执必须复用同一 command_id";
+    EXPECT_EQ(completed->type, common::MissionCommandType::kReturnHome)
+        << "补发回执 type 必须仍是 kReturnHome";
+    EXPECT_EQ(completed->result, common::MissionCommandResult::kCompleted)
+        << "落地 disarm 的终态回执 result 必须是 kCompleted";
+    EXPECT_EQ(completed->reason, common::MissionCommandReason::kNone)
+        << "完成回执 reason 必须是 kNone";
+    EXPECT_EQ(completed->mission_state, common::MissionState::kDisarmed)
+        << "完成回执 mission_state 必须是 S14(14)";
+    EXPECT_EQ(completed->header.sequence, accepted->header.sequence + 1U)
+        << "两条回执序号应连续（中间不得掺入其它 65021）";
+
+    // 同一条指令只补一条终态回执：残留队列里不得再有该 command_id 的回执。
+    EXPECT_EQ(DrainMissionCommandAcksOf(
+                  harness.mission_command_ack_subscription, 9500U, 400ms),
+              0U)
+        << "同一 command_id 全程只应有 2 条回执（accepted + completed）";
+}
+
+/// 返航受理 → 任务故障终态（S16）→ 补发第二条 65021：result=kRejected、
+/// reason=kMissionFault、mission_state=16，且同 command_id 全程只有 2 条回执。
+///
+/// 故障造法与 ResetGuard_FaultRejected 相同：强推 S10 → 捕网触发命令（187）
+/// 入队 → ACK 超时 → HandleMissionFault → S16。强推 S10 不改动延迟回执登记，
+/// 因此第二条回执只能来自 S16 收口。
+TEST(MissionStateMachineTest, MissionCommandReturnHomeFailsafeAckOnFault) {
+    auto config = MakeTakeoffTestConfig();
+    config.estimator_guard.enabled = false;  // 与既有用例口径一致，避免判据冻结
+    config.test_hooks_enabled = true;  // 用例需要 ForceStateForTest 造 S10 故障
+    // 故障终态不补发复位（同既有故障用例），保持队列只含 187。
+    config.actuator.reset_delay = 0ms;
+    config.actuator.reset_settle = 0ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true, MakeFenceFlight()))
+        << "夹具应启动并进入 S2 READY";
+    ASSERT_TRUE(DriveToGpsApproach(harness, 951))
+        << "用例前提：应经 S3/S4 驱动到 S5 空中态";
+    ASSERT_EQ(harness.machine.CurrentState(), common::MissionState::kGpsApproach)
+        << "用例前提：应停在空中任务态 S5";
+
+    // S5 注入 65020 type=1（主动返航）→ 第一条回执 accepted。
+    ASSERT_TRUE(harness.mission_command_topic
+                    .Publish(std::make_shared<const common::MissionCommand>(
+                        MakeMissionCommand(9510)))
+                    .accepted)
+        << "65020 返航指令应被 Topic 接收";
+    const auto accepted =
+        WaitForMissionCommandAck(harness.mission_command_ack_subscription);
+    ASSERT_TRUE(accepted.has_value()) << "受理时应先回一条 65021";
+    EXPECT_EQ(accepted->command_id, 9510U) << "第一条回执必须属于本条指令";
+    EXPECT_EQ(accepted->type, common::MissionCommandType::kReturnHome)
+        << "第一条回执 type 必须回填 kReturnHome";
+    EXPECT_EQ(accepted->result, common::MissionCommandResult::kAccepted)
+        << "受理回执 result 必须是 kAccepted";
+    EXPECT_EQ(accepted->reason, common::MissionCommandReason::kNone)
+        << "受理回执 reason 必须是 kNone";
+    EXPECT_EQ(accepted->mission_state, common::MissionState::kReturnHome)
+        << "受理当拍应已迁移 S12 返航";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kReturnHome, 3000ms)
+                    .has_value())
+        << "受理后应进入 S12 返航";
+
+    // 造任务故障：强推 S10 拦截执行 → 187 入队 → ACK 超时 → S16。
+    harness.machine.ForceStateForTest(common::MissionState::kInterceptExecuting);
+    ASSERT_TRUE(WaitForCommand(harness.sender, 187U, 2000ms))
+        << "S10 应发出捕网触发命令（187）";
+    harness.sender.SimulateTimeout(187U);
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kFailsafe, 2000ms)
+                    .has_value())
+        << "执行器 ACK 超时必须进入 S16 故障态";
+
+    // 第二条回执：故障终态补发 kRejected / kMissionFault。
+    const auto rejected = WaitForMissionCommandAckOf(
+        harness.mission_command_ack_subscription, 9510U, 3000ms);
+    ASSERT_TRUE(rejected.has_value())
+        << "进入 S16 故障终态必须补发第二条 65021";
+    EXPECT_EQ(rejected->command_id, 9510U) << "补发回执必须复用同一 command_id";
+    EXPECT_EQ(rejected->type, common::MissionCommandType::kReturnHome)
+        << "补发回执 type 必须仍是 kReturnHome";
+    EXPECT_EQ(rejected->result, common::MissionCommandResult::kRejected)
+        << "故障终态回执 result 必须是 kRejected";
+    EXPECT_EQ(rejected->reason, common::MissionCommandReason::kMissionFault)
+        << "故障终态回执 reason 必须是 kMissionFault(7)";
+    EXPECT_EQ(rejected->mission_state, common::MissionState::kFailsafe)
+        << "故障终态回执 mission_state 必须是 S16(16)";
+    EXPECT_EQ(rejected->header.sequence, accepted->header.sequence + 1U)
+        << "两条回执序号应连续（中间不得掺入其它 65021）";
+
+    // 同一条指令只补一条终态回执：残留队列里不得再有该 command_id 的回执。
+    EXPECT_EQ(DrainMissionCommandAcksOf(
+                  harness.mission_command_ack_subscription, 9510U, 400ms),
+              0U)
+        << "同一 command_id 全程只应有 2 条回执（accepted + rejected）";
+}
+
+// ---------------------------------------------------------------------------
 // 65020 重置任务状态（2026-11-17 P4b 改写）：清状态 + 重启 PX4
 //
 // 准入从"状态 == S14 DISARMED"改成**飞控事实**：遥测在线 + 未上锁 + 已落地；

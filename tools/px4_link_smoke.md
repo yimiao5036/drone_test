@@ -71,6 +71,7 @@ echo "退出码=$?"
 | `--sitl-offboard-loss` | 仅 UDP，起飞 1m 后停止 setpoint、验证 PX4 退出 Offboard，再 AUTO.LAND 回收；最短 25 秒 |
 | `--sitl-stage4-controller` | 仅 UDP，装配真实 `FlightController` + 意图脚本（G2 执行层门禁）；最短 60 秒 |
 | `--sitl-stage4-mission` | 仅 UDP，装配状态机全链 + 注入模拟数据（G3 全链门禁，含 G2 补验两项）；最短 60 秒 |
+| `--sitl-stage4-reset` | 仅 UDP，**非门禁**：S14 后注入 65020 `type=2` 重置并重启飞控，验收受理→S1→回退 S2→幂等；SITL 的 PX4 恒拒绝 246，恢复段不可覆盖；最短 90 秒（建议 150） |
 | `--bench-stage4-controller` | **仅串口**，G4 拆桨台架：零速引导 → Offboard → ARM → 零速保持 → 四向 0.20m/s 脉冲 → 停发验证；不发送起飞/降落/返航；最短 45 秒（未给 `--duration` 时默认 60 秒） |
 | `--bench-ack-props-off` | 台架安全确认：已拆桨、机体固定、遥控器可随时接管；缺省时台架模式拒绝启动 |
 | `--selftest` | 离线自检工具纯逻辑（G3 意图分类、G4 台架脚本/诊断阈值等），不读配置、不触 SITL/硬件；已纳入 `ctest`（`px4_link_smoke_selftest`） |
@@ -493,6 +494,47 @@ S7 稳定伺服 → 注入 65018(zone=21/1, 半径 100m, 高度带 [2m, 不限],
   `高度=1.04m`（低于下界 2m），S12→S13→S14；包线最大相对高度 5.02m（爬升到返航
   高度）、最大北向 25.77m；迁移 8 次、错误 0；日志
   `tools/sitl_evidence/command_fence_20261028/stage4_fence_altitude_20261028_pass.log`。
+
+### 2.3.9 stage4-reset 重置并重启飞控专项（`--sitl-stage4-reset`，非门禁）
+
+复用 stage4-command 的完整链路（起飞 → S5/S6/S7 → 注入 65020 `type=1` 主动返航 →
+S12 → S13 两段降落 → S14 DISARMED），**在 S14 之后再加两段**，验收 P4b 的
+「重置 = 清任务状态 + 重启 PX4」（设计见
+`docs/降落与估计器保护设计-2026-11-17.md` §6 / §6.7）：
+
+```text
+... S13a 机载受控下降 → S13b AUTO.LAND → S14 DISARMED
+→ 注入 65020 type=2（command_id=2）→ 65021 result=0 accepted / state=1 SELF_CHECK
+   + 机载发 246（MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN param1=1）
+→ SITL 的 PX4 未编 CONFIG_BOARDCTL_RESET，对 246 恒回 DENIED
+→ 机载停止重发、降级回 S2 READY（65013 state=2，远早于 mission.reboot_timeout=90s）
+→ 再注入 65020 type=2（command_id=3）→ 65021 result=1 completed / state=2
+   （已在 READY → 幂等，不再发 246）
+```
+
+```bash
+./build/px4_link_smoke --config config/px4_sitl_assignment.json --duration 150   --sitl-stage4-reset
+```
+
+- 前置：机载（本工具装配的状态机）`mission.reset_reboot_px4=true`（默认）、
+  `landing.enabled=true`（P2 两段降落，默认开）。`config/px4_sitl.json` 与
+  `config/px4_sitl_assignment.json` 均满足。
+- 判据（工具报告逐条 PASS/FAIL）：
+  1. 第 1 条 65020 `type=2` 已下发；
+  2. 65021 `result=0 accepted`、`reason=0`、`mission_state=S1 SELF_CHECK`；
+  3. 65013 回到 `S2 READY`，且距下发 < `mission.reboot_timeout`（90 s）；
+  4. 同一 `command_id` 只回一条 65021（两条重置各 1 条）；
+  5. 第 2 条 65021 `result=1 completed`、`reason=0`、`mission_state=S2 READY`；
+  6. 收尾时状态仍是 S2 READY。
+- **SITL 边界**：PX4 SITL 未编板级 reset 能力（`CONFIG_BOARDCTL_RESET`），246 恒回
+  `MAV_RESULT_DENIED`，因此本场景只覆盖「受理 → S1 → 降级回退 S2 → 幂等」；
+  「等飞控重新上线（心跳 + 3D fix + 全局位置 + Home）」的**恢复段不可能在 SITL
+  覆盖**，由状态机单测（`Reboot_*`）与真机拆桨台架/首飞前实测负责。
+- 观测口径：状态机每 500ms 才发一次 65013，而 SITL 的 PX4 对 246 几乎立刻拒绝，
+  S1 可能只活一个决策拍（100ms）；因此「S1 已发生」以 65021 回执里的
+  `mission_state=S1` 为准（报告另打印 65013 是否真的抓到 S1 帧，仅作诊断）。
+- **非门禁**：与 stage4-command 同性质，不替代 G2/G3；恢复段未覆盖前不得据此
+  认为真机重启已验证。
 
 ### 2.4 消息流可用性只读探针（`--probe-message-interval <消息ID>`，2026-10-16）
 

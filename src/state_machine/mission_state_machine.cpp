@@ -746,6 +746,9 @@ public:
         px4_reboot_timeout_logged_ = false;
         px4_reboot_retry_exhausted_logged_ = false;
         last_px4_reboot_ms_ = 0;
+        // 延迟终态回执（§11.6 E 项）：重置/新一轮任务不继承上一轮的待补回执，
+        // 否则会在新任务的 S14 补一条属于旧 command_id 的 65021。
+        deferred_return_ack_.reset();
     }
 
     /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
@@ -2348,6 +2351,30 @@ private:
         }
     }
 
+    /// 登记"延迟终态回执"（§11.6 E 项，2026-11-17）：65020 返航受理时只能回
+    /// `kAccepted`（"已开始执行"），真正的收口在 S14（落地 disarm）或 S16（故障）。
+    /// 不补这条回执，地面站界面会永远停在"已受理"——这正是 2026-11-17 现场
+    /// "点了返航没反应"的直接原因（飞机其实完成了返航+降落，界面没变）。
+    /// 补发的是**同一 command_id 的第二条 65021**，地面站按 command_id 更新记录。
+    void RememberDeferredReturnAck(const common::MissionCommand& command) {
+        deferred_return_ack_ = command;
+    }
+
+    /// 在 S14/S16 收口时补发延迟的终态回执（无待补回执时什么都不做）。
+    void FlushDeferredMissionCommandAck(common::MissionCommandResult result,
+                                        common::MissionCommandReason reason) {
+        if (!deferred_return_ack_.has_value()) {
+            return;
+        }
+        const common::MissionCommand command = *deferred_return_ack_;
+        deferred_return_ack_.reset();
+        SPDLOG_INFO(
+            "任务指令收口: 补发 65021 type={} command_id={} result={} reason={}",
+            static_cast<int>(command.type), command.command_id,
+            static_cast<int>(result), static_cast<int>(reason));
+        PublishMissionCommandAck(command, result, reason);
+    }
+
     /// 地面站任务指令（65020，2026-10-29）：当前只支持"主动返航"。
     ///
     /// 与自动通道的关系：到点判据超时返航、围栏越界返航、低电返航、目标丢失
@@ -2356,7 +2383,9 @@ private:
     /// 重复：谁先触发谁生效，后续守卫看到状态已离开任务态自然跳过。
     ///
     /// 只对空中任务态（S3~S11）生效；地面与终态回拒绝，已在返航/降落回"已完成"。
-    /// 每条指令只回一条 65021（含拒绝与重复），同 command_id 重发不重复执行。
+    /// 每条指令至少一条 65021（含拒绝与重复），同 command_id 重发不重复执行；
+    /// **`type=1` 受理成功后会再多一条终态回执**（S14 `kCompleted` / S16
+    /// `kRejected/kMissionFault`，2026-11-17 §11.6 E 项，见 FlushDeferredMissionCommandAck）。
     void EvaluateMissionCommand(uint64_t now_ms) {
         if (!latest_mission_command_.has_value()) {
             return;
@@ -2409,6 +2438,7 @@ private:
         // “目标状态已达成”，容易被误读为已到达）。
         if (state == common::MissionState::kReturnHome) {
             RecordExecutedMissionCommandId(command.command_id);
+            RememberDeferredReturnAck(command);
             return_best_distance_m_ = std::numeric_limits<double>::max();
             return_progress_ms_ = 0;
             return_stall_warned_ms_ = 0;
@@ -2434,6 +2464,9 @@ private:
             AbortTakeoff(common::MissionAssignmentReason::kCancelledByGcs,
                          "地面站主动返航指令");
             const bool returning = CurrentState() == common::MissionState::kReturnHome;
+            if (returning) {
+                RememberDeferredReturnAck(command);
+            }
             SPDLOG_WARN("任务指令（主动返航）: 起飞阶段中止 returning={} command_id={}",
                         returning, command.command_id);
             PublishMissionCommandAck(
@@ -2457,6 +2490,7 @@ private:
             TransitionTo(common::MissionState::kReturnHome,
                          "地面站主动返航指令，中止任务并返航");
             PublishTakeoffAbortAck(common::MissionAssignmentReason::kCancelledByGcs);
+            RememberDeferredReturnAck(command);
             PublishMissionCommandAck(command, common::MissionCommandResult::kAccepted,
                                      common::MissionCommandReason::kNone);
             return;
@@ -5999,6 +6033,16 @@ private:
                 // S6 冻结段保持交接时刻最后一条 S5 意图（见 FreezeHandoverTarget）。
             }
         }
+        // 延迟终态回执（§11.6 E 项，2026-11-17）：返航指令在受理时只能回"已受理"，
+        // 落地 disarm（S14）才是"已完成"；故障终态（S16）则回"被拒绝/故障"，
+        // 避免地面站界面永远停在"已受理"。
+        if (next_state == common::MissionState::kDisarmed) {
+            FlushDeferredMissionCommandAck(common::MissionCommandResult::kCompleted,
+                                           common::MissionCommandReason::kNone);
+        } else if (next_state == common::MissionState::kFailsafe) {
+            FlushDeferredMissionCommandAck(common::MissionCommandResult::kRejected,
+                                           common::MissionCommandReason::kMissionFault);
+        }
         PublishStatus(now_ms);
     }
 
@@ -6322,6 +6366,9 @@ private:
     uint64_t px4_reboot_fail_count_ = 0;   ///< 246 入队失败累计（节流告警）
     /// 上次重启时刻（`mission.reboot_min_interval` 的最小间隔判据）。
     uint64_t last_px4_reboot_ms_ = 0;
+    /// 待补终态回执的 65020（§11.6 E 项，2026-11-17）：返航指令受理后暂存，
+    /// S14 补 `kCompleted`、S16 补 `kRejected/kMissionFault`，随后清空。
+    std::optional<common::MissionCommand> deferred_return_ack_;
     /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
     /// S3 时序/S4 爬升在 Task 5 使用）。
     const config::TakeoffConfig takeoff_;
