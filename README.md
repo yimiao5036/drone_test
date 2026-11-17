@@ -11,6 +11,10 @@
 - **运行模式**：`config/config.json` 的 `runtime.enable_control=true`（2026-10-30 起为仓库默认，
   现场实测期）＝**控制运行**；改成 `false` 重启即 **只读运行**（只采日志、不下发控制）。
   定义见 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)。
+- **估计器降级处置**（2026-11-17 P3）：`EstimatorGuard` 判据命中即**锁存** → 切 `POSCTL(3/0)`、
+  停发一切控制意图、冻结任务推进（不自动返航/降落/上锁），恢复只能「重置任务状态」或重启；
+  `estimator_guard.enabled=false` 是唯一回滚开关。见
+  [`docs/降落与估计器保护设计-2026-11-17.md`](docs/降落与估计器保护设计-2026-11-17.md) §5.6。
 - 两个发射闸门仍关：`interception.enabled=false`（生产不自动触发捕网）、
   `actuator.gcs_fire_enabled=false`（65016 直控不装配）。
 - `TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 是**观测**模块（跑真实算法、
@@ -24,7 +28,7 @@
 ```bash
 cmake -S . -B build
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure     # 771/771
+ctest --test-dir build --output-on-failure     # 778/778
 python3 tools/check_docs.py                    # 文档基线/链接检查
 ./build/drone_control                          # 生成 logs/0001_xxx.log
 ```

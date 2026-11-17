@@ -105,6 +105,12 @@ struct MissionStateMachineConfig {
     /// 是否真走 S13a 只取决于 `enabled` 与命令接口是否注入（`SetCommandSender`）：
     /// 影子装配不注入命令接口，自然保持"S13 直接 AUTO.LAND"的旧路径。
     config::LandingConfig landing;
+    /// 估计器降级判据与处置（estimator_guard 配置节，2026-11-17 降落与估计器保护 P3）：
+    /// 每拍把最新飞行快照喂 `EstimatorGuard`（`state_machine/estimator_guard.h`），
+    /// 任一判据命中即**锁存**→ 切 `POSCTL` 悬停、停发一切控制意图、冻结任务推进
+    /// （不自动返航/降落/上锁），只等飞手接 `STABILIZED` 处置（设计 §5）。
+    /// `enabled=false` 是回滚开关：判据完全不跑，行为回到 P2。
+    config::EstimatorGuardConfig estimator_guard;
     /// 多边形围栏（fence 配置节，2026-10-29）：机载自治围栏——区域缓存装载、
     /// 越界判定与中止、位置意图钳制。默认关闭（回退 Home 圆形围栏）。
     config::FenceConfig fence;
@@ -247,6 +253,14 @@ public:
     common::MissionState CurrentState() const override;
     uint64_t TransitionCount() const override;
     uint64_t ErrorCount() const override;
+
+    /// 估计器降级是否已锁存（P3，2026-11-17；测试/SITL 断言用，不参与控制决策）。
+    /// 判据命中且**已注入命令接口**（控制运行）时为 true；只读运行只告警不冻结，
+    /// 因此这里保持 false。锁存后只有「重置任务状态」（65020 type=2）或程序重启
+    /// 能清除，判据本身不自动恢复（设计 §5.3）。
+    ///
+    /// 非虚接口：只给具体实现与测试用，不扩张 `IMissionStateMachine` 契约。
+    bool EstimatorDegraded() const;
 
     // ---- 测试入口（生产装配不可达） ----
     /// 强制提交一次状态迁移（单测/SITL 验收入口；Start 后调用，由决策线程消费

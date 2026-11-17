@@ -364,6 +364,10 @@ TEST(MissionStateMachineTest, IntentValidityComesFromConfig) {
     common::Topic<common::VisualTargetStatus> visual_status_topic;
     common::Topic<common::StereoTargetDistance> distance_topic;
     state_machine::MissionStateMachineConfig config;
+    // P3 估计器判据：既有用例的快照不模拟 LOCAL_POSITION_NED 新鲜度（P1 新增字段），
+    // 判据会在首个 armed 拍即判"局部位置超时"并冻结任务，故这些用例显式关闭；
+    // 判据接线本身由 EstimatorGuard_* 三条用例覆盖。
+    config.estimator_guard.enabled = false;
     config.intent_valid_for = 450ms;
     state_machine::MissionStateMachine machine(config);
     machine.SetInputs(ground_target_topic, flight_topic, health_topic);
@@ -523,6 +527,8 @@ state_machine::MissionStateMachineConfig MakeHandoverTestConfig(
     std::chrono::milliseconds visual_stale = 5000ms,
     std::chrono::milliseconds distance_stale = 5000ms) {
     state_machine::MissionStateMachineConfig config;
+    // 见上方：既有用例关闭估计器判据
+    config.estimator_guard.enabled = false;
     config.visual_stale = visual_stale;
     config.distance_stale = distance_stale;
     config.handover.enter_s6_lock_frames = 3;
@@ -1304,6 +1310,8 @@ constexpr float kNetIdleNormalized = 0.0F;
 /// 显式开启测试钩子（拦截序列无生产入口，用例经 `ForceStateForTest` 驱动）。
 state_machine::MissionStateMachineConfig MakeNetActuatorTestConfig() {
     state_machine::MissionStateMachineConfig config;
+    // 见上方：既有用例关闭估计器判据
+    config.estimator_guard.enabled = false;
     config.actuator.net_channel = 3;
     config.test_hooks_enabled = true;
     // 本组用例只验证捕网执行器触发/复位语义；关闭单发自动返航，
@@ -1519,6 +1527,8 @@ common::FlightStateSnapshot MakeReturnHomeFlight(float x_m, float y_m, float z_m
 state_machine::MissionStateMachineConfig MakeReturnHomeTestConfig() {
     state_machine::MissionStateMachineConfig config;
     config.test_hooks_enabled = true;
+    // 见上方：既有用例关闭估计器判据
+    config.estimator_guard.enabled = false;
     // 不读不写 config/zone.json：返航用例不应受工作目录里残留区域影响
     // （2026-11-04 曾有用例注入 alt_max=3 的区域落盘，导致后续用例误判）。
     config.fence.zone_cache_path.clear();
@@ -2463,6 +2473,8 @@ TEST(MissionStateMachineTest, Landing_RollbackSwitchKeepsOldPath) {
 state_machine::MissionStateMachineConfig MakeInterceptEntryTestConfig() {
     state_machine::MissionStateMachineConfig config;
     config.test_hooks_enabled = true;
+    // 见上方：既有用例关闭估计器判据
+    config.estimator_guard.enabled = false;
     config.interception.enabled = true;
     config.interception.auto_authorize = true;
     config.interception.enter_s9_lock_frames = 3;
@@ -2674,6 +2686,8 @@ std::optional<common::MissionAssignmentAck> WaitForAssignmentAck(
 /// S3/S4 用例显式传入 `MakeTakeoffTestConfig()`（缩短时序）。
 state_machine::MissionStateMachineConfig MakeAssignmentHarnessConfig() {
     state_machine::MissionStateMachineConfig config;
+    // 见上方：既有用例关闭估计器判据
+    config.estimator_guard.enabled = false;
     config.takeoff.bootstrap_lead = 5000ms;
     config.takeoff.mode_timeout = 5000ms;
     config.takeoff.arm_timeout = 5000ms;
@@ -2690,6 +2704,8 @@ state_machine::MissionStateMachineConfig MakeTakeoffTestConfig(
     std::chrono::milliseconds height_timeout = 3000ms,
     double height_m = 0.5, double climb_rate_mps = 0.5) {
     state_machine::MissionStateMachineConfig config;
+    // 见上方：既有用例关闭估计器判据
+    config.estimator_guard.enabled = false;
     auto& takeoff = config.takeoff;
     takeoff.bootstrap_lead = lead;
     takeoff.mode_timeout = mode_timeout;
@@ -6985,6 +7001,294 @@ TEST(MissionStateMachineTest, S5TargetOutsideUsesBit9NotBit7) {
     EXPECT_EQ(harness.machine.CurrentState(),
               common::MissionState::kGpsApproach)
         << "目标出区保持不得中止任务";
+}
+
+// ---------------------------------------------------------------------------
+// P3 估计器降级处置（2026-11-17，设计 §5 / §11.3）
+//
+// 判据模块自身（13 条的极性、阈值、锁存）由 estimator_guard_test.cpp 覆盖；
+// 这里只验证状态机侧接线三件事：
+// 1. 命中 → 恰好切一次 POSCTL（176 + 1/3/0）并**锁存**（后续同等跳变不再切）；
+// 2. 未上锁（地面上）不动作——地面 EKF 重置无害，不能切模式；
+// 3. 降级后冻结任务：不交段（不发 AUTO.LAND 4/6）、不再发控制意图、状态不推进。
+// 恢复只允许"重置任务状态"或程序重启（设计 §5.5），所以锁存是硬要求。
+// ---------------------------------------------------------------------------
+
+/// P3 用例快照：在既有返航/降落 helper 之上补 LOCAL_POSITION_NED 新鲜度
+/// （P1 新增字段）。判据的第一条是"局部位置超时 >500ms"，所以时间戳必须取
+/// 真实单调时钟附近的递增值（由用例给定），不能写死字面量——否则判据在首个
+/// armed 拍就命中"超时"，用例验证的就不再是注入的 z 跳变了。
+common::FlightStateSnapshot MakeEstimatorGuardFlight(float z_m, uint64_t stamp_ms,
+                                                     bool armed = true) {
+    common::FlightStateSnapshot flight =
+        MakeReturnHomeFlight(0.f, 0.f, z_m, /*vx=*/0.f, /*vy=*/0.f, /*vz=*/0.f,
+                             armed);
+    flight.local_position_valid = true;
+    flight.local_position_time_valid = true;
+    flight.local_position_time_ms = stamp_ms;
+    return flight;
+}
+
+/// 发布一帧 P3 用例快照，返回 Topic 是否接收（队列满时静默丢弃，故返回 false）。
+bool PublishEstimatorGuardFlight(
+    common::Topic<common::FlightStateSnapshot>& flight_topic, float z_m,
+    uint64_t stamp_ms, bool armed = true) {
+    return flight_topic
+        .Publish(std::make_shared<const common::FlightStateSnapshot>(
+            MakeEstimatorGuardFlight(z_m, stamp_ms, armed)))
+        .accepted;
+}
+
+// 用例 1：命中判据 → 切 POSCTL 恰好一次并锁存。
+// 现场事故就是 EKF 全状态重置把 local z 在单拍内平移约 9m（设计 §1.1），
+// 这条用例锁住"一帧命中即切、切完不再重试"的处置语义。
+TEST(MissionStateMachineTest, EstimatorGuard_DegradedSwitchesToPosctlOnceAndLatches) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachineConfig config;
+    config.test_hooks_enabled = true;
+    // 判据必须开启（生产语义）：P3 接线由本组三条用例覆盖。
+    config.estimator_guard.enabled = true;
+    // 不读不写 config/zone.json：避免工作目录里残留区域影响用例。
+    config.fence.zone_cache_path.clear();
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 基线帧：上锁、局部位置新鲜、z=0、静止。
+    const uint64_t t0 = TestMonotonicMs();
+    ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, 0.f, t0))
+        << "基线快照应被 Topic 接收";
+    // 决策线程每拍 DrainInputs 只保留最新帧：两帧必须分开喂，
+    // 否则跳变帧会把基线帧挤掉、判据拿不到"上一拍位置"。
+    std::this_thread::sleep_for(150ms);
+
+    // 跳变帧：同一上锁状态，局部位置时间戳 +100ms，z 单拍 +9m
+    // （远超 0.5m 门限与 |vz|·dt+0.1m 的速度余量）。
+    ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, 9.f, t0 + 100))
+        << "跳变快照应被 Topic 接收";
+
+    // 轮询等待锁存（上限 2s、10ms 节拍）：不写死 sleep，机器负载高时也不误判。
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !machine.EstimatorDegraded()) {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    ASSERT_TRUE(machine.EstimatorDegraded())
+        << "单拍 9m 高度跳变应立即锁存估计器降级";
+
+    // 切模式命令：DO_SET_MODE(176) + custom mode enabled(1) + PX4 主模式 POSCTL(3)
+    // + 子模式 0，其余参数必须为 0（不得带无关参数扰动模式切换）。
+    const auto history = sender.History();
+    uint64_t switch_count = 0;
+    for (const auto& call : history) {
+        if (call.command != 176U) {
+            continue;
+        }
+        ++switch_count;
+        EXPECT_FLOAT_EQ(call.params[0], 1.0f)
+            << "param1 必须是 custom mode enabled=1";
+        EXPECT_FLOAT_EQ(call.params[1], 3.0f)
+            << "param2 必须是 PX4 主模式 POSCTL=3";
+        EXPECT_FLOAT_EQ(call.params[2], 0.0f)
+            << "param3 必须是子模式 0（POSCTL 无子模式）";
+        const bool tail_zero = call.params[3] == 0.0f &&
+                               call.params[4] == 0.0f &&
+                               call.params[5] == 0.0f &&
+                               call.params[6] == 0.0f;
+        EXPECT_TRUE(tail_zero) << "param4~7 必须为 0";
+    }
+    EXPECT_EQ(switch_count, 1U) << "命中后应恰好发一条 176，实际 " << switch_count;
+
+    // 再连续喂 3 帧"新的等同跳变"（时间戳继续递增）→ 锁存后不得重复切模式。
+    const float repeated_z[] = {0.0f, 9.0f, 0.0f};
+    for (float z_m : repeated_z) {
+        ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, z_m,
+                                                TestMonotonicMs()))
+            << "锁存后的快照仍应被 Topic 接收";
+        std::this_thread::sleep_for(100ms);
+    }
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(CountCommands(sender, 176U), 1U)
+        << "判据已锁存，后续同等跳变不得重复切模式（历史里最多一条 176）";
+
+    machine.Stop();
+}
+
+// 用例 2：未上锁不动作（地面上 EKF 重置无害，设计 §3.3 判据入口约定）。
+// 未上锁时只刷新判据基线：不置位、不切模式；连局部位置时间戳缺失也不得置位，
+// 否则上电/罗盘对齐阶段就会被误判成"局部位置超时"并切 POSCTL。
+// `ForceStateForTest` 在本配置下不可用（test_hooks_enabled 默认 false），
+// 因此这里只按生产语义断言"未上锁时不动作"。
+TEST(MissionStateMachineTest, EstimatorGuard_DisarmedDoesNotReact) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachineConfig config;
+    config.estimator_guard.enabled = true;
+    // 不读不写 config/zone.json（同用例 1）。
+    config.fence.zone_cache_path.clear();
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    // 注入命令接口：证明"没有切模式命令"不是因为没地方发，而是判据没动作。
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 未上锁 + 大幅 z 跳变（0 ↔ 9m 往复）：每一帧都带真实时间戳。
+    for (int round = 0; round < 5; ++round) {
+        const float z_m = (round % 2 == 0) ? 0.0f : 9.0f;
+        auto flight =
+            MakeEstimatorGuardFlight(z_m, TestMonotonicMs(), /*armed=*/false);
+        if (round == 4) {
+            // 末帧连 LOCAL_POSITION_NED 时间戳都缺：未上锁时哨兵同样不得置位。
+            flight.local_position_time_valid = false;
+            flight.local_position_time_ms = 0;
+        }
+        ASSERT_TRUE(flight_topic
+                        .Publish(std::make_shared<const common::FlightStateSnapshot>(
+                            flight))
+                        .accepted)
+            << "未上锁快照应被 Topic 接收";
+        std::this_thread::sleep_for(80ms);
+    }
+    std::this_thread::sleep_for(300ms);  // 留出 ≥3 个决策周期
+
+    EXPECT_FALSE(machine.EstimatorDegraded())
+        << "未上锁时不得锁存估计器降级（地面 EKF 重置无害）";
+    EXPECT_EQ(CountCommands(sender, 176U), 0U) << "未上锁时不得切 POSCTL";
+
+    machine.Stop();
+}
+
+// 用例 3：降级后冻结任务——不交段（不发 AUTO.LAND 4/6）、不再发控制意图、
+// 状态不推进。装配复用 Landing_DescentReachesHandover 的路径：喂 10m 相对高度
+// 的 Offboard 空中快照 → 强推 S13 → S13a 每拍发下降意图（低位原因码 12）；
+// 判据命中（z 单拍 9m 跳变）后本用例持续喂新鲜快照 1.5s，检查三件事都不再发生。
+TEST(MissionStateMachineTest, EstimatorGuard_FreezesMissionAndStopsIntents) {
+    auto config = MakeLandingDescentTestConfig();
+    // 工厂默认关闭判据（既有用例不模拟局部位置新鲜度）；本用例必须开启。
+    config.estimator_guard.enabled = true;
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 每轮喂一帧新鲜快照并抽干意图队列。周期取 100ms（= 决策周期）：既保证
+    // 判据看到的局部位置始终新鲜（<500ms），也不超过意图订阅容量（队列满时
+    // Topic 静默丢弃，计数必须边喂边取，不能用阻塞接口）。
+    bool saw_landing_descent_intent = false;
+    bool state_left_landing = false;
+    auto pump = [&](std::chrono::milliseconds duration, float z_m) {
+        uint64_t intent_count = 0;
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        while (std::chrono::steady_clock::now() < deadline) {
+            (void)PublishEstimatorGuardFlight(flight_topic, z_m,
+                                              TestMonotonicMs());
+            while (auto message = intent_subscription.TryTake()) {
+                ++intent_count;
+                const auto& intent = **message;
+                // 低位原因码 12 = 降落下降（kReasonLandingDescent）。
+                if (intent.type == common::ControlIntentType::kPositionGuide &&
+                    (intent.reason_code & 0xFFU) == 12U) {
+                    saw_landing_descent_intent = true;
+                }
+            }
+            // 降级后冻结的持续性检查：每一拍都看，而不是只看窗口结尾。
+            if (machine.CurrentState() != common::MissionState::kLanding) {
+                state_left_landing = true;
+            }
+            std::this_thread::sleep_for(100ms);
+        }
+        return intent_count;
+    };
+
+    // S13a 装配：相对高度 10m、Offboard 6/0、上锁 → 强推 kLanding。
+    ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, -10.f,
+                                            TestMonotonicMs()))
+        << "S13a 初始快照应被 Topic 接收";
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+    // ForceStateForTest 由决策线程异步消费，先等到真的在 kLanding 再开始计数。
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               machine.CurrentState() != common::MissionState::kLanding) {
+            (void)PublishEstimatorGuardFlight(flight_topic, -10.f,
+                                              TestMonotonicMs());
+            std::this_thread::sleep_for(20ms);
+        }
+    }
+    ASSERT_EQ(machine.CurrentState(), common::MissionState::kLanding)
+        << "应已进入 S13 降落段（S13a）";
+
+    // 降级前：S13a 每决策拍发一条下降意图，作为"降级后停发"的对照。
+    const uint64_t intents_before = pump(600ms, -10.f);
+    ASSERT_GT(intents_before, 0U)
+        << "S13a 应持续发布下降意图（降级后停发的对照基线）";
+    ASSERT_TRUE(saw_landing_descent_intent)
+        << "S13a 意图必须带低位原因码 12（降落下降）";
+    ASSERT_FALSE(machine.EstimatorDegraded()) << "未注入跳变前不得锁存降级";
+    ASSERT_FALSE(state_left_landing) << "降级前应稳定停在 S13";
+
+    // 注入降级：z 从 -10m 单拍跳到 -19m（9m）。先空一个决策拍让输入队列排空，
+    // 避免注入帧被"队列满静默丢弃"。
+    std::this_thread::sleep_for(150ms);
+    ASSERT_TRUE(PublishEstimatorGuardFlight(flight_topic, -19.f,
+                                            TestMonotonicMs()))
+        << "降级注入快照应被 Topic 接收";
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 2000ms;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !machine.EstimatorDegraded()) {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    ASSERT_TRUE(machine.EstimatorDegraded())
+        << "S13a 期间 z 单拍 9m 跳变应锁存降级";
+
+    // 清掉降级当拍可能残留的意图，再从下一拍开始计数。
+    while (intent_subscription.TryTake().has_value()) {
+    }
+
+    // 观察窗：持续喂新鲜快照，状态机不得再发任何控制意图。
+    const uint64_t intents_after_window = pump(1500ms, -19.f);
+    // 再喂 ~300ms：意图计数必须保持不变（不再增长）。
+    const uint64_t intents_after_second = pump(300ms, -19.f);
+
+    EXPECT_FALSE(state_left_landing)
+        << "降级后状态机不得离开 S13（不推进/不返航/不进 S14）";
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kLanding)
+        << "降级后任务状态必须冻结在 kLanding";
+    // 判据命中确实切了 POSCTL（176 一条），但绝不允许交段 AUTO.LAND（176 + 4/6）。
+    EXPECT_EQ(CountCommands(sender, 176U), 1U)
+        << "判据命中应恰好切一次 POSCTL（176），不得有第二条";
+    for (const auto& call : sender.History()) {
+        if (call.command != 176U) {
+            continue;
+        }
+        EXPECT_FALSE(call.params[1] == 4.0f && call.params[2] == 6.0f)
+            << "降级后不得交段（不得发 AUTO.LAND 4/6）";
+    }
+    EXPECT_EQ(intents_after_window, 0U)
+        << "降级后 1.5s 内不得再发控制意图，实际 " << intents_after_window;
+    EXPECT_EQ(intents_after_second, 0U)
+        << "降级后意图计数不得增长，实际 " << intents_after_second;
+
+    machine.Stop();
 }
 
 }  // namespace

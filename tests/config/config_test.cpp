@@ -1460,6 +1460,105 @@ TEST(ConfigTest, LandingSlowZoneNotAboveTargetRejected) {
     std::filesystem::remove(path);
 }
 
+// 估计器降级判据（estimator_guard 节，2026-11-17 P3）：整节缺席时全部回退
+// EstimatorGuardThresholds 默认值，且默认开启（enabled 是唯一回滚开关）。
+TEST(ConfigTest, EstimatorGuardDefaultsWhenSectionMissing) {
+    json value = ReadSourceConfig();
+    value.erase("estimator_guard");
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_estimator_guard_default.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.estimator_guard.enabled);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.z_jump_m, 0.5);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.z_jump_speed_margin_m, 0.1);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.xy_jump_m, 1.0);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.xy_jump_speed_margin_m, 0.3);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.ratio_limit, 1.0);
+    EXPECT_EQ(config.estimator_guard.ratio_hold.count(), 1000);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.baro_divergence_m, 1.5);
+    EXPECT_EQ(config.estimator_guard.baro_hold.count(), 2000);
+    EXPECT_EQ(config.estimator_guard.sensor_hold.count(), 1000);
+    EXPECT_EQ(config.estimator_guard.local_position_stale.count(), 500);
+    EXPECT_EQ(config.estimator_guard.critical_sensor_mask, 0u);
+    EXPECT_EQ(config.estimator_guard.bad_estimator_flag_mask, 0u);
+    std::filesystem::remove(path);
+}
+
+// 只写部分键时其余键回退默认（阈值可以一个一个调，不必整节照抄）。
+TEST(ConfigTest, EstimatorGuardPartialOverridesKeepDefaults) {
+    json value = ReadSourceConfig();
+    json partial = json::object();
+    partial["enabled"] = false;
+    partial["z_jump_m"] = 1.2;
+    value["estimator_guard"] = partial;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_estimator_guard_partial.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_FALSE(config.estimator_guard.enabled);
+    EXPECT_DOUBLE_EQ(config.estimator_guard.z_jump_m, 1.2);
+    // 未写的键仍是默认值。
+    EXPECT_DOUBLE_EQ(config.estimator_guard.xy_jump_m, 1.0);
+    EXPECT_EQ(config.estimator_guard.ratio_hold.count(), 1000);
+    EXPECT_EQ(config.estimator_guard.baro_hold.count(), 2000);
+    EXPECT_EQ(config.estimator_guard.sensor_hold.count(), 1000);
+    EXPECT_EQ(config.estimator_guard.local_position_stale.count(), 500);
+    EXPECT_EQ(config.estimator_guard.critical_sensor_mask, 0u);
+    EXPECT_EQ(config.estimator_guard.bad_estimator_flag_mask, 0u);
+    std::filesystem::remove(path);
+}
+
+// 越界阈值在加载期拒绝：填错一个数量级就是漏报或误报（比默认值更危险）。
+TEST(ConfigTest, EstimatorGuardOutOfRangeRejected) {
+    // z 单拍跳变门限 10 m：现场 9 m 的重置就漏报了。
+    json jump = ReadSourceConfig();
+    jump["estimator_guard"] = json::object();
+    jump["estimator_guard"]["z_jump_m"] = 10.0;
+    const auto jump_path =
+        WriteTemporaryConfig(jump, "drone_config_estimator_guard_jump.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(jump_path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(jump_path);
+
+    // 新息比持续时长 50 ms：正常噪声抖一下就会切 POSCTL（误报）。
+    json hold = ReadSourceConfig();
+    hold["estimator_guard"] = json::object();
+    hold["estimator_guard"]["ratio_hold_ms"] = 50;
+    const auto hold_path =
+        WriteTemporaryConfig(hold, "drone_config_estimator_guard_hold.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(hold_path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(hold_path);
+}
+
+// 两个掩码：显式非 0 原样保存（值由 MAV_SYS_STATUS_SENSOR_* /
+// ESTIMATOR_STATUS_FLAGS 定义），显式 0 不被默认值覆盖（0 本身有语义）。
+TEST(ConfigTest, EstimatorGuardMasksPreservedWhenExplicit) {
+    json explicit_mask = ReadSourceConfig();
+    json mask = json::object();
+    mask["critical_sensor_mask"] = 1048576;
+    mask["bad_estimator_flag_mask"] = 1;
+    explicit_mask["estimator_guard"] = mask;
+    const auto mask_path = WriteTemporaryConfig(
+        explicit_mask, "drone_config_estimator_guard_masks.json");
+    const auto masked =
+        drone::config::LoadAppConfig(mask_path.string(), "/opt/drone");
+    EXPECT_EQ(masked.estimator_guard.critical_sensor_mask, 1048576u);
+    EXPECT_EQ(masked.estimator_guard.bad_estimator_flag_mask, 1u);
+    std::filesystem::remove(mask_path);
+
+    json zero_mask = ReadSourceConfig();
+    json zero = json::object();
+    zero["critical_sensor_mask"] = 0;
+    zero["bad_estimator_flag_mask"] = 0;
+    zero_mask["estimator_guard"] = zero;
+    const auto zero_path = WriteTemporaryConfig(
+        zero_mask, "drone_config_estimator_guard_masks_zero.json");
+    const auto zeroed = drone::config::LoadAppConfig(zero_path.string(), "/opt/drone");
+    EXPECT_EQ(zeroed.estimator_guard.critical_sensor_mask, 0u);
+    EXPECT_EQ(zeroed.estimator_guard.bad_estimator_flag_mask, 0u);
+    std::filesystem::remove(zero_path);
+}
+
 TEST(ZoneStoreTest, SaveThenLoadRoundTrips) {
     const auto path =
         std::filesystem::temp_directory_path() / "drone_zone_roundtrip.json";

@@ -49,6 +49,7 @@
 #include "control/visual_control_law.h"
 #include "perception/geodetic_converter.h"
 #include "perception/target_estimator.h"
+#include "state_machine/estimator_guard.h"
 #include "state_machine/handover_wait.h"
 #include "state_machine/interception_device.h"
 #include "state_machine/mission_assignment.h"
@@ -176,6 +177,21 @@ constexpr float kPx4MainModeOffboard = 6.0F;
 constexpr float kPx4SubModeOffboard = 0.0F;
 constexpr float kPx4MainModeAuto = 4.0F;
 constexpr float kPx4SubModeAutoLand = 6.0F;
+/// 估计器降级的处置目标模式（2026-11-17 P3）：PX4 主模式 3=POSCTL（自稳 + 位置环），
+/// 无子模式。设计稿写"types.h 新常量"，实际与上面 6/4 这些模式编码放在同一处
+/// ——模式编码只在本文件与 Px4Link 消费，分散到 types.h 反而要多维护一份。
+/// 选 POSCTL 的理由：EKF 的水平/垂直估计已不可信，但**角速度/姿态环仍可用**；
+/// POSCTL 让 PX4 用自身位置环悬停（位置冻结在切模式那一刻），不再吃我们的
+/// Offboard 设定值，飞手接管时也只需切 STABILIZED。
+constexpr float kPx4MainModePosctl = 3.0F;
+constexpr float kPx4SubModePosctl = 0.0F;
+/// 估计器降级时切 POSCTL 的入队重试上限。**只在命令没有离开本机**
+/// （`SendCommand` 返回 false：链路未就绪/队列满）时重试；一旦入队成功就永不再发
+/// ——"反复切模式"本身会扰动姿态，正是设计 §5.3 禁止的那件事。
+constexpr uint64_t kEstimatorModeMaxAttempts = 3;
+/// 降级冻结期间的存活摘要周期：冻结后日志会安静下来，现场需要能确认
+/// "机载还活着、仍在等飞手接管"，又不至于刷屏。
+constexpr uint64_t kEstimatorFreezeDiagIntervalMs = 10000;
 constexpr uint8_t kPx4FlightMainModeOffboard = 6;
 constexpr uint8_t kPx4FlightSubModeOffboard = 0;
 constexpr uint8_t kPx4FlightMainModeAuto = 4;
@@ -335,6 +351,31 @@ const char* DegradedReasonName(control::DegradedReason reason) {
     return "未知";
 }
 
+/// 配置节 → 判据阈值（**唯一转换点**）：`config::EstimatorGuardConfig` 只承载
+/// JSON 参数，`EstimatorGuardThresholds` 是判据模块的入参，两处字段一一对应。
+/// 放在这里而不是让判据模块依赖 config：`estimator_guard` 是纯函数模块，保持
+/// 只依赖 `common/types.h` 才能在任意上下文（含 13 条判据单测）复用。
+EstimatorGuardThresholds ToEstimatorThresholds(
+    const config::EstimatorGuardConfig& cfg) {
+    EstimatorGuardThresholds thresholds;
+    thresholds.z_jump_m = cfg.z_jump_m;
+    thresholds.z_jump_speed_margin_m = cfg.z_jump_speed_margin_m;
+    thresholds.xy_jump_m = cfg.xy_jump_m;
+    thresholds.xy_jump_speed_margin_m = cfg.xy_jump_speed_margin_m;
+    thresholds.ratio_limit = cfg.ratio_limit;
+    thresholds.ratio_hold_ms =
+        static_cast<uint64_t>(cfg.ratio_hold.count());
+    thresholds.baro_divergence_m = cfg.baro_divergence_m;
+    thresholds.baro_hold_ms = static_cast<uint64_t>(cfg.baro_hold.count());
+    thresholds.sensor_hold_ms =
+        static_cast<uint64_t>(cfg.sensor_hold.count());
+    thresholds.local_position_stale_ms =
+        static_cast<uint64_t>(cfg.local_position_stale.count());
+    thresholds.critical_sensor_mask = cfg.critical_sensor_mask;
+    thresholds.bad_estimator_flag_mask = cfg.bad_estimator_flag_mask;
+    return thresholds;
+}
+
 /// 控制意图类型中文名（仅意图切换日志用）。
 const char* IntentTypeName(common::ControlIntentType type) {
     switch (type) {
@@ -377,6 +418,8 @@ public:
           interception_(config.interception),
           return_home_(config.return_home),
           landing_(config.landing),
+          estimator_guard_(ToEstimatorThresholds(config.estimator_guard)),
+          estimator_guard_enabled_(config.estimator_guard.enabled),
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
@@ -398,6 +441,9 @@ public:
         // 降落两段配置构造期兜底（landing 节，2026-11-17 P2）：交段高度/降速/
         // 低速档/容差/超时关系非法时直接抛异常，不允许带病进入自动降落。
         config.landing.Validate();
+        // 估计器降级判据阈值构造期兜底（estimator_guard 节，2026-11-17 P3）：
+        // 阈值错了就是漏报或误报，程序化构造的非法值一律 fail-fast。
+        config.estimator_guard.Validate();
         // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
         // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
         config.takeoff.Validate();
@@ -422,7 +468,7 @@ public:
                       config.tracking.camera.fy_px) *
             kRadToDeg;
         SPDLOG_INFO(
-            "任务状态机创建: shadow=true control_output=false intent_valid_for_ms={} "
+            "任务状态机创建: intent_valid_for_ms={} "
             "handover(enter_s6_lock_frames={} exit_lost_frames={} timeout_ms={} "
             "fow_margin_deg={:.1f} innovation_gate_m={:.1f}) "
             "fov_half(az={:.2f}deg el={:.2f}deg) servo_profile={} servo={:.1f}Hz",
@@ -448,6 +494,25 @@ public:
             landing_.handover_horizontal_m, landing_.handover_hold.count(),
             landing_.descent_timeout.count(), landing_.baro_mismatch_m,
             landing_.baro_mismatch_hold.count());
+        // 估计器降级处置（2026-11-17 P3）：阈值全部可调，启动时把它们印出来，
+        // 现场排"为什么没告警/为什么误告警"时不必回头翻 config.json。
+        SPDLOG_INFO(
+            "估计器降级处置: {}（z跳变>{:.2f}m xy跳变>{:.2f}m 新息比>{:.2f}@{}ms "
+            "baro偏差>{:.2f}m@{}ms 传感器不健康@{}ms 局部位置超时>{}ms "
+            "掩码 传感器=0x{:x} 估计器位=0x{:x}）",
+            estimator_guard_enabled_
+                ? "启用（命中即切 POSCTL + 停发意图 + 冻结任务）"
+                : "关闭（回滚开关 estimator_guard.enabled=false：判据不跑）",
+            estimator_guard_.Thresholds().z_jump_m,
+            estimator_guard_.Thresholds().xy_jump_m,
+            estimator_guard_.Thresholds().ratio_limit,
+            estimator_guard_.Thresholds().ratio_hold_ms,
+            estimator_guard_.Thresholds().baro_divergence_m,
+            estimator_guard_.Thresholds().baro_hold_ms,
+            estimator_guard_.Thresholds().sensor_hold_ms,
+            estimator_guard_.Thresholds().local_position_stale_ms,
+            estimator_guard_.Thresholds().critical_sensor_mask,
+            estimator_guard_.Thresholds().bad_estimator_flag_mask);
     }
 
     ~Impl() {
@@ -545,7 +610,7 @@ public:
 
         running_.store(true, std::memory_order_release);
         worker_ = std::thread([this] { WorkerLoop(); });
-        SPDLOG_INFO("任务状态机启动: shadow=true");
+        SPDLOG_INFO("任务状态机启动");
         return true;
     }
 
@@ -616,6 +681,18 @@ public:
         disarm_command_ms_ = 0;
         disarm_command_fail_count_ = 0;
         mission_end_logged_ = false;
+        // 估计器降级锁存（2026-11-17 P3）：恢复只允许「重置任务状态」或程序重启
+        // （设计 §5.5/§5.3）——判据本身不自动恢复，避免抖动下反复切模式。
+        // 注意重置指令在空中会被准入拒绝（未上锁），所以误报只能在地面清除：
+        // 这是设计要求的行为，不是缺陷。
+        estimator_guard_.Reset();
+        estimator_degraded_.store(false, std::memory_order_release);
+        estimator_mode_queued_ = false;
+        estimator_mode_attempts_ = 0;
+        estimator_mode_ms_ = 0;
+        estimator_mode_unavailable_logged_ = false;
+        estimator_degraded_since_ms_ = 0;
+        estimator_freeze_diag_ms_ = 0;
     }
 
     /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
@@ -639,6 +716,12 @@ public:
     }
 
     bool IsRunning() const { return running_.load(std::memory_order_acquire); }
+
+    /// 估计器降级是否已锁存（线程安全读取；供外层转发与测试/SITL 断言）。
+    /// 只有"判据命中 + 已注入命令接口"才为 true：只读运行只告警不冻结，恒为 false。
+    bool EstimatorDegraded() const {
+        return estimator_degraded_.load(std::memory_order_acquire);
+    }
 
     /// 绑定输入Topic。必须在Start前调用；运行中重新绑定会破坏订阅一致性，因此拒绝。
     void SetInputs(common::Topic<common::GroundStationTarget>& ground_target,
@@ -883,6 +966,10 @@ private:
     // 影子决策：SELF_CHECK 等待导航就绪，READY 等待新鲜目标，GPS_APPROACH 只做告警维护。
     // 这里刻意不生成控制意图，真实 ARM/TAKEOFF/导航流程需经过后续安全门禁。
     void Evaluate(uint64_t now_ms) {
+        // 估计器降级判据（2026-11-17 P3，设计 §5）：每拍先喂快照。命中即锁存、
+        // 切 POSCTL、停发意图并冻结推进。放在最前面是有意的——拦截设备故障
+        // （S16）时也要能观测到 EKF 故障，否则事后无法解释"为什么先切了模式"。
+        EvaluateEstimatorGuard(now_ms);
         uint32_t warnings = 0;
         // 预测越界告警按拍重算（2026-11-12 复审三轮）：S5/S6/S7 任一路径置位。
         fence_predicted_breach_ = false;
@@ -891,6 +978,23 @@ private:
         // 逻辑（位置/伺服/返航/降落意图全部停发）。
         if (UpdateInterceptionDevice(now_ms)) {
             SetWarnings(kWarningActuatorFault);
+            if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
+                PublishStatus(now_ms);
+            }
+            return;
+        }
+
+        // 估计器降级 → 任务冻结（设计 §5.2）：本拍起**不再发布任何控制意图**，
+        // 也不再推进任何任务动作（不返航、不降落、不进 S13a/S13b、不再起飞）。
+        // 为什么不复用 S16：S16 是"执行器故障"终态，语义与处置都不同（S16 仍允许
+        // 后续重置流程）；这里只冻结，状态保持原样，等飞手接管后人工处置。
+        if (EstimatorFreezeActive()) {
+            // 冻结期间告警位也要维护（地面站据此显示导航不可用），但不新增
+            // 协议位：估计器降级按设计 Q1 只落机载日志，暂不扩 65013。
+            if (!HasNavigationForGps()) {
+                warnings |= kWarningNavigationUnavailable;
+            }
+            SetWarnings(warnings);
             if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
                 PublishStatus(now_ms);
             }
@@ -1039,6 +1143,133 @@ private:
         SetWarnings(warnings);
         if (now_ms - last_status_publish_ms_ >= kStatusPublishIntervalMs) {
             PublishStatus(now_ms);
+        }
+    }
+
+    /// 冻结是否生效：判据开启且已锁存降级。
+    /// `estimator_degraded_` 只在"已注入命令接口"时才置位（见 EvaluateEstimatorGuard），
+    /// 因此只读运行天然不冻结。
+    bool EstimatorFreezeActive() const {
+        return estimator_guard_enabled_ && EstimatorDegraded();
+    }
+
+    /// 估计器降级判据与处置入口（2026-11-17 降落与估计器保护 P3，设计 §5）。
+    ///
+    /// 每拍把最新 `FlightStateSnapshot` 喂给 `EstimatorGuard`（判据与极性见
+    /// `state_machine/estimator_guard.md`）。任一判据命中即**锁存**并一次性完成：
+    ///   ① 切 `POSCTL(3/0)`：命令入队即止，成功后再不重发；
+    ///   ② `estimator_degraded_ = true` → 本拍起的 `Evaluate()` 走冻结分支
+    ///      （停发一切控制意图、不推进任务）；
+    ///   ③ WARN 一次，带判据名与数值；此后每 10s 一条存活摘要。
+    ///
+    /// **能力判断而非装配门禁**：没注入命令接口（只读运行）时只告警不冻结——
+    /// 那种装配本来就不向 PX4 发控制，冻结只会让人看不清任务链路的走向。
+    ///
+    /// 恢复只允许「重置任务状态」（65020 type=2 → `ResetSortieState`）或程序重启；
+    /// 判据模块内部同样锁存，不因后续帧好转而自动恢复（设计 §5.3）。
+    void EvaluateEstimatorGuard(uint64_t now_ms) {
+        if (!estimator_guard_enabled_) {
+            return;
+        }
+        if (!latest_flight_.has_value()) {
+            return;
+        }
+        const common::FlightStateSnapshot& flight = *latest_flight_;
+        // 判据内部只在 armed 时生效；未上锁只刷新基线（地面 EKF 重置无害）。
+        const EstimatorGuardResult result =
+            estimator_guard_.Update(flight, now_ms, flight.armed);
+        if (!result.degraded) {
+            return;
+        }
+        if (command_sender_ == nullptr) {
+            if (!estimator_mode_unavailable_logged_) {
+                estimator_mode_unavailable_logged_ = true;
+                SPDLOG_WARN(
+                    "估计器降级判据命中（命令接口未注入：只读运行，不处置）: "
+                    "判据={} 数值={:.2f} armed={}",
+                    EstimatorIssueLabel(result.issue), result.magnitude,
+                    flight.armed ? 1 : 0);
+            }
+            return;
+        }
+        if (!EstimatorDegraded()) {
+            estimator_degraded_.store(true, std::memory_order_release);
+            estimator_degraded_since_ms_ = result.since_ms;
+            // 先尝试切模式，日志才能说清"命令到底有没有出去"。
+            UpdateEstimatorModeCommand(now_ms);
+            SPDLOG_WARN(
+                "估计器降级: 切 POSCTL 悬停，请飞手切 STABILIZED 接管: "
+                "判据={} 数值={:.2f} 判定耗时={}ms 模式命令={} state={}",
+                EstimatorIssueLabel(result.issue), result.magnitude,
+                now_ms >= result.since_ms ? now_ms - result.since_ms : 0,
+                estimator_mode_queued_ ? "已入队（POSCTL 3/0）" : "入队失败（将重试）",
+                MissionStateName(CurrentState()));
+        } else {
+            // 命令从未成功入队时按 `return_home.command_retry` 有限重试。
+            UpdateEstimatorModeCommand(now_ms);
+        }
+        // 降落段收口：已落地且已上锁仍正常走 S14（设计 §5.2 第 5 条）。
+        // **不在这里发 DISARM**：判据命中的前提就是"位置/高度不可信"，此时
+        // 空中上锁等于摔机（§5.3）；PX4 的 COM_DISARM_LAND 会自己上锁，
+        // 操作员也可以手动上锁，我们只认"已上锁"这个事实。
+        if (CurrentState() == common::MissionState::kLanding &&
+            flight.landed_state_valid && flight.landed && !flight.armed) {
+            TransitionTo(common::MissionState::kDisarmed,
+                         "估计器降级期间 PX4 已确认 landed + disarmed，任务结束");
+            if (!mission_end_logged_) {
+                mission_end_logged_ = true;
+                SPDLOG_INFO("任务结束: S14 DISARMED（估计器降级期间收口），拦截结果={}",
+                            interception_fired_ ? "已发射" : "未发射");
+            }
+            return;
+        }
+        // 存活摘要：冻结后动作全部停止、日志安静下来，现场需要能确认
+        // "机载还在跑、仍在等飞手接管、模式命令已发"。
+        if (estimator_freeze_diag_ms_ == 0 ||
+            now_ms - estimator_freeze_diag_ms_ >= kEstimatorFreezeDiagIntervalMs) {
+            estimator_freeze_diag_ms_ = now_ms;
+            SPDLOG_INFO(
+                "估计器降级冻结中: state={} 判据={} 已持续={}s 模式命令={} "
+                "（不发意图/不返航/不降落/不上锁）",
+                MissionStateName(CurrentState()),
+                EstimatorIssueLabel(estimator_guard_.result().issue),
+                now_ms >= estimator_degraded_since_ms_
+                    ? (now_ms - estimator_degraded_since_ms_) / 1000
+                    : 0,
+                estimator_mode_queued_ ? "已入队" : "未入队");
+        }
+    }
+
+    /// 切 POSCTL(3/0)：只在"命令从未成功入队"时尝试，入队成功后**永不再发**。
+    ///
+    /// `SendCommand` 返回 false 表示命令没有离开本机（链路未就绪/队列满），PX4 侧
+    /// 不会因此扰动姿态，所以这种情况下按 `return_home.command_retry` 重试是安全的；
+    /// 一旦入队（true）立即锁死，最多发出**一帧** `DO_SET_MODE`——设计 §5.3
+    /// "不自动重试切模式"针对的正是"已经切过去了还反复切"。
+    void UpdateEstimatorModeCommand(uint64_t now_ms) {
+        if (estimator_mode_queued_ ||
+            estimator_mode_attempts_ >= kEstimatorModeMaxAttempts) {
+            return;
+        }
+        if (estimator_mode_attempts_ > 0 &&
+            now_ms - estimator_mode_ms_ <
+                static_cast<uint64_t>(return_home_.command_retry.count())) {
+            return;
+        }
+        ++estimator_mode_attempts_;
+        estimator_mode_ms_ = now_ms;
+        const bool queued = command_sender_->SendCommand(
+            kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled, kPx4MainModePosctl,
+            kPx4SubModePosctl, 0.f, 0.f, 0.f, 0.f);
+        if (queued) {
+            estimator_mode_queued_ = true;
+            return;
+        }
+        if (estimator_mode_attempts_ >= kEstimatorModeMaxAttempts) {
+            SPDLOG_ERROR(
+                "估计器降级: 切 POSCTL 连续 {} 次入队失败，模式仍在原状态，"
+                "请飞手立即接管（STABILIZED）",
+                estimator_mode_attempts_);
         }
     }
 
@@ -5771,6 +6002,26 @@ private:
     /// `enabled=false` 是回滚开关（S13 直接 AUTO.LAND）；是否真能发控制由
     /// `command_sender_` 是否注入决定，不再另设装配门禁字段。
     const config::LandingConfig landing_;
+    /// 估计器降级判据与阈值（estimator_guard 节，2026-11-17 P3；构造注入）。
+    /// 阈值只在构造期从 config 换算一次；`enabled=false` 是回滚开关。
+    /// **仅决策线程调用 `Update()`**（判据内部有跨拍状态），读取 `degraded()`
+    /// 供日志/摘要；对外暴露的降级状态走 `estimator_degraded_`（原子）。
+    EstimatorGuard estimator_guard_;
+    const bool estimator_guard_enabled_;
+    /// 降级锁存（原子：决策线程写，测试/SITL 线程读）。置位前必须先注入命令接口
+    /// ——只读运行只告警不冻结，理由见 EvaluateEstimatorGuard。
+    std::atomic<bool> estimator_degraded_{false};
+    /// 首次判定降级的时刻（判据内部 since_ms，用于"已持续 Ns"摘要）。
+    uint64_t estimator_degraded_since_ms_ = 0;
+    /// POSCTL 模式命令是否已成功入队（true 后永不再发）。
+    bool estimator_mode_queued_ = false;
+    /// 模式命令入队尝试次数（上限 kEstimatorModeMaxAttempts）与最近尝试时刻。
+    uint64_t estimator_mode_attempts_ = 0;
+    uint64_t estimator_mode_ms_ = 0;
+    /// "命令接口未注入，不处置"告警只打一次（只读运行会每拍命中判据）。
+    bool estimator_mode_unavailable_logged_ = false;
+    /// 冻结存活摘要节流（10s 一条）。
+    uint64_t estimator_freeze_diag_ms_ = 0;
     /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
     /// S3 时序/S4 爬升在 Task 5 使用）。
     const config::TakeoffConfig takeoff_;
@@ -5976,6 +6227,9 @@ uint64_t MissionStateMachine::TransitionCount() const {
     return impl_->TransitionCount();
 }
 uint64_t MissionStateMachine::ErrorCount() const { return impl_->ErrorCount(); }
+bool MissionStateMachine::EstimatorDegraded() const {
+    return impl_->EstimatorDegraded();
+}
 void MissionStateMachine::ForceStateForTest(common::MissionState state) {
     impl_->ForceStateForTest(state);
 }

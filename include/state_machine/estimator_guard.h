@@ -45,7 +45,10 @@ enum class EstimatorIssue : uint8_t {
 /// 判据中文文案（日志与事件用，禁止在别处另写一份）。
 const char* EstimatorIssueLabel(EstimatorIssue issue);
 
-/// 判据阈值。P1 用头文件默认值；P2 接 config.landing 节时外置（见设计文档 §4.7）。
+/// 判据阈值。生产值来自 `config.json` 的 `estimator_guard` 节（2026-11-17 P3 起
+/// 外置，`enabled=false` 是回滚开关），由 `MissionStateMachine` 构造期换算注入
+/// （`config::EstimatorGuardConfig` → 本结构，唯一转换点）；这里的默认值与
+/// 配置默认值同源，字段语义见 `include/config/配置管理.md`。
 struct EstimatorGuardThresholds {
     /// 单拍 z 跳变门限。本次现场是约 9m；0.5m 对 EKF 重置足够灵敏。
     double z_jump_m = 0.5;
@@ -93,6 +96,9 @@ public:
 
     bool degraded() const { return result_.degraded; }
     const EstimatorGuardResult& result() const { return result_; }
+    /// 当前生效阈值（只读）。构造函数会把 `critical_sensor_mask==0` 归一成模块
+    /// 默认掩码，所以启动日志与排查必须以这里为准，不能回读配置文件。
+    const EstimatorGuardThresholds& Thresholds() const { return thresholds_; }
     void Reset();
 
 private:

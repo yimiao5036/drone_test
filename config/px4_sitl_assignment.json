@@ -220,6 +220,22 @@
         "baro_mismatch_m": 1.5,
         "baro_mismatch_hold_ms": 2000
     },
+    "estimator_guard": {
+        "_comment": "估计器降级判据与处置（2026-11-17 P3）SITL 侧显式列出与 config/config.json 同源的默认值：判据命中即切 POSCTL + 停发 intent + 冻结任务，等飞手接管。enabled=false 是唯一回滚开关（判据完全不跑）。critical_sensor_mask=0=用模块默认；bad_estimator_flag_mask=0=关闭该判据（位语义未核对）。SITL 验收要看估计器降级链路时保持 enabled=true。",
+        "enabled": true,
+        "z_jump_m": 0.5,
+        "z_jump_speed_margin_m": 0.1,
+        "xy_jump_m": 1.0,
+        "xy_jump_speed_margin_m": 0.3,
+        "ratio_limit": 1.0,
+        "ratio_hold_ms": 1000,
+        "baro_divergence_m": 1.5,
+        "baro_hold_ms": 2000,
+        "sensor_hold_ms": 1000,
+        "local_position_stale_ms": 500,
+        "critical_sensor_mask": 0,
+        "bad_estimator_flag_mask": 0
+    },
     "takeoff": {
         "height_m": 2.0,
         "climb_rate_mps": 0.5,

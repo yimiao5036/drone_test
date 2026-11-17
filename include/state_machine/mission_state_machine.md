@@ -345,6 +345,18 @@ availability、飞行中 S12）由 Task 8 接入；65014 `flags.bit1` 取消、S
 `target_id` 过滤与 `target_wait_timeout`/`target_lost_timeout` 收口由 Task 10
 接入（2026-10-22），原「已知缺口」已关闭。
 
+**估计器降级处置（2026-11-17，降落与估计器保护 P3）**：每决策拍（100 ms）把最新
+`FlightStateSnapshot` 交给 `EstimatorGuard` 判"位置/高度估计还能不能信"（判据与极性见
+[`estimator_guard.md`](estimator_guard.md)，设计与实施口径见
+[`降落与估计器保护设计-2026-11-17.md`](../../docs/降落与估计器保护设计-2026-11-17.md)
+§3.3/§5）。8 类判据（z/xy 单拍跳变、`ESTIMATOR_STATUS.flags` 位、新息检验比、
+关键传感器健康位、气压/EKF 高度交叉校验、`STATUSTEXT` 关键字、`LOCAL_POSITION_NED`
+超时）任一命中即**锁存降级**，并**一次性**完成：发 `MAV_CMD_DO_SET_MODE(176)`
+切 **POSCTL(3/0)** 悬停、停止发布一切控制意图、冻结任务推进。**明确不做**：不自动降落、
+不自动返航、不空中上锁、不自动重试切模式、不纠偏估计。解除只允许「重置任务状态」
+（65020 `type=2`）或进程重启。**只读运行**（未注入命令接口）时只打一条 WARN、
+**不锁存、不冻结**——功能内部按能力判断，不读 `enable_control`。
+
 ## 接口与数据流
 
 ```cpp
@@ -365,6 +377,7 @@ struct MissionStateMachineConfig {
     config::FenceConfig fence;                        // 多边形围栏（fence 配置节同源，2026-10-29）
     config::ReturnHomeConfig return_home;             // S11~S14 返航（return_home 配置节同源）
     config::LandingConfig landing;                    // S13 拆两段（landing 配置节同源，2026-11-17 P2）
+    config::EstimatorGuardConfig estimator_guard;     // 估计器降级处置（estimator_guard 节同源，2026-11-17 P3）
     uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
@@ -387,6 +400,10 @@ public:
     Topic<ControlIntent>& IntentOutput() override;
     Topic<MissionStatus>& StatusOutput() override;                            // 65013 v2
     Topic<MissionAssignmentAck>& AssignmentAckOutput() override;              // 65015
+
+    // ---- 估计器降级可观测出口（2026-11-17 P3）----
+    /// 降级是否已锁存（测试/SITL 断言用；非虚，不扩张 IMissionStateMachine）。
+    bool EstimatorDegraded() const;
 
     // ---- 测试入口（生产装配不得调用） ----
     void ForceStateForTest(common::MissionState state);  // 强制迁移（需 test_hooks_enabled=true）
@@ -931,6 +948,21 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     冻结为双目测距极限 8m，下限仍占位）；
     V1 返航段可通过测试钩子/测试用例或显式开启配置驱动。多发命中判据/再交战策略
     V2 立项；`MissionStatus` 结果字段暂不新增（用状态+日志）。
+- **估计器降级处置（2026-11-17，降落与估计器保护 P3）**：`EstimatorGuard` 从"看得见
+  但不动作"的观测层接进决策链。命中即**切 POSCTL 悬停 + 停发一切控制意图 + 冻结任务
+  推进**，把飞机交给飞手（设计 §5，实施口径以 §5.6 为准）：
+
+  | 项 | 实现事实 |
+  |---|---|
+  | 接线点 | `Evaluate()` **首行**调 `EvaluateEstimatorGuard(now_ms)`（在拦截设备推进 `UpdateInterceptionDevice()` 之前），每决策拍（100 ms）取最新 `FlightStateSnapshot` 调一次 `EstimatorGuard::Update(state, now_ms, state.armed)`；无快照时直接跳过。`EstimatorGuard` 无内部同步，**只在决策线程调用** |
+  | 判据与锁存 | 8 类判据任一命中 → `estimator_degraded_`（`std::atomic<bool>`）**锁存**；判据模块内部同样锁存，不因后续帧好转自动恢复。清除只有两条：65020 `type=2`「重置任务状态」经 `ResetSortieState()`，或进程重启（`Start()` 走同一份清单） |
+  | 切 POSCTL（一次性） | 已注入命令接口时发 `MAV_CMD_DO_SET_MODE(176)`：`param1=1`（custom mode enabled）/`param2=3`（PX4 主模式 POSCTL）/`param3=0`，其余 0；**入队成功后永不再发**，全程最多一帧。仅当 `SendCommand` 返回 false（命令没离开本机：链路未就绪/队列满）时按 `return_home.command_retry`（默认 1000 ms）重试，**最多 3 次**；3 次都失败打一条 ERROR 交飞手 |
+  | 早返回冻结分支 | 锁存后 `Evaluate()` 在 `UpdateInterceptionDevice()` 之后**早返回**：跳过分配入口/自动起飞时序/电池守卫/任务指令/围栏守卫/目标看门狗/交接等待/引导越界告警/交接/S9-S10 入口与拦截执行/位置与视觉伺服意图/围栏与出区保持意图/热备份/S11~S14 返航降落整链——即**不发任何控制意图、不推进任何状态**；只保留告警位维护（仅 `kWarningNavigationUnavailable`）与 `MissionStatus` 周期发布。拦截设备**自身**时序（ACK/保持/复位）仍按拍推进，被跳过的是拦截**决策** |
+  | 唯一允许的迁移 | `kLanding` 且 `landed_state_valid && landed && !armed` → S14，日志 `任务结束: S14 DISARMED（估计器降级期间收口）`。**不发 DISARM**：判据前提就是位置/高度不可信，`landed` 也是用坏估计判出来的，空中上锁等于摔机；落地后由 PX4 `COM_DISARM_LAND` 或操作员手动上锁，机载只认"已上锁"这个事实 |
+  | 与 P2 保护 1 的优先级 | S13a 期间 baro 与 EKF 高度差超限会同时命中 P2 保护 1（立即交 AUTO.LAND）与 P3 判据；P3 在 `Evaluate()` 更早位置生效，**实际行为是冻结**（不交 AUTO.LAND）。要恢复 P2 处置只能关 `estimator_guard.enabled` |
+  | 能力判断而非装配门禁 | 未注入命令接口（只读运行）：只打一条 WARN，**不锁存、不冻结**；功能内部不读 `enable_control`，只看 `command_sender_ == nullptr` |
+  | 对外可观测 | 新增**非虚** `EstimatorDegraded()`（测试/SITL 断言用，不扩张 `IMissionStateMachine`）；降级状态本期**不进 65013**（设计 Q1），机载 WARN + 10 s 存活摘要是全部出口 |
+  | 配置 | `estimator_guard` 节 13 键（`enabled` + 12 个阈值/掩码），`DroneApplication::BindTopics` 整节注入 `MissionStateMachineConfig::estimator_guard`；`config::EstimatorGuardConfig` → `EstimatorGuardThresholds` 的换算唯一发生在 `mission_state_machine.cpp` 的 `ToEstimatorThresholds()`；`enabled=false` 是唯一回滚开关 |
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
 - `SeedAcceptedAssignmentForTest`（2026-10-28 增）为测试入口：把给定分配写进
   `assignment_tracker_`/`RememberResult(kAccepted)`/`accepted_assignment_`，并在
@@ -999,6 +1031,26 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `S13a PX4 已离开 Offboard 且非 AUTO.LAND（mode=../..），停止下降与命令重试`、
   `PX4 拒绝 AUTO.LAND（DO_SET_MODE result=..）`（首次一条）；
 - WARN（节流）：`S13a 下降意图停发: 局部位置/高度基准/Home 水平目标不可用（连续 .. 拍）累计=..`。
+
+估计器降级处置（2026-11-17 P3；判据模块 `EstimatorGuard` 本身**不打日志**，日志全部在状态机侧）：
+
+- INFO（构造期，一行含全部生效阈值）：
+  `估计器降级处置: 启用（命中即切 POSCTL + 停发意图 + 冻结任务）（z跳变>x.xxm xy跳变>x.xxm
+  新息比>x.xx@xxxxms baro偏差>x.xxm@xxxxms 传感器不健康@xxxms 局部位置超时>xxxms
+  掩码 传感器=0x… 估计器位=0x…）`；关闭时前缀为
+  `估计器降级处置: 关闭（回滚开关 estimator_guard.enabled=false：判据不跑）`。
+- WARN（**每次降级一条**）：`估计器降级: 切 POSCTL 悬停，请飞手切 STABILIZED 接管:
+  判据=<判据中文名> 数值=<数值> 判定耗时=<ms>ms 模式命令=已入队（POSCTL 3/0）/入队失败（将重试）
+  state=<状态名>`。
+- WARN（只读运行，**一条**，`estimator_mode_unavailable_logged_` 节流）：
+  `估计器降级判据命中（命令接口未注入：只读运行，不处置）: 判据=… 数值=… armed=0/1`。
+- INFO（每 10 s 一条**冻结存活摘要**）：`估计器降级冻结中: state=… 判据=…
+  已持续=<s>s 模式命令=已入队/未入队（不发意图/不返航/不降落/不上锁）`。
+- ERROR（3 次入队都失败）：`估计器降级: 切 POSCTL 连续 3 次入队失败，模式仍在原状态，
+  请飞手立即接管（STABILIZED）`。
+- INFO（S14 收口）：`任务结束: S14 DISARMED（估计器降级期间收口），拦截结果=已发射/未发射`。
+- 另：`任务状态机创建: …` 与 `任务状态机启动` 两条日志不再带历史遗留的 `shadow=true`
+  前缀（2026-11-17 清理；运行模式语义只由装配层与运行模式文档定义）。
 
 人工指令相关（2026-10-29）：
 - INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
@@ -1170,6 +1222,32 @@ ctest --test-dir build --output-on-failure
     前不得发 176，到点后必须交段（配置范围下限 10s，本题按真实时钟等待）；
   - `Landing_RollbackSwitchKeepsOldPath`：`landing.enabled=false` → 直接发 AUTO.LAND，
     且**一条** reason=12 的降落意图都不许出现（回滚语义＝2026-11 之前的旧行为）。
+- 估计器降级处置（2026-11-17 P3；`MissionStateMachineTest.EstimatorGuard_*`，快照 helper
+  `MakeEstimatorGuardFlight()` / `PublishEstimatorGuardFlight()` 在既有返航/降落快照上
+  补 `local_position_time_valid/time_ms`，**时间戳必须单调递增**，否则判据首个 armed 拍
+  就会判"局部位置超时"，用例验证的就不再是注入的跳变）：
+  - `EstimatorGuard_DegradedSwitchesToPosctlOnceAndLatches`：局部位置新鲜、上锁、z 单拍
+    0→9 m 跳变 → 锁存 `EstimatorDegraded()`、恰好一条 176（`param1=1`/`param2=3`/
+    `param3=0`，`param4~7=0`）；再连续喂同等跳变仍只有这一条（锁存后不重复切模式）；
+  - `EstimatorGuard_DisarmedDoesNotReact`：未上锁时 0↔9 m 往复 + 末帧缺局部位置时间戳
+    → 不锁存、0 条 176（命令接口已注入，证明"没切模式"不是没地方发，而是判据没动作）；
+  - `EstimatorGuard_FreezesMissionAndStopsIntents`：S13a 中注入 z −10→−19 m 跳变 →
+    状态留在 `kLanding`、1.5 s 内 0 条控制意图、无 `AUTO.LAND(4/6)`（176 只有切 POSCTL
+    的那一条）。
+- **既有用例的工厂统一关闭判据**：`mission_state_machine_test.cpp` 里所有既有
+  `MissionStateMachineConfig` 工厂（含派生工厂）都关闭判据——底座工厂里显式写了
+  `config.estimator_guard.enabled = false`：它们的快照不模拟 `LOCAL_POSITION_NED`
+  新鲜度（P1 才新增的字段），判据会在第一拍误判"局部位置超时"并冻结，与这些用例要
+  验证的东西无关。**新写用例要测降级必须显式打开判据**，并按
+  `MakeEstimatorGuardFlight()` 那组 helper 给快照填时间戳；判据逻辑本身仍由
+  `estimator_guard_test` 13 条覆盖，接线由上面 3 条覆盖。
+- 只跑估计器降级这组用例（两条等价）：
+
+  ```bash
+  ctest --test-dir build -R EstimatorGuard_ --output-on-failure
+  ./build/mission_state_machine_test --gtest_filter='*EstimatorGuard*'
+  ```
+
 - S9/S10 入口（2026-10-19；`MakeInterceptEntryTestConfig` 开启
   `interception.enabled=true`、`enter_s9_lock_frames=3`、窗口 2~12m、自动授权）：
   - `InterceptEntryLockAndRangeThenFiresAndReturns`：强制 S7 + 连续 LOCKED
@@ -1341,6 +1419,25 @@ ctest --test-dir build --output-on-failure
   先查 PX4 侧模式切换是否被拒（如 `COM_DISARM_LAND`/land detector 状态）。
 - **降落后想回到"直接 AUTO.LAND"**：`landing.enabled=false`（回滚开关，重启生效）。
   只读运行（未注入命令接口）本来就发不出降落意图，自然等于旧路径。
+- **日志出现 `估计器降级:` 但飞机没换模式**：先看这条 WARN 的 `模式命令=`——
+  `入队失败（将重试）` 表示 `SendCommand` 返回 false（命令没离开本机：链路未就绪/队列满），
+  会按 `return_home.command_retry` 重试最多 3 次，3 次都失败会打 ERROR
+  `切 POSCTL 连续 3 次入队失败…请飞手立即接管（STABILIZED）`；再查
+  `command_sender_ == nullptr`（只读运行，此时只有 `命令接口未注入：只读运行，不处置` 的
+  WARN、没有命中 WARN），最后查 PX4 串口/链路（对照 `docs/故障排查手册.md` §17.11）。
+- **想临时关掉降级判据**：`config/config.json` 的 `estimator_guard.enabled=false`
+  （重启生效，唯一回滚开关）。关掉后判据完全不跑：不告警、不切模式、不冻结，
+  调度行为回到 P2（S13a 的三条保护仍在，但**不再兜 EKF 跳变/传感器失效**）。
+- **降级后任务卡住不动、不返航也不降落**：这是设计，不是卡死——冻结期间跳过
+  电池守卫/围栏/看门狗/返航/降落全部逻辑（低电也不会自动返航），处置完全交给飞手。
+  恢复只有两条：65020 `type=2`「重置任务状态」或重启机载程序。注意 65020 只在 S14
+  （且未上锁、tracker 不在空中）时真正执行重置（S2 只回幂等完成）：若降级发生在 S13，
+  落地后状态机会自行收口 S14，可直接重置；冻结在 S5/S7 等其它任务态时落地后状态仍
+  停在那里，65020 会被拒（`kNotOnGround`），只能重启机载程序。
+- **改判据阈值时别只改字典**：`EstimatorGuardThresholds` 的默认值与 `config.h` 的
+  `EstimatorGuardConfig` 同源，生产值来自 `estimator_guard` 节 13 键；启动日志
+  `估计器降级处置: …` 打印的是**生效值**（含 `critical_sensor_mask=0` 被归一成
+  `0x200007`），排查"为什么没告警/为什么误告警"以日志为准，改配置后必须重启再对一遍。
 - **S13 已落地但不到 S14**：通常为仍 armed 且 DISARM 未 accepted；查 400 命令
   入队/ACK 与 PX4 disarmed 状态。
 - **65014 发送后没有 65015**：确认 `SetAssignmentInput` 已绑定且

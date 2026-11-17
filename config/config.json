@@ -194,6 +194,22 @@
         "baro_mismatch_m": 1.5,
         "baro_mismatch_hold_ms": 2000
     },
+    "estimator_guard": {
+        "_comment": "估计器降级判据与处置（2026-11-17 降落与估计器保护 P3）。任一判据命中即锁存：切 POSCTL 悬停 + 停发一切控制意图 + 冻结任务推进，等飞手切 STABILIZED 接管（不自动降落/返航/上锁/重试切模式）。enabled=false 是唯一回滚开关：关掉后判据完全不跑。单拍跳变判据一帧即命中；持续型判据各自有 hold，local_position_stale_ms 是瞬时判据（不受 hold 保护）。critical_sensor_mask=0 表示用模块默认（陀螺|加速度计|磁罗盘|AHRS，不含 GPS）；bad_estimator_flag_mask=0 表示关闭该判据（位语义未与固件核对，见 include/state_machine/estimator_guard.md）。阈值只用于判据，不改变控制律；实机首轮先看日志里「估计器降级:」WARN 的判据/数值再定。",
+        "enabled": true,
+        "z_jump_m": 0.5,
+        "z_jump_speed_margin_m": 0.1,
+        "xy_jump_m": 1.0,
+        "xy_jump_speed_margin_m": 0.3,
+        "ratio_limit": 1.0,
+        "ratio_hold_ms": 1000,
+        "baro_divergence_m": 1.5,
+        "baro_hold_ms": 2000,
+        "sensor_hold_ms": 1000,
+        "local_position_stale_ms": 500,
+        "critical_sensor_mask": 0,
+        "bad_estimator_flag_mask": 0
+    },
     "controller": {
         "_comment": "飞行控制器（阶段四）。三个水平速度上限显式同值=10（2026-11-11 维护者要求：配置里看得见、不靠派生）：max_speed_mps 约束速度式意图；max_feedforward_mps 约束位置意图前馈；position_guide_speed_mps 约束位置引导点推进。加载期校验前馈不得大于 max_speed。位置型意图按 position_guide 限速推进，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去。",
         "period_ms": 50,

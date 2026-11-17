@@ -149,6 +149,12 @@ void DroneApplication::BuildComponents() {
         // enable_control=true 的装配分支注入（见 BindTopics），因此影子装配天然
         // 保持"S13 直接 AUTO.LAND"，不需要额外的装配门禁字段。
         state_machine_config.landing = config_.landing;
+        // 估计器降级处置（estimator_guard 节，2026-11-17 P3）整节同源注入：阈值
+        // 全部来自 JSON，状态机不做二次换算；`enabled=false` 是唯一回滚开关。
+        // 命中后的处置（切 POSCTL + 停发意图 + 冻结任务）只在命令接口已注入时
+        // 生效，而这个注入点本身就在下面的控制运行装配分支里——所以只读运行
+        // 天然只告警不动作，功能内部不需要再判断 enable_control。
+        state_machine_config.estimator_guard = config_.estimator_guard;
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;

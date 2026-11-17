@@ -118,6 +118,36 @@ double ReadOptionalNonNegativeDouble(const json& object, const char* key,
     return value;
 }
 
+// 读取无符号位掩码（estimator_guard 的两个掩码字段）。
+// **0 是合法语义**（critical_sensor_mask=0 用模块默认，bad_estimator_flag_mask=0
+// 关闭该判据），因此这里只挡负数与超出目标类型宽度的值：超出宽度会被 static_cast
+// 静默截断，把"另一组位"当成配置执行，属于安全风险。
+uint32_t ReadOptionalUint32(const json& object, const char* key,
+                            uint32_t default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const int64_t value = object.at(key).get<int64_t>();
+    if (value < 0 ||
+        value > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        throw std::invalid_argument(std::string(key) + " 必须在 [0, 4294967295]");
+    }
+    return static_cast<uint32_t>(value);
+}
+
+uint16_t ReadOptionalUint16(const json& object, const char* key,
+                            uint16_t default_value) {
+    if (object.find(key) == object.end()) {
+        return default_value;
+    }
+    const int64_t value = object.at(key).get<int64_t>();
+    if (value < 0 ||
+        value > static_cast<int64_t>(std::numeric_limits<uint16_t>::max())) {
+        throw std::invalid_argument(std::string(key) + " 必须在 [0, 65535]");
+    }
+    return static_cast<uint16_t>(value);
+}
+
 // 围栏 default_* 配置的质量兜底（2026-10-30 审查修复）：
 // 这些字段决定"首次启动/无缓存"时自动生成的默认区域，非法值会让默认区域
 // 退化——half_side=0 时默认区域面积 0（越界判定恒为界内，围栏失效）；
@@ -756,6 +786,69 @@ void LandingConfig::Validate() const {
     }
 }
 
+void EstimatorGuardConfig::Validate() const {
+    // 阈值全部外置（P3，2026-11-17）：上下限只为挡住"明显错一个数量级"的填法
+    // （例如把 0.5 m 写成 5 m 会漏报现场 9 m 之外的抖动，把 1000 ms 写成 10 ms
+    // 会让新息比抖一下就切模式）。区间端点按设计 §3.3 初值取整后留一档余量。
+    // 跳变门限不含 0：0 会让任何一次的噪声抖动都命中，等于永久降级。
+    if (!std::isfinite(z_jump_m) || z_jump_m <= 0.1 || z_jump_m > 5.0) {
+        throw std::invalid_argument(
+            "estimator_guard.z_jump_m 必须在 (0.1, 5.0]");
+    }
+    // 余量允许 0（=不扣速度位移，纯门限判），但不得为负、也不得大到门限失效。
+    if (!std::isfinite(z_jump_speed_margin_m) ||
+        z_jump_speed_margin_m < 0.0 || z_jump_speed_margin_m > 2.0) {
+        throw std::invalid_argument(
+            "estimator_guard.z_jump_speed_margin_m 必须在 [0.0, 2.0]");
+    }
+    if (!std::isfinite(xy_jump_m) || xy_jump_m <= 0.2 || xy_jump_m > 10.0) {
+        throw std::invalid_argument(
+            "estimator_guard.xy_jump_m 必须在 (0.2, 10.0]");
+    }
+    if (!std::isfinite(xy_jump_speed_margin_m) ||
+        xy_jump_speed_margin_m < 0.0 || xy_jump_speed_margin_m > 2.0) {
+        throw std::invalid_argument(
+            "estimator_guard.xy_jump_speed_margin_m 必须在 [0.0, 2.0]");
+    }
+    // 新息检验比：PX4 口径 1.0 是"观测与状态一致"的边界，低于 0.5 会把正常
+    // 噪声判成不一致（误报），高于 10 则等于关掉该判据（漏报）。
+    if (!std::isfinite(ratio_limit) || ratio_limit <= 0.5 ||
+        ratio_limit > 10.0) {
+        throw std::invalid_argument(
+            "estimator_guard.ratio_limit 必须在 (0.5, 10.0]");
+    }
+    // 持续型判据的 hold：下限挡"单帧尖峰即切模式"，上限挡"迟迟不判"。
+    if (ratio_hold.count() < 100 || ratio_hold.count() > 10000) {
+        throw std::invalid_argument(
+            "estimator_guard.ratio_hold_ms 必须在 [100, 10000]");
+    }
+    // 气压与 EKF 两条独立物理路径的允许偏差：气压受桨风 0.2~0.5 m 影响，
+    // 低于 0.5 m 会常态误报；高于 10 m 则等于不再交叉校验。
+    if (!std::isfinite(baro_divergence_m) || baro_divergence_m < 0.5 ||
+        baro_divergence_m > 10.0) {
+        throw std::invalid_argument(
+            "estimator_guard.baro_divergence_m 必须在 [0.5, 10.0]");
+    }
+    if (baro_hold.count() < 200 || baro_hold.count() > 10000) {
+        throw std::invalid_argument(
+            "estimator_guard.baro_hold_ms 必须在 [200, 10000]");
+    }
+    if (sensor_hold.count() < 100 || sensor_hold.count() > 10000) {
+        throw std::invalid_argument(
+            "estimator_guard.sensor_hold_ms 必须在 [100, 10000]");
+    }
+    // 瞬时判据（断链/丢帧本身就要降级），不受 hold 保护，但下限仍是 100 ms：
+    // 低于它会把 LOCAL_POSITION_NED 的正常帧间隔判成丢帧。
+    if (local_position_stale.count() < 100 ||
+        local_position_stale.count() > 5000) {
+        throw std::invalid_argument(
+            "estimator_guard.local_position_stale_ms 必须在 [100, 5000]");
+    }
+    // 两个掩码刻意不做范围校验：0 是合法语义（critical_sensor_mask=0 用模块
+    // 默认掩码，bad_estimator_flag_mask=0 关闭该判据），位值由调用方按
+    // MAV_SYS_STATUS_SENSOR_* / ESTIMATOR_STATUS_FLAGS 定义填写。
+}
+
 void FenceConfig::Validate() const {
     if (zone_cache_path.empty()) {
         throw std::invalid_argument("fence.zone_cache_path 不能为空");
@@ -1264,6 +1357,48 @@ AppConfig LoadAppConfig(const std::string& path,
     config.landing.baro_mismatch_hold = ReadOptionalPositiveMilliseconds(
         landing, "baro_mismatch_hold_ms", config.landing.baro_mismatch_hold);
     config.landing.Validate();
+
+    // 估计器降级判据与处置（estimator_guard 节，2026-11-17 P3）：全部可选，
+    // 缺席回退 EstimatorGuardThresholds 的默认值。阈值的语义（哪条判据、
+    // 持续多久、掩码极性）见 docs/降落与估计器保护设计-2026-11-17.md §3.3/§5；
+    // enabled=false 是唯一回滚开关，判据完全不跑。
+    const json estimator_guard = root.value("estimator_guard", json::object());
+    config.estimator_guard.enabled =
+        estimator_guard.value("enabled", config.estimator_guard.enabled);
+    config.estimator_guard.z_jump_m = ReadOptionalPositiveDouble(
+        estimator_guard, "z_jump_m", config.estimator_guard.z_jump_m);
+    // 速度余量允许 0（=不扣速度位移），必须用允许 0 的 helper。
+    config.estimator_guard.z_jump_speed_margin_m = ReadOptionalNonNegativeDouble(
+        estimator_guard, "z_jump_speed_margin_m",
+        config.estimator_guard.z_jump_speed_margin_m);
+    config.estimator_guard.xy_jump_m = ReadOptionalPositiveDouble(
+        estimator_guard, "xy_jump_m", config.estimator_guard.xy_jump_m);
+    config.estimator_guard.xy_jump_speed_margin_m = ReadOptionalNonNegativeDouble(
+        estimator_guard, "xy_jump_speed_margin_m",
+        config.estimator_guard.xy_jump_speed_margin_m);
+    config.estimator_guard.ratio_limit = ReadOptionalPositiveDouble(
+        estimator_guard, "ratio_limit", config.estimator_guard.ratio_limit);
+    config.estimator_guard.ratio_hold = ReadOptionalPositiveMilliseconds(
+        estimator_guard, "ratio_hold_ms", config.estimator_guard.ratio_hold);
+    config.estimator_guard.baro_divergence_m = ReadOptionalPositiveDouble(
+        estimator_guard, "baro_divergence_m",
+        config.estimator_guard.baro_divergence_m);
+    config.estimator_guard.baro_hold = ReadOptionalPositiveMilliseconds(
+        estimator_guard, "baro_hold_ms", config.estimator_guard.baro_hold);
+    config.estimator_guard.sensor_hold = ReadOptionalPositiveMilliseconds(
+        estimator_guard, "sensor_hold_ms", config.estimator_guard.sensor_hold);
+    config.estimator_guard.local_position_stale =
+        ReadOptionalPositiveMilliseconds(
+            estimator_guard, "local_position_stale_ms",
+            config.estimator_guard.local_position_stale);
+    // 两个掩码：0 是合法语义（见 config.h 注释），不做范围校验，只挡负值与溢出。
+    config.estimator_guard.critical_sensor_mask = ReadOptionalUint32(
+        estimator_guard, "critical_sensor_mask",
+        config.estimator_guard.critical_sensor_mask);
+    config.estimator_guard.bad_estimator_flag_mask = ReadOptionalUint16(
+        estimator_guard, "bad_estimator_flag_mask",
+        config.estimator_guard.bad_estimator_flag_mask);
+    config.estimator_guard.Validate();
 
     // 自动起飞（takeoff 节，2026-10-22）：S3/S4 时序、到达判据与目标收口；
     // 全部可选，缺席回退默认值。低电门限不使用本地电量百分比，唯一来源是

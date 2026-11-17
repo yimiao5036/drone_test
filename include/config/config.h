@@ -278,6 +278,60 @@ struct LandingConfig {
     void Validate() const;
 };
 
+/// 估计器降级判据与处置（estimator_guard 节，2026-11-17 降落与估计器保护 P3）。
+///
+/// 背景：2026-11-17 10:25 现场 EKF 全状态重置（local z 平移 9 m）后，`AUTO.LAND`
+/// 无人监督一路降到底、PX4 误判触地砍推力而翻滚。判据模块 `EstimatorGuard`
+/// （`include/state_machine/estimator_guard.h`）在 P1 已落地并接通遥测，P3 起由
+/// `MissionStateMachine` **每拍喂快照**：任一判据命中即**锁存**，切 `POSCTL` 悬停、
+/// 停发一切控制意图、冻结任务推进，等飞手接 `STABILIZED` 处置
+/// （设计 §5：不自动降落、不自动返航、不自动上锁、不重试切模式）。
+///
+/// **`enabled=false` 是唯一回滚开关**：关掉后判据完全不跑（不告警、不切模式、
+/// 不冻结），调度行为回到 P2 状态。阈值全部外置的原因：这些阈值错了就是漏报或
+/// 误报，实机首轮必须能按日志调，不能改代码重编。
+///
+/// 判据实现与极性说明见 `include/state_machine/estimator_guard.md`（含"为什么
+/// `ESTIMATOR_STATUS.flags` 掩码默认 0=关闭"）。本结构只承载参数，不做判定。
+struct EstimatorGuardConfig {
+    /// 总开关（回滚开关）。false = 判据不跑（P1/P2 行为）。
+    bool enabled = true;
+
+    // ---- 单拍跳变判据（本次事故是 z 单拍跳 9 m，一帧即命中）----
+    /// EKF 局部 z 单拍跳变门限（m）：|Δz| > 本值 **且** |Δz| > |vz|·Δt + 余量。
+    double z_jump_m = 0.5;
+    /// 跳变判据里扣掉"速度本身位移"之外的余量（m）。
+    double z_jump_speed_margin_m = 0.1;
+    /// EKF 局部 xy 单拍跳变门限（m）：同样要求大于地速位移 + 余量。
+    double xy_jump_m = 1.0;
+    double xy_jump_speed_margin_m = 0.3;
+
+    // ---- 持续型判据（必须"持续"才判，单帧尖峰不算）----
+    /// 新息检验比门限（PX4 口径 >1 = 该路观测与状态不一致）。
+    double ratio_limit = 1.0;
+    /// 任一路比值超限需要持续的时长。
+    std::chrono::milliseconds ratio_hold{1000};
+    /// 气压高度（AGL）与 EKF 相对高度允许偏差（m）：两条独立物理路径交叉校验。
+    double baro_divergence_m = 1.5;
+    /// 高度源不一致需要持续的时长。
+    std::chrono::milliseconds baro_hold{2000};
+    /// 关键传感器健康位（present 置位但 health 清零）持续掉线的判定时长。
+    std::chrono::milliseconds sensor_hold{1000};
+    /// `LOCAL_POSITION_NED` 新鲜度门限。**瞬时判据**（断链/丢帧本身就要降级），
+    /// 不受 hold 保护。
+    std::chrono::milliseconds local_position_stale{500};
+
+    /// 关键传感器掩码（MAV_SYS_STATUS_SENSOR_* 位值）。
+    /// **0 = 用模块默认**（陀螺|加速度计|磁罗盘|AHRS，不含 GPS）。
+    uint32_t critical_sensor_mask = 0;
+    /// `ESTIMATOR_STATUS.flags` 位掩码：置位视为退化。
+    /// **默认 0 = 关闭**：本项目 third_party 的位定义是"置位=可用"的旧语义，
+    /// 未与固件核对前不能先验判（先验判会误报或漏报，都是安全风险）。
+    uint16_t bad_estimator_flag_mask = 0;
+
+    void Validate() const;
+};
+
 /// 多边形围栏（fence 节，2026-10-29）。
 /// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
 /// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
@@ -415,6 +469,7 @@ struct AppConfig {
     InterceptionConfig interception;    ///< S9/S10 入口判据与授权（2026-10-19）
     ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
     LandingConfig landing;              ///< S13 拆两段（2026-11-17 P2）
+    EstimatorGuardConfig estimator_guard;              ///< 估计器降级判据与处置（2026-11-17 P3）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
     FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
     ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）

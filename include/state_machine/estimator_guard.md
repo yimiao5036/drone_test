@@ -1,10 +1,12 @@
 # 估计器健康判据（estimator_guard）
 
 > 对应实现：`include/state_machine/estimator_guard.h`、`src/state_machine/estimator_guard.cpp`
-> 使用方：`MissionStateMachine`（P3 接入：判据置位 → 切 POSCTL 悬停 + 告警）
-> 设计文档：`docs/降落与估计器保护设计-2026-11-17.md` §3.3
-> **接线状态（2026-11-17）**：P1 已完成判据与单测；**状态机尚未接线**，
-> 也就是说当前这是"看得见但不动作"的观测层，P3 才接处置。
+> 使用方：`MissionStateMachine`（P3 起已接线：判据命中 → 切 POSCTL 悬停 + 停发意图 + 冻结任务）
+> 设计文档：`docs/降落与估计器保护设计-2026-11-17.md` §3.3/§5
+> **接线状态（2026-11-17，P3）**：**已接线**——`MissionStateMachine::Evaluate()` 每决策拍
+> （100 ms）调用 `Update()`，命中即锁存降级并由状态机处置（切 `POSCTL(3/0)` 悬停、
+> 停发一切控制意图、冻结任务推进，设计 §5/§5.6）。判据模块本身仍只回答"能不能信"：
+> 不切模式、不发命令、不打日志。
 
 ## 1. 功能职责
 
@@ -19,17 +21,40 @@
 
 线程安全：无内部同步，只能在状态机决策线程内调用。所有接口不抛异常。
 
+**与处置的分工（2026-11-17 P3 起已接线）**：`MissionStateMachine::Evaluate()` 每决策拍
+（100 ms）喂一帧快照；判据命中后由状态机**锁存**并发 `DO_SET_MODE(POSCTL 3/0)`、停发
+一切控制意图、冻结任务推进（不返航/不降落/不上锁/不重试切模式）。本模块不决定处置、
+不持有命令接口，也不感知 `enable_control`——只读运行时由状态机按"命令接口是否注入"
+决定只告警。
+
 ## 2. 接口与数据流
 
 ```cpp
-EstimatorGuard guard;                 // 阈值默认见头文件；P2 起由 config.landing 外置
-guard.Update(snapshot, now_ms, armed);// 每收到一帧 FlightStateSnapshot 调一次
+EstimatorGuard guard;                 // 阈值由构造注入（estimator_guard 节，13 键）
+guard.Update(snapshot, now_ms, armed);// 状态机每决策拍（100 ms）调一次
 guard.result();                       // { degraded, issue, since_ms, magnitude }
+guard.Thresholds();                   // 生效阈值（只读；critical_sensor_mask 已归一）
 guard.Reset();                        // 重置任务状态 / 程序重启时清锁存
 ```
 
 输入只有快照与 `now_ms`、`armed`；不额外持有时间戳表（`LOCAL_POSITION_NED` 的
 到达时刻由 `px4_link` 写进快照的 `local_position_time_ms`）。
+
+**阈值来源（2026-11-17 P3 起外置）**：`config/config.json` 的 `estimator_guard` 节
+13 键——`enabled` + `z_jump_m`、`z_jump_speed_margin_m`、`xy_jump_m`、
+`xy_jump_speed_margin_m`、`ratio_limit`、`ratio_hold_ms`、`baro_divergence_m`、
+`baro_hold_ms`、`sensor_hold_ms`、`local_position_stale_ms`、`critical_sensor_mask`、
+`bad_estimator_flag_mask`；`enabled=false` 是唯一回滚开关（判据完全不跑）。
+`DroneApplication::BindTopics` 整节注入 `MissionStateMachineConfig::estimator_guard`，
+`config::EstimatorGuardConfig` → `EstimatorGuardThresholds` 的换算**唯一**发生在
+`src/state_machine/mission_state_machine.cpp` 的 `ToEstimatorThresholds()`——本模块
+不依赖 config，保持纯函数、只依赖 `common/types.h`（这样 13 条判据单测可以直接
+构造阈值，不必拉起配置解析）。
+
+`Thresholds()` 是只读访问器：构造函数会把 `critical_sensor_mask==0` 归一成模块默认
+掩码 **`0x200007`**（陀螺 `1<<0` | 加速度计 `1<<1` | 磁罗盘 `1<<2` | AHRS `1<<21`，
+不含 GPS），所以**启动日志与现场排查以 `Thresholds()` 为准**，不要回读 `config.json`
+猜实际生效值。
 
 ## 3. 判据与阈值
 
@@ -61,14 +86,16 @@ guard.Reset();                        // 重置任务状态 / 程序重启时清
 
 ## 4. 日志行为
 
-模块本身**不打日志**（纯判据，便于单测）。由调用方在首次命中时打一条 WARN：
+模块本身**不打日志**（纯判据，便于单测）。日志全部在状态机侧（2026-11-17 P3 起）：
+命中一条 WARN，冻结后每 10 s 一条存活摘要，逐条文案见
+[`mission_state_machine.md`](mission_state_machine.md)「日志行为」。命中 WARN 形如：
 
 ```text
-估计器判据命中: issue=VerticalJump magnitude=9.00m since_ms=... （切换 POSCTL 悬停）
+估计器降级: 切 POSCTL 悬停，请飞手切 STABILIZED 接管: 判据=EKF 高度单拍跳变 数值=9.00 判定耗时=..ms 模式命令=已入队（POSCTL 3/0） state=..
 ```
 
-锁存后不再重复打印；状态机每到"判据降级"就切一次模式并记一条事件日志，
-不会随快照周期刷屏。
+锁存后不再重复打印命中 WARN，也不会随快照周期刷屏；切模式命令**入队成功后永不再发**
+（只在 `SendCommand` 返回 false 时按 `return_home.command_retry` 重试，最多 3 次）。
 
 ## 5. 测试方式
 
@@ -96,7 +123,7 @@ cmake --build build -j$(nproc)
 | 从不触发 | `armed` 是否一直为 false；`local_position_time_valid` 是否写入（`HandleLocalPosition`）；`baro_takeoff_ref_valid` 是否在解锁时抓到了气压基准 |
 | 频繁误报 | `ratio_hold_ms`/`baro_hold_ms`/`sensor_hold_ms` 是否太短；气压基准是否在起飞瞬间就偏（起飞前气压曲线是否平稳）；`critical_sensor_mask` 是否包含了 PX4 正常波动会清位的传感器 |
 | 跳变判据漏报 | `z_jump_m` 是否被调大；`local_position_time_ms` 是否没随消息更新（会导致一直比同一帧） |
-| 降级后不恢复 | 这是设计：只能 `Reset()`（清任务状态/程序重启）。要恢复请走 P4 |
+| 降级后不恢复 | 这是设计：只能 `Reset()`（状态机在「重置任务状态」65020 `type=2` 或程序重启时调用）。若冻结在非 S13 的任务态，落地后状态机不会自行走到 S14，65020 会被拒，需重启机载程序 |
 
 修改判据时**必须**同步：`docs/降落与估计器保护设计-2026-11-17.md` §3.3 判据表、
 `include/common/types.h` 的字段注释、`docs/数据接口文档.md` 的快照字段说明。
