@@ -96,7 +96,7 @@ struct CommandAckStatus {          // common/types.h
 ```
 
 - `IPx4CommandSender` 暴露命令发送、ACK 计数、ACK 快照与取消，供状态机在
-  `enable_control=true` 时注入（装配期物理隔离；`false` 时不注入，命令通道在装配层缺席）。
+  `enable_control=true`（控制运行）时注入；只读运行时不注入，命令通道在装配层缺席）。
 - `AckStatus()` 返回最近 ACK/超时快照，互斥量保护一次结构拷贝，可由状态机线程随时调用。
   `do_set_actuator_*` 在 `HandleCommandAck` / `CheckCommandTimeout` 的同一把锁内维护，
   只统计 `MAV_CMD_DO_SET_ACTUATOR(187)`：捕网复位等待跨越 S12~S14，期间

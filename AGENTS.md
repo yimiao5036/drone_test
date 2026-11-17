@@ -11,7 +11,7 @@
 - **主要功能**：接收地面站目标位置 → YOLOv26 目标识别 → 轨迹预测 → 控制 PX4 无人机跟踪/反制
 - **通信协议**：MAVLink（与 PX4 飞控和地面站通信）
 
-**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定）；要回纯影子把它改回 `false` 重启即可。两个发射闸门仍关：`interception.enabled=false`（S9/S10 自动拦截不可达）、`actuator.gcs_fire_enabled=false`（65016 直控不装配）。控制链由 `MissionStateMachine` 的 `kControlIntent` 经 `FlightController` → `Px4Setpoint` 下发 PX4；只有 `TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 仍是影子（跑真实算法、无控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home）；阶段四控制接入路径代码已全部落地，`enable_control=true` 时绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口，`false` 时影子停发。门禁 G1~G4 已完成（G4-1 电机怠速 2026-10-21 人工确认、G4-2 机体方向 2026-10-28 遥控器飞行确认、G4-3 机构/参数/时序 2026-10-23 冻结、G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过），下一步是 G5 首飞（科目见 [`docs/PX4实链验证清单.md`](docs/PX4实链验证清单.md) §7.5）。
+**当前安全基线**：`config/config.json` 现场实测期默认 `"enable_control": true`（2026-10-30 维护者决定）= **控制运行**；改成 `false` 重启即 **只读运行**（只采日志、不下发控制，用于地面排查）。**`enable_control` 的语义、只读运行、模块状态标记的唯一事实来源是 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)**（2026-11-17 重写，"影子"不再作为状态词）。两个发射闸门仍关：`interception.enabled=false`（S9/S10 自动拦截不可达）、`actuator.gcs_fire_enabled=false`（65016 直控不装配）。控制链由 `MissionStateMachine` 的 `kControlIntent` 经 `FlightController` → `Px4Setpoint` 下发 PX4；`TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 是**观测**模块（跑真实算法、无控制输出）。**PX4 已到位**（2026-10-10：装机体 + GPS，可出 Home）；阶段四控制接入路径代码已全部落地，控制运行时绑定 `Px4Setpoint` 并注入 PX4 快照源/命令接口。门禁 G1~G4 已完成（G4-1 电机怠速 2026-10-21 人工确认、G4-2 机体方向 2026-10-28 遥控器飞行确认、G4-3 机构/参数/时序 2026-10-23 冻结、G4-5 地面站直控发射拆桨台架 2026-10-28 实跑通过），下一步是 G5 首飞（科目见 [`docs/PX4实链验证清单.md`](docs/PX4实链验证清单.md) §7.5）。
 
 ## 开发与构建环境（强制规则）
 
@@ -25,7 +25,7 @@
   # 主工程
   cmake -S . -B build
   cmake --build build -j$(nproc)
-  ctest --test-dir build --output-on-failure     # 基线 678/678
+  ctest --test-dir build --output-on-failure     # 基线 771/771
   python3 tools/check_docs.py                    # 文档基线/链接/模块文档检查
   ./build/drone_control                          # 生成 logs/0001_xxx.log
   ./build/drone_control --config /路径/config.json
@@ -69,8 +69,8 @@
 | 图传发送线程 | 叠加帧 → 编码 → RTSP 推送 |
 | PX4 串口通信线程 | 与 PX4 飞控 MAVLink 双向通信 |
 | 电台数传线程 | 与地面站 MAVLink 双向通信 |
-| 双目深度线程 | 消费左右目帧与检测框，输出带质量/时间戳的稀疏 Census 距离（影子，无控制输出） |
-| 状态机与控制线程 | 消费各线程数据，状态机决策并生成控制意图；装配门禁：`enable_control=true` 绑定 `Px4Setpoint` 下发，`false` 回影子停发 |
+| 双目深度线程 | 消费左右目帧与检测框，输出带质量/时间戳的稀疏 Census 距离（观测，无控制输出） |
+| 状态机与控制线程 | 消费各线程数据，状态机决策并生成控制意图；装配层按运行模式决定是否绑定 `Px4Setpoint` 下发（见 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)） |
 
 ### 架构要点（装配、数据流与边界）
 
@@ -83,7 +83,7 @@
 ```text
 摄像头 RTSP/H.265 → CameraReceiver → kCameraStream → VideoDecoder → kDecodedFrame
   → YoloDetector → kDetection（每目标一条）+ kVisualTarget（每帧一条）
-  → VisualTargetMonitor（影子）→ kVisualTargetStatus
+  → VisualTargetMonitor（观测）→ kVisualTargetStatus
   → FrameCompositor → kAnnotatedFrame → VideoSender → H.264 → MediaMTX/HM30
 PX4 /dev/ttyS1 → Px4Link → kFlightState → GroundStationLink → /dev/ttyS6 → 地面站
 地面站目标 UPDATE/ACK：MAVLink2 V2_EXTENSION message_type 65010/65011，
@@ -92,7 +92,7 @@ PX4 /dev/ttyS1 → Px4Link → kFlightState → GroundStationLink → /dev/ttyS6
 
 **模块库**：`drone_video`（拉流/解码/叠加）、`drone_video_transmission`（编码+图传）、`drone_perception`（YOLO/坐标换算/卡尔曼/目标估计）、`drone_communication`（串口/MAVLink/PX4/地面站）、`drone_state_machine`、`drone_control_core`、`drone_health`、`drone_config`、`drone_application`。FFmpeg 经 PIMPL 隔离不泄漏到头文件；MAVLink 头以 SYSTEM include 传播压警告。
 
-**状态标记**（文档与代码边界）：正式 / 影子 / Stub / 独立 / 阻塞——改动前确认目标模块当前处于哪种状态，不要把规划能力当成已实现。
+**状态标记**（文档与代码边界）：正式 / 观测 / 预留 / Stub / 独立 / 阻塞——改动前确认目标模块当前处于哪种状态，不要把规划能力当成已实现。**定义见 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)**（2026-11-17 起"影子"不再作为状态词；"观测"是设计边界，不是"没做完"）。**功能代码不得按 `enable_control` 分支**，只按可观测能力（命令接口是否注入、快照是否有效）判断。
 
 **路径约定**：部署为目录式绿色软件，所有路径经 `/proc/self/exe` 相对可执行文件解析（`config/`、`models/`、`logs/`）；CMake 每次构建自动同步 `models/` 和 `config/` 到 build 目录。配置查找顺序：`--config` 参数 → 可执行文件旁 `config/config.json` → `./config/config.json`。
 
@@ -111,7 +111,7 @@ drone_test/
 │   ├── video_transmission/  # 编码 + 图传
 │   ├── perception/          # YOLO/RKNN、双目测距、WGS84→NED、目标估计、视觉稳定性
 │   ├── communication/       # serial_port.h, mavlink_handler.h, px4_link.h, ground_station_link.h
-│   ├── control/             # flight_controller.h, tracking_control_law.h, shadow 等
+│   ├── control/             # flight_controller.h, tracking_control_law.h, 观测组件等
 │   ├── state_machine/       # mission_state_machine.h（S0~S16）
 │   ├── health/              # health_manager.h
 │   └── config/              # config.h（AppConfig 解析与校验）
@@ -144,12 +144,13 @@ drone_test/
 ## 维护文档入口（排查/改动前先读）
 
 1. `docs/README.md` — **文档唯一入口**：文档地图、单一事实来源、更新矩阵、基线位置
-2. `docs/项目总览与数据流.md` — 正式/影子/Stub 边界、全部数据流、线程模型
-3. `docs/模块索引.md` — 按类名/Topic/配置/测试定位代码
-4. `docs/故障排查手册.md` — 按现象定位（无画面、无检测、无 ACK 等）
-5. `docs/新增设备接入指南.md` — 替换/新增硬件的固定步骤
-6. `docs/开发进度.md` — 当前状态/门禁/最近变更；`docs/开发历史.md` — 历史时间线
-7. 各模块头文件同级的实现文档
+2. `docs/运行模式与模块状态定义.md` — `enable_control`（控制运行/只读运行）与六种模块状态
+3. `docs/项目总览与数据流.md` — 模块状态、全部数据流、线程模型
+4. `docs/模块索引.md` — 按类名/Topic/配置/测试定位代码
+5. `docs/故障排查手册.md` — 按现象定位（无画面、无检测、无 ACK 等）
+6. `docs/新增设备接入指南.md` — 替换/新增硬件的固定步骤
+7. `docs/开发进度.md` — 当前状态/门禁/最近变更；`docs/开发历史.md` — 历史时间线
+8. 各模块头文件同级的实现文档
 
 ## 语言、命名与信息核实规则
 

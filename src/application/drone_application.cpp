@@ -35,9 +35,13 @@ namespace drone::application {
 //
 // 负责根据 AppConfig 创建组件、在启动前完成 Topic 接线，并按数据依赖顺序
 // 启动/停止各模块。main.cpp 不承载业务装配逻辑，只负责配置、日志、信号和等待。
-// 安全基线：enable_control=false 时 FlightController 影子运行（不绑定
-// Px4Setpoint、不注入 PX4 快照源与命令接口）；只有 enable_control=true 才在
-// BindTopics 门禁分支完成控制输出接线（见函数内注释）。
+// **运行模式**（`runtime.enable_control`，定义见 docs/运行模式与模块状态定义.md）：
+// - true = 控制运行：BindTopics 门禁分支完成 SetPx4LinkSource + Px4Link::SetInput
+//   (SetpointOutput) + 状态机 SetCommandSender 三项接线（见函数内注释）；
+// - false = 只读运行：上述三项都不做，FlightController 跑门禁链但保持 IDLE，
+//   Px4Setpoint 无消费者。仅用于地面排查。
+// 本类是全工程**唯一**允许读 enable_control 的地方（另一处是 LoadAppConfig 校验）；
+// 功能模块不得据它分支。
 // ============================================================================
 
 DroneApplication::DroneApplication(config::AppConfig config)
@@ -74,7 +78,7 @@ void DroneApplication::BuildComponents() {
                 std::make_unique<video::StereoFrameSplitter>(config_.stereo_splitter);
         }
         detector_ = std::make_unique<perception::YoloDetector>(config_.yolo);
-        // 双目测距 v2（影子）：配置校验已保证 stereo_split 与视觉跟踪就位。
+        // 双目测距 v2（观测）：配置校验已保证 stereo_split 与视觉跟踪就位。
         // 只在基准图（左目）跑检测，无右目检测实例；测距组件不注册健康源。
         // 构造期加载预置校正矩阵，失败抛异常（启用测距时属配置错误）。
         if (config_.runtime.enable_stereo_ranging) {
@@ -86,7 +90,7 @@ void DroneApplication::BuildComponents() {
             std::make_unique<video_transmission::VideoSender>(config_.video_sender);
     }
 
-    // 视觉稳定性判定只消费YOLO帧级观测，属纯影子输出：不接状态机、不接控制。
+    // 视觉稳定性判定只消费YOLO帧级观测，属**观测**输出：不产生控制意图。
     if (config_.runtime.enable_visual_monitor && detector_ != nullptr) {
         visual_monitor_ = std::make_unique<perception::VisualTargetMonitor>(
             config_.visual_monitor);
@@ -121,13 +125,13 @@ void DroneApplication::BuildComponents() {
         config_.health.startup_grace_period);
     RegisterHealthSources();
 
-    // 影子状态机只在PX4状态源与地面站目标源同时存在时创建。
+    // 任务状态机只在PX4状态源与地面站目标源同时存在时创建。
     // 意图有效期与 FlightController 的 controller.intent_timeout 同源注入，
     // 保证状态机 valid_until_ms 与控制器超龄门禁一致；交接判据阈值来自
     // handover 节；visual_tracking 整节注入（相机内参供视线角换算，
     // 控制律参数/阈值供 S7 视觉伺服），不在此写死；actuator 节（捕网执行器，
-    // Task 10）同源注入——是否发得出命令由命令接口注入门禁决定
-    // （enable_control=true 才注入，见下方 BindTopics 门禁分支）。
+    // Task 10）同源注入——是否发得出命令由命令接口是否注入决定
+    // （只在控制运行的装配分支注入，见下方 BindTopics 门禁分支）。
     if (px4_link_ != nullptr && ground_station_link_ != nullptr) {
         state_machine::MissionStateMachineConfig state_machine_config;
         state_machine_config.intent_valid_for = config_.controller.intent_timeout;
@@ -199,10 +203,10 @@ void DroneApplication::BuildComponents() {
             "仍要求落地且未解锁");
     }
 
-    // 飞行控制器（阶段四正式实现）：状态机装配即创建，与 enable_control 无关——
-    // enable_control=false 时影子运行：周期线程跑真实门禁链与限幅流水线，
-    // 但不注入 PX4 快照源（SetPx4LinkSource），授权链恒不通过、保持 IDLE 停发，
-    // SetpointOutput 无消费者；enable_control=true 的绑定见 BindTopics 门禁分支。
+    // 飞行控制器（正式实现）：状态机装配即创建，创建与运行模式无关——
+    // 只读运行时周期线程照样跑门禁链与限幅流水线，只是不注入 PX4 快照源
+    // （SetPx4LinkSource），授权链恒不通过、保持 IDLE，SetpointOutput 无消费者；
+    // 控制运行的绑定见 BindTopics 门禁分支。
     if (mission_state_machine_ != nullptr) {
         // bootstrap 停流兜底时长由 takeoff 节注入（局部副本，不回写配置成员）：
         // 状态机 S3 的模式/解锁超时是权威，控制器只负责防卡死兜底。
@@ -349,7 +353,7 @@ void DroneApplication::BindTopics() {
     }
 
     // 多机任务分配：65014 解析结果 → 状态机；65015 回执 → 地面站链路。
-    // 分配输入/回执不依赖 enable_control：无控制装配时状态机仍接收 65014，
+    // 分配输入/回执与运行模式无关：只读运行时状态机仍接收 65014，
     // 预检回 control_disabled，地面站可据此获知不可调度。
     if (mission_state_machine_ != nullptr && ground_station_link_ != nullptr) {
         mission_state_machine_->SetAssignmentInput(
@@ -377,7 +381,7 @@ void DroneApplication::BindTopics() {
     }
 
     // S5 位置引导输入：估计器/视觉稳定性/双目测距三者必须作为一组同时装配，
-    // 缺一不绑定（状态机保持影子行为，不会假装执行自动任务）。
+    // 缺一不绑定（状态机不发布 S5 意图，不会假装执行自动任务）。
     if (mission_state_machine_ != nullptr && target_estimator_ != nullptr &&
         visual_monitor_ != nullptr && stereo_ranger_ != nullptr) {
         mission_state_machine_->SetEstimationInputs(
@@ -387,34 +391,40 @@ void DroneApplication::BindTopics() {
     }
 
     // 交接判据的创新门限读取估计器最近一次视觉创新（只读诊断接口）。
-    // 未装配估计器时不注入：交接判据不评估（保持 GPS_APPROACH 影子行为）。
+    // 未装配估计器时不注入：交接判据不评估（保持 GPS_APPROACH）。
     if (mission_state_machine_ != nullptr && target_estimator_ != nullptr) {
         mission_state_machine_->SetEstimationDiagnostics(target_estimator_.get());
     }
 
     // 飞行控制器接线（阶段四装配门禁）。意图输入纪律：只接
-    // MissionStateMachine::IntentOutput()——VisualTrackingShadow 的影子意图不带
+    // MissionStateMachine::IntentOutput()——VisualTrackingShadow 的观测意图不带
     // 授权请求位（common::kControlIntentReasonRequestControl，reason_code bit31），
-    // 若接入控制器会每拍清锁存压死授权门禁，故影子输出永不接 FlightController。
+    // 若接入控制器会每拍清锁存压死授权门禁，故观测输出永不接 FlightController。
     if (flight_controller_ != nullptr && mission_state_machine_ != nullptr) {
         flight_controller_->SetInput(mission_state_machine_->IntentOutput());
         control_assembly_.intent_input_bound = true;
     }
 
-    // enable_control 门禁：只有显式打开才把控制输出接到 PX4 链路并注入授权
-    // 数据源；false 时保持物理隔离——不绑定 Px4Setpoint、不注入快照源、
-    // 不注入命令接口，控制器留在 IDLE 影子运行。
+    // 运行模式门禁（全工程唯一读 enable_control 的地方之一）：
+    // 控制运行 → 把控制输出接到 PX4 链路并注入授权数据源；
+    // 只读运行 → 保持物理隔离：不绑定 Px4Setpoint、不注入快照源与命令接口，
+    // 控制器留在 IDLE。定义见 docs/运行模式与模块状态定义.md。
     if (config_.runtime.enable_control && flight_controller_ != nullptr &&
         px4_link_ != nullptr) {
         flight_controller_->SetPx4LinkSource(px4_link_.get());
         px4_link_->SetInput(flight_controller_->SetpointOutput());
-        // 阶段四装配门禁分支（Task 6）内注入 PX4 命令窄接口（调用启用归 Task 7，
-        // 仅 enable_control=true 可达；false 时命令接口物理缺席）。
+        // 同一分支内注入 PX4 命令窄接口：它是"能不能发命令"的唯一事实依据，
+        // 功能模块（如 S13 两段降落）只判断 command_sender_ 是否注入，
+        // 不再回头判断 enable_control。
         mission_state_machine_->SetCommandSender(px4_link_.get());
         control_assembly_.command_sender_injected = true;
         control_assembly_.px4_snapshot_source_injected = true;
         control_assembly_.setpoint_bound_to_px4 = true;
-        SPDLOG_WARN("正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint");
+        SPDLOG_WARN("正式控制输出已启用（控制运行）：FlightController 已绑定 Px4Setpoint");
+    } else if (!config_.runtime.enable_control) {
+        SPDLOG_INFO(
+            "控制输出已禁用（只读运行）：不绑定 Px4Setpoint、不注入 PX4 快照源与"
+            "命令接口，仅供地面排查");
     }
 }
 

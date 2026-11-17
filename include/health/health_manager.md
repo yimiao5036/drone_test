@@ -186,4 +186,4 @@ ctest --test-dir build --output-on-failure
 - 如果只有 `data_freshness_bits` 变化，说明链路可能仍在线，但业务数据没有按期到达；不能简单等同于串口断开；
 - 修改位定义时必须同步更新 `include/common/types.h`、`docs/数据接口文档.md`、本实现文档、状态机规则和地面站协议；
 - 修改 `DroneApplication` 健康接线时，必须先完成 Topic 绑定，再启动状态机、地面站消费者和 HealthManager；
-- 在 `enable_control=false` 阶段，健康状态只能用于观察和影子决策，不能触发任何 PX4 控制命令。
+- 在只读运行（`enable_control=false`）阶段，健康状态只能用于观察与观测决策，不能触发任何 PX4 控制命令。

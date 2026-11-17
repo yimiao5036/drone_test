@@ -104,7 +104,7 @@ Faulted：终态，Update/Execute/Stop 均不再产生命令
   `等待 PX4 ACK 期间连接断开`、`执行器通道越界`。
 - 机构不动/反向：先查 MAIN5 输出功能与 `PWM_MAIN_MIN5/MAX5` 及接线；
 - 触发后不进入复位：查 187 ACK 是否到达、`reset_delay` 是否过大；
-- 未注入命令接口（`enable_control=false`）时零日志、零命令，属预期影子行为。
+- 未注入命令接口（只读运行）时零日志、零命令，属预期行为。
 
 ## 6. 测试
 

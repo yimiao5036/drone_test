@@ -1,4 +1,4 @@
-# drone_test
+﻿# drone_test
 
 运行在香橙派 RK3588（ARM64 / Ubuntu）上的反无人机机载 C++17 控制系统：
 地面站目标位置 → YOLO/RKNN 识别 → 轨迹估计 → 控制 PX4 接近/视觉跟踪/拦截 → 返航降落。
@@ -8,10 +8,14 @@
 
 ## 安全基线
 
-- `config/config.json` 保持 `runtime.enable_control=false`，正式程序不向 PX4 发送飞行控制；
-- `interception.enabled=false`，生产不自动触发捕网；
-- 状态机、目标估计、视觉稳定性、双目测距均为影子运行；
-- 打开控制只允许在现场部署目录本地副本，且必须先完成 G4/G5 与 `enable_control` 前置清单。
+- **运行模式**：`config/config.json` 的 `runtime.enable_control=true`（2026-10-30 起为仓库默认，
+  现场实测期）＝**控制运行**；改成 `false` 重启即 **只读运行**（只采日志、不下发控制）。
+  定义见 [`docs/运行模式与模块状态定义.md`](docs/运行模式与模块状态定义.md)。
+- 两个发射闸门仍关：`interception.enabled=false`（生产不自动触发捕网）、
+  `actuator.gcs_fire_enabled=false`（65016 直控不装配）。
+- `TargetEstimator`、`VisualTargetMonitor`、`StereoRanger` 是**观测**模块（跑真实算法、
+  不产生控制输出）；`VisualTrackingShadow` 的输出 Topic 无消费者、永不接控制器。
+- 功能代码**不得**按 `enable_control` 分支，只按可观测能力判断（命令接口是否注入等）。
 
 ## 快速构建与测试
 
@@ -32,7 +36,7 @@ CMake 会把 `config/` 和 `models/` 同步到构建目录。配置查找顺序�
 
 先看 [`docs/README.md`](docs/README.md)。日常维护最常用的几份：
 
-- [`docs/项目总览与数据流.md`](docs/项目总览与数据流.md)：正式/影子/Stub 边界、数据流、线程
+- [`docs/项目总览与数据流.md`](docs/项目总览与数据流.md)：模块状态、数据流、线程、Topic
 - [`docs/模块索引.md`](docs/模块索引.md)：按类名/Topic/配置/测试定位代码
 - [`docs/故障排查手册.md`](docs/故障排查手册.md)：按现象定位
 - [`docs/新增设备接入指南.md`](docs/新增设备接入指南.md)：替换/新增硬件
@@ -63,9 +67,9 @@ CMake 会把 `config/` 和 `models/` 同步到构建目录。配置查找顺序�
 | 飞控 | Pixhawk 2.4.8，PX4 1.17.0 |
 | 算力板与飞控 | `/dev/ttyS1` 串口 MAVLink |
 | 地面站 | 自研，HM30 电台，`/dev/ttyS6` |
-| 摄像头 | USB 双目 SBS MJPG（UVC）；左目用于 YOLO/图传，右目用于稀疏 Census 测距（影子） |
+| 摄像头 | USB 双目 SBS MJPG（UVC）；左目用于 YOLO/图传，右目用于稀疏 Census 测距（观测） |
 | 视觉算法 | YOLOv26 RKNN，生产输入 384×640 |
-| 测距 | 双目稀疏 Census v2（影子）；室外目标 <8m 可用，卷尺级精度待验收 |
+| 测距 | 双目稀疏 Census v2（观测）；室外目标 <8m 可用，卷尺级精度待验收 |
 | 导航 | PX4 融合 GPS/IMU/磁力计/气压计；算力板无独立 GPS |
 | Home/锚点 | 目标估计以 EKF 锚点（`GPS_GLOBAL_ORIGIN` #49）为原点；返航使用 PX4 Home |
 | 捕网枪 | PX4 MAIN5，Output Function=`Peripheral via Actuator Set 1`；机载 `net_channel=1` |

@@ -1,4 +1,4 @@
-# 视觉跟踪控制律（tracking_control_law + visual_tracking_shadow）
+﻿# 视觉跟踪控制律（tracking_control_law + visual_tracking_shadow）
 
 > 对应实现：`include/control/`、`src/control/`（tracking_config / tracking_types /
 > line_of_sight / pid_controller / rate_limiter / staleness_checker /
@@ -22,8 +22,8 @@
 - ⑦距离通道：Δd→PID→vx；无距离按配置降级（§6.2/§6.3）；
 - ⑧机体系→NED 随航向旋转输出（§2.3）。
 
-**VisualTrackingShadow**（影子适配层组件）：20Hz（配置）固定节拍组装快照
-驱动控制律，把输出映射为 `ControlIntent` 发布 `kControlIntent`。**纯影子：
+**VisualTrackingShadow**（观测适配层组件）：20Hz（配置）固定节拍组装快照
+驱动控制律，把输出映射为 `ControlIntent` 发布 `kControlIntent`。**纯观测：
 kControlIntent 当前无消费者，不产生真实控制输出。**
 
 **第二调用点（阶段四 Task 9）**：`MissionStateMachine` 的 S7 视觉伺服协作者
@@ -31,22 +31,22 @@ kControlIntent 当前无消费者，不产生真实控制输出。**
 `TrackingControlLaw`，配置来自 `visual_tracking` 节同源注入），
 在 10Hz 决策周期内组装快照并调用 `Update`（控制律按实际时钟差推算 dt，
 配置频率仅作首拍兜底），输出映射为状态机 `ControlIntent`（`control_source=1`
-带 bit31，接 `FlightController`——正式控制链）。影子与状态机的意图输出是两个
-独立 Topic，互不干扰；影子保留供观察（见 `visual_tracking_shadow.h` 并存说明）。
+带 bit31，接 `FlightController`——正式控制链）。观测组件与状态机的意图输出是两个
+独立 Topic，互不干扰；观测组件保留供观察（见 `visual_tracking_shadow.h` 并存说明）。
 接口与剖面选择见 [`visual_control_law.md`](visual_control_law.md)。
 
 不做什么：不接 Px4Link；不做多目标选举；不做 NED 空间转换（属
 TargetEstimator 融合阶段）。距离通道仅在注入 `StereoTargetDistance` 且该帧
 有效时启用；未注入/无效时 distance_valid 恒 false，走配置的
 `no_distance_action` 支路。生产装配当前尚未调用 `SetEstimationInputs`
-（视觉/测距输入未接线），S7 保持影子；SITL 验收工具会注入三路输入。
+（视觉/测距输入未接线），S7 不发布视觉意图；SITL 验收工具会注入三路输入。
 
 ## 2. 接口与数据流
 
 ```text
 Topic<VisualTargetStatus> ─┐
                            ├─► VisualTrackingShadow ──► Topic<ControlIntent>(kControlIntent)
-Topic<FlightStateSnapshot>─┘   （S7 跟随状态机 10Hz 决策拍；影子按 shadow.frequency_hz 独立节拍）
+Topic<FlightStateSnapshot>─┘   （S7 跟随状态机 10Hz 决策拍；观测组件按 shadow.frequency_hz 独立节拍）
 ```
 
 - 状态映射：`VisualTargetStatus.state==kLocked` → tracked=true，其余 false；
@@ -56,7 +56,7 @@ Topic<FlightStateSnapshot>─┘   （S7 跟随状态机 10Hz 决策拍；影子
   继续计算仅供观察（首次进入 INFO 标注）；false 保持真实语义（每拍降级保持）。
 - ControlIntent 映射：kVelocityHeading→target_x/y/z=NED 速度 + 速率式
   `yaw_rate_dps`（types.h 新增字段）/位置式 `yaw_deg`；kBrakeHover→kBrakeHover；
-  kDegradedHold→kNone。reason_code 影子段（避开骨架 0-7）：
+  kDegradedHold→kNone。reason_code 观测段（避开骨架 0-7）：
   **100=正常跟踪 101=Coast 102=判丢刹车 103=姿态超龄 104=视觉超龄
   105=持续无距离退出**。
 
@@ -83,8 +83,8 @@ Topic<FlightStateSnapshot>─┘   （S7 跟随状态机 10Hz 决策拍；影子
 
 | 等级 | 场景 |
 |------|------|
-| INFO | 影子启动/停止、虚拟姿态启用（一次）、控制律状态切换（刹车进出/降级切换）、节流摘要（默认 10s：模式/速度/yaw_rate/coast/虚拟姿态） |
-| ERROR | 影子启动失败（视觉输入未接线） |
+| INFO | 观测组件启动/停止、虚拟姿态启用（一次）、控制律状态切换（刹车进出/降级切换）、节流摘要（默认 10s：模式/速度/yaw_rate/coast/虚拟姿态） |
+| ERROR | 观测组件启动失败（视觉输入未接线） |
 
 热路径（每拍/每消息）零日志。
 
@@ -111,7 +111,7 @@ ctest --test-dir build -R 'ControlLaw|PixelToAngle|VisualTrackingShadow|Tracking
 | 摘要一直是"降级保持" | 看 reason：姿态超龄（PX4 未连接/未上电，且虚拟姿态被关）/视觉超龄（monitor 没发布或视频链路没跑）；虚拟姿态开关在 `visual_tracking.shadow.virtual_attitude_when_absent` |
 | 垂直角方向反了/量值不对 | 确认 camera 组 cy_px 是标定值 532.07 而非 360；主点假设错误的典型症状就是垂直方向固定偏约 9.7° |
 | 换了分辨率档位后角度错 | 内参只对 1280×720 有效，换档重新标定并更新 camera 组 |
-| 影子 kControlIntent 没人消费 | 影子主题无消费者（2026-10-13 阶段四 Task 9 起正式路径 = 状态机 S7 `MissionStateMachine::IntentOutput` → `FlightController`）；影子保留供观察，靠摘要日志核对行为 |
+| 观测 kControlIntent 没人消费 | 观测 Topic 无消费者（2026-10-13 阶段四 Task 9 起正式路径 = 状态机 S7 `MissionStateMachine::IntentOutput` → `FlightController`）；观测组件保留供观察，靠摘要日志核对行为 |
 | 增益/PID 整定 | 已整定（2026-10-14，见下节）；调整时只改 config.json，不动代码，改后必须用 `--sitl-stage4-tune` 复跑验证 |
 
 ## 7. 参数整定记录（2026-10-14，SITL 整定完成）

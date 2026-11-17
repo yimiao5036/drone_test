@@ -1,4 +1,4 @@
-# stereo_ranger 实现文档（v2：稀疏 Census 路线）
+﻿# stereo_ranger 实现文档（v2：稀疏 Census 路线）
 
 > 对应实现：`include/perception/stereo_ranger_core.h`、`src/perception/stereo_ranger_core.cpp`、
 > `include/perception/stereo_ranger.h`、`src/perception/stereo_ranger.cpp`
@@ -30,7 +30,7 @@
 
 ### 边界（v2）
 
-- **影子链路组件**：发布 `kStereoTargetDistance`，消费者为 `VisualTrackingShadow`
+- **观测链路组件**：发布 `kStereoTargetDistance`，消费者为 `VisualTrackingShadow`
   （距离通道，可选）与 `TargetEstimator`（视觉融合，需 `enable_visual_position_fusion`）；
   不产生飞行控制输出；不注册健康源。
 - **只在基准图跑检测**：无右目检测实例（`yolo_right` 已删除，省约一半 NPU）。
@@ -49,10 +49,10 @@ Topic<FrameHandle> kDecodedFrameRight（辅助图=SBS左半,NV12）   ─┘    
                                                                         │
                                                                         ▼
                                     VisualTrackingShadow::SetDistanceInput（可选）
-                                    valid 且未超龄 → 距离 PID 接管（影子观察）；
+                                    valid 且未超龄 → 距离 PID 接管（观测）；
                                     无效/未接线 → 回落 no_distance_action=kSlowApproach；
                                     TargetEstimator::SetVisualDistanceInput（可选，
-                                    视觉融合开关）→ 局部 NED 观测更新滤波器（影子）
+                                    视觉融合开关）→ 局部 NED 观测更新滤波器（观测）
 ```
 
 `StereoTargetDistance` 字段（`include/common/types.h`）：
@@ -198,7 +198,7 @@ Topic 一览：
   配置与本文。主工程侧只在运行中观察摘要日志（有效占比/IQR/距离 min/avg/max/
   匹配耗时）作快速判读。
   **优先级（2026-10-12 维护者决定）**：前期参考工程实测精度可接受（无量化回填）；
-  当前距离消费者全为影子（无控制输出依赖精度），卷尺级验收与 `fxB` 对齐降级为
+  当前距离消费者全为观测用途（无控制输出依赖精度），卷尺级验收与 `fxB` 对齐降级为
   **阶段四（正式控制接入）前置条件**——距离尺度错误会直接转化为接近速度错误，
   接入控制前必须完成。
   **室外现场使用（2026-10-20 回填）**：目标 **<8m 可正常测距**；近距约 1.9m 实测

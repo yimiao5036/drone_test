@@ -2,9 +2,11 @@
 
 ## 功能职责
 
-`MissionStateMachine`负责消费地面站目标、PX4飞行状态和健康状态快照，按任务阶段维护`MissionStatus`。默认仍是安全影子语义：验证`GroundStationTarget`已经能进入任务链路，并在满足导航快照基本条件时进入`GPS_APPROACH`影子状态。
+`MissionStateMachine`负责消费地面站目标、PX4飞行状态和健康状态快照，按任务阶段维护`MissionStatus`。任务链路按阶段推进：满足导航快照基本条件时进入`GPS_APPROACH`。
 
-阶段四新增（Task 7）：经`SetEstimationInputs`绑定目标估计/视觉稳定性/双目测距三个输入后，`GPS_APPROACH`（S5）开始发布`kPositionGuide`位置引导意图（2026-11-11 起落点为速度律 `p_ref` 锚点，三轴速度前馈同源；`control_source=0`，`reason_code`带 bit31 控制权请求位`common::kControlIntentReasonRequestControl`）。**未绑定时不出意图、保持原影子行为**。意图是否真正转化为 PX4 输出由`FlightController`授权链与`enable_control`装配门禁决定，状态机侧不做最终裁决。
+阶段四新增（Task 7）：经`SetEstimationInputs`绑定目标估计/视觉稳定性/双目测距三个输入后，`GPS_APPROACH`（S5）开始发布`kPositionGuide`位置引导意图（2026-11-11 起落点为速度律 `p_ref` 锚点，三轴速度前馈同源；`control_source=0`，`reason_code`带 bit31 控制权请求位`common::kControlIntentReasonRequestControl`）。**未绑定时不出意图**。意图是否真正转化为 PX4 输出由`FlightController`授权链与**运行模式**装配决定，状态机侧不做最终裁决；
+**本模块不读 `enable_control`**——需要判断“能不能发指令”时只看 `command_sender_ != nullptr`
+（定义见 [`docs/运行模式与模块状态定义.md`](../../docs/运行模式与模块状态定义.md)）。
 
 **S5 接近段速度律（2026-11-11 落机载，唯一 S5 引导方式）**：
 `PublishEstimateGuidedIntent()` 由 `ApproachSpeedLaw` 每拍产出 `(p_ref, v_ref)`：
@@ -49,7 +51,7 @@
 
 **热备份核对（设计 §2.4）**：S7 期间每秒核对卡尔曼状态年龄——`TargetState.header.receive_time_ms`年龄是否超出其自报有效期窗（`valid_for_ms`，与 S5 意图门禁`HasFreshEstimate`同一口径；无快照/`valid=false`亦视为断粮）。断粮 → 节流 WARN「S7 热备份断粮」+ `MissionStatus.active_warning_bits` bit2 置位，**不退出 S7**（S7 去留由四条收口路径决定，热备份告警只提示"假备份"风险）。
 
-**与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，影子部件保留（现场观察用），**影子意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
+**与 VisualTrackingShadow 并存（Topic 隔离）**：控制律调用迁入状态机后，观测组件保留（现场观察用），**观测意图主题与状态机`IntentOutput()`是两个独立 Topic**；装配层只把状态机意图接入`FlightController`（见`DroneApplication::BindTopics`注释），不存在双意图生产者竞争。
 
 阶段四新增（Task 10 / Task 5，2026-10-21；2026-11-11 泛化）：**通用拦截设备
 `IInterceptionDevice`（当前为 `single_pwm` 捕网执行器）**——注入命令窄接口
@@ -183,7 +185,7 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
 - 日志：`目标出区保持: 目标=(..) 距边界=..m 自机距边界=..m 保持点=(..)`（WARN）、
   `目标出区保持解除: …`（INFO）。
 
-**G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`enter_s6_lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**`DroneApplication` 生产装配仍未调用 `SetEstimationInputs`**（G3 裁决：生产接线与 `enable_control` 打开一并做，避免在未启控制时改变整机行为）——整机停在 S5 属预期，工具装配与生产装配共享同一状态机实现与配置注入路径。
+**G3 全链验收（Task 12，2026-10-13，`tools/px4_link_smoke --sitl-stage4-mission`）**：状态机转正验收走**独立装配工具**（工具装配 `MissionStateMachine → FlightController → Px4Link`，扮演地面站/视觉监视器/双目测距三路生产者注入模拟数据），覆盖 S5→S6→S7→回退→停发全序列、交接缝意图无超龄（末条 S5 位置意图→首条 S7 速度意图间隔 < `intent_timeout` 且窗口内未跌入 COAST——`enter_s6_lock_frames` 门限 + 20Hz 注入使 S6 只驻留 1 决策拍，S6 冻结续发的逐拍滚动语义由本模块单测覆盖，工具侧只作诊断记录）、S7 伺服启动、短期/持续 LOST 语义、目标过期停发链与卡尔曼备份接管。**生产装配的 `SetEstimationInputs` 已于 2026-10-22 随多机任务分配接线落地**（估计器/视觉稳定性/双目测距三者齐备时成组绑定）；G3 工具仍保留，作为不依赖真实观测链的独立验收路径，与生产装配共享同一状态机实现与配置注入路径。
 
 本阶段仍不做以下事情：
 
@@ -229,7 +231,7 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
   持有活动分配）下，`HasFreshGroundTarget`/`HasFreshEstimate` 对
   `target_id != assignment.target_id` 返回 false——非匹配 65010/估计不进入 S5、
   不更新位置引导、不参与交接；`GroundStationLink` 仍可照常做链路 ACK。
-  影子模式（未注入命令接口）保持既有 S5 行为，不过滤。
+  只读运行（未注入命令接口）时保持既有 S5 行为，不过滤。
 - **S5 目标看门狗**：S5 入口（`TransitionTo(kGpsApproach)`）在控制任务下记录
   `target_wait_started_ms_`；每拍 `EvaluateTargetWatchdog()`：
   - 未获得匹配目标（估计或 65010 任一新鲜即视为获得）超过
@@ -238,7 +240,7 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
     65015 aborted(`target_lost`) → S12；恢复即清零丢失计时；
   - 中止当拍停发位置引导（S12 接管返航意图），不触发拦截/187；
     `mission_abort_latched_` 保证一次任务只中止一次（接受新分配/`Start()` 复位）；
-  - 仅在 S5 生效，不改变 S6/S7 既有交接/视觉丢失逻辑；影子模式不启用。
+  - 仅在 S5 生效，不改变 S6/S7 既有交接/视觉丢失逻辑；只读运行时不启用。
 
 **S5 目标失效原地保持（2026-10-22，替代“直接停发”）**：目标不可用（过期 /
 `target_id` 不匹配 / 估计器无输出）时，控制任务在 S5 不再立即停发位置意图，
@@ -263,7 +265,7 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
 - 可观测：保持期间 65013 `active_warning_bits` 置 **bit5**（目标保持中），
   进入/退出各打一条 INFO（`S5 目标失效，进入原地保持` /
   `S5 原地保持结束`），保持期内不刷屏；
-- 单测覆盖：保持目标/无前馈/10Hz 续流、3 拍恢复迟滞、影子不保持、
+- 单测覆盖：保持目标/无前馈/10Hz 续流、3 拍恢复迟滞、无命令接口时不保持、
   局部位置无效回落、累计上限两条回执路径、引导期间不因历史累计中止
   （`S5*Hold*` 用例）。
 
@@ -308,7 +310,7 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
   （availability=engaged）。
 - **S4 空中超时**（`height_timeout`）：PX4 仍在 Offboard → 转 **S13**，由现有
   S13 两段落链发 AUTO.LAND(4/6)（2026-11-17 起先进 S13a 机载下降，到交段判据/
-  保护/超时才发 176；影子装配仍是直接发）；PX4 已离开 Offboard → 设置
+  保护/超时才发 176；只读运行/回滚路径仍是直接发）；PX4 已离开 Offboard → 设置
   让权标志，转 **S13 仅监控**，不再发 AUTO.LAND、不再争控。
 - **地面超时/条件失败**：停止发布 kTakeoff/位置意图；若 `landed` 且
   （`armed` **或本轮 400 ACK 已 ACCEPTED**）只发一次 DISARM（400 param1=0）——
@@ -328,12 +330,12 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
 - **不重试**：176/400 各只发一次；中止后不原地循环重发，中止当拍起停止
   发布起飞意图（空中中止由 S12 返航链按设计接管）。
 
-**影子兼容（关键）**：未注入命令接口（`enable_control=false` 装配）时，
-65014 一律回 `control_disabled`，`availability=unavailable`（影子模式不可被调度）；
-既有“新鲜 65010 目标 + 导航就绪 → S2→S5 影子验证”路径**原样保留**。注入命令
+**只读运行兼容（关键）**：未注入命令接口（迁移条件 `command_sender_ == nullptr`）时，
+65014 一律回 `control_disabled`，`availability=unavailable`（不可被调度）；
+既有“新鲜 65010 目标 + 导航就绪 → S2→S5”路径**原样保留**。注入命令
 接口后，65010 目标不得单独把 S2 推到 S5——必须由 65014 分配经预检进入 S3。
 此分叉只在 Evaluate 的 S2→S5 分支增加 `command_sender_ == nullptr` 条件，
-不删除任何影子测试路径。
+**不读 `enable_control`**，也不删除任何既有测试路径。
 
 完整自动任务链仍以`docs/状态机设计.md`为准。S3/S4 的算力板侧时序已由本模块
 落地（Task 5）；`FlightController::ControlAuthority::kBootstrap` 的原点保持
@@ -427,12 +429,14 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 `handover` 的关系校验（`exit_lost_frames > enter_s6_lock_frames` 等）由配置加载期
 `HandoverConfig::Validate`强制，状态机构造不重复校验（与 FlightController 同约定）。
 
-**接线现状（T12 裁决后）**：`DroneApplication`**仍未**调用`SetEstimationInputs`
-（整机因此停在 S5 影子行为，不影响既有链路）——T12 G3 全链验收改走独立装配工具
-（`tools/px4_link_smoke --sitl-stage4-mission`，三输入一组绑定 + 真实估计器诊断），
-生产接线与 `enable_control` 打开一并做（避免控制未启时改变整机行为）；
+**接线现状**：`DroneApplication` **已接线**——估计器/视觉稳定性/双目测距三者同时装配时
+调用`SetEstimationInputs`（缺一不绑定，状态机不发布 S5 意图）；估计器存在时注入
+`SetEstimationDiagnostics`。T12 当时"生产接线与 `enable_control` 打开一并做"的约定
+已随 2026-10-30 控制运行落地。裁剪装配（如视频探针）关掉上述组件时仍会出现
+"不出 S5 意图"，属预期；G3 全链验收另走独立装配工具
+（`tools/px4_link_smoke --sitl-stage4-mission`）。
 `SetEstimationDiagnostics`已在装配估计器时注入；
-`SetCommandSender`已在`enable_control=true`装配门禁分支注入（T6），
+`SetCommandSender`已在控制运行（`enable_control=true`）的装配门禁分支注入（T6），
 消费点=捕网执行器触发/复位（T10，enable_control=false 时零调用）。
 
 ## 关键实现点
@@ -546,7 +550,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     地面站按序号做去重/丢包统计会误判）。
   - **65015 的既有门槛（2026-10-28 复核）**：`PublishTakeoffAbortAck()` 首行是
     `if (!accepted_assignment_.has_value()) return;`，因此只有在先接受过 65014 分配的
-    任务里，中止才会同步 65015；影子/未分配场景（含 SITL `--sitl-stage4-command`）只看
+    任务里，中止才会同步 65015；未分配/只读运行场景（含 SITL `--sitl-stage4-command`）只看
     65021 与状态迁移。判读现场日志时不要把它当回归。
 - **S12 返航机头朝向**：`return_home.heading_mode=1`（默认）时，S12 非爬升段按
   期望航向（指向 Home，`atan2(east, north)`）下发 `yaw_valid=true` 的位置意图，
@@ -563,7 +567,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   **室内提示**：室内可能无 GPS fix/Home，停留自检属预期、不是通信问题
   （判据是「PX4 心跳已连接」是否出现）；分阶段验证见`docs/PX4实链验证清单.md`。
 - `READY`阶段等待有效地面站目标；**未注入命令接口时**，目标有效且导航仍有效
-  即进入`GPS_APPROACH`影子状态（既有语义，保留）。
+  即进入`GPS_APPROACH`（既有语义，保留）。
 - **S2 分配预检（Task 4，2026-10-22）**：只在`CurrentState()==kReady`处理
   最新一条 65014，且每条消息只处理一次（处理即清空`latest_assignment_`，
   不按 100ms 决策周期重复回 65015）。检查顺序：
@@ -579,7 +583,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
      `unsupported_interceptor_type`；
   6. `valid_for_ms > 0` 且 `now <= received_ms + valid_for_ms`，否则
      `invalid_message`（按本机单调时钟；0 视为非法）；
-  7. `command_sender_ != nullptr`，否则 `control_disabled`（影子装配）；
+  7. `command_sender_ != nullptr`，否则 `control_disabled`（只读运行）；
   8. `estimation_inputs_active_`（估计/视觉/测距三输入已绑定），否则
      `preflight_failed`；
   9. `latest_flight_`：连接在线、`landed_state_valid && landed`、`!armed`、
@@ -613,8 +617,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - **飞行中电池守卫（Task 8，2026-10-22）**：`EvaluateBatteryGuard()` 在
   `Evaluate` 中位于 `EvaluateTakeoffSequence` 之后、交接/拦截逻辑之前，
   因此低电中止当拍即进入 S12，后续 S9/S10 入口与捕网触发没有机会执行。
-  - 生效阶段：S3/S4 与 S5~S10；S12/S13/S14/S16 不再触发；影子装配
-    （`command_sender_ == nullptr`）不生效（S5 影子验证语义保留）。
+  - 生效阶段：S3/S4 与 S5~S10；S12/S13/S14/S16 不再触发；只读运行
+    （`command_sender_ == nullptr`）时不生效（S5 既有验证语义保留）。
   - **遥测失效**（`battery_valid=false`、`battery_remaining_valid=false`、
     百分比非有限或无飞行快照）→ 立即中止，reason
     `battery_telemetry_invalid`，不等防抖。
@@ -692,7 +696,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   NaN 与 NaN 视为内容相等；未置位轴不参与比较。
 - 估计失效或超龄时停止发布意图（不补发安全类意图，刹停语义归后续状态迁移任务）；
   超龄收口由 FlightController 的`intent_timeout`门禁接管。
-- 估计/视觉/测距三输入必须成组绑定；只绑部分时记 ERROR 并按未绑定处理（保持影子）。
+- 估计/视觉/测距三输入必须成组绑定；只绑部分时记 ERROR 并按未绑定处理（不发布 S5 意图）。
 - **交接判据（Task 8）**：
   - 判定逻辑抽为内部纯函数`HandoverEntryConditionsMet(HandoverInputs, HandoverConfig)`
     （匿名命名空间，供 Task 9 复用）：视觉 `LOCKED` → 距离有效且未超龄 →
@@ -738,8 +742,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 快照组装：视觉`LOCKED`→`tracked=true`（其余状态 false）；`is_predicted`恒
     false（主链路无预测坐标）；距离仅在`valid=true`且接收时间有效时透传
     （超龄判定在控制律内，阈值取`tracking.control.distance_stale_ms`）；
-    姿态取`FlightStateSnapshot`真实值（**正式路径不做虚拟姿态兜底**——影子
-    部件的`virtual_attitude_when_absent`属观察开关，不进入正式装配）。
+    姿态取`FlightStateSnapshot`真实值（**正式路径不做虚拟姿态兜底**——观测
+    组件的`virtual_attitude_when_absent`属观察开关，不进入正式装配）。
   - 意图坐标系：速度分量已是**局部 NED**（机体系→NED 旋转在视觉控制律
      内完成），意图`frame_id=3`标注；FlightController 不做二次旋转
     （边界见`include/control/flight_controller.md`）。
@@ -783,7 +787,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - 命令参数（single_pwm）：只有本 Actuator Set 参数位填归一化值，**其余位
     NaN**（规范"忽略"；0=中位行程会误动其他 Set），p7=0。机载只发 -0.7/0.0，
     PWM 映射在 PX4 侧。
-  - 门禁：`intercept_device_==nullptr`（enable_control=false 装配语义）→ 零调用，
+  - 门禁：`intercept_device_==nullptr`（只读运行或未装配执行器）→ 零调用，
     本功能物理缺席；触发/复位同为控制输出，不另开旁路。
   - 进程退出不补发复位行程（`Stop()` 不触发机构动作）：机构实际位置由
     G4 台架/人工确认；拦截执行段内停机属异常场景，PX4 侧输出保持最后值。
@@ -882,7 +886,7 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     |---|---|---|
     | **S13a** 机载下降 | `landing_descent_phase_ == true` | 每拍发位置引导意图（低位原因码 **12**）：目标 = Home 水平 + 相对高度 `landing.descend_target_ag_m`(1.2m)，推进速度 `descend_speed_mps`(0.8)/低空档 `descend_slow_speed_mps`(0.3)；跑三条保护 + 超时 + 交段判据 |
     | **S13b** 交 PX4 | `landing.enabled && !descent_phase_` | 发 `DO_SET_MODE(AUTO.LAND 4/6)`（按 `return_home.command_retry` 重试）；**确认前继续保持控制权**（按当前高度发布保持意图，不推进下降目标）；确认（ACK `result=0` 或观察到 PX4 已进 4/6）后停止发布 intent，只监视 `landed/armed` |
-    | 回滚路径 | `landing.enabled == false` | 完全保持 2026-11 之前的行为：直接发 `AUTO.LAND`、不发布任何降落位置意图；**纯影子装配**（未注入命令接口）在建 S13b 前就返回，同样什么都不发 |
+    | 回滚路径 | `landing.enabled == false` | 完全保持 2026-11 之前的行为：直接发 `AUTO.LAND`、不发布任何降落位置意图；**只读运行**（未注入命令接口）在建 S13b 前就返回，同样什么都不发 |
 
     - **启用判据**（进入 `kLanding` 时在 `TransitionTo` 里算一次）：
       `landing_descent_phase_ = landing.enabled && command_sender_ != nullptr &&
@@ -944,9 +948,12 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   `params[net_channel-1]` 索引固定 7 元素参数数组：程序化构造的 Set 越界即 UB；
   归一化值超出 [-1,1] 也会被拒）；配置加载期已校验，此处对程序化构造 fail-fast，
   先例见 FlightController 构造期 period 防御。
-- 控制输出是否接 PX4 仍由`DroneApplication`的`enable_control`门禁决定（绑定
-  `Px4Setpoint`+注入快照源+注入命令接口只在 true 分支）；诊断接口注入与
-  `enable_control` 无关（只读诊断，影子期即可用）。
+- 控制输出是否接 PX4 由`DroneApplication`按**运行模式**决定（绑定
+  `Px4Setpoint`+注入快照源+注入命令接口只在控制运行分支）；定义见
+  [`docs/运行模式与模块状态定义.md`](../../docs/运行模式与模块状态定义.md)。
+  诊断接口注入与运行模式无关（只读诊断，任何模式下都可用）。
+  **状态机自身不读 `enable_control`**：需要判断"能不能发指令"时只看
+  `command_sender_ != nullptr`。
 
 ## 日志行为
 
@@ -1052,8 +1059,8 @@ ctest --test-dir build --output-on-failure
 - 未绑定输入时拒绝启动。
 - 启动后发布`BOOT -> SELF_CHECK`。
 - PX4导航快照有效后进入`READY`。
-- 合法`GroundStationTarget`进入`GPS_APPROACH`影子状态并发布`MissionStatus`。
-- 未绑定估计输入时`IntentOutput()`不发布自动控制意图（影子行为兜底）。
+- 合法`GroundStationTarget`进入`GPS_APPROACH`并发布`MissionStatus`。
+- 未绑定估计输入时`IntentOutput()`不发布自动控制意图（兜底）。
 - 绑定估计输入后 S5 发布`kPositionGuide`意图：指向估计目标、`control_source=0`、
   reason_code 带 bit31 控制权请求位、`valid_until_ms = receive_time_ms + valid_for_ms`。
 - P3 前馈（`GpsApproachPublishesPositionIntent` 扩展 +
@@ -1196,7 +1203,7 @@ ctest --test-dir build --output-on-failure
 - 任务分配入口（Task 4，2026-10-22；`AssignmentHarness` 装配 65014/65015
   Topic、命令接口与估计输入，`MakeGroundedFlight` 提供地面/未 armed/导航有效
   快照）：
-  - `AssignmentRejectedWithoutCommandSender`：影子装配 → `control_disabled`、
+  - `AssignmentRejectedWithoutCommandSender`：未注入命令接口（只读运行）→ `control_disabled`、
     S2、availability=unavailable；
   - `AssignmentRejectedWithoutEstimationInputs`：有命令接口但未绑估计 →
     `preflight_failed`、S2；
@@ -1211,7 +1218,7 @@ ctest --test-dir build --output-on-failure
   - `GroundTargetDoesNotEnterGpsApproachWithControl`：注入命令接口后 65010
     目标不单独进入 S5；
   - `ShadowGroundTargetStillEntersGpsApproach`：绑定分配输入但未注入命令
-    接口时，既有 S2→S5 影子路径保持。
+    接口（只读运行）时，既有 S2→S5 路径保持（函数名沿用历史称呼，语义即"只读运行"）。
 - S3/S4 自动起飞（Task 5，`AssignmentHarness` 可注入缩短的
   `MissionStateMachineConfig`；分配类用例默认放宽 bootstrap/mode/arm 超时，
   避免不驱动 PX4 的 Task 4 用例被 S3 超时打断）：
@@ -1279,8 +1286,8 @@ ctest --test-dir build --output-on-failure
   - `S5TargetLostTimeoutWithRecovery`：S5 短暂丢失（200ms < 400ms）并恢复不
     中止；再次持续失效超过 `target_lost_timeout=400ms` → aborted/target_lost
     → S12，无 187；
-  - `ShadowS5IgnoresFilterAndWaitTimeout`：影子 S5 不按 target_id 过滤，
-    `target_wait_timeout` 不生效（既有影子行为保持）。
+  - `ShadowS5IgnoresFilterAndWaitTimeout`：未注入命令接口时的 S5 不按 target_id 过滤，
+    `target_wait_timeout` 不生效（既有行为保持；函数名沿用历史称呼，语义即"只读运行"）。
 - SITL 返航专项（2026-10-19，`tools/px4_link_smoke --sitl-stage4-return` +
   `config/px4_sitl_return.json`）：S7→S9→S10 发射→S12 算力板返航 Home→
   S13 AUTO.LAND→S14 DISARMED 全 PASS（状态机迁移 11 次、错误 0；最大高度
@@ -1333,15 +1340,14 @@ ctest --test-dir build --output-on-failure
   此期间状态机**仍在发保持意图**（不推进下降），不会掉进 Offboard 丢失兜底；
   先查 PX4 侧模式切换是否被拒（如 `COM_DISARM_LAND`/land detector 状态）。
 - **降落后想回到"直接 AUTO.LAND"**：`landing.enabled=false`（回滚开关，重启生效）。
-  纯影子装配（`enable_control=false`，未注入命令接口）本来就发不出降落意图，
-  自然等于旧路径。
+  只读运行（未注入命令接口）本来就发不出降落意图，自然等于旧路径。
 - **S13 已落地但不到 S14**：通常为仍 armed 且 DISARM 未 accepted；查 400 命令
   入队/ACK 与 PX4 disarmed 状态。
 - **65014 发送后没有 65015**：确认 `SetAssignmentInput` 已绑定且
   `GroundStationLink::MissionAssignmentOutput()` 已接到该 Topic；地址/来源
   不匹配的 65014 由 GroundStationLink 丢弃（设计上不回 65015），不是状态机问题。
-- **65014 回 `control_disabled`**：影子装配（未注入命令接口）属预期；正式
-  自动起飞必须在 `enable_control=true` 装配分支下注入 `SetCommandSender`。
+- **65014 回 `control_disabled`**：未注入命令接口（只读运行，或装配异常）属预期；
+  自动起飞必须在控制运行的装配分支下注入 `SetCommandSender`。
 - **65014 回 `preflight_failed`**：按顺序查：估计/视觉/测距三输入是否成组
   绑定；飞行快照是否 `landed_state_valid && landed && !armed`；局部位置/
   姿态/Home 是否有效。回 `px4_disconnected` 时查 PX4 心跳。
@@ -1442,10 +1448,11 @@ ctest --test-dir build --output-on-failure
   "交接冻结位置意图续发"日志与滚动续期的位置意图（2000ms 超时档位下
   `timeout_ms` 需大于冻结续发失效时间）；若位置意图在 S6 中途停止，查
   进入判据是否失效（撤销回 S5 的分支，属预期收口而非冻结失效）。
-- 整机实测停在 S5、从不进 S6：**属预期（T12 裁决后仍成立）**——`DroneApplication`
-  尚未调用 `SetEstimationInputs`（三输入未绑定，状态机保持影子）。G3 全链验收走
-  独立装配工具 `tools/px4_link_smoke --sitl-stage4-mission`（见 `tools/px4_link_smoke.md`）；
-  生产接线与 `enable_control` 打开一并做。勿据此判缺陷。
+- 整机实测停在 S5、从不进 S6：先看这是不是**裁剪装配**——估计器/视觉稳定性/双目测距
+  三者必须同时装配才会调用 `SetEstimationInputs`（缺一不绑定，状态机不发布 S5 意图）。
+  生产配置默认三者齐备，因此正式飞行中"停在 S5"要按 S5 判据本身排查（锁定帧数/
+  测距/视场余量/创新门限），不要再当作"生产未接线"。G3 全链验收另走独立装配工具
+  `tools/px4_link_smoke --sitl-stage4-mission`（见 `tools/px4_link_smoke.md`）。
 - 地面站看到"状态=S7 但飞机不动/无控制输出"：查 `MissionStatus.active_warning_bits`
   bit3（S7 伺服停发中）——置位说明伺服尚未启动或控制律降级停发，实际输出要么是
   冻结位置意图、要么无意图（控制器意图超时刹停）；服务器侧诊断先用该位区分
@@ -1471,4 +1478,4 @@ ctest --test-dir build --output-on-failure
   PX4/遥控」的原因串（187 ACK 超时 / 非 ACCEPTED / PX4 断连 / 触发命令未入队
   （发射超时））。S16 为终态，状态机不再发任何控制意图，需人工/维护处置后
   重启程序；`CancelPendingCommands()` 只取消待发命令，不会撤回机构已执行动作。
-- 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和`enable_control`安全配置。
+- 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和运行模式（`enable_control`）安全确认。

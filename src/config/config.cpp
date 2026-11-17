@@ -940,7 +940,9 @@ AppConfig LoadAppConfig(const std::string& path,
     config.log.level = log.value("level", std::string("info"));
 
     // runtime 开关与一致性校验：控制依赖 PX4 与地面站（状态机意图/目标来源）、
-    // 地面站依赖 PX4、控制装配由 enable_control 门禁接管（见下）。
+    // 地面站依赖 PX4。`enable_control` 是**运行模式开关**（控制运行 / 只读运行），
+    // 定义见 docs/运行模式与模块状态定义.md；它只在这里与装配门禁被读取，
+    // 功能代码不得据它分支。
     const json runtime = root.value("runtime", json::object());
     config.runtime.enable_video = runtime.value("enable_video", true);
     config.runtime.enable_px4 = runtime.value("enable_px4", true);
@@ -989,10 +991,10 @@ AppConfig LoadAppConfig(const std::string& path,
             "enable_visual_tracking=true时必须启用视频链路与视觉稳定性判定"
             "（视觉输入来源为VisualTargetMonitor）");
     }
-    // 阶段四装配门禁（部署门禁①）：enable_control=true 要求状态机依赖链齐备
-    // （PX4+地面站，上面已分别校验 PX4；此处补地面站），controller 配置节在
-    // 后段解析并无条件 Validate——非法即加载期 fail-fast，不静默降级。
-    // 仓库生产 config.json 永远保持 false，打开只发生在现场部署目录本地副本。
+    // 装配门禁：控制运行要求状态机依赖链齐备（PX4 + 地面站；PX4 上面已校验，
+    // 此处补地面站）。controller 配置节在后段解析并无条件 Validate——非法即
+    // 加载期 fail-fast，不静默降级。2026-10-30 起仓库生产 config.json 即为
+    // enable_control=true（控制运行），只读运行由现场按需改回 false。
     if (config.runtime.enable_control && !config.runtime.enable_ground_station) {
         throw std::invalid_argument(
             "enable_control=true时必须同时启用地面站链路（状态机意图与目标来源）");

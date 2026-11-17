@@ -35,11 +35,22 @@ struct RuntimeConfig {
     bool enable_ground_station = false;
     bool enable_target_estimator = false;
     bool enable_visual_monitor = false;
-    bool enable_visual_tracking = false;  ///< 视觉跟踪控制律影子（kControlIntent 无消费者）
-    bool enable_stereo_ranging = false;  ///< 双目测距影子（依赖 uvc+stereo_split+视觉跟踪）
-    /// 双目视觉观测 → 局部 NED 融合进目标估计器（影子；依赖 target_estimator +
+    bool enable_visual_tracking = false;  ///< 视觉跟踪控制律独立观测节拍（产物 Topic 无消费者）
+    bool enable_stereo_ranging = false;  ///< 双目测距（观测：输出供控制律距离通道；依赖 uvc+stereo_split+视觉跟踪）
+    /// 双目视觉观测 → 局部 NED 融合进目标估计器（观测；依赖 target_estimator +
     /// stereo_ranging + px4；不延展地面站有效期，docs/物理追踪思路.md §6.3）
     bool enable_visual_position_fusion = false;
+    /// **运行模式开关（2026-11-17 重新定义）**，只回答"本次运行允不允许向 PX4 下发控制"：
+    /// - `true` = **控制运行**（生产默认）：装配层注入 PX4 快照源、绑定 `Px4Setpoint`、
+    ///   给状态机注入命令窄接口；
+    /// - `false` = **只读运行**（地面排查：事故后采日志、链路排查、新机体首上电）：
+    ///   上面三项都不做，只读遥测/视频/回传。
+    ///
+    /// **它不是阶段标记，也不是功能分支依据**：功能代码不得读本字段，
+    /// 只能按可观测能力判断（命令接口是否注入、快照是否有效等）。
+    /// 唯一允许读它的地方是 `DroneApplication::BindTopics()` 的装配门禁与
+    /// `LoadAppConfig()` 的跨字段校验。
+    /// 定义与理由见 `docs/运行模式与模块状态定义.md`。
     bool enable_control = false;
 };
 

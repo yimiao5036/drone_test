@@ -1,4 +1,4 @@
-# flight_controller —— 飞行控制器（IFlightController / FlightController / FlightControllerStub）
+﻿# flight_controller —— 飞行控制器（IFlightController / FlightController / FlightControllerStub）
 
 ## 功能边界
 
@@ -18,7 +18,7 @@
   注入的 `IPx4Link::LatestState()` 快照核验 `connected + armed +
   Offboard(flight_mode=6/sub=0)`，并要求最新意图携带状态机显式请求位
   （`reason_code` bit31）；**未注入快照源时授权链恒不通过，控制器保持
-  IDLE 影子运行（不发布任何设定值）**。ACTIVE/COAST 中门禁失效立即发布
+  IDLE 观测/只读运行（不发布任何设定值）**。ACTIVE/COAST 中门禁失效立即发布
   `valid=false` 停发并转 IDLE；意图超龄转 COAST 零速刹车保持，
   `coast_timeout` 超时转 IDLE 停发。
 - **多边形围栏（2026-10-29 起唯一形态）**：位置设定值按地面站划定的多边形
@@ -67,7 +67,7 @@ common::Topic<Px4Setpoint> ──► IPx4Link（PX4 通信线程）
     钳制，每次钳制生效 +1，供 G2 验收核对）。
 - `SetPx4LinkSource(const communication::IPx4Link*)`：注入 PX4 只读快照源
   （控制权门禁与 Home 围栏数据源；装配期 Start 前调用；**未注入时授权链
-  恒不通过**，控制器保持 IDLE 影子运行）。门禁判据只取快照的 `connected`
+  恒不通过**，控制器保持 IDLE 观测/只读运行）。门禁判据只取快照的 `connected`
   字段——链路断开方向有滞后窗口（先清原子标志后发布快照），不得与
   `IsConnected()` 交叉推理。
 - 测试入口（生产装配不得调用）：`TestForceAuthority()` 强制控制权状态
@@ -84,7 +84,7 @@ common::Topic<Px4Setpoint> ──► IPx4Link（PX4 通信线程）
 授权链（本控制器侧部分，部署/健康门禁归装配层与健康管理）：
 
 ```text
-SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
+SetPx4LinkSource 已注入（未注入=只读运行，恒不授权）
   → 快照 connected && armed
   → flight_mode == 6 && flight_sub_mode == 0（PX4 1.17.0 Offboard 编码）
   → 状态机显式请求锁存（最新通过入口门禁的意图 reason_code bit31 置位）
@@ -93,7 +93,7 @@ SetPx4LinkSource 已注入（未注入=影子模式，恒不授权）
 **显式请求位约定（本任务冻结）**：`ControlIntent.reason_code` bit31 =
 `common::kControlIntentReasonRequestControl`（`include/common/types.h`），
 表示状态机显式请求控制权；低位段沿用 `docs/数据接口文档.md` §3.5 枚举
-（0~7 规划语义、100+ 视觉跟踪影子段）。锁存规则：跟随**最新通过入口门禁**
+（0~7 规划语义、100+ 视觉跟踪观测段）。锁存规则：跟随**最新通过入口门禁**
 的意图刷新（被拒绝的意图不刷新）；进入 IDLE 时清零——回 ACTIVE 必须重新
 满足授权链（含显式请求）。锁存本身**不随时间过期**：IDLE→ACTIVE 另要求
 持有新鲜（未超龄）请求位意图，陈旧锁存不得事后激活授权（评审 fix round 2）。
@@ -443,7 +443,7 @@ PX4 的 Home 生命周期（`Commander.cpp:1841`、`2145-2150`，详见
 
 `tests/control/flight_controller_test.cpp`（目标 `flight_controller_test`）：
 
-- `IdlePublishesNothingWithoutAuthority`：未注入快照源（影子）下有意图也
+- `IdlePublishesNothingWithoutAuthority`：未注入快照源（只读运行）下有意图也
   不发布任何 setpoint（`SetpointCount()==0`、输出订阅为空）。
 - `RejectsNanIntent`：NaN 意图字段 → 拒绝计数递增。
 - `RejectsAlreadyStaleIntent`：`valid_until_ms` 到达即过期 → 拒绝计数递增。
