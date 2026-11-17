@@ -1385,6 +1385,81 @@ TEST(ConfigTest, ReturnHomeHeadingDefaultsToVelocityDirection) {
     std::filesystem::remove(path);
 }
 
+// 降落两段（landing 节，2026-11-17 P2）：生产配置解析 + 显式覆盖。
+TEST(ConfigTest, LandingDefaultsAndParse) {
+    const auto baseline = ReadSourceConfig();
+    const auto baseline_path =
+        WriteTemporaryConfig(baseline, "drone_config_landing_default.json");
+    const auto defaults =
+        drone::config::LoadAppConfig(baseline_path.string(), "/opt/drone");
+    EXPECT_TRUE(defaults.landing.enabled);
+    EXPECT_DOUBLE_EQ(defaults.landing.descend_target_ag_m, 1.2);
+    EXPECT_DOUBLE_EQ(defaults.landing.descend_speed_mps, 0.8);
+    EXPECT_DOUBLE_EQ(defaults.landing.descend_slow_speed_mps, 0.3);
+    EXPECT_DOUBLE_EQ(defaults.landing.descend_slow_zone_m, 3.0);
+    EXPECT_DOUBLE_EQ(defaults.landing.handover_alt_tolerance_m, 0.15);
+    EXPECT_DOUBLE_EQ(defaults.landing.handover_vz_mps, 0.2);
+    EXPECT_DOUBLE_EQ(defaults.landing.handover_horizontal_m, 0.5);
+    EXPECT_EQ(defaults.landing.handover_hold.count(), 500);
+    EXPECT_EQ(defaults.landing.descent_timeout.count(), 120000);
+    EXPECT_DOUBLE_EQ(defaults.landing.baro_mismatch_m, 1.5);
+    EXPECT_EQ(defaults.landing.baro_mismatch_hold.count(), 2000);
+    std::filesystem::remove(baseline_path);
+
+    json value = baseline;
+    value["landing"]["enabled"] = false;
+    value["landing"]["descend_target_ag_m"] = 2.0;
+    value["landing"]["descend_speed_mps"] = 1.0;
+    value["landing"]["descend_slow_speed_mps"] = 0.4;
+    value["landing"]["descend_slow_zone_m"] = 4.0;
+    value["landing"]["handover_alt_tolerance_m"] = 0.25;
+    value["landing"]["handover_vz_mps"] = 0.3;
+    value["landing"]["handover_horizontal_m"] = 0.8;
+    value["landing"]["handover_hold_ms"] = 800;
+    value["landing"]["descent_timeout_ms"] = 60000;
+    value["landing"]["baro_mismatch_m"] = 2.0;
+    value["landing"]["baro_mismatch_hold_ms"] = 1500;
+    const auto path = WriteTemporaryConfig(value, "drone_config_landing_parse.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_FALSE(config.landing.enabled);
+    EXPECT_DOUBLE_EQ(config.landing.descend_target_ag_m, 2.0);
+    EXPECT_DOUBLE_EQ(config.landing.descend_speed_mps, 1.0);
+    EXPECT_DOUBLE_EQ(config.landing.descend_slow_speed_mps, 0.4);
+    EXPECT_DOUBLE_EQ(config.landing.descend_slow_zone_m, 4.0);
+    EXPECT_DOUBLE_EQ(config.landing.handover_alt_tolerance_m, 0.25);
+    EXPECT_DOUBLE_EQ(config.landing.handover_vz_mps, 0.3);
+    EXPECT_DOUBLE_EQ(config.landing.handover_horizontal_m, 0.8);
+    EXPECT_EQ(config.landing.handover_hold.count(), 800);
+    EXPECT_EQ(config.landing.descent_timeout.count(), 60000);
+    EXPECT_DOUBLE_EQ(config.landing.baro_mismatch_m, 2.0);
+    EXPECT_EQ(config.landing.baro_mismatch_hold.count(), 1500);
+    std::filesystem::remove(path);
+}
+
+// 低速档必须真的比主降速慢：否则"进入低空降速"这层保护名存实亡。
+TEST(ConfigTest, LandingSlowSpeedNotBelowMainSpeedRejected) {
+    json value = ReadSourceConfig();
+    value["landing"]["descend_speed_mps"] = 0.5;
+    value["landing"]["descend_slow_speed_mps"] = 0.5;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_landing_slow_speed.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 低速档切换高度必须高于交段高度：否则还没进低速档就已经交段。
+TEST(ConfigTest, LandingSlowZoneNotAboveTargetRejected) {
+    json value = ReadSourceConfig();
+    value["landing"]["descend_target_ag_m"] = 2.0;
+    value["landing"]["descend_slow_zone_m"] = 2.0;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_landing_slow_zone.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(ZoneStoreTest, SaveThenLoadRoundTrips) {
     const auto path =
         std::filesystem::temp_directory_path() / "drone_zone_roundtrip.json";

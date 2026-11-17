@@ -187,7 +187,7 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
 
 本阶段仍不做以下事情：
 
-- 不发送外部 setpoint（控制输出仍由 FlightController 产生）。`SetCommandSender` 当前消费点：S3 的 176/400（Task 5）、S10 捕网触发/复位、S13 AUTO.LAND、S14 前 DISARM；`FlightController::kBootstrap`（原点保持流）由 Task 6 接入，本模块只保证 kTakeoff 意图持续发布。
+- 不发送外部 setpoint（控制输出仍由 FlightController 产生）。`SetCommandSender` 当前消费点：S3 的 176/400（Task 5）、S10 捕网触发/复位、S13 交段 AUTO.LAND（2026-11-17 起由 S13a 交段判据/保护触发，见下）、S14 前 DISARM；`FlightController::kBootstrap`（原点保持流）由 Task 6 接入，本模块只保证 kTakeoff 意图持续发布。
 - S9/S10 入口判据与自动授权已落地（上段），但**默认 `interception.enabled=false`**；地面站确认授权协议尚未实现（`auto_authorize=false` 时只等超时返航），执行机构就绪仍以命令接口注入 + 未触发且 `Ready()`（无在途触发/复位时序）为代理，未接硬件状态反馈。
 - 不把地面站目标透传为PX4航点。
 - 不实现设计 §2.2 的"位置误差/地速/首条视觉指令经限幅生效"三项验证量（依赖
@@ -307,7 +307,8 @@ bit8 =「围栏停止点预测已介入」（`kWarningPredictedFenceBreach`）�
   `|vz| ≤ max_vz_mps`；满足后 `TakeoffComplete()` + `BeginEngage()` → **S5**
   （availability=engaged）。
 - **S4 空中超时**（`height_timeout`）：PX4 仍在 Offboard → 转 **S13**，由现有
-  `EvaluateLandingAndDisarm` 发 AUTO.LAND(4/6)；PX4 已离开 Offboard → 设置
+  S13 两段落链发 AUTO.LAND(4/6)（2026-11-17 起先进 S13a 机载下降，到交段判据/
+  保护/超时才发 176；影子装配仍是直接发）；PX4 已离开 Offboard → 设置
   让权标志，转 **S13 仅监控**，不再发 AUTO.LAND、不再争控。
 - **地面超时/条件失败**：停止发布 kTakeoff/位置意图；若 `landed` 且
   （`armed` **或本轮 400 ACK 已 ACCEPTED**）只发一次 DISARM（400 param1=0）——
@@ -360,6 +361,8 @@ struct MissionStateMachineConfig {
     config::ActuatorConfig actuator;                  // 捕网执行器（actuator 配置节同源，Task 10）
     config::TakeoffConfig takeoff;                    // 自动起飞时序（takeoff 配置节同源，2026-10-22）
     config::FenceConfig fence;                        // 多边形围栏（fence 配置节同源，2026-10-29）
+    config::ReturnHomeConfig return_home;             // S11~S14 返航（return_home 配置节同源）
+    config::LandingConfig landing;                    // S13 拆两段（landing 配置节同源，2026-11-17 P2）
     uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
@@ -869,9 +872,53 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
     回 65021 `kAccepted/kNone`（日志 `任务指令（主动返航）: 已在返航，按继续返航处理`）；
     S13 仍回 `kCompleted/kAlreadyReturning`。地面站「主动返航」按钮本身只在
     `mission.state ∈ [3,11]` 可点，这条路径主要给脚本/命令行重发用。
-  - **S13/S14**：S13 发 `MAV_CMD_DO_SET_MODE`（AUTO.LAND，4/6）；停止位置意图；
-    落地后若仍 armed 发 `MAV_CMD_COMPONENT_ARM_DISARM`（0）；确认 disarmed →
-    S14。正常返航不使用 PX4 自动 RTL；PX4 已接管则只监控 landed/disarmed。
+  - **S13 拆两段（2026-11-17，降落与估计器保护 P2；设计
+    [`降落与估计器保护设计-2026-11-17.md`](../../docs/降落与估计器保护设计-2026-11-17.md) §4）**：
+    旧流程 S13 发一次 `AUTO.LAND` 后即放手，27m 全程无人监督；2026-11-17 10:24 现场
+    EKF 全状态重置把 `local z` 平移 9m，PX4 以为已触地而砍推力 → 翻滚。现在把最后一段
+    高度留在我们手里，**不新增状态编号**（仍是 `kLanding`），内部用两个标志分段：
+
+    | 段 | 条件 | 动作 |
+    |---|---|---|
+    | **S13a** 机载下降 | `landing_descent_phase_ == true` | 每拍发位置引导意图（低位原因码 **12**）：目标 = Home 水平 + 相对高度 `landing.descend_target_ag_m`(1.2m)，推进速度 `descend_speed_mps`(0.8)/低空档 `descend_slow_speed_mps`(0.3)；跑三条保护 + 超时 + 交段判据 |
+    | **S13b** 交 PX4 | `landing.enabled && !descent_phase_` | 发 `DO_SET_MODE(AUTO.LAND 4/6)`（按 `return_home.command_retry` 重试）；**确认前继续保持控制权**（按当前高度发布保持意图，不推进下降目标）；确认（ACK `result=0` 或观察到 PX4 已进 4/6）后停止发布 intent，只监视 `landed/armed` |
+    | 回滚路径 | `landing.enabled == false` | 完全保持 2026-11 之前的行为：直接发 `AUTO.LAND`、不发布任何降落位置意图；**纯影子装配**（未注入命令接口）在建 S13b 前就返回，同样什么都不发 |
+
+    - **启用判据**（进入 `kLanding` 时在 `TransitionTo` 里算一次）：
+      `landing_descent_phase_ = landing.enabled && command_sender_ != nullptr &&
+      !landing_takeover_`。命令接口是否注入就是"能不能发控制"的唯一事实依据
+      （生产只在 `enable_control=true` 时注入），**不另设装配门禁字段**，也不在
+      状态机内重复判断 `enable_control`。
+    - **几何口径**：相对高度 = `RelativeAltitudeBaseZ() − local_z`（HOME_POSITION.z 优先、
+      退化到起飞快照，再退化到 `HomeLocalNed().down_m`），与围栏/65011/S12 同一出口，
+      水位不另写一套（P5 装雷达只改这个出口的内部实现）。
+    - **交段判据**：相对高度 ≤ `descend_target_ag_m + handover_alt_tolerance_m`(0.15)
+      且 `|vz| ≤ handover_vz_mps`(0.2) 且 `水平误差 ≤ handover_horizontal_m`(0.5)，
+      连续保持 `handover_hold`(500ms)。
+    - **三条保护（缺一不可，设计 §4.5）**：
+      ① **高度源交叉校验**：`BaroAboveTakeoffM()`（气压 AGL，不被 EKF 重置平移）与 EKF
+      相对高度之差 > `baro_mismatch_m`(1.5m) 持续 `baro_mismatch_hold`(2s) → 锁存 + WARN +
+      立即交 S13b（**不硬降到 1.2m**）；
+      ② **低空水平漂移**：相对高度 ≤ `descend_slow_zone_m`(3m) 且（水平误差 > 1.0m 或地速
+      > 0.5m/s）→ 立即交 S13b（宁可让 PX4 落，也不在 1m 高度画圈）；这两个门限是冻结值，
+      不进配置（`kLandingLowAltitudeDriftM` / `kLandingLowAltitudeDriftSpeedMps`）；
+      ③ **控制权保持**：每拍必须能发布可用意图。`FlightController` 没有回执通道，
+      因此把"被拒"落到本模块**能看见**的不可用条件上：无局部位置 / 无高度基准 /
+      无 Home 水平目标 / Home 落在围栏外（控制器会 `ClampIntoPolygon` 把落点带偏）。
+      连续 `kLandingIntentUnusableFrames`(10 拍 = 1s) 不可用 → 交 S13b，途中按
+      `ShouldLogThrottled` 记累计计数。
+    - **兜底**：`landing.descent_timeout`(120s) 到点即交 S13b（27m 按 0.8m/s 约 33s）；
+      控制权被抢（PX4 离开 Offboard 且非 AUTO.LAND）沿用 `landing_takeover_ = true`，
+      只等落地、不抢回控制权。
+    - **围栏前置判据（设计 §4.6）**：S13a **首拍**（决策线程，不是在状态迁移里——迁移可能
+      由测试钩子从其它线程触发，读飞行快照不安全）判 Home 水平目标是否在多边形内；
+      不在界内（或水平目标不可用）→ WARN + 跳过 S13a 直接 S13b。
+    - **`SetCommandSender` 消费点新增**：S13a 不新增命令，只是把"发 AUTO.LAND 的时机"
+      从"进入 S13 立刻"改为"交段判据满足/保护命中/超时"。
+  - **S13/S14 收口**：落地后若仍 armed 发 `MAV_CMD_COMPONENT_ARM_DISARM`（0）；确认
+    disarmed → S14。正常返航不使用 PX4 自动 RTL；PX4 已接管则只监控 landed/disarmed。
+  - **配置**：`MissionStateMachineConfig::landing`（`config::LandingConfig`，`landing` 节，
+    12 个 key；`enabled=false` 是回滚开关），构造期 `LandingConfig::Validate()` 兜底。
   - **配置**：`MissionStateMachineConfig::return_home`（`config::ReturnHomeConfig`，
     默认 `enabled=true`；`interception`/`return_home` 两节已接入 JSON 加载）。
     捕网执行器隔离用例显式 `enabled=false`。
@@ -925,8 +972,28 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   判读：`剖面=cruise` 且地速≈指令上限 → 正常；`剖面=decel` 持续出现 → 超速回落
   （追不上转返航进入）；`剖面=accel` 但地速不涨 → 查逆风/机体限幅。
 
-人工指令相关（2026-10-29）：
+降落两段（2026-11-17 P2）：
 
+- INFO：构造期 `降落两段配置: 启用（S13a 机载下降 → S13b 交 PX4 AUTO.LAND）/关闭（…）`
+  + 全部阈值一行（现场核配置不必再翻 JSON）；
+- INFO：进入 S13 时 `S13a 机载受控下降开始: 交段相对高度=..m 主降速=../s 低速档=..(≤..m) 超时=..ms`，
+  随后 `降落阶段: S13a … / 发 AUTO.LAND（4/6）/ PX4 已接管…`；
+- INFO：S13a 每 1s 一行
+  `S13a 下降摘要: 相对高度=..m 目标=..m 垂速=..m/s 水平误差=..m 地速=..m/s 限速=..m/s 低空档=是/否 baro交叉校验=正常/已锁存不一致`；
+- INFO：`S13a 交段判据满足（相对高度=..m 垂速=..m/s 水平误差=..m 保持=..ms），发 AUTO.LAND（4/6）交 PX4`、
+  `S13b AUTO.LAND 命令已入队（下降已交 PX4）`、`S13 交段确认: PX4 已接管降落（AUTO.LAND），停止发布 intent…`、
+  `S13a→S13b: PX4 已在 AUTO.LAND（4/6），停止发布下降意图`；
+- WARN：三条保护与兜底各一条（都是安全事件，逐条不节流）：
+  `S13a 跳过: Home 水平目标不在围栏区域内…`、
+  `S13a 高度源交叉校验失败: EKF相对高度=..m 气压AGL=..m 偏差=..m 持续..ms（门限../..）`、
+  `S13a 低空水平漂移: 相对高度=..m 水平误差=..m 地速=../s（门限 1.0m / 0.5m/s）`、
+  `S13a 下降超时（..ms，相对高度仍有 ..m）`、
+  `S13a 连续 .. 拍无法发布下降意图`、
+  `S13a PX4 已离开 Offboard 且非 AUTO.LAND（mode=../..），停止下降与命令重试`、
+  `PX4 拒绝 AUTO.LAND（DO_SET_MODE result=..）`（首次一条）；
+- WARN（节流）：`S13a 下降意图停发: 局部位置/高度基准/Home 水平目标不可用（连续 .. 拍）累计=..`。
+
+人工指令相关（2026-10-29）：
 - INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
   `任务指令回执已发布: command_id=.. type=.. result=.. reason=.. state=.. count=..`（节流，首条与每 100 条）；
   `任务指令重复已忽略`、`任务指令（主动返航）: 已在返航，按继续返航处理 command_id=..`
@@ -1068,8 +1135,9 @@ ctest --test-dir build --output-on-failure
   `return_home.enabled=true`，缩短到达保持/命令重试/发射超时便于测试）：
   - `InterceptionFiresThenReturnsHomeAndLands`：强制 S10 → 发射命令入队 →
     S11/S12 → 位置意图 reason=8、目标 Home 局部 NED（≥5m 保持当前高度）→
-    到达后 S13 发 176（AUTO.LAND，param2=4/param3=6）→ landed+armed 发 400
-    （DISARM）→ disarmed 进 S14；
+    到达后进 S13a（2026-11-17 P2 起两段：喂 1.2m 快照满交段保持后）发 176
+    （AUTO.LAND，param2=4/param3=6）→ landed+armed 发 400（DISARM）→ disarmed 进 S14；
+    两段细节本身由 `Landing_*` 用例覆盖；
   - `ReturnHomeClimbsToFiveMetersBeforeCruise`：相对 Home 2m → 先原地爬升到
     Home 上方 5m（intent x/y=当前），到高后改为水平飞 Home；
   - `ReturnHomeTargetsTakeoffOriginNotDriftedHome`（2026-11-04 现场回归）：S3 起飞点
@@ -1082,6 +1150,19 @@ ctest --test-dir build --output-on-failure
     设定值、转 S13 仅监控，不再发 AUTO.LAND（176）。
   - `MakeNetActuatorTestConfig` 显式 `return_home.enabled=false`，保持捕网
     执行器用例的 S10 停留/显式离开语义不变。
+- 降落两段（2026-11-17 P2；`MakeLandingDescentTestConfig` = `MakeReturnHomeTestConfig`
+  + 默认 `landing` 节，用例都注入 `SetCommandSender`，因此自动走 S13a→S13b）：
+  - `Landing_DescentReachesHandover`：相对高度 10m → 主降速档意图
+    （reason 低位 12、目标 (Home, −1.2)、`max_speed_mps=0.8`、无前馈、不指定航向、
+    带 bit31）→ 2.5m 切低速档 0.3 → 1.2m 稳定 500ms 后发 176（param2=4/param3=6）
+    → landed+disarmed 收口 S14；
+  - `Landing_BaroMismatchSkipsToPx4`：气压 AGL 5m vs EKF 10m（偏差 5m）持续
+    `baro_mismatch_hold=500ms` → 立即交 PX4（全程只喂 10m 高度，因此 176 只能来自保护）；
+  - `Landing_LowAltitudeDriftSkipsToPx4`：相对高度 2.5m、水平误差 1.2m → 立即交 PX4；
+  - `Landing_DescentTimeout`：相对高度恒 10m（永不满足交段）→ `descent_timeout=10s`
+    前不得发 176，到点后必须交段（配置范围下限 10s，本题按真实时钟等待）；
+  - `Landing_RollbackSwitchKeepsOldPath`：`landing.enabled=false` → 直接发 AUTO.LAND，
+    且**一条** reason=12 的降落意图都不许出现（回滚语义＝2026-11 之前的旧行为）。
 - S9/S10 入口（2026-10-19；`MakeInterceptEntryTestConfig` 开启
   `interception.enabled=true`、`enter_s9_lock_frames=3`、窗口 2~12m、自动授权）：
   - `InterceptEntryLockAndRangeThenFiresAndReturns`：强制 S7 + 连续 LOCKED
@@ -1234,8 +1315,26 @@ ctest --test-dir build --output-on-failure
 - **S12 不进入 S13**：到达判据为水平 2m、垂直 0.5m、水平速度 0.5m/s
   持续 1s；查位置/速度遥测是否持续满足；位置意图 reason 低位应为 8。
 - **S13 不发 AUTO.LAND**：确认 `SetCommandSender` 已注入（`enable_control=true`
-  装配分支），查 `AUTO.LAND 命令已入队`/入队失败 WARN；PX4 已被 failsafe
-  接管时状态机按设计不再发 176，只等 landed/disarmed。
+  装配分支），查 `AUTO.LAND 命令已入队`/`S13b AUTO.LAND 命令已入队`/入队失败 WARN；
+  PX4 已被 failsafe 接管时状态机按设计不再发 176，只等 landed/disarmed。
+- **S13 站着不降、也不发 AUTO.LAND（2026-11-17 起的新现象）**：说明处于 **S13a**。
+  看 `S13a 下降摘要`（1Hz）里的 `相对高度/目标/垂速/水平误差`：
+  - 相对高度不降 → 查位置意图 reason 低位是否为 12、控制器是否在发 setpoint
+    （`PX4 设定值下发统计` 应保持 ~24Hz）、PX4 是否仍在 Offboard；
+  - `相对高度` 卡在 `目标` 之上且 `限速=0.30` → 低速档在收敛，正常；
+  - 若紧接着出现 `S13a 交段判据满足` 才是正常的交段；否则看有没有 WARN：
+    `高度源交叉校验失败`（气压与 EKF 不一致 → 已交 PX4）、`低空水平漂移`、
+    `下降超时`、`连续 .. 拍无法发布下降意图`（缺局部位置/高度基准/Home 水平目标）。
+- **S13a 刚开始就 WARN `跳过: Home 水平目标不在围栏区域内`**：区域多边形不包含
+  Home（或 Home 水平目标算不出来）→ 直接交 PX4，这是设计行为（避免控制器钳制把
+  落点带偏）。若属误报，核对 `fence` 区域与 Home/起飞原点。
+- **S13b 长时间没有 `交段确认`**：AUTO.LAND 可能被 PX4 拒绝（看
+  `PX4 拒绝 AUTO.LAND（DO_SET_MODE result=..）`），或 PX4 还没切到 4/6。
+  此期间状态机**仍在发保持意图**（不推进下降），不会掉进 Offboard 丢失兜底；
+  先查 PX4 侧模式切换是否被拒（如 `COM_DISARM_LAND`/land detector 状态）。
+- **降落后想回到"直接 AUTO.LAND"**：`landing.enabled=false`（回滚开关，重启生效）。
+  纯影子装配（`enable_control=false`，未注入命令接口）本来就发不出降落意图，
+  自然等于旧路径。
 - **S13 已落地但不到 S14**：通常为仍 armed 且 DISARM 未 accepted；查 400 命令
   入队/ACK 与 PX4 disarmed 状态。
 - **65014 发送后没有 65015**：确认 `SetAssignmentInput` 已绑定且

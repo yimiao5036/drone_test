@@ -140,6 +140,11 @@ void DroneApplication::BuildComponents() {
         state_machine_config.actuator = config_.actuator;
         state_machine_config.interception = config_.interception;
         state_machine_config.return_home = config_.return_home;
+        // 降落两段（landing 节，2026-11-17 P2）整节同源注入。是否真走 S13a 由两件
+        // 事共同决定：`landing.enabled` 与命令接口是否注入——后者只在
+        // enable_control=true 的装配分支注入（见 BindTopics），因此影子装配天然
+        // 保持"S13 直接 AUTO.LAND"，不需要额外的装配门禁字段。
+        state_machine_config.landing = config_.landing;
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;

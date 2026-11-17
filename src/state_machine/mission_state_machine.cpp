@@ -147,6 +147,22 @@ constexpr uint32_t kReasonFenceViolation = 10;
 /// 目标出区保持位置意图低位原因码（11）：目标 NED 在围栏外，保持点=进入点
 /// 或钳回边界内；不中止任务。
 constexpr uint32_t kReasonTargetOutsideFence = 11;
+/// S13a 机载受控下降位置意图低位原因码（12，2026-11-17 降落与估计器保护 P2）：
+/// 目标=Home 水平 + 相对高度 descend_target_ag_m，垂直速度由 max_speed_mps 限制。
+/// 设计稿写"types.h"，实际沿用本文件既有的低位原因码常量集中定义（7~11 均在
+/// 此），避免同一枚举分散两处；docs/数据接口文档.md §3.5 同步登记该码。
+constexpr uint32_t kReasonLandingDescent = 12;
+/// S13a 低空水平漂移保护门限（设计 §4.5 保护 2，冻结值、不进配置）：
+/// 相对高度 ≤ descend_slow_zone_m 时，水平误差 > 1.0m 或地速 > 0.5m/s 即交 PX4。
+/// 宁可让 PX4 落，也不在 1m 高度画圈。
+constexpr double kLandingLowAltitudeDriftM = 1.0;
+constexpr double kLandingLowAltitudeDriftSpeedMps = 0.5;
+/// S13a 控制权保持保护（设计 §4.5 保护 3）：连续 N 拍无法发布可用的下降意图
+/// （局部位置/高度基准/水平目标任一不可用，或引导点落在围栏外被控制器钳制）
+/// 即交 PX4。10 拍 × 100ms 决策周期 = 1s。
+constexpr uint64_t kLandingIntentUnusableFrames = 10;
+/// S13a 下降摘要日志周期（1Hz）：现场核对"降没降、降多快、离目标多远"。
+constexpr uint64_t kLandingDiagIntervalMs = 1000;
 /// 地面站任务指令（65020）协议版本（与 GroundStationLink 同源约定）。
 constexpr uint8_t kMissionCommandProtocolVersion = 1;
 /// 目标恢复迟滞：连续 N 个决策拍看到新鲜估计才退出保持（防抖动来回切换；
@@ -360,6 +376,7 @@ public:
           actuator_config_(config.actuator),
           interception_(config.interception),
           return_home_(config.return_home),
+          landing_(config.landing),
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
@@ -378,6 +395,9 @@ public:
         // 拦截入口与返航配置构造期兜底（程序化构造非法值 fail-fast）。
         config.interception.Validate();
         config.return_home.Validate();
+        // 降落两段配置构造期兜底（landing 节，2026-11-17 P2）：交段高度/降速/
+        // 低速档/容差/超时关系非法时直接抛异常，不允许带病进入自动降落。
+        config.landing.Validate();
         // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
         // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
         config.takeoff.Validate();
@@ -413,6 +433,21 @@ public:
             fow_half_elevation_deg_,
             control::VisualProfileName(visual_law_->Profile()),
             tracking_config_.control.frequency_hz);
+        // 降落两段（2026-11-17 P2）：把"这一段到底走不走机载下降"在启动日志里
+        // 说清楚——现场读日志时不必再回头核对配置。
+        SPDLOG_INFO(
+            "降落两段配置: {}（descend_target={:.2f}m 主降速={:.2f}m/s "
+            "低速档={:.2f}m/s@<={:.1f}m 交段容差={:.2f}m/垂速{:.2f}m/s/"
+            "水平{:.2f}m 保持={}ms 超时={}ms baro门限={:.2f}m@{}ms）",
+            landing_.enabled
+                ? "启用（S13a 机载下降 → S13b 交 PX4 AUTO.LAND）"
+                : "关闭（回滚开关 landing.enabled=false：S13 直接 AUTO.LAND）",
+            landing_.descend_target_ag_m, landing_.descend_speed_mps,
+            landing_.descend_slow_speed_mps, landing_.descend_slow_zone_m,
+            landing_.handover_alt_tolerance_m, landing_.handover_vz_mps,
+            landing_.handover_horizontal_m, landing_.handover_hold.count(),
+            landing_.descent_timeout.count(), landing_.baro_mismatch_m,
+            landing_.baro_mismatch_hold.count());
     }
 
     ~Impl() {
@@ -4898,7 +4933,367 @@ private:
         }
     }
 
-    /// S13 发 AUTO.LAND（4/6），S14 前发 DISARM；PX4 接管时只监控不争控。
+    // ---- S13 拆两段：S13a 机载受控下降 + S13b 交 PX4（2026-11-17 P2）----
+    // 背景（docs/降落与估计器保护设计-2026-11-17.md §4）：旧 S13 发一次
+    // AUTO.LAND 后即放手，27 m 全程无人监督；2026-11-17 现场 EKF 全状态重置把
+    // local z 平移 9 m，PX4 以为已触地而砍推力 → 翻滚。新流程把最后一段高度留在
+    // 我们手里：S13a 用位置引导把相对高度压到交段高度（三条保护 + 超时随时可
+    // 提前交段），S13b 才交给 PX4 的 land detector 完成触地。
+
+    /// 降落段几何量（S13a/S13b 共用）。相对高度口径与围栏/65011 一致：
+    /// `RelativeAltitudeBaseZ() − local_z`（HOME_POSITION.z 优先，退化到起飞快照），
+    /// 与 S12 返航同一出口，不在降落段另写一套。
+    struct LandingGeometry {
+        common::Vec2Ned home_xy;    ///< 水平目标（起飞原点优先，Home 经纬度兜底）
+        double base_z = 0.0;        ///< 相对高度基准（NED z，向下为正）
+        double relative_alt_m = 0.0;  ///< base_z − local_z（向上为正）
+        double horizontal_m = 0.0;  ///< 到水平目标的距离
+        double ground_speed_mps = 0.0;  ///< 实测水平地速
+    };
+
+    /// 计算降落几何量。任一前置不可用时返回 nullopt：无局部位置（算不出相对
+    /// 高度）、无高度基准、无水平目标。调用方按"下降意图不可用"计数
+    /// （§4.5 保护 3），不得用 0 或猜值代替。
+    std::optional<LandingGeometry> ComputeLandingGeometry(
+        const common::FlightStateSnapshot& flight) const {
+        if (!flight.local_position_valid) {
+            return std::nullopt;
+        }
+        const auto home_xy = ReturnHorizontalTarget();
+        if (!home_xy.has_value()) {
+            return std::nullopt;
+        }
+        double base_z = 0.0;
+        if (const auto ekf_base = common::RelativeAltitudeBaseZ(flight);
+            ekf_base.has_value()) {
+            base_z = *ekf_base;
+        } else if (const auto home = HomeLocalNed(); home.has_value()) {
+            base_z = home->down_m;
+        } else {
+            return std::nullopt;
+        }
+        LandingGeometry geo;
+        geo.home_xy = *home_xy;
+        geo.base_z = base_z;
+        geo.relative_alt_m = base_z - static_cast<double>(flight.local_z_m);
+        geo.horizontal_m = std::hypot(
+            static_cast<double>(home_xy->north_m) -
+                static_cast<double>(flight.local_x_m),
+            static_cast<double>(home_xy->east_m) -
+                static_cast<double>(flight.local_y_m));
+        // 逐轴有限性降级：坏轴按 0 处理，不让 NaN 传播进判据（NaN 比较恒 false
+        // 会让"漂移保护"静默失效）。
+        geo.ground_speed_mps =
+            std::hypot(std::isfinite(flight.vx_mps)
+                           ? static_cast<double>(flight.vx_mps)
+                           : 0.0,
+                       std::isfinite(flight.vy_mps)
+                           ? static_cast<double>(flight.vy_mps)
+                           : 0.0);
+        return geo;
+    }
+
+    /// S13a 入口的围栏前置判据（设计 §4.6）：Home 水平目标落在围栏外时跳过
+    /// S13a——控制器的 `ClampIntoPolygon` 会把水平目标拉回界内，与"垂直下降"
+    /// 叠加后落点会偏移。无区域（多边形无效 / 围栏关闭）视为不受约束。
+    bool LandingHomeInsideFence() const {
+        const common::FencePolygonNed polygon = LatestFencePolygon();
+        if (!polygon.valid()) {
+            return true;
+        }
+        const auto home_xy = ReturnHorizontalTarget();
+        if (!home_xy.has_value()) {
+            return false;  // 无法确认落点即保守跳过（交 PX4 不需要我们的水平目标）
+        }
+        return control::fence::PointInPolygon(polygon.vertices, *home_xy);
+    }
+
+    /// 发布 S13 降落位置意图（S13a 下降 / S13b 确认前的保持共用）。
+    /// 低位原因码 12（kReasonLandingDescent）；不指定航向（保持原机头）、
+    /// 不叠加速度前馈（垂直通道不再叠一层）。推进速度由 max_speed_mps 限。
+    void PublishLandingIntent(const LandingGeometry& geo, double target_z,
+                              double speed_limit_mps, uint64_t now_ms) {
+        PositionIntentTarget target;
+        target.x = geo.home_xy.north_m;
+        target.y = geo.home_xy.east_m;
+        target.z = static_cast<float>(target_z);
+        target.frame_id = kFrameLocalNed;
+        target.yaw_valid = false;
+        target.max_speed_mps = static_cast<float>(speed_limit_mps);
+        PublishPositionIntent(target, now_ms, kReasonLandingDescent);
+    }
+
+    /// S13a → S13b：停止推进下降目标。AUTO.LAND 的发送/重试/确认，以及
+    /// "确认前保持控制权"由 EvaluateLandingHandover 接管。
+    /// 调用方负责先记录触发原因（保护为 WARN，正常交段为 INFO）。
+    void EnterLandingHandover() {
+        landing_descent_phase_ = false;
+        landing_handover_hold_since_ms_ = 0;
+        landing_intent_unusable_streak_ = 0;
+    }
+
+    /// S13a：机载受控下降（Offboard 位置引导，我们持有控制权）。
+    ///
+    /// 每拍顺序（命中任一条即交 S13b，且当拍不再发布下降意图）：
+    /// 1. PX4 已不在 Offboard：AUTO.LAND → 交段完成；其它模式 → 视为被抢，
+    ///    `landing_takeover_` 只等落地（沿用既有规则，不抢回控制权）；
+    /// 2. 几何量不可用 / 引导点被围栏钳制 → §4.5 保护 3 计数，连续 10 拍交段；
+    /// 3. 气压 AGL 与 EKF 相对高度偏差 > 阈值持续 → §4.5 保护 1，立即交段；
+    /// 4. 低空水平漂移（相对高度 ≤ 低速档高度 且 水平误差/地速超限）→
+    ///    §4.5 保护 2，立即交段；
+    /// 5. 下降超时 → 立即交段；
+    /// 6. 否则发布下降意图（目标相对高度 descend_target_ag_m，垂直推进速度
+    ///    由主降速/低速档限制），并评估交段判据（高度/垂速/水平误差 + 保持）。
+    void EvaluateLandingDescent(uint64_t now_ms,
+                                const common::FlightStateSnapshot& flight) {
+        // 0) 首拍先做围栏前置判据（放在决策线程而非状态迁移里：迁移可能由测试
+        //    钩子从其它线程触发，读飞行快照不安全）。
+        if (!landing_fence_checked_) {
+            landing_fence_checked_ = true;
+            if (!LandingHomeInsideFence()) {
+                SPDLOG_WARN(
+                    "S13a 跳过: Home 水平目标不在围栏区域内（或水平目标不可用），"
+                    "直接交 PX4 AUTO.LAND（避免控制器钳制把落点带偏）");
+                EnterLandingHandover();
+                return;
+            }
+        }
+        // 1) PX4 模式：已离开 Offboard 就不再是我们推进下降的舞台。
+        const bool offboard =
+            flight.flight_mode == kPx4FlightMainModeOffboard &&
+            flight.flight_sub_mode == kPx4FlightSubModeOffboard;
+        if (!offboard) {
+            const bool auto_land =
+                flight.flight_mode == kPx4FlightMainModeAuto &&
+                flight.flight_sub_mode == kPx4FlightSubModeAutoLand;
+            if (auto_land) {
+                SPDLOG_INFO("S13a→S13b: PX4 已在 AUTO.LAND（4/6），停止发布下降意图");
+                landing_handover_confirmed_ = true;
+            } else {
+                landing_takeover_ = true;
+                SPDLOG_WARN(
+                    "S13a PX4 已离开 Offboard 且非 AUTO.LAND（mode={}/{}），"
+                    "停止下降与命令重试，等待降落",
+                    flight.flight_mode, flight.flight_sub_mode);
+            }
+            EnterLandingHandover();
+            return;
+        }
+        // 2) 几何量不可用 → 保护 3（控制权保持）：每拍都必须能发布意图。
+        const auto geo = ComputeLandingGeometry(flight);
+        if (!geo.has_value()) {
+            ++landing_intent_unusable_streak_;
+            const uint64_t count = ++landing_intent_fail_count_;
+            if (ShouldLogThrottled(count)) {
+                SPDLOG_WARN(
+                    "S13a 下降意图停发: 局部位置/高度基准/Home 水平目标不可用"
+                    "（连续 {} 拍）累计={}",
+                    landing_intent_unusable_streak_, count);
+            }
+            if (landing_intent_unusable_streak_ >= kLandingIntentUnusableFrames) {
+                SPDLOG_WARN(
+                    "S13a 连续 {} 拍无法发布下降意图，提前交 PX4",
+                    landing_intent_unusable_streak_);
+                EnterLandingHandover();
+            }
+            return;
+        }
+        // 3) 保护 1：高度源交叉校验（气压 AGL 不被 EKF 重置平移）。
+        if (!landing_baro_mismatch_latched_) {
+            if (const auto baro_ag = common::BaroAboveTakeoffM(flight);
+                baro_ag.has_value()) {
+                const double diff =
+                    std::fabs(geo->relative_alt_m - *baro_ag);
+                if (diff > landing_.baro_mismatch_m) {
+                    if (landing_baro_mismatch_since_ms_ == 0) {
+                        landing_baro_mismatch_since_ms_ = now_ms;
+                    } else if (now_ms - landing_baro_mismatch_since_ms_ >=
+                               static_cast<uint64_t>(
+                                   landing_.baro_mismatch_hold.count())) {
+                        landing_baro_mismatch_latched_ = true;
+                        SPDLOG_WARN(
+                            "S13a 高度源交叉校验失败: EKF相对高度={:.2f}m "
+                            "气压AGL={:.2f}m 偏差={:.2f}m 持续{}ms（门限{:.2f}m/"
+                            "{}ms），立即交 PX4",
+                            geo->relative_alt_m, *baro_ag, diff,
+                            now_ms - landing_baro_mismatch_since_ms_,
+                            landing_.baro_mismatch_m,
+                            landing_.baro_mismatch_hold.count());
+                        EnterLandingHandover();
+                        return;
+                    }
+                } else {
+                    landing_baro_mismatch_since_ms_ = 0;
+                }
+            }
+        }
+        // 4) 保护 2：低空水平漂移——宁可让 PX4 落，也不在 1 m 高度画圈。
+        if (geo->relative_alt_m <= landing_.descend_slow_zone_m &&
+            (geo->horizontal_m > kLandingLowAltitudeDriftM ||
+             geo->ground_speed_mps > kLandingLowAltitudeDriftSpeedMps)) {
+            SPDLOG_WARN(
+                "S13a 低空水平漂移: 相对高度={:.2f}m 水平误差={:.2f}m "
+                "地速={:.2f}m/s（门限 {:.1f}m / {:.1f}m/s），立即交 PX4",
+                geo->relative_alt_m, geo->horizontal_m, geo->ground_speed_mps,
+                kLandingLowAltitudeDriftM, kLandingLowAltitudeDriftSpeedMps);
+            EnterLandingHandover();
+            return;
+        }
+        // 5) 超时兜底：到点即交 PX4（27 m 按 0.8 m/s 约 33 s，默认 120 s）。
+        if (!landing_descent_timeout_warned_ &&
+            now_ms >= landing_descent_started_ms_ &&
+            now_ms - landing_descent_started_ms_ >=
+                static_cast<uint64_t>(landing_.descent_timeout.count())) {
+            landing_descent_timeout_warned_ = true;
+            SPDLOG_WARN(
+                "S13a 下降超时（{}ms，相对高度仍有 {:.2f}m），提前交 PX4",
+                now_ms - landing_descent_started_ms_, geo->relative_alt_m);
+            EnterLandingHandover();
+            return;
+        }
+        // 6) 发布下降意图：目标相对高度 = descend_target_ag_m；推进速度按高度分档。
+        const bool low_zone = geo->relative_alt_m <= landing_.descend_slow_zone_m;
+        const double speed_limit = low_zone ? landing_.descend_slow_speed_mps
+                                            : landing_.descend_speed_mps;
+        PublishLandingIntent(*geo, geo->base_z - landing_.descend_target_ag_m,
+                             speed_limit, now_ms);
+        landing_intent_unusable_streak_ = 0;
+
+        // 7) 交段判据：高度到点 + 垂速收敛 + 水平误差达标，连续保持才交段。
+        const bool at_target =
+            geo->relative_alt_m <=
+                landing_.descend_target_ag_m + landing_.handover_alt_tolerance_m &&
+            std::isfinite(flight.vz_mps) &&
+            std::fabs(static_cast<double>(flight.vz_mps)) <=
+                landing_.handover_vz_mps &&
+            geo->horizontal_m <= landing_.handover_horizontal_m;
+        if (!at_target) {
+            landing_handover_hold_since_ms_ = 0;
+        } else if (landing_handover_hold_since_ms_ == 0) {
+            landing_handover_hold_since_ms_ = now_ms;
+        } else if (now_ms - landing_handover_hold_since_ms_ >=
+                   static_cast<uint64_t>(landing_.handover_hold.count())) {
+            SPDLOG_INFO(
+                "S13a 交段判据满足（相对高度={:.2f}m 垂速={:.2f}m/s "
+                "水平误差={:.2f}m 保持={}ms），发 AUTO.LAND（4/6）交 PX4",
+                geo->relative_alt_m, static_cast<double>(flight.vz_mps),
+                geo->horizontal_m, now_ms - landing_handover_hold_since_ms_);
+            EnterLandingHandover();
+            return;
+        }
+
+        // 8) 1Hz 下降摘要：现场核对"降没降、降多快、离目标多远"。
+        if (now_ms - landing_diag_last_ms_ >= kLandingDiagIntervalMs) {
+            landing_diag_last_ms_ = now_ms;
+            SPDLOG_INFO(
+                "S13a 下降摘要: 相对高度={:.2f}m 目标={:.2f}m 垂速={:.2f}m/s "
+                "水平误差={:.2f}m 地速={:.2f}m/s 限速={:.2f}m/s 低空档={} "
+                "baro交叉校验={}",
+                geo->relative_alt_m, landing_.descend_target_ag_m,
+                static_cast<double>(flight.vz_mps), geo->horizontal_m,
+                geo->ground_speed_mps, speed_limit, low_zone ? "是" : "否",
+                landing_baro_mismatch_latched_ ? "已锁存不一致" : "正常");
+        }
+    }
+
+    /// S13b：已交 PX4 AUTO.LAND。AUTO.LAND 未确认前**继续保持控制权**：
+    /// 按原高度发布保持意图（不推进下降目标），并按 `return_home.command_retry`
+    /// 重试 `DO_SET_MODE(AUTO.LAND 4/6)`；确认（ACK result=0 或观察到 PX4 已在
+    /// AUTO.LAND）后停止发布 intent，让授权链按现有规则断开，只监视 landed/armed。
+    /// 这样"命令发出→生效"的窗口内不会掉进 PX4 的 Offboard 丢失兜底。
+    void EvaluateLandingHandover(uint64_t now_ms,
+                                 const common::FlightStateSnapshot& flight) {
+        if (landing_takeover_) {
+            return;  // PX4 主导返航/降落，仅等待 landed/disarmed
+        }
+        if (command_sender_ == nullptr) {
+            if (!landing_command_unavailable_logged_) {
+                SPDLOG_ERROR("S13 无法发 AUTO.LAND：命令接口未注入");
+                landing_command_unavailable_logged_ = true;
+            }
+            return;
+        }
+        const bool offboard =
+            flight.flight_mode == kPx4FlightMainModeOffboard &&
+            flight.flight_sub_mode == kPx4FlightSubModeOffboard;
+        if (!offboard) {
+            const bool auto_land =
+                flight.flight_mode == kPx4FlightMainModeAuto &&
+                flight.flight_sub_mode == kPx4FlightSubModeAutoLand;
+            if (!auto_land) {
+                landing_takeover_ = true;
+                SPDLOG_WARN(
+                    "S13 PX4 已离开 Offboard 且非 AUTO.LAND（mode={}/{}），"
+                    "停止命令重试，等待降落",
+                    flight.flight_mode, flight.flight_sub_mode);
+                return;
+            }
+            landing_handover_confirmed_ = true;
+        }
+        // 确认前保持控制权：发布"原高度保持"意图（目标高度取当前 local_z，
+        // 不再推进到交段高度——保护触发时不该继续硬降）。只在两段流程下发：
+        // 回滚开关 landing.enabled=false 时不产生任何降落位置意图（保持 2026-11
+        // 之前的语义）；纯影子装配在建 S13b 前就因"命令接口未注入"返回，同样不发。
+        if (landing_.enabled && !landing_handover_confirmed_) {
+            if (const auto geo = ComputeLandingGeometry(flight); geo.has_value()) {
+                if (now_ms - landing_hold_intent_ms_ >=
+                    kIntentRepublishIntervalMs) {
+                    landing_hold_intent_ms_ = now_ms;
+                    PublishLandingIntent(
+                        *geo, static_cast<double>(flight.local_z_m),
+                        landing_.descend_slow_speed_mps, now_ms);
+                }
+            }
+        }
+        // AUTO.LAND 重试（沿用 return_home.command_retry 间隔）。
+        if (now_ms - landing_command_ms_ >=
+            static_cast<uint64_t>(return_home_.command_retry.count())) {
+            const bool queued = command_sender_->SendCommand(
+                kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled, kPx4MainModeAuto,
+                kPx4SubModeAutoLand, 0.f, 0.f, 0.f, 0.f);
+            landing_command_ms_ = now_ms;
+            if (queued) {
+                if (!landing_command_sent_) {
+                    landing_command_sent_ = true;
+                    SPDLOG_INFO("S13b AUTO.LAND 命令已入队（下降已交 PX4）");
+                }
+            } else {
+                const uint64_t count = ++landing_command_fail_count_;
+                if (ShouldLogThrottled(count)) {
+                    SPDLOG_WARN("AUTO.LAND 入队失败（下拍重试）累计={}", count);
+                }
+            }
+        }
+        // 确认判据：模式观察（上面）或 ACK result=0。ACK 必须来自本段发出的
+        // 那次 DO_SET_MODE（时间戳不早于最近一次入队），避免用上一轮落地的旧
+        // ACK 误判"已接管"。
+        if (!landing_handover_confirmed_) {
+            const common::CommandAckStatus ack = command_sender_->AckStatus();
+            if (ack.last_command == kMavCmdDoSetMode &&
+                ack.last_time_ms >= landing_command_ms_) {
+                if (ack.last_result == 0) {
+                    landing_handover_confirmed_ = true;
+                } else if (!landing_px4_reject_warned_) {
+                    landing_px4_reject_warned_ = true;
+                    SPDLOG_WARN(
+                        "PX4 拒绝 AUTO.LAND（DO_SET_MODE result={}），继续重试并"
+                        "保持控制权",
+                        ack.last_result);
+                }
+            }
+        }
+        if (landing_handover_confirmed_ && !landing_handover_confirmed_logged_) {
+            landing_handover_confirmed_logged_ = true;
+            SPDLOG_INFO(
+                "S13 交段确认: PX4 已接管降落（AUTO.LAND），{}",
+                landing_.enabled ? "停止发布 intent，只监视 landed/armed"
+                                 : "仅监视 landed/armed（回滚路径不发降落意图）");
+        }
+    }
+
+    /// S13 降落收口：S13a 机载受控下降 → S13b 交 PX4 → S14 前发 DISARM。
+    /// 落地/disarm 收口与 PX4 接管判定在 S13a/S13b 共用；段内推进分别在
+    /// EvaluateLandingDescent / EvaluateLandingHandover。
     void EvaluateLandingAndDisarm(uint64_t now_ms) {
         if (!return_home_.enabled) {
             return;
@@ -4942,50 +5337,10 @@ private:
                 }
                 return;
             }
-
-            if (landing_takeover_) {
-                return;  // PX4 主导返航/降落，仅等待 landed/disarmed
-            }
-            if (command_sender_ == nullptr) {
-                if (!landing_command_unavailable_logged_) {
-                    SPDLOG_ERROR("S13 无法发 AUTO.LAND：命令接口未注入");
-                    landing_command_unavailable_logged_ = true;
-                }
-                return;
-            }
-            const bool offboard =
-                flight.flight_mode == kPx4FlightMainModeOffboard &&
-                flight.flight_sub_mode == kPx4FlightSubModeOffboard;
-            if (!offboard) {
-                const bool auto_land =
-                    flight.flight_mode == kPx4FlightMainModeAuto &&
-                    flight.flight_sub_mode == kPx4FlightSubModeAutoLand;
-                if (!auto_land) {
-                    landing_takeover_ = true;
-                    SPDLOG_WARN(
-                        "S13 PX4 已离开 Offboard 且非 AUTO.LAND（mode={}/{}），"
-                        "停止命令重试，等待降落",
-                        flight.flight_mode, flight.flight_sub_mode);
-                }
-                return;
-            }
-            if (now_ms - landing_command_ms_ >=
-                static_cast<uint64_t>(return_home_.command_retry.count())) {
-                const bool queued = command_sender_->SendCommand(
-                    kMavCmdDoSetMode, kMavModeFlagCustomModeEnabled,
-                    kPx4MainModeAuto, kPx4SubModeAutoLand, 0.f, 0.f, 0.f, 0.f);
-                landing_command_ms_ = now_ms;
-                if (queued) {
-                    if (!landing_command_sent_) {
-                        landing_command_sent_ = true;
-                        SPDLOG_INFO("S13 AUTO.LAND 命令已入队");
-                    }
-                } else {
-                    const uint64_t count = ++landing_command_fail_count_;
-                    if (ShouldLogThrottled(count)) {
-                        SPDLOG_WARN("AUTO.LAND 入队失败（下拍重试）累计={}", count);
-                    }
-                }
+            if (landing_descent_phase_) {
+                EvaluateLandingDescent(now_ms, flight);
+            } else {
+                EvaluateLandingHandover(now_ms, flight);
             }
             return;
         }
@@ -5068,10 +5423,44 @@ private:
                 disarm_command_sent_ = false;
                 disarm_command_ms_ = 0;
                 disarm_command_fail_count_ = 0;
+                // S13 拆两段（2026-11-17 P2）：先按"旧路径（直接 AUTO.LAND）"复位，
+                // 只有 `landing.enabled` + 命令接口已注入 + 未被 PX4 接管才进入
+                // S13a。命令接口是否注入就是"能不能发控制"的唯一事实依据（生产
+                // 只在 enable_control=true 时注入），不再单独维护一份装配门禁。
+                // 围栏前置判据**不在迁移里做**（迁移可能由测试钩子从其它线程触发，
+                // 读飞行快照不安全），放到 EvaluateLandingDescent 的首拍。
+                landing_descent_phase_ = landing_.enabled &&
+                                         command_sender_ != nullptr &&
+                                         !landing_takeover_;
+                landing_descent_started_ms_ = landing_descent_phase_ ? now_ms : 0;
+                landing_fence_checked_ = false;
+                landing_handover_hold_since_ms_ = 0;
+                landing_handover_confirmed_ = false;
+                landing_handover_confirmed_logged_ = false;
+                landing_baro_mismatch_since_ms_ = 0;
+                landing_baro_mismatch_latched_ = false;
+                landing_intent_unusable_streak_ = 0;
+                landing_descent_timeout_warned_ = false;
+                landing_px4_reject_warned_ = false;
+                landing_intent_fail_count_ = 0;
+                landing_diag_last_ms_ = 0;
+                landing_hold_intent_ms_ = 0;
+                if (landing_descent_phase_) {
+                    SPDLOG_INFO(
+                        "S13a 机载受控下降开始: 交段相对高度={:.2f}m 主降速={:.2f}m/s "
+                        "低速档={:.2f}m/s(≤{:.1f}m) 超时={}ms",
+                        landing_.descend_target_ag_m,
+                        landing_.descend_speed_mps,
+                        landing_.descend_slow_speed_mps,
+                        landing_.descend_slow_zone_m,
+                        landing_.descent_timeout.count());
+                }
                 SPDLOG_INFO("降落阶段: {}",
-                            landing_takeover_
-                                ? "PX4 已接管，停止发设定值并等待 landed/disarmed"
-                                : "发 AUTO.LAND（4/6）");
+                            landing_descent_phase_
+                                ? "S13a 机载受控下降（到交段判据后发 AUTO.LAND 4/6）"
+                                : (landing_takeover_
+                                       ? "PX4 已接管，停止发设定值并等待 landed/disarmed"
+                                       : "发 AUTO.LAND（4/6）"));
             } else if (next_state == common::MissionState::kDisarmed) {
                 mission_end_logged_ = false;
                 // 任务结束（Task 8）：分配进入 terminal，本次上电不再分配。
@@ -5378,6 +5767,10 @@ private:
     /// 拦截入口/授权与返航配置（构造注入；JSON interception/return_home 节）。
     const config::InterceptionConfig interception_;
     const config::ReturnHomeConfig return_home_;
+    /// 降落两段配置（landing 节，2026-11-17 P2；构造注入）。
+    /// `enabled=false` 是回滚开关（S13 直接 AUTO.LAND）；是否真能发控制由
+    /// `command_sender_` 是否注入决定，不再另设装配门禁字段。
+    const config::LandingConfig landing_;
     /// 自动起飞配置（takeoff 节；Task 4 只做构造期校验与状态一致性，
     /// S3 时序/S4 爬升在 Task 5 使用）。
     const config::TakeoffConfig takeoff_;
@@ -5474,6 +5867,31 @@ private:
     uint64_t disarm_command_ms_ = 0;        ///< 最近一次 DISARM 入队尝试时刻
     uint64_t disarm_command_fail_count_ = 0;///< DISARM 入队失败计数
     bool mission_end_logged_ = false;       ///< S14 结束日志只打一次
+    // ---- S13 拆两段（landing 节，2026-11-17 降落与估计器保护 P2）----
+    /// true=S13a 机载受控下降（Offboard 位置引导，我们持有控制权）；
+    /// false=S13b 已交 PX4 AUTO.LAND（不再推进下降目标）。
+    /// 入口判定：`landing_.enabled && command_sender_ != nullptr &&
+    /// !landing_takeover_`，任一不满足即 false（回滚路径：S13 直发 AUTO.LAND）。
+    bool landing_descent_phase_ = false;
+    uint64_t landing_descent_started_ms_ = 0;  ///< S13a 起点（超时基准）
+    /// S13a 首拍是否已做围栏前置判据（Home 在界内才继续下降，设计 §4.6）。
+    bool landing_fence_checked_ = false;
+    /// 交段判据连续成立起点（0=当前不成立）；达到 handover_hold 即发起交段。
+    uint64_t landing_handover_hold_since_ms_ = 0;
+    /// S13b：AUTO.LAND 是否已确认（ACK result=0 或观察到 PX4 已进 AUTO.LAND）。
+    /// 确认后停止发布 intent（让授权链按现有规则断开），只监视 landed/armed。
+    bool landing_handover_confirmed_ = false;
+    bool landing_handover_confirmed_logged_ = false;  ///< "交段确认"日志只打一次
+    /// 保护 1（高度源交叉校验）：不一致起点（0=当前一致）与锁存标志。
+    uint64_t landing_baro_mismatch_since_ms_ = 0;
+    bool landing_baro_mismatch_latched_ = false;
+    /// 保护 3（控制权保持）：连续"无法发布可用下降意图"的拍数。
+    uint64_t landing_intent_unusable_streak_ = 0;
+    bool landing_descent_timeout_warned_ = false;  ///< 超时告警只打一次
+    bool landing_px4_reject_warned_ = false;       ///< AUTO.LAND 非 0 ACK 告警只打一次
+    uint64_t landing_intent_fail_count_ = 0;       ///< 下降意图停发累计（节流告警）
+    uint64_t landing_diag_last_ms_ = 0;            ///< 1Hz 下降摘要节流
+    uint64_t landing_hold_intent_ms_ = 0;          ///< S13b 保持意图最近发布时刻
     uint64_t intent_sequence_ = 0;
     uint64_t last_intent_publish_ms_ = 0;
     uint64_t intent_stale_count_ = 0;

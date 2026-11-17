@@ -224,6 +224,49 @@ struct ReturnHomeConfig {
     void Validate() const;
 };
 
+/// 降落两段（landing 节，2026-11-17 降落与估计器保护 P2）。
+/// 背景：2026-11-17 10:24 现场 `AUTO.LAND` 从 27 m 一路无人监督地降到底，
+/// 期间 EKF 全状态重置把 local z 平移 9 m，PX4 认为"已触地"而砍推力 → 翻滚。
+/// 改为两段收口：
+/// - **S13a**（机载受控下降）：Offboard 位置引导，把相对高度压到 `descend_target_ag_m`
+///   （默认 1.2 m），全程我们持有控制权，可随时中止/提前交段；
+/// - **S13b**（交 PX4）：发 `DO_SET_MODE(AUTO.LAND 4/6)`，确认后停止发布 intent，
+///   触地仍由 PX4 land detector 判定。
+/// `enabled=false` 是回滚开关：S13 直接发 AUTO.LAND（2026-10 之前的旧行为）。
+/// 纯影子装配（`runtime.enable_control=false`）不注入命令接口，状态机因此
+/// 自然走旧路径，不需要另设装配门禁字段。
+struct LandingConfig {
+    /// 两段降落总开关（回滚开关）。false = S13 直接 AUTO.LAND。
+    bool enabled = true;
+    /// 交 PX4 时的相对高度（m，相对起飞点/Home 基准，见 RelativeAltitudeBaseZ）。
+    /// 不用 0：留余量给 PX4 的 land detector 与姿态收敛；也不用 ≥3 m：
+    /// 交段越晚，无人监督的下降段越短。
+    double descend_target_ag_m = 1.2;
+    /// 主下降速度（m/s）：作为位置引导意图的 max_speed_mps。
+    double descend_speed_mps = 0.8;
+    /// 低速档下降速度（m/s）：相对高度进入 `descend_slow_zone_m` 后使用，
+    /// 让交段判据（高度/垂速/水平误差）有收敛时间，避免 1~2 m 处冲过头。
+    double descend_slow_speed_mps = 0.3;
+    /// 低速档切换高度（m）：相对高度 ≤ 该值用低速档。
+    double descend_slow_zone_m = 3.0;
+    /// 交段判据：相对高度容差（m）→ 要求相对高度 ≤ 目标 + 容差。
+    /// 只用 EKF/baro 差分，baro 受桨风影响 0.2~0.5 m，实机首轮先看日志再定。
+    double handover_alt_tolerance_m = 0.15;
+    /// 交段判据：垂直速度上限（m/s）。
+    double handover_vz_mps = 0.2;
+    /// 交段判据：水平误差上限（m，相对 Home 水平目标）。
+    double handover_horizontal_m = 0.5;
+    /// 交段判据持续成立时长：避免"擦过 1.2 m"就交段。
+    std::chrono::milliseconds handover_hold{500};
+    /// S13a 超时（27 m 按 0.8 m/s 约 33 s，留余量）：到点即交 PX4。
+    std::chrono::milliseconds descent_timeout{120000};
+    /// 高度源交叉校验阈值（m）：气压 AGL 与 EKF 相对高度之差超过该值，
+    /// 且持续 `baro_mismatch_hold`，立即交 PX4（不再硬降到 1.2 m）。
+    double baro_mismatch_m = 1.5;
+    std::chrono::milliseconds baro_mismatch_hold{2000};
+    void Validate() const;
+};
+
 /// 多边形围栏（fence 节，2026-10-29）。
 /// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
 /// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
@@ -360,6 +403,7 @@ struct AppConfig {
     ActuatorConfig actuator;            ///< 捕网执行器（阶段四控制接入 Task 10）
     InterceptionConfig interception;    ///< S9/S10 入口判据与授权（2026-10-19）
     ReturnHomeConfig return_home;       ///< S11~S14 拦截后返航（2026-10-19）
+    LandingConfig landing;              ///< S13 拆两段（2026-11-17 P2）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
     FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
     ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）

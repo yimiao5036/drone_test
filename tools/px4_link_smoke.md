@@ -301,8 +301,8 @@ python3 tools/feedforward_report.py logs/ff_off.csv logs/ff_on.csv
 bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ SEARCHING→LOCKED
 → S6→S7 视觉伺服 → 测距收敛（d_exp=10m）→ interception 入口（LOCKED 帧/
 测距 2~12m/Offboard+armed/命令接口就绪）→ S9 → 自动授权 S10 → 捕网触发
-→ S11（不判命中）→ S12 算力板位置返航 Home → 到达 → S13 AUTO.LAND
-→ S14 DISARMED
+→ S11（不判命中）→ S12 算力板位置返航 Home → 到达 → S13a 机载受控下降到 1.2m
+→ S13b AUTO.LAND（4/6）→ S14 DISARMED
 ```
 
 ```bash
@@ -342,7 +342,7 @@ bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ SEARCHIN
 ```text
 bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ LOCKED → S6→S7
 → 注入 65020（command_id=1）→ 65021 result=0 state=12 → S12（位置设定值带 USE_YAW，
-航向指向 Home）→ S13 AUTO.LAND → S14 DISARMED
+航向指向 Home）→ S13a 机载受控下降 → S13b AUTO.LAND → S14 DISARMED
 ```
 
 ```bash
@@ -353,11 +353,25 @@ bootstrap/Offboard/ARM/起飞 1m → 目标 40m（S5 位置引导）→ LOCKED �
   `!saw_intercept_executing_`）、S12 期间至少一帧位置设定值 `use_yaw=true` 且航向
   与「当前机体位置 → Home」方位角相差 ≤30°（或反向，`NormalizeDeg` 归一化）；
   返航/降落/上锁由状态机接管，工具不再补发 AUTO.LAND。
+- **S13 两段（2026-11-17 P2 起）**：工具本身就是控制装配（注入命令窄接口），
+  因此 S13 自动走 S13a→S13b：日志先出现
+  `S13a 机载受控下降开始` 与 1Hz 的 `S13a 下降摘要: 相对高度=..m 目标=1.20m …`，
+  到交段判据后 `S13a 交段判据满足 …` → `S13b AUTO.LAND 命令已入队` →
+  `S13 交段确认: PX4 已接管降落`。想验证旧路径（直接 AUTO.LAND）把配置里
+  `landing.enabled` 置 false。
 - **65015 不会出现**：`PublishTakeoffAbortAck()` 首行即 `if (!accepted_assignment_.has_value()) return;`，
   本场景没有 65014 分配，故按既有设计不发 65015（带分配路径由单测覆盖）。
 - 2026-10-28 WSL2 实跑：**PASS**，65021 `result=0 state=12`，返航航向样本 276 帧
   全部指向 Home，迁移 8 次、错误 0；日志
   `tools/sitl_evidence/command_fence_20261028/stage4_command_20261028_pass.log`。
+- **2026-11-17 P2 实跑：PASS**，65021 `result=0 state=12`、返航航向样本 452 帧全部
+  指向 Home、迁移 8 次、错误 0、最大相对高度 5.04 m。S13 两段实测：14:55:57.582
+  进 S13（相对高度 5.01 m）→ 0.8 m/s 降到 2.74 m 后切 0.3 m/s → 14:56:05.589
+  交段判据满足（**1.31 m**、垂速 0.10 m/s、水平 0.04 m、保持 501 ms）→
+  14:56:05.689 AUTO.LAND 入队 → 14:56:05.789 交段确认（PX4 已在 4/6，停止 intent，
+  控制权 ACTIVE→COAST→IDLE）→ 14:56:09.693 S14 DISARMED。S13a 全程
+  `PX4 设定值下发统计` 保持 **22.0~22.4 Hz、拒绝=0**（intent 不断流）。
+  日志 `build/logs/0010_20261117_145448.log`（harness 侧 `/tmp/sitl_harness/smoke_20261117_145448.log`）。
 
 ### 2.3.4 stage4-fence 围栏越界专项（`--sitl-stage4-fence`，非门禁）
 

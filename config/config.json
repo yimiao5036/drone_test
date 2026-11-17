@@ -179,6 +179,21 @@
         "fire_timeout_ms": 3000,
         "command_retry_ms": 1000
     },
+    "landing": {
+        "_comment": "S13 拆两段（2026-11-17 降落与估计器保护 P2）：S13a 机载 Offboard 受控下降到 descend_target_ag_m（默认 1.2m，全程我们持有控制权、可提前交段），S13b 发 AUTO.LAND(4/6) 交 PX4 触地。降速：≥descend_slow_zone_m 用 descend_speed_mps，低于该高度用 descend_slow_speed_mps。交段判据 = 相对高度 ≤ 目标+容差 && |vz| ≤ handover_vz_mps && 水平误差 ≤ handover_horizontal_m，连续 holding handover_hold_ms。三条保护（§4.5）：①气压 AGL 与 EKF 相对高度差 >baro_mismatch_m 持续 baro_mismatch_hold_ms → 立即交段；②相对高度 ≤descend_slow_zone_m 且（水平误差>1.0m 或地速>0.5m/s）→ 立即交段；③intent 连续 10 拍不可用 → 交段。descent_timeout_ms 到点即交段。enabled=false 为回滚开关：S13 直接发 AUTO.LAND（旧行为）；影子装配(enable_control=false)也走旧行为。",
+        "enabled": true,
+        "descend_target_ag_m": 1.2,
+        "descend_speed_mps": 0.8,
+        "descend_slow_speed_mps": 0.3,
+        "descend_slow_zone_m": 3.0,
+        "handover_alt_tolerance_m": 0.15,
+        "handover_vz_mps": 0.2,
+        "handover_horizontal_m": 0.5,
+        "handover_hold_ms": 500,
+        "descent_timeout_ms": 120000,
+        "baro_mismatch_m": 1.5,
+        "baro_mismatch_hold_ms": 2000
+    },
     "controller": {
         "_comment": "飞行控制器（阶段四）。三个水平速度上限显式同值=10（2026-11-11 维护者要求：配置里看得见、不靠派生）：max_speed_mps 约束速度式意图；max_feedforward_mps 约束位置意图前馈；position_guide_speed_mps 约束位置引导点推进。加载期校验前馈不得大于 max_speed。位置型意图按 position_guide 限速推进，避免目标跳变时 PX4 用自身 MPC_XY_VEL_MAX 冲过去。",
         "period_ms": 50,

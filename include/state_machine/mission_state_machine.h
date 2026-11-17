@@ -99,6 +99,12 @@ struct MissionStateMachineConfig {
     /// 拦截后返航（S11~S14，return_home 配置节）：单发发射结束→算力板位置
     /// 返航→AUTO.LAND→DISARM。默认启用；测试可关闭以隔离捕网执行器语义。
     config::ReturnHomeConfig return_home;
+    /// 降落两段（landing 配置节，2026-11-17 降落与估计器保护 P2）：
+    /// S13a 机载受控下降到 `descend_target_ag_m` → S13b 交 PX4 AUTO.LAND 触地。
+    /// 构造期 `LandingConfig::Validate()` 兜底（程序化构造非法值 fail-fast）。
+    /// 是否真走 S13a 只取决于 `enabled` 与命令接口是否注入（`SetCommandSender`）：
+    /// 影子装配不注入命令接口，自然保持"S13 直接 AUTO.LAND"的旧路径。
+    config::LandingConfig landing;
     /// 多边形围栏（fence 配置节，2026-10-29）：机载自治围栏——区域缓存装载、
     /// 越界判定与中止、位置意图钳制。默认关闭（回退 Home 圆形围栏）。
     config::FenceConfig fence;

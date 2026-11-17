@@ -1,4 +1,4 @@
-﻿{
+{
     "log": {
         "dir": "logs/",
         "level": "info"
@@ -163,5 +163,20 @@
         "timeout_ms": 60000,
         "fire_timeout_ms": 3000,
         "command_retry_ms": 1000
+    },
+    "landing": {
+        "_comment": "本配置文件不含 runtime 节（enable_control=false，影子装配），因此 S13a 不会启用、S13 直接发 AUTO.LAND。此处保留 landing 节只为与 config/config.json 键集一致，便于原地切到控制装配做两段降落验证。",
+        "enabled": true,
+        "descend_target_ag_m": 1.2,
+        "descend_speed_mps": 0.8,
+        "descend_slow_speed_mps": 0.3,
+        "descend_slow_zone_m": 3.0,
+        "handover_alt_tolerance_m": 0.15,
+        "handover_vz_mps": 0.2,
+        "handover_horizontal_m": 0.5,
+        "handover_hold_ms": 500,
+        "descent_timeout_ms": 120000,
+        "baro_mismatch_m": 1.5,
+        "baro_mismatch_hold_ms": 2000
     }
 }

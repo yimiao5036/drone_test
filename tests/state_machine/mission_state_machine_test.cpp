@@ -1812,7 +1812,10 @@ TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
         << "静止起步首拍必须走加速斜坡（不得直接给巡航顶速）";
     EXPECT_EQ(return_intent->feedforward_valid_mask, 0U);
 
-    // 到达 Home 附近并稳定 300ms → S13；发 AUTO.LAND（176，4/6）。
+    // 到达 Home 附近并稳定 300ms → S13。2026-11-17 起 S13 是两段（P2）：
+    // 先进 S13a 机载下降（reason 12），到 1.2m 交段判据保持 500ms 后才发
+    // AUTO.LAND（176，4/6）。两段细节由 Landing_* 用例覆盖，这里只验证
+    // "拦截→返航→两段降落→上锁"整链不断。
     for (int round = 0; round < 8; ++round) {
         ASSERT_TRUE(flight_topic.Publish(
             std::make_shared<const common::FlightStateSnapshot>(
@@ -1822,7 +1825,13 @@ TEST(MissionStateMachineTest, InterceptionFiresThenReturnsHomeAndLands) {
     ASSERT_TRUE(WaitForState(status_subscription,
                              common::MissionState::kLanding, 2500ms)
                     .has_value());
-    ASSERT_TRUE(WaitForCommand(sender, 176U));
+    for (int round = 0; round < 12; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(0.1f, 0.0f, -1.2f))).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    ASSERT_TRUE(WaitForCommand(sender, 176U, 3000ms));
     {
         const auto history = sender.History();
         bool found = false;
@@ -2180,6 +2189,268 @@ TEST(MissionStateMachineTest, ReturnHomeYieldsWhenPx4LeavesOffboard) {
     std::this_thread::sleep_for(300ms);
     for (const auto& call : sender.History()) {
         EXPECT_NE(call.command, 176U);
+    }
+    machine.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// S13 拆两段（landing 节，2026-11-17 降落与估计器保护 P2；设计 §4/§9.1）：
+// S13a 机载受控下降到交段高度 → S13b 交 PX4 AUTO.LAND。三条保护 + 超时 +
+// 围栏前置判据都在这一段；`landing.enabled=false`（回滚开关）与"未注入命令
+// 接口"（纯影子装配）保持旧路径（S13 直接 AUTO.LAND）。
+// ---------------------------------------------------------------------------
+
+state_machine::MissionStateMachineConfig MakeLandingDescentTestConfig() {
+    auto config = MakeReturnHomeTestConfig();
+    // landing 节取头文件默认值（1.2m / 0.8 / 0.3@3m / 0.15 / 0.2 / 0.5 / 500ms）。
+    // 是否真走 S13a 由 `landing.enabled` + 命令接口注入决定，用例都已
+    // SetCommandSender，因此这里不必再设额外的装配门禁。
+    config.landing = config::LandingConfig{};
+    return config;
+}
+
+/// 等待满足谓词的 S13a 降落意图（低位原因码 12）。用谓词而不是"第一条"，
+/// 因为低速档切换等用例需要在已有意图之后继续等新档位的意图。
+template <typename Predicate>
+std::optional<common::ControlIntent> WaitForLandingIntentIf(
+    common::Topic<common::ControlIntent>::Subscription& subscription,
+    Predicate predicate, std::chrono::milliseconds timeout = 2000ms) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto message = subscription.WaitTakeFor(50ms);
+        if (!message) {
+            continue;
+        }
+        const auto& intent = **message;
+        if (intent.type == common::ControlIntentType::kPositionGuide &&
+            (intent.reason_code & 0xFFU) == 12U && predicate(intent)) {
+            return intent;
+        }
+    }
+    return std::nullopt;
+}
+
+/// 统计某条 MAVLink 命令的入队次数。
+uint64_t CountCommands(const FakeCommandSender& sender, uint16_t command) {
+    uint64_t count = 0;
+    for (const auto& call : sender.History()) {
+        if (call.command == command) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// 正常路径：≥低速档高度用主降速（0.8m/s）压向 1.2m → 进入低速档（0.3m/s）→
+// 高度/垂速/水平误差达标并保持 500ms → 发 AUTO.LAND（4/6）一次。
+TEST(MissionStateMachineTest, Landing_DescentReachesHandover) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeLandingDescentTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto status_subscription = machine.StatusOutput().Subscribe(16);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // Home 在局部原点，相对高度 10m ≥ 低速档 3m → 主降速档。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(0.f, 0.f, -10.f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    const auto fast_intent = WaitForLandingIntentIf(
+        intent_subscription,
+        [](const common::ControlIntent& intent) {
+            return std::fabs(intent.max_speed_mps - 0.8f) < 0.01f;
+        });
+    ASSERT_TRUE(fast_intent.has_value()) << "S13a 应发布主降速档下降意图";
+    EXPECT_NEAR(fast_intent->target_x, 0.f, 0.05f);              // Home 水平
+    EXPECT_NEAR(fast_intent->target_y, 0.f, 0.05f);
+    EXPECT_NEAR(fast_intent->target_z, -1.2f, 0.05f);            // base_z(0) − 1.2
+    EXPECT_EQ(fast_intent->feedforward_valid_mask, 0U) << "垂直下降不叠前馈";
+    EXPECT_FALSE(fast_intent->yaw_valid) << "下降不转机头";
+    EXPECT_NE(fast_intent->reason_code & common::kControlIntentReasonRequestControl, 0U)
+        << "下降意图必须请求控制权（授权链依赖 bit31）";
+    EXPECT_EQ(CountCommands(sender, 176U), 0U) << "未到交段高度不得发 AUTO.LAND";
+
+    // 相对高度 2.5m ≤ 低速档 3m → 限速降到 0.3m/s。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(0.f, 0.f, -2.5f)))
+                    .accepted);
+    const auto slow_intent = WaitForLandingIntentIf(
+        intent_subscription,
+        [](const common::ControlIntent& intent) {
+            return std::fabs(intent.max_speed_mps - 0.3f) < 0.01f;
+        });
+    ASSERT_TRUE(slow_intent.has_value()) << "低空应切低速档";
+    EXPECT_NEAR(slow_intent->target_z, -1.2f, 0.05f);
+
+    // 到达交段高度（1.2m）+ 垂速 0 + 水平误差 0.1m，保持 ≥500ms → 发 AUTO.LAND。
+    for (int round = 0; round < 12; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(
+                MakeReturnHomeFlight(0.1f, 0.f, -1.2f))).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    ASSERT_TRUE(WaitForCommand(sender, 176U, 3000ms)) << "交段判据满足应发 AUTO.LAND";
+    {
+        bool found = false;
+        for (const auto& call : sender.History()) {
+            if (call.command == 176U) {
+                found = true;
+                EXPECT_FLOAT_EQ(call.params[0], 1.0f);  // custom mode enabled
+                EXPECT_FLOAT_EQ(call.params[1], 4.0f);  // AUTO
+                EXPECT_FLOAT_EQ(call.params[2], 6.0f);  // LAND
+            }
+        }
+        EXPECT_TRUE(found);
+    }
+
+    // PX4 确认接管（4/6）后落地 → 落地上锁收口（S14）。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(0.f, 0.f, 0.f, 0,0,0,
+                                                              /*armed=*/false,
+                                                              /*landed=*/true, 4, 6)))
+                    .accepted);
+    ASSERT_TRUE(WaitForState(status_subscription,
+                             common::MissionState::kDisarmed, 2500ms)
+                    .has_value());
+    machine.Stop();
+}
+
+// 保护 1：气压 AGL 与 EKF 相对高度相差 5m（>1.5m）持续 500ms → 不硬降到 1.2m，
+// 立即交 PX4。测试全程只喂 10m 高度的快照，因此任何 AUTO.LAND 都只能来自保护。
+TEST(MissionStateMachineTest, Landing_BaroMismatchSkipsToPx4) {
+    auto config = MakeLandingDescentTestConfig();
+    config.landing.baro_mismatch_hold = 500ms;  // 缩短持续判据（配置下限）
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    auto flight = MakeReturnHomeFlight(0.f, 0.f, -10.f);  // EKF 相对高度 10m
+    flight.baro_altitude_valid = true;
+    flight.baro_takeoff_ref_valid = true;
+    flight.baro_takeoff_ref_amsl_m = 100.f;
+    flight.baro_amsl_m = 105.f;  // 气压 AGL 5m → 偏差 5m
+    ASSERT_TRUE(flight_topic.Publish(
+                    std::make_shared<const common::FlightStateSnapshot>(flight))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    // 偏差持续 500ms 后立即交段（尚未到达 1.2m）。
+    for (int round = 0; round < 12 && CountCommands(sender, 176U) == 0U; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(flight)).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    ASSERT_TRUE(WaitForCommand(sender, 176U, 2000ms))
+        << "高度源交叉校验失败应提前交 PX4";
+    machine.Stop();
+}
+
+// 保护 2：相对高度 ≤3m 时水平误差 1.2m（>1.0m）→ 立即交 PX4（不在低空画圈）。
+TEST(MissionStateMachineTest, Landing_LowAltitudeDriftSkipsToPx4) {
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(MakeLandingDescentTestConfig());
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 相对高度 2.5m（≤3m 低速档）、水平误差 1.2m（>1.0m）。
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(1.2f, 0.f, -2.5f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    ASSERT_TRUE(WaitForCommand(sender, 176U, 2000ms))
+        << "低空水平漂移应立即交 PX4";
+    machine.Stop();
+}
+
+// 兜底：一直降不到交段高度（相对高度恒定 10m）→ descent_timeout 到点交 PX4。
+// 超时下限是配置范围下限 10s（设计 §4.7），因此本题按真实时钟等 10s。
+TEST(MissionStateMachineTest, Landing_DescentTimeout) {
+    auto config = MakeLandingDescentTestConfig();
+    config.landing.descent_timeout = 10000ms;  // 配置范围下限
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    auto flight = MakeReturnHomeFlight(0.f, 0.f, -10.f);  // 相对高度恒 10m
+    ASSERT_TRUE(flight_topic.Publish(
+                    std::make_shared<const common::FlightStateSnapshot>(flight))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    // 超时前：持续发布下降意图，但不得发 AUTO.LAND。
+    for (int round = 0; round < 25; ++round) {
+        ASSERT_TRUE(flight_topic.Publish(
+            std::make_shared<const common::FlightStateSnapshot>(flight)).accepted);
+        std::this_thread::sleep_for(80ms);
+    }
+    EXPECT_EQ(CountCommands(sender, 176U), 0U) << "超时前不得交段";
+
+    ASSERT_TRUE(WaitForCommand(sender, 176U, 12000ms)) << "下降超时应交 PX4";
+    machine.Stop();
+}
+
+// 回滚开关（landing.enabled=false）：完全保持 2026-11 之前的旧路径——直接发
+// AUTO.LAND，不发布任何 S13a 下降意图。
+TEST(MissionStateMachineTest, Landing_RollbackSwitchKeepsOldPath) {
+    auto config = MakeReturnHomeTestConfig();
+    config.landing.enabled = false;  // 回滚开关
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(flight_topic.Publish(std::make_shared<const common::FlightStateSnapshot>(
+                                         MakeReturnHomeFlight(0.f, 0.f, -10.f)))
+                    .accepted);
+    std::this_thread::sleep_for(150ms);
+    // 清掉进入 S13 之前可能残留的意图（本题只关心降落后发什么）。
+    while (intent_subscription.WaitTakeFor(10ms)) {
+    }
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    ASSERT_TRUE(WaitForCommand(sender, 176U, 2000ms))
+        << "回滚开关下应直接发 AUTO.LAND";
+    std::this_thread::sleep_for(400ms);
+    while (auto message = intent_subscription.WaitTakeFor(10ms)) {
+        const auto& intent = **message;
+        EXPECT_FALSE(intent.type == common::ControlIntentType::kPositionGuide &&
+                     (intent.reason_code & 0xFFU) == 12U)
+            << "回滚路径不得发布 S13a 下降意图";
     }
     machine.Stop();
 }

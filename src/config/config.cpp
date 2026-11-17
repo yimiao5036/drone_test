@@ -683,6 +683,79 @@ void ReturnHomeConfig::Validate() const {
     }
 }
 
+void LandingConfig::Validate() const {
+    // 交段高度：0.5~5.0 m（设计 §4.7）。低于 0.5 m 没有余量给姿态收敛，
+    // 高于 5 m 又把无人监督的触地段拉长——两端都偏离"留一点余量"的初衷。
+    if (!std::isfinite(descend_target_ag_m) || descend_target_ag_m < 0.5 ||
+        descend_target_ag_m > 5.0) {
+        throw std::invalid_argument(
+            "landing.descend_target_ag_m 必须在 [0.5, 5.0]");
+    }
+    if (!std::isfinite(descend_speed_mps) || descend_speed_mps < 0.2 ||
+        descend_speed_mps > 2.0) {
+        throw std::invalid_argument(
+            "landing.descend_speed_mps 必须在 [0.2, 2.0]");
+    }
+    if (!std::isfinite(descend_slow_speed_mps) || descend_slow_speed_mps < 0.1 ||
+        descend_slow_speed_mps > 1.0) {
+        throw std::invalid_argument(
+            "landing.descend_slow_speed_mps 必须在 [0.1, 1.0]");
+    }
+    // 低速档必须真的更慢：否则"进入低空降速"这一层保护名存实亡。
+    if (descend_slow_speed_mps >= descend_speed_mps) {
+        throw std::invalid_argument(
+            "landing.descend_slow_speed_mps 必须小于 landing.descend_speed_mps");
+    }
+    if (!std::isfinite(descend_slow_zone_m) || descend_slow_zone_m < 1.0 ||
+        descend_slow_zone_m > 10.0) {
+        throw std::invalid_argument(
+            "landing.descend_slow_zone_m 必须在 [1.0, 10.0]");
+    }
+    // 低速档切换高度必须高于交段高度：否则还在正常下降就已经"交段完成"，
+    // 低速档永远用不上。
+    if (descend_slow_zone_m <= descend_target_ag_m) {
+        throw std::invalid_argument(
+            "landing.descend_slow_zone_m 必须大于 landing.descend_target_ag_m");
+    }
+    if (!std::isfinite(handover_alt_tolerance_m) ||
+        handover_alt_tolerance_m < 0.05 || handover_alt_tolerance_m > 0.5) {
+        throw std::invalid_argument(
+            "landing.handover_alt_tolerance_m 必须在 [0.05, 0.5]");
+    }
+    if (!std::isfinite(handover_vz_mps) || handover_vz_mps < 0.05 ||
+        handover_vz_mps > 0.5) {
+        throw std::invalid_argument("landing.handover_vz_mps 必须在 [0.05, 0.5]");
+    }
+    if (!std::isfinite(handover_horizontal_m) || handover_horizontal_m < 0.2 ||
+        handover_horizontal_m > 2.0) {
+        throw std::invalid_argument(
+            "landing.handover_horizontal_m 必须在 [0.2, 2.0]");
+    }
+    // 0 表示不要求稳定保持（调试用），负值非法。
+    if (handover_hold.count() < 0) {
+        throw std::invalid_argument("landing.handover_hold_ms 必须 >= 0");
+    }
+    if (descent_timeout.count() < 10000 || descent_timeout.count() > 300000) {
+        throw std::invalid_argument(
+            "landing.descent_timeout_ms 必须在 [10000, 300000]");
+    }
+    if (!std::isfinite(baro_mismatch_m) || baro_mismatch_m < 0.5 ||
+        baro_mismatch_m > 5.0) {
+        throw std::invalid_argument(
+            "landing.baro_mismatch_m 必须在 [0.5, 5.0]");
+    }
+    if (baro_mismatch_hold.count() < 500 || baro_mismatch_hold.count() > 10000) {
+        throw std::invalid_argument(
+            "landing.baro_mismatch_hold_ms 必须在 [500, 10000]");
+    }
+    // 交叉校验门限必须大于交段高度容差：否则刚进交段判据就会因 baro 噪声
+    // 判"高度源不一致"，永远不会走正常交段路径。
+    if (baro_mismatch_m <= handover_alt_tolerance_m) {
+        throw std::invalid_argument(
+            "landing.baro_mismatch_m 必须大于 landing.handover_alt_tolerance_m");
+    }
+}
+
 void FenceConfig::Validate() const {
     if (zone_cache_path.empty()) {
         throw std::invalid_argument("fence.zone_cache_path 不能为空");
@@ -1161,6 +1234,34 @@ AppConfig LoadAppConfig(const std::string& path,
             "interception.enabled=true 时 return_home.enabled 必须为 true"
             "（发射后必须有返航收口）");
     }
+
+    // 降落两段（landing 节，2026-11-17 P2）：全部可选，缺席回退默认值。
+    const json landing = root.value("landing", json::object());
+    config.landing.enabled = landing.value("enabled", config.landing.enabled);
+    config.landing.descend_target_ag_m = ReadOptionalPositiveDouble(
+        landing, "descend_target_ag_m", config.landing.descend_target_ag_m);
+    config.landing.descend_speed_mps = ReadOptionalPositiveDouble(
+        landing, "descend_speed_mps", config.landing.descend_speed_mps);
+    config.landing.descend_slow_speed_mps = ReadOptionalPositiveDouble(
+        landing, "descend_slow_speed_mps", config.landing.descend_slow_speed_mps);
+    config.landing.descend_slow_zone_m = ReadOptionalPositiveDouble(
+        landing, "descend_slow_zone_m", config.landing.descend_slow_zone_m);
+    config.landing.handover_alt_tolerance_m = ReadOptionalPositiveDouble(
+        landing, "handover_alt_tolerance_m",
+        config.landing.handover_alt_tolerance_m);
+    config.landing.handover_vz_mps = ReadOptionalPositiveDouble(
+        landing, "handover_vz_mps", config.landing.handover_vz_mps);
+    config.landing.handover_horizontal_m = ReadOptionalPositiveDouble(
+        landing, "handover_horizontal_m", config.landing.handover_horizontal_m);
+    config.landing.handover_hold = ReadOptionalNonNegativeMilliseconds(
+        landing, "handover_hold_ms", config.landing.handover_hold);
+    config.landing.descent_timeout = ReadOptionalPositiveMilliseconds(
+        landing, "descent_timeout_ms", config.landing.descent_timeout);
+    config.landing.baro_mismatch_m = ReadOptionalPositiveDouble(
+        landing, "baro_mismatch_m", config.landing.baro_mismatch_m);
+    config.landing.baro_mismatch_hold = ReadOptionalPositiveMilliseconds(
+        landing, "baro_mismatch_hold_ms", config.landing.baro_mismatch_hold);
+    config.landing.Validate();
 
     // 自动起飞（takeoff 节，2026-10-22）：S3/S4 时序、到达判据与目标收口；
     // 全部可选，缺席回退默认值。低电门限不使用本地电量百分比，唯一来源是

@@ -6793,6 +6793,10 @@ int RunStage4Tune(drone::communication::Px4Link& link, const std::string& config
     mission_config.actuator = app.actuator;
     mission_config.interception = app.interception;
     mission_config.return_home = app.return_home;
+    // 降落两段（2026-11-17 P2）：本工具自身就是控制装配（绑 Px4Setpoint +
+    // 注入命令窄接口），因此 S13 自动走 S13a→S13b；想回到旧路径（S13 直接
+    // AUTO.LAND）把配置里 landing.enabled 置 false。
+    mission_config.landing = app.landing;
     // 围栏：65018 专项必须显式启用，且不落盘（只验证在线下发与钳制）；其余剧本关闭。
     mission_config.fence = app.fence;
     if (tune_script == TuneScript::kFenceViolation ||
@@ -7099,6 +7103,9 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
     mission_config.actuator = app.actuator;
     mission_config.interception = app.interception;
     mission_config.return_home = app.return_home;
+    // 降落两段（2026-11-17 P2）：本工具是控制装配，S13 走 S13a→S13b
+    // （语义同上一处装配注释）。
+    mission_config.landing = app.landing;
     // 围栏（2026-10-29）：圆形兜底删除后，G3 的"围栏外目标被钳制"证据改由
     // 多边形承担——启用围栏并让状态机按 fence.default_* 以 Home 为中心生成
     // kMissionFenceRadiusM 的默认方形区域，控制器据此钳制位置意图。
