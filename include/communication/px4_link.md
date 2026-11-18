@@ -15,7 +15,8 @@
 - 周期发送机载电脑 `HEARTBEAT`；
 - 接收并筛选目标 PX4 `HEARTBEAT`；
 - 维护 connected、armed、PX4 main/sub mode 和 system status；
-- 解析固件版本/能力、落地、全局/局部位置、姿态、GPS、电池、Home 和 RC；
+- 解析固件版本/能力、落地、全局/局部位置、姿态、GPS、电池、Home、RC 和
+  **测距雷达 `DISTANCE_SENSOR(132)`（P5，2026-11-18 起订阅 10 Hz）**；
 - 连接后读取 PX4 电池参数 `BAT_LOW_THR` / `COM_LOW_BAT_ACT`（静态配置，非遥测流）；
 - 心跳超时后将连接状态置为断开，各类遥测按 `telemetry_timeout` 独立失效；
 - **串口连续读错误时关闭端口，按 `reconnect_interval` 自动重开**；UDP 不重连；
@@ -263,12 +264,33 @@ bits 24..31 → flight_sub_mode（sub mode）
   | `ESTIMATOR_STATUS` | 230 | 1 Hz | `estimator_status_valid`/`estimator_flags`/`estimator_*_ratio`/`estimator_*_accuracy` | 估计器健康（原始值透出，极性判断在 `EstimatorGuard`） |
   | `VIBRATION` | 241 | 1 Hz | `vibration_*`、`vibration_clipping_*` | 本次根因（Z 轴振动与削波）在线观测 |
   | `STATUSTEXT` | 253 | 事件式 | `statustext_valid`/`statustext_severity`/`statustext_text`/`statustext_time_ms` | PX4 拒绝原因（`Arming denied: ...`）与 EKF 告警文本 |
+  | `DISTANCE_SENSOR` | 132 | 10 Hz（P5，2026-11-18 起订阅） | `distance_valid`/`distance_m`/`distance_min_m`/`distance_max_m`/`distance_type`/`distance_orientation`/`distance_signal_quality`/`distance_time_valid`/`distance_time_ms` | 下视雷达 AGL——低空唯一不经 EKF 的物理量，是 `common::AboveTakeoffM()` 的首选高度源，也是 `radar.preflight_required` 的预检证据 |
 
   另扩展 `SYS_STATUS`：新增 `sensors_status_valid`/`sensors_present`/`sensors_health`/
   `sensors_enabled` 三个位图（`MAV_SYS_STATUS_SENSOR_*`），此前只取了电压/电流/电量。
-  `DISTANCE_SENSOR`（132）的**解析已就位**（`distance_*`，`current_distance` 为
-  `UINT16_MAX`/0 时置 `distance_valid=false`），但本期不订阅、不参与判据，留待
-  P5 装雷达后启用。
+
+  **`DISTANCE_SENSOR`（132，P5 雷达，2026-11-18 起订阅 10 Hz）**：除既有
+  `current/min/max/type/orientation` 外，补 **`signal_quality`** 与**到达时刻**
+  （`distance_time_valid`/`distance_time_ms`）：
+
+  - `signal_quality` 的编码**必须按 PX4 出口实现读**（`src/modules/mavlink/streams/
+    DISTANCE_SENSOR.hpp`），不能按 MAVLink 文档想当然：驱动 `quality<0`（多数驱动没有
+    质量指标，TFmini 与 SITL 的 gz 雷达都是）→ MAVLink **0 = 未知**；驱动 `==0`
+    （驱动明确判无效）→ **1 = invalid**；2~100 原样透传。**0 不是"质量差"**——把它当差
+    会让所有不给质量的雷达永远判无效。
+  - **多路测距实例时优先保留下视那一路**：一旦快照里已有 `orientation=25`
+    （`ROTATION_PITCH_270`，向下）的读数，其它朝向的帧不再覆盖（高度出口仍会按
+    orientation 再判一次）。
+  - **超量程的表现是"没有新数据"**：PX4 的 TFmini 驱动在无回波/超量程时 `distance_m<0`
+    直接 `-EAGAIN`，**根本不发布** `distance_sensor`
+    （`src/drivers/distance_sensor/tfmini/TFMINI.cpp`），所以"距上次到达过久"就是超量程
+    的主要表现，`radar.stale_ms`（默认 200 ms）是这条防线本身。**绝不能用 0 或
+    `max_distance` 顶替失败**——那正是"超量程当落地"的成因。
+  - **TFmini-S 量程 0.4~12 m**（`TFMINI.cpp` 的 `set_min_distance(0.4f)`/
+    `set_max_distance(12.0f)`）；`min/max_distance` 由 PX4 原样透传（cm→m），`max<=0`
+    视为驱动没给量程，跳过量程判据。
+  - 链路失效（心跳超时/断连）时 `distance_*` 的 valid 一并清零，高度出口随即退化到
+    气压/EKF——这是设计内的降级，不是故障（不置 65013 bit13）。
 
   **气压基准**：`baro_takeoff_ref_valid`/`baro_takeoff_ref_amsl_m` 与起飞高度基准
   同一时刻抓取（`CaptureTakeoffReference()`），二者相减即"气压 AGL"
@@ -381,7 +403,8 @@ PX4 内部用它把局部坐标换算回经纬高。因此上文"帧 id=3 本地
 - `MAV_CMD_SET_MESSAGE_INTERVAL`：请求 SYS_STATUS、GPS、姿态、本地/全局位置、RC、电池和
   `EXTENDED_SYS_STATE` 的配置频率（当前生产配置：姿态/局部位置 25Hz、GPS 10Hz、
   全局位置/RC 5Hz、EXTENDED_SYS_STATE 2Hz、SYS_STATUS/电池 1Hz；另含估计器健康三路订阅
-  `ALTITUDE(141)` 5Hz、`ESTIMATOR_STATUS(230)` 1Hz、`VIBRATION(241)` 1Hz）。
+  `ALTITUDE(141)` 5Hz、`ESTIMATOR_STATUS(230)` 1Hz、`VIBRATION(241)` 1Hz，以及
+  **P5 起 `DISTANCE_SENSOR(132)` 10Hz**）。
   **2026-11-17 起串口波特率为 921600**（原 115200）：115200 下这套订阅 + 65010 目标流
   已占约 45%，现场出现设定值迟到导致 `ARM` 被 `TEMPORARILY_REJECTED` 拒绝；
   921600 下余量约 8×。

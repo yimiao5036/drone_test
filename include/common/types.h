@@ -363,13 +363,22 @@ struct FlightStateSnapshot {
     uint8_t statustext_severity = 0;         ///< MAV_SEVERITY（0 最严重）
     std::string statustext_text;             ///< 最近一条（截断到 63 字节）
     uint64_t statustext_time_ms = 0;
-    /// 测距传感器（DISTANCE_SENSOR，132）：P5 装雷达后才参与判据，本期只解析。
+    /// 测距传感器（DISTANCE_SENSOR，132）：P5 雷达，2026-11-18 起参与单一高度出口。
+    ///
+    /// `signal_quality` 的编码必须按 PX4 出口实现读，不能按 MAVLink 文档想当然
+    /// （`src/modules/mavlink/streams/DISTANCE_SENSOR.hpp`）：
+    /// 驱动 `signal_quality < 0`（多数驱动没有质量指标，SITL 的 gz 雷达也是）
+    /// → MAVLink **0 = 未知**；驱动 `== 0`（驱动明确判无效）→ MAVLink **1 = invalid**；
+    /// 其余 2~100 原样透传。故"0"是"没有质量指标"，**不能当质量差处理**。
     bool distance_valid = false;
     float distance_m = 0.f;
     float distance_min_m = 0.f;
     float distance_max_m = 0.f;
     uint8_t distance_type = 0;
     uint8_t distance_orientation = 0;        ///< MAV_SENSOR_ORIENTATION，向下为 ROTATION_PITCH_270(25)
+    uint8_t distance_signal_quality = 0;     ///< 0=未知、1=invalid、2~100=质量百分比
+    bool distance_time_valid = false;        ///< DISTANCE_SENSOR 已有到达时间
+    uint64_t distance_time_ms = 0;           ///< 最近一帧 DISTANCE_SENSOR 单调时钟（时效判据）
 };
 
 /// 相对起飞点高度基准（NED z，向下为正），供围栏判据、飞控钳制、65011 下传共用：
@@ -399,6 +408,220 @@ inline std::optional<double> BaroAboveTakeoffM(const FlightStateSnapshot& state)
     }
     return static_cast<double>(state.baro_amsl_m) -
            static_cast<double>(state.baro_takeoff_ref_amsl_m);
+}
+
+// ---- 单一高度出口（2026-11-18 P5 雷达接入，设计 §7/§11.5）--------------------
+// 为什么要有这一层：2026-11-17 事故的决定性因素是"高度量混淆"——EKF z 被重置
+// 9 m，而气压是平滑的。装雷达后低空多了一个**不经 EKF** 的物理量（离地距离），
+// 但判断"现在用哪个高度"必须只有一处，否则 S13a 交段判据、保护 1 交叉校验、
+// 落地确认会各算一套，彼此矛盾。所有使用方一律经 `AboveTakeoffM()` 取高度。
+
+/// 高度来源：单一高度出口的退化链。
+enum class HeightSource : uint8_t {
+    kNone = 0,
+    kRadar = 1,  ///< 测距雷达 AGL（低空唯一不经 EKF 的量，最可信）
+    kBaro = 2,   ///< 气压 AGL（不被 EKF 坐标重置平移）
+    kEkf = 3,    ///< EKF 局部高度差分（基准 − local_z）
+};
+
+inline const char* HeightSourceText(HeightSource source) {
+    switch (source) {
+        case HeightSource::kRadar:
+            return "雷达AGL";
+        case HeightSource::kBaro:
+            return "气压AGL";
+        case HeightSource::kEkf:
+            return "EKF差分";
+        case HeightSource::kNone:
+            break;
+    }
+    return "无";
+}
+
+/// 雷达被判"无有效测量"的原因（只用于日志与排查，不参与控制）。
+enum class RadarRejectReason : uint8_t {
+    kNone = 0,
+    kDisabled,          ///< radar.enabled=false（回滚开关）
+    kNoData,            ///< 从未收到 DISTANCE_SENSOR（未装雷达 / 驱动没起来）
+    kStale,             ///< 超过 radar.stale_ms 未更新（超量程时驱动干脆不再发布）
+    kNoMeasurement,     ///< 本帧明确无测量（current_distance=0 或 UINT16_MAX）
+    kOutOfRange,        ///< 不在 [min_distance, max_distance] 内
+    kSignalInvalid,     ///< signal_quality=1（MAVLink：invalid signal）
+    kQualityLow,        ///< signal_quality 在 2~100 之间但低于门槛
+    kWrongOrientation,  ///< 不是向下安装
+};
+
+inline const char* RadarRejectReasonText(RadarRejectReason reason) {
+    switch (reason) {
+        case RadarRejectReason::kDisabled:
+            return "雷达未启用";
+        case RadarRejectReason::kNoData:
+            return "未收到测距数据";
+        case RadarRejectReason::kStale:
+            return "测距数据过期";
+        case RadarRejectReason::kNoMeasurement:
+            return "本帧无有效测量";
+        case RadarRejectReason::kOutOfRange:
+            return "超出量程";
+        case RadarRejectReason::kSignalInvalid:
+            return "信号无效";
+        case RadarRejectReason::kQualityLow:
+            return "信号质量低于门槛";
+        case RadarRejectReason::kWrongOrientation:
+            return "不是向下安装";
+        case RadarRejectReason::kNone:
+            break;
+    }
+    return "可用";
+}
+
+/// 向下安装的 MAV_SENSOR_ORIENTATION（ROTATION_PITCH_270=25）；P5 只用向下测距。
+constexpr uint8_t kDistanceOrientationDownward = 25;
+/// signal_quality==1 表示驱动明确判无效（编码见 `FlightStateSnapshot` 里的说明）。
+constexpr uint8_t kDistanceSignalQualityInvalid = 1;
+
+/// 雷达可用性判据（`radar` 节）。**机载必须自己再判一遍**，不能只信驱动的 valid 位
+/// ——设计 §7 明确要求：signal_quality 达阈值、量程内、时效 ≤ stale_ms；任一不满足
+/// 即"无测量"，退到下一路高度源，**绝不填 0 或 max_distance**。
+struct RadarGateParams {
+    bool enabled = false;             ///< radar.enabled=false 时高度出口完全保持 P5 之前的行为
+    uint8_t min_signal_quality = 30;  ///< 0=不做质量判据；quality==0（未知）不受该值约束
+    uint64_t stale_ms = 200;          ///< 数据时效上限
+};
+
+/// 雷达链路"活着"：收到过数据且距上次到达 ≤ `alive_ms`。**不判读数是否在量程内**。
+///
+/// 为什么起飞前门禁用这个而不是 `RadarAglM()`：落在地上的下视测距**必然在盲区**
+/// （TFmini-S 最小 0.4 m，装机后离地 0.1~0.2 m；PX4 会把读数钳到 min 或直接不发）。
+/// 拿"读数量程有效"当起飞门禁，等于任何时刻都拒绝起飞。起飞前只该回答
+/// "雷达接上了没有、驱动在不在报数"，这与 PX4 自己的 `distanceSensorChecks`
+/// 口径一致（它判的是 topic 是否存在 + 时间戳 1 s 内，不判数值）。
+inline bool RadarAlive(const FlightStateSnapshot& state, uint64_t now_ms,
+                       uint64_t alive_ms) {
+    if (!state.distance_time_valid) {
+        return false;
+    }
+    const uint64_t age_ms =
+        now_ms >= state.distance_time_ms ? now_ms - state.distance_time_ms : 0;
+    return age_ms <= alive_ms;
+}
+
+/// 雷达 AGL（离地高度，向上为正）。不可用返回 nullopt，`reason` 给出原因。
+/// 调用方 **不得** 用 0 或 max_distance 代替失败——那正是"超量程当落地"的成因。
+inline std::optional<double> RadarAglM(const FlightStateSnapshot& state, uint64_t now_ms,
+                                       const RadarGateParams& gate,
+                                       RadarRejectReason* reason = nullptr) {
+    auto reject = [reason](RadarRejectReason value) -> std::optional<double> {
+        if (reason != nullptr) {
+            *reason = value;
+        }
+        return std::nullopt;
+    };
+    if (reason != nullptr) {
+        *reason = RadarRejectReason::kNone;
+    }
+    if (!gate.enabled) {
+        return reject(RadarRejectReason::kDisabled);
+    }
+    if (!state.distance_time_valid) {
+        return reject(RadarRejectReason::kNoData);
+    }
+    // 时间戳只往前比：时钟未初始化的一拍（now < 到达时刻）不吃负差值。
+    const uint64_t age_ms =
+        now_ms >= state.distance_time_ms ? now_ms - state.distance_time_ms : 0;
+    if (age_ms > gate.stale_ms) {
+        return reject(RadarRejectReason::kStale);
+    }
+    if (!state.distance_valid) {
+        return reject(RadarRejectReason::kNoMeasurement);
+    }
+    if (state.distance_orientation != kDistanceOrientationDownward) {
+        return reject(RadarRejectReason::kWrongOrientation);
+    }
+    // 量程：PX4 把驱动的 min/max 原样透传（cm→m）。max<=0 视为驱动没给量程，跳过。
+    if (state.distance_max_m > 0.f && (state.distance_m <= state.distance_min_m ||
+                                       state.distance_m >= state.distance_max_m)) {
+        return reject(RadarRejectReason::kOutOfRange);
+    }
+    if (state.distance_signal_quality == kDistanceSignalQualityInvalid) {
+        return reject(RadarRejectReason::kSignalInvalid);
+    }
+    // quality==0 是"驱动没有质量指标"（TFmini 与 SITL 的 gz 雷达都是），不是差；
+    // 只有 2~100 的实测质量才受门槛约束，否则不给质量的雷达永远被判无效。
+    if (gate.min_signal_quality > 0 &&
+        state.distance_signal_quality > kDistanceSignalQualityInvalid &&
+        state.distance_signal_quality < gate.min_signal_quality) {
+        return reject(RadarRejectReason::kQualityLow);
+    }
+    return static_cast<double>(state.distance_m);
+}
+
+/// EKF 相对起飞点高度（向上为正）：`RelativeAltitudeBaseZ() − local_z`。
+inline std::optional<double> EkfAboveTakeoffM(const FlightStateSnapshot& state) {
+    if (!state.local_position_valid) {
+        return std::nullopt;
+    }
+    const auto base_z = RelativeAltitudeBaseZ(state);
+    if (!base_z.has_value()) {
+        return std::nullopt;
+    }
+    return *base_z - static_cast<double>(state.local_z_m);
+}
+
+/// 单一高度出口的结果。
+struct AboveTakeoffHeight {
+    double agl_m = 0.0;  ///< 向上为正
+    HeightSource source = HeightSource::kNone;
+    RadarRejectReason radar_reject = RadarRejectReason::kNone;  ///< 雷达为何没被用上
+};
+
+/// **单一高度出口**：有效雷达 AGL → 气压 AGL → EKF 差分逐级退化。
+/// 三条都不成立返回 nullopt，调用方按"高度不可用"处理（**不得退化成 0**）。
+///
+/// 两条必须说清的口径：
+/// 1. **`gate.enabled=false` 时只用 EKF 差分**（气压只做交叉校验，不当决策源）——
+///    这是 P5 之前的行为，回滚开关必须保证它与装雷达前逐位一致，所以这里
+///    **先于**气压返回，不能偷偷改成"baro 优先"。
+/// 2. 口径差异：雷达是"离地"，气压/EKF 是"离起飞点"。地形起伏处两者本来就有差，
+///    交叉校验门限要给地形差留余量（默认 1.5 m 的来历见 `landing.baro_mismatch_m`）。
+///
+/// `ekf_fallback`：调用方若已有自己的 EKF 差分（例如降落段用 `HomeLocalNed()`
+/// 兜底算出的 base_z），传进来即可，避免两处基准不一致。
+inline std::optional<AboveTakeoffHeight> AboveTakeoffM(
+    const FlightStateSnapshot& state, uint64_t now_ms,
+    const RadarGateParams& gate, std::optional<double> ekf_fallback = std::nullopt) {
+    AboveTakeoffHeight height;
+    const std::optional<double> ekf_alt =
+        ekf_fallback.has_value() ? ekf_fallback : EkfAboveTakeoffM(state);
+    if (!gate.enabled) {
+        // P5 之前的行为：决策高度 = EKF 差分。气压不参与选择（只做交叉校验）。
+        height.radar_reject = RadarRejectReason::kDisabled;
+        if (ekf_alt.has_value()) {
+            height.agl_m = *ekf_alt;
+            height.source = HeightSource::kEkf;
+            return height;
+        }
+        return std::nullopt;
+    }
+    RadarRejectReason radar_reject = RadarRejectReason::kNone;
+    if (const auto radar = RadarAglM(state, now_ms, gate, &radar_reject);
+        radar.has_value()) {
+        height.agl_m = *radar;
+        height.source = HeightSource::kRadar;
+        return height;
+    }
+    height.radar_reject = radar_reject;
+    if (const auto baro = BaroAboveTakeoffM(state); baro.has_value()) {
+        height.agl_m = *baro;
+        height.source = HeightSource::kBaro;
+        return height;
+    }
+    if (ekf_alt.has_value()) {
+        height.agl_m = *ekf_alt;
+        height.source = HeightSource::kEkf;
+        return height;
+    }
+    return std::nullopt;
 }
 
 /// 控制意图类型（状态机/策略 → 飞行控制）。
@@ -572,6 +795,11 @@ enum class MissionAssignmentReason : uint8_t {
     /// （2026-11-18 H 项）。**默认不启用**（维护者裁决振动只告警），
     /// 只有把阻断阈值配成 >0 时才会出现该 reason。
     kVibrationHigh = 24,
+    /// 起飞前门禁：雷达不报数（2026-11-18 P5）。仅在
+    /// `radar.preflight_required=true` 时出现：`DISTANCE_SENSOR` 超过
+    /// `radar.stale_ms` 未更新或从未收到（**不判量程**——地面上就在盲区）。
+    /// **注意**这里不用 `SYS_STATUS.LASER_POSITION`——本版 PX4 不填那个位。
+    kRadarUnavailable = 25,
 };
 
 /// 任务分配（地面站 65014 → 状态机）。

@@ -8463,4 +8463,376 @@ TEST(MissionStateMachineTest,
         << "失败不重发 400（未 armed 也不补 DISARM）";
 }
 
+// ---------------------------------------------------------------------------
+// P5「雷达接入」软件侧（2026-11-18）：单一高度出口在状态机里的落点。
+// A/B 覆盖 S13a 交段判据与保护 1 高度源交叉校验，C/D 覆盖 S13b 落地确认门禁，
+// E/F 覆盖 S2 起飞前雷达门禁（判据 = `common::RadarAlive()`：收到过
+// DISTANCE_SENSOR 且时效内，**不判读数量程**——落在地上的下视测距必然在盲区）。
+//
+// 沿用既有约定：estimator_guard.enabled=false（否则首拍就可能锁存降级）、
+// test_hooks_enabled=true（经 ForceStateForTest 驱动）、命令接口 FakeCommandSender、
+// landing 配置取默认值（1.2m / 0.8 / 0.3@3m / 容差 0.15 / 保持 500ms / 超时 120s）。
+// 快照口径：`distance_*` 是 P5 新增的 DISTANCE_SENSOR(132) 字段；signal_quality
+// 按 PX4 出口实现编码——0=驱动没有质量指标（可用）、1=invalid、2~100 才受门槛约束。
+// ---------------------------------------------------------------------------
+
+/// 雷达降落快照：`MakeReturnHomeFlight` 基线 + 单一高度出口所需字段。
+/// EKF 相对高度 = `home_local_z_m(0) - local_z_m`；雷达帧时间戳取当前单调时钟
+/// （每次构造都新鲜），向下安装、量程 (0.1, 8) 内、quality=0（无质量指标）。
+common::FlightStateSnapshot MakeRadarLandingFlight(
+    float local_z_m, float radar_distance_m, uint8_t main_mode = 6,
+    uint8_t sub_mode = 0, bool landed = false, bool armed = true) {
+    common::FlightStateSnapshot flight = MakeReturnHomeFlight(
+        0.f, 0.f, local_z_m, 0.f, 0.f, 0.f, armed, landed, main_mode, sub_mode);
+    // 显式给 EKF 高度基准：Home 局部 z=0、local_z=-5 → EKF 相对高度 5m。
+    flight.home_local_z_valid = true;
+    flight.home_local_z_m = 0.f;
+    // DISTANCE_SENSOR：向下安装、量程内、驱动不给质量指标（0=未知，可用）。
+    flight.distance_valid = true;
+    flight.distance_time_valid = true;
+    flight.distance_time_ms = TestMonotonicMs();
+    flight.distance_m = radar_distance_m;
+    flight.distance_min_m = 0.1f;
+    flight.distance_max_m = 8.f;
+    flight.distance_orientation = common::kDistanceOrientationDownward;
+    flight.distance_signal_quality = 0;
+    return flight;
+}
+
+/// 给快照补气压 AGL（`baro_amsl_m - baro_takeoff_ref_amsl_m = baro_agl_m`）。
+void SetBaroAgl(common::FlightStateSnapshot& flight, float baro_agl_m) {
+    flight.baro_altitude_valid = true;
+    flight.baro_takeoff_ref_valid = true;
+    flight.baro_takeoff_ref_amsl_m = 100.f;
+    flight.baro_amsl_m = 100.f + baro_agl_m;
+}
+
+// A. 最重要的一条：S13a 交段判据必须吃雷达 AGL，而不是 EKF 差分。
+// 构造"EKF 说 5.0m、雷达与气压都说 1.2m"的分歧快照：如果代码还在吃 EKF，
+// 5.0m 永远不会满足交段高度 ≤1.2m + 容差 0.15m = 1.35m，本用例必然失败；
+// 而这里断言 AUTO.LAND 在 5s 内出现——descent_timeout（默认 120s）远未到点，
+// 所以交段命令只可能来自高度判据。
+TEST(MissionStateMachineTest, Radar_DescentHandoverUsesRadarAglNotEkf) {
+    auto config = MakeLandingDescentTestConfig();
+    config.radar.enabled = true;  // 高度出口优先用雷达 AGL
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // EKF 相对高度 5.0m，雷达 1.2m；气压也给 1.2m，避免保护 1 因"来源不一致"
+    // 提前交段，混淆本用例要断言的正常交段路径。
+    auto flight = MakeRadarLandingFlight(-5.0f, 1.2f);
+    SetBaroAgl(flight, 1.2f);
+    ASSERT_TRUE(PublishFlight(flight_topic, flight));
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    const auto handover_start = std::chrono::steady_clock::now();
+    bool handover = false;
+    for (int round = 0; round < 20 && !handover; ++round) {
+        auto snapshot = MakeRadarLandingFlight(-5.0f, 1.2f);
+        SetBaroAgl(snapshot, 1.2f);
+        ASSERT_TRUE(PublishFlight(flight_topic, snapshot));
+        std::this_thread::sleep_for(80ms);
+        handover = CountCommands(sender, 176U) > 0U;
+    }
+    ASSERT_TRUE(handover)
+        << "雷达/气压 AGL=1.2m 应满足交段判据；若还在吃 EKF(5.0m) 则永远不会交段";
+    EXPECT_LT(std::chrono::steady_clock::now() - handover_start, 5000ms)
+        << "交段必须来自高度判据（保持 500ms），不是 descent_timeout(120s)";
+
+    // 降段命令是 DO_SET_MODE(176) + (custom mode enabled, AUTO=4, LAND=6)。
+    bool found = false;
+    for (const auto& call : sender.History()) {
+        if (call.command == 176U) {
+            found = true;
+            EXPECT_FLOAT_EQ(call.params[0], 1.0f);
+            EXPECT_FLOAT_EQ(call.params[1], 4.0f);
+            EXPECT_FLOAT_EQ(call.params[2], 6.0f);
+        }
+    }
+    EXPECT_TRUE(found) << "必须出现 AUTO.LAND(4/6) 交段命令";
+    machine.Stop();
+}
+
+// B. 雷达过期（超量程时 PX4 的 TFmini 驱动干脆不发布，所以"过期"就是
+// 超量程在机载侧的主要表现）→ 高度出口退到气压 AGL，并继续发布下降意图。
+// 气压 AGL 与 EKF 差分都给 5.0m：二者一致时保护 1 不触发，且 5m > 1.35m，
+// 因此断言"没有交段 + 有下降意图"即可证明退化链在工作；来源差异由
+// tests/common/height_source_test.cpp 逐条钉死。
+TEST(MissionStateMachineTest, Radar_OutOfRangeFallsBackToBaroAndCrossChecks) {
+    auto config = MakeLandingDescentTestConfig();
+    config.radar.enabled = true;
+    config.radar.stale = 200ms;
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    auto intent_subscription = machine.IntentOutput().Subscribe(64);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // 雷达帧停在 5s 前：distance_time_valid=true 但 age >> stale_ms(200ms)。
+    auto flight = MakeRadarLandingFlight(-5.0f, 5.0f);
+    SetBaroAgl(flight, 5.0f);
+    flight.distance_time_ms = TestMonotonicMs() - 5000;
+    ASSERT_TRUE(PublishFlight(flight_topic, flight));
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    for (int round = 0; round < 12; ++round) {
+        auto snapshot = MakeRadarLandingFlight(-5.0f, 5.0f);
+        SetBaroAgl(snapshot, 5.0f);
+        snapshot.distance_time_ms = TestMonotonicMs() - 5000;
+        ASSERT_TRUE(PublishFlight(flight_topic, snapshot));
+        std::this_thread::sleep_for(80ms);
+    }
+    EXPECT_EQ(CountCommands(sender, 176U), 0U)
+        << "5m 高于交段高度，不得下发 AUTO.LAND";
+
+    // 位置意图：目标 z = base_z(0) - 1.2 = -1.2m；5m > 低速档 3m → 主降速 0.8m/s。
+    const auto descent = WaitForLandingIntentIf(
+        intent_subscription, [](const common::ControlIntent& intent) {
+            return std::fabs(intent.max_speed_mps - 0.8f) < 0.01f;
+        });
+    ASSERT_TRUE(descent.has_value())
+        << "雷达退化为气压后仍必须继续发布下降意图（而不是停发/交段）";
+    EXPECT_NEAR(descent->target_z, -1.2f, 0.05f);
+    EXPECT_FALSE(descent->yaw_valid) << "下降不转机头";
+    machine.Stop();
+}
+
+// C. 落地确认门禁：PX4 报 landed 且仍上锁，但高度见证说还有 2.0m ——
+// "PX4 说落地但高度见证说还悬着 → 暂不上锁"（上锁即砍推力，2m 高度同样危险）。
+// 先让状态机处于 S13b（PX4 已在 AUTO.LAND 4/6），再喂 landed=true 快照。
+TEST(MissionStateMachineTest, Landing_HigherThanEvidenceDoesNotDisarmImmediately) {
+    auto config = MakeLandingDescentTestConfig();
+    config.radar.enabled = true;
+    config.landing.landed_max_agl_m = 1.0;
+    config.landing.landed_agl_timeout = 5000ms;  // 矛盾兜底 5s（用例只观察 ~1s）
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    // Offboard 下降中（2m，交段判据不满足）→ 强制进 S13。
+    ASSERT_TRUE(PublishFlight(flight_topic, MakeRadarLandingFlight(-2.0f, 2.0f)));
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+
+    // PX4 已在 AUTO.LAND(4/6)：S13a 首拍观察到后 EnterLandingHandover → S13b。
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(PublishFlight(flight_topic,
+                                  MakeRadarLandingFlight(-2.0f, 2.0f, 4, 6)));
+        std::this_thread::sleep_for(80ms);
+    }
+
+    // PX4 报 landed + 仍 armed，雷达高度见证 2.0m > landed_max_agl_m(1.0m)：
+    // 持续 1s（远小于 landed_agl_timeout=5s）不得发 COMPONENT_ARM_DISARM(400)。
+    for (int round = 0; round < 12; ++round) {
+        ASSERT_TRUE(PublishFlight(
+            flight_topic, MakeRadarLandingFlight(-2.0f, 2.0f, 4, 6, true, true)));
+        std::this_thread::sleep_for(80ms);
+    }
+    EXPECT_EQ(CountCommands(sender, 400U), 0U)
+        << "高度见证 2.0m > 1.0m 时不得上锁（PX4 的 land detector 可能被 EKF 骗过）";
+    EXPECT_EQ(machine.CurrentState(), common::MissionState::kLanding)
+        << "被门禁拦住的收口必须停在 S13，不能悄悄进 S14";
+    machine.Stop();
+}
+
+// C2. 落地确认门禁的兜底分支：矛盾**持续**超过 landed_agl_timeout 后必须按 PX4
+// 处置（继续 DISARM）并打 ERROR，而不是无限期卡在 S13——否则雷达一旦卡在某个
+// 高度值（或地面见证源整体失效），任务永远收不了尾。这里把超时缩到 500ms
+// 让用例只等 ~1.5s。
+TEST(MissionStateMachineTest, Landing_EvidenceMismatchTimesOutAndDisarms) {
+    auto config = MakeLandingDescentTestConfig();
+    config.radar.enabled = true;
+    config.landing.landed_max_agl_m = 1.0;
+    config.landing.landed_agl_timeout = 500ms;  // 兜底等待 0.5s（下限 500ms）
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(PublishFlight(flight_topic, MakeRadarLandingFlight(-2.0f, 2.0f)));
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(PublishFlight(flight_topic,
+                                  MakeRadarLandingFlight(-2.0f, 2.0f, 4, 6)));
+        std::this_thread::sleep_for(80ms);
+    }
+
+    // 矛盾持续（2.0m > 1.0m）超过 500ms 兜底等待 → 按 PX4 处置发 DISARM。
+    bool disarmed = false;
+    for (int round = 0; round < 25 && !disarmed; ++round) {
+        ASSERT_TRUE(PublishFlight(
+            flight_topic, MakeRadarLandingFlight(-2.0f, 2.0f, 4, 6, true, true)));
+        std::this_thread::sleep_for(80ms);
+        disarmed = CountCommands(sender, 400U) > 0U;
+    }
+    EXPECT_TRUE(disarmed)
+        << "矛盾超过 landed_agl_timeout 后必须按 PX4 处置（否则任务永远收不了尾）";
+    machine.Stop();
+}
+
+// D. 同样是 PX4 报 landed + 仍上锁，但雷达高度见证 0.6m ≤ 1.0m → 认账并发
+// COMPONENT_ARM_DISARM(400) 上锁（收口 S14 的正常路径不能被门禁误伤）。
+TEST(MissionStateMachineTest, Landing_DisarmsWhenEvidenceAgrees) {
+    auto config = MakeLandingDescentTestConfig();
+    config.radar.enabled = true;
+    config.landing.landed_max_agl_m = 1.0;
+    config.landing.landed_agl_timeout = 5000ms;
+    common::Topic<common::GroundStationTarget> ground_topic;
+    common::Topic<common::FlightStateSnapshot> flight_topic;
+    common::Topic<common::HealthStatus> health_topic;
+    FakeCommandSender sender;
+    state_machine::MissionStateMachine machine(config);
+    machine.SetInputs(ground_topic, flight_topic, health_topic);
+    machine.SetCommandSender(&sender);
+    ASSERT_TRUE(machine.Start());
+    ASSERT_TRUE(WaitForSelfCheck(machine));
+
+    ASSERT_TRUE(PublishFlight(flight_topic, MakeRadarLandingFlight(-0.6f, 0.6f)));
+    std::this_thread::sleep_for(150ms);
+    machine.ForceStateForTest(common::MissionState::kLanding);
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(PublishFlight(flight_topic,
+                                  MakeRadarLandingFlight(-0.6f, 0.6f, 4, 6)));
+        std::this_thread::sleep_for(80ms);
+    }
+
+    // 落地且高度见证一致（0.6m ≤ 1.0m）：~1s 内必须下发 DISARM。
+    bool disarmed = false;
+    for (int round = 0; round < 15 && !disarmed; ++round) {
+        ASSERT_TRUE(PublishFlight(
+            flight_topic, MakeRadarLandingFlight(-0.6f, 0.6f, 4, 6, true, true)));
+        std::this_thread::sleep_for(80ms);
+        disarmed = CountCommands(sender, 400U) > 0U;
+    }
+    ASSERT_TRUE(disarmed) << "高度见证 ≤ 1.0m 时应认可 PX4 落地并上锁";
+    for (const auto& call : sender.History()) {
+        if (call.command == 400U) {
+            EXPECT_FLOAT_EQ(call.params[0], 0.0f) << "param1=0 是 DISARM";
+        }
+    }
+    machine.Stop();
+}
+
+// E. 起飞前雷达门禁（硬判）：radar.preflight_required=true 且**没有任何
+// DISTANCE_SENSOR 数据**（未装/驱动没起来）→ 持续 hold 后 65014 被拒，
+// reason=25 kRadarUnavailable，保持 S2 READY。
+TEST(MissionStateMachineTest, PreflightGate_RadarRequiredRejectsWhenNoReading) {
+    auto config = MakeTakeoffTestConfig();
+    config.radar.enabled = true;
+    config.radar.preflight_required = true;
+    config.preflight_gate.sensor_health_hold = 100ms;  // 配置校验下限，加速用例
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true,
+                              MakePreflightGateFlight()))
+        << "夹具应启动并进入 S2 READY";
+
+    constexpr uint32_t kWarningRadarUnavailable = 1U << 13U;  // 8192
+    // 持续喂"传感器健康 + 无 DISTANCE_SENSOR"的快照：雷达门禁在 hold 后锁存。
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, MakePreflightGateFlight(),
+                              300ms))
+        << "无雷达读数快照应连续被 Topic 接收";
+    ASSERT_TRUE(WaitForWarningBit(harness.status_subscription,
+                                  kWarningRadarUnavailable, 1500ms)
+                    .has_value())
+        << "雷达持续不报数达 hold 后 65013 bit13(8192) 应亮";
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(211)))
+        << "65014 应被 Topic 接收";
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "被拒也要回 65015";
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected)
+        << "雷达不报数且硬判时必须拒绝分配";
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kRadarUnavailable)
+        << "reason 必须是 kRadarUnavailable";
+    EXPECT_EQ(static_cast<uint8_t>(ack->reason), 25U)
+        << "协议 wire 值必须是 25";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "预检拒绝不得离开 S2 READY";
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "被拒的分配不得发出任何落飞控命令";
+}
+
+// F. 恢复：持续发布新鲜雷达帧（distance_time_ms=now）→ 雷达门禁锁存解除，
+// 再发 65014 正常受理。
+// 注意这里刻意发布**盲区内的越界读数**（0.05m < min 0.4m，落在地上必然如此）：
+// 起飞前门禁只判 `RadarAlive()`（链路活着），不判读数量程——若判量程，
+// 地面上的下视雷达永远越界，等于任何时刻都拒绝起飞。
+TEST(MissionStateMachineTest, PreflightGate_RadarReadingRecoversAccepts) {
+    auto config = MakeTakeoffTestConfig();
+    config.radar.enabled = true;
+    config.radar.preflight_required = true;
+    config.preflight_gate.sensor_health_hold = 100ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true,
+                              MakePreflightGateFlight()))
+        << "夹具应启动并进入 S2 READY";
+
+    constexpr uint32_t kWarningRadarUnavailable = 1U << 13U;  // 8192
+    // 先用"无雷达数据"建立拒绝锁存。
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, MakePreflightGateFlight(),
+                              300ms));
+    ASSERT_TRUE(WaitForWarningBit(harness.status_subscription,
+                                  kWarningRadarUnavailable, 1500ms)
+                    .has_value())
+        << "用例前提：无雷达读数时 bit13 应已亮（锁存已建立）";
+
+    // 雷达开始报数：时间戳新鲜（时效内）即可，读数是地面盲区的 0.05m（< min），
+    // 高度出口会判 kOutOfRange，但起飞前门禁只认 RadarAlive → 必须受理。
+    for (int round = 0; round < 4; ++round) {
+        auto flight = MakePreflightGateFlight();
+        flight.distance_valid = true;
+        flight.distance_time_valid = true;
+        flight.distance_time_ms = TestMonotonicMs();
+        flight.distance_m = 0.05f;  // 地面盲区读数（低于驱动最小量程）
+        flight.distance_min_m = 0.4f;
+        flight.distance_max_m = 8.f;
+        flight.distance_orientation = common::kDistanceOrientationDownward;
+        flight.distance_signal_quality = 0;  // 驱动没有质量指标
+        ASSERT_TRUE(PublishFlight(harness.flight_topic, flight))
+            << "新鲜雷达帧应被 Topic 接收";
+        std::this_thread::sleep_for(100ms);
+    }
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(212)))
+        << "65014 应被 Topic 接收";
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "恢复后 65014 必须回 65015";
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kAccepted)
+        << "雷达恢复报数后应正常受理（不得因地面盲区读数越界而拒绝）";
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kNone);
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming, 2000ms)
+                    .has_value())
+        << "受理后应按既有链路进入 S3 ARMING";
+}
+
 }  // namespace

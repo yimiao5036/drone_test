@@ -213,6 +213,10 @@ constexpr uint32_t kWarningPx4RebootTimeout = 1U << 10U;
 /// - bit12：振动超过 `preflight_gate.vibration_warn_mps2`（**只告警**，不影响受理）。
 constexpr uint32_t kWarningPreflightSensorUnhealthy = 1U << 11U;
 constexpr uint32_t kWarningVibrationHigh = 1U << 12U;
+/// 65013 告警位 bit13（2026-11-18 P5）：雷达不可用——仅在
+/// `radar.preflight_required=true`（地面待命期间）置位。飞行中雷达掉数据
+/// **不置该位**：那时高度出口已经退化到气压/EKF，属设计内的降级，不是故障。
+constexpr uint32_t kWarningRadarUnavailable = 1U << 13U;
 /// 起飞前门禁关注的关键传感器位（MAV_SYS_STATUS_SENSOR_*，与 EstimatorGuard 同口径，
 /// 不含 GPS：GNSS 丢失属精度下降，不属"传感器坏了"）。这里不引 mavlink 头，
 /// 避免状态机库把 third_party 的 SYSTEM include 传播给所有依赖方。
@@ -464,6 +468,7 @@ public:
           estimator_guard_enabled_(config.estimator_guard.enabled),
           mission_(config.mission),
           preflight_gate_(config.preflight_gate),
+          radar_(config.radar),
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
@@ -494,6 +499,9 @@ public:
         // 起飞前门禁配置兜底（preflight_gate 节，2026-11-18 H 项）：这些值直接
         // 决定"能不能起飞"，写错一个数量级就是恒拒绝或恒放行，必须 fail-fast。
         config.preflight_gate.Validate();
+        // 雷达配置兜底（radar 节，2026-11-18 P5）：质量门槛/时效/两开关的组合
+        // 非法时 fail-fast——它决定"用哪个高度下降"，写错就是降错高度。
+        config.radar.Validate();
         // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
         // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
         config.takeoff.Validate();
@@ -582,6 +590,18 @@ public:
             preflight_gate_.vibration_warn_mps2,
             preflight_gate_.vibration_block_mps2,
             preflight_gate_.vibration_hold.count());
+        // 雷达（2026-11-18 P5）：把"高度源到底用不用雷达、要不要拿它卡起飞"说清楚。
+        // 硬件未到位时 enabled=false，本行只是复述配置，不改变任何行为。
+        SPDLOG_INFO(
+            "测距雷达: {}（高度源={} signal_quality门槛={}（0=不判） 时效>{}ms "
+            "预检门禁={}）",
+            radar_.enabled ? "启用（高度出口优先用雷达 AGL）"
+                           : "关闭（回滚开关 radar.enabled=false：只剩气压/EKF）",
+            radar_.enabled ? "雷达AGL → 气压AGL → EKF差分"
+                           : "只用 EKF差分（气压只做交叉校验）",
+            static_cast<int>(radar_.min_signal_quality), radar_.stale.count(),
+            radar_.preflight_required ? "硬判（受理 65014 前要求雷达在报数）"
+                                      : "关（不拿雷达卡起飞）");
     }
 
     ~Impl() {
@@ -787,6 +807,9 @@ public:
         preflight_vibration_warned_ = false;
         preflight_vibration_blocked_ = false;
         preflight_vibration_peak_mps2_ = 0.0;
+        // 雷达门禁同样按任务复位（2026-11-18 P5）：锁存不跨轮次。
+        preflight_radar_unavailable_since_ms_ = 0;
+        preflight_radar_blocked_ = false;
     }
 
     /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
@@ -1678,6 +1701,49 @@ private:
                 }
             }
         }
+        // ---- 雷达可用性（2026-11-18 P5；只在 radar.preflight_required 时硬判） ----
+        // 判据是**雷达链路活着**（`common::RadarAlive`：收到过数据且时效内），
+        // **不判读数量程**：落在地上的下视测距必然在盲区（TFmini-S 最小 0.4 m，
+        // 装机后离地 0.1~0.2 m），拿"读数量程有效"当起飞门禁等于任何时刻都拒绝起飞。
+        // 也不用 `SYS_STATUS.LASER_POSITION`——本版 PX4 的
+        // `mavlink/streams/SYS_STATUS.hpp` 根本不填 bit8，那个位永远是 0
+        // （2026-11-18 核对源码后修正设计稿，见 config.h 的 RadarConfig）。
+        // "PX4 侧是否要求装测距"由参数 `SYS_HAS_NUM_DIST` 管：缺测距时 PX4 自己会
+        // 拒绝解锁（`Preflight Fail: Distance Sensor 0 missing`）。
+        if (radar_.preflight_required) {
+            const bool radar_ok = common::RadarAlive(
+                flight, now_ms, static_cast<uint64_t>(radar_.stale.count()));
+            if (radar_ok) {
+                preflight_radar_unavailable_since_ms_ = 0;
+                if (preflight_radar_blocked_) {
+                    preflight_radar_blocked_ = false;
+                    SPDLOG_INFO("起飞前门禁: 雷达恢复报数，允许接受任务分配");
+                }
+            } else {
+                if (preflight_radar_unavailable_since_ms_ == 0) {
+                    preflight_radar_unavailable_since_ms_ = now_ms;
+                }
+                // 观察期内**不打日志**：刚连上飞控时第一帧 DISTANCE_SENSOR 还没到
+                // （与 H 项"未收到 SYS_STATUS"同一个坑），开机就刷 WARN 只会误导现场。
+                if (!preflight_radar_blocked_ &&
+                    ElapsedMs(now_ms, preflight_radar_unavailable_since_ms_) >=
+                        static_cast<uint64_t>(
+                            preflight_gate_.sensor_health_hold.count())) {
+                    preflight_radar_blocked_ = true;
+                    SPDLOG_ERROR(
+                        "起飞前门禁: 雷达持续不报数（≥{}ms，判据=收到过 DISTANCE_SENSOR "
+                        "且时效≤{}ms，不判量程）→ 拒绝新的任务分配"
+                        "（65015 reason=25 kRadarUnavailable）。检查：接线/供电、"
+                        "PX4 驱动是否起来（`dmesg`/`distance_sensor` 实例）、"
+                        "`SYS_HAS_NUM_DIST`；radar.preflight_required=false 可关掉该门禁",
+                        preflight_gate_.sensor_health_hold.count(),
+                        radar_.stale.count());
+                }
+                if (preflight_radar_blocked_) {
+                    warnings |= kWarningRadarUnavailable;
+                }
+            }
+        }
         return warnings;
     }
 
@@ -1843,6 +1909,16 @@ private:
                 preflight_gate_.vibration_block_mps2,
                 preflight_gate_.vibration_hold.count());
             return common::MissionAssignmentReason::kVibrationHigh;
+        }
+        // 雷达门禁（2026-11-18 P5）：装雷达且要求硬判时，雷达不报数就不放行。
+        // 同样只看 `EvaluatePreflightGate` 维护的锁存，不在这里重新判一帧。
+        // 判据是"链路活着"而不是"读数在量程内"（地面上就在盲区，见该函数注释）。
+        if (radar_.preflight_required && preflight_radar_blocked_) {
+            SPDLOG_WARN(
+                "任务指令（分配预检）: 雷达持续不报数（已≥{}ms），"
+                "拒绝分配（kRadarUnavailable）",
+                preflight_gate_.sensor_health_hold.count());
+            return common::MissionAssignmentReason::kRadarUnavailable;
         }
         return common::MissionAssignmentReason::kNone;
     }
@@ -5740,16 +5816,25 @@ private:
     struct LandingGeometry {
         common::Vec2Ned home_xy;    ///< 水平目标（起飞原点优先，Home 经纬度兜底）
         double base_z = 0.0;        ///< 相对高度基准（NED z，向下为正）
-        double relative_alt_m = 0.0;  ///< base_z − local_z（向上为正）
+        /// **决策用高度**（向上为正）= 单一高度出口 `common::AboveTakeoffM()`：
+        /// 雷达 AGL → 气压 AGL → EKF 差分。P5 之前它与 EKF 差分逐位相同。
+        /// 注意口径：雷达是"离地"，气压/EKF 是"离起飞点"（地形起伏处有差异）。
+        double relative_alt_m = 0.0;
+        common::HeightSource height_source = common::HeightSource::kNone;
+        /// EKF 差分单独留一份：交叉校验要知道"若按 EKF 算，高度是多少"。
+        std::optional<double> ekf_relative_alt_m;
+        /// 雷达没被用上的原因（仅日志用）。
+        common::RadarRejectReason radar_reject = common::RadarRejectReason::kNone;
         double horizontal_m = 0.0;  ///< 到水平目标的距离
         double ground_speed_mps = 0.0;  ///< 实测水平地速
     };
 
     /// 计算降落几何量。任一前置不可用时返回 nullopt：无局部位置（算不出相对
-    /// 高度）、无高度基准、无水平目标。调用方按"下降意图不可用"计数
-    /// （§4.5 保护 3），不得用 0 或猜值代替。
+    /// 高度）、无高度基准（发布 NED 目标需要）、无水平目标、或单一高度出口
+    /// 三条高度源全都不可用。调用方按"下降意图不可用"计数（§4.5 保护 3），
+    /// 不得用 0 或猜值代替。
     std::optional<LandingGeometry> ComputeLandingGeometry(
-        const common::FlightStateSnapshot& flight) const {
+        const common::FlightStateSnapshot& flight, uint64_t now_ms) const {
         if (!flight.local_position_valid) {
             return std::nullopt;
         }
@@ -5766,10 +5851,24 @@ private:
         } else {
             return std::nullopt;
         }
+        // 决策高度走单一出口（2026-11-18 P5）：radar.enabled=false 时等价于旧的
+        // EKF 差分（`ekf_relative_alt` 用本函数算出的 base_z，含 HomeLocalNed 兜底，
+        // 与旧实现逐位一致）；enabled=true 时退化为 雷达 AGL → 气压 AGL → EKF 差分。
+        // 三条都不可用时返回 nullopt（保护 3 会计数），**绝不用 0 代替**。
+        const double ekf_relative_alt =
+            base_z - static_cast<double>(flight.local_z_m);
+        const auto height = common::AboveTakeoffM(
+            flight, now_ms, radar_.ToGateParams(), ekf_relative_alt);
+        if (!height.has_value()) {
+            return std::nullopt;
+        }
         LandingGeometry geo;
         geo.home_xy = *home_xy;
         geo.base_z = base_z;
-        geo.relative_alt_m = base_z - static_cast<double>(flight.local_z_m);
+        geo.relative_alt_m = height->agl_m;
+        geo.height_source = height->source;
+        geo.radar_reject = height->radar_reject;
+        geo.ekf_relative_alt_m = ekf_relative_alt;
         geo.horizontal_m = std::hypot(
             static_cast<double>(home_xy->north_m) -
                 static_cast<double>(flight.local_x_m),
@@ -5874,7 +5973,7 @@ private:
             return;
         }
         // 2) 几何量不可用 → 保护 3（控制权保持）：每拍都必须能发布意图。
-        const auto geo = ComputeLandingGeometry(flight);
+        const auto geo = ComputeLandingGeometry(flight, now_ms);
         if (!geo.has_value()) {
             ++landing_intent_unusable_streak_;
             const uint64_t count = ++landing_intent_fail_count_;
@@ -5892,12 +5991,55 @@ private:
             }
             return;
         }
-        // 3) 保护 1：高度源交叉校验（气压 AGL 不被 EKF 重置平移）。
+        // 2.5) 高度源退化可见性（2026-11-18 P5）：装雷达后如果某一段没用上雷达，
+        //      如实说一次"为什么"（超量程/过期/质量…）。**不是**故障告警：退化链
+        //      本身是设计内的安全方向（雷达没了就退气压，再退 EKF），所以只 INFO。
+        if (radar_.enabled && !landing_height_source_logged_) {
+            landing_height_source_logged_ = true;
+            if (geo->height_source == common::HeightSource::kRadar) {
+                SPDLOG_INFO("S13a 高度源: 雷达AGL（{:.2f}m）", geo->relative_alt_m);
+            } else {
+                SPDLOG_INFO(
+                    "S13a 高度源: {}（{:.2f}m）——雷达未用上，原因={}；"
+                    "这是设计内的逐级退化，不是故障",
+                    common::HeightSourceText(geo->height_source),
+                    geo->relative_alt_m,
+                    common::RadarRejectReasonText(geo->radar_reject));
+            }
+        }
+        // 3) 保护 1：高度源交叉校验。**对照源随"正在用的高度源"变**（2026-11-18 P5）：
+        //    - 用雷达：对照气压 AGL（同为"离地"口径，最贴近同一物理量）；
+        //      气压不可用时退到 EKF 差分（仍能抓住 EKF 高度重置）。
+        //    - 用气压：对照 EKF 差分（专抓 EKF 高度重置）。
+        //    - 用 EKF（含 `radar.enabled=false` 的旧路径）：对照气压 AGL——这就是
+        //      P2 的原逻辑，必须逐位保留，否则回滚开关会少一层保护。
+        //    - 两路都没有：跳过（无对照源）。
         if (!landing_baro_mismatch_latched_) {
-            if (const auto baro_ag = common::BaroAboveTakeoffM(flight);
-                baro_ag.has_value()) {
-                const double diff =
-                    std::fabs(geo->relative_alt_m - *baro_ag);
+            std::optional<double> witness;
+            const char* witness_name = "";
+            if (geo->height_source == common::HeightSource::kRadar) {
+                if (const auto baro_ag = common::BaroAboveTakeoffM(flight);
+                    baro_ag.has_value()) {
+                    witness = baro_ag;
+                    witness_name = "气压AGL";
+                } else if (geo->ekf_relative_alt_m.has_value()) {
+                    witness = geo->ekf_relative_alt_m;
+                    witness_name = "EKF差分";
+                }
+            } else if (geo->height_source == common::HeightSource::kBaro) {
+                if (geo->ekf_relative_alt_m.has_value()) {
+                    witness = geo->ekf_relative_alt_m;
+                    witness_name = "EKF差分";
+                }
+            } else if (geo->height_source == common::HeightSource::kEkf) {
+                if (const auto baro_ag = common::BaroAboveTakeoffM(flight);
+                    baro_ag.has_value()) {
+                    witness = baro_ag;
+                    witness_name = "气压AGL";
+                }
+            }
+            if (witness.has_value()) {
+                const double diff = std::fabs(geo->relative_alt_m - *witness);
                 if (diff > landing_.baro_mismatch_m) {
                     if (landing_baro_mismatch_since_ms_ == 0) {
                         landing_baro_mismatch_since_ms_ = now_ms;
@@ -5906,10 +6048,10 @@ private:
                                    landing_.baro_mismatch_hold.count())) {
                         landing_baro_mismatch_latched_ = true;
                         SPDLOG_WARN(
-                            "S13a 高度源交叉校验失败: EKF相对高度={:.2f}m "
-                            "气压AGL={:.2f}m 偏差={:.2f}m 持续{}ms（门限{:.2f}m/"
-                            "{}ms），立即交 PX4",
-                            geo->relative_alt_m, *baro_ag, diff,
+                            "S13a 高度源交叉校验失败: {}={:.2f}m {}={:.2f}m "
+                            "偏差={:.2f}m 持续{}ms（门限{:.2f}m/{}ms），立即交 PX4",
+                            common::HeightSourceText(geo->height_source),
+                            geo->relative_alt_m, witness_name, *witness, diff,
                             now_ms - landing_baro_mismatch_since_ms_,
                             landing_.baro_mismatch_m,
                             landing_.baro_mismatch_hold.count());
@@ -5968,9 +6110,11 @@ private:
         } else if (now_ms - landing_handover_hold_since_ms_ >=
                    static_cast<uint64_t>(landing_.handover_hold.count())) {
             SPDLOG_INFO(
-                "S13a 交段判据满足（相对高度={:.2f}m 垂速={:.2f}m/s "
+                "S13a 交段判据满足（高度={:.2f}m@{} 垂速={:.2f}m/s "
                 "水平误差={:.2f}m 保持={}ms），发 AUTO.LAND（4/6）交 PX4",
-                geo->relative_alt_m, static_cast<double>(flight.vz_mps),
+                geo->relative_alt_m,
+                common::HeightSourceText(geo->height_source),
+                static_cast<double>(flight.vz_mps),
                 geo->horizontal_m, now_ms - landing_handover_hold_since_ms_);
             EnterLandingHandover();
             return;
@@ -5980,10 +6124,12 @@ private:
         if (now_ms - landing_diag_last_ms_ >= kLandingDiagIntervalMs) {
             landing_diag_last_ms_ = now_ms;
             SPDLOG_INFO(
-                "S13a 下降摘要: 相对高度={:.2f}m 目标={:.2f}m 垂速={:.2f}m/s "
+                "S13a 下降摘要: 高度={:.2f}m@{} 目标={:.2f}m 垂速={:.2f}m/s "
                 "水平误差={:.2f}m 地速={:.2f}m/s 限速={:.2f}m/s 低空档={} "
-                "baro交叉校验={}",
-                geo->relative_alt_m, landing_.descend_target_ag_m,
+                "交叉校验={}",
+                geo->relative_alt_m,
+                common::HeightSourceText(geo->height_source),
+                landing_.descend_target_ag_m,
                 static_cast<double>(flight.vz_mps), geo->horizontal_m,
                 geo->ground_speed_mps, speed_limit, low_zone ? "是" : "否",
                 landing_baro_mismatch_latched_ ? "已锁存不一致" : "正常");
@@ -6029,7 +6175,8 @@ private:
         // 回滚开关 landing.enabled=false 时不产生任何降落位置意图（保持 2026-11
         // 之前的语义）；纯影子装配在建 S13b 前就因"命令接口未注入"返回，同样不发。
         if (landing_.enabled && !landing_handover_confirmed_) {
-            if (const auto geo = ComputeLandingGeometry(flight); geo.has_value()) {
+            if (const auto geo = ComputeLandingGeometry(flight, now_ms);
+                geo.has_value()) {
                 if (now_ms - landing_hold_intent_ms_ >=
                     kIntentRepublishIntervalMs) {
                     landing_hold_intent_ms_ = now_ms;
@@ -6103,6 +6250,52 @@ private:
                     TransitionTo(common::MissionState::kDisarmed,
                                  "PX4 已确认 landed + disarmed，任务结束");
                     return;
+                }
+                // 落地确认门禁（2026-11-18 P5）：PX4 报 landed，但**我们自己的高度
+                // 见证**说还悬着——先别 DISARM（上锁即砍推力，1~2 m 高度同样危险）。
+                // 矛盾持续超过 `landing.landed_agl_timeout` 才按 PX4 处置并打 ERROR，
+                // 避免雷达卡死时任务永远收不了尾。
+                // **能力边界**：这条只约束"我们是否认账并上锁"，拦不住 PX4 在
+                // AUTO.LAND 里自己的 land detector 决策（设计 §7 已写明）。
+                // 只在 radar.enabled 时生效：P5 之前没有独立高度见证，拿 EKF 自己
+                // 当见证等于自证——回滚开关必须让落地确认行为也回到旧路径。
+                if (radar_.enabled && landing_.landed_max_agl_m > 0.0) {
+                    const auto agl = common::AboveTakeoffM(
+                        flight, now_ms, radar_.ToGateParams());
+                    if (agl.has_value() &&
+                        agl->agl_m > landing_.landed_max_agl_m) {
+                        if (landing_landed_agl_block_since_ms_ == 0) {
+                            landing_landed_agl_block_since_ms_ = now_ms;
+                        }
+                        const uint64_t blocked_ms =
+                            ElapsedMs(now_ms, landing_landed_agl_block_since_ms_);
+                        if (blocked_ms < static_cast<uint64_t>(
+                                             landing_.landed_agl_timeout.count())) {
+                            const uint64_t count = ++landing_landed_agl_warn_count_;
+                            if (ShouldLogThrottled(count)) {
+                                SPDLOG_WARN(
+                                    "S13b 落地确认: PX4 报 landed，但高度见证（{}）为 "
+                                    "{:.2f}m > {:.2f}m，暂不发 DISARM（累计 {} 拍）",
+                                    common::HeightSourceText(agl->source),
+                                    agl->agl_m, landing_.landed_max_agl_m, count);
+                            }
+                            return;
+                        }
+                        if (!landing_landed_agl_overridden_) {
+                            landing_landed_agl_overridden_ = true;
+                            SPDLOG_ERROR(
+                                "S13b 落地确认: 矛盾已持续 {}ms（PX4 landed vs {}={:.2f}m "
+                                "> {:.2f}m），按 PX4 处置继续 DISARM；"
+                                "landing.landed_max_agl_m=0 可关闭该门禁",
+                                blocked_ms,
+                                common::HeightSourceText(agl->source),
+                                agl->agl_m, landing_.landed_max_agl_m);
+                        }
+                    } else {
+                        landing_landed_agl_block_since_ms_ = 0;
+                        landing_landed_agl_overridden_ = false;
+                        landing_landed_agl_warn_count_ = 0;
+                    }
                 }
                 if (command_sender_ == nullptr) {
                     if (!landing_command_unavailable_logged_) {
@@ -6235,6 +6428,11 @@ private:
                 landing_baro_mismatch_latched_ = false;
                 landing_intent_unusable_streak_ = 0;
                 landing_descent_timeout_warned_ = false;
+                // P5（2026-11-18）：高度源说明与落地确认门禁同样按段复位。
+                landing_height_source_logged_ = false;
+                landing_landed_agl_block_since_ms_ = 0;
+                landing_landed_agl_warn_count_ = 0;
+                landing_landed_agl_overridden_ = false;
                 landing_px4_reject_warned_ = false;
                 landing_intent_fail_count_ = 0;
                 landing_diag_last_ms_ = 0;
@@ -6599,6 +6797,9 @@ private:
     const config::MissionConfig mission_;
     /// 起飞前门禁配置（preflight_gate 节，2026-11-18 H 项；构造注入）。
     const config::PreflightGateConfig preflight_gate_;
+    /// 测距雷达配置（radar 节，2026-11-18 P5；构造注入）。高度出口的判据参数由
+    /// `radar_.ToGateParams()` 统一生成，避免高度出口与预检门禁各用一套阈值。
+    const config::RadarConfig radar_;
     /// 传感器健康锁存（`present & ~health` 的关键位持续掉线达 hold）。只在
     /// `EvaluatePreflightGate` 里更新，`ValidateAssignment` 只读。
     uint32_t preflight_sensor_unhealthy_mask_ = 0;
@@ -6614,6 +6815,10 @@ private:
     bool preflight_vibration_warned_ = false;
     bool preflight_vibration_blocked_ = false;
     double preflight_vibration_peak_mps2_ = 0.0;
+    /// 雷达预检门禁状态（radar 节，2026-11-18 P5）：与上面两组同构——由
+    /// `EvaluatePreflightGate` 每拍维护，`ValidateAssignment` 只读锁存。
+    uint64_t preflight_radar_unavailable_since_ms_ = 0;
+    bool preflight_radar_blocked_ = false;
     /// PX4 重启等待锁存（原子：决策线程写，测试/SITL 线程读）。置位期间 `Evaluate()`
     /// 早返回——不发任何控制意图与命令（246 重发除外），只维护 65013。
     std::atomic<bool> px4_reboot_pending_{false};
@@ -6749,6 +6954,13 @@ private:
     /// 保护 3（控制权保持）：连续"无法发布可用下降意图"的拍数。
     uint64_t landing_intent_unusable_streak_ = 0;
     bool landing_descent_timeout_warned_ = false;  ///< 超时告警只打一次
+    /// 高度源首次说明（P5）：每段降落只打一条"这次用的哪个高度源"。
+    bool landing_height_source_logged_ = false;
+    /// 落地确认门禁状态（P5 `landing.landed_max_agl_m`）：PX4 landed 与高度见证
+    /// 矛盾时的计时/告警计数/是否已按 PX4 处置放行。
+    uint64_t landing_landed_agl_block_since_ms_ = 0;
+    uint64_t landing_landed_agl_warn_count_ = 0;
+    bool landing_landed_agl_overridden_ = false;
     bool landing_px4_reject_warned_ = false;       ///< AUTO.LAND 非 0 ACK 告警只打一次
     uint64_t landing_intent_fail_count_ = 0;       ///< 下降意图停发累计（节流告警）
     uint64_t landing_diag_last_ms_ = 0;            ///< 1Hz 下降摘要节流

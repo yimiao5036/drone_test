@@ -119,9 +119,10 @@ TEST(ConfigTest, LoadsCurrentProductionConfiguration) {
     EXPECT_EQ(config.uvc_camera.fps, 30u);
     EXPECT_EQ(config.stereo_splitter.width, 2560u);
     EXPECT_EQ(config.stereo_splitter.height, 720u);
-    // 生产配置已切换 384x640 矩形输入模型（提交 cdde006）
+    // 生产配置已切换 384x640 矩形输入模型（提交 cdde006）；
+    // 2026-11-18 更新模型（提交 f18deb0）换成 yolo_v6_rk3588_2026_11_18.rknn
     EXPECT_EQ(config.yolo.model_path,
-              "/opt/drone/models/yolov26_ReLU6_09_13-rk3588_384_640.rknn");
+              "/opt/drone/models/yolo_v6_rk3588_2026_11_18.rknn");
     EXPECT_EQ(config.yolo.input_queue_capacity, 1u);
     EXPECT_EQ(config.yolo.npu_core_mode, "all");
     EXPECT_FALSE(config.yolo.collect_npu_internal_perf);
@@ -1458,6 +1459,128 @@ TEST(ConfigTest, LandingSlowZoneNotAboveTargetRejected) {
     EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
                  std::invalid_argument);
     std::filesystem::remove(path);
+}
+
+// 测距雷达（radar 节，2026-11-18 P5）：四个键都能覆盖成给定值；整节缺席时
+// 回退默认（enabled=false = 高度出口行为与 P5 之前逐位一致），并把配置映射成
+// 高度出口判据参数（`ToGateParams()`，避免各处各写一份阈值）。
+TEST(ConfigTest, RadarConfigParsesAllKeys) {
+    json defaults_json = ReadSourceConfig();
+    defaults_json.erase("radar");  // 整节缺席
+    const auto defaults_path =
+        WriteTemporaryConfig(defaults_json, "drone_config_radar_default.json");
+    const auto defaults =
+        drone::config::LoadAppConfig(defaults_path.string(), "/opt/drone");
+    EXPECT_FALSE(defaults.radar.enabled) << "硬件未到时默认不进高度链";
+    EXPECT_FALSE(defaults.radar.preflight_required);
+    EXPECT_EQ(defaults.radar.min_signal_quality, 30U);
+    EXPECT_EQ(defaults.radar.stale.count(), 200);
+    const auto default_gate = defaults.radar.ToGateParams();
+    EXPECT_FALSE(default_gate.enabled);
+    EXPECT_EQ(default_gate.min_signal_quality, 30U);
+    EXPECT_EQ(default_gate.stale_ms, 200U);
+    std::filesystem::remove(defaults_path);
+
+    json value = ReadSourceConfig();
+    value["radar"] = json::object();
+    value["radar"]["enabled"] = true;
+    value["radar"]["preflight_required"] = true;
+    value["radar"]["min_signal_quality"] = 45;
+    value["radar"]["stale_ms"] = 500;
+    const auto path = WriteTemporaryConfig(value, "drone_config_radar_parse.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_TRUE(config.radar.enabled);
+    EXPECT_TRUE(config.radar.preflight_required);
+    EXPECT_EQ(config.radar.min_signal_quality, 45U);
+    EXPECT_EQ(config.radar.stale.count(), 500);
+    const auto gate = config.radar.ToGateParams();
+    EXPECT_TRUE(gate.enabled);
+    EXPECT_EQ(gate.min_signal_quality, 45U);
+    EXPECT_EQ(gate.stale_ms, 500U)
+        << "stale(str::chrono) 必须映射成 RadarGateParams.stale_ms";
+    std::filesystem::remove(path);
+}
+
+// "只装雷达不进高度链"是没意义的组合：门禁拿它卡起飞，就必须真的在用。
+TEST(ConfigTest, RadarPreflightRequiredWithoutEnabledRejected) {
+    json value = ReadSourceConfig();
+    value["radar"] = json::object();
+    value["radar"]["preflight_required"] = true;  // enabled 保持默认 false
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_radar_preflight.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 质量门槛范围 [0,100]：1 是 MAVLink 的 invalid 专用值（单独拒绝），
+// 101 超百分比上限。101 必须先按 int 读再校验，否则塞进 uint8_t 会静默截断。
+TEST(ConfigTest, RadarSignalQualityOutOfRangeRejected) {
+    json one = ReadSourceConfig();
+    one["radar"] = json::object();
+    one["radar"]["min_signal_quality"] = 1;
+    const auto one_path =
+        WriteTemporaryConfig(one, "drone_config_radar_quality_one.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(one_path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(one_path);
+
+    json high = ReadSourceConfig();
+    high["radar"] = json::object();
+    high["radar"]["min_signal_quality"] = 101;
+    const auto high_path =
+        WriteTemporaryConfig(high, "drone_config_radar_quality_high.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(high_path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(high_path);
+}
+
+// 时效下限 50ms：填成 10ms 等于永远过期（超量程时驱动干脆不发数据，
+// 时效判据就是这条防线本身）。
+TEST(ConfigTest, RadarStaleTooSmallRejected) {
+    json value = ReadSourceConfig();
+    value["radar"] = json::object();
+    value["radar"]["enabled"] = true;
+    value["radar"]["stale_ms"] = 10;
+    const auto path = WriteTemporaryConfig(value, "drone_config_radar_stale.json");
+    EXPECT_THROW((void)drone::config::LoadAppConfig(path.string(), "/opt/drone"),
+                 std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+// 落地确认门禁（landing.landed_*，2026-11-18 P5）：默认 1.0m / 3000ms，
+// 显式覆盖生效；landed_max_agl_m=4.0 超上限 3.0（量级放到 3m 等于关掉门禁）→
+// 加载期拒绝。
+TEST(ConfigTest, LandingLandedGateParsesAndRejectsOutOfRange) {
+    json defaults_json = ReadSourceConfig();
+    defaults_json["landing"].erase("landed_max_agl_m");
+    defaults_json["landing"].erase("landed_agl_timeout_ms");
+    const auto defaults_path =
+        WriteTemporaryConfig(defaults_json, "drone_config_landed_default.json");
+    const auto defaults =
+        drone::config::LoadAppConfig(defaults_path.string(), "/opt/drone");
+    EXPECT_DOUBLE_EQ(defaults.landing.landed_max_agl_m, 1.0);
+    EXPECT_EQ(defaults.landing.landed_agl_timeout.count(), 3000);
+    std::filesystem::remove(defaults_path);
+
+    json value = ReadSourceConfig();
+    value["landing"]["landed_max_agl_m"] = 1.5;
+    value["landing"]["landed_agl_timeout_ms"] = 2500;
+    const auto path =
+        WriteTemporaryConfig(value, "drone_config_landed_parse.json");
+    const auto config = drone::config::LoadAppConfig(path.string(), "/opt/drone");
+    EXPECT_DOUBLE_EQ(config.landing.landed_max_agl_m, 1.5);
+    EXPECT_EQ(config.landing.landed_agl_timeout.count(), 2500);
+    std::filesystem::remove(path);
+
+    json too_high = ReadSourceConfig();
+    too_high["landing"]["landed_max_agl_m"] = 4.0;  // 上限 3.0
+    const auto too_high_path =
+        WriteTemporaryConfig(too_high, "drone_config_landed_high.json");
+    EXPECT_THROW(
+        (void)drone::config::LoadAppConfig(too_high_path.string(), "/opt/drone"),
+        std::invalid_argument);
+    std::filesystem::remove(too_high_path);
 }
 
 // 估计器降级判据（estimator_guard 节，2026-11-17 P3）：整节缺席时全部回退

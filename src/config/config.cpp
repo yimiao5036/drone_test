@@ -784,6 +784,18 @@ void LandingConfig::Validate() const {
         throw std::invalid_argument(
             "landing.baro_mismatch_m 必须大于 landing.handover_alt_tolerance_m");
     }
+    // 落地确认门禁（2026-11-18 P5）：0 = 关闭；上限 3 m——PX4 land detector 的量级
+    // 在 1 m 附近，门限放到 3 m 等于关掉它。
+    if (!std::isfinite(landed_max_agl_m) || landed_max_agl_m < 0.0 ||
+        landed_max_agl_m > 3.0) {
+        throw std::invalid_argument(
+            "landing.landed_max_agl_m 必须在 [0.0, 3.0]（0 = 关闭该门禁）");
+    }
+    // 兜底等待：太短会在正常触地瞬态里误放行，太长则雷达卡死时任务收不了尾。
+    if (landed_agl_timeout.count() < 500 || landed_agl_timeout.count() > 30000) {
+        throw std::invalid_argument(
+            "landing.landed_agl_timeout_ms 必须在 [500, 30000]");
+    }
 }
 
 void EstimatorGuardConfig::Validate() const {
@@ -907,6 +919,40 @@ void PreflightGateConfig::Validate() const {
             "preflight_gate.vibration_hold_ms 必须在 [100, 10000]");
     }
     // require_sensor_health 不校验：bool 本身只有两个值。
+}
+
+common::RadarGateParams RadarConfig::ToGateParams() const {
+    common::RadarGateParams gate;
+    gate.enabled = enabled;
+    gate.min_signal_quality = min_signal_quality;
+    gate.stale_ms = static_cast<uint64_t>(stale.count());
+    return gate;
+}
+
+void RadarConfig::Validate() const {
+    // 质量门槛：0 = 不做质量判据；1 是 MAVLink 的 invalid 专用值，写成门槛没有
+    // 意义（>=1 等于不设门槛），单独拒绝更容易发现填错；上限 100 是百分比。
+    if (min_signal_quality > 100) {
+        throw std::invalid_argument(
+            "radar.min_signal_quality 必须在 [0, 100]");
+    }
+    if (min_signal_quality == 1) {
+        throw std::invalid_argument(
+            "radar.min_signal_quality 不能用 1（1 是 MAVLink 的 invalid 专用值，"
+            "要关闭质量判据请填 0）");
+    }
+    // 时效：下限 50 ms 挡住"填成 5 ms 等于永远过期"，上限 2000 ms 挡住
+    // "填成 2000 ms 等于没有时效判据"——超量程时驱动干脆不发数据，
+    // 时效是这条防线本身（见 config.h 的 RadarConfig 说明）。
+    if (stale.count() < 50 || stale.count() > 2000) {
+        throw std::invalid_argument("radar.stale_ms 必须在 [50, 2000]");
+    }
+    // "只装雷达不进高度链"是没意义的组合：门禁拿它卡起飞，就必须真的在用。
+    if (preflight_required && !enabled) {
+        throw std::invalid_argument(
+            "radar.preflight_required=true 要求 radar.enabled=true"
+            "（雷达不在高度链里就不该拿它卡起飞）");
+    }
 }
 
 void FenceConfig::Validate() const {
@@ -1416,6 +1462,11 @@ AppConfig LoadAppConfig(const std::string& path,
         landing, "baro_mismatch_m", config.landing.baro_mismatch_m);
     config.landing.baro_mismatch_hold = ReadOptionalPositiveMilliseconds(
         landing, "baro_mismatch_hold_ms", config.landing.baro_mismatch_hold);
+    // 落地确认门禁（2026-11-18 P5）：0 表示关闭，必须用允许 0 的 helper。
+    config.landing.landed_max_agl_m = ReadOptionalNonNegativeDouble(
+        landing, "landed_max_agl_m", config.landing.landed_max_agl_m);
+    config.landing.landed_agl_timeout = ReadOptionalPositiveMilliseconds(
+        landing, "landed_agl_timeout_ms", config.landing.landed_agl_timeout);
     config.landing.Validate();
 
     // 估计器降级判据与处置（estimator_guard 节，2026-11-17 P3）：全部可选，
@@ -1498,6 +1549,27 @@ AppConfig LoadAppConfig(const std::string& path,
         preflight_gate, "vibration_hold_ms",
         config.preflight_gate.vibration_hold);
     config.preflight_gate.Validate();
+
+    // 测距雷达（radar 节，2026-11-18 P5 软件侧）：全部可选，缺席回退默认值
+    // （enabled=false = 高度出口行为与 P5 之前逐位一致）。硬件到位后只改配置，
+    // 不改代码；语义与两处对 PX4 源码的修正见 config.h 的 RadarConfig。
+    const json radar = root.value("radar", json::object());
+    config.radar.enabled = radar.value("enabled", config.radar.enabled);
+    config.radar.preflight_required =
+        radar.value("preflight_required", config.radar.preflight_required);
+    if (radar.contains("min_signal_quality")) {
+        // 先按 int 读再校验范围：直接往 uint8_t 里塞会静默截断，越界就查不出来了。
+        const int quality = radar.value(
+            "min_signal_quality", static_cast<int>(config.radar.min_signal_quality));
+        if (quality < 0 || quality > 100) {
+            throw std::invalid_argument(
+                "radar.min_signal_quality 必须在 [0, 100]");
+        }
+        config.radar.min_signal_quality = static_cast<uint8_t>(quality);
+    }
+    config.radar.stale = ReadOptionalPositiveMilliseconds(
+        radar, "stale_ms", config.radar.stale);
+    config.radar.Validate();
 
     // 自动起飞（takeoff 节，2026-10-22）：S3/S4 时序、到达判据与目标收口；
     // 全部可选，缺席回退默认值。低电门限不使用本地电量百分比，唯一来源是

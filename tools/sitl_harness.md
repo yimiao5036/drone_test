@@ -131,7 +131,8 @@ bash tools/sitl_harness.sh webgcs --port 5762    # 换端口
 
 环境变量（可选）：`PX4_DIR`（默认 `$HOME/PX4-Autopilot`）、`REPO`（默认脚本上级
 目录）、`LOG_DIR`（默认 `/tmp/sitl_harness`）、`SITL_GUI=1`（拉起 Gazebo 3D 图形界面，
-WSLg 下窗口直接出现在 Windows 桌面；默认 0 无界面）。
+WSLg 下窗口直接出现在 Windows 桌面；默认 0 无界面）、`PX4_GZ_MODEL`（gz 机体名，
+默认 `x500`）、`SITL_LIDAR=1`（雷达机体，等价 `PX4_GZ_MODEL=x500_lidar_down`，见 §4.2）。
 
 > `stack` 启动前会把 `build/config/zone.json` 移到 `$LOG_DIR` 备份：测试用例会把
 > 泸州测试区写进该缓存，与 SITL 的苏黎世 Home 冲突时会开机即判 `距边界=-8342817m`
@@ -152,6 +153,67 @@ python3 tools/assignment_sitl.py --connection /tmp/gcs_test \
   --aircraft-system 1 --aircraft-component 25 \
   --assignment-id 3 --target-id 7 --interceptor-type 25 --duration 45
 ```
+
+### 4.2 雷达模型（`SITL_LIDAR=1`，P5 雷达接入，2026-11-18）
+
+用 PX4 自带的下视激光雷达机体 `gz_x500_lidar_down`（ROMFS airframe
+`4016_gz_x500_lidar_down`，仿真模型 `x500_lidar_down` = x500 + LW20 `gpu_lidar`，
+量程 0.1~100 m、朝下）跑现有验收装置，验证「雷达 → PX4 → MAVLink
+`DISTANCE_SENSOR(132)` → 机载」这条数据链路。
+
+```bash
+# 等价写法，二选一（同时给出时以 PX4_GZ_MODEL 为准）
+SITL_LIDAR=1 bash tools/sitl_harness.sh stack
+PX4_GZ_MODEL=x500_lidar_down bash tools/sitl_harness.sh stack
+SITL_LIDAR=1 bash tools/sitl_harness.sh smoke --config config/px4_sitl.json --duration 60
+```
+
+**默认仍是 `gz_x500`**：不设这两个变量时，脚本执行的命令与设置的参数与 P5 之前
+完全一致（`set_lidar_params()` 内部按 `SITL_LIDAR_MODEL=0` 直接 return）。
+
+机体名的来路（PX4 既有机制，本脚本只给目标名）：`make px4_sitl gz_<模型>`（目标由
+`src/modules/simulation/gz_bridge/CMakeLists.txt:97~110` 从 `airframes/*_gz_*` 剥离
+`.*_gz_` 前缀生成）→ px4 按 `airframes/[0-9]+_gz_<模型>` 反查 `SYS_AUTOSTART=4016`
+（`ROMFS/px4fmu_common/init.d-posix/rcS:56`）→ `MODEL_NAME=${PX4_SIM_MODEL#*gz_}`
+交给 gz spawn（`px4-rc.gzsim:108~110`）。`Tools/simulation/gz/models/x500_lidar_down`
+已存在，**不需要改 PX4 任何文件**；机体名写错时装置会先报
+`PX4 里没有机体 gz_<名>`，不必等 make 的 `No rule to make target`。
+
+雷达机体下装置自动设置 4 个 PX4 参数（`param set`，名称/默认值/范围都在 PX4 源码里
+核对过；「文件:行号」指本机 `/root/PX4-Autopilot`，2026-11-18）：
+
+| 参数 | 设成 | 源码默认 | 取值范围 | 定义位置 | 为什么 |
+|---|---|---|---|---|---|
+| `SYS_HAS_NUM_DIST` | `1` | 0 | 0~4 | `src/lib/systemlib/system_params.c:241` | 不设 >0 时 commander 的 `distanceSensorChecks` 直接 return（`distanceSensorChecks.cpp:40~42`），缺测距也不会在 ARM 时被拒 |
+| `EKF2_RNG_CTRL` | `1` | 1 | 0/1/2 | `src/modules/ekf2/params_range_finder.yaml:5` | 条件融合；**不用 2**（2=始终融合，设计稿明确"先别上 2"） |
+| `EKF2_HGT_REF` | `1` | 1 | 0~3 | `src/modules/ekf2/module.yaml:87` | **1 是 GPS 不是 Baro**（0=Baro、2=Range sensor）；保持默认即保证雷达不作主基准 |
+| `EKF2_RNG_A_HMAX` | `10` | 5.0 | 1.0~**10.0** m | `src/modules/ekf2/params_range_finder.yaml:75` | 条件模式下超过该高度停融；设计稿写 12，但元数据上限是 10（`param set` 不校验范围，写 12 会存成元数据外的值），取上限 10 |
+
+> - 参数改完**不需要重启 PX4**：`param set` 触发 `parameter_update`，EKF2 在 `Run()`
+>   里 `updateParams()` 重读（`src/modules/ekf2/EKF2.cpp:445~451`）。
+> - **故意没设** `EKF2_RNG_A_VMAX`（默认 1.0 m/s）：条件模式下水平速度超过它也不融合，
+>   所以跑水平机动场景时雷达融合会时断时续——那是预期，不是链路故障。
+> - `SIM_GZ_EN_LIDAR` 默认 1（`src/modules/simulation/gz_bridge/parameters.c:52`），
+>   gz_bridge 本来就在发布 `distance_sensor`，无需设置。
+
+**验收看什么**（`px4_link_smoke` 报告里新增的 INFO 行）：
+
+```text
+[INFO] DISTANCE_SENSOR(132 测距) 收到 N 条      # 雷达机体应 N>0；默认机体应 N==0
+[INFO] DISTANCE_SENSOR 最近一帧: distance=… m orientation=25（25=ROTATION_PITCH_270 向下）
+[INFO] SYS_STATUS sensors_present=0x……（bit8=0x100 LASER_POSITION: 未置位）
+```
+
+- 这三条**只是 INFO、不参与 PASS/FAIL**：等 `radar.enabled` 打开后再升级成硬判据，
+  否则默认配置（`radar.enabled=false`）+ 默认无雷达机体会让既有基线凭空多一条 FAIL。
+- `sensors_present` 的 bit8（`MAV_SYS_STATUS_SENSOR_LASER_POSITION`，`0x100`）**本版
+  PX4 恒为 0**：`src/modules/mavlink/streams/SYS_STATUS.hpp:144~159` 的
+  `fillOutComponent()` 列表里没有 `health_component_t::distance_sensor`。所以
+  "PX4 有没有把测距当回事"只能看两件事：`SYS_HAS_NUM_DIST=1` 时缺测距是否拒绝解锁，
+  以及 `DISTANCE_SENSOR` 本身是否新鲜有效——**不要拿这个位做门禁**。
+- `DISTANCE_SENSOR.signal_quality` 是「无质量指标=0（未知）」而不是「质量差」：
+  gz_bridge 发布的驱动质量走 PX4 出口映射（驱动 `<0` → MAVLink 0，驱动 `==0` → 1
+  即 invalid），机载 `radar.min_signal_quality` 别把 0 判成不合格。
 
 ## 5. 日志与判读
 

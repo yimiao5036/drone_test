@@ -94,6 +94,10 @@
             {
                 "message_id": 241,
                 "interval_us": 1000000
+            },
+            {
+                "message_id": 132,
+                "interval_us": 100000
             }
         ],
         "serial": {
@@ -192,7 +196,9 @@
         "handover_hold_ms": 500,
         "descent_timeout_ms": 120000,
         "baro_mismatch_m": 1.5,
-        "baro_mismatch_hold_ms": 2000
+        "baro_mismatch_hold_ms": 2000,
+        "landed_max_agl_m": 1.0,
+        "landed_agl_timeout_ms": 3000
     },
     "estimator_guard": {
         "_comment": "估计器降级判据与处置（2026-11-17 降落与估计器保护 P3）。任一判据命中即锁存：切 POSCTL 悬停 + 停发一切控制意图 + 冻结任务推进，等飞手切 STABILIZED 接管（不自动降落/返航/上锁/重试切模式）。enabled=false 是唯一回滚开关：关掉后判据完全不跑。单拍跳变判据一帧即命中；持续型判据各自有 hold，local_position_stale_ms 是瞬时判据（不受 hold 保护）。critical_sensor_mask=0 表示用模块默认（陀螺|加速度计|磁罗盘|AHRS，不含 GPS）；bad_estimator_flag_mask=0 表示关闭该判据（位语义未与固件核对，见 include/state_machine/estimator_guard.md）。阈值只用于判据，不改变控制律；实机首轮先看日志里「估计器降级:」WARN 的判据/数值再定。",
@@ -217,6 +223,13 @@
         "vibration_warn_mps2": 20.0,
         "vibration_block_mps2": 0.0,
         "vibration_hold_ms": 1000
+    },
+    "radar": {
+        "_comment": "测距雷达（2026-11-18 P5 软件侧，硬件后到）。AboveTakeoffM() 是唯一取高度出口：有效雷达 AGL → 气压 AGL → EKF 差分逐级退化，无效读数绝不填 0/max_distance。enabled=false 是回滚开关（与 P5 之前逐位一致）；装雷达后 enabled 与 preflight_required 一起打开（Validate 拒绝 preflight_required=true 而 enabled=false）。两处与设计稿不同的实现口径（2026-11-18 核对 PX4 源码后修正）：①不能用 SYS_STATUS.LASER_POSITION 做门禁——本版 PX4 的 mavlink/streams/SYS_STATUS.hpp 根本不填 bit8，永远为 0；雷达门禁改为判 DISTANCE_SENSOR 是否在报数（common::RadarAlive：收到过且时效内，**不判量程**——落在地上的下视测距必然在盲区，TFmini-S 最小 0.4 m，拿量程有效当起飞门禁等于任何时刻都拒绝起飞），PX4 侧要求装测距由参数 SYS_HAS_NUM_DIST 管。②signal_quality 不能按『0=未知就算差』处理——PX4 把驱动 quality<0（TFmini 与 SITL 的 gz 雷达都是）映射成 0，把 quality==0 映射成 1（invalid）；0 是『没有质量指标』，1 才是无效，2~100 才受 min_signal_quality 约束。超量程时 PX4 的 TFmini 驱动干脆不再发布本消息，所以 stale_ms 是超量程的主要防线。",
+        "enabled": false,
+        "preflight_required": false,
+        "min_signal_quality": 30,
+        "stale_ms": 200
     },
     "mission": {
         "_comment": "任务级重置动作（2026-11-17 降落与估计器保护 P4b）。65020 type=2 的语义从「只清状态」改为「清任务状态 + 重启 PX4」：受理后发 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246) param1=1，状态机切 S1 SELF_CHECK 等飞控回来（心跳 + GPS fix + 全局位置 + Home）再走常规 S1→S2。重启期间不发任何 setpoint/命令（246 重试除外），PX4 冷启动约 15~30 s；到 reboot_timeout_ms 仍无遥测则保持 S1 + ERROR + 65013 告警位 bit10（不自动重启机载程序）。reset_reboot_px4=false 是唯一回滚开关（旧语义：只清状态直接回 S2，老地面站连新机载时用）。**重启治标不治本**：罗盘失效、Z 轴振动、EKF 参数问题重启后会再次出现，这只是把飞控恢复到已知初始状态，不修复硬件。",

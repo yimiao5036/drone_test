@@ -53,6 +53,13 @@
             "summary_log_interval_ms": 10000
         }
     },
+    "radar": {
+        "_comment": "测距雷达（2026-11-18 P5 软件侧，硬件后到）。AboveTakeoffM() 是唯一取高度出口：有效雷达 AGL → 气压 AGL → EKF 差分逐级退化，无效读数绝不填 0/max_distance。enabled=false 是回滚开关（与 P5 之前逐位一致）；装雷达后 enabled 与 preflight_required 一起打开（Validate 拒绝 preflight_required=true 而 enabled=false）。两处与设计稿不同的实现口径（2026-11-18 核对 PX4 源码后修正）：①不能用 SYS_STATUS.LASER_POSITION 做门禁——本版 PX4 的 mavlink/streams/SYS_STATUS.hpp 根本不填 bit8，永远为 0；雷达门禁改为判 DISTANCE_SENSOR 是否在报数（common::RadarAlive：收到过且时效内，**不判量程**——落在地上的下视测距必然在盲区，TFmini-S 最小 0.4 m，拿量程有效当起飞门禁等于任何时刻都拒绝起飞），PX4 侧要求装测距由参数 SYS_HAS_NUM_DIST 管。②signal_quality 不能按『0=未知就算差』处理——PX4 把驱动 quality<0（TFmini 与 SITL 的 gz 雷达都是）映射成 0，把 quality==0 映射成 1（invalid）；0 是『没有质量指标』，1 才是无效，2~100 才受 min_signal_quality 约束。超量程时 PX4 的 TFmini 驱动干脆不再发布本消息，所以 stale_ms 是超量程的主要防线。",
+        "enabled": false,
+        "preflight_required": false,
+        "min_signal_quality": 30,
+        "stale_ms": 200
+    },
     "px4": {
         "transport": "udp",
         "onboard_system_id": 1,
@@ -83,7 +90,8 @@
             {"message_id": 49, "interval_us": 1000000},
             {"message_id": 141, "interval_us": 200000},
             {"message_id": 230, "interval_us": 1000000},
-            {"message_id": 241, "interval_us": 1000000}
+            {"message_id": 241, "interval_us": 1000000},
+            {"message_id": 132, "interval_us": 100000}
         ],
         "serial": {
             "device": "/dev/ttyS1",

@@ -84,6 +84,33 @@ guard.Reset();                        // 重置任务状态 / 程序重启时清
   `third_party` 里是"置位=该路可用"的旧语义，部分固件用另一套位定义）。宁可
   少判，也不能用错极性误报；位掩码由 config 打开前必须先实机核对。
 
+### 为什么关键传感器掩码里**没有** `LASER_POSITION`（2026-11-18 P5）
+
+设计稿 P5 曾计划"给 `EstimatorGuard` 的关键传感器掩码加 `MAV_SYS_STATUS_SENSOR_LASER_POSITION`
+（bit8=0x100）"。**2026-11-18 核对 PX4 源码后否决**，两条理由都写在这里，避免以后有人
+"补上"：
+
+1. **那个位在本版 PX4 永远不置位**。`src/modules/mavlink/streams/SYS_STATUS.hpp` 的
+   `fillOutComponent()` 只填 battery / motors_escs / parachute / accel / gyro / mag /
+   gps / rc / attitude_estimation / local_position_estimate / AHRS / logging /
+   pressure 这些组件，**没有 `distance_sensor`**。把它加进 `critical_sensor_mask`
+   是死代码：`present & ~health` 里永远不含这一位，判据永远不会命中。
+   （同一原因，起飞前门禁也不用这个位，改判 `DISTANCE_SENSOR` 是否在报数——
+   `common::RadarAlive()`；PX4 侧"是否要求装测距"由参数 `SYS_HAS_NUM_DIST` 管。）
+2. **飞行中雷达掉数据不该判"估计器降级"**。这是**设计内的安全方向**，不是故障：
+   `radar.enabled=true` 时高度出口是"雷达 AGL → 气压 AGL → EKF 差分"逐级退化，
+   雷达过期/超量程就退到气压（气压不被 EKF 坐标重置平移），再退到 EKF 差分——
+   判据要回答的问题是"估计还能不能信"，而"雷达没数据"并不让 EKF 变得更不可信。
+   把降级锁存打上去反而会**冻结任务、停发控制、不降落**，比继续用气压降落危险得多。
+   同理 65013 的 `bit13 雷达不可用`只在**地面待命 + `radar.preflight_required=true`**
+   期间置位，飞行中雷达掉数据不置位。
+
+**那"雷达坏了"由谁兜？** 三层：①高度出口逐级退化（气压/EKF 仍在）；
+②`EstimatorGuard` 已有的**气压 AGL vs EKF 相对高度**交叉校验（`kBaroDivergence`）
+仍能抓到"EKF 高度被重置而气压平滑"这类真问题；③S13a 保护 1 的对照源随在用高度源切换，
+用气压时照样对照 EKF 差分。P5 的落地确认门禁（`landing.landed_max_agl_m`）则负责
+"PX4 说落地了但高度见证说还悬着"这一条。
+
 ## 4. 日志行为
 
 模块本身**不打日志**（纯判据，便于单测）。日志全部在状态机侧（2026-11-17 P3 起）：

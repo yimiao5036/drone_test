@@ -163,6 +163,10 @@ void DroneApplication::BuildComponents() {
         // 是硬门禁（受理 65014 时拒绝），振动默认只告警（block=0）。判据全部取自
         // P1 已订阅的遥测（SYS_STATUS 健康位 + VIBRATION），不新增链路。
         state_machine_config.preflight_gate = config_.preflight_gate;
+        // 测距雷达（radar 节，2026-11-18 P5）整节同源注入：`AboveTakeoffM()` 的
+        // 判据参数（质量门槛/时效）与预检门禁共用同一份配置，避免两处各写一套。
+        // 硬件未到位时 enabled=false，高度出口行为与 P5 之前逐位一致。
+        state_machine_config.radar = config_.radar;
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;

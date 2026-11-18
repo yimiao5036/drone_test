@@ -1138,12 +1138,21 @@ private:
         }
     }
 
-    // 测距传感器（DISTANCE_SENSOR，132）：P5 装雷达后才参与判据，本期只解析。
+    // 测距传感器（DISTANCE_SENSOR，132）：P5 雷达（2026-11-18 起进入单一高度出口）。
+    // 除既有字段外补 `signal_quality` 与到达时刻：高度出口要判"质量 + 时效"，
+    // 且**超量程时 PX4 的 TFmini 驱动干脆不再发布本消息**（`TFMINI.cpp` 里
+    // `distance_m<0` 直接 `-EAGAIN`），所以"没新数据"本身就是超量程的主要表现。
     void HandleDistanceSensor(const mavlink_message_t& message,
                               uint64_t now_ms) {
-        (void)now_ms;
         mavlink_distance_sensor_t sensor{};
         mavlink_msg_distance_sensor_decode(&message, &sensor);
+        // 多路测距实例时只保留下视那一路：已有下视读数后，其它朝向不再覆盖
+        // （P5 只用向下测距，高度出口也会按 orientation 再判一次）。
+        if (state_.distance_time_valid &&
+            state_.distance_orientation == common::kDistanceOrientationDownward &&
+            sensor.orientation != common::kDistanceOrientationDownward) {
+            return;
+        }
         state_.distance_min_m = static_cast<float>(sensor.min_distance) / 100.f;
         state_.distance_max_m = static_cast<float>(sensor.max_distance) / 100.f;
         state_.distance_type = sensor.type;
@@ -1153,6 +1162,10 @@ private:
             sensor.current_distance != std::numeric_limits<uint16_t>::max() &&
             sensor.current_distance != 0;
         state_.distance_m = static_cast<float>(sensor.current_distance) / 100.f;
+        // 编码见 types.h：0=未知（驱动没有质量指标）、1=invalid、2~100=质量百分比。
+        state_.distance_signal_quality = sensor.signal_quality;
+        state_.distance_time_valid = true;
+        state_.distance_time_ms = now_ms;
     }
 
     // 电池状态：累加各电芯电压求总压，仅处理动力电池 id=0。

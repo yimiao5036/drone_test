@@ -665,6 +665,21 @@ if(BUILD_TESTING)
         include(GoogleTest)
         gtest_discover_tests(config_test)
 
+        # 单一高度出口纯类型测试（2026-11-18 P5）：AboveTakeoffM() 的退化链
+        # （雷达 AGL → 气压 AGL → EKF 差分）、RadarAglM() 的各类拒绝原因与
+        # RadarAlive()（起飞前门禁判据）的时效边界。
+        add_executable(height_source_test tests/common/height_source_test.cpp)
+        target_link_libraries(height_source_test PRIVATE
+            drone_common GTest::gtest_main)
+        if(MSVC)
+            target_compile_options(height_source_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(height_source_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+
+        include(GoogleTest)
+        gtest_discover_tests(height_source_test)
+
         # YOLO 后处理纯函数测试：量化解码、NMS、letterbox 逆变换（开发机可跑）
         add_executable(yolo_postprocess_test tests/perception/yolo_postprocess_test.cpp)
         target_link_libraries(yolo_postprocess_test PRIVATE

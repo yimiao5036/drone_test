@@ -120,6 +120,12 @@ struct MissionStateMachineConfig {
     /// `kSensorUnhealthy`）与**振动指标**（默认只告警；`vibration_block_mps2>0`
     /// 才拒绝 → `kVibrationHigh`）。语义与"为什么振动不硬卡"见 `PreflightGateConfig`。
     config::PreflightGateConfig preflight_gate;
+    /// 测距雷达（radar 配置节，2026-11-18 P5 软件侧）：`common::AboveTakeoffM()`
+    /// 是唯一取高度出口（雷达 AGL → 气压 AGL → EKF 差分），S13a 交段判据与
+    /// S13b 落地确认都走它；`preflight_required=true` 时受理 65014 前还要求
+    /// `DISTANCE_SENSOR` 有新鲜有效读数（`kRadarUnavailable`）。
+    /// `enabled=false` 是回滚开关：高度出口行为与 P5 之前逐位一致（硬件未到时默认）。
+    config::RadarConfig radar;
     /// 多边形围栏（fence 配置节，2026-10-29）：机载自治围栏——区域缓存装载、
     /// 越界判定与中止、位置意图钳制。默认关闭（回退 Home 圆形围栏）。
     config::FenceConfig fence;

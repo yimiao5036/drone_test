@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "common/types.h"
 #include "communication/ground_station_link.h"
 #include "communication/px4_link.h"
 #include "control/approach_speed_law.h"
@@ -275,6 +276,16 @@ struct LandingConfig {
     /// 且持续 `baro_mismatch_hold`，立即交 PX4（不再硬降到 1.2 m）。
     double baro_mismatch_m = 1.5;
     std::chrono::milliseconds baro_mismatch_hold{2000};
+    /// 落地确认门禁（2026-11-18 P5）：PX4 报 `landed` 且**仍上锁**时，要求单一高度
+    /// 出口（`AboveTakeoffM()`）给出的离地高度 ≤ 本值，才认账并发 DISARM。
+    /// 背景：事故形态是"EKF 高度被重置 → land detector 误判已落地 → 砍推力"，
+    /// 在 2 m 高度上锁与砍推力同样危险，所以落地确认也必须有独立高度见证。
+    /// 0 = 不做该判据。**能力边界**：它只能约束"我们是否认账并上锁"，
+    /// 拦不住 PX4 自己在 AUTO.LAND 里做的 land detector 决策。
+    double landed_max_agl_m = 1.0;
+    /// 上面这条门禁的兜底等待：PX4 报 landed 但与高度见证矛盾超过该时长，
+    /// 仍按 PX4 处置（打 ERROR 说明矛盾），避免雷达卡死时任务永远收不了尾。
+    std::chrono::milliseconds landed_agl_timeout{3000};
     void Validate() const;
 };
 
@@ -395,6 +406,49 @@ struct PreflightGateConfig {
     double vibration_block_mps2 = 0.0;
     /// 振动超阈值需要持续的时长（防单帧尖峰误告警）。
     std::chrono::milliseconds vibration_hold{1000};
+    void Validate() const;
+};
+
+/// 测距雷达（radar 节，2026-11-18 降落与估计器保护 P5 软件侧）。
+///
+/// 背景：本次事故的决定性因素是"高度量混淆"——EKF z 被重置约 9 m，而气压平滑。
+/// 装下视雷达后，低空多了一个**完全不经 EKF** 的物理量（离地距离），S13a 交段
+/// 判据与落地确认都改用它；`common::AboveTakeoffM()` 是唯一取高度出口，
+/// 退化链为 雷达 AGL → 气压 AGL → EKF 差分（见 `include/common/types.h`）。
+///
+/// **软件侧先落地、硬件后到**：`enabled=false` 时高度出口行为与 P5 之前逐位一致，
+/// 所以本配置节可以先随固件发出去，等雷达到位只改配置 + 接线上电。
+///
+/// 两条与设计稿不同的实现口径（2026-11-18 核对 PX4 源码后修正，见设计文档 §7）：
+/// 1. **不能用 `SYS_STATUS.LASER_POSITION` 做门禁**：本版 PX4 的
+///    `mavlink/streams/SYS_STATUS.hpp` 只填 battery/motors/parachute/accel/gyro/
+///    mag/gps/rc/attitude/local_position/AHRS/logging/pressure 这些组件，
+///    `MAV_SYS_STATUS_SENSOR_LASER_POSITION(bit8=0x100)` **永远不置位**。
+///    因此雷达门禁改为判"`DISTANCE_SENSOR` 是否有新鲜有效读数"（自己算），
+///    并把"PX4 侧是否要求装测距"交给 PX4 参数 `SYS_HAS_NUM_DIST`。
+/// 2. **`signal_quality` 不能按"0=未知就算差"处理**：PX4 的 DISTANCE_SENSOR 出口
+///    把驱动的 `quality<0`（TFmini 与 SITL 的 gz 雷达都是）映射成 MAVLink 0，
+///    把 `quality==0` 映射成 1（invalid）。0 是"没有质量指标"，1 才是无效，
+///    2~100 才参与 `min_signal_quality` 门槛。
+struct RadarConfig {
+    /// 高度源是否使用雷达（回滚开关）。false = 完全保持 P5 之前的行为。
+    bool enabled = false;
+    /// 起飞前是否**硬要求**雷达在报数（受理 65014 前判，拒绝走 `kRadarUnavailable`）。
+    /// 判据是 `common::RadarAlive()`——"收到过且时效内"，**不判读数量程**：
+    /// 落在地上的下视测距必然在盲区（TFmini-S 最小 0.4 m），拿量程有效当起飞门禁
+    /// 等于任何时刻都拒绝起飞。要求 `enabled=true` 才有意义（`Validate()` 会拒绝
+    /// "只装雷达不进高度链"这种组合）。
+    bool preflight_required = false;
+    /// 信号质量门槛（2~100 的实测百分比）。0 = 不做质量判据。
+    /// 默认 30 是保守起点：TFmini 不给质量（恒 0=未知，不受该值约束），
+    /// 一旦换到给质量的器件，首轮先看日志里的实测值再调整（设计 §7 待实测 #1）。
+    uint8_t min_signal_quality = 30;
+    /// 数据时效上限（ms）：PX4 的 TFmini 驱动在超量程/无回波时**干脆不发布**
+    /// `distance_sensor`（`TFMINI.cpp` 里 `distance_m<0` 直接 `-EAGAIN`），
+    /// 所以"没新数据"就是"超量程"的主要表现，时效判据是超量程的主要防线。
+    std::chrono::milliseconds stale{200};
+    /// 把本配置映射成高度出口的判据参数（单一入口，避免各处各写一份阈值）。
+    common::RadarGateParams ToGateParams() const;
     void Validate() const;
 };
 
@@ -538,6 +592,7 @@ struct AppConfig {
     EstimatorGuardConfig estimator_guard;              ///< 估计器降级判据与处置（2026-11-17 P3）
     MissionConfig mission;                  ///< 65020 重置 = 清状态 + 重启 PX4（2026-11-17 P4b）
     PreflightGateConfig preflight_gate;     ///< 起飞前门禁：传感器健康 + 振动（2026-11-18 H 项）
+    RadarConfig radar;                       ///< 测距雷达：单一高度出口 + 预检门禁（2026-11-18 P5）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
     FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
     ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）

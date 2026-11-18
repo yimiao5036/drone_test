@@ -7100,6 +7100,11 @@ int RunStage4Tune(drone::communication::Px4Link& link, const std::string& config
     // 重置 = 清状态 + 重启 PX4（2026-11-17 P4b）：mission 节同源加载，工具侧的
     // 重置专项断言（S1→S2 回退必须早于 reboot_timeout）与状态机实际行为同源。
     mission_config.mission = app.mission;
+    // 起飞前门禁（2026-11-18 H 项）与测距雷达（2026-11-18 P5）整节同源加载：
+    // 少了这两行，工具装配会一直跑"门禁全关 + 雷达不进高度链"，配置里改开关
+    // 在 SITL 里看不出任何差别（2026-11-18 发现并补齐）。
+    mission_config.preflight_gate = app.preflight_gate;
+    mission_config.radar = app.radar;
     // 围栏：65018 专项必须显式启用，且不落盘（只验证在线下发与钳制）；其余剧本关闭。
     mission_config.fence = app.fence;
     if (tune_script == TuneScript::kFenceViolation ||
@@ -7409,6 +7414,10 @@ int RunStage4Mission(drone::communication::Px4Link& link, const std::string& con
     // 降落两段（2026-11-17 P2）：本工具是控制装配，S13 走 S13a→S13b
     // （语义同上一处装配注释）。
     mission_config.landing = app.landing;
+    // 起飞前门禁（H 项）与测距雷达（P5）同样整节同源加载；缺了它们，配置里的
+    // 开关在 SITL 里毫无差别（2026-11-18 补齐）。
+    mission_config.preflight_gate = app.preflight_gate;
+    mission_config.radar = app.radar;
     // 围栏（2026-10-29）：圆形兜底删除后，G3 的"围栏外目标被钳制"证据改由
     // 多边形承担——启用围栏并让状态机按 fence.default_* 以 Home 为中心生成
     // kMissionFenceRadiusM 的默认方形区域，控制器据此钳制位置意图。
@@ -8562,6 +8571,40 @@ int main(int argc, char** argv) {
         // STATUSTEXT 是事件式（PX4 只在有话说时发），0 条不算失败。
         std::cout << "[INFO] STATUSTEXT(253 文本告警) 收到 "
                   << link.MessageReceiveCount(MAVLINK_MSG_ID_STATUSTEXT) << " 条"
+                  << std::endl;
+        // 测距雷达（DISTANCE_SENSOR，132，P5「雷达接入」软件侧探针，2026-11-18）：
+        // 这里**只打 INFO 计数、不做硬性 PASS/FAIL**——等 `config.radar.enabled`
+        // 打开（并配套雷达机体）后再升级为 PASS/FAIL 检查。现在不能硬判的原因：
+        // 默认配置 radar.enabled=false 且默认机体 gz_x500 没有雷达，加硬性判据会让
+        // 既有验收基线凭空多一条 FAIL。
+        // 期望：雷达机体（SITL_LIDAR=1 → gz_x500_lidar_down）N>0，默认机体 N==0。
+        // PX4 侧链路：gz 的 LW20 gpu_lidar（量程 0.1~100 m、朝下）→ gz_bridge 的
+        // laserScantoLidarSensorCallback 直接发布 distance_sensor
+        // （orientation=ROTATION_DOWNWARD_FACING=25，无质量指标时 signal_quality=0）
+        // → MAVLink DISTANCE_SENSOR(132)。
+        std::cout << "[INFO] DISTANCE_SENSOR(132 测距) 收到 "
+                  << link.MessageReceiveCount(MAVLINK_MSG_ID_DISTANCE_SENSOR) << " 条"
+                  << std::endl;
+        // 最近一帧的距离/朝向（有数据时才打）：链路通时这里应给出"米 + 25(向下)"；
+        // 朝向不是 25 说明装了别的雷达模型或模型姿态与设计不符。
+        if (latest.distance_valid) {
+            std::cout << "[INFO] DISTANCE_SENSOR 最近一帧: distance=" << latest.distance_m
+                      << " m orientation=" << static_cast<int>(latest.distance_orientation)
+                      << "（25=ROTATION_PITCH_270 向下）" << std::endl;
+        }
+        // SYS_STATUS 原始位图（十六进制）：核对 MAV_SYS_STATUS_SENSOR_LASER_POSITION
+        // (bit8=0x100) 到底有没有被 PX4 置位。**结论：本版 PX4 永远不置位**——
+        // src/modules/mavlink/streams/SYS_STATUS.hpp:144~159 的 fillOutComponent 列表里
+        // 没有 health_component_t::distance_sensor，所以即使 SYS_HAS_NUM_DIST=1 且
+        // distance_sensor 正常发布，bit8 也恒为 0；雷达门禁只能判 DISTANCE_SENSOR
+        // 本身是否新鲜有效，不能用这个位（与 include/config/config.h 的 RadarConfig
+        // 注释一致）。
+        // 读法：SYS_STATUS 一条都没收到时这里也是 0，先看上面 SYS_STATUS/BATTERY_STATUS
+        // 的计数；有计数还恒缺 bit8，就是上面说的"PX4 不填这个位"，不是雷达没起来。
+        const uint32_t sensors_present = latest.sensors_present;
+        std::cout << "[INFO] SYS_STATUS sensors_present=0x" << std::hex << sensors_present
+                  << std::dec << "（bit8=0x100 LASER_POSITION: "
+                  << ((sensors_present & 0x100u) != 0 ? "已置位" : "未置位") << "）"
                   << std::endl;
         PrintMessageCheck("RC_CHANNELS",
                           link.MessageReceiveCount(MAVLINK_MSG_ID_RC_CHANNELS),

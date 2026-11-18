@@ -394,6 +394,18 @@ S14 落地上锁补 `completed`、S16 任务故障补 `rejected/mission_fault`�
 [`../config/配置管理.md`](../config/配置管理.md)「preflight_gate」，判据与 PX4 预检的分工见
 [`../../docs/状态机设计.md`](../../docs/状态机设计.md) §6.6。
 
+**测距雷达与单一高度出口（2026-11-18 P5 软件侧；硬件后到）**：装下视雷达后，低空多了一个
+**完全不经 EKF** 的物理量（离地距离）。本模块所有"相对高度"读数统一走
+`common::AboveTakeoffM()`（`include/common/types.h`）：`radar.enabled=false` 时**只用 EKF
+差分**（与 P5 之前逐位一致）；`true` 时按 **雷达 AGL → 气压 AGL → EKF 差分**逐级退化，
+三路都不可用则返回 `nullopt`、**绝不填 0 或 `max_distance`**。使用点是 S13a 交段判据与
+保护 1/2、S13b 落地确认。另有两处门禁：`radar.preflight_required=true` 时受理 65014 前
+要求雷达**在报数**（收到过 `DISTANCE_SENSOR` 且时效 ≤ `radar.stale_ms`，**不判量程**——
+地面上本来就在盲区），否则回 `reason=25 kRadarUnavailable` + 65013 **bit13**；
+`landing.landed_max_agl_m>0` 且 `radar.enabled=true` 时，PX4 报 `landed` 仍要求独立高度见证
+≤ 该值才发 DISARM。配置与回滚见 [`../config/配置管理.md`](../config/配置管理.md)「radar」，
+设计口径见 [`../../docs/状态机设计.md`](../../docs/状态机设计.md) §6.7。
+
 ## 接口与数据流
 
 ```cpp
@@ -422,6 +434,11 @@ struct MissionStateMachineConfig {
                                                       // require_sensor_health/sensor_health_hold_ms/
                                                       // vibration_warn_mps2/vibration_block_mps2/
                                                       // vibration_hold_ms；构造期 Validate() fail-fast
+    config::RadarConfig radar;                        // 测距雷达（radar 节同源，2026-11-18 P5）：
+                                                      // enabled/preflight_required/min_signal_quality/
+                                                      // stale_ms；高度出口判据由 ToGateParams() 统一生成，
+                                                      // 构造期 Validate() fail-fast（含 preflight_required
+                                                      // 必须搭配 enabled 的组合校验）
     uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
@@ -496,6 +513,11 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 `MissionStateMachineConfig::preflight_gate`（`config::PreflightGateConfig`），构造期调
 `PreflightGateConfig::Validate()` 兜底（与 landing/estimator_guard/mission 同一先例：
 程序化构造的非法值 fail-fast）。
+测距雷达（2026-11-18 P5）同样**整节注入**：`config_.radar` →
+`MissionStateMachineConfig::radar`（`config::RadarConfig`），构造期调
+`RadarConfig::Validate()` 兜底。高度出口的判据参数一律由 `radar_.ToGateParams()` 生成，
+**不在 S13a/S13b/预检门禁各写一套阈值**；`radar_.enabled=false`（硬件未到位时的默认）
+让高度出口行为与 P5 之前逐位一致。
 
 **接线现状**：`DroneApplication` **已接线**——估计器/视觉稳定性/双目测距三者同时装配时
 调用`SetEstimationInputs`（缺一不绑定，状态机不发布 S5 意图）；估计器存在时注入
@@ -1027,24 +1049,40 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
       !landing_takeover_`。命令接口是否注入就是"能不能发控制"的唯一事实依据
       （生产只在 `enable_control=true` 时注入），**不另设装配门禁字段**，也不在
       状态机内重复判断 `enable_control`。
-    - **几何口径**：相对高度 = `RelativeAltitudeBaseZ() − local_z`（HOME_POSITION.z 优先、
-      退化到起飞快照，再退化到 `HomeLocalNed().down_m`），与围栏/65011/S12 同一出口，
-      水位不另写一套（P5 装雷达只改这个出口的内部实现）。
+    - **几何口径**（2026-11-18 P5 起改为**单一高度出口**）：决策用高度 =
+      `common::AboveTakeoffM()`（`include/common/types.h`）——`radar.enabled=false` 时等价于
+      旧的 EKF 差分（`RelativeAltitudeBaseZ() − local_z`，基准 HOME_POSITION.z 优先、退化到
+      起飞快照、再退化到 `HomeLocalNed().down_m`，**与 P5 之前逐位一致**），
+      `=true` 时为 **雷达 AGL → 气压 AGL → EKF 差分**逐级退化；三条都不可用则本函数返回
+      `nullopt`、按保护 3 计数（**绝不用 0 代替**）。`ComputeLandingGeometry()` 额外把
+      EKF 差分留一份（`ekf_relative_alt_m`）供交叉校验，并记下本次用的 `HeightSource` 与
+      雷达未被采用的原因（`RadarRejectReason`）。**口径差异**：雷达是"离地"，气压/EKF 是
+      "离起飞点"，地形起伏处本来就有差（交叉校验门限要给地形差留余量）。
     - **交段判据**：相对高度 ≤ `descend_target_ag_m + handover_alt_tolerance_m`(0.15)
       且 `|vz| ≤ handover_vz_mps`(0.2) 且 `水平误差 ≤ handover_horizontal_m`(0.5)，
-      连续保持 `handover_hold`(500ms)。
+      连续保持 `handover_hold`(500ms)。判据里的"相对高度"就是上面那个**决策高度**。
     - **三条保护（缺一不可，设计 §4.5）**：
-      ① **高度源交叉校验**：`BaroAboveTakeoffM()`（气压 AGL，不被 EKF 重置平移）与 EKF
-      相对高度之差 > `baro_mismatch_m`(1.5m) 持续 `baro_mismatch_hold`(2s) → 锁存 + WARN +
-      立即交 S13b（**不硬降到 1.2m**）；
+      ① **高度源交叉校验**：**对照源随"正在用的高度源"变**（2026-11-18 P5）——用雷达时
+      对照气压 AGL（同为"离地"口径，最贴近同一物理量；气压不可用则退 EKF 差分），
+      用气压时对照 EKF 差分（专抓 EKF 高度重置），用 EKF（含 `radar.enabled=false` 的旧
+      路径）时对照气压 AGL（**P2 原逻辑，必须逐位保留**）。两者之差 > `baro_mismatch_m`(1.5m)
+      持续 `baro_mismatch_hold`(2s) → 锁存 + WARN + 立即交 S13b（**不硬降到 1.2m**）；
+      没有可用对照源时跳过（不冒充证据）；
       ② **低空水平漂移**：相对高度 ≤ `descend_slow_zone_m`(3m) 且（水平误差 > 1.0m 或地速
       > 0.5m/s）→ 立即交 S13b（宁可让 PX4 落，也不在 1m 高度画圈）；这两个门限是冻结值，
       不进配置（`kLandingLowAltitudeDriftM` / `kLandingLowAltitudeDriftSpeedMps`）；
       ③ **控制权保持**：每拍必须能发布可用意图。`FlightController` 没有回执通道，
       因此把"被拒"落到本模块**能看见**的不可用条件上：无局部位置 / 无高度基准 /
-      无 Home 水平目标 / Home 落在围栏外（控制器会 `ClampIntoPolygon` 把落点带偏）。
-      连续 `kLandingIntentUnusableFrames`(10 拍 = 1s) 不可用 → 交 S13b，途中按
-      `ShouldLogThrottled` 记累计计数。
+      **单一高度出口三条都不可用** / 无 Home 水平目标 / Home 落在围栏外（控制器会
+      `ClampIntoPolygon` 把落点带偏）。连续 `kLandingIntentUnusableFrames`(10 拍 = 1s)
+      不可用 → 交 S13b，途中按 `ShouldLogThrottled` 记累计计数。
+    - **落地确认门禁（2026-11-18 P5，仅 `radar.enabled=true` 生效）**：PX4 报 `landed` 且
+      **仍上锁**时，要求单一高度出口的离地高度 ≤ `landing.landed_max_agl_m`（默认 1.0m，
+      0=关闭）才认账并发 DISARM；矛盾持续超过 `landing.landed_agl_timeout_ms`（默认 3000ms）
+      则**按 PX4 处置**继续 DISARM 并打一条 ERROR（避免雷达卡死时任务永远收不了尾）。
+      **能力边界**：这条只约束"我们是否认账并上锁"，**拦不住** PX4 在 `AUTO.LAND` 里自己的
+      land detector 决策（它判已落地就砍推力）。**为什么只在 `radar.enabled=true` 时生效**：
+      P5 之前没有独立高度见证，拿 EKF 自己当见证等于自证。
     - **兜底**：`landing.descent_timeout`(120s) 到点即交 S13b（27m 按 0.8m/s 约 33s）；
       控制权被抢（PX4 离开 Offboard 且非 AUTO.LAND）沿用 `landing_takeover_ = true`，
       只等落地、不抢回控制权。
@@ -1056,7 +1094,8 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   - **S13/S14 收口**：落地后若仍 armed 发 `MAV_CMD_COMPONENT_ARM_DISARM`（0）；确认
     disarmed → S14。正常返航不使用 PX4 自动 RTL；PX4 已接管则只监控 landed/disarmed。
   - **配置**：`MissionStateMachineConfig::landing`（`config::LandingConfig`，`landing` 节，
-    12 个 key；`enabled=false` 是回滚开关），构造期 `LandingConfig::Validate()` 兜底。
+    14 个 key，其中 `landed_max_agl_m`/`landed_agl_timeout_ms` 为 P5 落地确认门禁用；
+    `enabled=false` 是回滚开关），构造期 `LandingConfig::Validate()` 兜底。
   - **配置**：`MissionStateMachineConfig::return_home`（`config::ReturnHomeConfig`，
     默认 `enabled=true`；`interception`/`return_home` 两节已接入 JSON 加载）。
     捕网执行器隔离用例显式 `enabled=false`。
@@ -1097,6 +1136,19 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   | 构造期 | INFO 一行打印生效阈值：`起飞前门禁: 传感器健康=启用（hold=..ms，关键位=陀螺\|加速度计\|磁罗盘\|AHRS） 振动告警=..m/s² 阻断=..m/s²（0=只告警不阻断） hold=..ms` |
   | 边界（抓不到什么） | **抓不到"未校准"**（校准状态不是 `SYS_STATUS` 健康位），也抓不到磁强/磁倾角异常（PX4 的 `COM_ARM_MAG_STR` / `EKF2_MAG_CHK_*` 校核没有复刻）。这两类仍由 PX4 在 ARM 时拒绝，本模块负责把 `STATUSTEXT` 打出来 |
   | 回滚 | `preflight_gate.require_sensor_health=false`（传感器判据完全不跑）/ `vibration_block_mps2=0`（振动回到只告警）；改配置重启生效 |
+- **雷达预检门禁与 65013 bit13（2026-11-18 P5）**：与 H 项同构——`EvaluatePreflightGate()`
+  里多评估一条，`ValidateAssignment()` 只读锁存：
+
+  | 项 | 实现事实 |
+  |---|---|
+  | 判据 | `radar.preflight_required=true` 时判 `common::RadarAlive(flight, now_ms, radar.stale_ms)`：**收到过** `DISTANCE_SENSOR(132)` 且距上次到达 ≤ `radar.stale_ms`（默认 200ms）。**不判量程、不判质量**——落在地上的下视测距必然在盲区（TFmini-S 最小 0.4m，装机后离地 0.1~0.2m），拿"读数量程有效"当起飞门禁等于任何时刻都拒绝起飞；与 PX4 `distanceSensorChecks`（topic 存在 + 时间戳 1s 内）口径一致 |
+  | 锁存 | 不报数持续 `preflight_gate.sensor_health_hold_ms`（默认 1s，复用同一 hold）→ `preflight_radar_blocked_`；恢复报数即清零并打 INFO「雷达恢复报数，允许接受任务分配」。`ResetSortieState()` 一并清 `preflight_radar_*`（锁存不跨任务轮次） |
+  | 出手 | 受理 65014 时若已锁存 → 65015 `reason=25 kRadarUnavailable`（WARN `任务指令（分配预检）: 雷达持续不报数（已≥…ms），拒绝分配（kRadarUnavailable）`）；锁存期间 65013 置 **bit13**（8192） |
+  | 不出手的场景 | **飞行中雷达掉数据不置 bit13、不冻结任务**：那时高度出口已按设计退化到气压/EKF，属安全方向而不是故障（这也正是 `EstimatorGuard` 的传感器掩码里**没有** `LASER_POSITION` 的原因，见 [`estimator_guard.md`](estimator_guard.md) §3） |
+  | 与 `RadarAglM` 的分工 | 量程/方向/质量/过期是**高度出口**层的拒绝原因（`RadarRejectReason`，日志 `S13a 高度源: … 原因=…`），只影响"这次下降用哪路高度"，**不会拒绝任务分配** |
+  | 不做 | 不用 `SYS_STATUS.LASER_POSITION`(bit8=0x100) 做门禁——本版 PX4 的 `mavlink/streams/SYS_STATUS.hpp` 的 `fillOutComponent()` 组件列表里没有 `distance_sensor`，该位永远不置位。PX4 侧"是否要求装测距"由参数 `SYS_HAS_NUM_DIST` 管（>0 时缺测距 PX4 自己在 ARM 时拒绝） |
+  | 构造期 | INFO 一行：`测距雷达: 启用/关闭（…）（高度源=… signal_quality门槛=…（0=不判） 时效>…ms 预检门禁=…）` |
+  | 回滚 | `radar.preflight_required=false`（不再拿雷达卡起飞）或 `radar.enabled=false`（连高度出口一起回到 P5 之前）；改配置重启生效 |
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
 - `SeedAcceptedAssignmentForTest`（2026-10-28 增）为测试入口：把给定分配写进
   `assignment_tracker_`/`RememberResult(kAccepted)`/`accepted_assignment_`，并在
@@ -1145,26 +1197,40 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   判读：`剖面=cruise` 且地速≈指令上限 → 正常；`剖面=decel` 持续出现 → 超速回落
   （追不上转返航进入）；`剖面=accel` 但地速不涨 → 查逆风/机体限幅。
 
-降落两段（2026-11-17 P2）：
+降落两段（2026-11-17 P2；2026-11-18 P5 起高度源改为单一高度出口、S13b 增加落地确认门禁）：
 
 - INFO：构造期 `降落两段配置: 启用（S13a 机载下降 → S13b 交 PX4 AUTO.LAND）/关闭（…）`
   + 全部阈值一行（现场核配置不必再翻 JSON）；
 - INFO：进入 S13 时 `S13a 机载受控下降开始: 交段相对高度=..m 主降速=../s 低速档=..(≤..m) 超时=..ms`，
   随后 `降落阶段: S13a … / 发 AUTO.LAND（4/6）/ PX4 已接管…`；
 - INFO：S13a 每 1s 一行
-  `S13a 下降摘要: 相对高度=..m 目标=..m 垂速=..m/s 水平误差=..m 地速=..m/s 限速=..m/s 低空档=是/否 baro交叉校验=正常/已锁存不一致`；
-- INFO：`S13a 交段判据满足（相对高度=..m 垂速=..m/s 水平误差=..m 保持=..ms），发 AUTO.LAND（4/6）交 PX4`、
+  `S13a 下降摘要: 高度=..m@<高度源> 目标=..m 垂速=..m/s 水平误差=..m 地速=..m/s 限速=..m/s 低空档=是/否 交叉校验=正常/已锁存不一致`；
+  `<高度源>` 取 `雷达AGL`/`气压AGL`/`EKF差分`（`common::HeightSourceText()`）；
+- INFO（**每段降落一条**，`landing_height_source_logged_`；仅 `radar.enabled=true` 时打）：
+  `S13a 高度源: 雷达AGL（1.84m）`；没用上雷达时
+  `S13a 高度源: 气压AGL（2.10m）——雷达未用上，原因=测距数据过期；这是设计内的逐级退化，不是故障`
+  ——**这是"为什么这次没用雷达"的唯一出口**（原因取自 `RadarRejectReason`：雷达未启用 /
+  未收到测距数据 / 测距数据过期 / 本帧无有效测量 / 超出量程 / 信号无效 /
+  信号质量低于门槛 / 不是向下安装）；
+- INFO：`S13a 交段判据满足（高度=..m@<高度源> 垂速=..m/s 水平误差=..m 保持=..ms），发 AUTO.LAND（4/6）交 PX4`、
   `S13b AUTO.LAND 命令已入队（下降已交 PX4）`、`S13 交段确认: PX4 已接管降落（AUTO.LAND），停止发布 intent…`、
   `S13a→S13b: PX4 已在 AUTO.LAND（4/6），停止发布下降意图`；
 - WARN：三条保护与兜底各一条（都是安全事件，逐条不节流）：
   `S13a 跳过: Home 水平目标不在围栏区域内…`、
-  `S13a 高度源交叉校验失败: EKF相对高度=..m 气压AGL=..m 偏差=..m 持续..ms（门限../..）`、
+  `S13a 高度源交叉校验失败: <在用源>=..m <对照源>=..m 偏差=..m 持续..ms（门限../..），立即交 PX4`
+  （对照源随在用高度源切换：雷达↔气压、气压↔EKF、EKF↔气压）、
   `S13a 低空水平漂移: 相对高度=..m 水平误差=..m 地速=../s（门限 1.0m / 0.5m/s）`、
   `S13a 下降超时（..ms，相对高度仍有 ..m）`、
   `S13a 连续 .. 拍无法发布下降意图`、
   `S13a PX4 已离开 Offboard 且非 AUTO.LAND（mode=../..），停止下降与命令重试`、
   `PX4 拒绝 AUTO.LAND（DO_SET_MODE result=..）`（首次一条）；
 - WARN（节流）：`S13a 下降意图停发: 局部位置/高度基准/Home 水平目标不可用（连续 .. 拍）累计=..`。
+- WARN（落地确认门禁，节流，**仅 `radar.enabled=true` 且 `landed_max_agl_m>0`**）：
+  `S13b 落地确认: PX4 报 landed，但高度见证（雷达AGL）为 1.83m > 1.00m，暂不发 DISARM（累计 N 拍）`
+  ——PX4 说已落地、独立高度见证说还悬着，先别上锁（上锁即砍推力）；
+- ERROR（同一条门禁的兜底，**一条**）：矛盾持续超过 `landing.landed_agl_timeout_ms`（默认 3000ms）
+  后按 PX4 处置继续 DISARM：
+  `S13b 落地确认: 矛盾已持续 3010ms（PX4 landed vs 雷达AGL=1.83m > 1.00m），按 PX4 处置继续 DISARM；landing.landed_max_agl_m=0 可关闭该门禁`。
 
 估计器降级处置（2026-11-17 P3；判据模块 `EstimatorGuard` 本身**不打日志**，日志全部在状态机侧）：
 
@@ -1209,6 +1275,21 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - WARN（ARM 被拒，每次中止一条；有 `STATUSTEXT` 时再补一条）：
   `自动起飞中止: reason=6 detail=400 ARM ACK 非 ACCEPTED（PX4 预检/健康检查未通过） airborne=0 uncertain=0`
   与 `自动起飞中止: PX4 最近告警文本（severity=…）: Preflight Fail: Compass 1 uncalibrated`。
+
+测距雷达（2026-11-18 P5；相同的"能不能起飞/降错高度"级别，**不节流**）：
+
+- INFO（构造期一行，现场确认 `radar` 节生效以它为准）：
+  `测距雷达: 关闭（回滚开关 radar.enabled=false：只剩气压/EKF）（高度源=只用 EKF差分（气压只做交叉校验） signal_quality门槛=30（0=不判） 时效>200ms 预检门禁=关（不拿雷达卡起飞））`；
+  `enabled=true` 时首字段为 `启用（高度出口优先用雷达 AGL）`、高度源为
+  `雷达AGL → 气压AGL → EKF差分`。
+- WARN（**一条**，`preflight_radar_warned_` 节流）：
+  `起飞前门禁: 雷达未报数（观察 1000ms；判据=收到过 DISTANCE_SENSOR 且时效≤200ms，不判量程——地面上本来就在盲区）`。
+- ERROR（**锁存时一条**）：
+  `起飞前门禁: 雷达持续不报数（≥1000ms）→ 拒绝新的任务分配（65015 reason=25 kRadarUnavailable）。检查：接线/供电、PX4 驱动是否起来（dmesg/distance_sensor 实例）、SYS_HAS_NUM_DIST；radar.preflight_required=false 可关掉该门禁`。
+- INFO（恢复时一条）：`起飞前门禁: 雷达恢复报数，允许接受任务分配`。
+- WARN（受理 65014 时的拒绝原因）：`任务指令（分配预检）: 雷达持续不报数（已≥1000ms），拒绝分配（kRadarUnavailable）`。
+- 注意：**量程/质量不产生任何门禁日志**——它们只出现在 `S13a 高度源: … 原因=…` 里，
+  说明"这次下降为什么没用雷达"，不会拒绝任务分配。
 
 人工指令相关（2026-10-29）：
 - INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
@@ -1465,6 +1546,39 @@ ctest --test-dir build --output-on-failure
   ./build/mission_state_machine_test --gtest_filter='*PreflightGate_*'
   ```
 
+- 测距雷达（2026-11-18 P5；`MissionStateMachineTest.Radar_*` / `Landing_*Evidence*` /
+  `PreflightGate_Radar*`，快照 helper `MakeRadarLandingFlight()` 在
+  `MakeReturnHomeFlight` 基线之上补齐单一高度出口所需字段——**雷达帧时间戳取当前单调时钟**，
+  否则会立即被判"测距数据过期"而测不出想测的分支）：
+  - `Radar_DescentHandoverUsesRadarAglNotEkf`：构造"EKF 说 5.0m、雷达与气压都说 1.2m"的分歧
+    快照 → **必须走交段**（若还在吃 EKF 则永远不交段）；
+  - `Radar_OutOfRangeFallsBackToBaroAndCrossChecks`：雷达帧停在 5 s 前（`distance_time_valid`
+    仍为真、age ≫ `stale_ms`）→ 退到气压 AGL 并**继续发布下降意图**（不停发、不误交段）；
+    过期/超量程在机载侧的唯一表现就是"没有新帧"，这条用例把它钉死；
+  - `Landing_HigherThanEvidenceDoesNotDisarmImmediately`：S13b 中 PX4 报 `landed` 且仍
+    armed，雷达高度见证 2.0m > `landed_max_agl_m`(1.0m) → **不发 DISARM**（先不上锁）；
+  - `Landing_DisarmsWhenEvidenceAgrees`：同样 `landed`+仍上锁，但见证 0.6m ≤ 1.0m →
+    认账并发 DISARM；
+  - `PreflightGate_RadarRequiredRejectsWhenNoReading`：`radar.preflight_required=true` 且
+    持续没有 `DISTANCE_SENSOR` → hold 后 65013 bit13（8192）亮、65014 回
+    `rejected/kRadarUnavailable(25)`、**保持 S2 READY、零落飞控命令**；
+  - `PreflightGate_RadarReadingRecoversAccepts`：先建立拒绝锁存，再持续发布新鲜雷达帧
+    （**刻意用盲区内的越界读数** 0.05m < min 0.4m）→ 锁存解除、65014 正常受理——这条正是
+    "只判在报数、不判量程"的回归证据。
+  只跑这一组：
+
+  ```bash
+  ctest --test-dir build -R 'Radar_|PreflightGate_Radar|Landing_.*Evidence' --output-on-failure
+  ./build/mission_state_machine_test --gtest_filter='*Radar_*:*PreflightGate_Radar*:*Evidence*'
+  ```
+
+  纯类型层的退化链/拒绝原因由独立目标 `height_source_test` 覆盖（不启线程、不依赖状态机）：
+
+  ```bash
+  ctest --test-dir build -R height_source --output-on-failure
+  ./build/height_source_test
+  ```
+
 - S9/S10 入口（2026-10-19；`MakeInterceptEntryTestConfig` 开启
   `interception.enabled=true`、`enter_s9_lock_frames=3`、窗口 2~12m、自动授权）：
   - `InterceptEntryLockAndRangeThenFiresAndReturns`：强制 S7 + 连续 LOCKED
@@ -1665,6 +1779,30 @@ ctest --test-dir build --output-on-failure
   `PX4 拒绝 AUTO.LAND（DO_SET_MODE result=..）`），或 PX4 还没切到 4/6。
   此期间状态机**仍在发保持意图**（不推进下降），不会掉进 Offboard 丢失兜底；
   先查 PX4 侧模式切换是否被拒（如 `COM_DISARM_LAND`/land detector 状态）。
+- **65015 `reason=25 kRadarUnavailable`（雷达不报数）**：先看构造期 `测距雷达:` 一行确认
+  `预检门禁=硬判`（即 `radar.preflight_required=true`），再按顺序查：①`DISTANCE_SENSOR`
+  到底有没有到（`px4_link_smoke` 的 `DISTANCE_SENSOR(132 测距) 收到 N 条`、或机载日志里
+  `S13a 高度源` 是否出现过 `雷达AGL`）；②PX4 侧驱动是否起来（`dmesg`、`distance_sensor`
+  实例、`SYS_HAS_NUM_DIST`）；③接线/供电/串口。**判据不含量程**——落在地下视测距本来就在
+  盲区（TFmini-S 最小 0.4m，装机后离地 0.1~0.2m），所以"地面上读数很小/无读数"是正常的，
+  只要 `DISTANCE_SENSOR` 在按 10Hz 到达就算"在报数"。复现：`SITL_LIDAR=1 bash
+  tools/sitl_harness.sh stack`（有雷达）对 `bash tools/sitl_harness.sh stack`（默认机体，
+  无雷达 → 应拒绝分配）。回滚：`radar.preflight_required=false`。
+- **S13a 用了气压/EKF 而没用雷达**：看那条 `S13a 高度源: …——雷达未用上，原因=…`。常见原因
+  与对应查法：`测距数据过期`（超量程/无回波时 PX4 的 TFmini 驱动干脆不发布，查距离是否
+  超出 0.4~12m、`radar.stale_ms` 是否被调小）、`不是向下安装`（orientation 必须是 25）、
+  `信号质量低于门槛`（`min_signal_quality` 与实测值；不给质量的雷达恒 0=未知，不受约束）、
+  `超出量程`、`未收到测距数据`（`radar.enabled` 关了？链路没订上 132？）。
+  **这是设计内的逐级退化，不是故障**——雷达没了退气压、再退 EKF，不会中断降落。
+- **S13b 迟迟不发 DISARM / 一直停在 `kLanding`**（`radar.enabled=true` 时）：先看
+  `S13b 落地确认: PX4 报 landed，但高度见证（…）=…m > …m，暂不发 DISARM`——说明 PX4 的
+  land detector 说已落地，而我们的独立高度见证（首选雷达 AGL）说还悬着（典型是雷达卡在某个
+  读数、或地形/安装偏差让 AGL 偏大）。矛盾超过 `landing.landed_agl_timeout_ms`（默认 3000ms）
+  会按 PX4 处置继续 DISARM 并打 ERROR，不会永久卡住。要临时绕过：`landing.landed_max_agl_m=0`
+  （关掉该门禁）。**注意能力边界**：这条拦不住 PX4 自己在 `AUTO.LAND` 里判落地砍推力。
+- **飞行中雷达掉数据，65013 bit13 却不亮**：这是设计——bit13 只在**地面待命 + 预检期间**
+  置位；飞行中高度出口退化到气压/EKF 是安全方向，不是故障（见
+  [`estimator_guard.md`](estimator_guard.md)「为什么不加 LASER_POSITION」）。
 - **降落后想回到"直接 AUTO.LAND"**：`landing.enabled=false`（回滚开关，重启生效）。
   只读运行（未注入命令接口）本来就发不出降落意图，自然等于旧路径。
 - **日志出现 `估计器降级:` 但飞机没换模式**：先看这条 WARN 的 `模式命令=`——
