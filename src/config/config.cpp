@@ -874,6 +874,41 @@ void MissionConfig::Validate() const {
     // reset_reboot_px4 不校验：bool 本身只有两个值，false 是合法回滚语义。
 }
 
+void PreflightGateConfig::Validate() const {
+    // 起飞前门禁（H 项，2026-11-18）：这几个值都会直接决定"能不能起飞"，
+    // 填错一个数量级要么恒拒绝（禁飞）、要么恒放行（等于没做），必须 fail-fast。
+    if (sensor_health_hold.count() < 100 ||
+        sensor_health_hold.count() > 10000) {
+        throw std::invalid_argument(
+            "preflight_gate.sensor_health_hold_ms 必须在 [100, 10000]");
+    }
+    // 振动阈值：0 是合法语义（告警关 / 阻断关），所以下限是 0；上限 100 m/s²
+    // 只挡"明显填错"（PX4 里 vibration_z 是加速度计高频指标，几十就已很糟）。
+    if (!std::isfinite(vibration_warn_mps2) || vibration_warn_mps2 < 0.0 ||
+        vibration_warn_mps2 > 100.0) {
+        throw std::invalid_argument(
+            "preflight_gate.vibration_warn_mps2 必须在 [0, 100]");
+    }
+    if (!std::isfinite(vibration_block_mps2) || vibration_block_mps2 < 0.0 ||
+        vibration_block_mps2 > 100.0) {
+        throw std::invalid_argument(
+            "preflight_gate.vibration_block_mps2 必须在 [0, 100]");
+    }
+    // 阻断阈值必须高于告警阈值，否则"告警线"永远被阻断线遮住；
+    // 等于 0 表示不阻断，此时不做该比较。
+    if (vibration_block_mps2 > 0.0 && vibration_warn_mps2 > 0.0 &&
+        vibration_block_mps2 <= vibration_warn_mps2) {
+        throw std::invalid_argument(
+            "preflight_gate.vibration_block_mps2 必须大于 vibration_warn_mps2"
+            "（阻断线要高于告警线）");
+    }
+    if (vibration_hold.count() < 100 || vibration_hold.count() > 10000) {
+        throw std::invalid_argument(
+            "preflight_gate.vibration_hold_ms 必须在 [100, 10000]");
+    }
+    // require_sensor_health 不校验：bool 本身只有两个值。
+}
+
 void FenceConfig::Validate() const {
     if (zone_cache_path.empty()) {
         throw std::invalid_argument("fence.zone_cache_path 不能为空");
@@ -1441,6 +1476,28 @@ AppConfig LoadAppConfig(const std::string& path,
     config.mission.reboot_min_interval = ReadOptionalPositiveMilliseconds(
         mission, "reboot_min_interval_ms", config.mission.reboot_min_interval);
     config.mission.Validate();
+
+    // 起飞前门禁（preflight_gate 节，2026-11-18 H 项）：全部可选，缺席回退默认值。
+    // 语义见 config.h 的 PreflightGateConfig：传感器健康是硬门禁（受理 65014 时拒绝），
+    // 振动默认只告警（vibration_block_mps2=0 表示不阻断）。
+    const json preflight_gate =
+        root.value("preflight_gate", json::object());
+    config.preflight_gate.require_sensor_health = preflight_gate.value(
+        "require_sensor_health", config.preflight_gate.require_sensor_health);
+    config.preflight_gate.sensor_health_hold = ReadOptionalPositiveMilliseconds(
+        preflight_gate, "sensor_health_hold_ms",
+        config.preflight_gate.sensor_health_hold);
+    // 振动阈值允许 0（=关闭该档），必须用允许 0 的 helper。
+    config.preflight_gate.vibration_warn_mps2 = ReadOptionalNonNegativeDouble(
+        preflight_gate, "vibration_warn_mps2",
+        config.preflight_gate.vibration_warn_mps2);
+    config.preflight_gate.vibration_block_mps2 = ReadOptionalNonNegativeDouble(
+        preflight_gate, "vibration_block_mps2",
+        config.preflight_gate.vibration_block_mps2);
+    config.preflight_gate.vibration_hold = ReadOptionalPositiveMilliseconds(
+        preflight_gate, "vibration_hold_ms",
+        config.preflight_gate.vibration_hold);
+    config.preflight_gate.Validate();
 
     // 自动起飞（takeoff 节，2026-10-22）：S3/S4 时序、到达判据与目标收口；
     // 全部可选，缺席回退默认值。低电门限不使用本地电量百分比，唯一来源是

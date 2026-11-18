@@ -358,6 +358,46 @@ struct MissionConfig {
     void Validate() const;
 };
 
+/// 起飞前门禁（preflight_gate 节，2026-11-18 维护者裁决 H 项）。
+///
+/// 背景：2026-11-17 的事故源头是**罗盘 #1 失效 + 高振动**（`振动 5.24 m/s²`）。
+/// P3 的 `EstimatorGuard` 只在**飞行中**兜底（判据命中 → 切 POSCTL 冻结）；
+/// 地面这一层之前没有任何门禁——PX4 拒绝解锁时我们只会等 `arm_timeout` 再回
+/// `kArmTimeout`，把"罗盘没校准"报成"解锁超时"。
+///
+/// 本门禁**只作用于 65014 任务分配预检**（不阻断 S1→S2，联调不受影响）：
+/// - 传感器健康：`SYS_STATUS` 里 `present` 置位但 `health` 清零的关键位
+///   （陀螺/加速度计/磁罗盘/AHRS）持续 `sensor_health_hold` → 拒绝分配
+///   （`kSensorUnhealthy`）。能抓"缺磁/无数据/磁故障"；**抓不到"未校准"**
+///   （校准状态不是健康位），那类仍由 PX4 在 ARM 时拒绝 + 我们把
+///   `STATUSTEXT` 原样打进日志。
+/// - 振动：**维护者 2026-11-18 裁决只告警、不默认阻断**。理由：PX4 自身
+///   `HealthAndArmingChecks` 里没有振动项（不是 PX4 门禁）；常引用的 30 m/s²
+///   出自 ArduPilot 文档；事故当天 `5.24` 远低于 30，卡它反而误禁飞。
+///   `vibration_block_mps2 > 0` 时才真的拒绝（`kVibrationHigh`）。
+///
+/// 指标口径（不要当成加速度 RMS）：`VIBRATION` 的 `vibration_x/y/z` 在 PX4 里分别是
+/// 陀螺锥动 / 陀螺高频 / **加速度计高频**指标，见 `VIBRATION.hpp`；只有 `z`（accel）
+/// 参与本门禁阈值比较。三个量都**不来自磁力计**——所以"振动伤罗盘"这个说法不成立，
+/// 振动真正伤的是加速度计与 EKF 姿态/速度。
+struct PreflightGateConfig {
+    /// 传感器健康门禁总开关。false = 回到 2026-11-17 之前（不做任何地面预检）。
+    bool require_sensor_health = true;
+    /// 关键传感器（陀螺|加速度计|磁罗盘|AHRS）健康位持续掉线多久才拒绝分配。
+    /// 取 1 s 与 `EstimatorGuard` 的飞行中判据同量级，避免上电瞬间的抖动误拒。
+    std::chrono::milliseconds sensor_health_hold{1000};
+    /// 振动告警阈值（m/s²，`VIBRATION.vibration_z` 加速度计高频指标）。
+    /// 默认 20：事故当天 5.24 与之相比仍有明显余量，又不至于等到 ArduPilot 的
+    /// 30 才提示。0 = 关闭告警。
+    double vibration_warn_mps2 = 20.0;
+    /// 振动**阻断**阈值（m/s²）。**默认 0 = 不阻断**（维护者裁决）；设 >0 才启用。
+    /// 启用后的取舍：宁可地面拒飞，也不要带着高振动去飞 EKF。
+    double vibration_block_mps2 = 0.0;
+    /// 振动超阈值需要持续的时长（防单帧尖峰误告警）。
+    std::chrono::milliseconds vibration_hold{1000};
+    void Validate() const;
+};
+
 /// 多边形围栏（fence 节，2026-10-29）。
 /// 区域由地面站 65018 下发（机载缓存 `fence.zone_cache_path`），机载自治执行：
 /// 越界判定 + 位置意图钳制 + 越界中止（与电池守卫共用中止入口）。
@@ -497,6 +537,7 @@ struct AppConfig {
     LandingConfig landing;              ///< S13 拆两段（2026-11-17 P2）
     EstimatorGuardConfig estimator_guard;              ///< 估计器降级判据与处置（2026-11-17 P3）
     MissionConfig mission;                  ///< 65020 重置 = 清状态 + 重启 PX4（2026-11-17 P4b）
+    PreflightGateConfig preflight_gate;     ///< 起飞前门禁：传感器健康 + 振动（2026-11-18 H 项）
     TakeoffConfig takeoff;              ///< S3/S4 自动起飞时序（2026-10-22）
     FenceConfig fence;                  ///< 多边形围栏（2026-10-29）
     ApproachConfig approach;            ///< S5/S6 接近段速率与预测（2026-11-02）

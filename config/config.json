@@ -210,6 +210,14 @@
         "critical_sensor_mask": 0,
         "bad_estimator_flag_mask": 0
     },
+    "preflight_gate": {
+        "_comment": "起飞前门禁（2026-11-18 H 项，维护者裁决）。只作用于 65014 任务分配预检：关键传感器（陀螺|加速度计|磁罗盘|AHRS）的 SYS_STATUS 健康位持续 sensor_health_hold_ms 掉线 → 拒绝分配（65015 reason=23 kSensorUnhealthy）。振动只告警不阻断：VIBRATION.vibration_z 是【加速度计高频指标】(m/s/s)，超过 vibration_warn_mps2 打 WARN + 65013 bit12；vibration_block_mps2>0 时才真的拒绝（reason=24 kVibrationHigh）。注意：VIBRATION 三个字段都不来自磁力计（x=陀螺锥动、y=陀螺高频、z=加速度计高频），所以振动不会污染罗盘；振动真正伤的是加速度计与 EKF 姿态/速度。PX4 自身没有振动 arming 门禁，常引用的 30 m/s² 出自ArduPilot 文档，事故当天为 5.24。罗盘方面本门禁只能抓『缺磁/无数据/磁故障』（健康位），抓不到『未校准』——那类由 PX4 在 ARM 时拒绝，我们把 STATUSTEXT 打进日志。",
+        "require_sensor_health": true,
+        "sensor_health_hold_ms": 1000,
+        "vibration_warn_mps2": 20.0,
+        "vibration_block_mps2": 0.0,
+        "vibration_hold_ms": 1000
+    },
     "mission": {
         "_comment": "任务级重置动作（2026-11-17 降落与估计器保护 P4b）。65020 type=2 的语义从「只清状态」改为「清任务状态 + 重启 PX4」：受理后发 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246) param1=1，状态机切 S1 SELF_CHECK 等飞控回来（心跳 + GPS fix + 全局位置 + Home）再走常规 S1→S2。重启期间不发任何 setpoint/命令（246 重试除外），PX4 冷启动约 15~30 s；到 reboot_timeout_ms 仍无遥测则保持 S1 + ERROR + 65013 告警位 bit10（不自动重启机载程序）。reset_reboot_px4=false 是唯一回滚开关（旧语义：只清状态直接回 S2，老地面站连新机载时用）。**重启治标不治本**：罗盘失效、Z 轴振动、EKF 参数问题重启后会再次出现，这只是把飞控恢复到已知初始状态，不修复硬件。",
         "reset_reboot_px4": true,

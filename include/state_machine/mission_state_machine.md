@@ -381,6 +381,19 @@ S14 落地上锁补 `completed`、S16 任务故障补 `rejected/mission_fault`�
 `command_id`、同 `type`**，地面站按 `command_id` 更新同一条记录；`type=2`（重置）受理当拍
 即离开进行中，没有第二条。机制与判读见「关键实现点」的「延迟终态回执」段。
 
+**起飞前门禁（2026-11-18 H 项）**：本模块在**受理 65014 之前**校验"这架飞机现在能不能起飞"——
+关键传感器（陀螺/加速度计/磁罗盘/AHRS）的 `SYS_STATUS` 健康位持续掉线 → 拒绝分配
+（65015 `reason=23 kSensorUnhealthy` + 65013 **bit11**）；振动 `VIBRATION.vibration_z`
+超告警阈值 → 只 WARN + 65013 **bit12**，**默认不阻断**（维护者 2026-11-18 裁决；
+`preflight_gate.vibration_block_mps2>0` 才拒绝 `reason=24 kVibrationHigh`）。门禁**只在
+地面待命态评估、只作用于受理 65014**，不阻断 S1→S2，也不接管飞行中的传感器退化（那是 P3
+`EstimatorGuard` 的职责）。另：`400 ARM_DISARM` 被 PX4 拒绝时回 `kPreflightFailed(6)`
+（不再错报 `kArmTimeout(9)`），并把 PX4 的 `STATUSTEXT` 打进日志。**明确不做**：抓不到
+"未校准"（不是健康位）、没有 `SYS_STATUS` 时不做断言（跳过并 WARN 一次）、不做振动阻断的
+默认开启。配置与回滚见
+[`../config/配置管理.md`](../config/配置管理.md)「preflight_gate」，判据与 PX4 预检的分工见
+[`../../docs/状态机设计.md`](../../docs/状态机设计.md) §6.6。
+
 ## 接口与数据流
 
 ```cpp
@@ -405,6 +418,10 @@ struct MissionStateMachineConfig {
     config::MissionConfig mission;                    // 重置动作（mission 节同源，2026-11-17 P4b）：
                                                       // reset_reboot_px4/reboot_timeout_ms/
                                                       // reboot_retry/reboot_min_interval_ms
+    config::PreflightGateConfig preflight_gate;       // 起飞前门禁（preflight_gate 节同源，2026-11-18 H 项）：
+                                                      // require_sensor_health/sensor_health_hold_ms/
+                                                      // vibration_warn_mps2/vibration_block_mps2/
+                                                      // vibration_hold_ms；构造期 Validate() fail-fast
     uint8_t expected_interceptor_type = 25;           // 本机功能类别（ground_station.aircraft_component_id 同源）
 };
 
@@ -475,6 +492,10 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 （生产与状态机侧两阈值同源注入，测试可分别收紧）。
 `handover` 的关系校验（`exit_lost_frames > enter_s6_lock_frames` 等）由配置加载期
 `HandoverConfig::Validate`强制，状态机构造不重复校验（与 FlightController 同约定）。
+起飞前门禁（2026-11-18 H 项）走**整节注入**：`config_.preflight_gate` →
+`MissionStateMachineConfig::preflight_gate`（`config::PreflightGateConfig`），构造期调
+`PreflightGateConfig::Validate()` 兜底（与 landing/estimator_guard/mission 同一先例：
+程序化构造的非法值 fail-fast）。
 
 **接线现状**：`DroneApplication` **已接线**——估计器/视觉稳定性/双目测距三者同时装配时
 调用`SetEstimationInputs`（缺一不绑定，状态机不发布 S5 意图）；估计器存在时注入
@@ -1059,6 +1080,23 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
   | 能力判断而非装配门禁 | 未注入命令接口（只读运行）：只打一条 WARN，**不锁存、不冻结**；功能内部不读 `enable_control`，只看 `command_sender_ == nullptr` |
   | 对外可观测 | 新增**非虚** `EstimatorDegraded()`（测试/SITL 断言用，不扩张 `IMissionStateMachine`）；降级状态本期**不进 65013**（设计 Q1），机载 WARN + 10 s 存活摘要是全部出口 |
   | 配置 | `estimator_guard` 节 13 键（`enabled` + 12 个阈值/掩码），`DroneApplication::BindTopics` 整节注入 `MissionStateMachineConfig::estimator_guard`；`config::EstimatorGuardConfig` → `EstimatorGuardThresholds` 的换算唯一发生在 `mission_state_machine.cpp` 的 `ToEstimatorThresholds()`；`enabled=false` 是唯一回滚开关 |
+- **起飞前门禁（2026-11-18，H 项）**：`EvaluatePreflightGate(now_ms)` 每决策拍评估地面这一层的
+  判据并**锁存**，结论供受理 65014 时读取。设计口径见
+  [`降落与估计器保护设计-2026-11-17.md`](../../docs/降落与估计器保护设计-2026-11-17.md) §11.6，
+  判据表与 PX4 预检的分工见 [`状态机设计.md`](../../docs/状态机设计.md) §6.6：
+
+  | 项 | 实现事实 |
+  |---|---|
+  | 评估时机 | `Evaluate()` 里在「S1→S2」与「分配入口」**之前**调 `EvaluatePreflightGate(now_ms)`，返回的告警位并进本拍 `warnings`；只在 `BOOT/SELF_CHECK/READY/DISARMED` 且 `latest_flight_` 有效时评估，其余状态直接返回 0（飞行中的传感器退化归 P3 `EstimatorGuard`）。估计器降级的冻结早退分支**不评估**（那一层本来就不推进任务） |
+  | 锁存 | `preflight_sensor_blocked_` / `preflight_vibration_blocked_` 两个 bool，`ValidateAssignment()` **只读锁存**；hold 计时用 `preflight_sensor_unhealthy_since_ms_` / `preflight_vibration_since_ms_`，条件消失即清零并解除锁存（各打一条 INFO）。单帧抖动不会拒绝一次合法分配 |
+  | 判据 ① 传感器健康 | `SYS_STATUS` 的 `present & ~health` 与 `kPreflightCriticalSensorMask`（bit0 陀螺 \| bit1 加速度计 \| bit2 磁罗盘 \| bit21 AHRS，**不含 GPS**）取交，非空且持续 `sensor_health_hold` → 锁存 → 65015 `reason=23 kSensorUnhealthy` + 65013 bit11（2048）；恢复打 INFO「关键传感器健康位恢复，允许接受任务分配」 |
+  | 判据 ② 振动（默认只告警） | `VIBRATION.vibration_z` ≥ `vibration_warn_mps2` 持续 `vibration_hold` → WARN + 65013 bit12（4096），**不影响受理**；`vibration_block_mps2>0` 且 ≥ 该值持续 hold → 锁存 → `reason=24 kVibrationHigh`。指标口径：`vibration_z` 是**加速度计高频指标**（m/s/s），`x`=陀螺锥动、`y`=陀螺高频，**没有一个来自磁力计** |
+  | 判据 ③ 没有 `SYS_STATUS` | `sensors_status_valid=false` → 清锁存、跳过判据、**WARN 一次**（`preflight_sensor_status_missing_warned_` 节流），**不拒绝**。理由：拿不到证据 ≠ 传感器坏了；真故障 PX4 会在 ARM 时拒绝，而把"收不到一条流"当拒绝理由会让全队禁飞 |
+  | 判据 ④ 没有磁罗盘 | `present` 里没有 bit2（`SYS_HAS_MAG=0` 的装配）→ **WARN 一次**（`preflight_missing_mag_warned_`），不拒绝：PX4 不做磁力计预检，但估计器没有航向观测，航向只能靠 GPS 航迹 |
+  | ARM 被拒改报预检失败 | `TakeoffAckRejected(400)` 为真时 `AbortTakeoff(kPreflightFailed(6), "400 ARM ACK 非 ACCEPTED（PX4 预检/健康检查未通过）")`（旧版回 `kArmTimeout(9)`，把预检失败报成"解锁超时"）。`AbortTakeoff()` 里额外打印 PX4 最近一条 `STATUSTEXT`（`statustext_valid` 时）：`自动起飞中止: PX4 最近告警文本（severity=…）: …`——这是现场唯一能看到的"为什么拒绝解锁"。`reason=9` 从此只表示"等实际 armed 超时" |
+  | 构造期 | INFO 一行打印生效阈值：`起飞前门禁: 传感器健康=启用（hold=..ms，关键位=陀螺\|加速度计\|磁罗盘\|AHRS） 振动告警=..m/s² 阻断=..m/s²（0=只告警不阻断） hold=..ms` |
+  | 边界（抓不到什么） | **抓不到"未校准"**（校准状态不是 `SYS_STATUS` 健康位），也抓不到磁强/磁倾角异常（PX4 的 `COM_ARM_MAG_STR` / `EKF2_MAG_CHK_*` 校核没有复刻）。这两类仍由 PX4 在 ARM 时拒绝，本模块负责把 `STATUSTEXT` 打出来 |
+  | 回滚 | `preflight_gate.require_sensor_health=false`（传感器判据完全不跑）/ `vibration_block_mps2=0`（振动回到只告警）；改配置重启生效 |
 - `SetCommandSender`/`SetEstimationDiagnostics`须在 Start 前调用；运行中注入/重绑输入被拒绝并记 ERROR。
 - `SeedAcceptedAssignmentForTest`（2026-10-28 增）为测试入口：把给定分配写进
   `assignment_tracker_`/`RememberResult(kAccepted)`/`accepted_assignment_`，并在
@@ -1147,6 +1185,30 @@ distance_stale_ms}`同源传入。控制律内部超龄阈值取`tracking.contro
 - INFO（S14 收口）：`任务结束: S14 DISARMED（估计器降级期间收口），拦截结果=已发射/未发射`。
 - 另：`任务状态机创建: …` 与 `任务状态机启动` 两条日志不再带历史遗留的 `shadow=true`
   前缀（2026-11-17 清理；运行模式语义只由装配层与运行模式文档定义）。
+
+起飞前门禁（2026-11-18 H 项；都是"能不能起飞"级别的安全事件，**不节流**）：
+
+- INFO（构造期，一行含生效值）：
+  `起飞前门禁: 传感器健康=启用（hold=1000ms，关键位=陀螺|加速度计|磁罗盘|AHRS） 振动告警=20.0m/s² 阻断=0.0m/s²（0=只告警不阻断） hold=1000ms`；
+  关掉传感器判据时该字段为 `传感器健康=关闭（…）`。
+- ERROR（**锁存时一条**）：
+  `起飞前门禁: 关键传感器健康位持续掉线（掩码=0x…，position=<中文位名>）→ 拒绝新的任务分配（65015 reason=23 kSensorUnhealthy）。常见原因：罗盘未接线/驱动不报数/磁故障；未校准不在本判据内`。
+- INFO（恢复时一条）：`起飞前门禁: 关键传感器健康位恢复，允许接受任务分配`。
+- WARN（振动超告警，**锁存时一条**）：
+  `起飞前门禁: 振动 X.XX m/s² 超过告警阈值 20.00（加速度计高频指标，非磁力计）——建议检查桨平衡/电机轴承/减振，本项默认只告警不阻断`；
+  回落后 INFO `起飞前门禁: 振动回落到告警阈值以下`。
+- ERROR（振动阻断，**只有 `vibration_block_mps2>0` 才可能出现**）：
+  `起飞前门禁: 振动 X.XX m/s² 超过阻断阈值 Y.YY→ 拒绝新的任务分配（65015 reason=24 kVibrationHigh）。把 preflight_gate.vibration_block_mps2 设为 0 可回到只告警`。
+- WARN（各一条，靠 `_warned_` 标志位节流）：
+  `起飞前门禁: 未收到 SYS_STATUS，传感器健康门禁暂不生效（ARM 时仍由 PX4 自己的预检兜底）`、
+  `起飞前门禁: SYS_STATUS 未声明磁罗盘（SYS_HAS_MAG=0？）——PX4 不会做磁力计预检，估计器无航向观测；如非有意配置请检查罗盘`。
+- WARN（受理 65014 时的拒绝原因，**不节流**）：
+  `任务指令（分配预检）: 关键传感器健康位持续掉线（掩码=0x… 已持续≥…ms），拒绝分配（kSensorUnhealthy）` /
+  `任务指令（分配预检）: 振动 X.XX m/s² 超过阻断阈值 Y.YY（已持续≥…ms），拒绝分配（kVibrationHigh）` /
+  `任务指令（分配预检）: 未收到 SYS_STATUS，本次跳过传感器健康门禁（PX4 仍会在 ARM 时做自己的预检）`。
+- WARN（ARM 被拒，每次中止一条；有 `STATUSTEXT` 时再补一条）：
+  `自动起飞中止: reason=6 detail=400 ARM ACK 非 ACCEPTED（PX4 预检/健康检查未通过） airborne=0 uncertain=0`
+  与 `自动起飞中止: PX4 最近告警文本（severity=…）: Preflight Fail: Compass 1 uncalibrated`。
 
 人工指令相关（2026-10-29）：
 - INFO：`任务状态机任务指令输入已绑定（65020 主动返航/重置状态）`（启动期一次）；
@@ -1376,6 +1438,31 @@ ctest --test-dir build --output-on-failure
   ```bash
   ctest --test-dir build -R EstimatorGuard_ --output-on-failure
   ./build/mission_state_machine_test --gtest_filter='*EstimatorGuard*'
+  ```
+
+- 起飞前门禁（2026-11-18 H 项；`MissionStateMachineTest.PreflightGate_*`，快照 helper
+  `MakePreflightGateFlight()`，用例把两个 hold 收到配置下限 100ms 以压缩时长；判据从
+  65015 `reason` 与 65013 告警位两头断言）：
+  - `PreflightGate_SensorUnhealthyRejectsAssignment`：`present` 含磁罗盘但 `health` 清其位，
+    持续一个 hold → 65013 bit11（2048）亮、状态**仍停在 S2 READY**（评估本身不迁移）、
+    65014 回 `rejected/kSensorUnhealthy`、零落飞控命令；
+  - `PreflightGate_SensorHealthRecoveryAllowsAssignment`：先以同样方式建立拒绝锁存，再把健康位
+    全部恢复持续一个 hold → 同一夹具发 65014 得到 `accepted` 并进入 S3（锁存解除、不再按
+    `kSensorUnhealthy` 拒绝）；
+  - `PreflightGate_VibrationWarnOnlyKeepsAssignmentAccepted`：`vibration_z=25`（> 默认 warn 20）
+    持续 hold → bit12（4096）亮，但默认 `vibration_block_mps2=0`，65014 照常受理进 S3、
+    reason 不得是 `kVibrationHigh`；
+  - `PreflightGate_VibrationBlockRejectsWhenConfigured`：配置 `vibration_block_mps2=30`
+    （> warn 20）后 `vibration_z=35` 持续 hold → 65014 回 `rejected/kVibrationHigh`、
+    停在 S2 READY、零落飞控命令（证明振动阻断是"配了才生效"）；
+  - `PreflightGate_ArmRejectionReportsPreflightFailed`：S3 中 176/400 都已入队后模拟
+    `400` ACK `result=1`（TEMPORARILY_REJECTED，等价 PX4 预检拒绝解锁）→ 65015 aborted 的
+    reason 必须是 `kPreflightFailed(6)`（旧实现错报 `kArmTimeout(9)`）。
+  只跑这一组：
+
+  ```bash
+  ctest --test-dir build -R PreflightGate_ --output-on-failure
+  ./build/mission_state_machine_test --gtest_filter='*PreflightGate_*'
   ```
 
 - S9/S10 入口（2026-10-19；`MakeInterceptEntryTestConfig` 开启
@@ -1755,4 +1842,17 @@ ctest --test-dir build --output-on-failure
   PX4/遥控」的原因串（187 ACK 超时 / 非 ACCEPTED / PX4 断连 / 触发命令未入队
   （发射超时））。S16 为终态，状态机不再发任何控制意图，需人工/维护处置后
   重启程序；`CancelPendingCommands()` 只取消待发命令，不会撤回机构已执行动作。
+- **65014 回 `sensor_unhealthy(23)` / `vibration_high(24)`**（2026-11-18 H 项）：先把 65013
+  告警位与日志对齐——bit11 + ERROR「关键传感器健康位持续掉线（掩码=0x…，position=…）」说明
+  是 `SYS_STATUS` 健康位判据（常见：罗盘未接线/驱动不报数/磁故障）；bit12 只表示振动超
+  **告警**线（默认**不影响受理**，65015 出现 `vibration_high` 只有在
+  `preflight_gate.vibration_block_mps2>0` 时才可能）。健康位恢复后锁存自动解除并打 INFO，
+  **不需要重启机载程序**；要临时回到旧行为，改 `require_sensor_health=false` 或
+  `vibration_block_mps2=0` 后重启。**别把它当成"能不能起飞"的唯一判据**：没收到 `SYS_STATUS`
+  时本门禁主动跳过（只 WARN 一次），而"未校准"永远看不到健康位——这两类仍由 PX4 在 ARM 时拒绝。
+- **65015 `reason=6` 与 `reason=9` 别混**：`6 kPreflightFailed` = PX4 **明确拒绝解锁**
+  （`400` ACK 非 ACCEPTED；紧跟一条 `自动起飞中止: PX4 最近告警文本（severity=…）: Preflight Fail: …`），
+  照着那句英文修预检项（罗盘未校准/强磁干扰/传感器缺数据/加速度计未标定）；`9 kArmTimeout` =
+  命令已发出、PX4 既不拒也不上锁，等满 `takeoff.arm_timeout`，属链路/时序问题。
+  看到 6 去加大超时或 force arm 是错的方向。
 - 后续恢复完整自动链时，不能直接从`READY`跳到`GPS_APPROACH`输出控制；必须补齐`ARMING/TAKEOFF`门禁、SITL、拆桨台架验证和运行模式（`enable_control`）安全确认。

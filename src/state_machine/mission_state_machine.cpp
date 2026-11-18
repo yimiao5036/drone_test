@@ -208,6 +208,19 @@ constexpr uint64_t kRebootRetryIntervalMs = 1000;
 /// 位 0~9 已被围栏/目标/执行器/伺服等占用，本项是 2026-11-17 P4b 新增。
 /// 仅机载侧在重启等待期间置位，回到 S2 后自然清除。
 constexpr uint32_t kWarningPx4RebootTimeout = 1U << 10U;
+/// 65013 告警位 bit11/bit12（2026-11-18 H 项，起飞前门禁）：
+/// - bit11：关键传感器健康位持续掉线（地面待命期间亮；飞行中由 P3 接管）；
+/// - bit12：振动超过 `preflight_gate.vibration_warn_mps2`（**只告警**，不影响受理）。
+constexpr uint32_t kWarningPreflightSensorUnhealthy = 1U << 11U;
+constexpr uint32_t kWarningVibrationHigh = 1U << 12U;
+/// 起飞前门禁关注的关键传感器位（MAV_SYS_STATUS_SENSOR_*，与 EstimatorGuard 同口径，
+/// 不含 GPS：GNSS 丢失属精度下降，不属"传感器坏了"）。这里不引 mavlink 头，
+/// 避免状态机库把 third_party 的 SYSTEM include 传播给所有依赖方。
+constexpr uint32_t kPreflightCriticalSensorMask =
+    (1U << 0) |   // 3D_GYRO
+    (1U << 1) |   // 3D_ACCEL
+    (1U << 2) |   // 3D_MAG
+    (1U << 21);   // AHRS
 /// 重置准入的"已落地"近似判据（设计 §6.1）：PX4 `landed` 证据缺失时，相对高度
 /// ≤ 该值视为在地面。**只在 landed_state_valid=false 时使用**——它是兜底，
 /// 不能替代 PX4 的 land detector。
@@ -450,6 +463,7 @@ public:
           estimator_guard_(ToEstimatorThresholds(config.estimator_guard)),
           estimator_guard_enabled_(config.estimator_guard.enabled),
           mission_(config.mission),
+          preflight_gate_(config.preflight_gate),
           fence_(config.fence),
           takeoff_(config.takeoff),
           approach_(config.approach),
@@ -477,6 +491,9 @@ public:
         // 重置动作配置兜底（mission 节，2026-11-17 P4b）：超时/重试次数/最小间隔
         // 非法时直接抛异常，不允许带病重启飞控。
         config.mission.Validate();
+        // 起飞前门禁配置兜底（preflight_gate 节，2026-11-18 H 项）：这些值直接
+        // 决定"能不能起飞"，写错一个数量级就是恒拒绝或恒放行，必须 fail-fast。
+        config.preflight_gate.Validate();
         // 自动起飞时序配置构造期兜底（takeoff 节，2026-10-22）：
         // 高度/爬升率/各超时关系非法时直接抛异常，不允许带病起飞。
         config.takeoff.Validate();
@@ -555,6 +572,16 @@ public:
                 : "回滚：只清状态不重启（reset_reboot_px4=false，直接回 S2）",
             mission_.reboot_timeout.count(), mission_.reboot_retry,
             mission_.reboot_min_interval.count());
+        // 起飞前门禁（2026-11-18 H 项）：地面这一层的判据与阈值也印出来，
+        // 现场排"为什么拒绝起飞/为什么只告警"时不必翻 config.json。
+        SPDLOG_INFO(
+            "起飞前门禁: 传感器健康={}（hold={}ms，关键位=陀螺|加速度计|磁罗盘|AHRS）"
+            " 振动告警={:.1f}m/s² 阻断={:.1f}m/s²（0=只告警不阻断） hold={}ms",
+            preflight_gate_.require_sensor_health ? "启用" : "关闭",
+            preflight_gate_.sensor_health_hold.count(),
+            preflight_gate_.vibration_warn_mps2,
+            preflight_gate_.vibration_block_mps2,
+            preflight_gate_.vibration_hold.count());
     }
 
     ~Impl() {
@@ -749,6 +776,17 @@ public:
         // 延迟终态回执（§11.6 E 项）：重置/新一轮任务不继承上一轮的待补回执，
         // 否则会在新任务的 S14 补一条属于旧 command_id 的 65021。
         deferred_return_ack_.reset();
+        // 起飞前门禁（H 项）：锁存与计时清零，新一轮任务从当前遥测重新评估。
+        preflight_sensor_unhealthy_mask_ = 0;
+        preflight_sensor_unhealthy_since_ms_ = 0;
+        preflight_sensor_blocked_ = false;
+        preflight_missing_mag_warned_ = false;
+        preflight_sensor_status_missing_warned_ = false;
+        preflight_sensor_status_missing_since_ms_ = 0;
+        preflight_vibration_since_ms_ = 0;
+        preflight_vibration_warned_ = false;
+        preflight_vibration_blocked_ = false;
+        preflight_vibration_peak_mps2_ = 0.0;
     }
 
     /// 停止工作线程并释放订阅。幂等，不关闭输出Topic，便于主程序按统一顺序停机。
@@ -1094,6 +1132,10 @@ private:
             return;
         }
 
+        // 起飞前门禁（2026-11-18 H 项）：地面待命期间评估传感器健康与振动，
+        // 结果锁存给 65014 预检（`ValidateAssignment`），这里只把告警位并进本拍。
+        // 放在 S1→S2 与分配入口之前：同一拍受理的分配用的就是刚评估出的结论。
+        warnings |= EvaluatePreflightGate(now_ms);
         if (!HasNavigationForGps()) {
             warnings |= kWarningNavigationUnavailable;
         }
@@ -1496,6 +1538,165 @@ private:
         return *base_z - static_cast<double>(flight.local_z_m);
     }
 
+    /// 起飞前门禁评估（2026-11-18 H 项，设计 §11.6 H）。
+    ///
+    /// 只在**地面待命**状态（BOOT/SELF_CHECK/READY/DISARMED）评估：飞行中的传感器
+    /// 退化由 P3 `EstimatorGuard` 处置，这里不重复。评估结果锁存给 65014 预检用
+    /// （`preflight_sensor_blocked_` / `preflight_vibration_blocked_`），并返回 65013
+    /// 告警位。带 hold 的原因是上电瞬间与 S1 自检期间健康位会短暂抖动，单帧不拒。
+    ///
+    /// **判据口径**（不要误读）：
+    /// - 传感器：`SYS_STATUS` 里 `present` 置位但 `health` 清零的关键位（陀螺/
+    ///   加速度计/磁罗盘/AHRS）。能抓"缺磁/无数据/磁故障"；**抓不到"未校准"**
+    ///   ——校准状态不是健康位，那类由 PX4 在 ARM 时拒绝，我们把 STATUSTEXT 记下来。
+    /// - 振动：`VIBRATION.vibration_z`（加速度计高频指标，m/s/s）。**不来自磁力计**，
+    ///   所以它不构成"振动污染罗盘"的机制；默认只告警（维护者 2026-11-18 裁决）。
+    uint32_t EvaluatePreflightGate(uint64_t now_ms) {
+        const common::MissionState state = CurrentState();
+        const bool on_ground = state == common::MissionState::kBoot ||
+                               state == common::MissionState::kSelfCheck ||
+                               state == common::MissionState::kReady ||
+                               state == common::MissionState::kDisarmed;
+        if (!on_ground || !latest_flight_.has_value()) {
+            return 0;
+        }
+        const common::FlightStateSnapshot& flight = *latest_flight_;
+        uint32_t warnings = 0;
+
+        // ---- 传感器健康 ----
+        uint32_t unhealthy = 0;
+        if (preflight_gate_.require_sensor_health) {
+            if (!flight.sensors_status_valid) {
+                // 收不到 SYS_STATUS：什么都不能断言，清掉锁存、只告警一次。
+                // （真正的传感器故障由 PX4 在 ARM 时拒绝，见 ValidateAssignment 注释）
+                preflight_sensor_unhealthy_mask_ = 0;
+                preflight_sensor_unhealthy_since_ms_ = 0;
+                preflight_sensor_blocked_ = false;
+                // 刚连上飞控的头一两拍一定还没收到 SYS_STATUS（心跳先到），
+                // 那段不算"缺流"——等满 2 s 仍然没有才告警，否则每次开机都刷一条误导。
+                if (preflight_sensor_status_missing_since_ms_ == 0) {
+                    preflight_sensor_status_missing_since_ms_ = now_ms;
+                }
+                if (!preflight_sensor_status_missing_warned_ &&
+                    ElapsedMs(now_ms, preflight_sensor_status_missing_since_ms_) >=
+                        2000U) {
+                    preflight_sensor_status_missing_warned_ = true;
+                    SPDLOG_WARN(
+                        "起飞前门禁: 连续 2s 未收到 SYS_STATUS，传感器健康门禁暂不生效"
+                        "（ARM 时仍由 PX4 自己的预检兜底）");
+                }
+            } else {
+                preflight_sensor_status_missing_since_ms_ = 0;
+                preflight_sensor_status_missing_warned_ = false;
+                const uint32_t critical_present =
+                    flight.sensors_present & kPreflightCriticalSensorMask;
+                unhealthy = critical_present & ~flight.sensors_health;
+                preflight_sensor_unhealthy_mask_ = unhealthy;
+            }
+        }
+        if (unhealthy == 0U) {
+            preflight_sensor_unhealthy_since_ms_ = 0;
+            if (preflight_sensor_blocked_) {
+                preflight_sensor_blocked_ = false;
+                SPDLOG_INFO("起飞前门禁: 关键传感器健康位恢复，允许接受任务分配");
+            }
+            preflight_missing_mag_warned_ = false;
+        } else {
+            if (preflight_sensor_unhealthy_since_ms_ == 0) {
+                preflight_sensor_unhealthy_since_ms_ = now_ms;
+            }
+            if (!preflight_sensor_blocked_ &&
+                ElapsedMs(now_ms, preflight_sensor_unhealthy_since_ms_) >=
+                    static_cast<uint64_t>(
+                        preflight_gate_.sensor_health_hold.count())) {
+                preflight_sensor_blocked_ = true;
+                SPDLOG_ERROR(
+                    "起飞前门禁: 关键传感器健康位持续掉线（掩码=0x{:x}，position={}）"
+                    "→ 拒绝新的任务分配（65015 reason=23 kSensorUnhealthy）。"
+                    "常见原因：罗盘未接线/驱动不报数/磁故障；未校准不在本判据内",
+                    unhealthy, SensorMaskText(unhealthy));
+            }
+            if (preflight_sensor_blocked_) {
+                warnings |= kWarningPreflightSensorUnhealthy;
+            }
+        }
+        // 完全没有磁罗盘（SYS_HAS_MAG=0 的装配）：不拒绝，但必须说清后果——
+        // PX4 不会做磁力计预检，估计器没有航向观测，航向只能靠 GPS 航迹。
+        if (flight.sensors_status_valid && (flight.sensors_present & (1U << 2)) == 0U) {
+            if (!preflight_missing_mag_warned_) {
+                preflight_missing_mag_warned_ = true;
+                SPDLOG_WARN(
+                    "起飞前门禁: SYS_STATUS 未声明磁罗盘（SYS_HAS_MAG=0？）——"
+                    "PX4 不会做磁力计预检，估计器无航向观测；如非有意配置请检查罗盘");
+            }
+        }
+
+        // ---- 振动（默认只告警） ----
+        if (flight.vibration_valid) {
+            const double vibration_z = static_cast<double>(flight.vibration_z);
+            preflight_vibration_peak_mps2_ =
+                std::max(preflight_vibration_peak_mps2_, vibration_z);
+            const bool above_warn = preflight_gate_.vibration_warn_mps2 > 0.0 &&
+                                    vibration_z >= preflight_gate_.vibration_warn_mps2;
+            const bool above_block =
+                preflight_gate_.vibration_block_mps2 > 0.0 &&
+                vibration_z >= preflight_gate_.vibration_block_mps2;
+            if (!above_warn && !above_block) {
+                preflight_vibration_since_ms_ = 0;
+                preflight_vibration_peak_mps2_ = 0.0;
+                if (preflight_vibration_blocked_ || preflight_vibration_warned_) {
+                    preflight_vibration_blocked_ = false;
+                    preflight_vibration_warned_ = false;
+                    SPDLOG_INFO("起飞前门禁: 振动回落到告警阈值以下");
+                }
+            } else {
+                if (preflight_vibration_since_ms_ == 0) {
+                    preflight_vibration_since_ms_ = now_ms;
+                }
+                const bool held =
+                    ElapsedMs(now_ms, preflight_vibration_since_ms_) >=
+                    static_cast<uint64_t>(preflight_gate_.vibration_hold.count());
+                // 位与日志都按 hold 判定（单帧尖峰不该让地面站闪红）：
+                // `vibration_hold` 的语义是"超阈值要持续多久才算数"，位与告警一致。
+                if (held && above_warn) {
+                    warnings |= kWarningVibrationHigh;
+                }
+                if (held && !preflight_vibration_warned_) {
+                    preflight_vibration_warned_ = true;
+                    SPDLOG_WARN(
+                        "起飞前门禁: 振动 {:.2f} m/s² 超过告警阈值 {:.2f}（加速度计高频指标，"
+                        "非磁力计）——建议检查桨平衡/电机轴承/减振，本项默认只告警不阻断",
+                        vibration_z, preflight_gate_.vibration_warn_mps2);
+                }
+                if (held && above_block && !preflight_vibration_blocked_) {
+                    preflight_vibration_blocked_ = true;
+                    SPDLOG_ERROR(
+                        "起飞前门禁: 振动 {:.2f} m/s² 超过阻断阈值 {:.2f}→ 拒绝新的任务分配"
+                        "（65015 reason=24 kVibrationHigh）。把 "
+                        "preflight_gate.vibration_block_mps2 设为 0 可回到只告警",
+                        vibration_z, preflight_gate_.vibration_block_mps2);
+                }
+            }
+        }
+        return warnings;
+    }
+
+    /// 传感器掩码 → 可读文本（仅用于拒绝/告警日志，避免现场查位定义）。
+    static std::string SensorMaskText(uint32_t mask) {
+        std::string text;
+        const auto append = [&text](const char* name) {
+            if (!text.empty()) {
+                text += '|';
+            }
+            text += name;
+        };
+        if ((mask & (1U << 0U)) != 0U) append("陀螺");
+        if ((mask & (1U << 1U)) != 0U) append("加速度计");
+        if ((mask & (1U << 2U)) != 0U) append("磁罗盘");
+        if ((mask & (1U << 21U)) != 0U) append("AHRS");
+        return text.empty() ? "无" : text;
+    }
+
     /// PX4 低电参数是否可用于自动起飞门禁（设计 §9.2）：
     /// BAT_LOW_THR 有效且落在 (0,100)，COM_LOW_BAT_ACT 有效且为 0
     /// （Warning Only；其余动作由 PX4 自行执行，机载不再叠加处置）。
@@ -1611,6 +1812,37 @@ private:
         if (mission_faulted_ ||
             (intercept_device_ != nullptr && intercept_device_->Faulted())) {
             return common::MissionAssignmentReason::kMissionFault;
+        }
+        // 起飞前门禁（2026-11-18 H 项）：传感器健康是硬门禁，振动按配置可硬可软。
+        // 只看"已经持续成立的锁存状态"（由 EvaluatePreflightGate 每拍维护），
+        // 单帧抖动不会因此拒绝一次合法分配。
+        if (preflight_gate_.require_sensor_health) {
+            if (!flight.sensors_status_valid) {
+                // 没有 SYS_STATUS：**无法校验**，只告警不拒绝。理由：真正的传感器
+                // 故障 PX4 一定会在 ARM 时拒绝（ARM ACK 非 ACCEPTED → 现在回
+                // kPreflightFailed 并打印 PX4 的 STATUSTEXT）；而拿"收不到 SYS_STATUS"
+                // 当拒绝理由，会把一条遥测流配置问题变成全队禁飞——正是 P4b 要修的那类坑。
+                SPDLOG_WARN(
+                    "任务指令（分配预检）: 未收到 SYS_STATUS，本次跳过传感器健康门禁"
+                    "（PX4 仍会在 ARM 时做自己的预检）");
+            } else if (preflight_sensor_blocked_) {
+                SPDLOG_WARN(
+                    "任务指令（分配预检）: 关键传感器健康位持续掉线（掩码=0x{:x} 已持续≥{}ms），"
+                    "拒绝分配（kSensorUnhealthy）",
+                    preflight_sensor_unhealthy_mask_,
+                    preflight_gate_.sensor_health_hold.count());
+                return common::MissionAssignmentReason::kSensorUnhealthy;
+            }
+        }
+        if (preflight_gate_.vibration_block_mps2 > 0.0 &&
+            preflight_vibration_blocked_) {
+            SPDLOG_WARN(
+                "任务指令（分配预检）: 振动 {:.2f} m/s² 超过阻断阈值 {:.2f}（已持续≥{}ms），"
+                "拒绝分配（kVibrationHigh）",
+                preflight_vibration_peak_mps2_,
+                preflight_gate_.vibration_block_mps2,
+                preflight_gate_.vibration_hold.count());
+            return common::MissionAssignmentReason::kVibrationHigh;
         }
         return common::MissionAssignmentReason::kNone;
     }
@@ -3347,8 +3579,14 @@ private:
                 // ACK 非 ACCEPTED（0）且非 IN_PROGRESS（5）立即中止；
                 // 实际 armed 是最终判据。
                 if (TakeoffAckRejected(kMavCmdComponentArmDisarm)) {
-                    AbortTakeoff(common::MissionAssignmentReason::kArmTimeout,
-                                 "400 ACK 非 ACCEPTED");
+                    // 2026-11-18 H 项：ARM 被拒 **不是** 超时——PX4 的
+                    // `HealthAndArmingChecks` 拒绝解锁时一定会回非 ACCEPTED，
+                    // 常见原因就是罗盘未校准/磁干扰/传感器故障。旧实现回
+                    // kArmTimeout（"解锁超时"），把预检失败报成超时，现场只能猜。
+                    // 这里改回 kPreflightFailed，并把 PX4 拒绝时那句
+                    // STATUSTEXT（P1 已订阅）原样打进日志。
+                    AbortTakeoff(common::MissionAssignmentReason::kPreflightFailed,
+                                 "400 ARM ACK 非 ACCEPTED（PX4 预检/健康检查未通过）");
                     return;
                 }
                 if (TakeoffAckRejected(kMavCmdDoSetMode)) {
@@ -3568,6 +3806,14 @@ private:
 
         SPDLOG_WARN("自动起飞中止: reason={} detail={} airborne={} uncertain={}",
                     static_cast<int>(reason), detail, airborne, uncertain);
+        // PX4 拒绝解锁时真正的原因只写在 STATUSTEXT 里（例如
+        // "Preflight Fail: Compass 1 uncalibrated"）。这是现场唯一能看到的
+        // 官方解释，原样打出来；H 项门禁也抓不到"未校准"这类非健康位问题。
+        if (have_flight && latest_flight_->statustext_valid) {
+            SPDLOG_WARN("自动起飞中止: PX4 最近告警文本（severity={}）: {}",
+                        latest_flight_->statustext_severity,
+                        latest_flight_->statustext_text);
+        }
         if (uncertain) {
             takeoff_unavailable_latched_ = true;
         }
@@ -6351,6 +6597,23 @@ private:
     uint64_t estimator_freeze_diag_ms_ = 0;
     /// 重置动作配置（mission 节，2026-11-17 P4b；构造注入）。
     const config::MissionConfig mission_;
+    /// 起飞前门禁配置（preflight_gate 节，2026-11-18 H 项；构造注入）。
+    const config::PreflightGateConfig preflight_gate_;
+    /// 传感器健康锁存（`present & ~health` 的关键位持续掉线达 hold）。只在
+    /// `EvaluatePreflightGate` 里更新，`ValidateAssignment` 只读。
+    uint32_t preflight_sensor_unhealthy_mask_ = 0;
+    uint64_t preflight_sensor_unhealthy_since_ms_ = 0;
+    bool preflight_sensor_blocked_ = false;
+    /// "未声明磁罗盘"告警只打一次（SYS_HAS_MAG=0 的有意装配不要刷屏）。
+    bool preflight_missing_mag_warned_ = false;
+    /// "收不到 SYS_STATUS"告警只打一次，并要等满 2 s 才算"缺流"（刚连上时心跳先到）。
+    bool preflight_sensor_status_missing_warned_ = false;
+    uint64_t preflight_sensor_status_missing_since_ms_ = 0;
+    /// 振动告警/阻断锁存与观察窗内峰值（m/s²，`VIBRATION.vibration_z`）。
+    uint64_t preflight_vibration_since_ms_ = 0;
+    bool preflight_vibration_warned_ = false;
+    bool preflight_vibration_blocked_ = false;
+    double preflight_vibration_peak_mps2_ = 0.0;
     /// PX4 重启等待锁存（原子：决策线程写，测试/SITL 线程读）。置位期间 `Evaluate()`
     /// 早返回——不发任何控制意图与命令（246 重发除外），只维护 65013。
     std::atomic<bool> px4_reboot_pending_{false};

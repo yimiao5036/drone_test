@@ -159,6 +159,10 @@ void DroneApplication::BuildComponents() {
         // "清状态 + 重启 PX4" 的超时/重试/最小间隔都来自 JSON。`reset_reboot_px4=false`
         // 是回滚开关（旧语义：只清状态直接回 S2）。
         state_machine_config.mission = config_.mission;
+        // 起飞前门禁（preflight_gate 节，2026-11-18 H 项）整节同源注入：传感器健康
+        // 是硬门禁（受理 65014 时拒绝），振动默认只告警（block=0）。判据全部取自
+        // P1 已订阅的遥测（SYS_STATUS 健康位 + VIBRATION），不新增链路。
+        state_machine_config.preflight_gate = config_.preflight_gate;
         // 自动起飞时序整节同源注入；本机拦截功能类别取地面站身份
         // aircraft_component_id（65014 的 interceptor_type 必须与之相等）。
         state_machine_config.takeoff = config_.takeoff;

@@ -564,6 +564,14 @@ enum class MissionAssignmentReason : uint8_t {
     kInternalError = 20,
     kZoneMismatch = 21,  ///< 机载围栏区域版本与分配声明不一致（v3，2026-10-29）
     kFenceViolation = 22,  ///< 围栏越界触发的中止/降落（return/land 动作，2026-10-30）
+    /// 起飞前门禁：关键传感器（陀螺/加速度计/磁罗盘/AHRS）健康位持续掉线
+    /// （2026-11-18 H 项）。只在受理 65014 时使用；`present` 置位但 `health`
+    /// 清零达 `preflight_gate.sensor_health_hold` 才拒。
+    kSensorUnhealthy = 23,
+    /// 起飞前门禁：振动超过 `preflight_gate.vibration_block_mps2`
+    /// （2026-11-18 H 项）。**默认不启用**（维护者裁决振动只告警），
+    /// 只有把阻断阈值配成 >0 时才会出现该 reason。
+    kVibrationHigh = 24,
 };
 
 /// 任务分配（地面站 65014 → 状态机）。

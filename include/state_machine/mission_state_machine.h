@@ -115,6 +115,11 @@ struct MissionStateMachineConfig {
     /// 65020 `type=2` 受理后"清任务状态 + 重启 PX4"（发 246 param1=1 → S1 SELF_CHECK
     /// 等飞控回来）。`reset_reboot_px4=false` 回滚成 `2026-11-04` 的旧语义（只清状态）。
     config::MissionConfig mission;
+    /// 起飞前门禁（preflight_gate 配置节，2026-11-18 H 项）：受理 65014 前校验
+    /// **SYS_STATUS 关键传感器健康位**（陀螺|加速度计|磁罗盘|AHRS，持续掉线 →
+    /// `kSensorUnhealthy`）与**振动指标**（默认只告警；`vibration_block_mps2>0`
+    /// 才拒绝 → `kVibrationHigh`）。语义与"为什么振动不硬卡"见 `PreflightGateConfig`。
+    config::PreflightGateConfig preflight_gate;
     /// 多边形围栏（fence 配置节，2026-10-29）：机载自治围栏——区域缓存装载、
     /// 越界判定与中止、位置意图钳制。默认关闭（回退 Home 圆形围栏）。
     config::FenceConfig fence;

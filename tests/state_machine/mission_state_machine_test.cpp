@@ -8217,4 +8217,250 @@ TEST(MissionStateMachineTest, ResetGuard_ClearsEstimatorDegradationAfterLanding)
     machine.Stop();
 }
 
+// ---------------------------------------------------------------------------
+// H 项「起飞前门禁」（2026-11-18，维护者裁决）
+//
+// 背景：2026-11-17 事故源头是罗盘 #1 失效 + 高振动。地面这一层原先没有任何门禁，
+// PX4 拒绝解锁时只会等 arm_timeout 再回 kArmTimeout，把"预检没过"报成"解锁超时"。
+// 门禁只在**地面待命状态**（BOOT/SELF_CHECK/READY/DISARMED）按决策拍评估，结果
+// 锁存给 65014 预检（`ValidateAssignment`），本组覆盖 5 条契约：
+// 1. SYS_STATUS 关键传感器（陀螺|加速度计|磁罗盘|AHRS）健康位持续掉线达 hold →
+//    65015 rejected / kSensorUnhealthy(23)，保持 S2；
+// 2. 健康位恢复后锁存解除 → 不再按 kSensorUnhealthy 拒绝（正常受理进 S3）；
+// 3. 振动默认只告警：65013 bit12(4096) 亮，但 65014 照常受理（block=0）；
+// 4. `vibration_block_mps2>0` 才阻断：65015 rejected / kVibrationHigh(24)；
+// 5. PX4 拒绝解锁（ARM ACK 非 ACCEPTED）回 kPreflightFailed(6)，不是 kArmTimeout(9)。
+//
+// 快照口径：既有基线快照的 `sensors_status_valid` 默认 false，此时门禁只告警不拒绝
+// （SYS_STATUS 缺席不能变成全队禁飞），所以下面凡验证"拒绝/放行"的用例都显式给出
+// SYS_STATUS 字段；`require_sensor_health` 保持默认 true（不关开关）。
+// ---------------------------------------------------------------------------
+
+/// 起飞前门禁用快照（H 项）：`MakeGroundedFlight` 基线 + 显式 SYS_STATUS/VIBRATION
+/// 字段。默认"关键传感器全健康 + 零振动"，用例按需覆盖单项。
+common::FlightStateSnapshot MakePreflightGateFlight() {
+    common::FlightStateSnapshot flight = MakeGroundedFlight();
+    // MAV_SYS_STATUS_SENSOR：3D_GYRO(1<<0)|3D_ACCEL(1<<1)|3D_MAG(1<<2)|AHRS(1<<21)
+    constexpr uint32_t kCriticalSensors =
+        (1U << 0U) | (1U << 1U) | (1U << 2U) | (1U << 21U);
+    flight.sensors_status_valid = true;
+    flight.sensors_present = kCriticalSensors;
+    flight.sensors_health = kCriticalSensors;
+    flight.vibration_valid = true;
+    flight.vibration_z = 0.f;
+    return flight;
+}
+
+/// 连续喂同一快照 duration（每 100ms 一帧，轮询 + 上限）：门禁的 hold 以决策拍
+/// （`kDecisionPeriod=100ms`）计时，单帧喂入走不完 hold，必须持续给遥测。
+bool FeedFlightFor(common::Topic<common::FlightStateSnapshot>& topic,
+                   const common::FlightStateSnapshot& flight,
+                   std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!PublishFlight(topic, flight)) {
+            return false;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    return true;
+}
+
+// 关键传感器健康位持续掉线（present 置位、health 清零）达 hold → 65014 被拒，
+// reason=kSensorUnhealthy(23)、保持 S2 READY、不发任何落飞控命令。
+TEST(MissionStateMachineTest, PreflightGate_SensorUnhealthyRejectsAssignment) {
+    // 加速用例：hold 取配置校验下限 100ms（现场默认 1000ms）。
+    auto config = MakeTakeoffTestConfig();
+    config.preflight_gate.sensor_health_hold = 100ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true))
+        << "夹具应启动并进入 S2 READY";
+
+    constexpr uint32_t kWarningPreflightSensorUnhealthy = 1U << 11U;  // 2048
+    // MAG 在 present 里但不在 health 里：装配有罗盘、驱动/数据掉线（健康位判据）。
+    auto unhealthy = MakePreflightGateFlight();
+    unhealthy.sensors_health = ~(1U << 2U);  // 除 MAG 外全置位
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, unhealthy, 300ms))
+        << "不健康快照应连续被 Topic 接收";
+    ASSERT_TRUE(WaitForWarningBit(harness.status_subscription,
+                                  kWarningPreflightSensorUnhealthy, 1500ms)
+                    .has_value())
+        << "健康位掉线达 hold 后 65013 bit11(2048) 应亮";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "门禁评估本身不得改变任务状态";
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(201))) << "65014 应被 Topic 接收";
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "被拒也要回 65015";
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected)
+        << "关键传感器健康位持续掉线时必须拒绝分配";
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kSensorUnhealthy)
+        << "reason 必须是 kSensorUnhealthy(23)";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "预检拒绝不得离开 S2 READY";
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "被拒的分配不得发出任何落飞控命令";
+}
+
+// 恢复：健康位全置位持续一个 hold 窗口后锁存解除 → 同一夹具再发 65014 不再按
+// kSensorUnhealthy 拒绝（其余预检项在基线下均满足 → 受理进 S3）。
+TEST(MissionStateMachineTest,
+     PreflightGate_SensorHealthRecoveryAllowsAssignment) {
+    auto config = MakeTakeoffTestConfig();
+    config.preflight_gate.sensor_health_hold = 100ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true))
+        << "夹具应启动并进入 S2 READY";
+
+    constexpr uint32_t kWarningPreflightSensorUnhealthy = 1U << 11U;  // 2048
+    auto unhealthy = MakePreflightGateFlight();
+    unhealthy.sensors_health = ~(1U << 2U);  // 除 MAG 外全置位
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, unhealthy, 300ms))
+        << "不健康快照应连续被 Topic 接收";
+    ASSERT_TRUE(WaitForWarningBit(harness.status_subscription,
+                                  kWarningPreflightSensorUnhealthy, 1500ms)
+                    .has_value())
+        << "用例前提：健康位掉线达 hold 后 bit11 应亮（拒绝锁存已建立）";
+
+    // 健康位恢复：`EvaluatePreflightGate` 在恢复那一拍清掉拒绝锁存。
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, MakePreflightGateFlight(),
+                              300ms))
+        << "恢复快照应连续被 Topic 接收";
+    // 清掉旧的 65013，下面的 WaitForState 才能证明"受理后新发布了 S3 状态"。
+    while (harness.status_subscription.TryTake().has_value()) {
+    }
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(202))) << "65014 应被 Topic 接收";
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "恢复后 65014 必须回 65015";
+    EXPECT_NE(ack->reason, common::MissionAssignmentReason::kSensorUnhealthy)
+        << "健康位恢复后不得再按 kSensorUnhealthy 拒绝（锁存必须解除）";
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kAccepted)
+        << "恢复后其余预检项均满足，应正常受理";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming, 2000ms)
+                    .has_value())
+        << "受理后应按既有链路进入 S3 ARMING";
+}
+
+// 振动默认只告警：vibration_z 超 warn 阈值（默认 20）→ 65013 bit12(4096) 亮，
+// 但 block 阈值默认 0（不阻断），65014 照常受理、reason 不得是 kVibrationHigh。
+TEST(MissionStateMachineTest,
+     PreflightGate_VibrationWarnOnlyKeepsAssignmentAccepted) {
+    auto config = MakeTakeoffTestConfig();
+    config.preflight_gate.vibration_hold = 100ms;
+    EXPECT_DOUBLE_EQ(config.preflight_gate.vibration_warn_mps2, 20.0)
+        << "本用例前提：告警阈值保持默认 20 m/s²";
+    EXPECT_DOUBLE_EQ(config.preflight_gate.vibration_block_mps2, 0.0)
+        << "本用例前提：阻断阈值保持默认 0（只告警不阻断）";
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true))
+        << "夹具应启动并进入 S2 READY";
+
+    constexpr uint32_t kWarningVibrationHigh = 1U << 12U;  // 4096
+    auto vibrating = MakePreflightGateFlight();
+    vibrating.vibration_valid = true;
+    vibrating.vibration_z = 25.0f;  // ≥ warn 20
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, vibrating, 300ms))
+        << "振动快照应连续被 Topic 接收";
+    const auto warned = WaitForWarningBit(
+        harness.status_subscription, kWarningVibrationHigh, 1500ms);
+    ASSERT_TRUE(warned.has_value())
+        << "振动超 warn 阈值后 65013 bit12(4096) 应亮";
+    EXPECT_EQ(warned->active_warning_bits & kWarningVibrationHigh,
+              kWarningVibrationHigh)
+        << "bit12 的值必须是 1U<<12 = 4096";
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(203))) << "65014 应被 Topic 接收";
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "65014 必须回 65015";
+    EXPECT_NE(ack->result, common::MissionAssignmentResult::kRejected)
+        << "振动只告警：默认配置下不得因振动拒绝受理";
+    EXPECT_NE(ack->reason, common::MissionAssignmentReason::kVibrationHigh)
+        << "默认 vibration_block_mps2=0 不得回 kVibrationHigh";
+    EXPECT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming, 2000ms)
+                    .has_value())
+        << "只告警不阻断：受理后应照常进入 S3 ARMING";
+}
+
+// 显式启用阻断（block=30 > warn=20）：vibration_z 超阻断阈值并持续 hold →
+// 65014 被拒，reason=kVibrationHigh(24)、保持 S2 READY、不发落飞控命令。
+TEST(MissionStateMachineTest,
+     PreflightGate_VibrationBlockRejectsWhenConfigured) {
+    auto config = MakeTakeoffTestConfig();
+    config.preflight_gate.vibration_block_mps2 = 30.0;  // >0 才真的拒绝
+    config.preflight_gate.vibration_hold = 100ms;
+    AssignmentHarness harness(config);
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true))
+        << "夹具应启动并进入 S2 READY";
+
+    auto vibrating = MakePreflightGateFlight();
+    vibrating.vibration_valid = true;
+    vibrating.vibration_z = 35.0f;  // ≥ block 30
+    ASSERT_TRUE(FeedFlightFor(harness.flight_topic, vibrating, 300ms))
+        << "振动快照应连续被 Topic 接收";
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(204))) << "65014 应被 Topic 接收";
+    const auto ack = WaitForAssignmentAck(harness.ack_subscription);
+    ASSERT_TRUE(ack.has_value()) << "被拒也要回 65015";
+    EXPECT_EQ(ack->result, common::MissionAssignmentResult::kRejected)
+        << "振动超阻断阈值并持续 hold 时必须拒绝分配";
+    EXPECT_EQ(ack->reason, common::MissionAssignmentReason::kVibrationHigh)
+        << "reason 必须是 kVibrationHigh(24)";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "预检拒绝不得离开 S2 READY";
+    EXPECT_EQ(harness.sender.CallCount(), 0U)
+        << "被拒的分配不得发出任何落飞控命令";
+}
+
+// PX4 拒绝解锁（400 ARM ACK 非 ACCEPTED）→ 65015 aborted 的 reason 必须是
+// kPreflightFailed(6)：旧实现错报 kArmTimeout(9)，现场只能猜"是不是超时"。
+// 装配与 `TakeoffArmTimeoutAbortsWithoutRetry` 相同，只把"等超时"换成"ACK 拒绝"。
+TEST(MissionStateMachineTest,
+     PreflightGate_ArmRejectionReportsPreflightFailed) {
+    AssignmentHarness harness(
+        MakeTakeoffTestConfig(/*lead=*/100ms, /*mode=*/2000ms,
+                              /*arm=*/300ms, /*height=*/3000ms));
+    ASSERT_TRUE(harness.Start(/*with_control=*/true,
+                              /*with_estimation=*/true))
+        << "夹具应启动并进入 S2 READY";
+
+    ASSERT_TRUE(harness.Send(MakeAssignment(205))) << "65014 应被 Topic 接收";
+    ASSERT_TRUE(WaitForState(harness.status_subscription,
+                             common::MissionState::kArming)
+                    .has_value())
+        << "受理后应进入 S3 ARMING";
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 1))
+        << "176(DO_SET_MODE) 应已入队";
+    ASSERT_TRUE(PublishFlight(harness.flight_topic,
+                              MakeOffboardFlight(/*armed=*/false,
+                                                 /*landed=*/true)))
+        << "Offboard 快照应被 Topic 接收";
+    ASSERT_TRUE(WaitForCallCount(harness.sender, 2)) << "400(ARM) 应已入队";
+
+    // MAV_RESULT=1（TEMPORARILY_REJECTED）：PX4 预检/健康检查拒绝解锁。
+    harness.sender.SimulateAck(400U, /*result=*/1U, TestMonotonicMs());
+
+    const auto aborted = WaitForAckWithResult(
+        harness.ack_subscription,
+        common::MissionAssignmentResult::kCancelledOrAborted);
+    ASSERT_TRUE(aborted.has_value()) << "ARM 被拒后应回 65015 aborted";
+    EXPECT_EQ(aborted->reason,
+              common::MissionAssignmentReason::kPreflightFailed)
+        << "PX4 拒绝解锁必须回 kPreflightFailed(6)，不得再错报成 kArmTimeout(9)";
+    EXPECT_NE(aborted->reason, common::MissionAssignmentReason::kArmTimeout)
+        << "拒绝解锁不是超时（arm=300ms 远未到）";
+    EXPECT_EQ(aborted->availability, common::MissionAvailability::kReady)
+        << "地面中止后应恢复可调度（状态确定，不进 unavailable）";
+    EXPECT_EQ(harness.machine.CurrentState(), common::MissionState::kReady)
+        << "地面中止后应回 S2 READY";
+    EXPECT_EQ(harness.sender.CallCount(), 2U)
+        << "失败不重发 400（未 armed 也不补 DISARM）";
+}
+
 }  // namespace
