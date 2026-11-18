@@ -1,0 +1,48 @@
+# Git 文本属性与行尾约定
+#
+# 背景：Windows 侧编辑器（CLion 等）曾把项目自有文件的行尾由 LF 改写为 CRLF，
+# 产生大量「忽略空白后 diff 为空」的假改动（见 docs/开发进度.md 遗留事项），
+# 淹没真实改动并干扰代码评审。本文件用声明式规则把行尾固定下来，防止再次发生。
+#
+# 约定：
+#   1. 项目自有文本文件统一以 LF 存入仓库，检出时也保持 LF；
+#   2. third_party/ 为原样入库的第三方源码，保持上游原始行尾、不做任何转换，
+#      以免制造误导性的全量 diff 和后续升级上游时的合并冲突。
+
+# --- 默认：自动识别文本，统一 LF ---
+* text=auto eol=lf
+
+# --- 二进制资产：禁止文本转换，不参与逐行 diff ---
+*.rknn  binary
+*.onnx  binary
+*.pt    binary
+*.so    binary
+*.a     binary
+*.o     binary
+*.gz    binary
+*.tar   binary
+*.zip   binary
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.bmp   binary
+*.h264  binary
+*.h265  binary
+*.mp4   binary
+
+# 无扩展名的二进制文件（固件/可执行体）
+videoPart/rknn_update/rknn_server binary
+videoPart/yolo26-rknn/runtime/Linux/rknn_server/aarch64/usr/bin/rknn_server binary
+
+# 排查提示：在 WSL2 的 /mnt/*（drvfs）上，git status 会把仅 mtime 变化、
+# 内容未变的文件误报为 modified（git update-index --refresh 也会持续报 needs update）。
+# 判断是否真的改动一律以 `git diff` 是否为空为准；对该文件执行一次 `git add` 即可刷新索引。
+
+# --- 第三方源码：保持上游原样，不做任何行尾转换 ---
+# 注意：third_party/spdlog/ 自带的 .gitattributes 写的是 `* text=false`，
+#   而 git 只把 `-text` 识别为“禁止转换”，`text=false` 会退化成“未定义”，
+#   届时父级的 `eol=lf` 就会接管并把 spdlog 全部改写为 LF。
+#   因此这里必须同时 `-text -eol`，把 text 和 eol 两个属性都显式取消，
+#   才能真正做到第三方源码字节不变。
+#   （同一文件多条规则时后出现的规则优先，故本规则置于文件末尾。）
+third_party/** -text -eol

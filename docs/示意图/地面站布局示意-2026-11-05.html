@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>地面站布局示意（浅色·室外可读）</title>
+<!--
+  配色基线：tools/web平台/src/styles.css 的「Light web application theme」段
+  （--bg #f5f7fa / --panel #fff / --line #e4e7ed / --primary #409eff /
+    --success #67c23a / --warning #e6a23c / --danger #f56c6c / 文字 #303133 #606266 #909399）。
+
+  室外可读规则（2026-11-05 反馈：原深色版在户外看不清）：
+  1. 底色全部换成白/浅灰，正文用深色 #303133（白底对比 ≈ 12:1）；
+  2. Element 的 --el-color-warning(#e6a23c) / danger(#f56c6c) / success(#529b2e) 在
+     白底上对比只有 2.2~3.6:1，室外屏幕反光时读不出，故**只用于色块与描边**，
+     文字一律改用深一档的 ink 变量（#b45309 4.9:1 / #c0392b 5.2:1 / #3d7a1f 5.1:1）；
+  3. 主色 #409eff 白底对比 2.8:1，同理：色块/图标用 #409eff，文字与主按钮底用 #1677d2（4.6:1）。
+  布局尺寸（顶栏 58 / 上下文条 40 / 指标条 38）与深色版完全一致，本次只换色。
+  2026-11-05 评审后三处修正（尺寸仍不变）：
+  1. 告警中心由「顶栏下拉」改为「地图右下角卡片」——下拉实测会压住上下文条 34px、指标条 38px、
+     并盖住视频浮窗标题 45×53px，且与触发它的 chip 相隔 184px；
+  2. 侧栏机队说明行改 S5/S7 缩写 + nowrap/ellipsis——原文在 163px 内折成两行、卡片被撑高；
+  3. 顶栏补回站点真实存在的 .flight-badge，并把「更多」折叠点写明为 1280（站点 ≤1260 隐藏该徽标）。
+  2026-11-05 第四次修订（⑤ + 落地范围 1A）：
+  4. 告警条只负责提醒——「立即返航」移出横幅，只留 继续等待 / 稍后提醒 60 s / 查看；
+     危险动作只保留在上下文条与右下卡片（卡片行内「返航」首点变「确认返航 · 3 s」）。
+  5. 告警条出现期间，顶栏 chip 降级为「圆点 + 计数」，同一句提示不再重复。
+  6. 按 1A 全量范围补全：MissionStrip（自动任务）并入 侧栏标题「就绪 N」+ 上下文条「#12 执行中」；
+     position-strip（75 px、7 格）删除，改为地图左下坐标条（站点 MapPanel 已有 .map-coordinates）。
+-->
+<style>
+  /* ========== 室外可读 token ========== */
+  :root {
+    --bg: #f5f7fa;          /* 页面底（= 站点 --bg） */
+    --panel: #ffffff;       /* 卡片/面板（= 站点 --panel） */
+    --line: #e4e7ed;        /* 常规分隔线 */
+    --line-strong: #dcdfe6; /* 描边（比缺省更深一档，室外更清楚） */
+    --ink: #303133;         /* 正文 */
+    --ink-2: #606266;       /* 次要文字 */
+    --ink-3: #909399;       /* 弱文字 */
+    --ink-4: #a8abb2;       /* 极弱文字 */
+    --fill-primary: #409eff;   /* 主色块 */
+    --fill-success: #67c23a;
+    --fill-warning: #e6a23c;
+    --fill-danger: #f56c6c;
+    --ink-primary: #1677d2;    /* 白底上的主色文字/按钮底 4.6:1 */
+    --ink-success: #3d7a1f;    /* 5.1:1 */
+    --ink-warning: #b45309;    /* 4.9:1 */
+    --ink-danger: #c0392b;     /* 5.2:1 */
+    --tint-primary: #ecf5ff;
+    --tint-success: #f0f9eb;
+    --tint-warning: #fdf6ec;
+    --tint-danger: #fef0f0;
+    --shadow-card: 0 2px 10px rgba(31, 45, 61, .05);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); }
+  body { font-family: "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif; color: var(--ink-2); }
+  .mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
+
+  .screen {
+    position: relative; width: 1440px; height: 900px; overflow: hidden;
+    display: flex; background: radial-gradient(1200px 700px at 70% -10%, #ffffff 0%, #f7f9fc 55%, #f2f5f9 100%);
+    margin-bottom: 24px; border: 1px solid var(--line);
+  }
+
+  /* ---------- 侧栏 ---------- */
+  .sidebar { width: 210px; flex: 0 0 210px; border-right: 1px solid var(--line); padding: 14px 12px; display: flex; flex-direction: column; gap: 12px; background: var(--panel); box-shadow: 2px 0 10px rgba(31, 45, 61, .04); }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .brand-mark { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, #79bbff, #409eff); }
+  .brand b { display: block; font-size: 14px; letter-spacing: .08em; color: var(--ink); }
+  .brand small { font-size: 9px; letter-spacing: .12em; color: var(--ink-4); }
+  .nav-item { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 10px; border-radius: 8px; font-size: 13px; color: var(--ink-2); }
+  .nav-item.active { background: var(--tint-primary); color: var(--ink-primary); border: 1px solid #d9ecff; box-shadow: inset 3px 0 var(--fill-primary); }
+  .fleet-title { font-size: 11px; color: var(--ink-3); letter-spacing: .08em; margin-top: 6px; }
+  .fleet-item { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+  .fleet-item b { color: var(--ink); font-size: 13px; }
+  /* 侧栏宽度固定 210，说明行必须单行截断：用 S5/S7 缩写，超长才省略号 */
+  .fleet-item small { color: var(--ink-3); display: block; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+  .dot.green { background: var(--fill-success); } .dot.amber { background: var(--fill-warning); } .dot.red { background: var(--fill-danger); } .dot.grey { background: #c0c4cc; }
+
+  /* ---------- 主区 ---------- */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  /* 顶栏：高 58，单行不换行，标题与按钮都不压缩 */
+  .topbar { height: 58px; flex: 0 0 58px; display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--line); background: rgba(255, 255, 255, .94); }
+  .title-block { flex: 0 0 auto; white-space: nowrap; }
+  .title-block .eyebrow { font-size: 9px; letter-spacing: .14em; color: var(--ink-4); }
+  .title-block h1 { margin: 0; font-size: 20px; line-height: 1.1; color: var(--ink); letter-spacing: .04em; white-space: nowrap; }
+  .spacer { flex: 1 1 auto; min-width: 8px; }
+
+  .chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; border: 1px solid var(--line-strong); background: #f4f4f5; color: var(--ink-2); }
+  .chip.ok { border-color: #c2e7b0; background: var(--tint-success); color: var(--ink-success); }
+  .chip.off { border-color: #f3d19e; background: var(--tint-warning); color: var(--ink-warning); }
+  .chip.alert { border-color: var(--fill-warning); background: var(--tint-warning); color: var(--ink-warning); cursor: pointer; }
+  .chip.alert .badge { background: var(--fill-warning); color: #fff; border-radius: 999px; padding: 0 6px; font-size: 10px; line-height: 15px; }
+  /* 展开态：面板在右下角时，靠 chip 自身的高亮表达“就是我打开的”，不做跨屏连线 */
+  .chip.alert.active { box-shadow: 0 0 0 3px rgba(230, 162, 60, .18); }
+  .chip.alert .caret { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid currentColor; opacity: .75; }
+  /* 告警条出现时 chip 降级为「圆点 + 计数」：同一句话只出现一次，还省约 80 px 顶栏宽度 */
+  .chip.alert.compact { padding: 0 8px; gap: 7px; }
+  .chip.alert.compact .badge { padding: 0 5px; }
+
+  /* 站点顶栏里的当前机徽标（App.vue .flight-badge）；≤1260 px 由站点媒体查询自动隐藏 */
+  .flight-badge { flex: 0 0 auto; height: 26px; padding: 0 9px; display: inline-flex; align-items: center; white-space: nowrap; font-size: 11px; color: var(--ink-2); background: #f4f4f5; border: 1px solid var(--line-strong); border-radius: 4px; }
+
+  .btn { flex: 0 0 auto; height: 30px; padding: 0 12px; border-radius: 6px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; border: 1px solid var(--line-strong); background: var(--panel); color: var(--ink-2); }
+  .btn.primary { border-color: var(--ink-primary); background: var(--ink-primary); color: #fff; }
+  .btn.ghost { border-color: var(--line-strong); color: var(--ink-3); }
+  .btn .caret { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid currentColor; opacity: .8; }
+  .clock { flex: 0 0 auto; font-size: 12px; color: var(--ink-2); letter-spacing: .04em; }
+
+  /* 选中飞机上下文条：动作按钮带机名，消除“对谁生效”的歧义 */
+  .contextbar { height: 40px; flex: 0 0 40px; display: flex; align-items: center; gap: 10px; padding: 0 14px; background: #fafbfd; border-bottom: 1px solid var(--line); font-size: 12px; }
+  .contextbar .who { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .contextbar .who small { color: var(--ink-3); font-weight: 400; }
+  .pill { height: 22px; padding: 0 8px; border-radius: 999px; font-size: 10px; display: inline-flex; align-items: center; background: var(--tint-primary); color: var(--ink-primary); border: 1px solid #d9ecff; }
+
+  /* 紧凑状态条：替代 4 张留白很大的指标卡 */
+  .metricbar { height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 0; padding: 0 6px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .metric { flex: 1 1 0; display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 24px; border-right: 1px solid #ebeef5; min-width: 0; }
+  .metric:last-child { border-right: none; }
+  .metric .k { font-size: 10px; color: var(--ink-3); letter-spacing: .06em; white-space: nowrap; }
+  .metric .v { font-size: 13px; color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .metric .n { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .metric .v.green { color: var(--ink-success); } .metric .v.amber { color: var(--ink-warning); } .metric .v.red { color: var(--ink-danger); }
+
+  /* 主体区 */
+  .body { flex: 1; display: flex; gap: 10px; padding: 10px 12px 104px; min-height: 0; }
+  /* 地图：与站点 #mission-map (#eef2f6) 一致，浅底深灰网格 */
+  .map { flex: 1; border-radius: 10px; border: 1px solid var(--line-strong); position: relative; overflow: hidden;
+         background:
+           radial-gradient(600px 300px at 30% 30%, rgba(64, 158, 255, .07), transparent 70%),
+           repeating-linear-gradient(0deg, rgba(96, 98, 102, .07) 0 1px, transparent 1px 46px),
+           repeating-linear-gradient(90deg, rgba(96, 98, 102, .07) 0 1px, transparent 1px 46px),
+           linear-gradient(160deg, #f2f6fa 0%, #eef2f6 45%, #e9eef4 100%); }
+  .map-tag { position: absolute; left: 12px; top: 10px; font-size: 11px; color: var(--ink-2); background: rgba(255, 255, 255, .94); border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 8px; }
+  /* 地图底左坐标条：替掉原来 75 px 高的 position-strip（站点 MapPanel 也有 .map-coordinates，
+     但站点用的是深色玻璃 rgba(15,23,42,.68)，室外建议同这里一样改白底） */
+  .map-coords { position: absolute; left: 12px; bottom: 12px; display: flex; gap: 8px; font-size: 11px; color: var(--ink-2); }
+  .map-coords span { background: rgba(255, 255, 255, .94); border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 8px; white-space: nowrap; }
+  .map-coords b { color: var(--ink); font-weight: 600; }
+  .polygon { position: absolute; left: 22%; top: 26%; width: 46%; height: 46%; border: 2px dashed var(--fill-primary); transform: skewY(-6deg); border-radius: 6px; background: rgba(64, 158, 255, .07); }
+  .polygon span { position: absolute; left: 10px; top: -22px; font-size: 10px; color: var(--ink-primary); }
+  .plane { position: absolute; left: 47%; top: 47%; width: 16px; height: 16px; transform: rotate(-24deg); }
+  .plane::before { content: ""; position: absolute; inset: 0; background: var(--ink-primary); clip-path: polygon(50% 0, 100% 100%, 50% 72%, 0 100%); }
+  /* 视频浮窗：站点在地图上用的是深色玻璃底（视频画面本身是暗的），保持深底以保证画面观感 */
+  .video { position: absolute; right: 12px; top: 42px; width: 320px; height: 300px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, .28); background: rgba(15, 23, 42, .78); display: flex; flex-direction: column; box-shadow: 0 18px 42px rgba(31, 45, 61, .22); overflow: hidden; color: #e5eef8; }
+  .video .vh { height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; font-size: 11px; color: #cbd5e1; border-bottom: 1px solid rgba(255, 255, 255, .14); }
+  .video .body2 { flex: 1; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: 12px; }
+  .video .vf { height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 8px; border-top: 1px solid rgba(255, 255, 255, .12); }
+
+  /* 告警中心：不再是顶栏下拉（下拉会同时压住上下文条、指标条和视频浮窗），
+     改为「地图右下角可展开卡片」——锚在地图内，天然避开右上视频浮窗与顶部信息条。
+     落地时它挂在地图容器里，写 right:12px; bottom:12px；
+     示意页的 .main 未定位、绝对定位落在 .screen 上，故这里用 24/117 换算成距地图右下角各 12px。 */
+  .alert-panel { position: absolute; right: 24px; bottom: 117px; width: 340px; max-height: 320px; overflow: auto; background: var(--panel); border: 1px solid #f3d19e; border-top: 3px solid var(--fill-warning); border-radius: 10px; box-shadow: 0 -6px 26px rgba(31, 45, 61, .18); }
+  .alert-panel .ap-h { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; font-size: 12px; color: var(--ink-warning); background: var(--tint-warning); border-bottom: 1px solid #f3d19e; }
+  .alert-panel .ap-h .x { cursor: pointer; opacity: .75; padding: 0 2px; }
+  .alert-row { display: flex; gap: 10px; padding: 10px 12px; border-bottom: 1px solid #ebeef5; font-size: 12px; }
+  .alert-row:last-child { border-bottom: none; }
+  .alert-row b { color: var(--ink); }
+  .alert-row small { display: block; color: var(--ink-3); margin-top: 3px; line-height: 1.5; }
+  .alert-row .act { margin-left: auto; display: flex; flex-direction: column; gap: 6px; }
+  .mini { height: 22px; padding: 0 8px; font-size: 11px; border-radius: 5px; border: 1px solid var(--line-strong); background: var(--panel); color: var(--ink-2); white-space: nowrap; }
+  .mini.danger { border-color: #f5c2c2; background: var(--tint-danger); color: var(--ink-danger); }
+
+  /* 弹窗 */
+  .mask { position: absolute; inset: 0; background: rgba(0, 0, 0, .35); }
+
+  /* 非模态告警条：自动出现，但不遮挡地图、不拦鼠标 */
+  .banner { height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 10px; padding: 0 14px; font-size: 12px; color: var(--ink-warning); background: var(--tint-warning); border-bottom: 1px solid #f3d19e; }
+  .banner .ico { width: 16px; height: 16px; border-radius: 50%; background: #fbe6c8; border: 1px solid var(--fill-warning); color: var(--ink-warning); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+  .banner b { color: var(--ink); }
+  .banner .sep { color: #d9b98f; }
+  .banner .more { color: var(--ink-warning); text-decoration: underline dotted; cursor: pointer; white-space: nowrap; }
+  .banner .spacer2 { flex: 1; }
+  .banner .x { color: var(--ink-warning); opacity: .8; cursor: pointer; margin-left: 2px; }
+  .dialog { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 520px; background: var(--panel); border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: 0 30px 70px rgba(31, 45, 61, .22); overflow: hidden; }
+  .dialog .dh { display: flex; align-items: center; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .dialog .dh b { font-size: 15px; color: var(--ink); }
+  .dialog .dh .warn { width: 22px; height: 22px; border-radius: 50%; background: var(--tint-warning); border: 1px solid var(--fill-warning); color: var(--ink-warning); display: flex; align-items: center; justify-content: center; font-size: 13px; }
+  .dialog .db { padding: 14px 16px; font-size: 13px; color: var(--ink-2); line-height: 1.7; }
+  .dialog .db table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+  .dialog .db td { padding: 6px 8px; border-top: 1px solid #ebeef5; color: var(--ink-3); }
+  .dialog .db td b { color: var(--ink); font-weight: 600; }
+  .dialog .df { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+
+  /* 说明条 */
+  .legend { position: absolute; left: 0; right: 0; bottom: 0; height: 102px; background: rgba(255, 255, 255, .97); border-top: 1px solid var(--line); padding: 10px 16px; font-size: 12px; color: var(--ink-2); display: grid; grid-template-columns: 1fr 1fr; gap: 4px 22px; }
+  .legend b { color: var(--ink); }
+  .num { display: inline-flex; width: 16px; height: 16px; border-radius: 50%; background: var(--fill-primary); color: #fff; font-size: 10px; font-weight: 700; align-items: center; justify-content: center; margin-right: 6px; }
+  .callout { position: absolute; width: 16px; height: 16px; border-radius: 50%; background: var(--fill-primary); color: #fff; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 3px rgba(64, 158, 255, .22); }
+  /* 行内编号：紧贴被标注的元素，避免绝对定位跑到别处 */
+  .badge-in { display: inline-flex; width: 15px; height: 15px; border-radius: 50%; background: var(--fill-primary); color: #fff; font-size: 10px; font-weight: 700; align-items: center; justify-content: center; margin-left: 6px; vertical-align: middle; flex: 0 0 auto; }
+</style>
+</head>
+<body>
+
+<!-- ================== 方案一：主界面 ================== -->
+<div class="screen" id="screen1">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div><b>AEROLINK</b><small>PX4 GROUND STATION</small></div>
+    </div>
+    <div class="nav-item active">◆ 任务态势</div>
+    <div class="nav-item">≣ 运行日志</div>
+    <div class="nav-item">⚙ 系统设置</div>
+    <div class="fleet-title">飞机选择 · 1 · 就绪 1</div>
+    <div class="fleet-item" style="border-color:#409eff;background:#ecf5ff">
+      <div style="display:flex;align-items:center"><b>捕网-01</b><span style="margin-left:auto" class="dot amber"></span></div>
+      <small>25:1 · S5 · 未发现目标</small>
+    </div>
+  </aside>
+
+  <div class="main">
+    <!-- 顶栏：单行、不换行、标题不被压缩 -->
+    <header class="topbar">
+      <div class="title-block">
+        <div class="eyebrow">CONTROL CENTER /</div>
+        <h1>任务态势</h1>
+      </div>
+      <span class="badge-in">1</span>
+      <div class="chip ok"><span class="dot green"></span>SITL-5761 已连接</div>
+      <div class="chip alert">⚠ 未发现目标<span class="badge">1</span></div>
+      <span class="badge-in">2</span>
+      <div class="flight-badge">捕网-01 · SAFE · 就绪</div>
+      <div class="spacer"></div>
+      <div class="clock mono">23:58:23</div>
+      <button class="btn">任务调度</button>
+      <button class="btn">共享区域</button>
+      <button class="btn ghost">更多 <span class="caret"></span></button>
+      <span class="badge-in">3</span>
+      <button class="btn primary">连接设备</button>
+    </header>
+
+    <!-- 选中飞机上下文条：动作按钮带机名 -->
+    <div class="contextbar">
+      <div class="who"><span class="dot green"></span>捕网-01 <small>25:1 · 组件 25 / 系统 1</small></div>
+      <span class="pill">GPS_APPROACH（S5）</span>
+      <span class="pill" style="background:#fdf6ec;border-color:#f3d19e;color:#b45309">已到点 20 s · 视觉未锁定</span>
+      <span class="pill" style="background:#f4f4f5;border-color:#dcdfe6;color:#606266">#12 执行中 · 目标 T7</span>
+      <div class="spacer"></div>
+      <button class="btn" style="border-color:#f5c2c2;background:#fef0f0;color:#c0392b">返航 · 捕网-01</button>
+      <span class="badge-in">4</span>
+      <button class="btn ghost">重置 · 捕网-01</button>
+    </div>
+
+    <!-- 紧凑状态条：替代 4 张指标卡 -->
+    <div class="metricbar">
+      <div class="metric"><span class="k">GPS</span><span class="v green">3D FIX</span><span class="n">12 星 · HDOP 0.9</span></div>
+      <div class="metric"><span class="k">电量</span><span class="v green mono">78%</span><span class="n">22.4 V · 3.1 A</span></div>
+      <div class="metric"><span class="k">模式</span><span class="v">OFFBOARD</span><span class="n">已解锁</span></div>
+      <div class="metric"><span class="k">链路</span><span class="v green">ONLINE</span><span class="n">SITL-5761 · 3491 PKTS</span></div>
+      <span class="badge-in" style="margin-right:10px">5</span>
+    </div>
+
+    <div class="body">
+      <div class="map">
+        <div class="map-tag">任务卫星地图 · WGS84</div>
+        <div class="polygon"><span>区域 1 v1 · 越界后：中止任务返航</span></div>
+        <div class="plane"></div>
+        <!-- 坐标条：替掉原来的 position-strip（75 px、7 格），只留飞行必需项 -->
+        <div class="map-coords"><span>LAT <b>30.1234567°</b></span><span>LON <b>120.1234567°</b></span><span>REL <b>62.4</b> m</span><span>MSL <b>71.8</b> m</span><span>HDG <b>274</b>°</span></div>
+        <!-- 视频保持“悬浮在地图上”的原设计，不占独立列 -->
+        <div class="video">
+          <div class="vh"><span>实时视频 · 捕网-01</span><span class="dot red"></span></div>
+          <div class="body2">等待图传画面</div>
+          <div class="vf"><button class="mini">播放</button><button class="mini">重连</button><button class="mini">全屏</button></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="legend">
+      <div><span class="num">1</span><b>顶栏单行不换行</b>：标题定宽、chip 与按钮 <span class="mono">nowrap</span>；折叠点 1280，<span class="mono">&lt;1280</span> 把「任务调度 / 共享区域」收进「更多」。</div>
+      <div><span class="num">2</span><b>告警 chip</b>：只放一个聚合 chip；告警条出现期间降级为「圆点 + 计数 <b>●2</b>」，同一句提示不重复出现。</div>
+      <div><span class="num">3</span><b>低频操作收进「更多」</b>：捕网发射 / 系统状态 / 断开连接等；「连接设备」保持主色常驻。</div>
+      <div><span class="num">4</span><b>动作按钮带机名</b>：返航只出现在<b>上下文条</b>与<b>右下卡片</b>（都明确指向一架），横幅不放危险按钮。</div>
+      <div><span class="num">5</span><b>指标区改紧凑条</b>：4 张卡（86px）+ 自动任务条 + 75px 坐标条 → 38px 状态条 + 地图底坐标条；就绪数进侧栏标题、活动分配进上下文条。</div>
+      <div style="grid-column:2"><b>保留</b>：地图 / 视频 / 机队位置不变。<br /><b>配色</b>：站点浅色主题，白底上黄/红文字深一档 <span class="mono">#b45309 / #c0392b</span>。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ================== 方案二：多机告警 ================== -->
+<div class="screen" id="screen2">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"></div><div><b>AEROLINK</b><small>PX4 GROUND STATION</small></div></div>
+    <div class="nav-item active">◆ 任务态势</div>
+    <div class="nav-item">≣ 运行日志</div>
+    <div class="nav-item">⚙ 系统设置</div>
+    <div class="fleet-title">飞机选择 · 3 · 就绪 2</div>
+    <div class="fleet-item" style="border-color:#f3d19e;background:#fdf6ec">
+      <div style="display:flex;align-items:center"><b>捕网-01</b><span style="margin-left:auto" class="dot amber"></span></div>
+      <small>25:1 · S5 · 未发现目标 20s</small>
+    </div>
+    <div class="fleet-item">
+      <div style="display:flex;align-items:center"><b>捕网-02</b><span style="margin-left:auto" class="dot green"></span></div>
+      <small>26:1 · S7 · 视觉跟踪中</small>
+    </div>
+    <div class="fleet-item" style="border-color:#f5c2c2;background:#fef0f0">
+      <div style="display:flex;align-items:center"><b>捕网-03</b><span style="margin-left:auto" class="dot red"></span></div>
+      <small>27:1 · S5 · 未发现目标 95s</small>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="title-block"><div class="eyebrow">CONTROL CENTER /</div><h1>任务态势</h1></div>
+      <div class="chip ok"><span class="dot green"></span>SITL-5761 已连接</div>
+      <div class="chip alert active compact" title="2 架未发现目标"><span class="dot amber"></span><span class="badge">2</span></div>
+      <div class="flight-badge">捕网-01 · ARMED · 就绪</div>
+      <div class="spacer"></div>
+      <div class="clock mono">00:04:11</div>
+      <button class="btn">任务调度</button>
+      <button class="btn">共享区域</button>
+      <button class="btn ghost">更多 <span class="caret"></span></button>
+      <button class="btn primary">连接设备</button>
+    </header>
+
+    <!-- 告警条：自动出现，但不弹窗、不遮地图、不拦鼠标 -->
+    <div class="banner">
+      <span class="ico">!</span>
+      <span><b>捕网-01</b> 已到目标点，<b>20 s</b> 未发现视觉目标</span>
+      <span class="sep">|</span>
+      <button class="mini">继续等待</button>
+      <button class="mini">稍后提醒 60 s</button>
+      <button class="mini">查看</button>
+      <span class="spacer2"></span>
+      <span class="more">还有 1 架：捕网-03 95 s ›</span>
+      <span class="x">✕</span>
+    </div>
+
+    <div class="contextbar">
+      <div class="who"><span class="dot amber"></span>捕网-01 <small>25:1</small></div>
+      <span class="pill">GPS_APPROACH（S5）</span>
+      <span class="pill" style="background:#fdf6ec;border-color:#f3d19e;color:#b45309">已到点 20 s · 视觉未锁定</span>
+      <span class="pill" style="background:#f4f4f5;border-color:#dcdfe6;color:#606266">#12 执行中 · 目标 T7</span>
+      <div class="spacer"></div>
+      <button class="btn" style="border-color:#f5c2c2;background:#fef0f0;color:#c0392b">返航 · 捕网-01</button>
+      <button class="btn ghost">重置 · 捕网-01</button>
+    </div>
+
+    <div class="metricbar">
+      <div class="metric"><span class="k">GPS</span><span class="v green">3D FIX</span><span class="n">14 星 · HDOP 0.8</span></div>
+      <div class="metric"><span class="k">电量</span><span class="v green mono">72%</span><span class="n">22.1 V · 4.6 A</span></div>
+      <div class="metric"><span class="k">模式</span><span class="v">OFFBOARD</span><span class="n">已解锁</span></div>
+      <div class="metric"><span class="k">链路</span><span class="v green">ONLINE</span><span class="n">SITL-5761 · 5820 PKTS</span></div>
+    </div>
+
+    <div class="body">
+      <div class="map">
+        <div class="map-tag">任务卫星地图 · WGS84</div>
+        <div class="polygon"><span>区域 1 v1 · 越界后：中止任务返航</span></div>
+        <div class="plane"></div>
+        <!-- 坐标条：替掉原来的 position-strip（75 px、7 格），只留飞行必需项 -->
+        <div class="map-coords"><span>LAT <b>30.1234567°</b></span><span>LON <b>120.1234567°</b></span><span>REL <b>63.1</b> m</span><span>MSL <b>72.5</b> m</span><span>HDG <b>277</b>°</span></div>
+        <!-- 视频保持“悬浮在地图上”的原设计，不占独立列 -->
+        <div class="video">
+          <div class="vh"><span>实时视频 · 捕网-01</span><span class="dot red"></span></div>
+          <div class="body2">等待图传画面</div>
+          <div class="vf"><button class="mini">播放</button><button class="mini">重连</button><button class="mini">全屏</button></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 告警中心：地图右下角可展开卡片（不用顶栏下拉，避免压住信息条与视频浮窗） -->
+    <div class="alert-panel">
+      <div class="ap-h"><span>⚠ 未发现目标 · 2 架</span><span class="mono" style="font-size:10px;opacity:.8">点条目标题切换飞机 <span class="x">✕</span></span></div>
+      <div class="alert-row">
+        <div><b>捕网-01</b> <span style="color:#b45309;font-weight:600">20 s</span><small>已到目标点，视觉未锁定</small></div>
+        <div class="act"><button class="mini">查看</button><button class="mini danger">返航</button></div>
+      </div>
+      <div class="alert-row">
+        <div><b>捕网-03</b> <span style="color:#c0392b;font-weight:600">95 s</span><small>已到目标点，视觉未锁定</small></div>
+        <div class="act"><button class="mini">查看</button><button class="mini danger">返航</button></div>
+      </div>
+    </div>
+
+    <div class="mask" style="display:none"></div>
+    <div class="legend">
+      <div><b>角标</b>：小圆点 + 一行说明（黄=等待、红=超时更久、绿=正常）；说明行 <span class="mono">nowrap+ellipsis</span>，状态写 S5/S7 缩写，全称放上下文条。</div>
+      <div><b>聚合 chip（降级态）</b>：告警条在时只显示「●2」不再重复文字；点开即右下卡片，chip 自身高亮表达关联。</div>
+      <div><b>告警条只提醒、不动手</b>：38 px、横在地图上，按钮只有「继续等待 / 稍后提醒 60 s / 查看」；危险动作一律不上横幅。</div>
+      <div><b>处置在右下卡片</b>：从地图右下角展开（限高 320 px、内部滚动），不压信息条、不盖视频浮窗；行内「返航」首点变「确认返航 · 3 s」。</div>
+      <div><b>动作只作用于该机</b>：走 <span class="mono">/api/aircraft/25/1/return-home</span>，与现有单机返航链路一致。</div>
+      <div><b>关掉告警条</b>：静默到状态变化或 60 s 后（按 飞机 + 状态进入时间 去重）。</div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

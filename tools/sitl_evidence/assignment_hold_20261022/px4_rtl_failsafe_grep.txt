@@ -1,0 +1,3 @@
+33:WARN  [health_and_arming_checks] Preflight Fail: ekf2 missing data
+34:WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS
+52:pxh> WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS

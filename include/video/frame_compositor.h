@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "common/latency_statistics.h"
 #include "common/topic.h"
 #include "common/types.h"
 #include "video/video_frame.h"
@@ -44,6 +45,7 @@ struct CompositorConfig {
     std::vector<std::string> class_names{"UAV", "OBS"};
     /// 当前解码帧比最近检测帧领先超过该数量时清除旧框；25fps 下默认约 400ms。
     std::uint64_t max_detection_frame_lag = 10;
+    bool collect_detailed_latency = true;  ///< 中间阶段延迟统计；false=只留ingress→标注输出链（探针首尾模式）
 };
 
 /// 视频帧叠加器。
@@ -84,6 +86,9 @@ public:
     std::uint64_t DroppedFrameCount() const;
     /// 累计错误次数。
     std::uint64_t ErrorCount() const;
+    common::LatencySummary InputQueueLatency() const;
+    common::LatencySummary ComposeLatency() const;
+    common::LatencySummary IngressToAnnotatedLatency() const;
 
 private:
     struct Impl;

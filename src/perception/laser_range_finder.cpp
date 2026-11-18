@@ -11,6 +11,9 @@
 
 namespace drone::perception {
 
+// 数据流：串口 → 厂商协议解析 → LaserRangeSample Topic。
+// Stub 仅占位生命周期与输出主题，真实串口读取与协议解析在实现期接入。
+
 LaserRangeFinderStub::LaserRangeFinderStub() {
     SPDLOG_INFO("激光测距部件骨架创建");
 }

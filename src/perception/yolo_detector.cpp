@@ -37,6 +37,9 @@ namespace drone::perception {
 
 namespace {
 
+// 检测数据流：解码帧 Topic → 独立推理线程 → IDetectionBackend → 每目标一条 DetectionResult。
+// 后端通过依赖注入隔离 RKNN 与开发机 Mock，检测器本身不绑定具体硬件。
+
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
     return count == 1 || count % 100 == 0;
@@ -54,17 +57,27 @@ std::int64_t SteadyNowMs() {
 // 默认后端工厂（条件编译）：
 // - DRONE_HAVE_RKNN 且模型路径非空 → RKNN 后端（香橙派）
 // - 否则返回 nullptr，由调用方注入或 Start 失败
+// 按编译选项创建默认后端：香橙派启用 RKNN 时创建真实后端，开发机返回空指针，
+// 测试或其它平台应通过构造函数注入 IDetectionBackend。
 std::unique_ptr<IDetectionBackend> CreateDefaultDetectionBackend(
-    const std::string& model_path, float conf_threshold, float nms_threshold) {
+    const std::string& model_path, float conf_threshold, float nms_threshold,
+    const std::string& npu_core_mode, bool collect_npu_internal_perf,
+    bool collect_npu_perf_detail, bool collect_detailed_latency) {
 #ifdef DRONE_HAVE_RKNN
     if (!model_path.empty()) {
-        return std::make_unique<RknnDetectionBackend>(model_path, conf_threshold,
-                                                      nms_threshold);
+        return std::make_unique<RknnDetectionBackend>(
+            model_path, conf_threshold, nms_threshold, npu_core_mode,
+            collect_npu_internal_perf, collect_npu_perf_detail,
+            collect_detailed_latency);
     }
 #else
     (void)model_path;
     (void)conf_threshold;
     (void)nms_threshold;
+    (void)npu_core_mode;
+    (void)collect_npu_internal_perf;
+    (void)collect_npu_perf_detail;
+    (void)collect_detailed_latency;
 #endif
     return nullptr;
 }
@@ -81,6 +94,12 @@ struct YoloDetector::Impl {
         }
         if (this->config.nms_threshold < 0.f || this->config.nms_threshold > 1.f) {
             throw std::invalid_argument("YOLO NMS 阈值必须在 [0,1]");
+        }
+        const auto& mode = this->config.npu_core_mode;
+        if (mode != "auto" && mode != "core0" && mode != "core01" &&
+            mode != "core012" && mode != "all") {
+            throw std::invalid_argument(
+                "YOLO npu_core_mode仅支持auto/core0/core01/core012/all");
         }
     }
 
@@ -100,14 +119,23 @@ struct YoloDetector::Impl {
     common::Topic<video::FrameHandle>::Subscription input_sub;
     common::Topic<video::FrameHandle>* input_topic = nullptr;  // SetInput 记录，重启时重新订阅
     common::Topic<common::DetectionResult> detection_output;
+    // 帧级单目标观测输出：每个成功推理帧一条（允许无目标）。
+    common::Topic<common::VisualTargetObservation> observation_output;
 
     // 统计
     std::atomic<uint64_t> processed_count{0};
     std::atomic<uint64_t> error_count{0};
     std::atomic<uint64_t> sequence{0};
+    std::atomic<uint64_t> observation_count{0};
+    std::atomic<uint64_t> detected_observation_count{0};
+    std::atomic<uint64_t> observation_sequence{0};
     std::atomic<float> avg_inference_ms{0.f};
+    common::LatencyStatistics input_queue_latency;
+    common::LatencyStatistics inference_latency;
+    common::LatencyStatistics ingress_to_inference_latency;
 
     /// 更新推理平均耗时（EMA）。
+    // α=0.1 在响应近期变化和抑制单帧抖动之间折中，不保存完整历史样本。
     void UpdateAvg(float elapsed_ms) {
         constexpr float kAlpha = 0.1f;
         float current = avg_inference_ms.load();
@@ -117,6 +145,7 @@ struct YoloDetector::Impl {
     }
 
     /// 检测线程主循环。
+    // 订阅队列采用有限等待，Stop 重置订阅后线程能及时从等待中退出。
     void DetectLoop() {
         while (!stop_requested.load()) {
             auto message = input_sub.WaitTakeFor(std::chrono::milliseconds(100));
@@ -135,9 +164,15 @@ struct YoloDetector::Impl {
                 continue;
             }
 
-            // 推理
+            // 推理：后端只返回原图坐标系检测框，检测器负责计时和消息格式转换。
             std::vector<BackendDetection> detections;
             const auto start = std::chrono::steady_clock::now();
+            const std::int64_t start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                start.time_since_epoch()).count();
+            if (config.collect_detailed_latency && frame.Info().timestamp_ms > 0) {
+                input_queue_latency.Add(
+                    static_cast<double>(start_ms - frame.Info().timestamp_ms));
+            }
             try {
                 detections = backend->Detect(frame);
             } catch (const std::exception& e) {
@@ -151,9 +186,19 @@ struct YoloDetector::Impl {
             const float elapsed_ms =
                 std::chrono::duration<float, std::milli>(end - start).count();
             UpdateAvg(elapsed_ms);
+            if (config.collect_detailed_latency) {
+                inference_latency.Add(elapsed_ms);
+            }
+            if (frame.Info().pipeline_ingress_time_ms > 0) {
+                const auto end_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end.time_since_epoch()).count();
+                ingress_to_inference_latency.Add(static_cast<double>(
+                    end_ms - frame.Info().pipeline_ingress_time_ms));
+            }
             ++processed_count;
 
-            // 发布检测结果：每个目标一条消息，共享帧序号与推理耗时
+            // 发布检测结果：每个目标一条消息，共享帧序号与推理耗时。
+            // 一帧无目标时不发布消息，由叠加器/融合模块按帧序号处理“无检测”。
             const std::uint64_t frame_sequence = frame.Info().sequence;
             const std::int64_t source_time_ms = frame.Info().timestamp_ms;
             for (const auto& d : detections) {
@@ -175,9 +220,51 @@ struct YoloDetector::Impl {
                 result.inference_time_ms = elapsed_ms;
                 (void)detection_output.Emplace(std::move(result));
             }
+
+            // 帧级单目标观测：每个成功推理的帧发布且仅发布一条，允许无目标。
+            // 解码帧会被输入队列丢弃，因此下游只能靠本消息区分
+            // “本帧确实没有目标” 与 “本帧还没推理完”。
+            // 当前按“单目标”约定取置信度最高者，不做ID关联或NMS后重选。
+            const BackendDetection* primary = nullptr;
+            for (const auto& d : detections) {
+                if (primary == nullptr || d.confidence > primary->confidence) {
+                    primary = &d;
+                }
+            }
+
+            common::VisualTargetObservation observation;
+            observation.header.sequence = observation_sequence.fetch_add(1) + 1;
+            observation.header.source_time_ms =
+                static_cast<std::uint64_t>(source_time_ms);
+            observation.header.receive_time_ms =
+                static_cast<std::uint64_t>(SteadyNowMs());
+            observation.frame_sequence = frame_sequence;
+            observation.candidate_count =
+                static_cast<std::uint32_t>(detections.size());
+            observation.frame_width = frame.Info().width;
+            observation.frame_height = frame.Info().height;
+            observation.inference_time_ms = elapsed_ms;
+            if (primary != nullptr) {
+                observation.detected = true;
+                observation.class_id = static_cast<std::uint32_t>(primary->class_id);
+                observation.confidence = primary->confidence;
+                observation.bbox_x = primary->x1;
+                observation.bbox_y = primary->y1;
+                observation.bbox_w = primary->x2 - primary->x1;
+                observation.bbox_h = primary->y2 - primary->y1;
+                observation.center_pixel_x = (primary->x1 + primary->x2) * 0.5f;
+                observation.center_pixel_y = (primary->y1 + primary->y2) * 0.5f;
+            }
+            const bool detected = observation.detected;
+            (void)observation_output.Emplace(std::move(observation));
+            ++observation_count;
+            if (detected) {
+                ++detected_observation_count;
+            }
         }
     }
 
+    // 停止顺序：设置停止标志 → Reset 输入订阅唤醒线程 → join，保证后端不被并发访问。
     void Stop() {
         if (!thread.joinable()) {
             return;
@@ -193,13 +280,20 @@ YoloDetector::YoloDetector(YoloDetectorConfig config,
     if (backend == nullptr) {
         backend = CreateDefaultDetectionBackend(config.model_path,
                                                 config.conf_threshold,
-                                                config.nms_threshold);
+                                                config.nms_threshold,
+                                                config.npu_core_mode,
+                                                config.collect_npu_internal_perf,
+                                                config.collect_npu_perf_detail,
+                                                config.collect_detailed_latency);
     }
     impl_ = std::make_unique<Impl>(std::move(config), std::move(backend));
-    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} 后端={}",
+    SPDLOG_INFO("YOLO 检测器创建: 模型={} 置信度阈值={} NMS阈值={} 订阅队列={} NPU核心={} 内部性能统计={} 逐层性能报告={} 细分延迟统计={} 后端={}",
                 impl_->config.model_path.empty() ? "(注入后端)" : impl_->config.model_path,
                 impl_->config.conf_threshold, impl_->config.nms_threshold,
-                impl_->config.input_queue_capacity,
+                impl_->config.input_queue_capacity, impl_->config.npu_core_mode,
+                impl_->config.collect_npu_internal_perf,
+                impl_->config.collect_npu_perf_detail,
+                impl_->config.collect_detailed_latency,
                 impl_->backend != nullptr ? "已配置" : "缺失(启动将失败)");
 }
 
@@ -210,6 +304,7 @@ YoloDetector::~YoloDetector() {
     SPDLOG_INFO("YOLO 检测器销毁");
 }
 
+// 启动必须先确认后端存在且 Load 成功，避免无后端时线程空转；加载失败只记录一次。
 bool YoloDetector::Start() {
     if (impl_->thread.joinable()) {
         return true;  // 已启动，幂等
@@ -264,8 +359,20 @@ common::Topic<common::DetectionResult>& YoloDetector::DetectionOutput() {
     return impl_->detection_output;
 }
 
+common::Topic<common::VisualTargetObservation>& YoloDetector::ObservationOutput() {
+    return impl_->observation_output;
+}
+
 uint64_t YoloDetector::ProcessedFrameCount() const {
     return impl_->processed_count.load();
+}
+
+uint64_t YoloDetector::ObservationCount() const {
+    return impl_->observation_count.load();
+}
+
+uint64_t YoloDetector::DetectedObservationCount() const {
+    return impl_->detected_observation_count.load();
 }
 
 float YoloDetector::InferenceTimeMsAvg() const {
@@ -274,6 +381,23 @@ float YoloDetector::InferenceTimeMsAvg() const {
 
 uint64_t YoloDetector::ErrorCount() const {
     return impl_->error_count.load();
+}
+
+common::LatencySummary YoloDetector::InputQueueLatency() const {
+    return impl_->input_queue_latency.Snapshot();
+}
+
+common::LatencySummary YoloDetector::InferenceLatency() const {
+    return impl_->inference_latency.Snapshot();
+}
+
+common::LatencySummary YoloDetector::IngressToInferenceLatency() const {
+    return impl_->ingress_to_inference_latency.Snapshot();
+}
+
+DetectionBackendLatencySnapshot YoloDetector::BackendLatencySnapshot() const {
+    return impl_->backend != nullptr ? impl_->backend->LatencySnapshot()
+                                     : DetectionBackendLatencySnapshot{};
 }
 
 }  // namespace drone::perception

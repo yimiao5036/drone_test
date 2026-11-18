@@ -1,7 +1,8 @@
 # MediaMTX 配置（香橙派版）—— 图传 RTSP 服务器 中转方案
 #
-# 架构：香橙派程序把处理后的流「推」到本机 mediamtx(127.0.0.1:8554/drone_out)，
-#       mediamtx 对外发布 rtsp://<香橙派IP>:8554/drone_out，供任意图传/地面端「拉取」。
+# 架构：香橙派程序把处理后的流「推」到本机 mediamtx。
+#       图传路径与地面站二元身份绑定，例如捕网-01为 127.0.0.1:8554/drone_25_1，
+#       mediamtx 对外发布 rtsp://<香橙派IP>:8554/drone_25_1，供任意图传/地面端「拉取」。
 # 作用：
 #   - 香橙派程序无需依赖思翼专用接口，只推给本机 mediamtx；
 #   - 换图传设备 = 不改香橙派代码/配置，只要新设备支持 RTSP 拉流即可。
@@ -26,11 +27,17 @@ srt: false
 moq: false
 
 paths:
-  # 香橙派程序推流的目标路径（对应 config.json 的 video.output_rtsp 尾部 /drone_out）
-  # source: publisher 表示由推流方(香橙派程序)主动发布
-  drone_out:
+  # 香橙派程序推流的目标路径与身份绑定：drone_<component>_<system>。
+  # 当前生产默认捕网-01为 /drone_25_1；火箭-01为 /drone_26_1。
+  # source: publisher 表示由推流方(香橙派程序)主动发布。
+  drone_25_1:
     source: publisher
     # 允许多个接收端(图传/地面端)同时拉取，无上限
+    maxReaders: 0
+
+  # 兼容旧版路径，调试旧地面端时可继续使用；正式多机不要再依赖该固定名称。
+  drone_out:
+    source: publisher
     maxReaders: 0
 
   # 备用/调试路径：也可推 live 便于本机用 VLC/ffplay 验证

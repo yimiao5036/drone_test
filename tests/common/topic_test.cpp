@@ -1,8 +1,10 @@
 #include "common/topic.h"
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -86,6 +88,38 @@ TEST(TopicTest, SubscriptionUsesRaIIToUnsubscribe) {
 TEST(TopicTest, RejectsZeroCapacitySubscription) {
     Topic<int> topic;
     EXPECT_THROW(topic.Subscribe(0), std::invalid_argument);
+}
+
+// 停机路径回归：Reset() 常在线程 join 之前调用以唤醒阻塞的消费者（见各模块
+// Stop()），历史上它与 TryTake/WaitTakeFor 并发访问 Subscription::state_ 构成
+// data race。本用例让消费线程持续取消息、主线程并发 Reset，要求不崩溃且 Reset
+// 后句柄失效；建议在 TSan/ASan 构建中运行以覆盖该竞争。
+TEST(TopicTest, ResetIsSafeWhileAnotherThreadConsumes) {
+    Topic<int> topic;
+    auto subscription = topic.Subscribe(4);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> taken{0};
+    std::thread consumer([&subscription, &stop, &taken] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (subscription.TryTake().has_value()) {
+                taken.fetch_add(1, std::memory_order_relaxed);
+            }
+            (void)subscription.WaitTakeFor(1ms);
+        }
+    });
+
+    for (int i = 0; i < 2000; ++i) {
+        (void)topic.Emplace(i);
+    }
+    subscription.Reset();  // 与消费线程的 TryTake/WaitTakeFor 并发
+    stop.store(true, std::memory_order_relaxed);
+    consumer.join();
+
+    EXPECT_FALSE(subscription.IsOpen());
+    EXPECT_FALSE(subscription.TryTake().has_value());
+    EXPECT_EQ(topic.SubscriberCount(), 0U);
+    EXPECT_GE(taken.load(std::memory_order_relaxed), 0);
 }
 
 }  // namespace

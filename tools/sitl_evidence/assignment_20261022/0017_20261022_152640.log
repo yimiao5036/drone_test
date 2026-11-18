@@ -1,0 +1,35 @@
+[2026-10-22 15:26:40.362] [info] [t:13122] 异步文件日志已初始化: logs/0017_20261022_152640.log (等级=info)
+[2026-10-22 15:26:40.362] [info] [t:13122] PX4 通信部件创建: firmware=1.17.0 transport=udp:127.0.0.1:14540 onboard=1/191 target=1/1 mavlink=2
+[2026-10-22 15:26:40.363] [info] [t:13122] 飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线+控制权三态+Home 围栏已接入）
+[2026-10-22 15:26:40.364] [info] [t:13122] UDP 传输打开: udp:127.0.0.1:14540
+[2026-10-22 15:26:40.365] [info] [t:13122] PX4 通信启动: transport=udp:127.0.0.1:14540
+[2026-10-22 15:26:40.365] [info] [t:13122] 飞行控制器启动: period=50ms intent_timeout=300ms coast_timeout=1000ms bootstrap_timeout=6000ms feedforward=off cap=2.00m/s
+[2026-10-22 15:26:40.977] [info] [t:13125] PX4 心跳已连接: source=1/1 mode=6/0 armed=false
+[2026-10-22 15:26:40.977] [info] [t:13125] PX4 遥测请求已入队: one_shot=3 intervals=9
+[2026-10-22 15:26:40.979] [info] [t:13125] PX4 电池参数读取完成: BAT_LOW_THR=15.0% COM_LOW_BAT_ACT=0
+[2026-10-22 15:26:40.979] [info] [t:13125] PX4 固件版本上报: reported=1.17.0 configured=1.17.0 capabilities=59647
+[2026-10-22 15:26:40.981] [info] [t:13125] PX4 命令 ACK: sequence=1 command=512 result=0 internal=true progress=0
+[2026-10-22 15:26:40.985] [info] [t:13125] PX4 命令 ACK: sequence=2 command=512 result=0 internal=true progress=0
+[2026-10-22 15:26:40.989] [info] [t:13125] PX4 命令 ACK: sequence=3 command=512 result=0 internal=true progress=0
+[2026-10-22 15:26:40.997] [info] [t:13125] PX4 命令 ACK: sequence=4 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.005] [info] [t:13125] PX4 命令 ACK: sequence=5 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.013] [info] [t:13125] PX4 命令 ACK: sequence=6 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.021] [info] [t:13125] PX4 命令 ACK: sequence=7 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.029] [info] [t:13125] PX4 命令 ACK: sequence=8 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.037] [info] [t:13125] PX4 命令 ACK: sequence=9 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.045] [info] [t:13125] PX4 命令 ACK: sequence=10 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.053] [info] [t:13125] PX4 命令 ACK: sequence=11 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:41.061] [info] [t:13125] PX4 命令 ACK: sequence=12 command=511 result=0 internal=true progress=0
+[2026-10-22 15:26:42.981] [info] [t:13125] PX4 命令 ACK: sequence=13 command=176 result=0 internal=false progress=0
+[2026-10-22 15:26:43.001] [info] [t:13125] PX4 命令 ACK: sequence=14 command=400 result=0 internal=false progress=0
+[2026-10-22 15:26:44.015] [warning] [t:13126] 飞行控制器控制权迁移: IDLE -> ACTIVE (授权链全通)
+[2026-10-22 15:27:04.146] [warning] [t:13126] 飞行控制器拒绝意图(意图持有期超龄): 累计=1
+[2026-10-22 15:27:04.146] [warning] [t:13126] 飞行控制器控制权迁移: ACTIVE -> COAST (意图持有期超龄)
+[2026-10-22 15:27:05.196] [warning] [t:13126] 飞行控制器控制权迁移: COAST -> IDLE (COAST 超时)
+[2026-10-22 15:27:06.912] [info] [t:13125] PX4 命令 ACK: sequence=15 command=176 result=0 internal=false progress=0
+[2026-10-22 15:27:14.456] [info] [t:13125] PX4 命令 ACK: sequence=16 command=400 result=0 internal=false progress=0
+[2026-10-22 15:27:14.946] [info] [t:13122] 飞行控制器停止: setpoint_count=366 rejected_intent_count=1
+[2026-10-22 15:27:14.948] [info] [t:13125] PX4 通信线程停止，连接状态置为断开
+[2026-10-22 15:27:14.948] [info] [t:13122] UDP 传输关闭: udp:127.0.0.1:14540
+[2026-10-22 15:27:14.948] [info] [t:13122] PX4 通信停止: transport=udp:127.0.0.1:14540
+[2026-10-22 15:27:14.948] [info] [t:13122] PX4 通信部件销毁: transport=udp:127.0.0.1:14540

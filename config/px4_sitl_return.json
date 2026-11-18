@@ -1,0 +1,226 @@
+{
+    "log": {
+        "dir": "logs/",
+        "level": "info"
+    },
+    "visual_tracking": {
+        "_comment": "2026-10-14 新增：G3/stage4-tune 的 SITL 侧控制律配置（缺席时落到头文件默认值，distance PID=0/0/0 距离通道不工作——必须整节存在）。整定工作值，终值以 config/config.json 为准；camera 为 2026-09-23 左目标定实测内参（1280x720 档）",
+        "control": {
+            "frequency_hz": 10.0,
+            "visual_stale_ms": 200,
+            "distance_stale_ms": 500,
+            "attitude_stale_ms": 300
+        },
+        "camera": {
+            "image_width": 1280,
+            "image_height": 720,
+            "fx_px": 1007.82,
+            "fy_px": 1008.02,
+            "cx_px": 620.73,
+            "cy_px": 532.07
+        },
+        "heading": {
+            "mode": "rate",
+            "gain": 0.9,
+            "yaw_rate_limit_dps": 30.0,
+            "yaw_slew_limit_dps2": 60.0
+        },
+        "vertical": {
+            "vz_gain_mps_per_deg": 0.1,
+            "vz_limit_mps": 2.0
+        },
+        "distance": {
+            "d_exp_m": 10.0,
+            "kp": 0.5,
+            "ki": 0.05,
+            "kd": 0.1,
+            "integral_limit": 2.0,
+            "derivative_filter_coef": 0.2,
+            "approach_velocity_limit_mps": 3.0,
+            "retreat_velocity_limit_mps": 1.0,
+            "no_distance_action": "slow_approach",
+            "no_distance_approach_limit_mps": 0.5,
+            "no_distance_exit_grace_ms": 3000
+        },
+        "accel_limit": {
+            "ax_mps2": 2.0,
+            "ay_mps2": 2.0,
+            "az_mps2": 1.5
+        },
+        "shadow": {
+            "frequency_hz": 20.0,
+            "virtual_attitude_when_absent": true,
+            "summary_log_interval_ms": 10000
+        }
+    },
+    "px4": {
+        "transport": "udp",
+        "onboard_system_id": 1,
+        "onboard_component_id": 191,
+        "firmware_version": "1.17.0",
+        "target_system_id": 1,
+        "target_component_id": 1,
+        "mavlink_version": 2,
+        "heartbeat_send_interval_ms": 1000,
+        "heartbeat_timeout_ms": 3000,
+        "telemetry_timeout_ms": 2000,
+        "state_publish_interval_ms": 100,
+        "command_ack_timeout_ms": 1000,
+        "setpoint_send_interval_ms": 40,
+        "setpoint_timeout_ms": 500,
+        "setpoint_queue_capacity": 4,
+        "command_queue_capacity": 16,
+        "one_shot_message_requests": [
+            148,
+            242,
+            49
+        ],
+        "message_interval_requests": [
+            {
+                "message_id": 1,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 24,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 30,
+                "interval_us": 100000
+            },
+            {
+                "message_id": 32,
+                "interval_us": 100000
+            },
+            {
+                "message_id": 33,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 65,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 147,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 245,
+                "interval_us": 500000
+            },
+            {
+                "message_id": 49,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 141,
+                "interval_us": 200000
+            },
+            {
+                "message_id": 230,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 241,
+                "interval_us": 1000000
+            },
+            {
+                "message_id": 132,
+                "interval_us": 100000
+            }
+        ],
+        "serial": {
+            "device": "/dev/ttyS1",
+            "baud_rate": 115200,
+            "data_bits": 8,
+            "stop_bits": 1,
+            "parity": "N",
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "udp": {
+            "bind_address": "127.0.0.1",
+            "bind_port": 14540,
+            "remote_address": "127.0.0.1",
+            "remote_port": 14580,
+            "read_timeout_ms": 20,
+            "write_timeout_ms": 100
+        },
+        "reconnect_interval_ms": 1000
+    },
+    "interception": {
+        "enabled": true,
+        "auto_authorize": true,
+        "enter_s9_lock_frames": 10,
+        "min_range_m": 2.0,
+        "max_range_m": 12.0,
+        "min_battery_percent": 0.0,
+        "authorization_timeout_ms": 1000
+    },
+    "return_home": {
+        "enabled": true,
+        "altitude_m": 5.0,
+        "arrival_radius_m": 2.0,
+        "arrival_vertical_m": 0.5,
+        "arrival_speed_mps": 0.5,
+        "arrival_hold_ms": 1000,
+        "timeout_ms": 60000,
+        "fire_timeout_ms": 3000,
+        "command_retry_ms": 1000
+    },
+    "landing": {
+        "_comment": "本配置文件不含 runtime 节（enable_control=false，影子装配），因此 S13a 不会启用、S13 直接发 AUTO.LAND。此处保留 landing 节只为与 config/config.json 键集一致，便于原地切到控制装配做两段降落验证。",
+        "enabled": true,
+        "descend_target_ag_m": 1.2,
+        "descend_speed_mps": 0.8,
+        "descend_slow_speed_mps": 0.3,
+        "descend_slow_zone_m": 3.0,
+        "handover_alt_tolerance_m": 0.15,
+        "handover_vz_mps": 0.2,
+        "handover_horizontal_m": 0.5,
+        "handover_hold_ms": 500,
+        "descent_timeout_ms": 120000,
+        "baro_mismatch_m": 1.5,
+        "baro_mismatch_hold_ms": 2000,
+        "landed_max_agl_m": 1.0,
+        "landed_agl_timeout_ms": 3000
+    },
+    "estimator_guard": {
+        "_comment": "估计器降级判据与处置（2026-11-17 P3）：与 config/config.json 键集一致的默认值。本文件不含 runtime 节（只读运行、不注入命令接口），判据即便命中也无处切模式，保留本节点只为原地切到控制装配后行为一致。enabled=false 是唯一回滚开关；critical_sensor_mask=0=用模块默认；bad_estimator_flag_mask=0=关闭该判据（位语义未核对）。",
+        "enabled": true,
+        "z_jump_m": 0.5,
+        "z_jump_speed_margin_m": 0.1,
+        "xy_jump_m": 1.0,
+        "xy_jump_speed_margin_m": 0.3,
+        "ratio_limit": 1.0,
+        "ratio_hold_ms": 1000,
+        "baro_divergence_m": 1.5,
+        "baro_hold_ms": 2000,
+        "sensor_hold_ms": 1000,
+        "local_position_stale_ms": 500,
+        "critical_sensor_mask": 0,
+        "bad_estimator_flag_mask": 0
+    },
+    "preflight_gate": {
+        "_comment": "起飞前门禁（2026-11-18 H 项，维护者裁决）。只作用于 65014 任务分配预检：关键传感器（陀螺|加速度计|磁罗盘|AHRS）的 SYS_STATUS 健康位持续 sensor_health_hold_ms 掉线 → 拒绝分配（65015 reason=23 kSensorUnhealthy）。振动只告警不阻断：VIBRATION.vibration_z 是【加速度计高频指标】(m/s/s)，超过 vibration_warn_mps2 打 WARN + 65013 bit12；vibration_block_mps2>0 时才真的拒绝（reason=24 kVibrationHigh）。注意：VIBRATION 三个字段都不来自磁力计（x=陀螺锥动、y=陀螺高频、z=加速度计高频），所以振动不会污染罗盘；振动真正伤的是加速度计与 EKF 姿态/速度。PX4 自身没有振动 arming 门禁，常引用的 30 m/s² 出自ArduPilot 文档，事故当天为 5.24。罗盘方面本门禁只能抓『缺磁/无数据/磁故障』（健康位），抓不到『未校准』——那类由 PX4 在 ARM 时拒绝，我们把 STATUSTEXT 打进日志。",
+        "require_sensor_health": true,
+        "sensor_health_hold_ms": 1000,
+        "vibration_warn_mps2": 20.0,
+        "vibration_block_mps2": 0.0,
+        "vibration_hold_ms": 1000
+    },
+    "radar": {
+        "_comment": "测距雷达（2026-11-18 P5 软件侧，硬件后到）。AboveTakeoffM() 是唯一取高度出口：有效雷达 AGL → 气压 AGL → EKF 差分逐级退化，无效读数绝不填 0/max_distance。enabled=false 是回滚开关（与 P5 之前逐位一致）；装雷达后 enabled 与 preflight_required 一起打开（Validate 拒绝 preflight_required=true 而 enabled=false）。两处与设计稿不同的实现口径（2026-11-18 核对 PX4 源码后修正）：①不能用 SYS_STATUS.LASER_POSITION 做门禁——本版 PX4 的 mavlink/streams/SYS_STATUS.hpp 根本不填 bit8，永远为 0；雷达门禁改为判 DISTANCE_SENSOR 是否在报数（common::RadarAlive：收到过且时效内，**不判量程**——落在地上的下视测距必然在盲区，TFmini-S 最小 0.4 m，拿量程有效当起飞门禁等于任何时刻都拒绝起飞），PX4 侧要求装测距由参数 SYS_HAS_NUM_DIST 管。②signal_quality 不能按『0=未知就算差』处理——PX4 把驱动 quality<0（TFmini 与 SITL 的 gz 雷达都是）映射成 0，把 quality==0 映射成 1（invalid）；0 是『没有质量指标』，1 才是无效，2~100 才受 min_signal_quality 约束。超量程时 PX4 的 TFmini 驱动干脆不再发布本消息，所以 stale_ms 是超量程的主要防线。",
+        "enabled": false,
+        "preflight_required": false,
+        "min_signal_quality": 30,
+        "stale_ms": 200
+    },
+    "mission": {
+        "_comment": "任务级重置动作（2026-11-17 P4b）：与 config/config.json 键集一致的默认值。本文件不含 runtime 节（只读运行、不注入命令接口），65020 重置即便受理也无处发 246，保留本节点只为原地切到控制装配后行为一致。reset_reboot_px4=false 是唯一回滚开关（旧语义：只清状态直接回 S2）。**重启治标不治本**：罗盘/振动/EKF 参数问题重启后会再次出现，不修复硬件。",
+        "reset_reboot_px4": true,
+        "reboot_timeout_ms": 90000,
+        "reboot_retry": 3,
+        "reboot_min_interval_ms": 30000
+    }
+}

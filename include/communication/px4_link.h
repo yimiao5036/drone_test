@@ -6,10 +6,12 @@
  * 接收遥测并维护飞行状态快照（FlightStateSnapshot），发送 PX4 设定值
  * 与 MAVLink 命令并关联 ACK。只有本链路线程可以写飞控串口。
  *
- * 骨架期说明：
- * - 本接口为纯虚抽象，MAVLink 解析、ACK 关联与 PX4 版本适配在实现期接入。
- * - Px4LinkStub 为骨架占位实现：生命周期可运行，业务方法记录
- *   "未实现"节流日志并返回默认值。
+ * 当前实现阶段：
+ * - Px4Link 已实现独占串口线程、MAVLink 1/2 心跳、连接超时、版本与飞行遥测快照；
+ * - 可靠命令队列、ACK、安全遥测请求和本地 NED 设定值已实现；
+ * - 串口连续读错误时关闭端口并按 reconnect_interval 自动重开（UDP 不重连）；
+ *   断链期间发布 connected=false 快照，控制器授权链随之停发；
+ * - Px4LinkStub 继续保留用于骨架冒烟测试。
  *
  * 数据流：
  *   common::Topic<Px4Setpoint>（飞行控制器）──► IPx4Link ──► PX4 串口
@@ -18,18 +20,47 @@
  */
 #pragma once
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "common/topic.h"
 #include "common/types.h"
+#include "communication/communication_transport.h"
 
 namespace drone::communication {
 
-/// PX4 通信部件抽象接口。
-class IPx4Link {
+/// 窄命令发送接口：仅暴露 SendCommand 与 ACK 计数，供状态机在
+/// enable_control=true 时注入（装配期物理隔离；false 时不注入）。
+class IPx4CommandSender {
 public:
-    virtual ~IPx4Link() = default;
+    virtual ~IPx4CommandSender() = default;
 
+    /// 发送 MAVLink 命令（解锁/起飞/返航等）。
+    /// @param mavlink_command MAV_CMD 常量值（实现期用 mavlink 库常量，骨架期传数值）。
+    /// @param params 命令参数 param1~param7。
+    /// @return 是否成功入队发送。
+    virtual bool SendCommand(uint16_t mavlink_command, float param1, float param2,
+                             float param3, float param4, float param5,
+                             float param6, float param7) = 0;
+    /// ACK 匹配成功次数。
+    virtual uint64_t AckMatchCount() const = 0;
+    /// ACK 超时次数。
+    virtual uint64_t AckTimeoutCount() const = 0;
+    /// 最近 ACK/超时状态快照（线程安全）。
+    virtual common::CommandAckStatus AckStatus() const = 0;
+    /// 清空排队与在途命令（故障处置）；返回后不再发送旧命令。
+    /// 仅置取消标志，由链路通信线程在下一次循环执行清空；
+    /// 已写入串口的命令无法撤回，最迟在下一次读超时后生效。
+    virtual void CancelPendingCommands() = 0;
+};
+
+/// PX4 通信部件抽象接口。
+class IPx4Link : public IPx4CommandSender {
+public:
     // ---- 生命周期 ----
     /// 启动通信（打开串口、启动收发线程）。返回是否成功启动。
     virtual bool Start() = 0;
@@ -48,26 +79,94 @@ public:
     /// 飞行状态快照输出主题：common::FlightStateSnapshot。
     virtual common::Topic<common::FlightStateSnapshot>& StateOutput() = 0;
 
-    // ---- 命令 ----
-    /// 发送 MAVLink 命令（解锁/起飞/返航等）。
-    /// @param mavlink_command MAV_CMD 常量值（实现期用 mavlink 库常量，骨架期传数值）。
-    /// @param params 命令参数 param1~param7。
-    /// @return 是否成功入队发送。
-    virtual bool SendCommand(uint16_t mavlink_command, float param1, float param2,
-                             float param3, float param4, float param5,
-                             float param6, float param7) = 0;
+    /// 最近发布的飞行状态快照拷贝（只读门禁用；未发布过时返回默认快照，
+    /// connected=false）。线程安全。
+    virtual common::FlightStateSnapshot LatestState() const = 0;
 
     // ---- 状态查询 ----
     /// 累计发送设定值帧数。
     virtual uint64_t SetpointSendCount() const = 0;
     /// 累计接收消息数。
     virtual uint64_t ReceiveCount() const = 0;
-    /// ACK 匹配成功次数。
-    virtual uint64_t AckMatchCount() const = 0;
-    /// ACK 超时次数。
-    virtual uint64_t AckTimeoutCount() const = 0;
     /// 累计错误次数。
     virtual uint64_t ErrorCount() const = 0;
+};
+
+/// MAV_CMD_SET_MESSAGE_INTERVAL 请求项。
+struct MavlinkMessageIntervalRequest {
+    uint32_t message_id = 0;
+    int32_t interval_us = 0;
+};
+
+/// PX4 MAVLink 链路配置。设备名、身份和周期均由 JSON 注入，禁止在实现中写死。
+struct Px4LinkConfig {
+    std::string transport = "serial";  ///< serial 或 udp
+    SerialPortConfig serial;
+    UdpTransportConfig udp;
+    std::string firmware_version = "1.17.0";  ///< 当前适配目标，用于日志与版本核验
+    uint8_t onboard_system_id = 1;
+    uint8_t onboard_component_id = 191;  ///< MAV_COMP_ID_ONBOARD_COMPUTER
+    uint8_t target_system_id = 1;
+    uint8_t target_component_id = 1;     ///< MAV_COMP_ID_AUTOPILOT1
+    uint8_t mavlink_version = 2;         ///< 1 或 2
+    std::chrono::milliseconds heartbeat_send_interval{1000};
+    std::chrono::milliseconds heartbeat_timeout{3000};
+    std::chrono::milliseconds telemetry_timeout{2000};
+    std::chrono::milliseconds state_publish_interval{100};
+    /// 串口连续读错误后关闭端口的重试周期（仅 transport=serial；UDP 不重连）。
+    std::chrono::milliseconds reconnect_interval{1000};
+    std::chrono::milliseconds command_ack_timeout{1000};
+    std::chrono::milliseconds setpoint_send_interval{50};
+    std::chrono::milliseconds setpoint_timeout{500};
+    /// 电池参数（BAT_LOW_THR/COM_LOW_BAT_ACT）未读到时按此周期重发请求。
+    std::chrono::milliseconds parameter_request_interval{1000};
+    /// 连接建立后超过该时长仍无有效电池参数，保持 valid=false 并节流告警。
+    std::chrono::milliseconds parameter_timeout{5000};
+    std::size_t setpoint_queue_capacity = 4;
+    std::size_t command_queue_capacity = 16;
+    std::vector<uint32_t> one_shot_message_requests;
+    std::vector<MavlinkMessageIntervalRequest> message_interval_requests;
+
+    void Validate() const;
+};
+
+/// PX4 真实通信实现：独占串口线程，心跳、版本、飞行遥测与新鲜度快照。
+class Px4Link final : public IPx4Link {
+public:
+    explicit Px4Link(Px4LinkConfig config);
+    ~Px4Link() override;
+
+    Px4Link(const Px4Link&) = delete;
+    Px4Link& operator=(const Px4Link&) = delete;
+
+    bool Start() override;
+    void Stop() override;
+    bool IsRunning() const override;
+    bool IsConnected() const override;
+
+    void SetInput(common::Topic<common::Px4Setpoint>& setpoint) override;
+    common::Topic<common::FlightStateSnapshot>& StateOutput() override;
+
+    bool SendCommand(uint16_t mavlink_command, float param1, float param2,
+                     float param3, float param4, float param5,
+                     float param6, float param7) override;
+
+    common::FlightStateSnapshot LatestState() const override;
+
+    uint64_t SetpointSendCount() const override;
+    uint64_t ReceiveCount() const override;
+    uint64_t AckMatchCount() const override;
+    uint64_t AckTimeoutCount() const override;
+    common::CommandAckStatus AckStatus() const override;
+    void CancelPendingCommands() override;
+    uint64_t ErrorCount() const override;
+
+    /// 指定 MAVLink message ID 的累计接收数（用于硬件 smoke 诊断）。
+    uint64_t MessageReceiveCount(uint32_t message_id) const;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 /// 骨架占位实现：生命周期完整，业务方法打印"未实现"节流日志并返回默认值。
@@ -92,10 +191,14 @@ public:
                      float param3, float param4, float param5,
                      float param6, float param7) override;
 
+    common::FlightStateSnapshot LatestState() const override;
+
     uint64_t SetpointSendCount() const override;
     uint64_t ReceiveCount() const override;
     uint64_t AckMatchCount() const override;
     uint64_t AckTimeoutCount() const override;
+    common::CommandAckStatus AckStatus() const override;
+    void CancelPendingCommands() override;
     uint64_t ErrorCount() const override;
 
 private:

@@ -31,7 +31,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 
@@ -40,6 +40,9 @@ extern "C" {
 namespace drone::video_transmission {
 
 namespace {
+
+// FFmpeg 编码后端数据流：NV12 FrameHandle → 编码输入帧 → 编码包 → RTSP/mpegts。
+// rkmpp 路径直接接收 NV12；libx264/libx265 路径先转换为 YUV420P。
 
 /// 异常日志节流：第 1 次与每满 100 次才打印，避免高频异常刷屏。
 bool ShouldLogThrottled(std::uint64_t count) {
@@ -56,11 +59,15 @@ std::string AvErrorToString(int errnum) {
 }  // namespace
 
 /// 编码后端实现细节（PIMPL）：FFmpeg 编码上下文与 RTSP 输出会话。
+// PIMPL 资源持有者：统一管理编码器、封装器、帧/包缓冲和软编转换上下文。
+// 所有方法由 VideoSender 单线程调用，因此内部不额外加锁。
 struct VideoEncoderImpl {
     EncoderBackendConfig config;
     std::atomic<uint64_t> sent_count{0};
     std::atomic<uint64_t> error_count{0};
     std::atomic<bool> running{false};
+    common::LatencyStatistics frame_prepare_latency;
+    common::LatencyStatistics packet_write_latency;
 
     // FFmpeg 状态
     AVFormatContext* format_ctx_ = nullptr;   // RTSP 输出封装上下文
@@ -76,6 +83,7 @@ struct VideoEncoderImpl {
     bool is_file_ = false;   // mpegts 文件输出：由封装器自理 SPS/PPS，不手动拼 extradata
     std::int64_t frame_counter_ = 0;  // 单调递增帧序号（编码输入 PTS）
 
+    // 构造阶段只校验静态配置，不打开网络会话；真正的 FFmpeg 资源在 Start 中创建。
     explicit VideoEncoderImpl(EncoderBackendConfig cfg) : config(std::move(cfg)) {
         if (config.url.empty()) {
             throw std::invalid_argument("图传推送地址 url 不能为空");
@@ -94,8 +102,74 @@ struct VideoEncoderImpl {
 
     ~VideoEncoderImpl() { Stop(); }
 
-    /// 依据配置与可用性选择编码器名字："h264"/"h265" → rkmpp 或软编码。
-    std::string PickEncoderName() const {
+    /// 用指定编码器创建上下文并打开；失败时自清场（幂等）返回 false。
+    /// rkmpp 分支：VBR 峰值码率走 AVCodecContext::rc_max_rate 字段直设（板上
+    /// 实测 h264_rkmpp 不消费同名 AVDictionary 键，WARN 护栏抓到的），
+    /// rc_mode=VBR 仍走 AVDictionary 私有选项；open 后检查 dict 残留，
+    /// 未识别选项打 WARN（启动期护栏，版本/拼写漂移立即可见）。
+    bool TryOpenEncoder(const char* name, bool is_rkmpp) {
+        if (codec_ctx_ != nullptr) {
+            avcodec_free_context(&codec_ctx_);
+            codec_ctx_ = nullptr;
+        }
+        encoder_ = avcodec_find_encoder_by_name(name);
+        if (encoder_ == nullptr) {
+            return false;  // 编码器不存在属正常分支（如开发机无 rkmpp），日志由调用方定级
+        }
+        codec_ctx_ = avcodec_alloc_context3(encoder_);
+        if (codec_ctx_ == nullptr) {
+            ++error_count;
+            SPDLOG_ERROR("图传编码器分配上下文失败: {}", name);
+            return false;
+        }
+        codec_ctx_->codec_id = encoder_->id;
+        codec_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
+        codec_ctx_->bit_rate = config.bitrate;
+        if (is_rkmpp) {
+            // VBR 峰值码率：字段直设（dict 键 rc_max_rate 在 ffmpeg-rockchip
+            // 8.1 的 h264_rkmpp 上不被识别，2026-09-23 板上 WARN 实证）
+            codec_ctx_->rc_max_rate = config.bitrate;
+        }
+        codec_ctx_->width = static_cast<int>(config.width);
+        codec_ctx_->height = static_cast<int>(config.height);
+        codec_ctx_->time_base = AVRational{1, config.fps};
+        codec_ctx_->framerate = AVRational{config.fps, 1};
+        codec_ctx_->gop_size = config.gop;
+        codec_ctx_->max_b_frames = 0;
+        codec_ctx_->pix_fmt = is_rkmpp ? AV_PIX_FMT_NV12     // rkmpp 直接收 NV12
+                                       : AV_PIX_FMT_YUV420P;  // libx264/265 需 YUV420P
+        // SPS/PPS 放入 extradata（RTSP SDP 需要）
+        codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+        AVDictionary* opts = nullptr;
+        if (is_rkmpp) {
+            av_dict_set(&opts, "rc_mode", "VBR", 0);
+        }
+        const int open_ret = avcodec_open2(codec_ctx_, encoder_, &opts);
+        if (opts != nullptr) {
+            const AVDictionaryEntry* entry = nullptr;
+            std::string leftovers;
+            while ((entry = av_dict_get(opts, "", entry, AV_DICT_IGNORE_SUFFIX)) !=
+                   nullptr) {
+                if (!leftovers.empty()) {
+                    leftovers += ',';
+                }
+                leftovers += entry->key;
+            }
+            av_dict_free(&opts);
+            SPDLOG_WARN("图传编码器 {} 未识别私有选项: {}", name, leftovers);
+        }
+        if (open_ret < 0) {
+            ++error_count;
+            SPDLOG_WARN("图传编码器打开失败: {} ({})", name, AvErrorToString(open_ret));
+            return false;
+        }
+        return true;
+    }
+
+    /// 选择并打开编码器：prefer_hardware 且 rkmpp 存在时先硬编，失败回退软编。
+    // 对齐解码器 CreateDecoder 模式：无 rkmpp 属正常（INFO），存在但打开失败打 WARN。
+    bool OpenEncoderWithFallback() {
         const bool h264 = config.codec == "h264";
         const bool h265 = config.codec == "h265";
         if (!h264 && !h265) {
@@ -104,53 +178,32 @@ struct VideoEncoderImpl {
         if (config.prefer_hardware) {
             const char* hw_name = h264 ? "h264_rkmpp" : "hevc_rkmpp";
             if (avcodec_find_encoder_by_name(hw_name) != nullptr) {
-                return hw_name;
+                if (TryOpenEncoder(hw_name, true)) {
+                    return true;
+                }
+                SPDLOG_WARN("图传硬编码器 {} 存在但打开失败，回退软编码", hw_name);
+            } else {
+                SPDLOG_INFO("图传无 rkmpp 硬编码器（{}），使用软编码", hw_name);
             }
         }
-        // 软编码回退（开发机无 rkmpp 为正常路径）
-        return h264 ? "libx264" : "libx265";
+        const char* sw_name = h264 ? "libx264" : "libx265";
+        if (!TryOpenEncoder(sw_name, false)) {
+            ++error_count;
+            SPDLOG_ERROR("图传软编码器不可用或打开失败: {}（需 FFmpeg 5.0+ 或 ffmpeg-rockchip）",
+                         sw_name);
+            return false;
+        }
+        return true;
     }
 
+    // 启动顺序：选择/打开编码器 → 创建输出封装 → 建立输出流 → 分配帧/包缓冲。
+    // 失败由 catch 统一 Stop 回滚，避免 RTSP 会话或 FFmpeg 对象残留。
     bool Start() {
         if (running.load()) {
             return true;  // 幂等
         }
         try {
-            const std::string encoder_name = PickEncoderName();
-            encoder_ = avcodec_find_encoder_by_name(encoder_name.c_str());
-            if (encoder_ == nullptr) {
-                ++error_count;
-                SPDLOG_ERROR("图传编码器未找到: {}（需 FFmpeg 5.0+ 或 ffmpeg-rockchip）",
-                             encoder_name);
-                return false;
-            }
-
-            codec_ctx_ = avcodec_alloc_context3(encoder_);
-            if (codec_ctx_ == nullptr) {
-                ++error_count;
-                SPDLOG_ERROR("图传编码器分配上下文失败: {}", encoder_name);
-                return false;
-            }
-            codec_ctx_->codec_id = encoder_->id;
-            codec_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
-            codec_ctx_->bit_rate = config.bitrate;
-            codec_ctx_->width = static_cast<int>(config.width);
-            codec_ctx_->height = static_cast<int>(config.height);
-            codec_ctx_->time_base = AVRational{1, config.fps};
-            codec_ctx_->framerate = AVRational{config.fps, 1};
-            codec_ctx_->gop_size = config.gop;
-            codec_ctx_->max_b_frames = 0;
-            codec_ctx_->pix_fmt = (encoder_name == "libx264" || encoder_name == "libx265")
-                                      ? AV_PIX_FMT_YUV420P
-                                      : AV_PIX_FMT_NV12;  // rkmpp 直接收 NV12
-            // SPS/PPS 放入 extradata（RTSP SDP 需要）
-            codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-            const int open_ret = avcodec_open2(codec_ctx_, encoder_, nullptr);
-            if (open_ret < 0) {
-                ++error_count;
-                SPDLOG_ERROR("图传编码器打开失败: {} ({})", encoder_name,
-                             AvErrorToString(open_ret));
+            if (!OpenEncoderWithFallback()) {
                 return false;
             }
 
@@ -218,11 +271,23 @@ struct VideoEncoderImpl {
             }
             // 软编路径：NV12 -> YUV420P（libx264 输入需 YUV420P，需转换 + 独立输出帧）
             if (codec_ctx_->pix_fmt == AV_PIX_FMT_YUV420P) {
-                sws_ctx_ = sws_getContext(
-                    static_cast<int>(config.width), static_cast<int>(config.height),
-                    AV_PIX_FMT_NV12, static_cast<int>(config.width),
-                    static_cast<int>(config.height), AV_PIX_FMT_YUV420P,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+                // 现代创建路径（sws_alloc_context + av_opt + sws_init_context）：
+                // FFmpeg 8 libswscale 9 下旧式 sws_getContext 有弃用风险，
+                // 该写法 5.1+ 引入，6.1/8.1 双版本通用
+                sws_ctx_ = sws_alloc_context();
+                if (sws_ctx_ != nullptr) {
+                    av_opt_set_int(sws_ctx_, "srcw", static_cast<int>(config.width), 0);
+                    av_opt_set_int(sws_ctx_, "srch", static_cast<int>(config.height), 0);
+                    av_opt_set_int(sws_ctx_, "dstw", static_cast<int>(config.width), 0);
+                    av_opt_set_int(sws_ctx_, "dsth", static_cast<int>(config.height), 0);
+                    av_opt_set_pixel_fmt(sws_ctx_, "src_format", AV_PIX_FMT_NV12, 0);
+                    av_opt_set_pixel_fmt(sws_ctx_, "dst_format", AV_PIX_FMT_YUV420P, 0);
+                    av_opt_set_int(sws_ctx_, "sws_flags", SWS_BILINEAR, 0);
+                    if (sws_init_context(sws_ctx_, nullptr, nullptr) < 0) {
+                        sws_freeContext(sws_ctx_);
+                        sws_ctx_ = nullptr;
+                    }
+                }
                 if (sws_ctx_ == nullptr) {
                     ++error_count;
                     SPDLOG_ERROR("图传创建 NV12→YUV420P 转换上下文失败");
@@ -253,7 +318,7 @@ struct VideoEncoderImpl {
 
             running = true;
             SPDLOG_INFO("图传编码器就绪: {} → {}, {}x{}@{}fps, {}bps",
-                        encoder_name, config.url, config.width, config.height,
+                        encoder_->name, config.url, config.width, config.height,
                         config.fps, config.bitrate);
             return true;
         } catch (const std::exception& e) {
@@ -265,6 +330,7 @@ struct VideoEncoderImpl {
     }
 
     /// 取出编码器中所有已就绪的包并推流。
+    // 不能依赖 running 标志：Stop 冲刷时 running 已经置 false，必须持续取到 EAGAIN/EOF。
     bool DrainPackets() {
         for (;;) {
             const int ret = avcodec_receive_packet(codec_ctx_, packet_);
@@ -286,6 +352,7 @@ struct VideoEncoderImpl {
     }
 
     /// 编码输出的包做时间戳换算、关键帧补 SPS/PPS 后写出。
+    // RTSP 中途接入时关键帧需要携带参数集；mpegts 文件由封装器自行管理参数集。
     bool WritePacket() {
         av_packet_rescale_ts(packet_, codec_ctx_->time_base, stream_->time_base);
         packet_->stream_index = stream_->index;
@@ -309,7 +376,13 @@ struct VideoEncoderImpl {
             packet_->size = static_cast<int>(total);
         }
 
+        const auto write_start = std::chrono::steady_clock::now();
         const int ret = av_interleaved_write_frame(format_ctx_, packet_);
+        const auto write_end = std::chrono::steady_clock::now();
+        if (config.collect_detailed_latency) {
+            packet_write_latency.Add(
+                std::chrono::duration<double, std::milli>(write_end - write_start).count());
+        }
         av_packet_unref(packet_);
         if (ret < 0) {
             ++error_count;
@@ -323,7 +396,10 @@ struct VideoEncoderImpl {
         return true;
     }
 
+    // 将共享 NV12 FrameHandle 拷贝到可复用的 FFmpeg 输入帧，再送入编码器并排空输出包。
+    // 拷贝按源/目标 stride 逐行进行，不能假设池内缓冲是紧凑排列。
     bool EncodeFrame(const video::FrameHandle& frame) {
+        const auto prepare_start = std::chrono::steady_clock::now();
         if (!running.load()) {
             ++error_count;
             return false;
@@ -391,6 +467,12 @@ struct VideoEncoderImpl {
             encode_input = pic_out_;
         }
 
+        const auto prepare_end = std::chrono::steady_clock::now();
+        if (config.collect_detailed_latency) {
+            frame_prepare_latency.Add(
+                std::chrono::duration<double, std::milli>(prepare_end - prepare_start).count());
+        }
+
         const int send_ret = avcodec_send_frame(codec_ctx_, encode_input);
         if (send_ret < 0) {
             ++error_count;
@@ -404,6 +486,8 @@ struct VideoEncoderImpl {
         return DrainPackets();
     }
 
+    // 停止顺序：停止接收新帧 → 发送空帧冲刷编码器 → 写 trailer → 释放包/帧/封装器/编码器。
+    // 该顺序保证延迟编码包先写出，再关闭 RTSP 或本地文件会话。
     void Stop() {
         if (!running.load()) {
             return;
@@ -476,6 +560,12 @@ public:
     }
     std::uint64_t ErrorCount() const override {
         return impl_->error_count.load();
+    }
+    common::LatencySummary FramePrepareLatency() const override {
+        return impl_->frame_prepare_latency.Snapshot();
+    }
+    common::LatencySummary PacketWriteLatency() const override {
+        return impl_->packet_write_latency.Snapshot();
     }
 
 private:

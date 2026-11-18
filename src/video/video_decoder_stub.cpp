@@ -12,6 +12,9 @@
 
 namespace drone::video {
 
+// 数据流：EncodedFrame Topic → 解码 → FrameHandle Topic。
+// Stub 只暴露生命周期与输出主题，真实解码逻辑由 VideoDecoder 实现。
+
 VideoDecoderStub::VideoDecoderStub() {
     SPDLOG_INFO("视频解码部件骨架创建");
 }
@@ -38,8 +41,8 @@ bool VideoDecoderStub::IsRunning() const {
     return running_;
 }
 
+// 骨架期忽略输入绑定；实现期保存订阅并启动消费。
 void VideoDecoderStub::SetInput(common::Topic<common::EncodedFrame>& /*input*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动消费
 }
 
 common::Topic<FrameHandle>& VideoDecoderStub::FrameOutput() {

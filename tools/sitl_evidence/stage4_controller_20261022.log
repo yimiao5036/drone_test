@@ -1,0 +1,104 @@
+PX4 链路冒烟测试
+  config: config/px4_sitl.json
+  transport: udp
+  device: /dev/ttyS1
+  baud: 115200
+  onboard: 1/191
+  target: 1/1
+  firmware: 1.17.0
+  duration: 90 秒
+  安全边界: SITL UDP 装配真实 FlightController，意图脚本驱动全链；零速漂移/阶跃斜率/停发刹车/Offboard 退出时延验收
+
+  controller: period=50ms max_speed=2m/s max_accel=2m/s² intent_timeout=300ms coast_timeout=1000ms
+[0s] connected=否 armed=否 mode=0/0 landed=未知 gps=无/不足 global=否 local=是 attitude=否 battery=否 home=否 rc=否
+[状态变化] connected=是 armed=否 mode=4/3
+[SITL] 引导阶段开始：注入零速度引导流（PX4 进入 Offboard 前要求已有 setpoint 流，控制器授权链要求 armed+Offboard 才发布）
+[1s] connected=是 armed=否 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[2s] connected=是 armed=否 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] Offboard 模式请求已入队
+[3s] connected=是 armed=否 mode=4/3 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[状态变化] connected=是 armed=否 mode=6/0
+[SITL] ARM 请求已入队
+[4s] connected=是 armed=否 mode=6/0 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[状态变化] connected=是 armed=是 mode=6/0
+[SITL] 起飞目标已锁定: N=-0.016409 E=0.00371046 D=-0.968489
+[SITL] 控制器已接管设定值流（授权链全通：armed+Offboard+请求位），停止工具引导流
+[SITL] 起飞阶段开始：位置引导意图 → 相对起飞 1m
+[5s] connected=是 armed=是 mode=6/0 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[6s] connected=是 armed=是 mode=6/0 landed=是 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[7s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[8s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[9s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[10s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[11s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[12s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[13s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[14s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] 悬停稳定 3 秒完成（最大相对高度 0.979422 m），切零速度意图保持
+[SITL] 零速度意图保持 3 秒开始
+[15s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[16s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[17s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] 零速度保持完成：最大漂移 0.0507011 m，切北向 2 m/s 阶跃意图
+[18s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[20s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] 阶跃段完成：设定值爬升斜率 2 m/s²（发布侧 51 样本），稳态速度 1.87575 m/s（期望 2，限幅触发 0 次）；停止发意图（超龄注入）
+[21s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] 控制器进入 COAST（意图超龄）零速刹车，等待速度过零
+[22s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] 控制器转 IDLE 停发（COAST 超时），等待 PX4 退出 Offboard
+[SITL] 速度过零（≤0.1 m/s）：COAST 后 1600 ms
+[23s] connected=是 armed=是 mode=6/0 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[状态变化] connected=是 armed=是 mode=4/5
+[SITL] PX4 已退出 Offboard: mode=4/5（IDLE 后 1799 ms）
+[SITL] AUTO.LAND 模式请求已入队
+[24s] connected=是 armed=是 mode=4/5 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[状态变化] connected=是 armed=是 mode=4/6
+[25s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[26s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[27s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[28s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[29s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[30s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[31s] connected=是 armed=是 mode=4/6 landed=否 gps=3D+ global=是 local=是 attitude=是 battery=是 home=是 rc=否
+[SITL] PX4 已确认降落，准备主动 DISARM
+[SITL] DISARM 请求已入队
+
+========== stage4 执行层门禁报告（FlightController → Px4Link → PX4）==========
+[PASS] PX4 HEARTBEAT
+[PASS] 测试结束时心跳仍连接
+[PASS] 引导零速度流已注入(≥20 条)
+[PASS] Offboard 模式请求已入队
+[PASS] Offboard 模式 ACK 已收到
+[PASS] Offboard 模式 ACK accepted
+[PASS] PX4 已进入 Offboard(6/0)
+[PASS] ARM 请求已入队
+[PASS] ARM ACK 已收到
+[PASS] ARM ACK accepted
+[PASS] PX4 已确认 armed
+[PASS] 控制器已接管设定值流(授权链全通)
+[PASS] 相对起飞目标已建立
+[PASS] 达到相对 1m 高度
+[PASS] 目标高度稳定悬停 3 秒
+[PASS] 位置引导意图未被控制拒绝(含 Home 基准)
+[PASS] 零速意图 3 秒最大漂移 < 0.10m
+[PASS] 阶跃设定值爬升斜率受限(≤max_accel×1.2，发布侧)
+[PASS] 阶跃稳态速度=min(2, max_speed)
+[PASS] 停发后 COAST 零速刹车已触发
+[PASS] 速度过零时间 ≤ 2000ms(指数收敛物理下限)
+[PASS] 控制器已转 IDLE 停发
+[PASS] PX4 已在 2.2s 内退出 Offboard(含 1Hz 心跳相位)
+[PASS] 停发后设定值发送已停止(≤2 条)
+[PASS] AUTO.LAND 请求/ACK accepted/PX4 已确认 landed
+[PASS] 主动 DISARM 前未被自动上锁
+[PASS] DISARM ACK accepted 且已确认 disarmed
+[PASS] 飞行未触发高度/漂移安全回收
+[PASS] 控制器无异常计数(未支持意图/未知来源)
+[PASS] LOCAL_POSITION_NED 收到 330 条
+[PASS] ATTITUDE 收到 350 条
+[PASS] EXTENDED_SYS_STATE 收到 66 条
+实测值: 零速最大漂移 0.0507011 m（上限 0.1），阶跃设定值斜率(发布侧) 2 m/s²（上限 2.4），阶跃稳态速度 1.87575 m/s（期望 2），阶跃段位移 北向 2.33186 m / 东西 0.149467 m
+实测时延: COAST→速度过零 1600 ms（上限 2000），COAST→IDLE 965 ms，IDLE→PX4 退出 Offboard 1799 ms（上限 2200），退出模式 4/5，停发后额外发送 0 条
+包线: 最大相对高度 0.979422 m，最大水平漂移 0.0353357 m，最大北向位移 4.58234 m，控制权最终态 IDLE
+控制器诊断: setpoint=364 rejected=1 clamped=0 error=0 引导注入=39 条
+结果: stage4 执行层门禁通过

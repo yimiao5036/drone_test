@@ -2,15 +2,18 @@
 
 > 对应实现：`include/video/video_decoder.h`、`src/video/video_decoder.cpp`
 > 接口：`IVideoDecoder`（同头文件）；占位实现 `VideoDecoderStub`（`src/video/video_decoder_stub.cpp`）
-> 上游：RTSP 接收 `camera_receiver.md`；下游：内存池 `video_frame_pool.md`
+> 上游：RTSP 接收 `camera_receiver.md`、UVC 双目接收 `uvc_camera_receiver.md`；下游：内存池 `video_frame_pool.md`、双目拆分 `stereo_frame_splitter.md`
 
 ## 1. 功能职责
 
-订阅 H.264/H.265 码流块（`common::EncodedFrame`），解码为 **NV12** 帧，从内存池分配
+订阅 H.264/H.265/MJPEG 码流块（`common::EncodedFrame`），解码为 **NV12** 帧，从内存池分配
 `FrameHandle` 发布（零拷贝共享、最后引用归还内存池）：
 
-- 解码器优先 rkmpp 硬解（香橙派 DRM 路径），不可用时回退 FFmpeg 软解（开发机验证路径）。
+- 解码器优先 rkmpp 硬解（香橙派）：hevc/h264 输出 NV12；mjpeg_rkmpp 输出
+  **NV16**（YCbCr422SP），在解码器内经 RGA `imcvtcolor` 转 NV12 写入既有内存池，
+  下游（拆分器/YOLO/叠加/编码）零改动。硬解不可用时回退 FFmpeg 软解（开发机验证路径）。
 - 解码器未创建前不丢弃任何包：首个数据帧（任意类型，含 IDR 前独立到达的 SPS/PPS 小包）创建解码器并送包，之后全量送包，由解码器自行完成参数集同步与关键帧等待（对齐原型 `videoPart/rtsp_yolo_stream`）。
+- MJPEG（USB UVC 双目）语义：一帧一个访问单元、皆关键帧、无参数集、帧间无依赖；单帧解码失败计 `DroppedFrameCount` 继续，无 H.26x 的参数集同步问题。
 - 池满丢帧不阻塞（WARN 节流）。
 
 不做什么：不负责拉流（上游 `CameraReceiver`）；不负责色彩转换到 RGB（后续 YOLO 用 RGA 转）。
@@ -24,6 +27,9 @@ struct VideoDecoderConfig {
     std::uint32_t height = 0;
     std::uint32_t stride_alignment = 64;  // 水平 stride 像素对齐
     bool prefer_hardware = true;       // 优先 rkmpp 硬解
+    double slow_frame_threshold_ms = 0.0; // 慢帧关联日志阈值；0=关闭
+    bool prefer_rga_dma_transfer = false; // 优先RGA DMA-BUF直传到内存池
+    bool collect_detailed_latency = true; // 中间阶段延迟细分统计；false=只留ingress→解码输出链（探针首尾模式）
 };
 
 class VideoDecoder final : public IVideoDecoder {
@@ -37,11 +43,33 @@ class VideoDecoder final : public IVideoDecoder {
 
 ## 3. 关键实现点
 
-- **解码器选择**：`avcodec_find_decoder_by_name("hevc_rkmpp"/"h264_rkmpp")` 优先；
-  硬解打开失败（如无 DRM 设备）回退 `avcodec_find_decoder` 软解。
-- **硬解路径**：`av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_DRM)` + 绑定解码器；
-  输出 `AV_PIX_FMT_DRM_PRIME` → `av_hwframe_transfer_data` 转存系统内存（NV12）。
-- **软解路径**：YUV420P → swscale 转 NV12；`sws_ctx` 按源格式缓存，格式变化时重建。
+- **解码器选择**：`RkmppDecoderName()` 按编码给出 rkmpp 名（hevc/h264/mjpeg_rkmpp），
+  `avcodec_find_decoder_by_name` 找到才尝试硬解；无 rkmpp 名或打开失败回退
+  `avcodec_find_decoder` 软解。mjpeg_rkmpp 是否存在取决于 ffmpeg-rockchip 版本，
+  找不到走软解属预期（MJPG 软解负载低）。
+- **硬解设备两级探测**：`CreateRkHardwareDevice()` 先 `av_hwdevice_find_type_by_name("rkmpp")`
+  运行时探测 ffmpeg-rockchip 8.1 的 rkmpp 设备类型（编译期不引用
+  `AV_HWDEVICE_TYPE_RKMMPP` 枚举，FFmpeg 6.1 头文件没有）；探测不到回退
+  `AV_HWDEVICE_TYPE_DRM`（旧 fork/6.1 兼容）。hevc/h264/mjpeg 三编码统一走此入口；
+  创建成功与打开失败日志均带设备类型名（rkmpp/drm），不做设备类型重试矩阵，
+  打开失败直接走既有软解回退。
+- **预知分辨率写入解码上下文（mjpeg_rkmpp 死锁坑）**：`config.width/height > 0` 时
+  创建解码器即写入 `codec_ctx->width/height`。ffmpeg-rockchip 8.1 的 mjpeg_rkmpp 在送包
+  路径按 `avctx->width×height` 预分配输出缓冲（`rkmpp_mjpeg_put_packet` 的 `buf_sz`），
+  宽高为 0 时 `mpp_buffer_get(0)` 失败、首包即被拒，永远触发不了 info_change——表现为
+  `Failed to get buffer for frame: -2` + `Decoder failed to send packet` 无限刷屏且不出图。
+  UVC 链路由配置解析透传 uvc 宽高（`config.cpp`），RTSP 链路保持 0 由码流参数集确定。
+- **硬解持续失败会话级回退**：解码器能 open 但送包/取帧连续 90 次（约 30fps×3s）全败时，
+  `NoteHardwareDecodeFailure()` 置 `hardware_disabled_session` 并释放解码器，下个数据帧
+  重建为软解（WARN 一次）；一次性切换不反复，进程重启前不再尝试硬解。成功出帧即清零计数。
+- **硬解路径**：硬解输出 `AV_PIX_FMT_DRM_PRIME`（DRM_PRIME 描述符：hevc/h264 为
+  NV12，mjpeg_rkmpp 为 NV16）。优先经 `drm_nv12_transfer` RGA 直传（按图层 fourcc
+  分派：NV12 `imcopy` / NV16 `imcvtcolor` 转 NV12，见 `drm_nv12_transfer.md`）；
+  RGA 拒绝或失败时回退 `av_hwframe_transfer_data` 转存系统内存（NV16 转存帧再由
+  sws 转 NV12，sws 支持 NV16 输入，无需新代码）。转存目标`sw_frame`由首帧让FFmpeg
+  按硬件上下文自动分配，后续使用`av_frame_make_writable`后复用；仅在分辨率/格式不
+  兼容时清空重建，避免旧实现每帧`av_frame_unref`造成的目标缓冲重复分配。
+- **软解路径**：YUV420P/YUVJ420P（MJPG 软解输出）→ swscale 转 NV12；`sws_ctx` 按源格式缓存，格式变化时重建。
 - **参数集**：`EncodedFrame.parameter_sets` 写入 `codec_ctx->extradata`（RTSP 流级参数集）；
   无参数集时解码器从关键帧内嵌 SPS/PPS 解析。
 - **参数集与送包策略（关键）**：不再按“未初始化跳过非关键帧”。本款摄像头 RTSP 的
@@ -56,23 +84,41 @@ class VideoDecoder final : public IVideoDecoder {
   解码线程）。修复：**NV12 帧不走 sws**，直接按 `frame->linesize` 源 stride 逐行 `memcpy`
   Y/UV 平面到内存池；仅软解 YUV420P 才用 `sws_scale` 转 NV12。硬解识别条件兼看
   `hw_frames_ctx`。
-- **本相机实测**：H.265/HEVC Main、1280x720、25fps、LIVE555 RTSP；`ffprobe` 确认；
-  rkmpp 硬解经实验确认可正常出帧。
+- **当前链路实测**：动态探针根据FFmpeg `AVCodecParameters.codec_id`确认当前输入实际为H.265/HEVC、1280x720、25fps，并使用`hevc_rkmpp`硬解；RTSP路径名中的`.264`不能作为编码格式依据。解码器同时保留H.264和H.265的rkmpp适配。
 - **内存池**：配置给分辨率则 `Start()` 预建池；否则首帧确定尺寸懒建池。
   `hor_stride = align_up(width, 64)`；`buf_size` 由池按 NV12 自动推算。
-- **packet 拷贝**：`av_new_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝）。
+- **packet 拷贝**：`av_grow_packet` + memcpy（骨架期接受拷贝开销，实测不足再优化零拷贝；
+  `av_new_packet` 已在 FFmpeg 8 删除）。
+- **FFmpeg 版本兼容**：同源兼容 FFmpeg 6.1（开发机 WSL2）与 ffmpeg-rockchip 8.1（香橙派），
+  不再支持 4.4；版本差异一律运行时探测吸收，不用版本宏。sws 上下文用现代创建路径
+  （`sws_alloc_context`+`av_opt`+`sws_init_context`），规避 libswscale 9 对旧式
+  `sws_getContext` 的弃用风险。
+
+### 延迟统计
+
+解码器记录三项2048样本固定窗口统计：`InputQueueLatency()`（码流进入进程到解码线程开始）、`DecodeLatency()`（当前H.264/H.265解码+硬件帧转存+NV12拷贝）、`IngressToDecodedLatency()`（入口到NV12发布）。
+
+为定位上板间歇出现的解码长尾，另增加最近256样本的细分：`PacketPrepareLatency()`、`SendPacketLatency()`、`ReceiveFrameLatency()`、`HardwareTransferPrepareLatency()`、`HardwareTransferLatency()`、`FrameCopyLatency()`。其中D4P单独统计分辨率检查和`av_frame_make_writable`，D4只统计`av_hwframe_transfer_data`。同时提供`ActiveCodec()`、`IsHardwareDecoder()`以及编码访问单元/字节/关键帧累计值，探针据此显示实际格式、解码模式、区间FPS/码率和关键帧数。统计只在探针读取快照时复制排序，逐帧不打日志。
+
+`slow_frame_threshold_ms`默认0，不在正式程序打印慢帧；`video_latency_probe`单独设为10ms。超过阈值且跳过前100帧预热后，记录触发包序号、字节数、关键帧标志、总耗时、D1～D5、D4P和未归类耗时，日志按第1次及每100次节流。rkmpp是异步流水线，日志中的包是触发本次输出的包，不保证就是输出画面的原始源包。
+
+`collect_detailed_latency=false` 时中间统计（01 输入排队、02 总解码、D1-D5 细分）不采集，仅保留 ingress→解码输出链 `IngressToDecodedLatency()`；正式配置恒为 true，仅探针首尾模式使用。慢帧日志判断不受影响。
+
+首次收到`AV_PIX_FMT_DRM_PRIME`帧时，INFO日志输出`AVDRMFrameDescriptor`：对象fd/size/modifier、图层DRM格式（含 fourcc 字符解码，如 `0x3631564e(NV16)`，便于板上确认 mjpeg_rkmpp 输出格式）以及各平面的object index/offset/pitch。该日志只打印一次，用于确认当前MPP输出是否能安全通过RGA DMA-BUF接口直接读取，禁止在未知平面布局时假定NV12连续排列。
+
+第三轮300秒上板测试在约250秒后复现长尾，D1/D2/D3/D5保持稳定，D4从约1.7～1.9ms升至平均10.7ms、P95约15ms，确认瓶颈位于`av_hwframe_transfer_data`。缓冲复用后慢帧仍可复现，因此新增`drm_nv12_transfer`：对已确认的单对象线性NV12/NV16布局，使用RGA从DMA-BUF fd直接`imcopy`（NV12）/`imcvtcolor`（NV16→NV12）到`VideoFramePool`，成功时绕过D4和D5；失败自动回退原路径。探针默认启用该试验路径，代码缺省关闭、生产`config/config.json`显式开启。**统计记账复用现有计数器**：RGA直传计入D4R（NV16转换同）、FFmpeg转存计入D4/D4P、CPU拷贝/sws计入D5，不新增计数器。
 
 ## 4. 日志行为
 
 | 等级 | 场景 |
 |------|------|
-| INFO | 创建（配置）、启动、停止、销毁、解码器创建（名称/硬解或软解）、池创建（容量/分辨率/stride） |
-| WARN | rkmpp 存在但打开失败回退软解、池满丢帧（节流） |
+| INFO | 创建（配置）、启动、停止、销毁、解码器创建（名称/硬解或软解，硬解带设备类型 rkmpp/drm）、池创建（容量/分辨率/stride） |
+| WARN | rkmpp存在但打开失败回退软解、池满丢帧、硬解连续90次失败会话级回退软解（一次）；探针启用阈值后的慢解码帧关联信息（均节流） |
 | ERROR（节流） | 送包失败、取帧失败、sws 创建失败、池创建失败、硬件帧转存失败 |
 
 ## 5. 测试方式
 
-`tests/video/video_decoder_test.cpp`（2 个用例）：
+`tests/video/video_decoder_test.cpp`：
 
 ```bash
 cmake --build build && cd build && ctest -R VideoDecoder
@@ -80,6 +126,8 @@ cmake --build build && cd build && ctest -R VideoDecoder
 
 - `DecodesH264ToNv12Frames`：libx264 软编 10 帧（ultrafast 预设，SPS/PPS 随关键帧）→ 发布 →
   软解 → 断言输出帧数、320x240、NV12 格式、缓冲可写、`DroppedFrameCount==0`。
+- `DecodesMjpegToNv12Frames`：内置 mjpeg 编码器软编 10 帧（YUVJ420P，皆关键帧、无参数集）→
+  软解 → 断言 NV12 输出、`ActiveCodec()==kMjpeg`、`IsHardwareDecoder()==false`、计数正确。
 - `StopsCleanlyWhenIdle`：无输入启停干净（确定性停机）。
 - 硬解路径（rkmpp/DRM）需香橙派实机验证。
 
@@ -90,6 +138,9 @@ cmake --build build && cd build && ctest -R VideoDecoder
 | `non-existing PPS 0` / `h265d: pps invalid`（段错误） | ① 若 SPS/PPS 为 IDR 前独立小包：勿按“未初始化跳过非关键帧”（已修复为全量送包）。② HEVC 容器 extradata 勿塞给 rkmpp（已修复）。③ 若已能出帧仍段错误：为输出转存内存问题；纯 NV12 拷贝不再走 sws（已修复），确认源 linesize 与池 stride 匹配 |
 | 解码 0 帧但无错误 | 输入队列容量(8) < 突发帧数挤掉关键帧后无后续关键帧（GOP 过长）；调整队列容量或等关键帧机制确认 |
 | `DroppedFrameCount` 增长 | 池容量 < 输出订阅队列 + 在途；调大 `pool_capacity` |
+| D4运行数分钟后由约2ms升至10～15ms | 已定位到`av_hwframe_transfer_data`并增加RGA DMA-BUF直传试验路径；确认`RGA_DMA成功`增长、回退为0、D4/D5无样本及D4R稳定。实现细节见`drm_nv12_transfer.md` |
+| 硬解画面偏色/错位（mjpeg_rkmpp） | 看会话首次 DRM 图层日志 fourcc 是否为 `NV16`；NV16 应走 RGA `imcvtcolor` 转 NV12（首次 RGA 成功日志带“NV16转NV12”），布局规则与排查见 `drm_nv12_transfer.md` |
 | 硬解失败 | 香橙派需 rkmpp 版 FFmpeg + `/dev/dri` 可用；开发机无 rkmpp 属正常回退软解 |
-| 帧率不足 | 软解慢属预期（开发机）；香橙派确认走 `hevc_rkmpp`；`sws` 在格式不变时不会重建 |
+| mjpeg_rkmpp 刷屏 `Failed to get buffer for frame: -2` | 解码上下文宽高为 0 导致 MPP 按 0 尺寸分配输出缓冲：确认 UVC 链路 `decoder.width/height` 已被配置解析透传（`config.cpp`），RTSP 链路无此问题；兜底是连续 90 次失败后自动回退软解 |
+| 帧率不足 | 软解慢属预期（开发机）；香橙派按实际流确认走`h264_rkmpp`或`hevc_rkmpp`；`sws`在格式不变时不会重建 |
 | 修改输出格式 | 当前固定 NV12；如需 RGB888 改 `sws` 目标格式与 `PixelFormat` |

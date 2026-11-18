@@ -1,0 +1,173 @@
+[2026-10-22 15:07:37.179] [info] [t:4995] 异步文件日志已初始化: /root/drone_test/build/logs/0005_20261022_150737.log (等级=info)
+[2026-10-22 15:07:37.179] [info] [t:4995] 正式主程序加载配置: path=../config/px4_sitl_assignment.json log_level=info
+[2026-10-22 15:07:37.179] [info] [t:4995] UVC摄像头接收器创建: /dev/video0 2560x720@30 缓冲=4
+[2026-10-22 15:07:37.179] [info] [t:4995] 视频解码器创建: 池容量=16 预置分辨率=2560x720 硬解优先=true RGA_DMA优先=true RGA_DMA可用=false
+[2026-10-22 15:07:37.179] [info] [t:4995] 视频帧内存池创建: 容量=8 槽位大小=1382400B 对齐=64B 总内存=10.5MB 格式=1
+[2026-10-22 15:07:37.179] [info] [t:4995] 视频帧内存池创建: 容量=8 槽位大小=1382400B 对齐=64B 总内存=10.5MB 格式=1
+[2026-10-22 15:07:37.179] [info] [t:4995] 双目拆分输出池创建: 容量=8x2 单目=1280x720 水平stride=1280 槽位=1382400B
+[2026-10-22 15:07:37.179] [info] [t:4995] 双目拆分器创建: 全幅=2560x720 池容量=8x2 RGA=无（memcpy）
+[2026-10-22 15:07:37.179] [info] [t:4995] YOLO 检测器创建: 模型=/root/drone_test/build/models/yolov26_ReLU6_09_13-rk3588_384_640.rknn 置信度阈值=0.3 NMS阈值=0.45 订阅队列=1 NPU核心=all 内部性能统计=false 逐层性能报告=false 细分延迟统计=true 后端=缺失(启动将失败)
+[2026-10-22 15:07:37.220] [info] [t:4995] 双目测距v2创建: shadow=true 基准图=SBS右半(物理左目) fx_rect=1057.33px 基线=60.120mm fxB=63.57m·px 视差=[8,160]px
+[2026-10-22 15:07:37.220] [info] [t:4995] 叠加器创建: 池容量=8 线宽=2 文字=开
+[2026-10-22 15:07:37.220] [info] [t:4995] 图传发送器创建: 编码=h264 地址=rtsp://127.0.0.1:8554/drone_25_1 分辨率=1280x720@25fps
+[2026-10-22 15:07:37.220] [info] [t:4995] 视觉稳定性判定创建: shadow=true control_output=false lock_frames=5 lost_frames=10
+[2026-10-22 15:07:37.220] [info] [t:4995] PX4 通信部件创建: firmware=1.17.0 transport=udp:127.0.0.1:14540 onboard=1/191 target=1/1 mavlink=2
+[2026-10-22 15:07:37.220] [info] [t:4995] 串口对象创建: device=/tmp/gcs_app baud=115200 数据位=8 停止位=1 校验=N
+[2026-10-22 15:07:37.220] [info] [t:4995] 地面站通信部件创建: serial=/tmp/gcs_app@115200 aircraft=1/25 type=net_capture callsign=捕网-01 gcs=255/190 mavlink=2 timesync=true
+[2026-10-22 15:07:37.220] [info] [t:4995] 目标估计器创建: model=linear_cv shadow=true control_output=false
+[2026-10-22 15:07:37.220] [info] [t:4995] 健康管理部件创建: cpu_sample_period_ms=1000 startup_grace_ms=5000
+[2026-10-22 15:07:37.220] [info] [t:4995] 任务状态机创建: shadow=true control_output=false intent_valid_for_ms=300 handover(lock_frames=10 exit_lost_frames=30 timeout_ms=3000 fow_margin_deg=5.0 innovation_gate_m=3.0) fov_half(az=33.19deg el=10.56deg) servo=TrackingControlLaw(20.0Hz)
+[2026-10-22 15:07:37.220] [info] [t:4995] 飞行控制器创建（默认 IDLE 不发布设定值；限幅流水线+控制权三态+Home 围栏已接入）
+[2026-10-22 15:07:37.220] [info] [t:4995] 任务状态机估计器诊断接口已注入: estimator=0x624ceb2dfc70
+[2026-10-22 15:07:37.221] [info] [t:4995] 任务状态机 PX4 命令接口已注入: sender=0x624ceb2df810 net_type=single_pwm
+[2026-10-22 15:07:37.221] [warning] [t:4995] 正式控制输出已启用（enable_control=true）：FlightController 已绑定 Px4Setpoint
+[2026-10-22 15:07:37.221] [info] [t:4995] 主程序集成创建: video=true px4=true ground_station=true target_estimator=true control=true camera_source=uvc stereo_split=true stereo_ranging=true
+[2026-10-22 15:07:37.221] [info] [t:4995] 视觉稳定性判定启动: shadow=true
+[2026-10-22 15:07:37.221] [info] [t:4995] 视觉跟踪影子启动: 频率=20Hz 虚拟姿态=true 姿态输入=true 距离输入=true
+[2026-10-22 15:07:37.221] [info] [t:5005] 视觉跟踪影子：姿态缺失/超龄，启用虚拟零姿态（仅供观察控制律行为，不产生真实控制输出）
+[2026-10-22 15:07:37.221] [info] [t:5005] 视觉跟踪影子摘要: 模式=降级保持 有效=false vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=true 距离=--(有效=0)
+[2026-10-22 15:07:37.221] [info] [t:4995] 双目测距启动: shadow=true 配对窗=20ms 批次闭合=50ms 帧缓冲=4 队列容量=2
+[2026-10-22 15:07:37.221] [info] [t:4995] 图传无 rkmpp 硬编码器（h264_rkmpp），使用软编码
+[2026-10-22 15:07:37.239] [error] [t:4995] 图传 RTSP 写头失败(推流地址不可达?): Connection refused
+[2026-10-22 15:07:37.239] [error] [t:4995] 图传发送器后端启动失败（推流地址不可达或无可用编码器）
+[2026-10-22 15:07:37.239] [error] [t:4995] 主程序图传发送启动失败，视频链路降级
+[2026-10-22 15:07:37.239] [info] [t:4995] 叠加器启动
+[2026-10-22 15:07:37.239] [error] [t:4995] YOLO 检测器启动失败: 无推理后端（未启用 RKNN 编译或未注入后端）
+[2026-10-22 15:07:37.239] [error] [t:4995] 主程序YOLO启动失败，检测链路降级
+[2026-10-22 15:07:37.239] [info] [t:4995] 双目拆分器启动
+[2026-10-22 15:07:37.239] [info] [t:4995] 视频帧内存池创建: 容量=16 槽位大小=2764800B 对齐=64B 总内存=42.2MB 格式=1
+[2026-10-22 15:07:37.239] [info] [t:4995] 解码帧内存池创建: 容量=16 分辨率=2560x720 水平stride=2560 槽位=2764800B
+[2026-10-22 15:07:37.239] [info] [t:4995] 视频解码器启动
+[2026-10-22 15:07:37.240] [error] [t:4995] UVC摄像头打开失败: /dev/video0 open: No such file or directory，累计 1
+[2026-10-22 15:07:37.240] [error] [t:4995] 主程序摄像头接收启动失败，视频链路降级
+[2026-10-22 15:07:37.240] [info] [t:4995] 目标估计器启动: shadow=true visual_fusion=false
+[2026-10-22 15:07:37.240] [info] [t:4995] 飞行控制器启动: period=50ms intent_timeout=300ms coast_timeout=1000ms bootstrap_timeout=6000ms feedforward=off cap=2.00m/s
+[2026-10-22 15:07:37.240] [info] [t:4995] 任务状态机启动: shadow=true
+[2026-10-22 15:07:37.240] [info] [t:4995] 串口打开成功: device=/tmp/gcs_app baud=115200
+[2026-10-22 15:07:37.240] [info] [t:5034] 任务状态转移: BOOT -> SELF_CHECK reason=初始化完成
+[2026-10-22 15:07:37.240] [info] [t:4995] 地面站通信启动: serial=/tmp/gcs_app@115200
+[2026-10-22 15:07:37.240] [info] [t:4995] 健康管理部件启动: source_count=6
+[2026-10-22 15:07:37.240] [warning] [t:5037] 健康数据源活动错误: camera
+[2026-10-22 15:07:37.240] [warning] [t:5037] 健康数据源活动错误: yolo
+[2026-10-22 15:07:37.240] [warning] [t:5037] 健康数据源活动错误: video
+[2026-10-22 15:07:37.241] [info] [t:5004] 视觉稳定性摘要: state=SEARCHING valid=false 连续检测=0 连续丢失=0 置信度=0.00 中心=(0,0) 框=0x0px 画面速度=均0.0/峰0.0(n=0) 从未检测 近期检测率=0.0%(0/0) 累计检测率=0.0% 累计观测=0 累计转换=0
+[2026-10-22 15:07:37.243] [info] [t:4995] UDP 传输打开: udp:127.0.0.1:14540
+[2026-10-22 15:07:37.243] [info] [t:4995] PX4 通信启动: transport=udp:127.0.0.1:14540
+[2026-10-22 15:07:37.243] [info] [t:4995] 主程序启动完成: degraded=true
+[2026-10-22 15:07:37.243] [info] [t:4995] 正式主程序运行中，按Ctrl+C停止
+[2026-10-22 15:07:37.271] [info] [t:5005] [ControlLaw] 状态切换: 降级保持 -> 零速刹车 (判丢，零速刹车)
+[2026-10-22 15:07:37.271] [info] [t:5005] 视觉跟踪影子摘要: 模式=零速刹车 有效=true vx=0.00 vy=0.00 vz=0.00 yaw_rate=0.0dps coast=false 虚拟姿态=false 距离=--(有效=0)
+[2026-10-22 15:07:37.858] [info] [t:5038] PX4 心跳已连接: source=1/1 mode=4/3 armed=false
+[2026-10-22 15:07:37.858] [info] [t:5038] PX4 遥测请求已入队: one_shot=3 intervals=9
+[2026-10-22 15:07:37.859] [info] [t:5038] PX4 电池参数读取完成: BAT_LOW_THR=15.0% COM_LOW_BAT_ACT=0
+[2026-10-22 15:07:37.866] [info] [t:5038] PX4 固件版本上报: reported=1.17.0 configured=1.17.0 capabilities=59647
+[2026-10-22 15:07:37.866] [info] [t:5038] PX4 命令 ACK: sequence=1 command=512 result=0 internal=true progress=0
+[2026-10-22 15:07:37.870] [info] [t:5038] PX4 命令 ACK: sequence=2 command=512 result=0 internal=true progress=0
+[2026-10-22 15:07:37.874] [info] [t:5038] PX4 命令 ACK: sequence=3 command=512 result=0 internal=true progress=0
+[2026-10-22 15:07:37.882] [info] [t:5038] PX4 命令 ACK: sequence=4 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.890] [info] [t:5038] PX4 命令 ACK: sequence=5 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.898] [info] [t:5038] PX4 命令 ACK: sequence=6 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.906] [info] [t:5038] PX4 命令 ACK: sequence=7 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.914] [info] [t:5038] PX4 命令 ACK: sequence=8 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.922] [info] [t:5038] PX4 命令 ACK: sequence=9 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.930] [info] [t:5038] PX4 命令 ACK: sequence=10 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.938] [info] [t:5038] PX4 命令 ACK: sequence=11 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:37.941] [info] [t:5034] 任务状态转移: SELF_CHECK -> READY reason=PX4导航快照满足GPS引导前置条件
+[2026-10-22 15:07:37.946] [info] [t:5038] PX4 命令 ACK: sequence=12 command=511 result=0 internal=true progress=0
+[2026-10-22 15:07:42.246] [warning] [t:5036] 健康数据源超时: ground_station
+[2026-10-22 15:07:42.246] [warning] [t:5036] 健康数据源超时: video
+[2026-10-22 15:07:42.246] [warning] [t:5036] 健康数据源超时: yolo
+[2026-10-22 15:07:42.246] [warning] [t:5036] 健康数据源超时: video_decoder
+[2026-10-22 15:07:42.246] [warning] [t:5036] 健康数据源超时: camera
+[2026-10-22 15:07:45.355] [info] [t:5035] 地面站心跳建立: system=255 component=190
+[2026-10-22 15:07:45.355] [info] [t:5035] 收到地面站V2_EXTENSION: type=65014 target=1/25 count=1
+[2026-10-22 15:07:45.355] [info] [t:5035] 收到任务分配: target=1/25 len=60 count=1
+[2026-10-22 15:07:45.355] [info] [t:5035] 任务分配已发布: version=1 assignment_id=7 target_id=7 type=25 flags=1 valid_for_ms=5000 count=1
+[2026-10-22 15:07:45.449] [info] [t:5034] 状态机收到任务分配: assignment_id=7 target_id=7 type=25 flags=0x01 valid_for_ms=5000 count=1
+[2026-10-22 15:07:45.449] [info] [t:5034] 任务分配已接受: assignment_id=7 target_id=7 origin=(-0.01,-0.02,0.17) → S3 ARMING
+[2026-10-22 15:07:45.449] [info] [t:5034] 任务状态转移: READY -> ARMING reason=接受任务分配
+[2026-10-22 15:07:45.449] [info] [t:5034] S3 自动起飞开始: origin=(-0.01,-0.02,0.17) bootstrap_lead=300ms mode_timeout=2000ms arm_timeout=3000ms
+[2026-10-22 15:07:45.449] [info] [t:5037] 健康数据源恢复: ground_station
+[2026-10-22 15:07:45.466] [info] [t:5035] 任务分配ACK发送成功: assignment_id=7 target_id=7 result=0 reason=0 state=2 availability=2 count=1
+[2026-10-22 15:07:45.490] [warning] [t:5033] 飞行控制器控制权迁移: IDLE -> BOOTSTRAP (起飞预授权门禁全通)
+[2026-10-22 15:07:45.749] [info] [t:5034] S3 起飞模式命令已入队: DO_SET_MODE(176) p1=1 p2=6 p3=0（本次起飞仅一次）
+[2026-10-22 15:07:45.763] [info] [t:5038] PX4 命令 ACK: sequence=13 command=176 result=0 internal=false progress=0
+[2026-10-22 15:07:45.949] [info] [t:5034] S3 已进入 Offboard(6/0)，解锁命令已入队: ARM_DISARM(400) p1=1（本次起飞仅一次）
+[2026-10-22 15:07:45.970] [info] [t:5038] PX4 命令 ACK: sequence=14 command=400 result=0 internal=false progress=0
+[2026-10-22 15:07:46.196] [info] [t:5035] 地面站时间同步建立: offset_ms=0.121 rtt_ms=0.878 jitter_ms=6.925 samples=5
+[2026-10-22 15:07:46.890] [warning] [t:5033] 飞行控制器控制权迁移: BOOTSTRAP -> ACTIVE (armed+Offboard，bootstrap 完成)
+[2026-10-22 15:07:46.908] [warning] [t:5032] PX4 Home变化（诊断记录，估计器不重置）: 旧=(47.3979713,8.5461638,-0.222m) 新=(47.3979713,8.5461635,0.078m) gps_fix=3 卫星=10 eph=0.70m epv=1.10m 锚点ref=(47.3979714,8.5461638,0.25m,收1) 局部位置=(0.00,-0.02,0.15)
+[2026-10-22 15:07:46.950] [info] [t:5034] 任务状态转移: ARMING -> TAKEOFF reason=PX4 已解锁且处于 Offboard
+[2026-10-22 15:07:46.950] [info] [t:5034] S4 自动爬升开始: 高度 2.00m 爬升率 0.50m/s 到达判据 z±0.20m xy±0.50m vz≤0.30m/s 稳定 1000ms
+[2026-10-22 15:07:47.223] [info] [t:5006] 双目测距摘要: 帧=0 匹配帧=0 批次=0 发布=0 有效测距=0 有效占比=0.0% 跳过=0 帧未配=0 截断=0 处理avg=0.00ms max=0.00ms
+[2026-10-22 15:07:47.451] [info] [t:5034] 重复任务分配只重发65015: assignment_id=7 result=0 reason=0 count=1
+[2026-10-22 15:07:55.062] [info] [t:5034] 起飞到达任务高度: z=-1.72（原点 z0=0.17，高度 2.00m），进入 GPS_APPROACH
+[2026-10-22 15:07:55.062] [info] [t:5034] 任务状态转移: TAKEOFF -> GPS_APPROACH reason=起飞到达任务高度
+[2026-10-22 15:07:55.062] [info] [t:5034] S5 目标看门狗启动: target_id=7 wait_timeout=10000ms lost_timeout=10000ms
+[2026-10-22 15:07:55.163] [warning] [t:5034] GPS_APPROACH影子状态目标过期: count=1
+[2026-10-22 15:07:55.290] [warning] [t:5033] 飞行控制器拒绝意图(意图持有期超龄): 累计=1
+[2026-10-22 15:07:55.290] [warning] [t:5033] 飞行控制器控制权迁移: ACTIVE -> COAST (意图持有期超龄)
+[2026-10-22 15:07:56.340] [warning] [t:5033] 飞行控制器控制权迁移: COAST -> IDLE (COAST 超时)
+[2026-10-22 15:08:08.016] [warning] [t:5034] GPS_APPROACH影子状态目标过期: count=100
+[2026-10-22 15:08:08.016] [warning] [t:5034] S5 目标看门狗中止: reason=13 detail=起飞后等待分配目标超时 → S12 返航
+[2026-10-22 15:08:08.016] [info] [t:5034] 任务状态转移: GPS_APPROACH -> RETURN_HOME reason=目标等待/丢失超时，中止任务并返航
+[2026-10-22 15:08:08.016] [info] [t:5034] 返航开始: Home 局部NED 由 Home+EKF锚点换算，返航高度 5.0m，到达半径 2.0m
+[2026-10-22 15:08:21.873] [warning] [t:5032] PX4 Home变化窗口汇总（周期）: 窗口=0.0s 变化=1次 首=(47.3979713,8.5461636,0.127m) 末=(47.3979713,8.5461636,0.127m) 水平范围=0.0x0.0m 净漂移=0.0m 高度净漂移=+0.00m 高度范围=0.00m 最大单步=0.01m gps_fix=3 卫星=10 eph=0.70m epv=1.10m 锚点ref=(47.3979714,8.5461638,0.25m,收1) 局部位置=(-0.02,-0.04,0.04)
+[2026-10-22 15:08:35.817] [warning] [t:5035] 地面站心跳超时: timeout_ms=3000
+[2026-10-22 15:08:38.758] [warning] [t:5036] 健康数据源超时: ground_station
+[2026-10-22 15:09:05.332] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/28，累计 1
+[2026-10-22 15:09:05.332] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1
+[2026-10-22 15:09:05.333] [warning] [t:5037] 健康数据源活动错误: ground_station
+[2026-10-22 15:09:11.037] [warning] [t:5034] 返航超时，原地悬停等待地面站/人工处置
+[2026-10-22 15:09:15.240] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 100
+[2026-10-22 15:09:15.240] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 100
+[2026-10-22 15:09:28.140] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 200
+[2026-10-22 15:09:28.140] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 200
+[2026-10-22 15:09:38.106] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/43，累计 300
+[2026-10-22 15:09:38.106] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 300
+[2026-10-22 15:09:48.093] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 400
+[2026-10-22 15:09:48.093] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 400
+[2026-10-22 15:10:00.975] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 500
+[2026-10-22 15:10:00.975] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 500
+[2026-10-22 15:10:10.941] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 600
+[2026-10-22 15:10:10.941] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 600
+[2026-10-22 15:10:20.910] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/43，累计 700
+[2026-10-22 15:10:20.910] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 700
+[2026-10-22 15:10:33.845] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 800
+[2026-10-22 15:10:33.845] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 800
+[2026-10-22 15:10:43.810] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/28，累计 900
+[2026-10-22 15:10:43.810] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 900
+[2026-10-22 15:10:53.776] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/42，累计 1000
+[2026-10-22 15:10:53.776] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1000
+[2026-10-22 15:11:06.676] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/43，累计 1100
+[2026-10-22 15:11:06.676] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1100
+[2026-10-22 15:11:16.643] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 1200
+[2026-10-22 15:11:16.643] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1200
+[2026-10-22 15:11:26.628] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 1300
+[2026-10-22 15:11:26.628] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1300
+[2026-10-22 15:11:39.525] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 1400
+[2026-10-22 15:11:39.525] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1400
+[2026-10-22 15:11:49.492] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/43，累计 1500
+[2026-10-22 15:11:49.492] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1500
+[2026-10-22 15:11:59.458] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 1600
+[2026-10-22 15:11:59.458] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1600
+[2026-10-22 15:12:09.444] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 1700
+[2026-10-22 15:12:09.444] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1700
+[2026-10-22 15:12:22.350] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 1800
+[2026-10-22 15:12:22.350] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1800
+[2026-10-22 15:12:32.317] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/42，累计 1900
+[2026-10-22 15:12:32.317] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 1900
+[2026-10-22 15:12:42.284] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/48，累计 2000
+[2026-10-22 15:12:42.284] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2000
+[2026-10-22 15:12:55.197] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/21，累计 2100
+[2026-10-22 15:12:55.197] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2100
+[2026-10-22 15:13:05.163] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 2200
+[2026-10-22 15:13:05.163] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2200
+[2026-10-22 15:13:15.130] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/40，累计 2300
+[2026-10-22 15:13:15.130] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2300
+[2026-10-22 15:13:28.028] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/48，累计 2400
+[2026-10-22 15:13:28.028] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2400
+[2026-10-22 15:13:38.013] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 2500
+[2026-10-22 15:13:38.013] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2500
+[2026-10-22 15:13:47.979] [error] [t:5035] 串口写入超时: device=/tmp/gcs_app 已写入=0/72，累计 2600
+[2026-10-22 15:13:47.979] [error] [t:5035] 地面站 MAVLink 帧发送失败，累计 2600

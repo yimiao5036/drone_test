@@ -2,8 +2,8 @@
  * @file perception_fusion.h
  * @brief 感知融合部件接口（IPerceptionFusion）
  *
- * 属于 drone/perception 模块。职责：对齐视觉检测、光流、雷达距离和
- * 机体姿态（来自飞行状态快照），输出融合后的目标状态（TargetState）。
+ * 属于 drone/perception 模块。当前仍为兼容骨架；后续职责是对齐视觉检测、
+ * 光流、双目深度和机体姿态，输出可供目标估计器使用的空间观测。
  *
  * 骨架期说明：
  * - 本接口为纯虚抽象，融合算法在实现期接入。
@@ -14,6 +14,7 @@
  *   common::Topic<DetectionResult> ─┐
  *   common::Topic<OpticalFlowResult>─┤
  *   common::Topic<LaserRangeSample> ─┼──► IPerceptionFusion ──► common::Topic<TargetState>
+ *                 （旧兼容占位，正式双目消息待硬件接口冻结后替换）
  *   common::Topic<FlightStateSnapshot>┘
  * 可替换边界：融合算法。
  */

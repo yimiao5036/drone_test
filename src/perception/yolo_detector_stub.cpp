@@ -12,6 +12,9 @@
 
 namespace drone::perception {
 
+// 数据流：解码帧 Topic → 推理后端 → DetectionResult Topic。
+// Stub 与 YoloDetector 共享同一冻结接口，在无硬件/装配阶段替代真实检测器。
+
 YoloDetectorStub::YoloDetectorStub() {
     SPDLOG_INFO("YOLO 识别部件骨架创建");
 }
@@ -38,16 +41,28 @@ bool YoloDetectorStub::IsRunning() const {
     return running_;
 }
 
+// 骨架期忽略输入绑定；实现期保存订阅并启动消费。
 void YoloDetectorStub::SetInput(common::Topic<video::FrameHandle>& /*input*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动消费
 }
 
 common::Topic<common::DetectionResult>& YoloDetectorStub::DetectionOutput() {
     return detection_output_;
 }
 
+common::Topic<common::VisualTargetObservation>& YoloDetectorStub::ObservationOutput() {
+    return observation_output_;
+}
+
 uint64_t YoloDetectorStub::ProcessedFrameCount() const {
     return processed_count_;
+}
+
+uint64_t YoloDetectorStub::ObservationCount() const {
+    return 0;
+}
+
+uint64_t YoloDetectorStub::DetectedObservationCount() const {
+    return 0;
 }
 
 float YoloDetectorStub::InferenceTimeMsAvg() const {

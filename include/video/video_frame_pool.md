@@ -51,6 +51,10 @@ public:
 - **防御**：越界/重复归还被忽略并计入 `DuplicateRecycleCount`（节流 ERROR 日志）。
 - **线程安全**：互斥锁保护空闲栈，临界区 O(1)；`Acquire` 单生产者约定，`Recycle` 任意消费者线程可并发。
 
+### 延迟时间传播
+
+`Acquire(pipeline_ingress_time_ms)`可写入原始编码访问单元进入机载进程的时间；生产者完成当前阶段后通过`FrameHandle::SetTiming()`刷新阶段产出时间。该元数据只用于端内延迟，不改变内存池归还语义。
+
 ## 4. 日志行为
 
 | 等级 | 场景 |

@@ -32,6 +32,7 @@ namespace drone::video_transmission {
 struct VideoSenderConfig {
     EncoderBackendConfig encode;  ///< 编码 + 图传推流后端配置
     std::size_t input_queue = 2;  ///< 标注帧订阅队列容量（丢最旧）
+    bool collect_detailed_latency = true;  ///< 中间阶段延迟统计；false=只留ingress→RTSP链（探针首尾模式）
 
     /// 编码后端注入工厂（测试用）：为空时用默认 FFmpeg 后端。
     /// 测试注入 Mock 以验证发送线程/计数逻辑而不依赖真实 RTSP 目标。
@@ -61,6 +62,11 @@ public:
     virtual uint64_t DroppedFrameCount() const = 0;
     /// 累计错误次数。
     virtual uint64_t ErrorCount() const = 0;
+    virtual common::LatencySummary InputQueueLatency() const = 0;
+    virtual common::LatencySummary EncodeAndPushLatency() const = 0;
+    virtual common::LatencySummary IngressToRtspLatency() const = 0;
+    virtual common::LatencySummary FramePrepareLatency() const = 0;
+    virtual common::LatencySummary PacketWriteLatency() const = 0;
 };
 
 /// 图传发送器（实现 IVideoSender）。
@@ -90,6 +96,11 @@ public:
     uint64_t SentFrameCount() const override;
     uint64_t DroppedFrameCount() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override;
+    common::LatencySummary EncodeAndPushLatency() const override;
+    common::LatencySummary IngressToRtspLatency() const override;
+    common::LatencySummary FramePrepareLatency() const override;
+    common::LatencySummary PacketWriteLatency() const override;
 
 private:
     struct Impl;
@@ -114,6 +125,11 @@ public:
     uint64_t SentFrameCount() const override;
     uint64_t DroppedFrameCount() const override;
     uint64_t ErrorCount() const override;
+    common::LatencySummary InputQueueLatency() const override { return {}; }
+    common::LatencySummary EncodeAndPushLatency() const override { return {}; }
+    common::LatencySummary IngressToRtspLatency() const override { return {}; }
+    common::LatencySummary FramePrepareLatency() const override { return {}; }
+    common::LatencySummary PacketWriteLatency() const override { return {}; }
 
 private:
     bool running_ = false;

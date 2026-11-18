@@ -11,6 +11,9 @@
 
 namespace drone::perception {
 
+// 数据流：解码帧 Topic → 光流估算 → OpticalFlowResult Topic。
+// Stub 仅占位生命周期与输出主题，光流算法与质量评估在实现期接入。
+
 OpticalFlowEstimatorStub::OpticalFlowEstimatorStub() {
     SPDLOG_INFO("光流估计部件骨架创建");
 }
@@ -37,8 +40,8 @@ bool OpticalFlowEstimatorStub::IsRunning() const {
     return running_;
 }
 
+// 骨架期忽略输入绑定；实现期保存订阅并启动消费。
 void OpticalFlowEstimatorStub::SetInput(common::Topic<video::FrameHandle>& /*input*/) {
-    // 骨架期忽略输入绑定；实现期保存订阅并启动消费
 }
 
 common::Topic<common::OpticalFlowResult>& OpticalFlowEstimatorStub::FlowOutput() {
